@@ -33,7 +33,7 @@ pub struct SheetState {
 impl SheetState {
     pub fn new(main_rows: usize, main_cols: usize) -> Self {
         SheetState {
-            grid: Grid::new(main_rows, main_cols),
+            grid: Grid::new(main_rows as u32, main_cols as u32),
             aggregates: HashMap::new(),
         }
     }
