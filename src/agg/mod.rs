@@ -46,8 +46,12 @@ pub fn compute_aggregate(grid: &Grid, def: &AggregateDef) -> String {
     let xs = collect_numbers(grid, &def.source);
     let out = match def.func {
         AggFunc::Sum => {
-            let s: f64 = xs.iter().sum();
-            format!("{s}")
+            if xs.is_empty() {
+                String::new()
+            } else {
+                let s: f64 = xs.iter().sum();
+                format!("{s}")
+            }
         }
         AggFunc::Mean => {
             if xs.is_empty() {
@@ -75,7 +79,13 @@ pub fn compute_aggregate(grid: &Grid, def: &AggregateDef) -> String {
             .max_by(|a, b| a.partial_cmp(b).unwrap())
             .map(|m| format!("{m}"))
             .unwrap_or_default(),
-        AggFunc::Count => format!("{}", xs.len()),
+        AggFunc::Count => {
+            if xs.is_empty() {
+                String::new()
+            } else {
+                format!("{}", xs.len())
+            }
+        }
     };
     out
 }
