@@ -1,5 +1,6 @@
-//! Append-only log I/O and file watching for multi-instance sync.
+//! Append-only log I/O, file watching, and tabular import for multi-instance sync.
 
+use crate::grid::CellAddr;
 use crate::ops::{apply_line, append_op, replay_lines, Op, SheetState};
 use notify::{RecursiveMode, Watcher};
 use std::fs;
@@ -54,6 +55,116 @@ pub fn commit_op(path: &Path, offset: &mut u64, state: &mut SheetState, op: &Op)
     append_op(path, op)?;
     *offset = tail_apply(path, *offset, state)?;
     Ok(())
+}
+
+// ── Tabular import ───────────────────────────────────────────────────────────
+
+pub fn import_tsv(data: &str, state: &mut SheetState) {
+    import_delimited(data, state, '\t');
+}
+
+pub fn import_csv(data: &str, state: &mut SheetState) {
+    import_delimited(data, state, ',');
+}
+
+fn import_delimited(data: &str, state: &mut SheetState, delim: char) {
+    let lines: Vec<&str> = data.lines().collect();
+    if lines.is_empty() {
+        return;
+    }
+
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    for line in &lines {
+        if delim == ',' {
+            rows.push(parse_csv_line(line));
+        } else {
+            rows.push(line.split(delim).map(|s| s.to_string()).collect());
+        }
+    }
+
+    let max_cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+    if max_cols == 0 {
+        return;
+    }
+
+    let first_all_numeric = rows.first().map_or(true, |r| {
+        r.iter().all(|cell| {
+            let t = cell.trim();
+            t.is_empty() || t.parse::<f64>().is_ok()
+        })
+    });
+
+    let (header_row, data_rows) = if first_all_numeric || rows.len() <= 1 {
+        (None, &rows[..])
+    } else {
+        (Some(&rows[0]), &rows[1..])
+    };
+
+    let mc = max_cols as u32;
+    let mr = data_rows.len() as u32;
+    state.grid.set_main_size(mr.max(1) as usize, mc.max(1) as usize);
+
+    if let Some(hdr) = header_row {
+        use crate::grid::HEADER_ROWS;
+        let header_idx = (HEADER_ROWS - 1) as u8;
+        for (ci, val) in hdr.iter().enumerate() {
+            if !val.is_empty() {
+                let global_col = crate::grid::MARGIN_COLS as u32 + ci as u32;
+                state.grid.set(
+                    &CellAddr::Header {
+                        row: header_idx,
+                        col: global_col,
+                    },
+                    val.clone(),
+                );
+            }
+        }
+    }
+
+    for (ri, row) in data_rows.iter().enumerate() {
+        for (ci, val) in row.iter().enumerate() {
+            if !val.is_empty() {
+                state.grid.set(
+                    &CellAddr::Main {
+                        row: ri as u32,
+                        col: ci as u32,
+                    },
+                    val.clone(),
+                );
+            }
+        }
+    }
+}
+
+fn parse_csv_line(line: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut chars = line.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if in_quotes {
+            if ch == '"' {
+                if chars.peek() == Some(&'"') {
+                    current.push('"');
+                    chars.next();
+                } else {
+                    in_quotes = false;
+                }
+            } else {
+                current.push(ch);
+            }
+        } else if ch == '"' {
+            in_quotes = true;
+        } else if ch == ',' {
+            fields.push(current.clone());
+            current.clear();
+        } else {
+            current.push(ch);
+        }
+    }
+    fields.push(current);
+    fields
 }
 
 /// Watches `path` for changes; poll [`LogWatcher::poll_dirty`].
@@ -111,6 +222,34 @@ mod tests {
         assert_eq!(
             state.grid.get(&CellAddr::Main { row: 0, col: 0 }),
             Some("42")
+        );
+    }
+
+    #[test]
+    fn import_tsv_basic() {
+        let mut state = SheetState::new(1, 1);
+        import_tsv("Name\tAge\nAlice\t30\nBob\t25\n", &mut state);
+        assert_eq!(state.grid.main_rows(), 2);
+        assert_eq!(state.grid.main_cols(), 2);
+        assert_eq!(
+            state.grid.get(&CellAddr::Main { row: 0, col: 0 }),
+            Some("Alice")
+        );
+        assert_eq!(
+            state.grid.get(&CellAddr::Main { row: 1, col: 1 }),
+            Some("25")
+        );
+    }
+
+    #[test]
+    fn import_csv_quoted() {
+        let mut state = SheetState::new(1, 1);
+        import_csv("a,\"b,c\",d\n1,2,3\n", &mut state);
+        assert_eq!(state.grid.main_rows(), 1);
+        assert_eq!(state.grid.main_cols(), 3);
+        assert_eq!(
+            state.grid.get(&CellAddr::Main { row: 0, col: 1 }),
+            Some("2")
         );
     }
 }

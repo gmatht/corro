@@ -2,7 +2,6 @@
 
 use crate::grid::{CellAddr, Grid, MainRange};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
@@ -27,14 +26,12 @@ pub struct AggregateDef {
 #[derive(Clone, Debug, Default)]
 pub struct SheetState {
     pub grid: Grid,
-    pub aggregates: HashMap<CellAddr, AggregateDef>,
 }
 
 impl SheetState {
     pub fn new(main_rows: usize, main_cols: usize) -> Self {
         SheetState {
             grid: Grid::new(main_rows as u32, main_cols as u32),
-            aggregates: HashMap::new(),
         }
     }
 }
@@ -49,13 +46,6 @@ pub enum Op {
     SetMainSize {
         main_rows: u32,
         main_cols: u32,
-    },
-    SetAggregate {
-        addr: CellAddr,
-        def: AggregateDef,
-    },
-    ClearAggregate {
-        addr: CellAddr,
     },
     MoveRowRange {
         from: u32,
@@ -82,12 +72,6 @@ impl Op {
                 state
                     .grid
                     .set_main_size(*main_rows as usize, *main_cols as usize);
-            }
-            Op::SetAggregate { addr, def } => {
-                state.aggregates.insert(addr.clone(), def.clone());
-            }
-            Op::ClearAggregate { addr } => {
-                state.aggregates.remove(addr);
             }
             Op::MoveRowRange { from, count, to } => {
                 state.grid.move_main_rows(

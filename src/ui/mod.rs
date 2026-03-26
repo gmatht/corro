@@ -1,9 +1,8 @@
-//! Ratatui front-end: sheet viewport, editing, aggregates, move, file sync.
+//! Ratatui front-end: sheet viewport, editing, export, move, file sync.
 
 use crate::agg::{cell_display, compute_aggregate};
-use crate::grid::{
-    addr_logical_col, addr_logical_row, CellAddr, Grid, FOOTER_ROWS, HEADER_ROWS, MARGIN_COLS,
-};
+use crate::export;
+use crate::grid::{CellAddr, Grid, FOOTER_ROWS, HEADER_ROWS, MARGIN_COLS};
 use crate::grid::MainRange;
 use crate::io::{commit_op, load_full, tail_apply, IoError, LogWatcher};
 use crate::ops::{AggFunc, AggregateDef, Op, SheetState};
@@ -98,9 +97,10 @@ pub enum Mode {
     Edit { buffer: String },
     OpenPath { buffer: String },
     Help,
-    AggPick { idx: usize },
     /// Alt-activated menu bar; letter shortcuts execute actions.
     Menu,
+    ExportTsv { buffer: String },
+    ExportCsv { buffer: String },
 }
 
 // ── Viewport helpers ──────────────────────────────────────────────────────────
@@ -120,14 +120,6 @@ fn main_row_window(state: &SheetState, cursor: SheetCursor) -> (usize, usize) {
         if g.logical_row_has_content(hr + r) {
             lo = lo.min(r);
             hi = hi.max(r);
-        }
-    }
-    for a in state.aggregates.keys() {
-        let lr = addr_logical_row(a, g);
-        if lr >= hr && lr < hr + mr {
-            let ri = lr - hr;
-            lo = lo.min(ri);
-            hi = hi.max(ri);
         }
     }
     if cursor.row >= hr && cursor.row < hr + mr {
@@ -160,14 +152,6 @@ fn main_col_window(state: &SheetState, cursor: SheetCursor) -> (usize, usize) {
         if g.logical_col_has_content(lm + c) {
             lo = lo.min(c);
             hi = hi.max(c);
-        }
-    }
-    for a in state.aggregates.keys() {
-        let lc = addr_logical_col(a, g);
-        if lc >= lm && lc < lm + mc {
-            let ci = lc - lm;
-            lo = lo.min(ci);
-            hi = hi.max(ci);
         }
     }
     if cursor.col >= lm && cursor.col < lm + mc {
@@ -230,12 +214,10 @@ fn visible_row_indices(
     let cur = cursor.row.min(total.saturating_sub(1));
     let cursor_in_footer = cursor.row >= hr + mr;
 
-    // If everything fits, show all logical rows so section moves don't remap.
     if total <= dim {
         return ((0..total).collect(), 0);
     }
 
-    // Stable compact band: ^A + focused main rows (+1 blank edge) + non-blank footer band.
     let (main_lo, main_hi) = main_row_window(state, cursor);
     let footer_start = hr + mr;
     let mut footer_band: Vec<usize> = match footer_nonblank_end(state) {
@@ -263,10 +245,9 @@ fn visible_row_indices(
         return (stable_band, 0);
     }
 
-    // Freeze panes: keep footer band pinned; keep ^A pinned when room allows.
     let mut reserved: Vec<usize> = footer_band;
     if hr > 0 && dim > reserved.len() {
-        reserved.push(hr - 1); // ^A orientation row
+        reserved.push(hr - 1);
     }
     if !cursor_in_footer && fr > 0 && !reserved.iter().any(|&r| r == blank_footer) {
         let mut cand = reserved.clone();
@@ -321,20 +302,18 @@ fn visible_col_indices(
     prev_start: usize,
 ) -> (Vec<usize>, usize) {
     let g = &state.grid;
-    let lm = MARGIN_COLS; // left margin width (= 10)
+    let lm = MARGIN_COLS;
     let mc = g.main_cols();
-    let rm = MARGIN_COLS; // right margin width
+    let rm = MARGIN_COLS;
     let total = lm + mc + rm;
     let dim = dim.max(1).min(total.max(1));
     let cur = cursor.col.min(total.saturating_sub(1));
     let cursor_in_right = cursor.col >= lm + mc;
 
-    // If everything fits, show all columns so section moves don't remap.
     if total <= dim {
         return ((0..total).collect(), 0);
     }
 
-    // Stable compact band: <0 + focused main cols (+1 blank edge) + non-blank right band.
     let (main_lo, main_hi) = main_col_window(state, cursor);
     let right_start = lm + mc;
     let mut right_band: Vec<usize> = match right_nonblank_end(state) {
@@ -362,10 +341,9 @@ fn visible_col_indices(
         return (stable_band, 0);
     }
 
-    // Freeze panes: keep right-band pinned; keep <0 pinned when room allows.
     let mut reserved: Vec<usize> = right_band;
     if lm > 0 && dim > reserved.len() {
-        reserved.push(lm - 1); // <0 orientation col
+        reserved.push(lm - 1);
     }
     if !cursor_in_right && rm > 0 && !reserved.iter().any(|&c| c == blank_right) {
         let mut cand = reserved.clone();
@@ -414,8 +392,6 @@ fn visible_col_indices(
 
 // ── Navigation helpers ────────────────────────────────────────────────────────
 
-/// Number of completely blank main rows at the bottom of the current extent
-/// (rows after the last row that contains any content).
 fn trailing_blank_main_rows(state: &SheetState) -> usize {
     let g = &state.grid;
     let hr = HEADER_ROWS;
@@ -426,7 +402,6 @@ fn trailing_blank_main_rows(state: &SheetState) -> usize {
     }
 }
 
-/// Number of completely blank main columns at the right of the current extent.
 fn trailing_blank_main_cols(state: &SheetState) -> usize {
     let g = &state.grid;
     let lm = MARGIN_COLS;
@@ -437,13 +412,8 @@ fn trailing_blank_main_cols(state: &SheetState) -> usize {
     }
 }
 
-// ── <0-column footer aggregates ──────────────────────────────────────────────
+// ── Display-time aggregate helpers ───────────────────────────────────────────
 
-/// If the `<0` cell of `footer_row_idx` holds a recognised aggregate keyword,
-/// return the corresponding function so every main-data cell in that footer row
-/// can be rendered as the column-wide aggregate instead of its stored value.
-///
-/// `<0` is the innermost left-margin column: global col `MARGIN_COLS - 1`.
 fn footer_row_agg_func(grid: &Grid, footer_row_idx: usize) -> Option<AggFunc> {
     let key_col = (MARGIN_COLS - 1) as u32;
     let val = grid.get(&CellAddr::Footer {
@@ -461,12 +431,6 @@ fn footer_row_agg_func(grid: &Grid, footer_row_idx: usize) -> Option<AggFunc> {
     }
 }
 
-/// If the `^A` cell of `global_col` holds a recognised aggregate keyword,
-/// return the function so every main-data cell in that right-margin column
-/// can be rendered as the row-wide aggregate instead of its stored value.
-///
-/// `^A` is the last header row (nearest to main), used as a column-header
-/// label: `^A,>0 = TOTAL` means "this column shows row totals".
 fn right_col_agg_func(grid: &Grid, global_col: usize) -> Option<AggFunc> {
     let val = grid.get(&CellAddr::Header {
         row: (HEADER_ROWS - 1) as u8,
@@ -554,6 +518,172 @@ fn footer_special_col_aggregate(
     Some(fold_numbers(footer_func, &samples))
 }
 
+// ── Cell-address shorthand ───────────────────────────────────────────────────
+
+/// Parse `ADDR: VALUE` shorthand. Returns `(target_addr, value)` or `None`.
+fn parse_cell_shorthand(buf: &str) -> Option<(CellAddr, String)> {
+    let colon = buf.find(':')?;
+    let addr_part = buf[..colon].trim();
+    let value_part = buf[colon + 1..].trim_start().to_string();
+    if addr_part.is_empty() {
+        return None;
+    }
+
+    let bytes = addr_part.as_bytes();
+
+    // Main cell: A1, B3, AA10
+    if bytes[0].is_ascii_uppercase() {
+        let mut col_end = 0;
+        while col_end < bytes.len() && bytes[col_end].is_ascii_uppercase() {
+            col_end += 1;
+        }
+        if col_end == 0 || col_end >= bytes.len() {
+            return None;
+        }
+        let col_name = &addr_part[..col_end];
+        let row_str = &addr_part[col_end..];
+        let row_num: u32 = row_str.parse().ok()?;
+        if row_num == 0 {
+            return None;
+        }
+        let col = parse_excel_column(col_name)?;
+        return Some((CellAddr::Main { row: row_num - 1, col }, value_part));
+    }
+
+    // Header: ^X or ^X,COL  (but we use ^X,COL for the full address)
+    if bytes[0] == b'^' && bytes.len() >= 2 {
+        let letter = bytes[1];
+        if !letter.is_ascii_uppercase() {
+            return None;
+        }
+        let row = b'Z' - letter;
+        if addr_part.len() == 2 {
+            return Some((CellAddr::Header { row, col: 0 }, value_part));
+        }
+        if bytes[2] != b',' {
+            return None;
+        }
+        let col_part = &addr_part[3..];
+        let col = resolve_global_col(col_part)?;
+        return Some((CellAddr::Header { row, col }, value_part));
+    }
+
+    // Footer: _X or _X,COL
+    if bytes[0] == b'_' && bytes.len() >= 2 {
+        let letter = bytes[1];
+        if !letter.is_ascii_uppercase() {
+            return None;
+        }
+        let row = letter - b'A';
+        if addr_part.len() == 2 {
+            return Some((CellAddr::Footer { row, col: 0 }, value_part));
+        }
+        if bytes[2] != b',' {
+            return None;
+        }
+        let col_part = &addr_part[3..];
+        let col = resolve_global_col(col_part)?;
+        return Some((CellAddr::Footer { row, col }, value_part));
+    }
+
+    // Left margin: <N,R
+    if bytes[0] == b'<' {
+        let rest = &addr_part[1..];
+        let comma = rest.find(',')?;
+        let margin_col: u8 = rest[..comma].parse().ok()?;
+        let main_row: u32 = rest[comma + 1..].parse().ok()?;
+        if main_row == 0 {
+            return None;
+        }
+        return Some((CellAddr::Left { col: margin_col, row: main_row - 1 }, value_part));
+    }
+
+    // Right margin: >N,R
+    if bytes[0] == b'>' {
+        let rest = &addr_part[1..];
+        let comma = rest.find(',')?;
+        let margin_col: u8 = rest[..comma].parse().ok()?;
+        let main_row: u32 = rest[comma + 1..].parse().ok()?;
+        if main_row == 0 {
+            return None;
+        }
+        return Some((CellAddr::Right { col: margin_col, row: main_row - 1 }, value_part));
+    }
+
+    None
+}
+
+fn parse_excel_column(name: &str) -> Option<u32> {
+    let mut n: u32 = 0;
+    for b in name.bytes() {
+        if !b.is_ascii_uppercase() {
+            return None;
+        }
+        n = n.checked_mul(26)?.checked_add((b - b'A') as u32 + 1)?;
+    }
+    Some(n - 1)
+}
+
+fn resolve_global_col(col_part: &str) -> Option<u32> {
+    let bytes = col_part.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+    if bytes[0] == b'<' {
+        let n: u32 = col_part[1..].parse().ok()?;
+        return Some((MARGIN_COLS as u32).checked_sub(1)?.checked_sub(n)?);
+    }
+    if bytes[0] == b'>' {
+        let n: u32 = col_part[1..].parse().ok()?;
+        return Some(n);
+    }
+    if bytes[0].is_ascii_uppercase() {
+        let col = parse_excel_column(col_part)?;
+        return Some(MARGIN_COLS as u32 + col);
+    }
+    None
+}
+
+// ── Clipboard helper ─────────────────────────────────────────────────────────
+
+fn copy_to_clipboard(text: &str) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::process::{Command, Stdio};
+        let mut child = Command::new("clip")
+            .stdin(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("clip: {e}"))?;
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write;
+            stdin.write_all(text.as_bytes()).map_err(|e| format!("clip stdin: {e}"))?;
+        }
+        child.wait().map_err(|e| format!("clip wait: {e}"))?;
+        Ok(())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        use std::process::{Command, Stdio};
+        // Try xclip, then pbcopy
+        let cmd = if Command::new("xclip").arg("-version").output().is_ok() {
+            "xclip"
+        } else {
+            "pbcopy"
+        };
+        let mut child = Command::new(cmd)
+            .args(if cmd == "xclip" { &["-selection", "clipboard"][..] } else { &[][..] })
+            .stdin(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("{cmd}: {e}"))?;
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write;
+            stdin.write_all(text.as_bytes()).map_err(|e| format!("{cmd} stdin: {e}"))?;
+        }
+        child.wait().map_err(|e| format!("{cmd} wait: {e}"))?;
+        Ok(())
+    }
+}
+
 // ── App ───────────────────────────────────────────────────────────────────────
 
 pub struct App {
@@ -593,11 +723,28 @@ impl App {
     pub fn load_initial(&mut self) -> Result<(), IoError> {
         if let Some(ref p) = self.path.clone() {
             if Path::new(p).exists() {
-                let (off, n) = load_full(p, &mut self.state)?;
-                self.offset = off;
-                self.ops_applied = n;
-                self.watcher = Some(LogWatcher::new(p.clone())?);
-                self.status = format!("Loaded {}", p.display());
+                let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+                match ext.as_str() {
+                    "tsv" => {
+                        let data = std::fs::read_to_string(p)
+                            .map_err(|e| IoError::Io(e))?;
+                        crate::io::import_tsv(&data, &mut self.state);
+                        self.status = format!("Imported TSV {}", p.display());
+                    }
+                    "csv" => {
+                        let data = std::fs::read_to_string(p)
+                            .map_err(|e| IoError::Io(e))?;
+                        crate::io::import_csv(&data, &mut self.state);
+                        self.status = format!("Imported CSV {}", p.display());
+                    }
+                    _ => {
+                        let (off, n) = load_full(p, &mut self.state)?;
+                        self.offset = off;
+                        self.ops_applied = n;
+                        self.watcher = Some(LogWatcher::new(p.clone())?);
+                        self.status = format!("Loaded {}", p.display());
+                    }
+                }
             } else {
                 self.watcher = Some(LogWatcher::new(p.clone())?);
                 self.status = format!("New file {}", p.display());
@@ -630,15 +777,6 @@ impl App {
             }
         }
         Ok(())
-    }
-
-    fn default_main_range(&self) -> MainRange {
-        MainRange {
-            row_start: 0,
-            row_end: self.state.grid.main_rows() as u32,
-            col_start: 0,
-            col_end: self.state.grid.main_cols() as u32,
-        }
     }
 
     fn selection_main_row_range(&self) -> Option<(u32, u32)> {
@@ -680,6 +818,32 @@ impl App {
         Some(((c0 - left) as u32, (c1 - left) as u32))
     }
 
+    fn do_export(&mut self, csv: bool) -> String {
+        let mut buf = Vec::new();
+        if csv {
+            export::export_csv(&self.state.grid, &mut buf);
+        } else {
+            export::export_tsv(&self.state.grid, &mut buf);
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    fn finish_export(&mut self, csv: bool, filename: &str) {
+        let data = self.do_export(csv);
+        let ext = if csv { "csv" } else { "tsv" };
+        if filename.trim().is_empty() {
+            match copy_to_clipboard(&data) {
+                Ok(()) => self.status = format!("{} copied to clipboard", ext.to_uppercase()),
+                Err(e) => self.status = format!("Clipboard error: {e}"),
+            }
+        } else {
+            match std::fs::write(filename.trim(), &data) {
+                Ok(()) => self.status = format!("Exported {} to {filename}", ext.to_uppercase()),
+                Err(e) => self.status = format!("Write error: {e}"),
+            }
+        }
+    }
+
     pub fn run(&mut self) -> Result<(), RunError> {
         enable_raw_mode()?;
         let mut stdout = stdout();
@@ -707,7 +871,6 @@ impl App {
     }
 
     fn draw(&mut self, f: &mut Frame) {
-        // Layout: formula bar (1) | grid (fills terminal) | hints bar (1)
         let layout = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -720,25 +883,18 @@ impl App {
         let grid_area = layout[1];
         let hints_area = layout[2];
 
-        // Compute inner area first (block borders don't depend on content).
         let sentinel = Block::default().borders(Borders::ALL);
         let inner = sentinel.inner(grid_area);
         let inner_h = inner.height as usize;
         let inner_w = inner.width as usize;
 
-        // Rows available for data (minus column-header line).
         let data_rows = inner_h.saturating_sub(1).max(1);
-        // Columns that fit after the row-label gutter.
         let data_cols = inner_w
             .saturating_sub(ROW_LABEL_CHARS)
             .checked_div(CELL_W)
             .unwrap_or(1)
             .max(1);
 
-        // Avoid aggressive auto-growth in draw(); growth happens via navigation
-        // and edits so small sheets can stay fully visible and stable on screen.
-
-        // ── Block title ───────────────────────────────────────────────────────
         let grid = &self.state.grid;
         let title_str = {
             let raw = format!(
@@ -765,7 +921,6 @@ impl App {
                 Style::default().add_modifier(Modifier::BOLD),
             ));
 
-        // ── Viewport ──────────────────────────────────────────────────────────
         let (row_ixs, next_row_scroll) =
             visible_row_indices(&self.state, self.cursor, data_rows, self.row_scroll);
         let (col_ixs, next_col_scroll) =
@@ -788,16 +943,24 @@ impl App {
                 format!(" open: {buffer}_"),
                 Style::default().fg(Color::White).bg(Color::DarkGray),
             ),
+            Mode::ExportTsv { buffer } => (
+                format!(" export TSV (blank=clipboard): {buffer}_"),
+                Style::default().fg(Color::White).bg(Color::DarkGray),
+            ),
+            Mode::ExportCsv { buffer } => (
+                format!(" export CSV (blank=clipboard): {buffer}_"),
+                Style::default().fg(Color::White).bg(Color::DarkGray),
+            ),
             Mode::Help => (
-                " ^A/_A and <0/>0 stay visible  |  e·edit  v·select  a·agg  r/c·move  o·open  q·quit".into(),
+                " e·edit  v·select  t·tsv  c·csv  r/c·move  o·open  addr: val  q·quit".into(),
                 Style::default().fg(Color::White).bg(Color::Blue),
             ),
             Mode::Menu => (
-                "  F·open-file   R·row-ops   C·col-ops   A·aggregate   ?·help   Esc·close".into(),
+                "  F·open-file   R·row-ops   C·col-ops   T·export-tsv   ?·help   Esc·close".into(),
                 Style::default().fg(Color::Black).bg(Color::Cyan),
             ),
             _ => {
-                let val = cell_display(grid, &self.state.aggregates, &addr);
+                let val = cell_display(grid, &addr);
                 let base = format!(" {addr_str}  {val}");
                 let text = if self.status.is_empty() {
                     base
@@ -815,7 +978,6 @@ impl App {
         // ── Grid ──────────────────────────────────────────────────────────────
         let mut lines: Vec<Line> = Vec::new();
 
-        // Column header row
         {
             let mut spans: Vec<Span> = vec![Span::styled(
                 format!("{:>width$}", "", width = ROW_LABEL_CHARS),
@@ -859,9 +1021,6 @@ impl App {
                 format!("{:>4} ", sheet_row_label(r, grid.main_rows())),
                 row_label_style,
             )];
-            // If this is a footer row whose <0 cell holds an aggregate keyword,
-            // pre-compute the function so every main-data cell in the row can
-            // display the column-wide aggregate instead of its stored value.
             let footer_agg = if r >= hr + mr {
                 footer_row_agg_func(grid, r - hr - mr)
             } else {
@@ -871,7 +1030,6 @@ impl App {
                 let cur = SheetCursor { row: r, col: c };
                 let cell_addr = cur.to_addr(grid);
                 let text = if let Some(func) = footer_agg {
-                    // <0-driven: footer row → show column aggregate for main cols.
                     if c >= lm && c < lm + mc {
                         let main_col = (c - lm) as u32;
                         compute_aggregate(grid, &AggregateDef {
@@ -885,12 +1043,11 @@ impl App {
                         })
                     } else if c >= lm + mc {
                         footer_special_col_aggregate(grid, func, c, mr, mc)
-                            .unwrap_or_else(|| cell_display(grid, &self.state.aggregates, &cell_addr))
+                            .unwrap_or_else(|| cell_display(grid, &cell_addr))
                     } else {
-                        cell_display(grid, &self.state.aggregates, &cell_addr)
+                        cell_display(grid, &cell_addr)
                     }
                 } else if r >= hr && r < hr + mr && c >= lm + mc {
-                    // _A-driven: right-margin col → show row aggregate for main rows.
                     if let Some(func) = right_col_agg_func(grid, c) {
                         let main_row = (r - hr) as u32;
                         compute_aggregate(grid, &AggregateDef {
@@ -903,10 +1060,10 @@ impl App {
                             },
                         })
                     } else {
-                        cell_display(grid, &self.state.aggregates, &cell_addr)
+                        cell_display(grid, &cell_addr)
                     }
                 } else {
-                    cell_display(grid, &self.state.aggregates, &cell_addr)
+                    cell_display(grid, &cell_addr)
                 };
                 let disp = if text.chars().count() > CELL_W {
                     format!("{}…", text.chars().take(CELL_W).collect::<String>())
@@ -954,7 +1111,6 @@ impl App {
 
         f.render_widget(block, grid_area);
 
-        // ── Context-sensitive hints bar ───────────────────────────────────────
         let hints = self.hints_line();
         f.render_widget(
             Paragraph::new(hints).style(Style::default().fg(Color::DarkGray)),
@@ -966,17 +1122,17 @@ impl App {
         match &self.mode {
             Mode::Normal => {
                 if self.anchor.is_some() {
-                    "  r·move-rows   c·move-cols   a·agg   v·deselect   Esc·cancel".into()
+                    "  r·move-rows   c·move-cols   v·deselect   Esc·cancel".into()
                 } else {
-                    "  e·edit   v·select   a·agg   o·open   hjkl/arrows·nav   totals pinned   q·quit   Alt·menu   ?·help".into()
+                    "  e·edit   v·select   t·tsv   c·csv   o·open   hjkl/arrows·nav   q·quit   Alt·menu   ?·help".into()
                 }
             }
-            Mode::Edit { .. } => "  type to edit   Enter·confirm   Esc·discard".into(),
+            Mode::Edit { .. } => "  type to edit (or addr: val)   Enter·confirm   Esc·discard".into(),
             Mode::OpenPath { .. } => "  type file path   Enter·open   Esc·cancel".into(),
-            Mode::Help => "  Esc / q / ?  ·  close help".into(),
-            Mode::AggPick { .. } => {
-                "  1·SUM  2·MEAN  3·MEDIAN  4·MIN  5·MAX  6·COUNT   Enter·set   Esc·cancel".into()
+            Mode::ExportTsv { .. } | Mode::ExportCsv { .. } => {
+                "  type filename (blank=clipboard)   Enter·export   Esc·cancel".into()
             }
+            Mode::Help => "  Esc / q / ?  ·  close help".into(),
             Mode::Menu => "  press a letter shortcut   Esc·close".into(),
         }
     }
@@ -986,7 +1142,6 @@ impl App {
             return Ok(false);
         }
 
-        // Alt: toggle menu or execute a shortcut directly from Normal/Menu.
         if key.modifiers.contains(KeyModifiers::ALT) {
             if matches!(self.mode, Mode::Normal | Mode::Menu) {
                 match key.code {
@@ -999,8 +1154,8 @@ impl App {
                                 .unwrap_or_default(),
                         };
                     }
-                    KeyCode::Char('a') | KeyCode::Char('A') => {
-                        self.mode = Mode::AggPick { idx: 0 };
+                    KeyCode::Char('t') | KeyCode::Char('T') => {
+                        self.mode = Mode::ExportTsv { buffer: String::new() };
                     }
                     KeyCode::Char('?') | KeyCode::Char('h') | KeyCode::Char('H') => {
                         self.mode = Mode::Help;
@@ -1040,8 +1195,8 @@ impl App {
                         self.status =
                             "Col ops: v·select full columns, then c·move to target column".into();
                     }
-                    KeyCode::Char('a') | KeyCode::Char('A') => {
-                        self.mode = Mode::AggPick { idx: 0 };
+                    KeyCode::Char('t') | KeyCode::Char('T') => {
+                        self.mode = Mode::ExportTsv { buffer: String::new() };
                     }
                     KeyCode::Char('?') => self.mode = Mode::Help,
                     _ => {}
@@ -1057,60 +1212,30 @@ impl App {
                 }
                 return Ok(false);
             }
-            Mode::AggPick { idx } => {
+            Mode::ExportTsv { buffer } => {
                 match key.code {
-                    KeyCode::Esc => self.mode = Mode::Normal,
-                    KeyCode::Char(c) if c.is_ascii_digit() => {
-                        let d = c.to_digit(10).unwrap_or(1).saturating_sub(1).min(5);
-                        *idx = d as usize;
-                    }
                     KeyCode::Enter => {
-                        let funcs = [
-                            AggFunc::Sum,
-                            AggFunc::Mean,
-                            AggFunc::Median,
-                            AggFunc::Min,
-                            AggFunc::Max,
-                            AggFunc::Count,
-                        ];
-                        let f = funcs[*idx % funcs.len()];
-                        let addr = self.cursor.to_addr(&self.state.grid);
-                        let source = if let Some(a) = self.anchor {
-                            let r0 = a.row.min(self.cursor.row);
-                            let r1 = a.row.max(self.cursor.row);
-                            let c0 = a.col.min(self.cursor.col);
-                            let c1 = a.col.max(self.cursor.col);
-                            let hr = HEADER_ROWS;
-                            if r0 >= hr
-                                && r1 < hr + self.state.grid.main_rows()
-                                && c0 >= MARGIN_COLS
-                                && c1 < MARGIN_COLS + self.state.grid.main_cols()
-                            {
-                                MainRange {
-                                    row_start: (r0 - hr) as u32,
-                                    row_end: (r1 - hr) as u32 + 1,
-                                    col_start: (c0 - MARGIN_COLS) as u32,
-                                    col_end: (c1 - MARGIN_COLS) as u32 + 1,
-                                }
-                            } else {
-                                self.default_main_range()
-                            }
-                        } else {
-                            self.default_main_range()
-                        };
-                        let op = Op::SetAggregate {
-                            addr,
-                            def: AggregateDef { func: f, source },
-                        };
-                        if let Some(ref p) = self.path.clone() {
-                            commit_op(p, &mut self.offset, &mut self.state, &op)?;
-                            self.ops_applied = self.ops_applied.saturating_add(1);
-                        } else {
-                            op.apply(&mut self.state);
-                            self.status = "No file — aggregate in memory only".into();
-                        }
+                        let fname = buffer.clone();
+                        self.finish_export(false, &fname);
                         self.mode = Mode::Normal;
                     }
+                    KeyCode::Esc => self.mode = Mode::Normal,
+                    KeyCode::Char(c) => buffer.push(c),
+                    KeyCode::Backspace => { buffer.pop(); }
+                    _ => {}
+                }
+                return Ok(false);
+            }
+            Mode::ExportCsv { buffer } => {
+                match key.code {
+                    KeyCode::Enter => {
+                        let fname = buffer.clone();
+                        self.finish_export(true, &fname);
+                        self.mode = Mode::Normal;
+                    }
+                    KeyCode::Esc => self.mode = Mode::Normal,
+                    KeyCode::Char(c) => buffer.push(c),
+                    KeyCode::Backspace => { buffer.pop(); }
                     _ => {}
                 }
                 return Ok(false);
@@ -1123,9 +1248,25 @@ impl App {
                         self.offset = 0;
                         self.state = SheetState::new(1, 1);
                         if path.exists() {
-                            let (off, n) = load_full(&path, &mut self.state)?;
-                            self.offset = off;
-                            self.ops_applied = n;
+                            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+                            match ext.as_str() {
+                                "tsv" => {
+                                    if let Ok(data) = std::fs::read_to_string(&path) {
+                                        crate::io::import_tsv(&data, &mut self.state);
+                                    }
+                                }
+                                "csv" => {
+                                    if let Ok(data) = std::fs::read_to_string(&path) {
+                                        crate::io::import_csv(&data, &mut self.state);
+                                    }
+                                }
+                                _ => {
+                                    if let Ok((off, n)) = load_full(&path, &mut self.state) {
+                                        self.offset = off;
+                                        self.ops_applied = n;
+                                    }
+                                }
+                            }
                         }
                         self.watcher =
                             Some(LogWatcher::new(path.clone()).map_err(IoError::from)?);
@@ -1150,11 +1291,13 @@ impl App {
             Mode::Edit { buffer } => {
                 match key.code {
                     KeyCode::Enter => {
-                        let addr = self.cursor.to_addr(&self.state.grid);
-                        let op = Op::SetCell {
-                            addr,
-                            value: buffer.clone(),
-                        };
+                        let (addr, value) =
+                            if let Some((a, v)) = parse_cell_shorthand(buffer) {
+                                (a, v)
+                            } else {
+                                (self.cursor.to_addr(&self.state.grid), buffer.clone())
+                            };
+                        let op = Op::SetCell { addr, value };
                         if let Some(ref p) = self.path.clone() {
                             commit_op(p, &mut self.offset, &mut self.state, &op)?;
                             self.ops_applied = self.ops_applied.saturating_add(1);
@@ -1196,7 +1339,7 @@ impl App {
             }
             KeyCode::Char('e') | KeyCode::Enter => {
                 let addr = self.cursor.to_addr(&self.state.grid);
-                let cur = cell_display(&self.state.grid, &self.state.aggregates, &addr);
+                let cur = cell_display(&self.state.grid, &addr);
                 self.mode = Mode::Edit { buffer: cur };
             }
             KeyCode::Char('v') => {
@@ -1206,7 +1349,41 @@ impl App {
                     None
                 };
             }
-            KeyCode::Char('a') => self.mode = Mode::AggPick { idx: 0 },
+            KeyCode::Char('t') => {
+                self.mode = Mode::ExportTsv { buffer: String::new() };
+            }
+            KeyCode::Char('c') => {
+                if self.anchor.is_some() {
+                    if let Some((mc0, mc1)) = self.selection_main_col_range() {
+                        let left = MARGIN_COLS;
+                        let right = MARGIN_COLS + self.state.grid.main_cols();
+                        if self.cursor.col < left || self.cursor.col >= right {
+                            self.status =
+                                "Place cursor on a main column as move target, then press c".into();
+                            return Ok(false);
+                        }
+                        let count = mc1 - mc0 + 1;
+                        let to = (self.cursor.col - left) as u32;
+                        let op = Op::MoveColRange {
+                            from: mc0,
+                            count,
+                            to,
+                        };
+                        if let Some(ref p) = self.path.clone() {
+                            commit_op(p, &mut self.offset, &mut self.state, &op)?;
+                            self.ops_applied = self.ops_applied.saturating_add(1);
+                        } else {
+                            op.apply(&mut self.state);
+                        }
+                        self.anchor = None;
+                        self.status = format!("Moved cols {mc0}..{} → before col {to}", mc0 + count);
+                    } else {
+                        self.status = "Select full main columns first (v), then c to move".into();
+                    }
+                } else {
+                    self.mode = Mode::ExportCsv { buffer: String::new() };
+                }
+            }
             KeyCode::Char('r') => {
                 if let Some((mr0, mr1)) = self.selection_main_row_range() {
                     let hr = HEADER_ROWS;
@@ -1236,34 +1413,6 @@ impl App {
                     self.status = "Select full main rows first (v), then r to move".into();
                 }
             }
-            KeyCode::Char('c') => {
-                if let Some((mc0, mc1)) = self.selection_main_col_range() {
-                    let left = MARGIN_COLS;
-                    let right = MARGIN_COLS + self.state.grid.main_cols();
-                    if self.cursor.col < left || self.cursor.col >= right {
-                        self.status =
-                            "Place cursor on a main column as move target, then press c".into();
-                        return Ok(false);
-                    }
-                    let count = mc1 - mc0 + 1;
-                    let to = (self.cursor.col - left) as u32;
-                    let op = Op::MoveColRange {
-                        from: mc0,
-                        count,
-                        to,
-                    };
-                    if let Some(ref p) = self.path.clone() {
-                        commit_op(p, &mut self.offset, &mut self.state, &op)?;
-                        self.ops_applied = self.ops_applied.saturating_add(1);
-                    } else {
-                        op.apply(&mut self.state);
-                    }
-                    self.anchor = None;
-                    self.status = format!("Moved cols {mc0}..{} → before col {to}", mc0 + count);
-                } else {
-                    self.status = "Select full main columns first (v), then c to move".into();
-                }
-            }
             KeyCode::Left | KeyCode::Char('h') => {
                 self.cursor.col = self.cursor.col.saturating_sub(1);
                 self.cursor.clamp(&self.state.grid);
@@ -1272,9 +1421,6 @@ impl App {
                     .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
             }
             KeyCode::Right | KeyCode::Char('l') => {
-                // Grow main only when stepping off the last main column *and* there are
-                // fewer than NAV_BLANK trailing blank main columns.  Once there are enough
-                // blank columns the cursor naturally enters the right margin (>0 …).
                 let lm = MARGIN_COLS;
                 let mc = self.state.grid.main_cols();
                 if self.cursor.col == lm + mc.saturating_sub(1)
@@ -1296,9 +1442,6 @@ impl App {
                     .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                // Grow main only when stepping off the last main row *and* there are
-                // fewer than NAV_BLANK trailing blank main rows.  Once there are enough
-                // blank rows the cursor naturally falls into the footer section (_Z …).
                 let hr = HEADER_ROWS;
                 let last_main = hr + self.state.grid.main_rows().saturating_sub(1);
                 if self.cursor.row == last_main
@@ -1322,7 +1465,6 @@ impl App {
 
 // ── Display helpers ───────────────────────────────────────────────────────────
 
-/// Compact address label for the formula bar (e.g. `A1`, `^Z:A`, `_A:<0`).
 fn addr_label(addr: &CellAddr, main_cols: usize) -> String {
     match addr {
         CellAddr::Header { row, col } => format!(
@@ -1343,7 +1485,6 @@ fn addr_label(addr: &CellAddr, main_cols: usize) -> String {
     }
 }
 
-/// Left gutter label: `^Z`–`^A` (header), `1`–`n` (main), `_Z`–`_A` (footer).
 fn sheet_row_label(logical_row: usize, main_rows: usize) -> String {
     let hr = HEADER_ROWS;
     if logical_row < hr {
@@ -1356,8 +1497,6 @@ fn sheet_row_label(logical_row: usize, main_rows: usize) -> String {
     }
 }
 
-/// Top header label: `<9`–`<0` (left margin, outermost→innermost), Excel letters (main),
-/// `>0`–`>9` (right margin, innermost→outermost).
 fn col_header_label(global_col: usize, main_cols: usize) -> String {
     let m = MARGIN_COLS;
     if global_col < m {
@@ -1369,8 +1508,7 @@ fn col_header_label(global_col: usize, main_cols: usize) -> String {
     }
 }
 
-/// Excel-style column name: 0 → `A`, 25 → `Z`, 26 → `AA`, …
-fn excel_column_name(main_col_index: usize) -> String {
+pub fn excel_column_name(main_col_index: usize) -> String {
     let mut n = main_col_index + 1;
     let mut s = String::new();
     while n > 0 {

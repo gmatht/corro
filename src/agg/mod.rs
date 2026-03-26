@@ -44,7 +44,7 @@ fn median(mut xs: Vec<f64>) -> f64 {
 /// Compute display string for an aggregate over `source` main cells.
 pub fn compute_aggregate(grid: &Grid, def: &AggregateDef) -> String {
     let xs = collect_numbers(grid, &def.source);
-    let out = match def.func {
+    match def.func {
         AggFunc::Sum => {
             if xs.is_empty() {
                 String::new()
@@ -86,19 +86,11 @@ pub fn compute_aggregate(grid: &Grid, def: &AggregateDef) -> String {
                 format!("{}", xs.len())
             }
         }
-    };
-    out
+    }
 }
 
-/// Value shown for `addr`: aggregate result if defined, else raw cell.
-pub fn cell_display(
-    grid: &Grid,
-    aggregates: &std::collections::HashMap<CellAddr, AggregateDef>,
-    addr: &CellAddr,
-) -> String {
-    if let Some(def) = aggregates.get(addr) {
-        return compute_aggregate(grid, def);
-    }
+/// Raw cell value for display.
+pub fn cell_display(grid: &Grid, addr: &CellAddr) -> String {
     grid.get(addr).unwrap_or("").to_string()
 }
 
