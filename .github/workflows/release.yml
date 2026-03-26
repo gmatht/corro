@@ -1,0 +1,80 @@
+name: Release Binaries
+
+on:
+  push:
+    tags:
+      - "*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build and release (for example: 0.0.1)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            archive: tar.gz
+            artifact_name: corro-linux
+          - os: macos-latest
+            archive: tar.gz
+            artifact_name: corro-macos
+          - os: windows-latest
+            archive: zip
+            artifact_name: corro-windows
+
+    steps:
+      - name: Determine ref
+        id: ref
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "ref=refs/tags/${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=${{ github.ref }}" >> "$GITHUB_OUTPUT"
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.ref.outputs.ref }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Package binary (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/release/corro "dist/corro"
+          tar -czf "${{ matrix.artifact_name }}.tar.gz" -C dist corro
+
+      - name: Package binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "target\release\corro.exe" "dist\corro.exe"
+          Compress-Archive -Path "dist\corro.exe" -DestinationPath "${{ matrix.artifact_name }}.zip" -Force
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ref.outputs.tag }}
+          files: |
+            ${{ matrix.artifact_name }}.${{ matrix.archive }}
