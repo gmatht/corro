@@ -185,32 +185,25 @@ fn main_col_window(state: &SheetState, cursor: SheetCursor) -> (usize, usize) {
     (lo, hi)
 }
 
-fn footer_pin_rows(state: &SheetState) -> Vec<usize> {
+fn footer_nonblank_end(state: &SheetState) -> Option<usize> {
     let g = &state.grid;
     let hr = HEADER_ROWS;
     let mr = g.main_rows();
     let fr = FOOTER_ROWS;
-    if fr == 0 {
-        return Vec::new();
-    }
     let mut max_nonblank = None;
     for i in 0..fr {
         if g.logical_row_has_content(hr + mr + i) {
             max_nonblank = Some(i);
         }
     }
-    let end = max_nonblank.map(|i| (i + 1).min(fr - 1)).unwrap_or(0);
-    (0..=end).map(|i| hr + mr + i).collect()
+    max_nonblank
 }
 
-fn right_pin_cols(state: &SheetState) -> Vec<usize> {
+fn right_nonblank_end(state: &SheetState) -> Option<usize> {
     let g = &state.grid;
     let lm = MARGIN_COLS;
     let mc = g.main_cols();
     let rm = MARGIN_COLS;
-    if rm == 0 {
-        return Vec::new();
-    }
     let start = lm + mc;
     let mut max_nonblank = None;
     for i in 0..rm {
@@ -218,8 +211,7 @@ fn right_pin_cols(state: &SheetState) -> Vec<usize> {
             max_nonblank = Some(i);
         }
     }
-    let end = max_nonblank.map(|i| (i + 1).min(rm - 1)).unwrap_or(0);
-    (0..=end).map(|i| start + i).collect()
+    max_nonblank
 }
 
 /// Row viewport with pinned totals and minimal-scroll movement.
@@ -236,15 +228,28 @@ fn visible_row_indices(
     let total = hr + mr + fr;
     let dim = dim.max(1).min(total.max(1));
     let cur = cursor.row.min(total.saturating_sub(1));
+    let cursor_in_footer = cursor.row >= hr + mr;
 
     // If everything fits, show all logical rows so section moves don't remap.
     if total <= dim {
         return ((0..total).collect(), 0);
     }
 
-    // Stable compact band: ^A + focused main rows (+1 blank edge) + pinned footer band.
+    // Stable compact band: ^A + focused main rows (+1 blank edge) + non-blank footer band.
     let (main_lo, main_hi) = main_row_window(state, cursor);
-    let footer_band = footer_pin_rows(state);
+    let footer_start = hr + mr;
+    let mut footer_band: Vec<usize> = match footer_nonblank_end(state) {
+        Some(end) => (0..=end).map(|i| footer_start + i).collect(),
+        None => Vec::new(),
+    };
+    let blank_footer = footer_nonblank_end(state)
+        .map(|end| end + 1)
+        .filter(|&i| i < fr)
+        .map(|i| footer_start + i)
+        .unwrap_or(footer_start);
+    if cursor_in_footer {
+        footer_band.push(blank_footer);
+    }
     let main_span = main_hi.saturating_sub(main_lo) + 1;
     let mut stable_band = Vec::with_capacity(main_span + 1 + footer_band.len());
     if hr > 0 {
@@ -262,6 +267,21 @@ fn visible_row_indices(
     let mut reserved: Vec<usize> = footer_band;
     if hr > 0 && dim > reserved.len() {
         reserved.push(hr - 1); // ^A orientation row
+    }
+    if !cursor_in_footer && fr > 0 && !reserved.iter().any(|&r| r == blank_footer) {
+        let mut cand = reserved.clone();
+        cand.push(blank_footer);
+        cand.sort_unstable();
+        cand.dedup();
+        if cand.len() < dim {
+            let available = dim.saturating_sub(cand.len()).max(1);
+            let filtered_len = (0..total)
+                .filter(|r| !cand.iter().any(|p| p == r))
+                .count();
+            if filtered_len <= available {
+                reserved = cand;
+            }
+        }
     }
     reserved.sort_unstable();
     reserved.dedup();
@@ -307,15 +327,28 @@ fn visible_col_indices(
     let total = lm + mc + rm;
     let dim = dim.max(1).min(total.max(1));
     let cur = cursor.col.min(total.saturating_sub(1));
+    let cursor_in_right = cursor.col >= lm + mc;
 
     // If everything fits, show all columns so section moves don't remap.
     if total <= dim {
         return ((0..total).collect(), 0);
     }
 
-    // Stable compact band: <0 + focused main cols (+1 blank edge) + pinned right band.
+    // Stable compact band: <0 + focused main cols (+1 blank edge) + non-blank right band.
     let (main_lo, main_hi) = main_col_window(state, cursor);
-    let right_band = right_pin_cols(state);
+    let right_start = lm + mc;
+    let mut right_band: Vec<usize> = match right_nonblank_end(state) {
+        Some(end) => (0..=end).map(|i| right_start + i).collect(),
+        None => Vec::new(),
+    };
+    let blank_right = right_nonblank_end(state)
+        .map(|end| end + 1)
+        .filter(|&i| i < rm)
+        .map(|i| right_start + i)
+        .unwrap_or(right_start);
+    if cursor_in_right {
+        right_band.push(blank_right);
+    }
     let main_span = main_hi.saturating_sub(main_lo) + 1;
     let mut stable_band = Vec::with_capacity(main_span + 1 + right_band.len());
     if lm > 0 {
@@ -333,6 +366,21 @@ fn visible_col_indices(
     let mut reserved: Vec<usize> = right_band;
     if lm > 0 && dim > reserved.len() {
         reserved.push(lm - 1); // <0 orientation col
+    }
+    if !cursor_in_right && rm > 0 && !reserved.iter().any(|&c| c == blank_right) {
+        let mut cand = reserved.clone();
+        cand.push(blank_right);
+        cand.sort_unstable();
+        cand.dedup();
+        if cand.len() < dim {
+            let available = dim.saturating_sub(cand.len()).max(1);
+            let filtered_len = (0..total)
+                .filter(|c| !cand.iter().any(|p| p == c))
+                .count();
+            if filtered_len <= available {
+                reserved = cand;
+            }
+        }
     }
     reserved.sort_unstable();
     reserved.dedup();
