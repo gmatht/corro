@@ -185,8 +185,50 @@ fn main_col_window(state: &SheetState, cursor: SheetCursor) -> (usize, usize) {
     (lo, hi)
 }
 
-/// Row viewport with pinned totals and a stable fit-on-screen band.
-fn visible_row_indices(state: &SheetState, cursor: SheetCursor, dim: usize) -> Vec<usize> {
+fn footer_pin_rows(state: &SheetState) -> Vec<usize> {
+    let g = &state.grid;
+    let hr = HEADER_ROWS;
+    let mr = g.main_rows();
+    let fr = FOOTER_ROWS;
+    if fr == 0 {
+        return Vec::new();
+    }
+    let mut max_nonblank = None;
+    for i in 0..fr {
+        if g.logical_row_has_content(hr + mr + i) {
+            max_nonblank = Some(i);
+        }
+    }
+    let end = max_nonblank.map(|i| (i + 1).min(fr - 1)).unwrap_or(0);
+    (0..=end).map(|i| hr + mr + i).collect()
+}
+
+fn right_pin_cols(state: &SheetState) -> Vec<usize> {
+    let g = &state.grid;
+    let lm = MARGIN_COLS;
+    let mc = g.main_cols();
+    let rm = MARGIN_COLS;
+    if rm == 0 {
+        return Vec::new();
+    }
+    let start = lm + mc;
+    let mut max_nonblank = None;
+    for i in 0..rm {
+        if g.logical_col_has_content(start + i) {
+            max_nonblank = Some(i);
+        }
+    }
+    let end = max_nonblank.map(|i| (i + 1).min(rm - 1)).unwrap_or(0);
+    (0..=end).map(|i| start + i).collect()
+}
+
+/// Row viewport with pinned totals and minimal-scroll movement.
+fn visible_row_indices(
+    state: &SheetState,
+    cursor: SheetCursor,
+    dim: usize,
+    prev_start: usize,
+) -> (Vec<usize>, usize) {
     let g = &state.grid;
     let hr = HEADER_ROWS;
     let mr = g.main_rows();
@@ -197,30 +239,28 @@ fn visible_row_indices(state: &SheetState, cursor: SheetCursor, dim: usize) -> V
 
     // If everything fits, show all logical rows so section moves don't remap.
     if total <= dim {
-        return (0..total).collect();
+        return ((0..total).collect(), 0);
     }
 
-    // Stable compact band: ^A + focused main rows (+1 blank edge) + _A.
+    // Stable compact band: ^A + focused main rows (+1 blank edge) + pinned footer band.
     let (main_lo, main_hi) = main_row_window(state, cursor);
+    let footer_band = footer_pin_rows(state);
     let main_span = main_hi.saturating_sub(main_lo) + 1;
-    let mut stable_band = Vec::with_capacity(main_span + 2);
+    let mut stable_band = Vec::with_capacity(main_span + 1 + footer_band.len());
     if hr > 0 {
         stable_band.push(hr - 1);
     }
     stable_band.extend((main_lo..=main_hi).map(|ri| hr + ri));
-    if fr > 0 {
-        stable_band.push(hr + mr);
-    }
+    stable_band.extend(footer_band.iter().copied());
+    stable_band.sort_unstable();
+    stable_band.dedup();
     if stable_band.len() <= dim && stable_band.contains(&cur) {
-        return stable_band;
+        return (stable_band, 0);
     }
 
-    // Freeze panes: keep _A pinned; keep ^A pinned when room allows.
-    let mut reserved: Vec<usize> = Vec::new();
-    if fr > 0 {
-        reserved.push(hr + mr); // _A totals row (adjacent footer row)
-    }
-    if hr > 0 && dim > reserved.len() + 1 {
+    // Freeze panes: keep footer band pinned; keep ^A pinned when room allows.
+    let mut reserved: Vec<usize> = footer_band;
+    if hr > 0 && dim > reserved.len() {
         reserved.push(hr - 1); // ^A orientation row
     }
     reserved.sort_unstable();
@@ -231,28 +271,35 @@ fn visible_row_indices(state: &SheetState, cursor: SheetCursor, dim: usize) -> V
         .filter(|r| !reserved.iter().any(|p| p == r))
         .collect();
     if filtered.is_empty() {
-        return reserved;
+        return (reserved, 0);
     }
 
     let cur_pos = match filtered.binary_search(&cur) {
         Ok(i) => i,
         Err(i) => i.min(filtered.len().saturating_sub(1)),
     };
-    let mut start = cur_pos.saturating_sub(available / 2);
-    if start + available > filtered.len() {
-        start = filtered.len().saturating_sub(available);
+    let max_start = filtered.len().saturating_sub(available);
+    let mut start = prev_start.min(max_start);
+    if cur_pos < start {
+        start = cur_pos;
+    } else if cur_pos >= start + available {
+        start = cur_pos + 1 - available;
     }
     let end = (start + available).min(filtered.len());
 
     let mut out = filtered[start..end].to_vec();
     out.extend(reserved);
     out.sort_unstable();
-    out.truncate(dim);
-    out
+    (out, start)
 }
 
-/// Column viewport with pinned totals and a stable fit-on-screen band.
-fn visible_col_indices(state: &SheetState, cursor: SheetCursor, dim: usize) -> Vec<usize> {
+/// Column viewport with pinned totals and minimal-scroll movement.
+fn visible_col_indices(
+    state: &SheetState,
+    cursor: SheetCursor,
+    dim: usize,
+    prev_start: usize,
+) -> (Vec<usize>, usize) {
     let g = &state.grid;
     let lm = MARGIN_COLS; // left margin width (= 10)
     let mc = g.main_cols();
@@ -263,30 +310,28 @@ fn visible_col_indices(state: &SheetState, cursor: SheetCursor, dim: usize) -> V
 
     // If everything fits, show all columns so section moves don't remap.
     if total <= dim {
-        return (0..total).collect();
+        return ((0..total).collect(), 0);
     }
 
-    // Stable compact band: <0 + focused main cols (+1 blank edge) + >0.
+    // Stable compact band: <0 + focused main cols (+1 blank edge) + pinned right band.
     let (main_lo, main_hi) = main_col_window(state, cursor);
+    let right_band = right_pin_cols(state);
     let main_span = main_hi.saturating_sub(main_lo) + 1;
-    let mut stable_band = Vec::with_capacity(main_span + 2);
+    let mut stable_band = Vec::with_capacity(main_span + 1 + right_band.len());
     if lm > 0 {
         stable_band.push(lm - 1);
     }
     stable_band.extend((main_lo..=main_hi).map(|ci| lm + ci));
-    if rm > 0 {
-        stable_band.push(lm + mc);
-    }
+    stable_band.extend(right_band.iter().copied());
+    stable_band.sort_unstable();
+    stable_band.dedup();
     if stable_band.len() <= dim && stable_band.contains(&cur) {
-        return stable_band;
+        return (stable_band, 0);
     }
 
-    // Freeze panes: keep >0 pinned; keep <0 pinned when room allows.
-    let mut reserved: Vec<usize> = Vec::new();
-    if rm > 0 {
-        reserved.push(lm + mc); // >0 totals col (adjacent right-margin col)
-    }
-    if lm > 0 && dim > reserved.len() + 1 {
+    // Freeze panes: keep right-band pinned; keep <0 pinned when room allows.
+    let mut reserved: Vec<usize> = right_band;
+    if lm > 0 && dim > reserved.len() {
         reserved.push(lm - 1); // <0 orientation col
     }
     reserved.sort_unstable();
@@ -297,24 +342,26 @@ fn visible_col_indices(state: &SheetState, cursor: SheetCursor, dim: usize) -> V
         .filter(|c| !reserved.iter().any(|p| p == c))
         .collect();
     if filtered.is_empty() {
-        return reserved;
+        return (reserved, 0);
     }
 
     let cur_pos = match filtered.binary_search(&cur) {
         Ok(i) => i,
         Err(i) => i.min(filtered.len().saturating_sub(1)),
     };
-    let mut start = cur_pos.saturating_sub(available / 2);
-    if start + available > filtered.len() {
-        start = filtered.len().saturating_sub(available);
+    let max_start = filtered.len().saturating_sub(available);
+    let mut start = prev_start.min(max_start);
+    if cur_pos < start {
+        start = cur_pos;
+    } else if cur_pos >= start + available {
+        start = cur_pos + 1 - available;
     }
     let end = (start + available).min(filtered.len());
 
     let mut out = filtered[start..end].to_vec();
     out.extend(reserved);
     out.sort_unstable();
-    out.truncate(dim);
-    out
+    (out, start)
 }
 
 // ── Navigation helpers ────────────────────────────────────────────────────────
@@ -471,6 +518,8 @@ pub struct App {
     pub watcher: Option<LogWatcher>,
     pub status: String,
     pub ops_applied: usize,
+    pub row_scroll: usize,
+    pub col_scroll: usize,
 }
 
 impl App {
@@ -488,6 +537,8 @@ impl App {
             watcher: None,
             status: String::new(),
             ops_applied: 0,
+            row_scroll: 0,
+            col_scroll: 0,
         }
     }
 
@@ -667,8 +718,12 @@ impl App {
             ));
 
         // ── Viewport ──────────────────────────────────────────────────────────
-        let row_ixs = visible_row_indices(&self.state, self.cursor, data_rows);
-        let col_ixs = visible_col_indices(&self.state, self.cursor, data_cols);
+        let (row_ixs, next_row_scroll) =
+            visible_row_indices(&self.state, self.cursor, data_rows, self.row_scroll);
+        let (col_ixs, next_col_scroll) =
+            visible_col_indices(&self.state, self.cursor, data_cols, self.col_scroll);
+        self.row_scroll = next_row_scroll;
+        self.col_scroll = next_col_scroll;
 
         // ── Formula bar ───────────────────────────────────────────────────────
         let addr = self.cursor.to_addr(grid);
@@ -1030,6 +1085,8 @@ impl App {
                             row: HEADER_ROWS,
                             col: MARGIN_COLS,
                         };
+                        self.row_scroll = 0;
+                        self.col_scroll = 0;
                         self.mode = Mode::Normal;
                         self.status = format!("Opened {}", path.display());
                     }
