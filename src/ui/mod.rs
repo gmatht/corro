@@ -22,11 +22,11 @@ use thiserror::Error;
 const ROW_LABEL_CHARS: usize = 5;
 /// Fixed cell display width in terminal columns.
 const CELL_W: usize = 12;
-/// Max blank rows/cols shown between a section boundary (header↔main, main↔footer) and data.
-const MAX_EDGE_BLANK: usize = 1;
+/// Keep at most this many blank lines/cols around the active main data window.
+const DISPLAY_EDGE_BLANK: usize = 1;
 /// Trailing blank main rows/cols past the last data cell allowed before Down/Right transitions
 /// into the footer / right-margin instead of growing the main extent further.
-const NAV_BLANK: usize = 3;
+const NAV_BLANK: usize = 1;
 
 #[derive(Debug, Error)]
 pub enum RunError {
@@ -105,21 +105,17 @@ pub enum Mode {
 
 // ── Viewport helpers ──────────────────────────────────────────────────────────
 
-/// Logical rows shown for the main region only.  Returns main-relative indices 0..mr.
-/// `slots` is the number of data lines available for main rows.
-fn visible_main_rows(state: &SheetState, cursor: SheetCursor, slots: usize) -> Vec<usize> {
+fn main_row_window(state: &SheetState, cursor: SheetCursor) -> (usize, usize) {
     let g = &state.grid;
     let hr = HEADER_ROWS;
     let mr = g.main_rows();
     if mr == 0 {
-        return vec![];
+        return (0, 0);
     }
-    let slots = slots.max(1).min(mr);
-    let cur = cursor.row - hr; // main-relative
 
-    // Find interesting (used) extent inside main.
-    let mut lo = cur;
-    let mut hi = cur;
+    let mut lo = usize::MAX;
+    let mut hi = 0usize;
+
     for r in 0..mr {
         if g.logical_row_has_content(hr + r) {
             lo = lo.min(r);
@@ -134,43 +130,32 @@ fn visible_main_rows(state: &SheetState, cursor: SheetCursor, slots: usize) -> V
             hi = hi.max(ri);
         }
     }
-
-    let mut start = cur.saturating_sub(slots / 2).min(mr.saturating_sub(slots));
-
-    let min_start = lo.saturating_sub(MAX_EDGE_BLANK);
-    if start < min_start {
-        start = min_start;
+    if cursor.row >= hr && cursor.row < hr + mr {
+        let ri = cursor.row - hr;
+        lo = lo.min(ri);
+        hi = hi.max(ri);
     }
-    let max_start = hi
-        .saturating_add(MAX_EDGE_BLANK)
-        .saturating_sub(slots.saturating_sub(1));
-    if start > max_start && max_start >= min_start {
-        start = max_start;
+    if lo == usize::MAX {
+        lo = 0;
+        hi = 0;
     }
-    start = start.min(mr.saturating_sub(slots));
-    if cur < start {
-        start = cur;
-    } else if cur >= start + slots {
-        start = cur + 1 - slots;
-    }
-    start = start.min(mr.saturating_sub(slots));
 
-    (0..slots).map(|i| start + i).collect()
+    lo = lo.saturating_sub(DISPLAY_EDGE_BLANK);
+    hi = hi.saturating_add(DISPLAY_EDGE_BLANK).min(mr.saturating_sub(1));
+    (lo, hi)
 }
 
-/// Logical columns shown for the main region only.  Returns main-relative indices 0..mc.
-fn visible_main_cols(state: &SheetState, cursor: SheetCursor, slots: usize) -> Vec<usize> {
+fn main_col_window(state: &SheetState, cursor: SheetCursor) -> (usize, usize) {
     let g = &state.grid;
     let lm = MARGIN_COLS;
     let mc = g.main_cols();
     if mc == 0 {
-        return vec![];
+        return (0, 0);
     }
-    let slots = slots.max(1).min(mc);
-    let cur = cursor.col - lm; // main-relative
 
-    let mut lo = cur;
-    let mut hi = cur;
+    let mut lo = usize::MAX;
+    let mut hi = 0usize;
+
     for c in 0..mc {
         if g.logical_col_has_content(lm + c) {
             lo = lo.min(c);
@@ -185,35 +170,22 @@ fn visible_main_cols(state: &SheetState, cursor: SheetCursor, slots: usize) -> V
             hi = hi.max(ci);
         }
     }
-
-    let mut start = cur.saturating_sub(slots / 2).min(mc.saturating_sub(slots));
-
-    let min_start = lo.saturating_sub(MAX_EDGE_BLANK);
-    if start < min_start {
-        start = min_start;
+    if cursor.col >= lm && cursor.col < lm + mc {
+        let ci = cursor.col - lm;
+        lo = lo.min(ci);
+        hi = hi.max(ci);
     }
-    let max_start = hi
-        .saturating_add(MAX_EDGE_BLANK)
-        .saturating_sub(slots.saturating_sub(1));
-    if start > max_start && max_start >= min_start {
-        start = max_start;
+    if lo == usize::MAX {
+        lo = 0;
+        hi = 0;
     }
-    start = start.min(mc.saturating_sub(slots));
-    if cur < start {
-        start = cur;
-    } else if cur >= start + slots {
-        start = cur + 1 - slots;
-    }
-    start = start.min(mc.saturating_sub(slots));
 
-    (0..slots).map(|i| start + i).collect()
+    lo = lo.saturating_sub(DISPLAY_EDGE_BLANK);
+    hi = hi.saturating_add(DISPLAY_EDGE_BLANK).min(mc.saturating_sub(1));
+    (lo, hi)
 }
 
-/// Section-aware row viewport.
-///
-/// * Cursor **in main** → [^A peek] | main rows filling `dim-2` slots | [_Z peek]
-/// * Cursor **in header** → header rows centered on cursor | first-main-row peek
-/// * Cursor **in footer** → last-main-row peek | footer rows centered on cursor
+/// Row viewport with pinned totals and a stable fit-on-screen band.
 fn visible_row_indices(state: &SheetState, cursor: SheetCursor, dim: usize) -> Vec<usize> {
     let g = &state.grid;
     let hr = HEADER_ROWS;
@@ -221,65 +193,65 @@ fn visible_row_indices(state: &SheetState, cursor: SheetCursor, dim: usize) -> V
     let fr = FOOTER_ROWS;
     let total = hr + mr + fr;
     let dim = dim.max(1).min(total.max(1));
-    let cur = cursor.row;
+    let cur = cursor.row.min(total.saturating_sub(1));
 
-    // ── Cursor in header ──────────────────────────────────────────────────────
-    if cur < hr {
-        let peek = (mr > 0 && dim > 1) as usize;
-        let hslots = dim.saturating_sub(peek).max(1);
-        let start = cur
-            .saturating_sub(hslots / 2)
-            .min(hr.saturating_sub(hslots));
-        let end = (start + hslots).min(hr);
-        let mut out: Vec<usize> = (start..end).collect();
-        if peek > 0 {
-            out.push(hr); // first main row
-        }
-        return out;
+    // If everything fits, show all logical rows so section moves don't remap.
+    if total <= dim {
+        return (0..total).collect();
     }
 
-    // ── Cursor in footer ──────────────────────────────────────────────────────
-    if cur >= hr + mr {
-        let peek = (mr > 0 && dim > 1) as usize;
-        let fslots = dim.saturating_sub(peek).max(1);
-        let fc = cur - (hr + mr);
-        let fstart = fc
-            .saturating_sub(fslots / 2)
-            .min(fr.saturating_sub(fslots));
-        let fend = (fstart + fslots).min(fr);
-        let mut out = Vec::new();
-        if peek > 0 {
-            out.push(hr + mr - 1); // last main row
-        }
-        out.extend((fstart..fend).map(|i| hr + mr + i));
-        return out;
+    // Stable compact band: ^A + focused main rows (+1 blank edge) + _A.
+    let (main_lo, main_hi) = main_row_window(state, cursor);
+    let main_span = main_hi.saturating_sub(main_lo) + 1;
+    let mut stable_band = Vec::with_capacity(main_span + 2);
+    if hr > 0 {
+        stable_band.push(hr - 1);
+    }
+    stable_band.extend((main_lo..=main_hi).map(|ri| hr + ri));
+    if fr > 0 {
+        stable_band.push(hr + mr);
+    }
+    if stable_band.len() <= dim && stable_band.contains(&cur) {
+        return stable_band;
     }
 
-    // ── Cursor in main ────────────────────────────────────────────────────────
-    // Reserve exactly 1 slot for header peek (^A) and 1 for footer peek (_Z)
-    // so almost all screen real-estate goes to main data rows.
-    let hpeek = (hr > 0 && dim > 2) as usize;
-    let fpeek = (fr > 0 && dim > 2) as usize;
-    let mslots = dim.saturating_sub(hpeek + fpeek).max(1);
-
-    let main_rel = visible_main_rows(state, cursor, mslots);
-
-    let mut out = Vec::with_capacity(dim);
-    if hpeek > 0 {
-        out.push(hr - 1); // ^A — last header row, adjacent to main
+    // Freeze panes: keep _A pinned; keep ^A pinned when room allows.
+    let mut reserved: Vec<usize> = Vec::new();
+    if fr > 0 {
+        reserved.push(hr + mr); // _A totals row (adjacent footer row)
     }
-    out.extend(main_rel.iter().map(|&ri| hr + ri));
-    if fpeek > 0 {
-        out.push(hr + mr); // _Z — first footer row, adjacent to main
+    if hr > 0 && dim > reserved.len() + 1 {
+        reserved.push(hr - 1); // ^A orientation row
     }
+    reserved.sort_unstable();
+    reserved.dedup();
+
+    let available = dim.saturating_sub(reserved.len()).max(1);
+    let filtered: Vec<usize> = (0..total)
+        .filter(|r| !reserved.iter().any(|p| p == r))
+        .collect();
+    if filtered.is_empty() {
+        return reserved;
+    }
+
+    let cur_pos = match filtered.binary_search(&cur) {
+        Ok(i) => i,
+        Err(i) => i.min(filtered.len().saturating_sub(1)),
+    };
+    let mut start = cur_pos.saturating_sub(available / 2);
+    if start + available > filtered.len() {
+        start = filtered.len().saturating_sub(available);
+    }
+    let end = (start + available).min(filtered.len());
+
+    let mut out = filtered[start..end].to_vec();
+    out.extend(reserved);
+    out.sort_unstable();
+    out.truncate(dim);
     out
 }
 
-/// Section-aware column viewport, symmetric to `visible_row_indices`.
-///
-/// * Cursor **in main** → [<9 peek] | main cols filling `dim-2` slots | [>0 peek]
-/// * Cursor **in left margin** → left-margin cols | first-main-col peek
-/// * Cursor **in right margin** → last-main-col peek | right-margin cols
+/// Column viewport with pinned totals and a stable fit-on-screen band.
 fn visible_col_indices(state: &SheetState, cursor: SheetCursor, dim: usize) -> Vec<usize> {
     let g = &state.grid;
     let lm = MARGIN_COLS; // left margin width (= 10)
@@ -287,55 +259,61 @@ fn visible_col_indices(state: &SheetState, cursor: SheetCursor, dim: usize) -> V
     let rm = MARGIN_COLS; // right margin width
     let total = lm + mc + rm;
     let dim = dim.max(1).min(total.max(1));
-    let cur = cursor.col;
+    let cur = cursor.col.min(total.saturating_sub(1));
 
-    // ── Cursor in left margin ─────────────────────────────────────────────────
-    if cur < lm {
-        let peek = (mc > 0 && dim > 1) as usize;
-        let lslots = dim.saturating_sub(peek).max(1);
-        let start = cur
-            .saturating_sub(lslots / 2)
-            .min(lm.saturating_sub(lslots));
-        let end = (start + lslots).min(lm);
-        let mut out: Vec<usize> = (start..end).collect();
-        if peek > 0 {
-            out.push(lm); // first main col
-        }
-        return out;
+    // If everything fits, show all columns so section moves don't remap.
+    if total <= dim {
+        return (0..total).collect();
     }
 
-    // ── Cursor in right margin ────────────────────────────────────────────────
-    if cur >= lm + mc {
-        let peek = (mc > 0 && dim > 1) as usize;
-        let rslots = dim.saturating_sub(peek).max(1);
-        let rc = cur - (lm + mc);
-        let rstart = rc
-            .saturating_sub(rslots / 2)
-            .min(rm.saturating_sub(rslots));
-        let rend = (rstart + rslots).min(rm);
-        let mut out = Vec::new();
-        if peek > 0 {
-            out.push(lm + mc - 1); // last main col
-        }
-        out.extend((rstart..rend).map(|i| lm + mc + i));
-        return out;
+    // Stable compact band: <0 + focused main cols (+1 blank edge) + >0.
+    let (main_lo, main_hi) = main_col_window(state, cursor);
+    let main_span = main_hi.saturating_sub(main_lo) + 1;
+    let mut stable_band = Vec::with_capacity(main_span + 2);
+    if lm > 0 {
+        stable_band.push(lm - 1);
+    }
+    stable_band.extend((main_lo..=main_hi).map(|ci| lm + ci));
+    if rm > 0 {
+        stable_band.push(lm + mc);
+    }
+    if stable_band.len() <= dim && stable_band.contains(&cur) {
+        return stable_band;
     }
 
-    // ── Cursor in main ────────────────────────────────────────────────────────
-    let lpeek = (lm > 0 && dim > 2) as usize;
-    let rpeek = (rm > 0 && dim > 2) as usize;
-    let cslots = dim.saturating_sub(lpeek + rpeek).max(1);
-
-    let main_rel = visible_main_cols(state, cursor, cslots);
-
-    let mut out = Vec::with_capacity(dim);
-    if lpeek > 0 {
-        out.push(lm - 1); // <9 — last left-margin col, adjacent to main
+    // Freeze panes: keep >0 pinned; keep <0 pinned when room allows.
+    let mut reserved: Vec<usize> = Vec::new();
+    if rm > 0 {
+        reserved.push(lm + mc); // >0 totals col (adjacent right-margin col)
     }
-    out.extend(main_rel.iter().map(|&ci| lm + ci));
-    if rpeek > 0 {
-        out.push(lm + mc); // >0 — first right-margin col, adjacent to main
+    if lm > 0 && dim > reserved.len() + 1 {
+        reserved.push(lm - 1); // <0 orientation col
     }
+    reserved.sort_unstable();
+    reserved.dedup();
+
+    let available = dim.saturating_sub(reserved.len()).max(1);
+    let filtered: Vec<usize> = (0..total)
+        .filter(|c| !reserved.iter().any(|p| p == c))
+        .collect();
+    if filtered.is_empty() {
+        return reserved;
+    }
+
+    let cur_pos = match filtered.binary_search(&cur) {
+        Ok(i) => i,
+        Err(i) => i.min(filtered.len().saturating_sub(1)),
+    };
+    let mut start = cur_pos.saturating_sub(available / 2);
+    if start + available > filtered.len() {
+        start = filtered.len().saturating_sub(available);
+    }
+    let end = (start + available).min(filtered.len());
+
+    let mut out = filtered[start..end].to_vec();
+    out.extend(reserved);
+    out.sort_unstable();
+    out.truncate(dim);
     out
 }
 
@@ -408,6 +386,77 @@ fn right_col_agg_func(grid: &Grid, global_col: usize) -> Option<AggFunc> {
         "COUNT"                      => Some(AggFunc::Count),
         _                            => None,
     }
+}
+
+fn parse_num(s: &str) -> Option<f64> {
+    let t = s.trim();
+    if t.is_empty() {
+        return None;
+    }
+    t.parse::<f64>().ok()
+}
+
+fn fold_numbers(func: AggFunc, xs: &[f64]) -> String {
+    if xs.is_empty() {
+        return String::new();
+    }
+    match func {
+        AggFunc::Sum => format!("{}", xs.iter().sum::<f64>()),
+        AggFunc::Mean => format!("{}", xs.iter().sum::<f64>() / xs.len() as f64),
+        AggFunc::Median => {
+            let mut ys = xs.to_vec();
+            ys.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let n = ys.len();
+            let m = if n % 2 == 1 {
+                ys[n / 2]
+            } else {
+                (ys[n / 2 - 1] + ys[n / 2]) / 2.0
+            };
+            format!("{m}")
+        }
+        AggFunc::Min => xs
+            .iter()
+            .copied()
+            .min_by(|a, b| a.partial_cmp(b).unwrap())
+            .map(|v| format!("{v}"))
+            .unwrap_or_default(),
+        AggFunc::Max => xs
+            .iter()
+            .copied()
+            .max_by(|a, b| a.partial_cmp(b).unwrap())
+            .map(|v| format!("{v}"))
+            .unwrap_or_default(),
+        AggFunc::Count => format!("{}", xs.len()),
+    }
+}
+
+fn footer_special_col_aggregate(
+    grid: &Grid,
+    footer_func: AggFunc,
+    global_col: usize,
+    main_rows: usize,
+    main_cols: usize,
+) -> Option<String> {
+    let right_func = right_col_agg_func(grid, global_col)?;
+    let mut samples: Vec<f64> = Vec::new();
+    for r in 0..main_rows {
+        let row_val = compute_aggregate(
+            grid,
+            &AggregateDef {
+                func: right_func,
+                source: MainRange {
+                    row_start: r as u32,
+                    row_end: r as u32 + 1,
+                    col_start: 0,
+                    col_end: main_cols as u32,
+                },
+            },
+        );
+        if let Some(n) = parse_num(&row_val) {
+            samples.push(n);
+        }
+    }
+    Some(fold_numbers(footer_func, &samples))
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
@@ -587,17 +636,8 @@ impl App {
             .unwrap_or(1)
             .max(1);
 
-        // ── Auto-grow main extent to fill the viewport ────────────────────────
-        // Subtract 2 for the header-peek and footer-peek rows/cols so the grid
-        // appears "mostly data" — even on an empty document.
-        let target_mr = data_rows.saturating_sub(2).max(1);
-        let target_mc = data_cols.saturating_sub(2).max(1);
-        while self.state.grid.main_rows() < target_mr {
-            self.state.grid.grow_main_row_at_bottom();
-        }
-        while self.state.grid.main_cols() < target_mc {
-            self.state.grid.grow_main_col_at_right();
-        }
+        // Avoid aggressive auto-growth in draw(); growth happens via navigation
+        // and edits so small sheets can stay fully visible and stable on screen.
 
         // ── Block title ───────────────────────────────────────────────────────
         let grid = &self.state.grid;
@@ -646,7 +686,7 @@ impl App {
                 Style::default().fg(Color::White).bg(Color::DarkGray),
             ),
             Mode::Help => (
-                " ^Z↔^A·header  _Z↔_A·footer  1-n·main  </>·margin  |  e·edit  v·select  a·agg  r/c·move  o·open  q·quit".into(),
+                " ^A/_A and <0/>0 stay visible  |  e·edit  v·select  a·agg  r/c·move  o·open  q·quit".into(),
                 Style::default().fg(Color::White).bg(Color::Blue),
             ),
             Mode::Menu => (
@@ -680,9 +720,18 @@ impl App {
             )];
             for &c in &col_ixs {
                 let name = col_header_label(c, grid.main_cols());
+                let active_col = c == self.cursor.col;
+                let style = if active_col {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                };
                 spans.push(Span::styled(
                     format!("{:>w$}", name, w = CELL_W),
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    style,
                 ));
             }
             lines.push(Line::from(spans));
@@ -694,9 +743,18 @@ impl App {
         let mc = grid.main_cols();
         let max_data_lines = inner_h.saturating_sub(1);
         for &r in row_ixs.iter().take(max_data_lines) {
+            let active_row = r == self.cursor.row;
+            let row_label_style = if active_row {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Yellow)
+            };
             let mut spans: Vec<Span> = vec![Span::styled(
                 format!("{:>4} ", sheet_row_label(r, grid.main_rows())),
-                Style::default().fg(Color::Yellow),
+                row_label_style,
             )];
             // If this is a footer row whose <0 cell holds an aggregate keyword,
             // pre-compute the function so every main-data cell in the row can
@@ -722,6 +780,9 @@ impl App {
                                 col_end: main_col + 1,
                             },
                         })
+                    } else if c >= lm + mc {
+                        footer_special_col_aggregate(grid, func, c, mr, mc)
+                            .unwrap_or_else(|| cell_display(grid, &self.state.aggregates, &cell_addr))
                     } else {
                         cell_display(grid, &self.state.aggregates, &cell_addr)
                     }
@@ -804,7 +865,7 @@ impl App {
                 if self.anchor.is_some() {
                     "  r·move-rows   c·move-cols   a·agg   v·deselect   Esc·cancel".into()
                 } else {
-                    "  e·edit   v·select   a·agg   o·open   hjkl/arrows·nav   q·quit   Alt·menu   ?·help".into()
+                    "  e·edit   v·select   a·agg   o·open   hjkl/arrows·nav   totals pinned   q·quit   Alt·menu   ?·help".into()
                 }
             }
             Mode::Edit { .. } => "  type to edit   Enter·confirm   Esc·discard".into(),
