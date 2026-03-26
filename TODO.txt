@@ -1,0 +1,25 @@
+We need to think this through.
+
+(1) The current code is only showing 3x3
+
+The sheet is logically infinite.
+
+However we only want to show a few blank lines, in part because the viewport is finite.  But we very much don't want to limite ourselves to 3x3. Also we want to let the user arrow past the data rows to the special Footer and header rows. 
+
+It would also be nice to full up the terminal with rows and columns
+
+(2) Editing cells is not resposive.
+
+When editing a cell it should pop up the line being edited up in the formula bar, and update that bar with every key press.
+
+(3) It should have a menu bar accessed with the ALT key.
+
+(4) It should have a status line at the bottom, suggesting context sensitve hot keys  the user might want to press.
+
+(3)+(4) should make it easy to move/delete row(s)/column(s) and set footer rows to SUM/AVERAGE/MEDIAN etc.
+
+
+
+
+
+
