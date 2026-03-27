@@ -6,18 +6,11 @@ There is now a working prototype release: [`0.0.1`](https://github.com/gmatht/co
 
 ## Prototype demo
 
-`corro.cast` is included in this repository as a quick terminal walkthrough.
+`docs/corro.cast` is included in this repository as a quick terminal walkthrough.
 
-> Note: GitHub README rendering blocks the script-powered player, but the snippet below is kept for local/docs viewers that allow it.
->
-> Fallback: run `asciinema play -s 4 corro.cast` locally.
+[![corro demo](docs/curro.cast.png)](https://asciinema.org/a/vNq1tCRphSiNR3cX?speed=4)
 
-<link rel="stylesheet" type="text/css" href="https://cdn.jsdelivr.net/npm/asciinema-player@3.8.0/dist/bundle/asciinema-player.css" />
-<script src="https://cdn.jsdelivr.net/npm/asciinema-player@3.8.0/dist/bundle/asciinema-player.min.js"></script>
-<div id="corro-demo"></div>
-<script>
-  AsciinemaPlayer.create("corro.cast", document.getElementById("corro-demo"), { speed: 4 });
-</script>
+Replay locally at 4x with `asciinema play -s 4 docs/corro.cast`.
 
 ## Current limitations
 
