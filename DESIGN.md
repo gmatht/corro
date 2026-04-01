@@ -9,12 +9,13 @@ This document summarizes the architecture and key decisions implemented so far.
 - **Spreadsheet-ish editing in a TUI**: navigate, edit cells, display a small viewport.
 - **Collaborative-ish via filesystem**: append-only JSONL file as the source of truth; instances watch and apply new lines.
 - **Structural ops**: move row/column ranges without rewriting the whole file.
-- **Aggregates**: define computed cells like SUM/MEAN/etc over a main-region range.
+- **Formulas**: cells whose value starts with `=` evaluate for display and for numeric range aggregation.
+- **Special rows/columns**: margin labels (`SUM`, `TOTAL`, …) drive computed totals over main data (see below).
 - **Sparse “infinite” sheet**: unbounded logical size without allocating huge dense grids.
 
 Non-goals (currently):
 
-- Full spreadsheet features (formulas, recalculation graph, formatting, etc.).
+- Full Excel compatibility (full function set, formatting, etc.).
 - Robust multi-writer conflict resolution beyond “last writer wins per cell”.
 - Performance tuning for very large logs.
 
@@ -22,11 +23,11 @@ Non-goals (currently):
 
 The sheet is conceptually split into **five regions**:
 
-- **Header**: 26 fixed rows labeled `^0`…`^25` (displayed as `^25`→`^0` top-to-bottom).
-- **Footer**: 26 fixed rows labeled `_0`…`_25` (displayed as `_25`→`_0` top-to-bottom).
-- **Left margin**: 10 fixed columns labeled `<A`…`<J`, indexed by main row.
-- **Right margin**: 10 fixed columns labeled `>A`…`>J`, indexed by main row.
-- **Main**: the spreadsheet body, addressed by `(row, col)` with Excel-like column letters `A..`.
+- **Header**: 26 fixed rows indexed `0…25` internally; row labels in the TUI use **`^Z` (top) through `^A` (bottom)** — letter derived as `(Z - logical_row)`.
+- **Footer**: 26 fixed rows; labels **`_A` (top) through `_Z` (bottom)** (`_` + `(A + row_index)`).
+- **Left margin**: 10 fixed columns labeled `<0`…`<9` in column headers (see `col_header_label`), indexed by main row.
+- **Right margin**: 10 fixed columns labeled `>0`…`>9`.
+- **Main**: the spreadsheet body, addressed by `(row, col)` with Excel-like column letters `A`…
 
 Addresses are represented by `CellAddr` in `src/grid/mod.rs`:
 
@@ -62,13 +63,14 @@ All edits are represented as ops serialized to JSON and appended as one line (JS
 
 Key op types (see `src/ops/mod.rs`):
 
-- `SetCell { addr, value }`: set a cell’s raw string value.
-- `SetAggregate { addr, def }`: store aggregate definition at a cell address.
+- `SetCell { addr, value }`: set a cell’s raw string value (plain text or a formula beginning with `=`).
 - `SetMainSize { main_rows, main_cols }`: set main extent.
 - `MoveRowRange { from, count, to }`: reorder main rows (and associated margin cells).
 - `MoveColRange { from, count, to }`: reorder main columns (and shift header/footer cells for main columns).
 
-Replay applies ops in order to rebuild `SheetState` (`grid` + `aggregates`).
+Replay applies ops in order to rebuild `SheetState` (currently: `grid` only).
+
+**Breaking change:** older logs that used `set_aggregate` are no longer accepted; use `SetCell` with `=SUM(…)` (or other formulas) instead.
 
 ### Concurrency model
 
@@ -76,17 +78,24 @@ Replay applies ops in order to rebuild `SheetState` (`grid` + `aggregates`).
 - Other processes watch the file (via `notify`) and apply newly appended lines by tailing from a stored byte offset.
 - Conflicts are resolved by log order: if two writers set the same cell, the later line wins on replay.
 
-## Aggregates
+## Formulas (`=…`)
 
-Aggregates are stored as `AggregateDef { func, source }` keyed by an output `CellAddr`.
+- Stored as normal cell text. After a leading `=`, the rest is parsed as an expression (`src/formula/mod.rs`).
+- **Display**: the TUI shows the **evaluated** result (or `#CIRC`, `#PARSE`, etc.); **edit** mode shows the raw string.
+- **Operators**: `+ - * /`, parentheses, unary `-`.
+- **References** (see `src/addr.rs`): main `A1`, headers `^A` / `^A,B`, footers `_B` / `_B,A`, margins `<0,1` / `>0,1` (same rules as `ADDR: value` shorthand in the UI).
+- **Ranges** (main only): `A1:B2` (rectangle between corners, inclusive).
+- **Functions**: `SUM(range|expr)`, `IF(cond, a, b)` (condition is “truthy” if it evaluates to a non-zero number). Function names are case-insensitive.
+- **Cycles**: recursive references are detected; evaluation returns `#CIRC`.
+- **Budget**: evaluation is step-limited to avoid pathological graphs.
 
-`source` is a `MainRange` describing an inclusive-exclusive rectangle over **main** cells.
+## Aggregates and special rows/columns
 
-Aggregate evaluation currently scans the range on demand and parses numeric cells (trim + `f64` parse).
+There is **no** separate `SetAggregate` op. Numeric aggregation over a main-region rectangle uses the same rules as formulas: each cell contributes its **effective numeric value** (plain number or formula result).
 
-Supported functions:
+**Special header/footer behavior** (UI only): certain margin cells label a row or column as `SUM`, `MEAN`, etc. The TUI then **computes** that aggregate over the corresponding main strip using `compute_aggregate` in `src/agg/mod.rs` (`AggregateDef` + `AggFunc` are **not** persisted; they are constructed at render time). Those totals treat formula cells like any other cell: the formula’s numeric value is used.
 
-- `SUM`, `MEAN`, `MEDIAN`, `MIN`, `MAX`, `COUNT`
+Supported aggregate names: `SUM`/`TOTAL`, `MEAN`/`AVERAGE`/`AVG`, `MEDIAN`, `MIN`/`MINIMUM`, `MAX`/`MAXIMUM`, `COUNT`.
 
 ## TUI: viewport and navigation
 
@@ -102,7 +111,7 @@ It SHOULD instead show 3 *additional* blank lines for the main data, and a < > _
 The viewport is currently centered around the cursor when possible, but is clamped so that the UI does not show unbounded emptiness:
 It SHOULD be possible to move the cursor without moving the whole sheet.
 
-- It finds the first/last “interesting” row/col (has content, has aggregates, or is the cursor).
+- It finds the first/last “interesting” row/col (has content, or is the cursor).
 - It limits the window to show at most `MAX_EDGE_BLANK = 2` blank rows/cols beyond the interesting bounds, while keeping the cursor visible.
 
 This is the mechanism that implements: “use a sparse matrix for ‘infinite’ size, but limit the number of blank rows/cols you show to the user.”
@@ -145,9 +154,11 @@ Range moves:
 Core modules:
 
 - `src/grid/mod.rs`: regions, addressing, sparse storage, row/col moves.
+- `src/addr.rs`: shared Excel / `^` / `_` / `<` / `>` reference parsing.
+- `src/formula/mod.rs`: formula parse and evaluation.
 - `src/ops/mod.rs`: op schema, serialization, replay onto `SheetState`.
 - `src/io/mod.rs`: load/tail/apply ops; append writer; file watcher integration.
-- `src/agg/mod.rs`: aggregate evaluation and display helpers.
+- `src/agg/mod.rs`: aggregate evaluation and `cell_display` (raw string).
 - `src/ui/mod.rs`: ratatui app loop, input handling, and rendering.
 
 ## Known limitations / next steps
@@ -155,5 +166,4 @@ Core modules:
 - The UI is deliberately tiny and not yet a usable spreadsheet.
 - The log format is not versioned; migrations are not handled.
 - No durability guarantees beyond append; no compaction/snapshotting.
-- Aggregate evaluation is naive (range scanning each time).
-
+- Formula language is minimal; errors are coarse (`#PARSE`, `#CIRC`, …).
