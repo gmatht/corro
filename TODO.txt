@@ -1,3 +1,28 @@
+* Use more modern key bindings
+  - Shift-Arrow: Selects
+  - Typing should automatically start entering data
+
+* Concise and simple data format:
+  - A1: =3*2
+  - MOVE A(:C) D
+* Ctrl-Z Undo. How does this interact with log format. Shouldn't undo other user?
+  - Maybe undo "foo bar" with "undo foo bar"
+
+* Export to ASCII table
+
+* Export all including headers etc., Export Selection only
+
+* Give example of formula Referencing Header/footer/margin cells
+
+* export to ODT
+
+* slightly colour row/col/margins that border on data.
+
+* Moving to _B shouldn't expand ^* etc. (This makes view jump)
+
+
+-- DONE --
+
 We need to think this through.
 
 (1) The current code is only showing 3x3
