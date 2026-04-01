@@ -1,7 +1,9 @@
 //! Ratatui front-end: sheet viewport, editing, export, move, file sync.
 
+use crate::addr::{self, parse_cell_ref_at};
 use crate::agg::{cell_display, compute_aggregate};
 use crate::export;
+use crate::formula::cell_effective_display;
 use crate::grid::{CellAddr, Grid, FOOTER_ROWS, HEADER_ROWS, MARGIN_COLS};
 use crate::grid::MainRange;
 use crate::io::{commit_op, load_full, tail_apply, IoError, LogWatcher};
@@ -528,120 +530,11 @@ fn parse_cell_shorthand(buf: &str) -> Option<(CellAddr, String)> {
     if addr_part.is_empty() {
         return None;
     }
-
-    let bytes = addr_part.as_bytes();
-
-    // Main cell: A1, B3, AA10
-    if bytes[0].is_ascii_uppercase() {
-        let mut col_end = 0;
-        while col_end < bytes.len() && bytes[col_end].is_ascii_uppercase() {
-            col_end += 1;
-        }
-        if col_end == 0 || col_end >= bytes.len() {
-            return None;
-        }
-        let col_name = &addr_part[..col_end];
-        let row_str = &addr_part[col_end..];
-        let row_num: u32 = row_str.parse().ok()?;
-        if row_num == 0 {
-            return None;
-        }
-        let col = parse_excel_column(col_name)?;
-        return Some((CellAddr::Main { row: row_num - 1, col }, value_part));
-    }
-
-    // Header: ^X or ^X,COL  (but we use ^X,COL for the full address)
-    if bytes[0] == b'^' && bytes.len() >= 2 {
-        let letter = bytes[1];
-        if !letter.is_ascii_uppercase() {
-            return None;
-        }
-        let row = b'Z' - letter;
-        if addr_part.len() == 2 {
-            return Some((CellAddr::Header { row, col: 0 }, value_part));
-        }
-        if bytes[2] != b',' {
-            return None;
-        }
-        let col_part = &addr_part[3..];
-        let col = resolve_global_col(col_part)?;
-        return Some((CellAddr::Header { row, col }, value_part));
-    }
-
-    // Footer: _X or _X,COL
-    if bytes[0] == b'_' && bytes.len() >= 2 {
-        let letter = bytes[1];
-        if !letter.is_ascii_uppercase() {
-            return None;
-        }
-        let row = letter - b'A';
-        if addr_part.len() == 2 {
-            return Some((CellAddr::Footer { row, col: 0 }, value_part));
-        }
-        if bytes[2] != b',' {
-            return None;
-        }
-        let col_part = &addr_part[3..];
-        let col = resolve_global_col(col_part)?;
-        return Some((CellAddr::Footer { row, col }, value_part));
-    }
-
-    // Left margin: <N,R
-    if bytes[0] == b'<' {
-        let rest = &addr_part[1..];
-        let comma = rest.find(',')?;
-        let margin_col: u8 = rest[..comma].parse().ok()?;
-        let main_row: u32 = rest[comma + 1..].parse().ok()?;
-        if main_row == 0 {
-            return None;
-        }
-        return Some((CellAddr::Left { col: margin_col, row: main_row - 1 }, value_part));
-    }
-
-    // Right margin: >N,R
-    if bytes[0] == b'>' {
-        let rest = &addr_part[1..];
-        let comma = rest.find(',')?;
-        let margin_col: u8 = rest[..comma].parse().ok()?;
-        let main_row: u32 = rest[comma + 1..].parse().ok()?;
-        if main_row == 0 {
-            return None;
-        }
-        return Some((CellAddr::Right { col: margin_col, row: main_row - 1 }, value_part));
-    }
-
-    None
-}
-
-fn parse_excel_column(name: &str) -> Option<u32> {
-    let mut n: u32 = 0;
-    for b in name.bytes() {
-        if !b.is_ascii_uppercase() {
-            return None;
-        }
-        n = n.checked_mul(26)?.checked_add((b - b'A') as u32 + 1)?;
-    }
-    Some(n - 1)
-}
-
-fn resolve_global_col(col_part: &str) -> Option<u32> {
-    let bytes = col_part.as_bytes();
-    if bytes.is_empty() {
+    let (addr, n) = parse_cell_ref_at(addr_part)?;
+    if n != addr_part.len() {
         return None;
     }
-    if bytes[0] == b'<' {
-        let n: u32 = col_part[1..].parse().ok()?;
-        return Some((MARGIN_COLS as u32).checked_sub(1)?.checked_sub(n)?);
-    }
-    if bytes[0] == b'>' {
-        let n: u32 = col_part[1..].parse().ok()?;
-        return Some(n);
-    }
-    if bytes[0].is_ascii_uppercase() {
-        let col = parse_excel_column(col_part)?;
-        return Some(MARGIN_COLS as u32 + col);
-    }
-    None
+    Some((addr, value_part))
 }
 
 // ── Clipboard helper ─────────────────────────────────────────────────────────
@@ -746,13 +639,27 @@ impl App {
                     }
                 }
             } else {
-                self.watcher = Some(LogWatcher::new(p.clone())?);
+                self.watcher = None;
                 self.status = format!("New file {}", p.display());
             }
         } else {
             self.status = "No file — press o to set path".into();
         }
         self.cursor.clamp(&self.state.grid);
+        Ok(())
+    }
+
+    /// `notify` cannot watch a path that does not exist yet; we start the watcher after the first
+    /// `commit_op`, which creates the log file via `append_op`.
+    fn start_log_watcher_if_needed(&mut self) -> Result<(), IoError> {
+        if self.watcher.is_some() {
+            return Ok(());
+        }
+        if let Some(ref p) = self.path {
+            if p.exists() {
+                self.watcher = Some(LogWatcher::new(p.clone())?);
+            }
+        }
         Ok(())
     }
 
@@ -960,7 +867,7 @@ impl App {
                 Style::default().fg(Color::Black).bg(Color::Cyan),
             ),
             _ => {
-                let val = cell_display(grid, &addr);
+                let val = cell_effective_display(grid, &addr);
                 let base = format!(" {addr_str}  {val}");
                 let text = if self.status.is_empty() {
                     base
@@ -1043,9 +950,9 @@ impl App {
                         })
                     } else if c >= lm + mc {
                         footer_special_col_aggregate(grid, func, c, mr, mc)
-                            .unwrap_or_else(|| cell_display(grid, &cell_addr))
+                            .unwrap_or_else(|| cell_effective_display(grid, &cell_addr))
                     } else {
-                        cell_display(grid, &cell_addr)
+                        cell_effective_display(grid, &cell_addr)
                     }
                 } else if r >= hr && r < hr + mr && c >= lm + mc {
                     if let Some(func) = right_col_agg_func(grid, c) {
@@ -1060,10 +967,10 @@ impl App {
                             },
                         })
                     } else {
-                        cell_display(grid, &cell_addr)
+                        cell_effective_display(grid, &cell_addr)
                     }
                 } else {
-                    cell_display(grid, &cell_addr)
+                    cell_effective_display(grid, &cell_addr)
                 };
                 let disp = if text.chars().count() > CELL_W {
                     format!("{}…", text.chars().take(CELL_W).collect::<String>())
@@ -1268,8 +1175,11 @@ impl App {
                                 }
                             }
                         }
-                        self.watcher =
-                            Some(LogWatcher::new(path.clone()).map_err(IoError::from)?);
+                        self.watcher = if path.exists() {
+                            Some(LogWatcher::new(path.clone()).map_err(IoError::from)?)
+                        } else {
+                            None
+                        };
                         self.cursor = SheetCursor {
                             row: HEADER_ROWS,
                             col: MARGIN_COLS,
@@ -1277,7 +1187,11 @@ impl App {
                         self.row_scroll = 0;
                         self.col_scroll = 0;
                         self.mode = Mode::Normal;
-                        self.status = format!("Opened {}", path.display());
+                        self.status = if path.exists() {
+                            format!("Opened {}", path.display())
+                        } else {
+                            format!("New file {}", path.display())
+                        };
                     }
                     KeyCode::Esc => self.mode = Mode::Normal,
                     KeyCode::Char(c) => buffer.push(c),
@@ -1301,6 +1215,7 @@ impl App {
                         if let Some(ref p) = self.path.clone() {
                             commit_op(p, &mut self.offset, &mut self.state, &op)?;
                             self.ops_applied = self.ops_applied.saturating_add(1);
+                            self.start_log_watcher_if_needed()?;
                         } else {
                             op.apply(&mut self.state);
                             self.status = "No file — edit in memory only".into();
@@ -1372,6 +1287,7 @@ impl App {
                         if let Some(ref p) = self.path.clone() {
                             commit_op(p, &mut self.offset, &mut self.state, &op)?;
                             self.ops_applied = self.ops_applied.saturating_add(1);
+                            self.start_log_watcher_if_needed()?;
                         } else {
                             op.apply(&mut self.state);
                         }
@@ -1404,6 +1320,7 @@ impl App {
                     if let Some(ref p) = self.path.clone() {
                         commit_op(p, &mut self.offset, &mut self.state, &op)?;
                         self.ops_applied = self.ops_applied.saturating_add(1);
+                        self.start_log_watcher_if_needed()?;
                     } else {
                         op.apply(&mut self.state);
                     }
@@ -1478,7 +1395,7 @@ fn addr_label(addr: &CellAddr, main_cols: usize) -> String {
             col_header_label(*col as usize, main_cols)
         ),
         CellAddr::Main { row, col } => {
-            format!("{}{}", excel_column_name(*col as usize), row + 1)
+            format!("{}{}", addr::excel_column_name(*col as usize), row + 1)
         }
         CellAddr::Left { col, row } => format!("<{}:{}", MARGIN_COLS - 1 - (*col as usize), row + 1),
         CellAddr::Right { col, row } => format!(">{}:{}", col, row + 1),
@@ -1502,19 +1419,8 @@ fn col_header_label(global_col: usize, main_cols: usize) -> String {
     if global_col < m {
         format!("<{}", m - 1 - global_col)
     } else if global_col < m + main_cols {
-        excel_column_name(global_col - m)
+        addr::excel_column_name(global_col - m)
     } else {
         format!(">{}", global_col - m - main_cols)
     }
-}
-
-pub fn excel_column_name(main_col_index: usize) -> String {
-    let mut n = main_col_index + 1;
-    let mut s = String::new();
-    while n > 0 {
-        n -= 1;
-        s.push((b'A' + (n % 26) as u8) as char);
-        n /= 26;
-    }
-    s.chars().rev().collect()
 }

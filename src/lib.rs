@@ -1,5 +1,7 @@
+pub mod addr;
 pub mod agg;
 pub mod export;
+pub mod formula;
 pub mod grid;
 pub mod io;
 pub mod ops;
