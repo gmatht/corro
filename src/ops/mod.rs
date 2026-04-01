@@ -39,24 +39,11 @@ impl SheetState {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Op {
-    SetCell {
-        addr: CellAddr,
-        value: String,
-    },
-    SetMainSize {
-        main_rows: u32,
-        main_cols: u32,
-    },
-    MoveRowRange {
-        from: u32,
-        count: u32,
-        to: u32,
-    },
-    MoveColRange {
-        from: u32,
-        count: u32,
-        to: u32,
-    },
+    SetCell { addr: CellAddr, value: String },
+    SetMainSize { main_rows: u32, main_cols: u32 },
+    MoveRowRange { from: u32, count: u32, to: u32 },
+    MoveColRange { from: u32, count: u32, to: u32 },
+    Undo { target: String },
 }
 
 impl Op {
@@ -74,19 +61,48 @@ impl Op {
                     .set_main_size(*main_rows as usize, *main_cols as usize);
             }
             Op::MoveRowRange { from, count, to } => {
-                state.grid.move_main_rows(
-                    *from as usize,
-                    *count as usize,
-                    *to as usize,
-                );
+                state
+                    .grid
+                    .move_main_rows(*from as usize, *count as usize, *to as usize);
             }
             Op::MoveColRange { from, count, to } => {
-                state.grid.move_main_cols(
-                    *from as usize,
-                    *count as usize,
-                    *to as usize,
-                );
+                state
+                    .grid
+                    .move_main_cols(*from as usize, *count as usize, *to as usize);
             }
+            Op::Undo { .. } => {}
+        }
+    }
+}
+
+impl SheetState {
+    pub fn reverse_op(&mut self, op: &Op) -> Option<Op> {
+        match op {
+            Op::SetCell { addr, .. } => {
+                let prev_value = self.grid.get(addr).unwrap_or("").to_string();
+                Some(Op::SetCell {
+                    addr: addr.clone(),
+                    value: prev_value,
+                })
+            }
+            Op::MoveRowRange { from, count, to } => {
+                let insert_at = if *to > *from { *from + *count } else { *to };
+                Some(Op::MoveRowRange {
+                    from: insert_at,
+                    count: *count,
+                    to: *from,
+                })
+            }
+            Op::MoveColRange { from, count, to } => {
+                let insert_at = if *to > *from { *from + *count } else { *to };
+                Some(Op::MoveColRange {
+                    from: insert_at,
+                    count: *count,
+                    to: *from,
+                })
+            }
+            Op::SetMainSize { .. } => None,
+            Op::Undo { .. } => None,
         }
     }
 }
@@ -119,10 +135,7 @@ pub fn apply_line(line: &str, state: &mut SheetState) -> Result<(), serde_json::
 
 /// Append one op as JSONL to `path` (creates file if missing).
 pub fn append_op(path: &Path, op: &Op) -> std::io::Result<()> {
-    let mut f = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
+    let mut f = OpenOptions::new().create(true).append(true).open(path)?;
     let line = serde_json::to_string(op)?;
     writeln!(f, "{line}")?;
     f.sync_all()?;

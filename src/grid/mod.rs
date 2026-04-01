@@ -130,28 +130,44 @@ impl Grid {
     }
 
     /// Grow extent so cursor (logical row/col) is addressable in main/margins.
-    pub fn ensure_extent_for_cursor(&mut self, row: usize, col: usize) {
+    /// Returns true if the extent was actually grown (for UI feedback).
+    pub fn ensure_extent_for_cursor(&mut self, row: usize, col: usize) -> bool {
         let hr = HEADER_ROWS;
         let m = MARGIN_COLS;
         let main_end = m + self.extent_main_cols as usize;
-        if (hr..hr + self.extent_main_rows as usize).contains(&row)
-            && (m..main_end).contains(&col)
+        let mut grown = false;
+        if (hr..hr + self.extent_main_rows as usize).contains(&row) && (m..main_end).contains(&col)
         {
             let mr = (row - hr) as u32;
             let mc = (col - m) as u32;
-            self.extent_main_rows = self.extent_main_rows.max(mr + 1);
-            self.extent_main_cols = self.extent_main_cols.max(mc + 1);
+            if mr + 1 > self.extent_main_rows {
+                self.extent_main_rows = mr + 1;
+                grown = true;
+            }
+            if mc + 1 > self.extent_main_cols {
+                self.extent_main_cols = mc + 1;
+                grown = true;
+            }
         } else if (hr..hr + self.extent_main_rows as usize).contains(&row) && (0..m).contains(&col)
         {
             let mr = (row - hr) as u32;
-            self.extent_main_rows = self.extent_main_rows.max(mr + 1);
+            if mr + 1 > self.extent_main_rows {
+                self.extent_main_rows = mr + 1;
+                grown = true;
+            }
         } else if (hr..hr + self.extent_main_rows as usize).contains(&row)
             && (main_end..main_end + MARGIN_COLS).contains(&col)
         {
             let mr = (row - hr) as u32;
-            self.extent_main_rows = self.extent_main_rows.max(mr + 1);
+            if mr + 1 > self.extent_main_rows {
+                self.extent_main_rows = mr + 1;
+                grown = true;
+            }
         }
-        self.resize_header_footer_width();
+        if grown {
+            self.resize_header_footer_width();
+        }
+        grown
     }
 
     pub fn logical_row_has_content(&self, r: usize) -> bool {
@@ -165,10 +181,7 @@ impl Grid {
         if r < hr + self.extent_main_rows as usize {
             let mr = r - hr;
             let mru = mr as u32;
-            return self
-                .main_cells
-                .keys()
-                .any(|(row, _)| *row == mru)
+            return self.main_cells.keys().any(|(row, _)| *row == mru)
                 || self.left.keys().any(|(row, _)| *row == mru)
                 || self.right.keys().any(|(row, _)| *row == mru);
         }
@@ -236,25 +249,22 @@ impl Grid {
             CellAddr::Header { row, col } => {
                 let r = *row as usize;
                 let c = *col as usize;
-                self.header.get(r).and_then(|row| row.get(c)).map(|s| s.as_str())
+                self.header
+                    .get(r)
+                    .and_then(|row| row.get(c))
+                    .map(|s| s.as_str())
             }
             CellAddr::Footer { row, col } => {
                 let r = *row as usize;
                 let c = *col as usize;
-                self.footer.get(r).and_then(|row| row.get(c)).map(|s| s.as_str())
+                self.footer
+                    .get(r)
+                    .and_then(|row| row.get(c))
+                    .map(|s| s.as_str())
             }
-            CellAddr::Main { row, col } => self
-                .main_cells
-                .get(&(*row, *col))
-                .map(|s| s.as_str()),
-            CellAddr::Left { col, row } => self
-                .left
-                .get(&(*row, *col))
-                .map(|s| s.as_str()),
-            CellAddr::Right { col, row } => self
-                .right
-                .get(&(*row, *col))
-                .map(|s| s.as_str()),
+            CellAddr::Main { row, col } => self.main_cells.get(&(*row, *col)).map(|s| s.as_str()),
+            CellAddr::Left { col, row } => self.left.get(&(*row, *col)).map(|s| s.as_str()),
+            CellAddr::Right { col, row } => self.right.get(&(*row, *col)).map(|s| s.as_str()),
         }
     }
 
@@ -436,76 +446,28 @@ mod tests {
     #[test]
     fn move_rows_sparse() {
         let mut g = Grid::new(4, 2);
-        g.set(
-            &CellAddr::Main { row: 0, col: 0 },
-            "a".into(),
-        );
-        g.set(
-            &CellAddr::Main { row: 1, col: 0 },
-            "b".into(),
-        );
-        g.set(
-            &CellAddr::Main { row: 2, col: 0 },
-            "c".into(),
-        );
-        g.set(
-            &CellAddr::Main { row: 3, col: 0 },
-            "d".into(),
-        );
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "a".into());
+        g.set(&CellAddr::Main { row: 1, col: 0 }, "b".into());
+        g.set(&CellAddr::Main { row: 2, col: 0 }, "c".into());
+        g.set(&CellAddr::Main { row: 3, col: 0 }, "d".into());
         g.move_main_rows(0, 2, 4);
-        assert_eq!(
-            g.get(&CellAddr::Main { row: 0, col: 0 }),
-            Some("c")
-        );
-        assert_eq!(
-            g.get(&CellAddr::Main { row: 1, col: 0 }),
-            Some("d")
-        );
-        assert_eq!(
-            g.get(&CellAddr::Main { row: 2, col: 0 }),
-            Some("a")
-        );
-        assert_eq!(
-            g.get(&CellAddr::Main { row: 3, col: 0 }),
-            Some("b")
-        );
+        assert_eq!(g.get(&CellAddr::Main { row: 0, col: 0 }), Some("c"));
+        assert_eq!(g.get(&CellAddr::Main { row: 1, col: 0 }), Some("d"));
+        assert_eq!(g.get(&CellAddr::Main { row: 2, col: 0 }), Some("a"));
+        assert_eq!(g.get(&CellAddr::Main { row: 3, col: 0 }), Some("b"));
     }
 
     #[test]
     fn move_cols_sparse() {
         let mut g = Grid::new(2, 4);
-        g.set(
-            &CellAddr::Main { row: 0, col: 0 },
-            "a".into(),
-        );
-        g.set(
-            &CellAddr::Main { row: 0, col: 1 },
-            "b".into(),
-        );
-        g.set(
-            &CellAddr::Main { row: 0, col: 2 },
-            "c".into(),
-        );
-        g.set(
-            &CellAddr::Main { row: 0, col: 3 },
-            "d".into(),
-        );
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "a".into());
+        g.set(&CellAddr::Main { row: 0, col: 1 }, "b".into());
+        g.set(&CellAddr::Main { row: 0, col: 2 }, "c".into());
+        g.set(&CellAddr::Main { row: 0, col: 3 }, "d".into());
         g.move_main_cols(0, 2, 4);
-        assert_eq!(
-            g.get(&CellAddr::Main { row: 0, col: 0 }),
-            Some("c")
-        );
-        assert_eq!(
-            g.get(&CellAddr::Main { row: 0, col: 1 }),
-            Some("d")
-        );
-        assert_eq!(
-            g.get(&CellAddr::Main { row: 0, col: 2 }),
-            Some("a")
-        );
-        assert_eq!(
-            g.get(&CellAddr::Main { row: 0, col: 3 }),
-            Some("b")
-        );
+        assert_eq!(g.get(&CellAddr::Main { row: 0, col: 0 }), Some("c"));
+        assert_eq!(g.get(&CellAddr::Main { row: 0, col: 1 }), Some("d"));
+        assert_eq!(g.get(&CellAddr::Main { row: 0, col: 2 }), Some("a"));
+        assert_eq!(g.get(&CellAddr::Main { row: 0, col: 3 }), Some("b"));
     }
 }

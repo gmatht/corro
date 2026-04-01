@@ -4,8 +4,8 @@ use crate::addr::{self, parse_cell_ref_at};
 use crate::agg::{cell_display, compute_aggregate};
 use crate::export;
 use crate::formula::cell_effective_display;
-use crate::grid::{CellAddr, Grid, FOOTER_ROWS, HEADER_ROWS, MARGIN_COLS};
 use crate::grid::MainRange;
+use crate::grid::{CellAddr, Grid, FOOTER_ROWS, HEADER_ROWS, MARGIN_COLS};
 use crate::io::{commit_op, load_full, tail_apply, IoError, LogWatcher};
 use crate::ops::{AggFunc, AggregateDef, Op, SheetState};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -96,13 +96,27 @@ impl SheetCursor {
 #[derive(Clone, Debug)]
 pub enum Mode {
     Normal,
-    Edit { buffer: String },
-    OpenPath { buffer: String },
+    Edit {
+        buffer: String,
+    },
+    OpenPath {
+        buffer: String,
+    },
     Help,
     /// Alt-activated menu bar; letter shortcuts execute actions.
     Menu,
-    ExportTsv { buffer: String },
-    ExportCsv { buffer: String },
+    ExportTsv {
+        buffer: String,
+    },
+    ExportCsv {
+        buffer: String,
+    },
+    ExportAscii {
+        buffer: String,
+    },
+    ExportAll {
+        buffer: String,
+    },
 }
 
 // ── Viewport helpers ──────────────────────────────────────────────────────────
@@ -135,7 +149,9 @@ fn main_row_window(state: &SheetState, cursor: SheetCursor) -> (usize, usize) {
     }
 
     lo = lo.saturating_sub(DISPLAY_EDGE_BLANK);
-    hi = hi.saturating_add(DISPLAY_EDGE_BLANK).min(mr.saturating_sub(1));
+    hi = hi
+        .saturating_add(DISPLAY_EDGE_BLANK)
+        .min(mr.saturating_sub(1));
     (lo, hi)
 }
 
@@ -167,7 +183,9 @@ fn main_col_window(state: &SheetState, cursor: SheetCursor) -> (usize, usize) {
     }
 
     lo = lo.saturating_sub(DISPLAY_EDGE_BLANK);
-    hi = hi.saturating_add(DISPLAY_EDGE_BLANK).min(mc.saturating_sub(1));
+    hi = hi
+        .saturating_add(DISPLAY_EDGE_BLANK)
+        .min(mc.saturating_sub(1));
     (lo, hi)
 }
 
@@ -258,9 +276,7 @@ fn visible_row_indices(
         cand.dedup();
         if cand.len() < dim {
             let available = dim.saturating_sub(cand.len()).max(1);
-            let filtered_len = (0..total)
-                .filter(|r| !cand.iter().any(|p| p == r))
-                .count();
+            let filtered_len = (0..total).filter(|r| !cand.iter().any(|p| p == r)).count();
             if filtered_len <= available {
                 reserved = cand;
             }
@@ -354,9 +370,7 @@ fn visible_col_indices(
         cand.dedup();
         if cand.len() < dim {
             let available = dim.saturating_sub(cand.len()).max(1);
-            let filtered_len = (0..total)
-                .filter(|c| !cand.iter().any(|p| p == c))
-                .count();
+            let filtered_len = (0..total).filter(|c| !cand.iter().any(|p| p == c)).count();
             if filtered_len <= available {
                 reserved = cand;
             }
@@ -423,13 +437,13 @@ fn footer_row_agg_func(grid: &Grid, footer_row_idx: usize) -> Option<AggFunc> {
         col: key_col,
     })?;
     match val.trim().to_uppercase().as_str() {
-        "TOTAL" | "SUM"              => Some(AggFunc::Sum),
-        "MEAN" | "AVERAGE" | "AVG"  => Some(AggFunc::Mean),
-        "MEDIAN"                     => Some(AggFunc::Median),
-        "MIN" | "MINIMUM"            => Some(AggFunc::Min),
-        "MAX" | "MAXIMUM"            => Some(AggFunc::Max),
-        "COUNT"                      => Some(AggFunc::Count),
-        _                            => None,
+        "TOTAL" | "SUM" => Some(AggFunc::Sum),
+        "MEAN" | "AVERAGE" | "AVG" => Some(AggFunc::Mean),
+        "MEDIAN" => Some(AggFunc::Median),
+        "MIN" | "MINIMUM" => Some(AggFunc::Min),
+        "MAX" | "MAXIMUM" => Some(AggFunc::Max),
+        "COUNT" => Some(AggFunc::Count),
+        _ => None,
     }
 }
 
@@ -439,13 +453,13 @@ fn right_col_agg_func(grid: &Grid, global_col: usize) -> Option<AggFunc> {
         col: global_col as u32,
     })?;
     match val.trim().to_uppercase().as_str() {
-        "TOTAL" | "SUM"              => Some(AggFunc::Sum),
-        "MEAN" | "AVERAGE" | "AVG"  => Some(AggFunc::Mean),
-        "MEDIAN"                     => Some(AggFunc::Median),
-        "MIN" | "MINIMUM"            => Some(AggFunc::Min),
-        "MAX" | "MAXIMUM"            => Some(AggFunc::Max),
-        "COUNT"                      => Some(AggFunc::Count),
-        _                            => None,
+        "TOTAL" | "SUM" => Some(AggFunc::Sum),
+        "MEAN" | "AVERAGE" | "AVG" => Some(AggFunc::Mean),
+        "MEDIAN" => Some(AggFunc::Median),
+        "MIN" | "MINIMUM" => Some(AggFunc::Min),
+        "MAX" | "MAXIMUM" => Some(AggFunc::Max),
+        "COUNT" => Some(AggFunc::Count),
+        _ => None,
     }
 }
 
@@ -455,6 +469,23 @@ fn parse_num(s: &str) -> Option<f64> {
         return None;
     }
     t.parse::<f64>().ok()
+}
+
+fn left_margin_agg_func(grid: &Grid, main_row: u32) -> Option<AggFunc> {
+    let key_col = (MARGIN_COLS - 1) as u8;
+    let val = grid.get(&CellAddr::Left {
+        col: key_col,
+        row: main_row,
+    })?;
+    match val.trim().to_uppercase().as_str() {
+        "TOTAL" | "SUM" => Some(AggFunc::Sum),
+        "MEAN" | "AVERAGE" | "AVG" => Some(AggFunc::Mean),
+        "MEDIAN" => Some(AggFunc::Median),
+        "MIN" | "MINIMUM" => Some(AggFunc::Min),
+        "MAX" | "MAXIMUM" => Some(AggFunc::Max),
+        "COUNT" => Some(AggFunc::Count),
+        _ => None,
+    }
 }
 
 fn fold_numbers(func: AggFunc, xs: &[f64]) -> String {
@@ -549,7 +580,9 @@ fn copy_to_clipboard(text: &str) -> Result<(), String> {
             .map_err(|e| format!("clip: {e}"))?;
         if let Some(mut stdin) = child.stdin.take() {
             use std::io::Write;
-            stdin.write_all(text.as_bytes()).map_err(|e| format!("clip stdin: {e}"))?;
+            stdin
+                .write_all(text.as_bytes())
+                .map_err(|e| format!("clip stdin: {e}"))?;
         }
         child.wait().map_err(|e| format!("clip wait: {e}"))?;
         Ok(())
@@ -564,13 +597,19 @@ fn copy_to_clipboard(text: &str) -> Result<(), String> {
             "pbcopy"
         };
         let mut child = Command::new(cmd)
-            .args(if cmd == "xclip" { &["-selection", "clipboard"][..] } else { &[][..] })
+            .args(if cmd == "xclip" {
+                &["-selection", "clipboard"][..]
+            } else {
+                &[][..]
+            })
             .stdin(Stdio::piped())
             .spawn()
             .map_err(|e| format!("{cmd}: {e}"))?;
         if let Some(mut stdin) = child.stdin.take() {
             use std::io::Write;
-            stdin.write_all(text.as_bytes()).map_err(|e| format!("{cmd} stdin: {e}"))?;
+            stdin
+                .write_all(text.as_bytes())
+                .map_err(|e| format!("{cmd} stdin: {e}"))?;
         }
         child.wait().map_err(|e| format!("{cmd} wait: {e}"))?;
         Ok(())
@@ -591,6 +630,7 @@ pub struct App {
     pub ops_applied: usize,
     pub row_scroll: usize,
     pub col_scroll: usize,
+    pub op_history: Vec<Op>,
 }
 
 impl App {
@@ -610,23 +650,26 @@ impl App {
             ops_applied: 0,
             row_scroll: 0,
             col_scroll: 0,
+            op_history: Vec::new(),
         }
     }
 
     pub fn load_initial(&mut self) -> Result<(), IoError> {
         if let Some(ref p) = self.path.clone() {
             if Path::new(p).exists() {
-                let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+                let ext = p
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
                 match ext.as_str() {
                     "tsv" => {
-                        let data = std::fs::read_to_string(p)
-                            .map_err(|e| IoError::Io(e))?;
+                        let data = std::fs::read_to_string(p).map_err(|e| IoError::Io(e))?;
                         crate::io::import_tsv(&data, &mut self.state);
                         self.status = format!("Imported TSV {}", p.display());
                     }
                     "csv" => {
-                        let data = std::fs::read_to_string(p)
-                            .map_err(|e| IoError::Io(e))?;
+                        let data = std::fs::read_to_string(p).map_err(|e| IoError::Io(e))?;
                         crate::io::import_csv(&data, &mut self.state);
                         self.status = format!("Imported CSV {}", p.display());
                     }
@@ -735,6 +778,27 @@ impl App {
         String::from_utf8_lossy(&buf).into_owned()
     }
 
+    fn do_export_ascii(&mut self) -> String {
+        let mut buf = Vec::new();
+        export::export_ascii_table(&self.state.grid, &mut buf);
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    fn do_export_all(&mut self) -> String {
+        let mut buf = Vec::new();
+        export::export_all(&self.state.grid, &mut buf);
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    #[allow(dead_code)]
+    fn do_export_selection(&mut self) -> String {
+        let mut buf = Vec::new();
+        let rows: Vec<usize> = (0..self.state.grid.main_rows()).collect();
+        let cols: Vec<usize> = (MARGIN_COLS..MARGIN_COLS + self.state.grid.main_cols()).collect();
+        export::export_selection(&self.state.grid, &mut buf, &rows, &cols);
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
     fn finish_export(&mut self, csv: bool, filename: &str) {
         let data = self.do_export(csv);
         let ext = if csv { "csv" } else { "tsv" };
@@ -814,19 +878,19 @@ impl App {
             if raw.chars().count() > max_w {
                 format!(
                     "{}…",
-                    raw.chars().take(max_w.saturating_sub(1)).collect::<String>()
+                    raw.chars()
+                        .take(max_w.saturating_sub(1))
+                        .collect::<String>()
                 )
             } else {
                 raw
             }
         };
 
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(Span::styled(
-                title_str,
-                Style::default().add_modifier(Modifier::BOLD),
-            ));
+        let block = Block::default().borders(Borders::ALL).title(Span::styled(
+            title_str,
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
 
         let (row_ixs, next_row_scroll) =
             visible_row_indices(&self.state, self.cursor, data_rows, self.row_scroll);
@@ -859,11 +923,19 @@ impl App {
                 Style::default().fg(Color::White).bg(Color::DarkGray),
             ),
             Mode::Help => (
-                " e·edit  v·select  t·tsv  c·csv  r/c·move  o·open  addr: val  q·quit".into(),
+                " e·edit  v·select  t·tsv  c·csv  a·ascii  e·export-all  r/c·move  o·open  Ctrl-Z·undo  addr: val  q·quit".into(),
                 Style::default().fg(Color::White).bg(Color::Blue),
             ),
+            Mode::ExportAscii { .. } => (
+                " export ASCII table (blank=clipboard): ".into(),
+                Style::default().fg(Color::White).bg(Color::DarkGray),
+            ),
+            Mode::ExportAll { .. } => (
+                " export full (incl headers/margins): ".into(),
+                Style::default().fg(Color::White).bg(Color::DarkGray),
+            ),
             Mode::Menu => (
-                "  F·open-file   R·row-ops   C·col-ops   T·export-tsv   ?·help   Esc·close".into(),
+                "  F·open-file   R·row-ops   C·col-ops   T·export-tsv   A·ASCII   E·export-all   ?·help   Esc·close".into(),
                 Style::default().fg(Color::Black).bg(Color::Cyan),
             ),
             _ => {
@@ -899,12 +971,11 @@ impl App {
                         .bg(Color::Yellow)
                         .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
                 };
-                spans.push(Span::styled(
-                    format!("{:>w$}", name, w = CELL_W),
-                    style,
-                ));
+                spans.push(Span::styled(format!("{:>w$}", name, w = CELL_W), style));
             }
             lines.push(Line::from(spans));
         }
@@ -933,39 +1004,84 @@ impl App {
             } else {
                 None
             };
+            let main_row_idx = if r >= hr && r < hr + mr {
+                Some((r - hr) as u32)
+            } else {
+                None
+            };
+
+            let left_margin_agg = main_row_idx.and_then(|mri| left_margin_agg_func(grid, mri));
+
             for &c in &col_ixs {
                 let cur = SheetCursor { row: r, col: c };
                 let cell_addr = cur.to_addr(grid);
-                let text = if let Some(func) = footer_agg {
-                    if c >= lm && c < lm + mc {
-                        let main_col = (c - lm) as u32;
-                        compute_aggregate(grid, &AggregateDef {
+
+                let left_total_row_aggregate = || -> Option<String> {
+                    let func = left_margin_agg?;
+                    if c < lm || c >= lm + mc {
+                        return None;
+                    }
+                    let main_col = (c - lm) as u32;
+                    let mut agg_row_start: u32 = 0;
+                    for candidate in (0..main_row_idx?).rev() {
+                        if left_margin_agg_func(grid, candidate).is_some() {
+                            break;
+                        }
+                        agg_row_start = candidate;
+                    }
+                    Some(compute_aggregate(
+                        grid,
+                        &AggregateDef {
                             func,
                             source: MainRange {
-                                row_start: 0,
-                                row_end: mr as u32,
+                                row_start: agg_row_start,
+                                row_end: main_row_idx? + 1,
                                 col_start: main_col,
                                 col_end: main_col + 1,
                             },
-                        })
+                        },
+                    ))
+                };
+
+                let text = if let Some(func) = footer_agg {
+                    if c >= lm && c < lm + mc {
+                        let main_col = (c - lm) as u32;
+                        compute_aggregate(
+                            grid,
+                            &AggregateDef {
+                                func,
+                                source: MainRange {
+                                    row_start: 0,
+                                    row_end: mr as u32,
+                                    col_start: main_col,
+                                    col_end: main_col + 1,
+                                },
+                            },
+                        )
                     } else if c >= lm + mc {
                         footer_special_col_aggregate(grid, func, c, mr, mc)
                             .unwrap_or_else(|| cell_effective_display(grid, &cell_addr))
                     } else {
                         cell_effective_display(grid, &cell_addr)
                     }
+                } else if left_margin_agg.is_some() {
+                    left_total_row_aggregate()
+                        .unwrap_or_else(|| cell_effective_display(grid, &cell_addr))
                 } else if r >= hr && r < hr + mr && c >= lm + mc {
                     if let Some(func) = right_col_agg_func(grid, c) {
                         let main_row = (r - hr) as u32;
-                        compute_aggregate(grid, &AggregateDef {
-                            func,
-                            source: MainRange {
-                                row_start: main_row,
-                                row_end: main_row + 1,
-                                col_start: 0,
-                                col_end: mc as u32,
+                        compute_aggregate(
+                            grid,
+                            &AggregateDef {
+                                func,
+                                source: MainRange {
+                                    row_start: main_row,
+                                    row_end: main_row + 1,
+                                    col_start: 0,
+                                    col_end: mc as u32,
+                                },
                             },
-                        })
+                        )
                     } else {
                         cell_effective_display(grid, &cell_addr)
                     }
@@ -985,10 +1101,26 @@ impl App {
                     r >= r0 && r <= r1 && c >= c0 && c <= c1
                 });
                 let is_cur = r == self.cursor.row && c == self.cursor.col;
+
+                let is_left_border = c == lm - 1 && c >= col_ixs.first().copied().unwrap_or(0);
+                let is_right_border = c == lm + mc && col_ixs.contains(&(lm + mc));
+                let is_header_border =
+                    r == hr - 1 && r >= row_ixs.first().copied().unwrap_or(0) && hr > 0;
+                let is_footer_border = r == hr + mr && row_ixs.contains(&(hr + mr));
+
+                let border_color =
+                    if is_left_border || is_right_border || is_header_border || is_footer_border {
+                        Some(Color::DarkGray)
+                    } else {
+                        None
+                    };
+
                 let st = if is_cur {
                     Style::default().bg(Color::DarkGray)
                 } else if sel {
                     Style::default().bg(Color::Blue)
+                } else if let Some(bc) = border_color {
+                    Style::default().fg(bc)
                 } else {
                     Style::default()
                 };
@@ -999,8 +1131,7 @@ impl App {
 
         let n = lines.len().min(inner_h);
         if n > 0 {
-            let mut constraints: Vec<Constraint> =
-                (0..n).map(|_| Constraint::Length(1)).collect();
+            let mut constraints: Vec<Constraint> = (0..n).map(|_| Constraint::Length(1)).collect();
             if inner.height > n as u16 {
                 constraints.push(Constraint::Min(0));
             }
@@ -1031,15 +1162,27 @@ impl App {
                 if self.anchor.is_some() {
                     "  r·move-rows   c·move-cols   v·deselect   Esc·cancel".into()
                 } else {
-                    "  e·edit   v·select   t·tsv   c·csv   o·open   hjkl/arrows·nav   q·quit   Alt·menu   ?·help".into()
+                    "  e·edit   v·select   t·tsv   c·csv   a·ascii   e·export-all   o·open   Ctrl-Z·undo   q·quit   Alt·menu   ?·help".into()
                 }
             }
-            Mode::Edit { .. } => "  type to edit (or addr: val)   Enter·confirm   Esc·discard".into(),
+            Mode::Edit { .. } => {
+                "  type to edit (or addr: val)   Enter·confirm   Esc·discard".into()
+            }
             Mode::OpenPath { .. } => "  type file path   Enter·open   Esc·cancel".into(),
-            Mode::ExportTsv { .. } | Mode::ExportCsv { .. } => {
+            Mode::ExportTsv { .. }
+            | Mode::ExportCsv { .. }
+            | Mode::ExportAscii { .. }
+            | Mode::ExportAll { .. } => {
                 "  type filename (blank=clipboard)   Enter·export   Esc·cancel".into()
             }
-            Mode::Help => "  Esc / q / ?  ·  close help".into(),
+            Mode::Help => {
+                let formula_examples = "Formulas: A1:=3*2  SUM(A1:B2)  IF(A1>0,1,0)  Header:^A  Footer:_A  Margins:<0,_1  >0,_1".to_string();
+                if self.status.is_empty() {
+                    formula_examples
+                } else {
+                    format!("{}  ·  {}", formula_examples, self.status)
+                }
+            }
             Mode::Menu => "  press a letter shortcut   Esc·close".into(),
         }
     }
@@ -1062,7 +1205,19 @@ impl App {
                         };
                     }
                     KeyCode::Char('t') | KeyCode::Char('T') => {
-                        self.mode = Mode::ExportTsv { buffer: String::new() };
+                        self.mode = Mode::ExportTsv {
+                            buffer: String::new(),
+                        };
+                    }
+                    KeyCode::Char('a') | KeyCode::Char('A') => {
+                        self.mode = Mode::ExportAscii {
+                            buffer: String::new(),
+                        };
+                    }
+                    KeyCode::Char('e') | KeyCode::Char('E') => {
+                        self.mode = Mode::ExportAll {
+                            buffer: String::new(),
+                        };
                     }
                     KeyCode::Char('?') | KeyCode::Char('h') | KeyCode::Char('H') => {
                         self.mode = Mode::Help;
@@ -1103,7 +1258,19 @@ impl App {
                             "Col ops: v·select full columns, then c·move to target column".into();
                     }
                     KeyCode::Char('t') | KeyCode::Char('T') => {
-                        self.mode = Mode::ExportTsv { buffer: String::new() };
+                        self.mode = Mode::ExportTsv {
+                            buffer: String::new(),
+                        };
+                    }
+                    KeyCode::Char('a') | KeyCode::Char('A') => {
+                        self.mode = Mode::ExportAscii {
+                            buffer: String::new(),
+                        };
+                    }
+                    KeyCode::Char('e') | KeyCode::Char('E') => {
+                        self.mode = Mode::ExportAll {
+                            buffer: String::new(),
+                        };
                     }
                     KeyCode::Char('?') => self.mode = Mode::Help,
                     _ => {}
@@ -1128,7 +1295,9 @@ impl App {
                     }
                     KeyCode::Esc => self.mode = Mode::Normal,
                     KeyCode::Char(c) => buffer.push(c),
-                    KeyCode::Backspace => { buffer.pop(); }
+                    KeyCode::Backspace => {
+                        buffer.pop();
+                    }
                     _ => {}
                 }
                 return Ok(false);
@@ -1142,7 +1311,66 @@ impl App {
                     }
                     KeyCode::Esc => self.mode = Mode::Normal,
                     KeyCode::Char(c) => buffer.push(c),
-                    KeyCode::Backspace => { buffer.pop(); }
+                    KeyCode::Backspace => {
+                        buffer.pop();
+                    }
+                    _ => {}
+                }
+                return Ok(false);
+            }
+            Mode::ExportAscii { buffer } => {
+                match key.code {
+                    KeyCode::Enter => {
+                        let fname = buffer.clone();
+                        if fname.trim().is_empty() {
+                            match copy_to_clipboard(&self.do_export_ascii()) {
+                                Ok(()) => self.status = "ASCII table copied to clipboard".into(),
+                                Err(e) => self.status = format!("Clipboard error: {e}"),
+                            }
+                        } else {
+                            match std::fs::write(fname.trim(), self.do_export_ascii()) {
+                                Ok(()) => {
+                                    self.status =
+                                        format!("ASCII table exported to {}", fname.trim())
+                                }
+                                Err(e) => self.status = format!("Write error: {e}"),
+                            }
+                        }
+                        self.mode = Mode::Normal;
+                    }
+                    KeyCode::Esc => self.mode = Mode::Normal,
+                    KeyCode::Char(c) => buffer.push(c),
+                    KeyCode::Backspace => {
+                        buffer.pop();
+                    }
+                    _ => {}
+                }
+                return Ok(false);
+            }
+            Mode::ExportAll { buffer } => {
+                match key.code {
+                    KeyCode::Enter => {
+                        let fname = buffer.clone();
+                        if fname.trim().is_empty() {
+                            match copy_to_clipboard(&self.do_export_all()) {
+                                Ok(()) => self.status = "Full export copied to clipboard".into(),
+                                Err(e) => self.status = format!("Clipboard error: {e}"),
+                            }
+                        } else {
+                            match std::fs::write(fname.trim(), self.do_export_all()) {
+                                Ok(()) => {
+                                    self.status = format!("Full export saved to {}", fname.trim())
+                                }
+                                Err(e) => self.status = format!("Write error: {e}"),
+                            }
+                        }
+                        self.mode = Mode::Normal;
+                    }
+                    KeyCode::Esc => self.mode = Mode::Normal,
+                    KeyCode::Char(c) => buffer.push(c),
+                    KeyCode::Backspace => {
+                        buffer.pop();
+                    }
                     _ => {}
                 }
                 return Ok(false);
@@ -1155,7 +1383,11 @@ impl App {
                         self.offset = 0;
                         self.state = SheetState::new(1, 1);
                         if path.exists() {
-                            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+                            let ext = path
+                                .extension()
+                                .and_then(|e| e.to_str())
+                                .unwrap_or("")
+                                .to_lowercase();
                             match ext.as_str() {
                                 "tsv" => {
                                     if let Ok(data) = std::fs::read_to_string(&path) {
@@ -1205,13 +1437,13 @@ impl App {
             Mode::Edit { buffer } => {
                 match key.code {
                     KeyCode::Enter => {
-                        let (addr, value) =
-                            if let Some((a, v)) = parse_cell_shorthand(buffer) {
-                                (a, v)
-                            } else {
-                                (self.cursor.to_addr(&self.state.grid), buffer.clone())
-                            };
+                        let (addr, value) = if let Some((a, v)) = parse_cell_shorthand(buffer) {
+                            (a, v)
+                        } else {
+                            (self.cursor.to_addr(&self.state.grid), buffer.clone())
+                        };
                         let op = Op::SetCell { addr, value };
+                        self.op_history.push(op.clone());
                         if let Some(ref p) = self.path.clone() {
                             commit_op(p, &mut self.offset, &mut self.state, &op)?;
                             self.ops_applied = self.ops_applied.saturating_add(1);
@@ -1238,11 +1470,80 @@ impl App {
             return Ok(true);
         }
 
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('z') {
+            if let Some(last_op) = self.op_history.pop() {
+                if let Some(reverse_op) = self.state.reverse_op(&last_op) {
+                    if let Some(ref p) = self.path.clone() {
+                        if let Err(e) = commit_op(p, &mut self.offset, &mut self.state, &reverse_op)
+                        {
+                            self.status = format!("Undo failed: {}", e);
+                        } else {
+                            self.ops_applied = self.ops_applied.saturating_add(1);
+                            self.status = "Undo applied".to_string();
+                        }
+                    } else {
+                        reverse_op.apply(&mut self.state);
+                        self.status = "Undo applied (memory only)".to_string();
+                    }
+                } else {
+                    self.status = "Cannot undo this operation".to_string();
+                }
+            } else {
+                self.status = "Nothing to undo".to_string();
+            }
+            return Ok(false);
+        }
+
         match key.code {
             KeyCode::Esc => {
                 self.anchor = None;
             }
+            KeyCode::Left if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                if self.cursor.col > 0 {
+                    if self.anchor.is_none() {
+                        self.anchor = Some(self.cursor);
+                    }
+                    self.cursor.col = self.cursor.col.saturating_sub(1);
+                    self.cursor.clamp(&self.state.grid);
+                }
+            }
+            KeyCode::Right if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                if self.anchor.is_none() {
+                    self.anchor = Some(self.cursor);
+                }
+                self.cursor.col = self.cursor.col.saturating_add(1);
+                self.cursor.clamp(&self.state.grid);
+                self.state
+                    .grid
+                    .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
+            }
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                if self.cursor.row > 0 {
+                    if self.anchor.is_none() {
+                        self.anchor = Some(self.cursor);
+                    }
+                    self.cursor.row = self.cursor.row.saturating_sub(1);
+                    self.cursor.clamp(&self.state.grid);
+                }
+            }
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                if self.anchor.is_none() {
+                    self.anchor = Some(self.cursor);
+                }
+                self.cursor.row = self.cursor.row.saturating_add(1);
+                self.cursor.clamp(&self.state.grid);
+                self.state
+                    .grid
+                    .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
+            }
             KeyCode::Char('?') => self.mode = Mode::Help,
+            KeyCode::Char(c) if !c.is_control() => {
+                if matches!(self.mode, Mode::Normal) {
+                    self.mode = Mode::Edit {
+                        buffer: c.to_string(),
+                    };
+                }
+            }
             KeyCode::Char('o') => {
                 self.mode = Mode::OpenPath {
                     buffer: self
@@ -1265,7 +1566,9 @@ impl App {
                 };
             }
             KeyCode::Char('t') => {
-                self.mode = Mode::ExportTsv { buffer: String::new() };
+                self.mode = Mode::ExportTsv {
+                    buffer: String::new(),
+                };
             }
             KeyCode::Char('c') => {
                 if self.anchor.is_some() {
@@ -1284,6 +1587,7 @@ impl App {
                             count,
                             to,
                         };
+                        self.op_history.push(op.clone());
                         if let Some(ref p) = self.path.clone() {
                             commit_op(p, &mut self.offset, &mut self.state, &op)?;
                             self.ops_applied = self.ops_applied.saturating_add(1);
@@ -1292,20 +1596,21 @@ impl App {
                             op.apply(&mut self.state);
                         }
                         self.anchor = None;
-                        self.status = format!("Moved cols {mc0}..{} → before col {to}", mc0 + count);
+                        self.status =
+                            format!("Moved cols {mc0}..{} → before col {to}", mc0 + count);
                     } else {
                         self.status = "Select full main columns first (v), then c to move".into();
                     }
                 } else {
-                    self.mode = Mode::ExportCsv { buffer: String::new() };
+                    self.mode = Mode::ExportCsv {
+                        buffer: String::new(),
+                    };
                 }
             }
             KeyCode::Char('r') => {
                 if let Some((mr0, mr1)) = self.selection_main_row_range() {
                     let hr = HEADER_ROWS;
-                    if self.cursor.row < hr
-                        || self.cursor.row >= hr + self.state.grid.main_rows()
-                    {
+                    if self.cursor.row < hr || self.cursor.row >= hr + self.state.grid.main_rows() {
                         self.status =
                             "Place cursor on a main row as move target, then press r".into();
                         return Ok(false);
@@ -1317,6 +1622,7 @@ impl App {
                         count,
                         to,
                     };
+                    self.op_history.push(op.clone());
                     if let Some(ref p) = self.path.clone() {
                         commit_op(p, &mut self.offset, &mut self.state, &op)?;
                         self.ops_applied = self.ops_applied.saturating_add(1);
@@ -1361,8 +1667,7 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => {
                 let hr = HEADER_ROWS;
                 let last_main = hr + self.state.grid.main_rows().saturating_sub(1);
-                if self.cursor.row == last_main
-                    && trailing_blank_main_rows(&self.state) < NAV_BLANK
+                if self.cursor.row == last_main && trailing_blank_main_rows(&self.state) < NAV_BLANK
                 {
                     self.state.grid.grow_main_row_at_bottom();
                 }
@@ -1397,7 +1702,9 @@ fn addr_label(addr: &CellAddr, main_cols: usize) -> String {
         CellAddr::Main { row, col } => {
             format!("{}{}", addr::excel_column_name(*col as usize), row + 1)
         }
-        CellAddr::Left { col, row } => format!("<{}:{}", MARGIN_COLS - 1 - (*col as usize), row + 1),
+        CellAddr::Left { col, row } => {
+            format!("<{}:{}", MARGIN_COLS - 1 - (*col as usize), row + 1)
+        }
         CellAddr::Right { col, row } => format!(">{}:{}", col, row + 1),
     }
 }
