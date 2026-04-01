@@ -43,3 +43,5 @@
 * Option to run as auto-merge for git. Check that order that conflicting log entries is merged does not affect resulting table. If not, then just write both sets of LOG entries in the original order without the <<<<<<<<<< and >>>>>>>>>> etc. to resolve the merge conflict. Otherwise leave it to human intervention.
 
 * Show and implement "Quit Corro? \n(Q)uit, (B)ack" dialog on an uncaptured ESC.
+
+* Should look at expanding Menu to traditional File...Help menu with dropdown submenus.
