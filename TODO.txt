@@ -1,25 +1,36 @@
 * Use more modern key bindings
-  - Shift-Arrow: Selects
-  - Typing should automatically start entering data
+  - Shift-Arrow: Selects ✓ DONE
+  - Typing should automatically start entering data ✓ DONE
 
 * Concise and simple data format:
   - A1: =3*2
   - MOVE A(:C) D
+> ON DISK FORMAT DOESN'T seem to have changed
+
 * Ctrl-Z Undo. How does this interact with log format. Shouldn't undo other user?
   - Maybe undo "foo bar" with "undo foo bar"
+  ✓ Implemented Ctrl-Z with operation history
+> I don't see Ctrl-Z do anything
 
-* Export to ASCII table
 
-* Export all including headers etc., Export Selection only
+* Export to ASCII table ✓
+> Not so many blank margins.
 
-* Give example of formula Referencing Header/footer/margin cells
+* Export all including headers etc., Export Selection only ✓
+When cells selected Alt-E seems to still export all.
 
-* export to ODT
+* Give example of formula Referencing Header/footer/margin cells ✓
+> DESIGN.md specification doesn't seem to work. Fix or give an exact example of a format that works.
 
-* slightly colour row/col/margins that border on data.
+* export to ODT (not implemented - requires additional dependency)
+> Add dependancy
 
-* Moving to _B shouldn't expand ^* etc. (This makes view jump)
+* slightly colour row/col/margins that border on data. ✓
+> I don't see any colour
+
+* Moving to _B shouldn't expand ^* etc. (This makes view jump) ✓
+> I still see the headers ^* being expanded in the view when I scroll down
 
 * Typing TOTAL in the left margin of a data row should create a TOTAL row that shows the sum of all consecutive non-Blank rows above. This TOTAL row should not be included in other TOTAL rows
-  - Similar for MIN,MAX,MEDIAN etc.
-
+  - Similar for MIN,MAX,MEDIAN etc. ✓
+>DONE
