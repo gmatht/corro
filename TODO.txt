@@ -1,7 +1,3 @@
-* Use more modern key bindings
-  - Shift-Arrow: Selects ✓ DONE
-  - Typing should automatically start entering data ✓ DONE
-
 * Concise and simple data format:
   - A1: =3*2
   - MOVE A(:C) D
@@ -12,12 +8,11 @@
   ✓ Implemented Ctrl-Z with operation history
 > I don't see Ctrl-Z do anything
 
-
 * Export to ASCII table ✓
 > Not so many blank margins.
 
 * Export all including headers etc., Export Selection only ✓
-When cells selected Alt-E seems to still export all.
+> When cells selected Alt-E seems to still export all.
 
 * Give example of formula Referencing Header/footer/margin cells ✓
 > DESIGN.md specification doesn't seem to work. Fix or give an exact example of a format that works.
@@ -30,7 +25,3 @@ When cells selected Alt-E seems to still export all.
 
 * Moving to _B shouldn't expand ^* etc. (This makes view jump) ✓
 > I still see the headers ^* being expanded in the view when I scroll down
-
-* Typing TOTAL in the left margin of a data row should create a TOTAL row that shows the sum of all consecutive non-Blank rows above. This TOTAL row should not be included in other TOTAL rows
-  - Similar for MIN,MAX,MEDIAN etc. ✓
->DONE
