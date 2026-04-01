@@ -25,3 +25,21 @@
 
 * Moving to _B shouldn't expand ^* etc. (This makes view jump) ✓
 > I still see the headers ^* being expanded in the view when I scroll down
+
+* When not editing cell contents DELETE should delete currently selected Cell(s)
+
+* When selecting, r should expand selection to select whole row(s), likewise c and col(s)
+
+* When selecting, holding down ALT and pressing arrow keys should move selection arround, submitting to disk a `MOVE [selection] [destination]` command at the end of the corro on-disk file.
+
+* Columns should expand to up to a default 20 chars wide. This should be configurable per file, by adding document settings to the menu and appending `MAX_COL_WIDTH [NEW_WIDTH]` to the file. The user should also be able to override this per column.
+
+* User should be able to scroll down two from last blank line before entering the footer, so that the user can put a blank line between the selected cell and the end of the non-empty data and still be in the main data section. 
+
+* There should be an option in the menu to Sort the view. This doesn't change the underlying data, but sorts the view by the Column(s) the user chooses. The user can choose to set the default view in the file, (`SORT [COL1 [COL2 [...]]]`) or just temporarily for this session. Default to temp.
+
+* Use full underlines like "\e[4mUnderlined Text\e[24m" to seperate data rows from aggregate rows.
+
+* Option to run as auto-merge for git. Check that order that conflicting log entries is merged does not affect resulting table. If not, then just write both sets of LOG entries in the original order without the <<<<<<<<<< and >>>>>>>>>> etc. to resolve the merge conflict. Otherwise leave it to human intervention.
+
+* Show and implement "Quit Corro? \n(Q)uit, (B)ack" dialog on an uncaptured ESC.
