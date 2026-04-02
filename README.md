@@ -1,6 +1,6 @@
 # corro (WIP)
 
-`corro` is an early-stage Rust TUI spreadsheet experiment built around an **append-only JSONL operation log** and a small **sparse** sheet model.
+`corro` is an early-stage Rust TUI spreadsheet experiment built around an **append-only text operation log** and a small **sparse** sheet model.
 
 There is now a working prototype release: [`0.0.1`](https://github.com/gmatht/corro/releases/tag/0.0.1).
 
@@ -21,4 +21,3 @@ This is still a rough prototype and has important limitations:
 - Formula support is still worth adding in the future for broader spreadsheet compatibility and expressiveness.
 
 See `DESIGN.md` for the current architecture and decisions.
-

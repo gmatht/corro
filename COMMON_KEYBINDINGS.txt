@@ -1,0 +1,18 @@
+Here are some common keybindingings for spreadsheets. We cannot implement all of them, because they are contradictory. However we should base our keyboard interaction on one or more existing spreadsheets where possible.
+
+Microsoft Excel and Google Sheets share many core navigation and editing shortcuts, though specific formatting and menu access commands often differ.  Ctrl+C/V/X for copy, paste, and cut are universal, while Ctrl+Z/Y handles undo and redo in both applications. 
+
+Navigation and Selection
+Move to edges: Ctrl+Arrow keys jumps to the edge of data regions in both Excel and Sheets, while Ctrl+Home and Ctrl+End navigate to the top-left and bottom-right corners respectively. 
+Select ranges: Ctrl+Space selects an entire column and Shift+Space selects an entire row in both platforms; Ctrl+Shift+Space selects the entire worksheet in Excel, whereas Sheets uses Ctrl+Shift+8 or Ctrl+A for similar full-sheet selection. 
+Sheet navigation: In Excel, Ctrl+Page Up/Down moves between sheets, while Google Sheets uses Alt+Up/Down Arrow (Windows) or Option+Up/Down Arrow (Mac) for the same function. 
+Editing and Formatting
+Cell editing: F2 enters edit mode in Excel, while F2 or Ctrl+Enter (to fill a range) is used in Sheets; Alt+Enter inserts a line break within a cell in both. 
+Formatting shortcuts: Ctrl+Shift+1/2/3/4/5 formats numbers as General/Thousands/Date/Currency/Percentage in Excel, while Sheets uses Ctrl+Shift+1/2/3/4/5 for Decimal/Time/Date/Currency/Percentage respectively. 
+Borders and alignment: Excel uses Ctrl+Shift+7 for simple borders and Ctrl+Shift+_ to remove them, whereas Google Sheets relies on Alt+Shift+7 to apply outer borders and Alt+Shift+6 to remove all borders. 
+Reference locking: F4 toggles absolute/relative cell references (e.g., $A$1) in Excel, while Sheets uses Fn+F4 or Search+4 depending on the keyboard. 
+Specialized Behaviors and Menus
+Menu access: Excel uses Alt to display ribbon key tips, requiring sequences like Alt, H, O, I to autofit columns; Google Sheets uses Alt+/ (Windows) or Option+/ (Mac) to open the "Tool finder" for menu search. 
+Formulas and Data: Ctrl+~ (tilde) shows all formulas in both applications, while Ctrl+Shift+Enter creates an array formula in Sheets.  In Excel, Ctrl+Shift+L adds filters, and Alt+= triggers an autosum. 
+Comments and Notes: Google Sheets uses Ctrl+Alt+M to insert comments and Ctrl+Alt+Shift+A to open discussion threads, while Excel uses Shift+F2 for cell notes or comments. 
+Undo/Redo: While Ctrl+Z is standard for undo, Sheets supports Ctrl+Shift+Z for redo, whereas Excel typically uses Ctrl+Y. 

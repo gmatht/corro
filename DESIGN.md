@@ -7,7 +7,7 @@ This document summarizes the architecture and key decisions implemented so far.
 ## Goals
 
 - **Spreadsheet-ish editing in a TUI**: navigate, edit cells, display a small viewport.
-- **Collaborative-ish via filesystem**: append-only JSONL file as the source of truth; instances watch and apply new lines.
+- **Collaborative-ish via filesystem**: append-only text log as the source of truth; instances watch and apply new lines.
 - **Structural ops**: move row/column ranges without rewriting the whole file.
 - **Formulas**: cells whose value starts with `=` evaluate for display and for numeric range aggregation.
 - **Special rows/columns**: margin labels (`SUM`, `TOTAL`, …) drive computed totals over main data (see below).
@@ -57,9 +57,10 @@ These extents:
 - grow when navigating off the bottom/right edge of main (see UI rules)
 - can be set explicitly via `SetMainSize` (prunes cells beyond extent)
 
-## Operation log (append-only JSONL)
+## Operation log (append-only text)
 
-All edits are represented as ops serialized to JSON and appended as one line (JSONL).
+All edits are represented as short text lines and appended one per line.
+Older JSON log lines are still accepted on replay for compatibility.
 
 Key op types (see `src/ops/mod.rs`):
 
@@ -83,7 +84,7 @@ Replay applies ops in order to rebuild `SheetState` (currently: `grid` only).
 - Stored as normal cell text. After a leading `=`, the rest is parsed as an expression (`src/formula/mod.rs`).
 - **Display**: the TUI shows the **evaluated** result (or `#CIRC`, `#PARSE`, etc.); **edit** mode shows the raw string.
 - **Operators**: `+ - * /`, parentheses, unary `-`.
-- **References** (see `src/addr.rs`): main `A1`, headers `^A` / `^A,B`, footers `_B` / `_B,A`, margins `<0,1` / `>0,1` (same rules as `ADDR: value` shorthand in the UI).
+- **References** (see `src/addr.rs`): main `A1`, headers `^A` / `^A,A1`, footers `_B` / `_B,A1`, margins `<0` / `<0,1`, `>0` / `>0,1` (same rules as `ADDR: value` shorthand in the UI).
 - **Ranges** (main only): `A1:B2` (rectangle between corners, inclusive).
 - **Functions**: `SUM(range|expr)`, `IF(cond, a, b)` (condition is “truthy” if it evaluates to a non-zero number). Function names are case-insensitive.
 - **Cycles**: recursive references are detected; evaluation returns `#CIRC`.

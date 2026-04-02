@@ -6,7 +6,7 @@ use crate::export;
 use crate::formula::cell_effective_display;
 use crate::grid::MainRange;
 use crate::grid::{CellAddr, Grid, FOOTER_ROWS, HEADER_ROWS, MARGIN_COLS};
-use crate::io::{commit_op, load_full, tail_apply, IoError, LogWatcher};
+use crate::io::{commit_line, commit_op, load_full, tail_apply, IoError, LogWatcher};
 use crate::ops::{AggFunc, AggregateDef, Op, SheetState};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
@@ -25,9 +25,17 @@ const ROW_LABEL_CHARS: usize = 5;
 const CELL_W: usize = 12;
 /// Keep at most this many blank lines/cols around the active main data window.
 const DISPLAY_EDGE_BLANK: usize = 1;
-/// Trailing blank main rows/cols past the last data cell allowed before Down/Right transitions
-/// into the footer / right-margin instead of growing the main extent further.
-const NAV_BLANK: usize = 1;
+/// Trailing blank main rows allowed before Down transitions into the footer.
+const NAV_BLANK_ROWS: usize = 2;
+/// Trailing blank main cols allowed before Right transitions into the right margin.
+const NAV_BLANK_COLS: usize = 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SelectionKind {
+    Cells,
+    Rows,
+    Cols,
+}
 
 #[derive(Debug, Error)]
 pub enum RunError {
@@ -94,17 +102,20 @@ impl SheetCursor {
 }
 
 #[derive(Clone, Debug)]
-pub enum Mode {
+enum Mode {
     Normal,
     Edit {
         buffer: String,
+        formula_cursor: Option<SheetCursor>,
     },
     OpenPath {
         buffer: String,
     },
     Help,
     /// Alt-activated menu bar; letter shortcuts execute actions.
-    Menu,
+    Menu {
+        section: MenuSection,
+    },
     ExportTsv {
         buffer: String,
     },
@@ -117,11 +128,35 @@ pub enum Mode {
     ExportAll {
         buffer: String,
     },
+    ExportOdt {
+        buffer: String,
+    },
+    SetMaxColWidth {
+        buffer: String,
+    },
+    SetColWidth {
+        buffer: String,
+    },
+    SortView {
+        buffer: String,
+        persist: bool,
+    },
+    QuitPrompt,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum MenuSection {
+    File,
+    Help,
 }
 
 // ── Viewport helpers ──────────────────────────────────────────────────────────
 
-fn main_row_window(state: &SheetState, cursor: SheetCursor) -> (usize, usize) {
+fn main_row_window(
+    state: &SheetState,
+    cursor: SheetCursor,
+    main_order: &[usize],
+) -> (usize, usize) {
     let g = &state.grid;
     let hr = HEADER_ROWS;
     let mr = g.main_rows();
@@ -132,14 +167,17 @@ fn main_row_window(state: &SheetState, cursor: SheetCursor) -> (usize, usize) {
     let mut lo = usize::MAX;
     let mut hi = 0usize;
 
-    for r in 0..mr {
-        if g.logical_row_has_content(hr + r) {
-            lo = lo.min(r);
-            hi = hi.max(r);
+    for (pos, &main_row) in main_order.iter().enumerate() {
+        if g.logical_row_has_content(hr + main_row) {
+            lo = lo.min(pos);
+            hi = hi.max(pos);
         }
     }
     if cursor.row >= hr && cursor.row < hr + mr {
-        let ri = cursor.row - hr;
+        let ri = main_order
+            .iter()
+            .position(|&r| hr + r == cursor.row)
+            .unwrap_or(0);
         lo = lo.min(ri);
         hi = hi.max(ri);
     }
@@ -230,86 +268,41 @@ fn visible_row_indices(
     let mr = g.main_rows();
     let fr = FOOTER_ROWS;
     let total = hr + mr + fr;
-    let dim = dim.max(1).min(total.max(1));
-    let cur = cursor.row.min(total.saturating_sub(1));
-    let cursor_in_footer = cursor.row >= hr + mr;
+    let main_order = g.sorted_main_rows();
+    let mut display_rows: Vec<usize> = Vec::with_capacity(total);
+    display_rows.extend(0..hr);
+    display_rows.extend(main_order.iter().copied().map(|r| hr + r));
+    display_rows.extend((0..fr).map(|r| hr + mr + r));
 
-    if total <= dim {
-        return ((0..total).collect(), 0);
+    let dim = dim.max(1).min(display_rows.len().max(1));
+    if display_rows.len() <= dim {
+        return (display_rows, 0);
     }
 
-    let (main_lo, main_hi) = main_row_window(state, cursor);
-    let footer_start = hr + mr;
-    let mut footer_band: Vec<usize> = match footer_nonblank_end(state) {
-        Some(end) => (0..=end).map(|i| footer_start + i).collect(),
-        None => Vec::new(),
+    let cur_display = if cursor.row < hr {
+        cursor.row
+    } else if cursor.row < hr + mr {
+        hr + main_order
+            .iter()
+            .position(|&r| hr + r == cursor.row)
+            .unwrap_or(0)
+    } else {
+        cursor.row
     };
-    let blank_footer = footer_nonblank_end(state)
-        .map(|end| end + 1)
-        .filter(|&i| i < fr)
-        .map(|i| footer_start + i)
-        .unwrap_or(footer_start);
-    if cursor_in_footer {
-        footer_band.push(blank_footer);
-    }
-    let main_span = main_hi.saturating_sub(main_lo) + 1;
-    let mut stable_band = Vec::with_capacity(main_span + 1 + footer_band.len());
-    if hr > 0 {
-        stable_band.push(hr - 1);
-    }
-    stable_band.extend((main_lo..=main_hi).map(|ri| hr + ri));
-    stable_band.extend(footer_band.iter().copied());
-    stable_band.sort_unstable();
-    stable_band.dedup();
-    if stable_band.len() <= dim && stable_band.contains(&cur) {
-        return (stable_band, 0);
-    }
 
-    let mut reserved: Vec<usize> = footer_band;
-    if hr > 0 && dim > reserved.len() {
-        reserved.push(hr - 1);
-    }
-    if !cursor_in_footer && fr > 0 && !reserved.iter().any(|&r| r == blank_footer) {
-        let mut cand = reserved.clone();
-        cand.push(blank_footer);
-        cand.sort_unstable();
-        cand.dedup();
-        if cand.len() < dim {
-            let available = dim.saturating_sub(cand.len()).max(1);
-            let filtered_len = (0..total).filter(|r| !cand.iter().any(|p| p == r)).count();
-            if filtered_len <= available {
-                reserved = cand;
-            }
-        }
-    }
-    reserved.sort_unstable();
-    reserved.dedup();
-
-    let available = dim.saturating_sub(reserved.len()).max(1);
-    let filtered: Vec<usize> = (0..total)
-        .filter(|r| !reserved.iter().any(|p| p == r))
-        .collect();
-    if filtered.is_empty() {
-        return (reserved, 0);
-    }
-
-    let cur_pos = match filtered.binary_search(&cur) {
-        Ok(i) => i,
-        Err(i) => i.min(filtered.len().saturating_sub(1)),
-    };
-    let max_start = filtered.len().saturating_sub(available);
+    let cur_pos = display_rows
+        .iter()
+        .position(|&r| r == cur_display)
+        .unwrap_or(0);
+    let max_start = display_rows.len().saturating_sub(dim);
     let mut start = prev_start.min(max_start);
     if cur_pos < start {
         start = cur_pos;
-    } else if cur_pos >= start + available {
-        start = cur_pos + 1 - available;
+    } else if cur_pos >= start + dim {
+        start = cur_pos + 1 - dim;
     }
-    let end = (start + available).min(filtered.len());
 
-    let mut out = filtered[start..end].to_vec();
-    out.extend(reserved);
-    out.sort_unstable();
-    (out, start)
+    (display_rows[start..start + dim].to_vec(), start)
 }
 
 /// Column viewport with pinned totals and minimal-scroll movement.
@@ -624,13 +617,14 @@ pub struct App {
     pub state: SheetState,
     pub cursor: SheetCursor,
     pub anchor: Option<SheetCursor>,
-    pub mode: Mode,
+    mode: Mode,
     pub watcher: Option<LogWatcher>,
     pub status: String,
     pub ops_applied: usize,
     pub row_scroll: usize,
     pub col_scroll: usize,
     pub op_history: Vec<Op>,
+    selection_kind: SelectionKind,
 }
 
 impl App {
@@ -651,6 +645,7 @@ impl App {
             row_scroll: 0,
             col_scroll: 0,
             op_history: Vec::new(),
+            selection_kind: SelectionKind::Cells,
         }
     }
 
@@ -706,6 +701,94 @@ impl App {
         Ok(())
     }
 
+    fn push_inverse_op(&mut self, op: &Op) {
+        if let Some(inverse) = self.state.reverse_op(op) {
+            self.op_history.push(inverse);
+        }
+    }
+
+    fn current_selection_range(&self) -> Option<(Vec<usize>, Vec<usize>)> {
+        let a = self.anchor?;
+        let b = self.cursor;
+        let r0 = a.row.min(b.row);
+        let r1 = a.row.max(b.row);
+        let c0 = a.col.min(b.col);
+        let c1 = a.col.max(b.col);
+        Some(((r0..=r1).collect(), (c0..=c1).collect()))
+    }
+
+    fn addr_at(&self, row: usize, col: usize) -> Option<CellAddr> {
+        let grid = &self.state.grid;
+        let hr = HEADER_ROWS;
+        let mr = grid.main_rows();
+        let mc = grid.main_cols();
+        if row < hr {
+            Some(CellAddr::Header {
+                row: row as u8,
+                col: col as u32,
+            })
+        } else if row < hr + mr {
+            let mri = row - hr;
+            if col < MARGIN_COLS {
+                Some(CellAddr::Left {
+                    col: col as u8,
+                    row: mri as u32,
+                })
+            } else if col < MARGIN_COLS + mc {
+                Some(CellAddr::Main {
+                    row: mri as u32,
+                    col: (col - MARGIN_COLS) as u32,
+                })
+            } else if col < MARGIN_COLS + mc + MARGIN_COLS {
+                Some(CellAddr::Right {
+                    col: (col - MARGIN_COLS - mc) as u8,
+                    row: mri as u32,
+                })
+            } else {
+                None
+            }
+        } else if row < hr + mr + FOOTER_ROWS {
+            Some(CellAddr::Footer {
+                row: (row - hr - mr) as u8,
+                col: col as u32,
+            })
+        } else {
+            None
+        }
+    }
+
+    fn delete_selection(&mut self) -> bool {
+        let Some((rows, cols)) = self.current_selection_range() else {
+            return false;
+        };
+        let mut did_any = false;
+        for r in rows {
+            for c in cols.iter().copied() {
+                let Some(addr) = self.addr_at(r, c) else {
+                    continue;
+                };
+                if self.state.grid.get(&addr).is_some_and(|v| !v.is_empty()) {
+                    let op = Op::SetCell {
+                        addr,
+                        value: String::new(),
+                    };
+                    self.push_inverse_op(&op);
+                    if let Some(ref p) = self.path.clone() {
+                        let _ = commit_op(p, &mut self.offset, &mut self.state, &op);
+                    } else {
+                        op.apply(&mut self.state);
+                    }
+                    did_any = true;
+                }
+            }
+        }
+        if did_any {
+            self.status = "Selection deleted".into();
+            self.anchor = None;
+        }
+        did_any
+    }
+
     fn sync_external(&mut self) -> Result<(), IoError> {
         if let Some(w) = &self.watcher {
             if w.poll_dirty() {
@@ -748,6 +831,50 @@ impl App {
         Some(((r0 - hr) as u32, (r1 - hr) as u32))
     }
 
+    fn expand_selection_to_rows(&mut self) {
+        let hr = HEADER_ROWS;
+        let left = MARGIN_COLS;
+        let right = MARGIN_COLS + self.state.grid.main_cols().saturating_sub(1);
+        let row = self
+            .cursor
+            .row
+            .clamp(hr, hr + self.state.grid.main_rows().saturating_sub(1));
+        if let Some(anchor) = self.anchor {
+            let r0 = anchor.row.min(row);
+            let r1 = anchor.row.max(row);
+            self.anchor = Some(SheetCursor { row: r0, col: left });
+            self.cursor = SheetCursor {
+                row: r1,
+                col: right,
+            };
+        } else {
+            self.anchor = Some(SheetCursor { row, col: left });
+            self.cursor = SheetCursor { row, col: right };
+        }
+        self.selection_kind = SelectionKind::Rows;
+    }
+
+    fn expand_selection_to_cols(&mut self) {
+        let hr = HEADER_ROWS;
+        let bottom = hr + self.state.grid.main_rows().saturating_sub(1);
+        let left = MARGIN_COLS;
+        let right = MARGIN_COLS + self.state.grid.main_cols().saturating_sub(1);
+        let col = self.cursor.col.clamp(left, right);
+        if let Some(anchor) = self.anchor {
+            let c0 = anchor.col.min(col);
+            let c1 = anchor.col.max(col);
+            self.anchor = Some(SheetCursor { row: hr, col: c0 });
+            self.cursor = SheetCursor {
+                row: bottom,
+                col: c1,
+            };
+        } else {
+            self.anchor = Some(SheetCursor { row: hr, col });
+            self.cursor = SheetCursor { row: bottom, col };
+        }
+        self.selection_kind = SelectionKind::Cols;
+    }
+
     fn selection_main_col_range(&self) -> Option<(u32, u32)> {
         let a = self.anchor?;
         let b = self.cursor;
@@ -768,12 +895,163 @@ impl App {
         Some(((c0 - left) as u32, (c1 - left) as u32))
     }
 
+    fn commit_edit_buffer(&mut self, buffer: &str) -> Result<(), RunError> {
+        let (addr, value) = if let Some((a, v)) = parse_cell_shorthand(buffer) {
+            (a, v)
+        } else {
+            (self.cursor.to_addr(&self.state.grid), buffer.to_string())
+        };
+        let op = Op::SetCell { addr, value };
+        self.push_inverse_op(&op);
+        if let Some(ref p) = self.path.clone() {
+            commit_op(p, &mut self.offset, &mut self.state, &op)?;
+            self.ops_applied = self.ops_applied.saturating_add(1);
+            self.start_log_watcher_if_needed()?;
+        } else {
+            op.apply(&mut self.state);
+            self.status = "No file — edit in memory only".into();
+        }
+        Ok(())
+    }
+
+    fn move_selected_rows_by_one(&mut self, down: bool) -> Result<bool, RunError> {
+        let Some((from, to)) = self.selection_main_row_range() else {
+            return Ok(false);
+        };
+        let main_rows = self.state.grid.main_rows() as u32;
+        if down {
+            if to + 1 >= main_rows {
+                self.status = "Selection is already at the bottom".into();
+                return Ok(true);
+            }
+        } else if from == 0 {
+            self.status = "Selection is already at the top".into();
+            return Ok(true);
+        }
+
+        let count = to - from + 1;
+        let target = if down { to + 2 } else { from - 1 };
+        let op = Op::MoveRowRange {
+            from,
+            count,
+            to: target,
+        };
+        self.push_inverse_op(&op);
+        if let Some(ref p) = self.path.clone() {
+            commit_op(p, &mut self.offset, &mut self.state, &op)?;
+            self.ops_applied = self.ops_applied.saturating_add(1);
+            self.start_log_watcher_if_needed()?;
+        } else {
+            op.apply(&mut self.state);
+        }
+
+        let new_from = if down { from + 1 } else { from - 1 };
+        let new_to = if down { to + 1 } else { to - 1 };
+        self.anchor = Some(SheetCursor {
+            row: HEADER_ROWS + new_from as usize,
+            col: MARGIN_COLS,
+        });
+        self.cursor = SheetCursor {
+            row: HEADER_ROWS + new_to as usize,
+            col: MARGIN_COLS + self.state.grid.main_cols().saturating_sub(1),
+        };
+        self.selection_kind = SelectionKind::Rows;
+        self.status = if down {
+            format!("Moved rows {from}..{} down", to)
+        } else {
+            format!("Moved rows {from}..{} up", to)
+        };
+        Ok(true)
+    }
+
+    fn move_selected_cols_by_one(&mut self, right: bool) -> Result<bool, RunError> {
+        let Some((from, to)) = self.selection_main_col_range() else {
+            return Ok(false);
+        };
+        let main_cols = self.state.grid.main_cols() as u32;
+        if right {
+            if to + 1 >= main_cols {
+                self.status = "Selection is already at the far right".into();
+                return Ok(true);
+            }
+        } else if from == 0 {
+            self.status = "Selection is already at the far left".into();
+            return Ok(true);
+        }
+
+        let count = to - from + 1;
+        let target = if right { to + 2 } else { from - 1 };
+        let op = Op::MoveColRange {
+            from,
+            count,
+            to: target,
+        };
+        self.push_inverse_op(&op);
+        if let Some(ref p) = self.path.clone() {
+            commit_op(p, &mut self.offset, &mut self.state, &op)?;
+            self.ops_applied = self.ops_applied.saturating_add(1);
+            self.start_log_watcher_if_needed()?;
+        } else {
+            op.apply(&mut self.state);
+        }
+
+        let new_from = if right { from + 1 } else { from - 1 };
+        let new_to = if right { to + 1 } else { to - 1 };
+        self.anchor = Some(SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS + new_from as usize,
+        });
+        self.cursor = SheetCursor {
+            row: HEADER_ROWS + self.state.grid.main_rows().saturating_sub(1),
+            col: MARGIN_COLS + new_to as usize,
+        };
+        self.selection_kind = SelectionKind::Cols;
+        self.status = if right {
+            format!("Moved cols {from}..{} right", to)
+        } else {
+            format!("Moved cols {from}..{} left", to)
+        };
+        Ok(true)
+    }
+
+    fn formula_ref_for_addr(&self, addr: &CellAddr) -> String {
+        match addr {
+            CellAddr::Header { row, col } => format!(
+                "^{},{}",
+                (b'Z' - *row) as char,
+                formula_col_fragment(*col as usize, self.state.grid.main_cols())
+            ),
+            CellAddr::Footer { row, col } => format!(
+                "_{},{}",
+                (b'A' + *row) as char,
+                formula_col_fragment(*col as usize, self.state.grid.main_cols())
+            ),
+            CellAddr::Main { row, col } => {
+                format!("{}{}", addr::excel_column_name(*col as usize), row + 1)
+            }
+            CellAddr::Left { col, row } => format!("<{},{}", col, row + 1),
+            CellAddr::Right { col, row } => format!(">{},{}", col, row + 1),
+        }
+    }
+
     fn do_export(&mut self, csv: bool) -> String {
         let mut buf = Vec::new();
         if csv {
             export::export_csv(&self.state.grid, &mut buf);
         } else {
-            export::export_tsv(&self.state.grid, &mut buf);
+            if self.anchor.is_some() {
+                let rows = self
+                    .current_selection_range()
+                    .map(|(rows, _)| rows)
+                    .unwrap_or_default();
+                let cols = self
+                    .current_selection_range()
+                    .map(|(_, cols)| cols)
+                    .unwrap_or_default();
+                export::export_selection(&self.state.grid, &mut buf, &rows, &cols);
+            } else {
+                export::export_tsv(&self.state.grid, &mut buf);
+            }
         }
         String::from_utf8_lossy(&buf).into_owned()
     }
@@ -788,6 +1066,10 @@ impl App {
         let mut buf = Vec::new();
         export::export_all(&self.state.grid, &mut buf);
         String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    fn do_export_odt(&mut self) -> Vec<u8> {
+        export::export_odt_bytes(&self.state.grid).unwrap_or_default()
     }
 
     #[allow(dead_code)]
@@ -903,7 +1185,7 @@ impl App {
         let addr = self.cursor.to_addr(grid);
         let addr_str = addr_label(&addr, grid.main_cols());
         let (formula_text, formula_style) = match &self.mode {
-            Mode::Edit { buffer } => (
+            Mode::Edit { buffer, .. } => (
                 format!(" {addr_str}  {buffer}_"),
                 Style::default()
                     .fg(Color::White)
@@ -923,7 +1205,7 @@ impl App {
                 Style::default().fg(Color::White).bg(Color::DarkGray),
             ),
             Mode::Help => (
-                " e·edit  v·select  t·tsv  c·csv  a·ascii  e·export-all  r/c·move  o·open  Ctrl-Z·undo  addr: val  q·quit".into(),
+                " e·edit  v·select  t·tsv  c·csv  Alt-A·ascii  r/c·move  o·open  Ctrl-Z·undo  Alt-W·width  Alt-S·sort  q·quit".into(),
                 Style::default().fg(Color::White).bg(Color::Blue),
             ),
             Mode::ExportAscii { .. } => (
@@ -934,10 +1216,39 @@ impl App {
                 " export full (incl headers/margins): ".into(),
                 Style::default().fg(Color::White).bg(Color::DarkGray),
             ),
-            Mode::Menu => (
-                "  F·open-file   R·row-ops   C·col-ops   T·export-tsv   A·ASCII   E·export-all   ?·help   Esc·close".into(),
-                Style::default().fg(Color::Black).bg(Color::Cyan),
+            Mode::ExportOdt { buffer } => (
+                format!(" export ODT: {buffer}_"),
+                Style::default().fg(Color::White).bg(Color::DarkGray),
             ),
+            Mode::SetMaxColWidth { buffer } => (
+                format!(" max col width (default=20): {buffer}_"),
+                Style::default().fg(Color::White).bg(Color::DarkGray),
+            ),
+            Mode::SetColWidth { buffer } => (
+                format!(" col width [col=width|col]: {buffer}_"),
+                Style::default().fg(Color::White).bg(Color::DarkGray),
+            ),
+            Mode::SortView { buffer, persist } => (
+                format!(
+                    " sort cols [A,B,C]{}: {buffer}_",
+                    if *persist { " (save)" } else { "" }
+                ),
+                Style::default().fg(Color::White).bg(Color::DarkGray),
+            ),
+            Mode::QuitPrompt => (
+                " Quit Corro? (Q)uit, (B)ack ".into(),
+                Style::default().fg(Color::White).bg(Color::Red),
+            ),
+            Mode::Menu { section } => match section {
+                MenuSection::File => (
+                    "  File: F·open-file  T·export-tsv  A·ASCII  E·export-all  O·ODT  W·width  S·sort  Esc·back".into(),
+                    Style::default().fg(Color::Black).bg(Color::Cyan),
+                ),
+                MenuSection::Help => (
+                    "  Help: ?·help  R·row-ops  C·col-ops  q·quit  Esc·back".into(),
+                    Style::default().fg(Color::Black).bg(Color::Cyan),
+                ),
+            },
             _ => {
                 let val = cell_effective_display(grid, &addr);
                 let base = format!(" {addr_str}  {val}");
@@ -975,7 +1286,8 @@ impl App {
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD)
                 };
-                spans.push(Span::styled(format!("{:>w$}", name, w = CELL_W), style));
+                let w = grid.col_width(c).min(CELL_W).max(1);
+                spans.push(Span::styled(format!("{:>w$}", name, w = w), style));
             }
             lines.push(Line::from(spans));
         }
@@ -1088,17 +1400,30 @@ impl App {
                 } else {
                     cell_effective_display(grid, &cell_addr)
                 };
-                let disp = if text.chars().count() > CELL_W {
-                    format!("{}…", text.chars().take(CELL_W).collect::<String>())
+                let cw = grid.col_width(c).min(CELL_W).max(1);
+                let disp = if text.chars().count() > cw {
+                    format!("{}…", text.chars().take(cw).collect::<String>())
                 } else {
-                    format!("{:w$}", text, w = CELL_W)
+                    format!("{:w$}", text, w = cw)
                 };
-                let sel = self.anchor.is_some_and(|a| {
-                    let r0 = a.row.min(self.cursor.row);
-                    let r1 = a.row.max(self.cursor.row);
-                    let c0 = a.col.min(self.cursor.col);
-                    let c1 = a.col.max(self.cursor.col);
-                    r >= r0 && r <= r1 && c >= c0 && c <= c1
+                let sel = self.anchor.is_some_and(|a| match self.selection_kind {
+                    SelectionKind::Cells => {
+                        let r0 = a.row.min(self.cursor.row);
+                        let r1 = a.row.max(self.cursor.row);
+                        let c0 = a.col.min(self.cursor.col);
+                        let c1 = a.col.max(self.cursor.col);
+                        r >= r0 && r <= r1 && c >= c0 && c <= c1
+                    }
+                    SelectionKind::Rows => {
+                        let r0 = a.row.min(self.cursor.row);
+                        let r1 = a.row.max(self.cursor.row);
+                        r >= r0 && r <= r1
+                    }
+                    SelectionKind::Cols => {
+                        let c0 = a.col.min(self.cursor.col);
+                        let c1 = a.col.max(self.cursor.col);
+                        c >= c0 && c <= c1
+                    }
                 });
                 let is_cur = r == self.cursor.row && c == self.cursor.col;
 
@@ -1115,7 +1440,7 @@ impl App {
                         None
                     };
 
-                let st = if is_cur {
+                let mut st = if is_cur {
                     Style::default().bg(Color::DarkGray)
                 } else if sel {
                     Style::default().bg(Color::Blue)
@@ -1124,6 +1449,13 @@ impl App {
                 } else {
                     Style::default()
                 };
+                let is_data_row = r >= hr && r < hr + mr;
+                let is_aggregate_row = footer_agg.is_some()
+                    || left_margin_agg.is_some()
+                    || right_col_agg_func(grid, c).is_some();
+                if is_data_row && is_aggregate_row {
+                    st = st.add_modifier(Modifier::UNDERLINED);
+                }
                 spans.push(Span::styled(disp, st));
             }
             lines.push(Line::from(spans));
@@ -1162,7 +1494,7 @@ impl App {
                 if self.anchor.is_some() {
                     "  r·move-rows   c·move-cols   v·deselect   Esc·cancel".into()
                 } else {
-                    "  e·edit   v·select   t·tsv   c·csv   a·ascii   e·export-all   o·open   Ctrl-Z·undo   q·quit   Alt·menu   ?·help".into()
+                    "  e·edit   v·select   t·tsv   c·csv   Alt-A·ascii   o·open   Ctrl-Z·undo   Alt-W·width   Alt-S·sort   q·quit   ?·help".into()
                 }
             }
             Mode::Edit { .. } => {
@@ -1172,18 +1504,25 @@ impl App {
             Mode::ExportTsv { .. }
             | Mode::ExportCsv { .. }
             | Mode::ExportAscii { .. }
-            | Mode::ExportAll { .. } => {
+            | Mode::ExportAll { .. }
+            | Mode::ExportOdt { .. }
+            | Mode::SetMaxColWidth { .. }
+            | Mode::SetColWidth { .. } => {
                 "  type filename (blank=clipboard)   Enter·export   Esc·cancel".into()
             }
+            Mode::SortView { .. } => {
+                "  type sort columns like A,B,C   Enter·apply   Esc·cancel".into()
+            }
+            Mode::QuitPrompt => "  Q·quit   B·back   Esc·cancel".into(),
             Mode::Help => {
-                let formula_examples = "Formulas: A1:=3*2  SUM(A1:B2)  IF(A1>0,1,0)  Header:^A  Footer:_A  Margins:<0,_1  >0,_1".to_string();
+                let formula_examples = "Formulas: A1:=3*2  SUM(A1:B2)  IF(A1>0,1,0)  Header:^A,A  Footer:_A,A  Margins:<0,1  >0,1".to_string();
                 if self.status.is_empty() {
                     formula_examples
                 } else {
                     format!("{}  ·  {}", formula_examples, self.status)
                 }
             }
-            Mode::Menu => "  press a letter shortcut   Esc·close".into(),
+            Mode::Menu { .. } => "  left/right·switch   Enter/letter·open   Esc·close".into(),
         }
     }
 
@@ -1192,496 +1531,837 @@ impl App {
             return Ok(false);
         }
 
-        if key.modifiers.contains(KeyModifiers::ALT) {
-            if matches!(self.mode, Mode::Normal | Mode::Menu) {
-                match key.code {
-                    KeyCode::Char('f') | KeyCode::Char('F') => {
-                        self.mode = Mode::OpenPath {
-                            buffer: self
-                                .path
-                                .as_ref()
-                                .map(|p| p.to_string_lossy().into_owned())
-                                .unwrap_or_default(),
-                        };
-                    }
-                    KeyCode::Char('t') | KeyCode::Char('T') => {
-                        self.mode = Mode::ExportTsv {
-                            buffer: String::new(),
-                        };
-                    }
-                    KeyCode::Char('a') | KeyCode::Char('A') => {
-                        self.mode = Mode::ExportAscii {
-                            buffer: String::new(),
-                        };
-                    }
-                    KeyCode::Char('e') | KeyCode::Char('E') => {
-                        self.mode = Mode::ExportAll {
-                            buffer: String::new(),
-                        };
-                    }
-                    KeyCode::Char('?') | KeyCode::Char('h') | KeyCode::Char('H') => {
-                        self.mode = Mode::Help;
-                    }
-                    _ => {
-                        self.mode = if matches!(self.mode, Mode::Menu) {
-                            Mode::Normal
-                        } else {
-                            Mode::Menu
-                        };
-                    }
+        let mut mode = std::mem::replace(&mut self.mode, Mode::Normal);
+
+        if key.modifiers.contains(KeyModifiers::ALT)
+            && matches!(mode, Mode::Normal | Mode::Menu { .. })
+            && matches!(
+                key.code,
+                KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down
+            )
+        {
+            if matches!(key.code, KeyCode::Left | KeyCode::Right) {
+                let right = matches!(key.code, KeyCode::Right);
+                self.mode = mode;
+                let handled = self.move_selected_cols_by_one(right)?;
+                if handled {
+                    return Ok(false);
                 }
+                mode = std::mem::replace(&mut self.mode, Mode::Normal);
+            } else {
+                let down = matches!(key.code, KeyCode::Down);
+                self.mode = mode;
+                let handled = self.move_selected_rows_by_one(down)?;
+                if handled {
+                    return Ok(false);
+                }
+                mode = std::mem::replace(&mut self.mode, Mode::Normal);
             }
-            return Ok(false);
         }
 
-        match &mut self.mode {
-            Mode::Menu => {
-                match key.code {
-                    KeyCode::Esc => self.mode = Mode::Normal,
-                    KeyCode::Char('f') | KeyCode::Char('F') => {
-                        self.mode = Mode::OpenPath {
-                            buffer: self
-                                .path
-                                .as_ref()
-                                .map(|p| p.to_string_lossy().into_owned())
-                                .unwrap_or_default(),
+        if key.modifiers.contains(KeyModifiers::ALT)
+            && matches!(mode, Mode::Normal | Mode::Menu { .. })
+            && matches!(key.code, KeyCode::Char(_))
+        {
+            if let KeyCode::Char(ch) = key.code {
+                match ch {
+                    'f' | 'F' => {
+                        self.mode = Mode::Menu {
+                            section: MenuSection::File,
                         };
+                        return Ok(false);
                     }
-                    KeyCode::Char('r') | KeyCode::Char('R') => {
-                        self.mode = Mode::Normal;
-                        self.status =
-                            "Row ops: v·select full rows, then r·move to target row".into();
+                    'h' | 'H' => {
+                        self.mode = Mode::Menu {
+                            section: MenuSection::Help,
+                        };
+                        return Ok(false);
                     }
-                    KeyCode::Char('c') | KeyCode::Char('C') => {
-                        self.mode = Mode::Normal;
-                        self.status =
-                            "Col ops: v·select full columns, then c·move to target column".into();
-                    }
-                    KeyCode::Char('t') | KeyCode::Char('T') => {
+                    't' | 'T' => {
                         self.mode = Mode::ExportTsv {
                             buffer: String::new(),
                         };
+                        return Ok(false);
                     }
-                    KeyCode::Char('a') | KeyCode::Char('A') => {
+                    'a' | 'A' => {
                         self.mode = Mode::ExportAscii {
                             buffer: String::new(),
                         };
+                        return Ok(false);
                     }
-                    KeyCode::Char('e') | KeyCode::Char('E') => {
+                    'e' | 'E' => {
                         self.mode = Mode::ExportAll {
                             buffer: String::new(),
                         };
+                        return Ok(false);
                     }
-                    KeyCode::Char('?') => self.mode = Mode::Help,
+                    'o' | 'O' => {
+                        self.mode = Mode::ExportOdt {
+                            buffer: String::new(),
+                        };
+                        return Ok(false);
+                    }
+                    'w' | 'W' => {
+                        self.mode = Mode::SetMaxColWidth {
+                            buffer: String::new(),
+                        };
+                        return Ok(false);
+                    }
+                    'x' | 'X' => {
+                        self.mode = Mode::SetColWidth {
+                            buffer: String::new(),
+                        };
+                        return Ok(false);
+                    }
+                    's' => {
+                        self.mode = Mode::SortView {
+                            buffer: String::new(),
+                            persist: false,
+                        };
+                        return Ok(false);
+                    }
+                    'S' => {
+                        self.mode = Mode::SortView {
+                            buffer: String::new(),
+                            persist: true,
+                        };
+                        return Ok(false);
+                    }
                     _ => {}
                 }
-                return Ok(false);
             }
+        }
+
+        match &mut mode {
+            Mode::Menu { section } => match key.code {
+                KeyCode::Esc => mode = Mode::Normal,
+                KeyCode::Left | KeyCode::Char('h') => *section = MenuSection::File,
+                KeyCode::Right | KeyCode::Char('l') => *section = MenuSection::Help,
+                KeyCode::Char('f') | KeyCode::Char('F') if matches!(section, MenuSection::File) => {
+                    mode = Mode::OpenPath {
+                        buffer: self
+                            .path
+                            .as_ref()
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .unwrap_or_default(),
+                    };
+                }
+                KeyCode::Char('t') | KeyCode::Char('T') if matches!(section, MenuSection::File) => {
+                    mode = Mode::ExportTsv {
+                        buffer: String::new(),
+                    };
+                }
+                KeyCode::Char('a') | KeyCode::Char('A') if matches!(section, MenuSection::File) => {
+                    mode = Mode::ExportAscii {
+                        buffer: String::new(),
+                    };
+                }
+                KeyCode::Char('e') | KeyCode::Char('E') if matches!(section, MenuSection::File) => {
+                    mode = Mode::ExportAll {
+                        buffer: String::new(),
+                    };
+                }
+                KeyCode::Char('o') | KeyCode::Char('O') if matches!(section, MenuSection::File) => {
+                    mode = Mode::ExportOdt {
+                        buffer: String::new(),
+                    };
+                }
+                KeyCode::Char('w') | KeyCode::Char('W') if matches!(section, MenuSection::File) => {
+                    mode = Mode::SetMaxColWidth {
+                        buffer: String::new(),
+                    };
+                }
+                KeyCode::Char('x') | KeyCode::Char('X') if matches!(section, MenuSection::File) => {
+                    mode = Mode::SetColWidth {
+                        buffer: String::new(),
+                    };
+                }
+                KeyCode::Char('s') | KeyCode::Char('S') if matches!(section, MenuSection::File) => {
+                    mode = Mode::SortView {
+                        buffer: String::new(),
+                        persist: matches!(key.code, KeyCode::Char('S')),
+                    };
+                }
+                KeyCode::Char('r') | KeyCode::Char('R') if matches!(section, MenuSection::Help) => {
+                    self.status = "Row ops: v·select full rows, then r·move to target row".into();
+                    mode = Mode::Normal;
+                }
+                KeyCode::Char('c') | KeyCode::Char('C') if matches!(section, MenuSection::Help) => {
+                    self.status =
+                        "Col ops: v·select full columns, then c·move to target column".into();
+                    mode = Mode::Normal;
+                }
+                KeyCode::Char('?') if matches!(section, MenuSection::Help) => mode = Mode::Help,
+                _ => {}
+            },
             Mode::Help => {
                 if matches!(
                     key.code,
                     KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?')
                 ) {
-                    self.mode = Mode::Normal;
+                    mode = Mode::Normal;
                 }
-                return Ok(false);
             }
-            Mode::ExportTsv { buffer } => {
-                match key.code {
-                    KeyCode::Enter => {
-                        let fname = buffer.clone();
-                        self.finish_export(false, &fname);
-                        self.mode = Mode::Normal;
-                    }
-                    KeyCode::Esc => self.mode = Mode::Normal,
-                    KeyCode::Char(c) => buffer.push(c),
-                    KeyCode::Backspace => {
-                        buffer.pop();
-                    }
-                    _ => {}
+            Mode::ExportTsv { buffer } => match key.code {
+                KeyCode::Enter => {
+                    let fname = buffer.clone();
+                    self.finish_export(false, &fname);
+                    mode = Mode::Normal;
                 }
-                return Ok(false);
-            }
-            Mode::ExportCsv { buffer } => {
-                match key.code {
-                    KeyCode::Enter => {
-                        let fname = buffer.clone();
-                        self.finish_export(true, &fname);
-                        self.mode = Mode::Normal;
-                    }
-                    KeyCode::Esc => self.mode = Mode::Normal,
-                    KeyCode::Char(c) => buffer.push(c),
-                    KeyCode::Backspace => {
-                        buffer.pop();
-                    }
-                    _ => {}
+                KeyCode::Esc => mode = Mode::Normal,
+                KeyCode::Char(c) => buffer.push(c),
+                KeyCode::Backspace => {
+                    buffer.pop();
                 }
-                return Ok(false);
-            }
-            Mode::ExportAscii { buffer } => {
-                match key.code {
-                    KeyCode::Enter => {
-                        let fname = buffer.clone();
-                        if fname.trim().is_empty() {
-                            match copy_to_clipboard(&self.do_export_ascii()) {
-                                Ok(()) => self.status = "ASCII table copied to clipboard".into(),
-                                Err(e) => self.status = format!("Clipboard error: {e}"),
+                _ => {}
+            },
+            Mode::ExportCsv { buffer } => match key.code {
+                KeyCode::Enter => {
+                    let fname = buffer.clone();
+                    self.finish_export(true, &fname);
+                    mode = Mode::Normal;
+                }
+                KeyCode::Esc => mode = Mode::Normal,
+                KeyCode::Char(c) => buffer.push(c),
+                KeyCode::Backspace => {
+                    buffer.pop();
+                }
+                _ => {}
+            },
+            Mode::ExportAscii { buffer } => match key.code {
+                KeyCode::Enter => {
+                    let fname = buffer.clone();
+                    if fname.trim().is_empty() {
+                        match copy_to_clipboard(&self.do_export_ascii()) {
+                            Ok(()) => self.status = "ASCII table copied to clipboard".into(),
+                            Err(e) => self.status = format!("Clipboard error: {e}"),
+                        }
+                    } else {
+                        match std::fs::write(fname.trim(), self.do_export_ascii()) {
+                            Ok(()) => {
+                                self.status = format!("ASCII table exported to {}", fname.trim())
+                            }
+                            Err(e) => self.status = format!("Write error: {e}"),
+                        }
+                    }
+                    mode = Mode::Normal;
+                }
+                KeyCode::Esc => mode = Mode::Normal,
+                KeyCode::Char(c) => buffer.push(c),
+                KeyCode::Backspace => {
+                    buffer.pop();
+                }
+                _ => {}
+            },
+            Mode::ExportOdt { buffer } => match key.code {
+                KeyCode::Enter => {
+                    let fname = buffer.clone();
+                    if fname.trim().is_empty() {
+                        self.status = "ODT requires a filename".into();
+                    } else {
+                        match std::fs::write(fname.trim(), self.do_export_odt()) {
+                            Ok(()) => self.status = format!("ODT saved to {}", fname.trim()),
+                            Err(e) => self.status = format!("Write error: {e}"),
+                        }
+                    }
+                    mode = Mode::Normal;
+                }
+                KeyCode::Esc => mode = Mode::Normal,
+                KeyCode::Char(c) => buffer.push(c),
+                KeyCode::Backspace => {
+                    buffer.pop();
+                }
+                _ => {}
+            },
+            Mode::ExportAll { buffer } => match key.code {
+                KeyCode::Enter => {
+                    let fname = buffer.clone();
+                    if fname.trim().is_empty() {
+                        let data = if self.anchor.is_some() {
+                            self.do_export(false)
+                        } else {
+                            self.do_export_all()
+                        };
+                        match copy_to_clipboard(&data) {
+                            Ok(()) => {
+                                self.status = if self.anchor.is_some() {
+                                    "Selection copied to clipboard".into()
+                                } else {
+                                    "Full export copied to clipboard".into()
+                                }
+                            }
+                            Err(e) => self.status = format!("Clipboard error: {e}"),
+                        }
+                    } else {
+                        let data = if self.anchor.is_some() {
+                            self.do_export(false)
+                        } else {
+                            self.do_export_all()
+                        };
+                        match std::fs::write(fname.trim(), data) {
+                            Ok(()) => {
+                                self.status = if self.anchor.is_some() {
+                                    format!("Selection saved to {}", fname.trim())
+                                } else {
+                                    format!("Full export saved to {}", fname.trim())
+                                }
+                            }
+                            Err(e) => self.status = format!("Write error: {e}"),
+                        }
+                    }
+                    mode = Mode::Normal;
+                }
+                KeyCode::Esc => mode = Mode::Normal,
+                KeyCode::Char(c) => buffer.push(c),
+                KeyCode::Backspace => {
+                    buffer.pop();
+                }
+                _ => {}
+            },
+            Mode::SetMaxColWidth { buffer } => match key.code {
+                KeyCode::Enter => {
+                    if let Ok(width) = buffer.trim().parse::<usize>() {
+                        if let Some(ref p) = self.path.clone() {
+                            commit_line(
+                                p,
+                                &mut self.offset,
+                                &mut self.state,
+                                &format!("MAX_COL_WIDTH {width}"),
+                            )?;
+                            self.ops_applied = self.ops_applied.saturating_add(1);
+                            self.start_log_watcher_if_needed()?;
+                        } else {
+                            self.state.grid.set_max_col_width(width);
+                        }
+                        self.status = format!("Default column width set to {width}");
+                    }
+                    mode = Mode::Normal;
+                }
+                KeyCode::Esc => mode = Mode::Normal,
+                KeyCode::Char(c) => buffer.push(c),
+                KeyCode::Backspace => {
+                    buffer.pop();
+                }
+                _ => {}
+            },
+            Mode::SetColWidth { buffer } => match key.code {
+                KeyCode::Enter => {
+                    let raw = buffer.trim();
+                    if let Some((lhs, rhs)) = raw.split_once('=') {
+                        if let (Ok(col), Ok(width)) =
+                            (lhs.trim().parse::<usize>(), rhs.trim().parse::<usize>())
+                        {
+                            let line =
+                                format!("COL_WIDTH {} {}", addr::excel_column_name(col), width);
+                            if let Some(ref p) = self.path.clone() {
+                                commit_line(p, &mut self.offset, &mut self.state, &line)?;
+                                self.ops_applied = self.ops_applied.saturating_add(1);
+                                self.start_log_watcher_if_needed()?;
+                            } else {
+                                self.state
+                                    .grid
+                                    .set_col_width(MARGIN_COLS + col, Some(width));
+                            }
+                            self.status = format!("Column {col} width set to {width}");
+                        }
+                    } else if let Ok(col) = raw.parse::<usize>() {
+                        let line = format!("COL_WIDTH {}", addr::excel_column_name(col));
+                        if let Some(ref p) = self.path.clone() {
+                            commit_line(p, &mut self.offset, &mut self.state, &line)?;
+                            self.ops_applied = self.ops_applied.saturating_add(1);
+                            self.start_log_watcher_if_needed()?;
+                        } else {
+                            self.state.grid.set_col_width(MARGIN_COLS + col, None);
+                        }
+                        self.status = format!("Column {col} width override cleared");
+                    }
+                    mode = Mode::Normal;
+                }
+                KeyCode::Esc => mode = Mode::Normal,
+                KeyCode::Char(c) => buffer.push(c),
+                KeyCode::Backspace => {
+                    buffer.pop();
+                }
+                _ => {}
+            },
+            Mode::SortView { buffer, persist } => match key.code {
+                KeyCode::Enter => {
+                    let cols = buffer
+                        .split(',')
+                        .filter_map(|s| {
+                            let s = s.trim();
+                            if s.is_empty() {
+                                None
+                            } else {
+                                addr::parse_excel_column(s).map(|c| MARGIN_COLS + c as usize)
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    if *persist {
+                        let line = format!(
+                            "SORT {}",
+                            cols.iter()
+                                .map(|c| addr::excel_column_name(c.saturating_sub(MARGIN_COLS)))
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        );
+                        if let Some(ref p) = self.path.clone() {
+                            commit_line(p, &mut self.offset, &mut self.state, &line)?;
+                            self.ops_applied = self.ops_applied.saturating_add(1);
+                            self.start_log_watcher_if_needed()?;
+                        } else {
+                            self.state.grid.set_view_sort_cols(cols);
+                        }
+                    } else {
+                        self.state.grid.set_view_sort_cols(cols);
+                    }
+                    self.status = if *persist {
+                        "View sort saved".into()
+                    } else {
+                        "View sort updated".into()
+                    };
+                    mode = Mode::Normal;
+                }
+                KeyCode::Esc => mode = Mode::Normal,
+                KeyCode::Char(c) => buffer.push(c),
+                KeyCode::Backspace => {
+                    buffer.pop();
+                }
+                _ => {}
+            },
+            Mode::QuitPrompt => match key.code {
+                KeyCode::Char('q') | KeyCode::Char('Q') => {
+                    self.mode = mode;
+                    return Ok(true);
+                }
+                KeyCode::Char('b') | KeyCode::Char('B') | KeyCode::Esc => mode = Mode::Normal,
+                _ => {}
+            },
+            Mode::OpenPath { buffer } => match key.code {
+                KeyCode::Enter => {
+                    let path = PathBuf::from(buffer.trim());
+                    self.path = Some(path.clone());
+                    self.offset = 0;
+                    self.state = SheetState::new(1, 1);
+                    if path.exists() {
+                        let ext = path
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .unwrap_or("")
+                            .to_lowercase();
+                        match ext.as_str() {
+                            "tsv" => {
+                                if let Ok(data) = std::fs::read_to_string(&path) {
+                                    crate::io::import_tsv(&data, &mut self.state);
+                                }
+                            }
+                            "csv" => {
+                                if let Ok(data) = std::fs::read_to_string(&path) {
+                                    crate::io::import_csv(&data, &mut self.state);
+                                }
+                            }
+                            _ => {
+                                if let Ok((off, n)) = load_full(&path, &mut self.state) {
+                                    self.offset = off;
+                                    self.ops_applied = n;
+                                }
+                            }
+                        }
+                    }
+                    self.watcher = if path.exists() {
+                        Some(LogWatcher::new(path.clone()).map_err(IoError::from)?)
+                    } else {
+                        None
+                    };
+                    self.cursor = SheetCursor {
+                        row: HEADER_ROWS,
+                        col: MARGIN_COLS,
+                    };
+                    self.row_scroll = 0;
+                    self.col_scroll = 0;
+                    self.status = if path.exists() {
+                        format!("Opened {}", path.display())
+                    } else {
+                        format!("New file {}", path.display())
+                    };
+                    mode = Mode::Normal;
+                }
+                KeyCode::Esc => mode = Mode::Normal,
+                KeyCode::Char(c) => buffer.push(c),
+                KeyCode::Backspace => {
+                    buffer.pop();
+                }
+                _ => {}
+            },
+            Mode::Edit {
+                buffer,
+                formula_cursor,
+            } => match key.code {
+                KeyCode::Enter => {
+                    self.commit_edit_buffer(buffer)?;
+                    mode = Mode::Normal;
+                }
+                KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down
+                    if buffer.trim() == "=" =>
+                {
+                    let temp = formula_cursor.get_or_insert(self.cursor);
+                    match key.code {
+                        KeyCode::Left if temp.col > 0 => temp.col = temp.col.saturating_sub(1),
+                        KeyCode::Right => temp.col = temp.col.saturating_add(1),
+                        KeyCode::Up if temp.row > 0 => temp.row = temp.row.saturating_sub(1),
+                        KeyCode::Down => temp.row = temp.row.saturating_add(1),
+                        _ => {}
+                    }
+                    temp.clamp(&self.state.grid);
+                    let addr = temp.to_addr(&self.state.grid);
+                    *buffer = format!("={}", self.formula_ref_for_addr(&addr));
+                }
+                KeyCode::Up => {
+                    let raw = buffer.clone();
+                    self.commit_edit_buffer(&raw)?;
+                    if self.cursor.row > 0 {
+                        self.cursor.row = self.cursor.row.saturating_sub(1);
+                    }
+                    self.cursor.clamp(&self.state.grid);
+                    self.state
+                        .grid
+                        .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
+                    let addr = self.cursor.to_addr(&self.state.grid);
+                    let cur = cell_display(&self.state.grid, &addr);
+                    mode = Mode::Edit {
+                        buffer: cur.clone(),
+                        formula_cursor: if cur.trim() == "=" {
+                            Some(self.cursor)
+                        } else {
+                            None
+                        },
+                    };
+                }
+                KeyCode::Down => {
+                    let raw = buffer.clone();
+                    self.commit_edit_buffer(&raw)?;
+                    let hr = HEADER_ROWS;
+                    let last_main = hr + self.state.grid.main_rows().saturating_sub(1);
+                    if self.cursor.row == last_main
+                        && trailing_blank_main_rows(&self.state) < NAV_BLANK_ROWS
+                    {
+                        self.state.grid.grow_main_row_at_bottom();
+                    }
+                    self.cursor.row = self.cursor.row.saturating_add(1);
+                    self.cursor.clamp(&self.state.grid);
+                    self.state
+                        .grid
+                        .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
+                    let addr = self.cursor.to_addr(&self.state.grid);
+                    let cur = cell_display(&self.state.grid, &addr);
+                    mode = Mode::Edit {
+                        buffer: cur.clone(),
+                        formula_cursor: if cur.trim() == "=" {
+                            Some(self.cursor)
+                        } else {
+                            None
+                        },
+                    };
+                }
+                KeyCode::Esc => mode = Mode::Normal,
+                KeyCode::Char(c) => buffer.push(c),
+                KeyCode::Backspace => {
+                    buffer.pop();
+                }
+                _ => {}
+            },
+            Mode::Normal => {
+                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('q') {
+                    self.mode = mode;
+                    return Ok(true);
+                }
+                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('z') {
+                    if let Some(undo_op) = self.op_history.pop() {
+                        if let Some(ref p) = self.path.clone() {
+                            if let Err(e) =
+                                commit_op(p, &mut self.offset, &mut self.state, &undo_op)
+                            {
+                                self.status = format!("Undo failed: {}", e);
+                            } else {
+                                self.ops_applied = self.ops_applied.saturating_add(1);
+                                self.status = "Undo applied".to_string();
                             }
                         } else {
-                            match std::fs::write(fname.trim(), self.do_export_ascii()) {
-                                Ok(()) => {
-                                    self.status =
-                                        format!("ASCII table exported to {}", fname.trim())
-                                }
-                                Err(e) => self.status = format!("Write error: {e}"),
-                            }
+                            undo_op.apply(&mut self.state);
+                            self.status = "Undo applied (memory only)".to_string();
                         }
-                        self.mode = Mode::Normal;
+                    } else {
+                        self.status = "Nothing to undo".to_string();
                     }
-                    KeyCode::Esc => self.mode = Mode::Normal,
-                    KeyCode::Char(c) => buffer.push(c),
-                    KeyCode::Backspace => {
-                        buffer.pop();
-                    }
-                    _ => {}
+                    self.mode = mode;
+                    return Ok(false);
                 }
-                return Ok(false);
-            }
-            Mode::ExportAll { buffer } => {
+
                 match key.code {
-                    KeyCode::Enter => {
-                        let fname = buffer.clone();
-                        if fname.trim().is_empty() {
-                            match copy_to_clipboard(&self.do_export_all()) {
-                                Ok(()) => self.status = "Full export copied to clipboard".into(),
-                                Err(e) => self.status = format!("Clipboard error: {e}"),
-                            }
-                        } else {
-                            match std::fs::write(fname.trim(), self.do_export_all()) {
-                                Ok(()) => {
-                                    self.status = format!("Full export saved to {}", fname.trim())
-                                }
-                                Err(e) => self.status = format!("Write error: {e}"),
-                            }
+                    KeyCode::Esc => {
+                        self.anchor = None;
+                        if self.anchor.is_none() {
+                            mode = Mode::QuitPrompt;
                         }
-                        self.mode = Mode::Normal;
                     }
-                    KeyCode::Esc => self.mode = Mode::Normal,
-                    KeyCode::Char(c) => buffer.push(c),
-                    KeyCode::Backspace => {
-                        buffer.pop();
-                    }
-                    _ => {}
-                }
-                return Ok(false);
-            }
-            Mode::OpenPath { buffer } => {
-                match key.code {
-                    KeyCode::Enter => {
-                        let path = PathBuf::from(buffer.trim());
-                        self.path = Some(path.clone());
-                        self.offset = 0;
-                        self.state = SheetState::new(1, 1);
-                        if path.exists() {
-                            let ext = path
-                                .extension()
-                                .and_then(|e| e.to_str())
-                                .unwrap_or("")
-                                .to_lowercase();
-                            match ext.as_str() {
-                                "tsv" => {
-                                    if let Ok(data) = std::fs::read_to_string(&path) {
-                                        crate::io::import_tsv(&data, &mut self.state);
-                                    }
-                                }
-                                "csv" => {
-                                    if let Ok(data) = std::fs::read_to_string(&path) {
-                                        crate::io::import_csv(&data, &mut self.state);
-                                    }
-                                }
-                                _ => {
-                                    if let Ok((off, n)) = load_full(&path, &mut self.state) {
-                                        self.offset = off;
-                                        self.ops_applied = n;
-                                    }
-                                }
+                    KeyCode::Left if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                        if self.cursor.col > 0 {
+                            if self.anchor.is_none() {
+                                self.anchor = Some(self.cursor);
                             }
+                            self.cursor.col = self.cursor.col.saturating_sub(1);
+                            self.cursor.clamp(&self.state.grid);
                         }
-                        self.watcher = if path.exists() {
-                            Some(LogWatcher::new(path.clone()).map_err(IoError::from)?)
+                    }
+                    KeyCode::Right if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                        if self.anchor.is_none() {
+                            self.anchor = Some(self.cursor);
+                        }
+                        self.cursor.col = self.cursor.col.saturating_add(1);
+                        self.cursor.clamp(&self.state.grid);
+                        self.state
+                            .grid
+                            .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
+                    }
+                    KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                        if self.cursor.row > 0 {
+                            if self.anchor.is_none() {
+                                self.anchor = Some(self.cursor);
+                            }
+                            self.cursor.row = self.cursor.row.saturating_sub(1);
+                            self.cursor.clamp(&self.state.grid);
+                        }
+                    }
+                    KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                        if self.anchor.is_none() {
+                            self.anchor = Some(self.cursor);
+                        }
+                        self.cursor.row = self.cursor.row.saturating_add(1);
+                        self.cursor.clamp(&self.state.grid);
+                        self.state
+                            .grid
+                            .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
+                    }
+                    KeyCode::Char('o') => {
+                        mode = Mode::OpenPath {
+                            buffer: self
+                                .path
+                                .as_ref()
+                                .map(|p| p.to_string_lossy().into_owned())
+                                .unwrap_or_default(),
+                        };
+                    }
+                    KeyCode::Char('e') | KeyCode::Enter => {
+                        let addr = self.cursor.to_addr(&self.state.grid);
+                        let cur = cell_display(&self.state.grid, &addr);
+                        mode = Mode::Edit {
+                            buffer: cur.clone(),
+                            formula_cursor: if cur.trim() == "=" {
+                                Some(self.cursor)
+                            } else {
+                                None
+                            },
+                        };
+                    }
+                    KeyCode::Char('v') => {
+                        self.anchor = if self.anchor.is_none() {
+                            Some(self.cursor)
                         } else {
                             None
                         };
-                        self.cursor = SheetCursor {
-                            row: HEADER_ROWS,
-                            col: MARGIN_COLS,
-                        };
-                        self.row_scroll = 0;
-                        self.col_scroll = 0;
-                        self.mode = Mode::Normal;
-                        self.status = if path.exists() {
-                            format!("Opened {}", path.display())
-                        } else {
-                            format!("New file {}", path.display())
-                        };
+                        self.selection_kind = SelectionKind::Cells;
                     }
-                    KeyCode::Esc => self.mode = Mode::Normal,
-                    KeyCode::Char(c) => buffer.push(c),
-                    KeyCode::Backspace => {
-                        buffer.pop();
-                    }
-                    _ => {}
-                }
-                return Ok(false);
-            }
-            Mode::Edit { buffer } => {
-                match key.code {
-                    KeyCode::Enter => {
-                        let (addr, value) = if let Some((a, v)) = parse_cell_shorthand(buffer) {
-                            (a, v)
-                        } else {
-                            (self.cursor.to_addr(&self.state.grid), buffer.clone())
-                        };
-                        let op = Op::SetCell { addr, value };
-                        self.op_history.push(op.clone());
-                        if let Some(ref p) = self.path.clone() {
-                            commit_op(p, &mut self.offset, &mut self.state, &op)?;
-                            self.ops_applied = self.ops_applied.saturating_add(1);
-                            self.start_log_watcher_if_needed()?;
-                        } else {
-                            op.apply(&mut self.state);
-                            self.status = "No file — edit in memory only".into();
+                    KeyCode::Char('t') => {
+                        mode = Mode::ExportTsv {
+                            buffer: String::new(),
                         }
-                        self.mode = Mode::Normal;
                     }
-                    KeyCode::Esc => self.mode = Mode::Normal,
-                    KeyCode::Char(c) => buffer.push(c),
-                    KeyCode::Backspace => {
-                        buffer.pop();
+                    KeyCode::Char('c') => {
+                        if self.anchor.is_some() {
+                            if let Some((mc0, mc1)) = self.selection_main_col_range() {
+                                let left = MARGIN_COLS;
+                                let right = MARGIN_COLS + self.state.grid.main_cols();
+                                if self.cursor.col < left || self.cursor.col >= right {
+                                    self.status = "Place cursor on a main column as move target, then press c".into();
+                                } else {
+                                    let count = mc1 - mc0 + 1;
+                                    let to = (self.cursor.col - left) as u32;
+                                    let op = Op::MoveColRange {
+                                        from: mc0,
+                                        count,
+                                        to,
+                                    };
+                                    self.push_inverse_op(&op);
+                                    if let Some(ref p) = self.path.clone() {
+                                        commit_op(p, &mut self.offset, &mut self.state, &op)?;
+                                        self.ops_applied = self.ops_applied.saturating_add(1);
+                                        self.start_log_watcher_if_needed()?;
+                                    } else {
+                                        op.apply(&mut self.state);
+                                    }
+                                    self.anchor = None;
+                                    self.status = format!(
+                                        "Moved cols {mc0}..{} → before col {to}",
+                                        mc0 + count
+                                    );
+                                }
+                            } else {
+                                self.expand_selection_to_cols();
+                                self.status = "Selection expanded to columns".into();
+                            }
+                        } else {
+                            mode = Mode::ExportCsv {
+                                buffer: String::new(),
+                            };
+                        }
                     }
-                    _ => {}
-                }
-                return Ok(false);
-            }
-            Mode::Normal => {}
-        }
-
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('q') {
-            return Ok(true);
-        }
-
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('z') {
-            if let Some(last_op) = self.op_history.pop() {
-                if let Some(reverse_op) = self.state.reverse_op(&last_op) {
-                    if let Some(ref p) = self.path.clone() {
-                        if let Err(e) = commit_op(p, &mut self.offset, &mut self.state, &reverse_op)
+                    KeyCode::Char('r') => {
+                        if let Some((mr0, mr1)) = self.selection_main_row_range() {
+                            let hr = HEADER_ROWS;
+                            if self.cursor.row < hr
+                                || self.cursor.row >= hr + self.state.grid.main_rows()
+                            {
+                                self.status =
+                                    "Place cursor on a main row as move target, then press r"
+                                        .into();
+                            } else {
+                                let count = mr1 - mr0 + 1;
+                                let to = (self.cursor.row - hr) as u32;
+                                let op = Op::MoveRowRange {
+                                    from: mr0,
+                                    count,
+                                    to,
+                                };
+                                self.push_inverse_op(&op);
+                                if let Some(ref p) = self.path.clone() {
+                                    commit_op(p, &mut self.offset, &mut self.state, &op)?;
+                                    self.ops_applied = self.ops_applied.saturating_add(1);
+                                    self.start_log_watcher_if_needed()?;
+                                } else {
+                                    op.apply(&mut self.state);
+                                }
+                                self.anchor = None;
+                                self.status =
+                                    format!("Moved rows {mr0}..{} → before row {to}", mr0 + count);
+                            }
+                        } else {
+                            self.expand_selection_to_rows();
+                            self.status = "Selection expanded to rows".into();
+                        }
+                    }
+                    KeyCode::Delete | KeyCode::Backspace => {
+                        if !self.delete_selection() {
+                            if let Some(addr) = self.addr_at(self.cursor.row, self.cursor.col) {
+                                let op = Op::SetCell {
+                                    addr,
+                                    value: String::new(),
+                                };
+                                self.push_inverse_op(&op);
+                                if let Some(ref p) = self.path.clone() {
+                                    commit_op(p, &mut self.offset, &mut self.state, &op)?;
+                                    self.ops_applied = self.ops_applied.saturating_add(1);
+                                    self.start_log_watcher_if_needed()?;
+                                } else {
+                                    op.apply(&mut self.state);
+                                }
+                                self.status = "Cell deleted".into();
+                            }
+                        }
+                    }
+                    KeyCode::Left | KeyCode::Char('h') => {
+                        self.cursor.col = self.cursor.col.saturating_sub(1);
+                        self.cursor.clamp(&self.state.grid);
+                        self.state
+                            .grid
+                            .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
+                    }
+                    KeyCode::Right | KeyCode::Char('l') => {
+                        let lm = MARGIN_COLS;
+                        let mc = self.state.grid.main_cols();
+                        if self.cursor.col == lm + mc.saturating_sub(1)
+                            && trailing_blank_main_cols(&self.state) < NAV_BLANK_COLS
                         {
-                            self.status = format!("Undo failed: {}", e);
-                        } else {
-                            self.ops_applied = self.ops_applied.saturating_add(1);
-                            self.status = "Undo applied".to_string();
+                            self.state.grid.grow_main_col_at_right();
                         }
-                    } else {
-                        reverse_op.apply(&mut self.state);
-                        self.status = "Undo applied (memory only)".to_string();
+                        self.cursor.col = self.cursor.col.saturating_add(1);
+                        self.cursor.clamp(&self.state.grid);
+                        self.state
+                            .grid
+                            .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
                     }
-                } else {
-                    self.status = "Cannot undo this operation".to_string();
-                }
-            } else {
-                self.status = "Nothing to undo".to_string();
-            }
-            return Ok(false);
-        }
-
-        match key.code {
-            KeyCode::Esc => {
-                self.anchor = None;
-            }
-            KeyCode::Left if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                if self.cursor.col > 0 {
-                    if self.anchor.is_none() {
-                        self.anchor = Some(self.cursor);
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.cursor.row = self.cursor.row.saturating_sub(1);
+                        self.cursor.clamp(&self.state.grid);
+                        self.state
+                            .grid
+                            .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
                     }
-                    self.cursor.col = self.cursor.col.saturating_sub(1);
-                    self.cursor.clamp(&self.state.grid);
-                }
-            }
-            KeyCode::Right if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                if self.anchor.is_none() {
-                    self.anchor = Some(self.cursor);
-                }
-                self.cursor.col = self.cursor.col.saturating_add(1);
-                self.cursor.clamp(&self.state.grid);
-                self.state
-                    .grid
-                    .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
-            }
-            KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                if self.cursor.row > 0 {
-                    if self.anchor.is_none() {
-                        self.anchor = Some(self.cursor);
-                    }
-                    self.cursor.row = self.cursor.row.saturating_sub(1);
-                    self.cursor.clamp(&self.state.grid);
-                }
-            }
-            KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                if self.anchor.is_none() {
-                    self.anchor = Some(self.cursor);
-                }
-                self.cursor.row = self.cursor.row.saturating_add(1);
-                self.cursor.clamp(&self.state.grid);
-                self.state
-                    .grid
-                    .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
-            }
-            KeyCode::Char('?') => self.mode = Mode::Help,
-            KeyCode::Char(c) if !c.is_control() => {
-                if matches!(self.mode, Mode::Normal) {
-                    self.mode = Mode::Edit {
-                        buffer: c.to_string(),
-                    };
-                }
-            }
-            KeyCode::Char('o') => {
-                self.mode = Mode::OpenPath {
-                    buffer: self
-                        .path
-                        .as_ref()
-                        .map(|p| p.to_string_lossy().into_owned())
-                        .unwrap_or_default(),
-                };
-            }
-            KeyCode::Char('e') | KeyCode::Enter => {
-                let addr = self.cursor.to_addr(&self.state.grid);
-                let cur = cell_display(&self.state.grid, &addr);
-                self.mode = Mode::Edit { buffer: cur };
-            }
-            KeyCode::Char('v') => {
-                self.anchor = if self.anchor.is_none() {
-                    Some(self.cursor)
-                } else {
-                    None
-                };
-            }
-            KeyCode::Char('t') => {
-                self.mode = Mode::ExportTsv {
-                    buffer: String::new(),
-                };
-            }
-            KeyCode::Char('c') => {
-                if self.anchor.is_some() {
-                    if let Some((mc0, mc1)) = self.selection_main_col_range() {
-                        let left = MARGIN_COLS;
-                        let right = MARGIN_COLS + self.state.grid.main_cols();
-                        if self.cursor.col < left || self.cursor.col >= right {
-                            self.status =
-                                "Place cursor on a main column as move target, then press c".into();
-                            return Ok(false);
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        let hr = HEADER_ROWS;
+                        let last_main = hr + self.state.grid.main_rows().saturating_sub(1);
+                        if self.cursor.row == last_main
+                            && trailing_blank_main_rows(&self.state) < NAV_BLANK_ROWS
+                        {
+                            self.state.grid.grow_main_row_at_bottom();
                         }
-                        let count = mc1 - mc0 + 1;
-                        let to = (self.cursor.col - left) as u32;
-                        let op = Op::MoveColRange {
-                            from: mc0,
-                            count,
-                            to,
+                        self.cursor.row = self.cursor.row.saturating_add(1);
+                        self.cursor.clamp(&self.state.grid);
+                        self.state
+                            .grid
+                            .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
+                    }
+                    KeyCode::Char('?') => {
+                        mode = Mode::Menu {
+                            section: MenuSection::Help,
+                        }
+                    }
+                    KeyCode::Char(c) if !c.is_control() => {
+                        let buffer = c.to_string();
+                        mode = Mode::Edit {
+                            formula_cursor: if buffer.trim() == "=" {
+                                Some(self.cursor)
+                            } else {
+                                None
+                            },
+                            buffer,
                         };
-                        self.op_history.push(op.clone());
-                        if let Some(ref p) = self.path.clone() {
-                            commit_op(p, &mut self.offset, &mut self.state, &op)?;
-                            self.ops_applied = self.ops_applied.saturating_add(1);
-                            self.start_log_watcher_if_needed()?;
-                        } else {
-                            op.apply(&mut self.state);
-                        }
-                        self.anchor = None;
-                        self.status =
-                            format!("Moved cols {mc0}..{} → before col {to}", mc0 + count);
-                    } else {
-                        self.status = "Select full main columns first (v), then c to move".into();
                     }
-                } else {
-                    self.mode = Mode::ExportCsv {
-                        buffer: String::new(),
-                    };
+                    _ => {}
                 }
             }
-            KeyCode::Char('r') => {
-                if let Some((mr0, mr1)) = self.selection_main_row_range() {
-                    let hr = HEADER_ROWS;
-                    if self.cursor.row < hr || self.cursor.row >= hr + self.state.grid.main_rows() {
-                        self.status =
-                            "Place cursor on a main row as move target, then press r".into();
-                        return Ok(false);
-                    }
-                    let count = mr1 - mr0 + 1;
-                    let to = (self.cursor.row - hr) as u32;
-                    let op = Op::MoveRowRange {
-                        from: mr0,
-                        count,
-                        to,
-                    };
-                    self.op_history.push(op.clone());
-                    if let Some(ref p) = self.path.clone() {
-                        commit_op(p, &mut self.offset, &mut self.state, &op)?;
-                        self.ops_applied = self.ops_applied.saturating_add(1);
-                        self.start_log_watcher_if_needed()?;
-                    } else {
-                        op.apply(&mut self.state);
-                    }
-                    self.anchor = None;
-                    self.status = format!("Moved rows {mr0}..{} → before row {to}", mr0 + count);
-                } else {
-                    self.status = "Select full main rows first (v), then r to move".into();
-                }
-            }
-            KeyCode::Left | KeyCode::Char('h') => {
-                self.cursor.col = self.cursor.col.saturating_sub(1);
-                self.cursor.clamp(&self.state.grid);
-                self.state
-                    .grid
-                    .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
-            }
-            KeyCode::Right | KeyCode::Char('l') => {
-                let lm = MARGIN_COLS;
-                let mc = self.state.grid.main_cols();
-                if self.cursor.col == lm + mc.saturating_sub(1)
-                    && trailing_blank_main_cols(&self.state) < NAV_BLANK
-                {
-                    self.state.grid.grow_main_col_at_right();
-                }
-                self.cursor.col = self.cursor.col.saturating_add(1);
-                self.cursor.clamp(&self.state.grid);
-                self.state
-                    .grid
-                    .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.cursor.row = self.cursor.row.saturating_sub(1);
-                self.cursor.clamp(&self.state.grid);
-                self.state
-                    .grid
-                    .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                let hr = HEADER_ROWS;
-                let last_main = hr + self.state.grid.main_rows().saturating_sub(1);
-                if self.cursor.row == last_main && trailing_blank_main_rows(&self.state) < NAV_BLANK
-                {
-                    self.state.grid.grow_main_row_at_bottom();
-                }
-                self.cursor.row = self.cursor.row.saturating_add(1);
-                self.cursor.clamp(&self.state.grid);
-                self.state
-                    .grid
-                    .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
-            }
-            KeyCode::Char('q') => return Ok(true),
-            _ => {}
         }
 
+        self.mode = mode;
         Ok(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn undo_restores_previous_cell_value() {
+        let mut app = App::new(None);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "old".into());
+
+        let op = Op::SetCell {
+            addr: CellAddr::Main { row: 0, col: 0 },
+            value: "new".into(),
+        };
+        app.op_history.clear();
+        app.push_inverse_op(&op);
+        op.apply(&mut app.state);
+
+        let undo_op = app.op_history.pop().expect("inverse op");
+        undo_op.apply(&mut app.state);
+
+        assert_eq!(
+            app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }),
+            Some("old")
+        );
     }
 }
 
@@ -1722,6 +2402,17 @@ fn sheet_row_label(logical_row: usize, main_rows: usize) -> String {
 }
 
 fn col_header_label(global_col: usize, main_cols: usize) -> String {
+    let m = MARGIN_COLS;
+    if global_col < m {
+        format!("<{}", m - 1 - global_col)
+    } else if global_col < m + main_cols {
+        addr::excel_column_name(global_col - m)
+    } else {
+        format!(">{}", global_col - m - main_cols)
+    }
+}
+
+fn formula_col_fragment(global_col: usize, main_cols: usize) -> String {
     let m = MARGIN_COLS;
     if global_col < m {
         format!("<{}", m - 1 - global_col)

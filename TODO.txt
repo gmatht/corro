@@ -1,47 +1,37 @@
-* Concise and simple data format:
-  - A1: =3*2
-  - MOVE A(:C) D
-> ON DISK FORMAT DOESN'T seem to have changed
+* A lot of the issues is that the tradition TUI menu where you press Alt-F to get to the file subment and Alt-H to get to the Help submenu etc. doesn't seem to be done you. This makes it hard to test features, and is a bit of a blocker. ✓
 
-* Ctrl-Z Undo. How does this interact with log format. Shouldn't undo other user?
-  - Maybe undo "foo bar" with "undo foo bar"
-  ✓ Implemented Ctrl-Z with operation history
-> I don't see Ctrl-Z do anything
+* entering TOTAL now give JSON: unrecognized log line ✓
 
 * Export to ASCII table ✓
-> Not so many blank margins.
+How do we do this? It says a, but by design a will just enter a in the current cell. ✓
 
 * Export all including headers etc., Export Selection only ✓
-> When cells selected Alt-E seems to still export all.
+> When cells selected Alt-E seems to still export all. ✓
+> Now it doesn't even seem to recognise Alt-E ✓
 
 * Give example of formula Referencing Header/footer/margin cells ✓
-> DESIGN.md specification doesn't seem to work. Fix or give an exact example of a format that works.
+> DESIGN.md specification doesn't seem to work. Fix or give an exact example of a format that works. ✓
 
-* export to ODT (not implemented - requires additional dependency)
-> Add dependancy
+* export to ODT (not implemented - requires additional dependency) ✓
+>Cannot test without menu ✓
 
 * slightly colour row/col/margins that border on data. ✓
-> I don't see any colour
+> I don't see any colour ✓
 
 * Moving to _B shouldn't expand ^* etc. (This makes view jump) ✓
-> I still see the headers ^* being expanded in the view when I scroll down
+> I still see the headers ^* being expanded in the view when I scroll down ✓
 
-* When not editing cell contents DELETE should delete currently selected Cell(s)
+* When selecting, holding down ALT and pressing arrow keys should move selection arround, submitting to disk a `MOVE [selection] [destination]` command at the end of the corro on-disk file. ✓
 
-* When selecting, r should expand selection to select whole row(s), likewise c and col(s)
+* Columns should expand to up to a default 20 chars wide. This should be configurable per file, by adding document settings to the menu and appending `MAX_COL_WIDTH [NEW_WIDTH]` to the file. The user should also be able to override this per column. ✓
 
-* When selecting, holding down ALT and pressing arrow keys should move selection arround, submitting to disk a `MOVE [selection] [destination]` command at the end of the corro on-disk file.
+* There should be an option in the menu to Sort the view. This doesn't change the underlying data, but sorts the view by the Column(s) the user chooses. The user can choose to set the default view in the file, (`SORT [COL1 [COL2 [...]]]`) or just temporarily for this session. Default to temp. ✓
+> The option exists but it doesn't actually sort.
 
-* Columns should expand to up to a default 20 chars wide. This should be configurable per file, by adding document settings to the menu and appending `MAX_COL_WIDTH [NEW_WIDTH]` to the file. The user should also be able to override this per column.
+* Option to run as auto-merge for git. Check that order that conflicting log entries is merged does not affect resulting table. If not, then just write both sets of LOG entries in the original order without the <<<<<<<<<< and >>>>>>>>>> etc. to resolve the merge conflict. Otherwise leave it to human intervention. ✓
 
-* User should be able to scroll down two from last blank line before entering the footer, so that the user can put a blank line between the selected cell and the end of the non-empty data and still be in the main data section. 
+* Should look at expanding Menu to traditional File...Help menu with dropdown submenus. Alt-F to open File Submenu, Alt-H to open Help submenu etc. ✓
 
-* There should be an option in the menu to Sort the view. This doesn't change the underlying data, but sorts the view by the Column(s) the user chooses. The user can choose to set the default view in the file, (`SORT [COL1 [COL2 [...]]]`) or just temporarily for this session. Default to temp.
-
-* Use full underlines like "\e[4mUnderlined Text\e[24m" to seperate data rows from aggregate rows.
-
-* Option to run as auto-merge for git. Check that order that conflicting log entries is merged does not affect resulting table. If not, then just write both sets of LOG entries in the original order without the <<<<<<<<<< and >>>>>>>>>> etc. to resolve the merge conflict. Otherwise leave it to human intervention.
-
-* Show and implement "Quit Corro? \n(Q)uit, (B)ack" dialog on an uncaptured ESC.
-
-* Should look at expanding Menu to traditional File...Help menu with dropdown submenus.
+* After entering just '=' to cell, arrow keys should select which cell this cell is equal to. ✓
+  - Otherwise UpDown arrow keys when editing a cell, should submit edit and go to next/previous cell ✓
+> This is partially implemented, but arrowing here should not change the cell being edited. This should be a seperate kind of selection. ✓

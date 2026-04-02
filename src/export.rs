@@ -2,6 +2,7 @@
 
 use crate::grid::{CellAddr, Grid, FOOTER_ROWS, HEADER_ROWS, MARGIN_COLS};
 use std::io::Write;
+use zip::write::FileOptions;
 
 pub fn export_tsv(grid: &Grid, out: &mut dyn Write) {
     export_delimited(grid, out, '\t', false, false);
@@ -13,20 +14,20 @@ pub fn export_csv(grid: &Grid, out: &mut dyn Write) {
 
 pub fn export_ascii_table(grid: &Grid, out: &mut dyn Write) {
     let mc = grid.main_cols();
-    let mr = grid.main_rows();
     let tc = grid.total_cols();
-    let total_rows = HEADER_ROWS + mr + FOOTER_ROWS;
+    let (row_start, row_end) = ascii_row_bounds(grid);
+    let (col_start, col_end) = ascii_col_bounds(grid);
 
     let mut col_widths: Vec<usize> = vec![0; tc];
-    for c in 0..tc {
+    for c in col_start..col_end {
         let label = col_header_label(c, mc);
         col_widths[c] = label.chars().count().max(1);
     }
 
-    for r in 0..total_rows {
-        for c in 0..tc {
+    for r in row_start..row_end {
+        for c in col_start..col_end {
             let val = cell_value_at(grid, r, c);
-            col_widths[c] = col_widths[c].max(val.chars().count());
+            col_widths[c] = col_widths[c].max(val.chars().count().min(grid.col_width(c)));
         }
     }
 
@@ -49,14 +50,14 @@ pub fn export_ascii_table(grid: &Grid, out: &mut dyn Write) {
     let _ = writeln!(out, "{}", header_line);
     let _ = writeln!(out, "{}", border);
 
-    for r in 0..total_rows {
-        let row_label = sheet_row_label(r, mr);
+    for r in row_start..row_end {
+        let row_label = sheet_row_label(r, grid.main_rows());
         let mut data_line = format!(
             "{:width$}|",
             row_label,
             width = row_label.chars().count().max(4)
         );
-        for c in 0..tc {
+        for c in col_start..col_end {
             let val = cell_value_at(grid, r, c);
             let w = col_widths[c];
             data_line.push_str(&format!(" {:>width$} |", val, width = w));
@@ -68,6 +69,25 @@ pub fn export_ascii_table(grid: &Grid, out: &mut dyn Write) {
 
 pub fn export_all(grid: &Grid, out: &mut dyn Write) {
     export_delimited(grid, out, '\t', true, true);
+}
+
+pub fn export_odt_bytes(grid: &Grid) -> Result<Vec<u8>, std::io::Error> {
+    let cursor = std::io::Cursor::new(Vec::new());
+    let mut zip = zip::ZipWriter::new(cursor);
+    let opt = FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+
+    zip.start_file("mimetype", opt)?;
+    zip.write_all(b"application/vnd.oasis.opendocument.text")?;
+
+    zip.start_file("content.xml", FileOptions::default())?;
+    let xml = odt_content_xml(grid);
+    zip.write_all(xml.as_bytes())?;
+
+    zip.start_file("META-INF/manifest.xml", FileOptions::default())?;
+    zip.write_all(odt_manifest_xml().as_bytes())?;
+
+    let cursor = zip.finish()?;
+    Ok(cursor.into_inner())
 }
 
 pub fn export_selection(grid: &Grid, out: &mut dyn Write, rows: &[usize], cols: &[usize]) {
@@ -211,7 +231,7 @@ fn export_delimited(
         let _ = writeln!(out);
     }
 
-    for r in 0..total_rows {
+    for r in row_order(grid, total_rows) {
         let mut first = true;
         for c in col_start..col_end {
             if !first {
@@ -224,6 +244,158 @@ fn export_delimited(
             } else {
                 let _ = write!(out, "{}", val);
             }
+        }
+        let _ = writeln!(out);
+    }
+}
+
+fn odt_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+fn odt_content_xml(grid: &Grid) -> String {
+    let mr = grid.main_rows();
+    let tc = grid.total_cols();
+    let total_rows = HEADER_ROWS + mr + FOOTER_ROWS;
+
+    let mut s = String::from(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" office:version="1.2"><office:body><office:text><table:table>"#,
+    );
+
+    for c in 0..tc {
+        s.push_str(&format!(
+            r#"<table:table-column table:number-columns-repeated="1" table:style-name="co{}"/>"#,
+            c
+        ));
+    }
+
+    for r in row_order(grid, total_rows) {
+        s.push_str("<table:table-row>");
+        for c in 0..tc {
+            let val = odt_escape(&cell_value_at(grid, r, c));
+            let text = if val.is_empty() {
+                String::new()
+            } else {
+                format!(r#"<text:p>{}</text:p>"#, val)
+            };
+            s.push_str(&format!(
+                r#"<table:table-cell office:value-type="string">{}</table:table-cell>"#,
+                text
+            ));
+        }
+        s.push_str("</table:table-row>");
+    }
+
+    s.push_str("</table:table></office:text></office:body></office:document-content>");
+    s
+}
+
+fn ascii_row_bounds(grid: &Grid) -> (usize, usize) {
+    let hr = HEADER_ROWS;
+    let mr = grid.main_rows();
+    let fr = FOOTER_ROWS;
+    let mut start = 0;
+    while start < hr + mr + fr && !grid.logical_row_has_content(start) {
+        start += 1;
+    }
+    let mut end = hr + mr + fr;
+    while end > start && !grid.logical_row_has_content(end - 1) {
+        end -= 1;
+    }
+    (start, end.max(start + 1))
+}
+
+fn ascii_col_bounds(grid: &Grid) -> (usize, usize) {
+    let tc = grid.total_cols();
+    let mut start = 0;
+    while start < tc && !grid.logical_col_has_content(start) {
+        start += 1;
+    }
+    let mut end = tc;
+    while end > start && !grid.logical_col_has_content(end - 1) {
+        end -= 1;
+    }
+    (start, end.max(start + 1))
+}
+
+fn odt_manifest_xml() -> String {
+    String::from(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<manifest:manifest xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0" manifest:version="1.2">
+<manifest:file-entry manifest:full-path="/" manifest:media-type="application/vnd.oasis.opendocument.text"/>
+<manifest:file-entry manifest:full-path="content.xml" manifest:media-type="text/xml"/>
+</manifest:manifest>"#,
+    )
+}
+
+fn row_order(grid: &Grid, total_rows: usize) -> Vec<usize> {
+    let hr = HEADER_ROWS;
+    let mr = grid.main_rows();
+    let fr = FOOTER_ROWS;
+    let mut rows: Vec<usize> = Vec::with_capacity(total_rows);
+    rows.extend(0..hr);
+
+    rows.extend(grid.sorted_main_rows().into_iter().map(|r| hr + r));
+
+    rows.extend((0..fr).map(|r| hr + mr + r));
+    rows
+}
+
+pub fn export_sorted_tsv(grid: &Grid, out: &mut dyn Write, sort_cols: &[usize]) {
+    let mr = grid.main_rows();
+    let mc = grid.main_cols();
+    if sort_cols.is_empty() {
+        export_tsv(grid, out);
+        return;
+    }
+
+    let mut rows: Vec<usize> = (0..mr).collect();
+    rows.sort_by(|&a, &b| {
+        for &c in sort_cols {
+            let va = grid
+                .get(&CellAddr::Main {
+                    row: a as u32,
+                    col: c as u32,
+                })
+                .unwrap_or("");
+            let vb = grid
+                .get(&CellAddr::Main {
+                    row: b as u32,
+                    col: c as u32,
+                })
+                .unwrap_or("");
+            let ord = va.cmp(vb);
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+        }
+        a.cmp(&b)
+    });
+
+    for (i, c) in (0..mc).enumerate() {
+        if i > 0 {
+            let _ = write!(out, "\t");
+        }
+        let _ = write!(out, "{}", col_header_label(MARGIN_COLS + c, mc));
+    }
+    let _ = writeln!(out);
+
+    for r in rows {
+        for c in 0..mc {
+            if c > 0 {
+                let _ = write!(out, "\t");
+            }
+            let val = grid
+                .get(&CellAddr::Main {
+                    row: r as u32,
+                    col: c as u32,
+                })
+                .unwrap_or("");
+            let _ = write!(out, "{}", val);
         }
         let _ = writeln!(out);
     }

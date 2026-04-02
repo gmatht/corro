@@ -1,7 +1,7 @@
 //! Append-only log I/O, file watching, and tabular import for multi-instance sync.
 
 use crate::grid::CellAddr;
-use crate::ops::{apply_line, append_op, replay_lines, Op, SheetState};
+use crate::ops::{append_line, append_op, apply_line, replay_lines, Op, SheetState};
 use notify::{RecursiveMode, Watcher};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
@@ -26,7 +26,7 @@ pub fn load_full(path: &Path, state: &mut SheetState) -> Result<(u64, usize), Io
     Ok((data.len() as u64, n))
 }
 
-/// Read new bytes from `path` starting at `byte_offset`, apply as JSONL lines, return new EOF offset.
+/// Read new bytes from `path` starting at `byte_offset`, apply appended log lines, return new EOF offset.
 pub fn tail_apply(path: &Path, byte_offset: u64, state: &mut SheetState) -> Result<u64, IoError> {
     let meta = fs::metadata(path)?;
     let len = meta.len();
@@ -51,8 +51,25 @@ pub fn tail_apply(path: &Path, byte_offset: u64, state: &mut SheetState) -> Resu
 }
 
 /// Append `op` to the log and apply newly written bytes from `offset` (single-writer tail).
-pub fn commit_op(path: &Path, offset: &mut u64, state: &mut SheetState, op: &Op) -> Result<(), IoError> {
+pub fn commit_op(
+    path: &Path,
+    offset: &mut u64,
+    state: &mut SheetState,
+    op: &Op,
+) -> Result<(), IoError> {
     append_op(path, op)?;
+    *offset = tail_apply(path, *offset, state)?;
+    Ok(())
+}
+
+/// Append a plain-text document-setting line and apply it to the live state.
+pub fn commit_line(
+    path: &Path,
+    offset: &mut u64,
+    state: &mut SheetState,
+    line: &str,
+) -> Result<(), IoError> {
+    append_line(path, line)?;
     *offset = tail_apply(path, *offset, state)?;
     Ok(())
 }
@@ -102,7 +119,9 @@ fn import_delimited(data: &str, state: &mut SheetState, delim: char) {
 
     let mc = max_cols as u32;
     let mr = data_rows.len() as u32;
-    state.grid.set_main_size(mr.max(1) as usize, mc.max(1) as usize);
+    state
+        .grid
+        .set_main_size(mr.max(1) as usize, mc.max(1) as usize);
 
     if let Some(hdr) = header_row {
         use crate::grid::HEADER_ROWS;

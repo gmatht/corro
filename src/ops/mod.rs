@@ -1,5 +1,6 @@
-//! Append-only JSONL operations and replay onto [`SheetState`].
+//! Append-only log operations and replay onto [`SheetState`].
 
+use crate::addr::parse_excel_column;
 use crate::grid::{CellAddr, Grid, MainRange};
 use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
@@ -43,6 +44,9 @@ pub enum Op {
     SetMainSize { main_rows: u32, main_cols: u32 },
     MoveRowRange { from: u32, count: u32, to: u32 },
     MoveColRange { from: u32, count: u32, to: u32 },
+    SetMaxColWidth { width: usize },
+    SetColWidth { col: usize, width: Option<usize> },
+    SetViewSortCols { cols: Vec<usize> },
     Undo { target: String },
 }
 
@@ -70,13 +74,78 @@ impl Op {
                     .grid
                     .move_main_cols(*from as usize, *count as usize, *to as usize);
             }
+            Op::SetMaxColWidth { width } => {
+                state.grid.set_max_col_width(*width);
+            }
+            Op::SetColWidth { col, width } => {
+                state.grid.set_col_width(*col, *width);
+            }
+            Op::SetViewSortCols { cols } => {
+                state.grid.set_view_sort_cols(cols.clone());
+            }
             Op::Undo { .. } => {}
         }
     }
 }
 
+fn addr_text(addr: &CellAddr) -> String {
+    match addr {
+        CellAddr::Header { row, col } => format!("^{}:{}", (b'Z' - *row) as char, col),
+        CellAddr::Footer { row, col } => format!("_{}:{}", (b'A' + *row) as char, col),
+        CellAddr::Main { row, col } => format!(
+            "{}{}",
+            crate::addr::excel_column_name(*col as usize),
+            row + 1
+        ),
+        CellAddr::Left { col, row } => format!("<{}:{}", col, row + 1),
+        CellAddr::Right { col, row } => format!(">{}:{}", col, row + 1),
+    }
+}
+
+fn parse_op_text(line: &str) -> Option<Op> {
+    let mut parts = line.split_whitespace();
+    let cmd = parts.next()?.to_ascii_uppercase();
+    match cmd.as_str() {
+        "SET" => {
+            let addr = parts.next()?;
+            let value = parts.collect::<Vec<_>>().join(" ");
+            let (addr, _) = crate::addr::parse_cell_ref_at(addr)?;
+            Some(Op::SetCell { addr, value })
+        }
+        "MOVE" => {
+            let kind = parts.next()?.to_ascii_uppercase();
+            let from = parts.next()?.parse::<u32>().ok()?;
+            let count = parts.next()?.parse::<u32>().ok()?;
+            let to = parts.next()?.parse::<u32>().ok()?;
+            match kind.as_str() {
+                "ROW" => Some(Op::MoveRowRange { from, count, to }),
+                "COL" => Some(Op::MoveColRange { from, count, to }),
+                _ => None,
+            }
+        }
+        "MAX_COL_WIDTH" => parts
+            .next()?
+            .parse::<usize>()
+            .ok()
+            .map(|width| Op::SetMaxColWidth { width }),
+        "COL_WIDTH" => {
+            let col = parts.next()?;
+            let col = parse_excel_column(col).map(|c| crate::grid::MARGIN_COLS + c as usize)?;
+            let width = parts.next().and_then(|w| w.parse::<usize>().ok());
+            Some(Op::SetColWidth { col, width })
+        }
+        "SORT" => {
+            let cols = parts
+                .map(|s| parse_excel_column(s).map(|c| crate::grid::MARGIN_COLS + c as usize))
+                .collect::<Option<Vec<_>>>()?;
+            Some(Op::SetViewSortCols { cols })
+        }
+        _ => None,
+    }
+}
+
 impl SheetState {
-    pub fn reverse_op(&mut self, op: &Op) -> Option<Op> {
+    pub fn reverse_op(&self, op: &Op) -> Option<Op> {
         match op {
             Op::SetCell { addr, .. } => {
                 let prev_value = self.grid.get(addr).unwrap_or("").to_string();
@@ -102,6 +171,14 @@ impl SheetState {
                 })
             }
             Op::SetMainSize { .. } => None,
+            Op::SetMaxColWidth { .. } => Some(Op::SetMaxColWidth {
+                width: self.grid.max_col_width,
+            }),
+            Op::SetColWidth { col, .. } => Some(Op::SetColWidth {
+                col: *col,
+                width: self.grid.col_width_overrides.get(col).copied(),
+            }),
+            Op::SetViewSortCols { .. } => None,
             Op::Undo { .. } => None,
         }
     }
@@ -115,8 +192,7 @@ pub fn replay_lines(data: &str, state: &mut SheetState) -> Result<usize, serde_j
         if t.is_empty() {
             continue;
         }
-        let op: Op = serde_json::from_str(t)?;
-        op.apply(state);
+        apply_any_line(t, state)?;
         n += 1;
     }
     Ok(n)
@@ -128,15 +204,147 @@ pub fn apply_line(line: &str, state: &mut SheetState) -> Result<(), serde_json::
     if t.is_empty() {
         return Ok(());
     }
-    let op: Op = serde_json::from_str(t)?;
-    op.apply(state);
-    Ok(())
+    apply_any_line(t, state)
+}
+
+fn apply_any_line(line: &str, state: &mut SheetState) -> Result<(), serde_json::Error> {
+    if line.starts_with("<<<<<<<") || line.starts_with("=======") || line.starts_with(">>>>>>>") {
+        return Ok(());
+    }
+    match line.trim().to_ascii_uppercase().as_str() {
+        "SUM" | "TOTAL" | "MEAN" | "AVERAGE" | "AVG" | "MEDIAN" | "MIN" | "MINIMUM" | "MAX"
+        | "MAXIMUM" | "COUNT" => return Ok(()),
+        _ => {}
+    }
+    if let Some(op) = parse_op_text(line) {
+        op.apply(state);
+        return Ok(());
+    }
+    if let Ok(op) = serde_json::from_str::<Op>(line) {
+        op.apply(state);
+        return Ok(());
+    }
+
+    let mut parts = line.split_whitespace();
+    let cmd = match parts.next() {
+        Some(cmd) => cmd.to_ascii_uppercase(),
+        None => return Ok(()),
+    };
+
+    match cmd.as_str() {
+        "MAX_COL_WIDTH" => {
+            let width = parts
+                .next()
+                .and_then(|w| w.parse::<usize>().ok())
+                .ok_or_else(|| {
+                    serde_json::Error::io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "bad MAX_COL_WIDTH line",
+                    ))
+                })?;
+            if parts.next().is_some() {
+                return Err(serde_json::Error::io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "bad MAX_COL_WIDTH line",
+                )));
+            }
+            state.grid.set_max_col_width(width);
+            Ok(())
+        }
+        "COL_WIDTH" => {
+            let col_name = parts.next().ok_or_else(|| {
+                serde_json::Error::io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "bad COL_WIDTH line",
+                ))
+            })?;
+            let col = parse_excel_column(col_name)
+                .map(|c| crate::grid::MARGIN_COLS + c as usize)
+                .ok_or_else(|| {
+                    serde_json::Error::io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "bad COL_WIDTH line",
+                    ))
+                })?;
+            let width = match parts.next() {
+                Some(w) => Some(w.parse::<usize>().map_err(|_| {
+                    serde_json::Error::io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "bad COL_WIDTH line",
+                    ))
+                })?),
+                None => None,
+            };
+            if parts.next().is_some() {
+                return Err(serde_json::Error::io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "bad COL_WIDTH line",
+                )));
+            }
+            state.grid.set_col_width(col, width);
+            Ok(())
+        }
+        "SORT" => {
+            let cols = parts
+                .map(|s| {
+                    parse_excel_column(s)
+                        .map(|c| crate::grid::MARGIN_COLS + c as usize)
+                        .ok_or_else(|| {
+                            serde_json::Error::io(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "bad SORT line",
+                            ))
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            state.grid.set_view_sort_cols(cols);
+            Ok(())
+        }
+        _ => Err(serde_json::Error::io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "unrecognized log line",
+        ))),
+    }
 }
 
 /// Append one op as JSONL to `path` (creates file if missing).
 pub fn append_op(path: &Path, op: &Op) -> std::io::Result<()> {
     let mut f = OpenOptions::new().create(true).append(true).open(path)?;
-    let line = serde_json::to_string(op)?;
+    let line = match op {
+        Op::SetCell { addr, value } => format!("SET {} {}", addr_text(addr), value),
+        Op::MoveRowRange { from, count, to } => format!("MOVE ROW {from} {count} {to}"),
+        Op::MoveColRange { from, count, to } => format!("MOVE COL {from} {count} {to}"),
+        Op::SetMainSize {
+            main_rows,
+            main_cols,
+        } => {
+            format!("SIZE {main_rows} {main_cols}")
+        }
+        Op::SetMaxColWidth { width } => format!("MAX_COL_WIDTH {width}"),
+        Op::SetColWidth { col, width } => {
+            let name = crate::addr::excel_column_name(col.saturating_sub(crate::grid::MARGIN_COLS));
+            match width {
+                Some(w) => format!("COL_WIDTH {name} {w}"),
+                None => format!("COL_WIDTH {name}"),
+            }
+        }
+        Op::SetViewSortCols { cols } => format!(
+            "SORT {}",
+            cols.iter()
+                .map(|c| crate::addr::excel_column_name(c.saturating_sub(crate::grid::MARGIN_COLS)))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ),
+        Op::Undo { target } => format!("UNDO {target}"),
+    };
+    writeln!(f, "{line}")?;
+    f.sync_all()?;
+    Ok(())
+}
+
+/// Append a plain-text log line.
+pub fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
+    let mut f = OpenOptions::new().create(true).append(true).open(path)?;
     writeln!(f, "{line}")?;
     f.sync_all()?;
     Ok(())
@@ -165,5 +373,38 @@ mod tests {
         let j = serde_json::to_string(&op).unwrap();
         let back: Op = serde_json::from_str(&j).unwrap();
         assert_eq!(op, back);
+    }
+
+    #[test]
+    fn replay_doc_settings_lines() {
+        let mut s = SheetState::new(1, 3);
+        apply_line("MAX_COL_WIDTH 17", &mut s).unwrap();
+        apply_line("COL_WIDTH B 9", &mut s).unwrap();
+        assert_eq!(s.grid.max_col_width, 17);
+        assert_eq!(s.grid.col_width(crate::grid::MARGIN_COLS + 1), 9);
+    }
+
+    #[test]
+    fn replay_ignores_git_conflict_markers() {
+        let mut s = SheetState::new(1, 1);
+        let log = concat!(
+            "<<<<<<< HEAD\n",
+            "SET A1 left\n",
+            "=======\n",
+            "SET A1 right\n",
+            ">>>>>>> other\n"
+        );
+        replay_lines(log, &mut s).unwrap();
+        assert_eq!(
+            s.grid.get(&CellAddr::Main { row: 0, col: 0 }),
+            Some("right")
+        );
+    }
+
+    #[test]
+    fn replay_ignores_bare_aggregate_labels() {
+        let mut s = SheetState::new(1, 1);
+        apply_line("TOTAL", &mut s).unwrap();
+        apply_line("SUM", &mut s).unwrap();
     }
 }

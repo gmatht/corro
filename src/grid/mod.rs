@@ -72,6 +72,12 @@ pub struct Grid {
     pub left: HashMap<(u32, u8), String>,
     /// Right margin: (main_row, margin_col 0–9).
     pub right: HashMap<(u32, u8), String>,
+    /// Default display width cap for columns.
+    pub max_col_width: usize,
+    /// Optional per-global-column display width overrides.
+    pub col_width_overrides: HashMap<usize, usize>,
+    /// Optional sorted main-column view order.
+    pub view_sort_cols: Vec<usize>,
     pub header: Vec<Vec<String>>,
     pub footer: Vec<Vec<String>>,
 }
@@ -90,6 +96,9 @@ impl Grid {
             extent_main_cols: main_cols.max(1),
             left: HashMap::new(),
             right: HashMap::new(),
+            max_col_width: 20,
+            col_width_overrides: HashMap::new(),
+            view_sort_cols: Vec::new(),
             header: Vec::new(),
             footer: Vec::new(),
         };
@@ -242,6 +251,68 @@ impl Grid {
         self.left.retain(|&(r, _), _| r < self.extent_main_rows);
         self.right.retain(|&(r, _), _| r < self.extent_main_rows);
         self.resize_header_footer_width();
+    }
+
+    pub fn col_width(&self, global_col: usize) -> usize {
+        self.col_width_overrides
+            .get(&global_col)
+            .copied()
+            .unwrap_or(self.max_col_width)
+            .max(1)
+    }
+
+    pub fn set_max_col_width(&mut self, width: usize) {
+        self.max_col_width = width.max(1);
+    }
+
+    pub fn set_col_width(&mut self, global_col: usize, width: Option<usize>) {
+        match width {
+            Some(w) => {
+                self.col_width_overrides.insert(global_col, w.max(1));
+            }
+            None => {
+                self.col_width_overrides.remove(&global_col);
+            }
+        }
+    }
+
+    pub fn set_view_sort_cols(&mut self, cols: Vec<usize>) {
+        self.view_sort_cols = cols;
+    }
+
+    /// Logical main-row order for the current view sort.
+    pub fn sorted_main_rows(&self) -> Vec<usize> {
+        let mut rows: Vec<usize> = (0..self.extent_main_rows as usize).collect();
+        if self.view_sort_cols.is_empty() {
+            return rows;
+        }
+
+        rows.sort_by(|a, b| {
+            for &global_col in &self.view_sort_cols {
+                if global_col < MARGIN_COLS || global_col >= MARGIN_COLS + self.main_cols() {
+                    continue;
+                }
+                let col = (global_col - MARGIN_COLS) as u32;
+                let va = self
+                    .get(&CellAddr::Main {
+                        row: *a as u32,
+                        col,
+                    })
+                    .unwrap_or("");
+                let vb = self
+                    .get(&CellAddr::Main {
+                        row: *b as u32,
+                        col,
+                    })
+                    .unwrap_or("");
+                let ord = va.cmp(vb);
+                if ord != std::cmp::Ordering::Equal {
+                    return ord;
+                }
+            }
+            a.cmp(b)
+        });
+        rows
     }
 
     pub fn get(&self, addr: &CellAddr) -> Option<&str> {
