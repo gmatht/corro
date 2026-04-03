@@ -1219,6 +1219,44 @@ impl App {
         Some(((r0 - hr) as u32, (r1 - hr) as u32))
     }
 
+    fn view_row_order(&self) -> Vec<usize> {
+        let g = &self.state.grid;
+        let hr = HEADER_ROWS;
+        let mr = g.main_rows();
+        let fr = FOOTER_ROWS;
+        let mut rows = Vec::with_capacity(hr + mr + fr);
+        rows.extend(0..hr);
+        rows.extend(g.sorted_main_rows().into_iter().map(|r| hr + r));
+        rows.extend((0..fr).map(|r| hr + mr + r));
+        rows
+    }
+
+    fn move_cursor_row_through_view(&mut self, down: bool) -> bool {
+        if self.state.grid.view_sort_cols.is_empty() {
+            return false;
+        }
+
+        let rows = self.view_row_order();
+        let Some(pos) = rows.iter().position(|&r| r == self.cursor.row) else {
+            return false;
+        };
+        let next_pos = if down {
+            pos.saturating_add(1).min(rows.len().saturating_sub(1))
+        } else {
+            pos.saturating_sub(1)
+        };
+        if next_pos == pos {
+            return true;
+        }
+
+        self.cursor.row = rows[next_pos];
+        self.cursor.clamp(&self.state.grid);
+        self.state
+            .grid
+            .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
+        true
+    }
+
     fn expand_selection_to_rows(&mut self) {
         let hr = HEADER_ROWS;
         let left = MARGIN_COLS;
@@ -1974,7 +2012,7 @@ impl App {
                 if self.anchor.is_some() {
                     "  r·move-rows   c·move-cols   v·deselect   Esc·cancel".into()
                 } else {
-                    "  e·edit   v·select   t·tsv   c·csv   Alt-A·ascii   o·open   Ctrl-Z·undo   Alt-W·width   Alt-S·sort   q·quit   ?·help".into()
+                    "  shortcuts: e·edit v·select t·tsv c·csv o·open q·quit ?·help; printable letters edit cells unless reserved".into()
                 }
             }
             Mode::Edit { .. } => {
@@ -2849,25 +2887,29 @@ impl App {
                             .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
                     }
                     KeyCode::Up | KeyCode::Char('k') => {
-                        self.cursor.row = self.cursor.row.saturating_sub(1);
-                        self.cursor.clamp(&self.state.grid);
-                        self.state
-                            .grid
-                            .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
+                        if !self.move_cursor_row_through_view(false) {
+                            self.cursor.row = self.cursor.row.saturating_sub(1);
+                            self.cursor.clamp(&self.state.grid);
+                            self.state
+                                .grid
+                                .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
+                        }
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
-                        let hr = HEADER_ROWS;
-                        let last_main = hr + self.state.grid.main_rows().saturating_sub(1);
-                        if self.cursor.row == last_main
-                            && trailing_blank_main_rows(&self.state) < NAV_BLANK_ROWS
-                        {
-                            self.state.grid.grow_main_row_at_bottom();
+                        if !self.move_cursor_row_through_view(true) {
+                            let hr = HEADER_ROWS;
+                            let last_main = hr + self.state.grid.main_rows().saturating_sub(1);
+                            if self.cursor.row == last_main
+                                && trailing_blank_main_rows(&self.state) < NAV_BLANK_ROWS
+                            {
+                                self.state.grid.grow_main_row_at_bottom();
+                            }
+                            self.cursor.row = self.cursor.row.saturating_add(1);
+                            self.cursor.clamp(&self.state.grid);
+                            self.state
+                                .grid
+                                .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
                         }
-                        self.cursor.row = self.cursor.row.saturating_add(1);
-                        self.cursor.clamp(&self.state.grid);
-                        self.state
-                            .grid
-                            .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
                     }
                     KeyCode::Char(c) if !c.is_control() => {
                         let buffer = c.to_string();
@@ -2969,6 +3011,33 @@ mod tests {
     fn preview_level_is_not_highlighted() {
         assert_eq!(App::menu_selected_index(0, 1, 2, 4), Some(2));
         assert_eq!(App::menu_selected_index(1, 1, 0, 4), None);
+    }
+
+    #[test]
+    fn sorted_view_down_moves_through_visible_order() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(3, 1);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "2".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 1, col: 0 }, "apple".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 2, col: 0 }, "10".into());
+        app.state.grid.set_view_sort_cols(vec![MARGIN_COLS]);
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS + 1,
+            col: MARGIN_COLS,
+        };
+        app.mode = Mode::Normal;
+
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()))
+            .unwrap();
+
+        assert_eq!(app.cursor.row, HEADER_ROWS);
+        assert_eq!(app.state.grid.sorted_main_rows(), vec![1, 0, 2]);
     }
 
     #[test]

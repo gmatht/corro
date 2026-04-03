@@ -305,7 +305,9 @@ impl Grid {
                         col,
                     })
                     .unwrap_or("");
-                let ord = va.cmp(vb);
+                let oa = sort_key(va);
+                let ob = sort_key(vb);
+                let ord = oa.cmp(&ob);
                 if ord != std::cmp::Ordering::Equal {
                     return ord;
                 }
@@ -488,6 +490,42 @@ impl Grid {
     }
 }
 
+#[derive(Debug, PartialEq)]
+enum SortKey<'a> {
+    Text(&'a str),
+    Number(f64),
+}
+
+impl<'a> Eq for SortKey<'a> {}
+
+impl<'a> Ord for SortKey<'a> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match (self, other) {
+            (SortKey::Text(a), SortKey::Text(b)) => a.cmp(b),
+            (SortKey::Number(a), SortKey::Number(b)) => {
+                a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+            }
+            (SortKey::Text(_), SortKey::Number(_)) => std::cmp::Ordering::Less,
+            (SortKey::Number(_), SortKey::Text(_)) => std::cmp::Ordering::Greater,
+        }
+    }
+}
+
+impl<'a> PartialOrd for SortKey<'a> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn sort_key(value: &str) -> SortKey<'_> {
+    let trimmed = value.trim();
+    if let Ok(n) = trimmed.parse::<f64>() {
+        SortKey::Number(n)
+    } else {
+        SortKey::Text(trimmed)
+    }
+}
+
 /// Logical sheet row index (0 = top header row) for addressing.
 pub fn addr_logical_row(addr: &CellAddr, grid: &Grid) -> usize {
     let hr = HEADER_ROWS;
@@ -540,5 +578,16 @@ mod tests {
         assert_eq!(g.get(&CellAddr::Main { row: 0, col: 1 }), Some("d"));
         assert_eq!(g.get(&CellAddr::Main { row: 0, col: 2 }), Some("a"));
         assert_eq!(g.get(&CellAddr::Main { row: 0, col: 3 }), Some("b"));
+    }
+
+    #[test]
+    fn sorted_rows_put_text_before_numbers() {
+        let mut g = Grid::new(3, 1);
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "2".into());
+        g.set(&CellAddr::Main { row: 1, col: 0 }, "apple".into());
+        g.set(&CellAddr::Main { row: 2, col: 0 }, "10".into());
+        g.set_view_sort_cols(vec![MARGIN_COLS]);
+
+        assert_eq!(g.sorted_main_rows(), vec![1, 0, 2]);
     }
 }
