@@ -31,9 +31,10 @@ pub fn export_ascii_table(grid: &Grid, out: &mut dyn Write) {
         }
     }
 
-    let _total_width: usize = col_widths.iter().sum::<usize>() + tc + 1;
+    let _total_width: usize =
+        col_widths[col_start..col_end].iter().sum::<usize>() + (col_end - col_start) + 1;
     let border: String = "+".to_string()
-        + &col_widths
+        + &col_widths[col_start..col_end]
             .iter()
             .map(|w| "-".repeat(*w))
             .collect::<Vec<_>>()
@@ -42,7 +43,7 @@ pub fn export_ascii_table(grid: &Grid, out: &mut dyn Write) {
 
     let _ = writeln!(out, "{}", border);
     let mut header_line = String::from("|");
-    for c in 0..tc {
+    for c in col_start..col_end {
         let label = col_header_label(c, mc);
         let w = col_widths[c];
         header_line.push_str(&format!(" {:>width$} |", label, width = w));
@@ -398,5 +399,24 @@ pub fn export_sorted_tsv(grid: &Grid, out: &mut dyn Write, sort_cols: &[usize]) 
             let _ = write!(out, "{}", val);
         }
         let _ = writeln!(out);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ascii_table_trims_empty_margin_columns() {
+        let mut g = Grid::new(3, 1);
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "Aasdf".into());
+        g.set(&CellAddr::Main { row: 2, col: 0 }, "adsf".into());
+        let mut out = Vec::new();
+        export_ascii_table(&g, &mut out);
+        let s = String::from_utf8(out).unwrap();
+        assert!(!s.contains("<9"));
+        assert!(!s.contains(">9"));
+        assert!(s.contains("Aasdf"));
+        assert!(s.contains("adsf"));
     }
 }

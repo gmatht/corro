@@ -14,7 +14,9 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
+};
 use std::io::{self, stdout};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -112,9 +114,10 @@ enum Mode {
         buffer: String,
     },
     Help,
+    About,
     /// Alt-activated menu bar; letter shortcuts execute actions.
     Menu {
-        section: MenuSection,
+        stack: Vec<MenuLevel>,
     },
     ExportTsv {
         buffer: String,
@@ -144,11 +147,148 @@ enum Mode {
     QuitPrompt,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MenuSection {
     File,
+    Export,
+    Width,
     Help,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MenuTarget {
+    Action(MenuAction),
+    Submenu(MenuSection),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MenuLevel {
+    section: MenuSection,
+    item: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MenuAction {
+    OpenFile,
+    Exit,
+    ExportTsv,
+    ExportCsv,
+    ExportAscii,
+    ExportAll,
+    ExportOdt,
+    SetMaxColWidth,
+    SetColWidth,
+    SortView,
+    SaveSort,
+    HelpRows,
+    HelpCols,
+    About,
+    HelpFull,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MenuItem {
+    shortcut: char,
+    label: &'static str,
+    target: MenuTarget,
+}
+
+const FILE_MENU_ITEMS: [MenuItem; 6] = [
+    MenuItem {
+        shortcut: 'O',
+        label: "Open file",
+        target: MenuTarget::Action(MenuAction::OpenFile),
+    },
+    MenuItem {
+        shortcut: 'T',
+        label: "Export",
+        target: MenuTarget::Submenu(MenuSection::Export),
+    },
+    MenuItem {
+        shortcut: 'C',
+        label: "Width",
+        target: MenuTarget::Submenu(MenuSection::Width),
+    },
+    MenuItem {
+        shortcut: 'S',
+        label: "Sort view",
+        target: MenuTarget::Action(MenuAction::SortView),
+    },
+    MenuItem {
+        shortcut: 'P',
+        label: "Persist sort",
+        target: MenuTarget::Action(MenuAction::SaveSort),
+    },
+    MenuItem {
+        shortcut: 'X',
+        label: "Exit",
+        target: MenuTarget::Action(MenuAction::Exit),
+    },
+];
+
+const EXPORT_MENU_ITEMS: [MenuItem; 5] = [
+    MenuItem {
+        shortcut: 'T',
+        label: "TSV",
+        target: MenuTarget::Action(MenuAction::ExportTsv),
+    },
+    MenuItem {
+        shortcut: 'C',
+        label: "CSV",
+        target: MenuTarget::Action(MenuAction::ExportCsv),
+    },
+    MenuItem {
+        shortcut: 'A',
+        label: "ASCII table",
+        target: MenuTarget::Action(MenuAction::ExportAscii),
+    },
+    MenuItem {
+        shortcut: 'L',
+        label: "Export all",
+        target: MenuTarget::Action(MenuAction::ExportAll),
+    },
+    MenuItem {
+        shortcut: 'D',
+        label: "ODT",
+        target: MenuTarget::Action(MenuAction::ExportOdt),
+    },
+];
+
+const WIDTH_MENU_ITEMS: [MenuItem; 2] = [
+    MenuItem {
+        shortcut: 'D',
+        label: "Default width",
+        target: MenuTarget::Action(MenuAction::SetMaxColWidth),
+    },
+    MenuItem {
+        shortcut: 'C',
+        label: "Column width",
+        target: MenuTarget::Action(MenuAction::SetColWidth),
+    },
+];
+
+const HELP_MENU_ITEMS: [MenuItem; 4] = [
+    MenuItem {
+        shortcut: 'A',
+        label: "About",
+        target: MenuTarget::Action(MenuAction::About),
+    },
+    MenuItem {
+        shortcut: 'R',
+        label: "Row ops",
+        target: MenuTarget::Action(MenuAction::HelpRows),
+    },
+    MenuItem {
+        shortcut: 'C',
+        label: "Col ops",
+        target: MenuTarget::Action(MenuAction::HelpCols),
+    },
+    MenuItem {
+        shortcut: 'H',
+        label: "Full help",
+        target: MenuTarget::Action(MenuAction::HelpFull),
+    },
+];
 
 // ── Viewport helpers ──────────────────────────────────────────────────────────
 
@@ -239,6 +379,250 @@ fn footer_nonblank_end(state: &SheetState) -> Option<usize> {
         }
     }
     max_nonblank
+}
+
+fn menu_items(section: MenuSection) -> &'static [MenuItem] {
+    match section {
+        MenuSection::File => &FILE_MENU_ITEMS,
+        MenuSection::Export => &EXPORT_MENU_ITEMS,
+        MenuSection::Width => &WIDTH_MENU_ITEMS,
+        MenuSection::Help => &HELP_MENU_ITEMS,
+    }
+}
+
+fn menu_title(section: MenuSection) -> &'static str {
+    match section {
+        MenuSection::File => "File",
+        MenuSection::Export => "Export",
+        MenuSection::Width => "Width",
+        MenuSection::Help => "Help",
+    }
+}
+
+fn menu_action_item(section: MenuSection, item: usize) -> Option<MenuItem> {
+    menu_items(section).get(item).copied()
+}
+
+fn menu_toggle_root_section(section: MenuSection) -> MenuSection {
+    match section {
+        MenuSection::Help => MenuSection::File,
+        _ => MenuSection::Help,
+    }
+}
+
+fn menu_popup_area(area: Rect, section: MenuSection, parent: Option<(Rect, usize)>) -> Rect {
+    let items = menu_items(section).len() as u16;
+    let width = match section {
+        MenuSection::File => 22,
+        MenuSection::Export => 18,
+        MenuSection::Width => 20,
+        MenuSection::Help => 18,
+    }
+    .min(area.width.saturating_sub(2).max(1));
+    let height = items.saturating_add(2).min(area.height.max(3));
+    let (x, y) = parent
+        .map(|(p, item)| (p.x.saturating_add(p.width), p.y.saturating_add(item as u16)))
+        .unwrap_or_else(|| match section {
+            MenuSection::Help => (area.x.saturating_add(9), area.y.saturating_add(1)),
+            _ => (area.x.saturating_add(1), area.y.saturating_add(1)),
+        });
+    let x = x.min(
+        area.x
+            .saturating_add(area.width.saturating_sub(width.saturating_add(1))),
+    );
+    let y = y.min(area.y.saturating_add(area.height.saturating_sub(height)));
+    Rect {
+        x,
+        y,
+        width,
+        height,
+    }
+}
+
+impl App {
+    fn open_menu(&mut self, section: MenuSection) {
+        self.mode = Mode::Menu {
+            stack: vec![MenuLevel { section, item: 0 }],
+        };
+    }
+
+    fn open_menu_path(&mut self, stack: Vec<MenuLevel>) {
+        self.mode = Mode::Menu { stack };
+    }
+
+    fn menu_action_mode(&mut self, action: MenuAction) -> Mode {
+        match action {
+            MenuAction::OpenFile => Mode::OpenPath {
+                buffer: self
+                    .path
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            },
+            MenuAction::Exit => Mode::QuitPrompt,
+            MenuAction::ExportTsv => Mode::ExportTsv {
+                buffer: String::new(),
+            },
+            MenuAction::ExportCsv => Mode::ExportCsv {
+                buffer: String::new(),
+            },
+            MenuAction::ExportAscii => Mode::ExportAscii {
+                buffer: String::new(),
+            },
+            MenuAction::ExportAll => Mode::ExportAll {
+                buffer: String::new(),
+            },
+            MenuAction::ExportOdt => Mode::ExportOdt {
+                buffer: String::new(),
+            },
+            MenuAction::SetMaxColWidth => Mode::SetMaxColWidth {
+                buffer: String::new(),
+            },
+            MenuAction::SetColWidth => Mode::SetColWidth {
+                buffer: String::new(),
+            },
+            MenuAction::SortView => Mode::SortView {
+                buffer: String::new(),
+                persist: false,
+            },
+            MenuAction::SaveSort => Mode::SortView {
+                buffer: String::new(),
+                persist: true,
+            },
+            MenuAction::HelpRows => {
+                self.status = "Row ops: v·select full rows, then r·move to target row".into();
+                Mode::Normal
+            }
+            MenuAction::HelpCols => {
+                self.status = "Col ops: v·select full columns, then c·move to target column".into();
+                Mode::Normal
+            }
+            MenuAction::About => {
+                self.about_scroll = 0;
+                Mode::About
+            }
+            MenuAction::HelpFull => {
+                self.help_scroll = 0;
+                Mode::Help
+            }
+        }
+    }
+
+    fn menu_target_mode(&mut self, path: &[MenuLevel], target: MenuTarget) -> Mode {
+        match target {
+            MenuTarget::Action(action) => self.menu_action_mode(action),
+            MenuTarget::Submenu(section) => {
+                let mut stack = path.to_vec();
+                stack.push(MenuLevel { section, item: 0 });
+                Mode::Menu { stack }
+            }
+        }
+    }
+
+    fn menu_render_levels(stack: &[MenuLevel]) -> Vec<MenuLevel> {
+        let mut levels = stack.to_vec();
+        let mut preview_depth = 0usize;
+        while preview_depth < 8 {
+            let Some(level) = levels.last().copied() else {
+                break;
+            };
+            let Some(menu_item) = menu_action_item(level.section, level.item) else {
+                break;
+            };
+            match menu_item.target {
+                MenuTarget::Submenu(section) => {
+                    levels.push(MenuLevel { section, item: 0 });
+                    preview_depth += 1;
+                }
+                MenuTarget::Action(_) => break,
+            }
+        }
+        levels
+    }
+
+    fn menu_selected_index(
+        render_index: usize,
+        actual_depth: usize,
+        item: usize,
+        item_count: usize,
+    ) -> Option<usize> {
+        if render_index < actual_depth && item_count > 0 {
+            Some(item.min(item_count - 1))
+        } else {
+            None
+        }
+    }
+
+    fn help_page_body(&self) -> String {
+        String::from(
+            "Corro Help\n\n\
+Basics\n\
+- Arrow keys or hjkl move the cursor.\n\
+- Enter or e starts editing the current cell.\n\
+- Any printable key starts editing with that character.\n\
+- = followed by arrows builds a formula reference.\n\n\
+Selection and movement\n\
+- v toggles a cell selection.\n\
+- Shift+arrows extend the selection.\n\
+- r moves selected rows.\n\
+- c exports CSV when nothing is selected, or moves selected columns when columns are selected.\n\
+- Alt+arrows move selected rows or columns by one cell.\n\n\
+Menus\n\
+- Alt+F opens File.\n\
+- Alt+H opens Help.\n\
+- Right opens the highlighted submenu.\n\
+- Left goes back one menu level.\n\
+- Enter or the shortcut letter opens the selected item.\n\n\
+File menu\n\
+- Open file loads a .corro, .csv, or .tsv file.\n\
+- Export opens TSV, CSV, ASCII, full export, or ODT prompts.\n\
+- Width opens default width and per-column width prompts.\n\
+- Sort view changes the visible order of main rows.\n\
+- Exit opens the quit prompt.\n\n\
+Help menu\n\
+- About shows the version and a short description.\n\
+- Row ops and Col ops show quick move tips.\n\
+- Full help opens this page.\n\n\
+Special rows and columns\n\
+- Header rows use `^A` through `^Z` and can be paired with a column like `^A,B`.\n\
+- Footer rows use `_A` through `_Z` and can also be paired with a column like `_A,B`.\n\
+- Left-margin cells use `<col,row` with zero-based margin columns and one-based main rows.\n\
+- Right-margin cells use `>col,row` with the same coordinate style.\n\
+- In exports, these rows and columns stay visible as separate bands around the main grid.\n\n\
+Reference examples\n\
+- Main cell: A1\n\
+- Header cell: ^A,A\n\
+- Footer cell: _A,A\n\
+- Left margin: <0,1\n\
+- Right margin: >0,1\n\n\
+Quit\n\
+- q opens the quit prompt.\n\
+- Ctrl+Q exits immediately.\n\
+- Esc closes menus, prompts, help, and about.\n\
+- ? opens this help page.\n",
+        )
+    }
+
+    fn about_page_body(&self) -> String {
+        format!(
+            "{name}\n\nVersion: {version}\n\n{about}\n\n{details}",
+            name = env!("CARGO_PKG_NAME"),
+            version = env!("CARGO_PKG_VERSION"),
+            about = env!("CARGO_PKG_DESCRIPTION"),
+            details = "Corro is a terminal spreadsheet with an append-only JSONL log, sparse sheet storage, menu-driven exports, and undo via inverse ops.",
+        )
+    }
+
+    fn render_menu_popup(
+        &self,
+        f: &mut Frame,
+        popup_area: Rect,
+        popup: List<'_>,
+        state: &mut ListState,
+    ) {
+        f.render_widget(Clear, popup_area);
+        f.render_stateful_widget(popup, popup_area, state);
+    }
 }
 
 fn right_nonblank_end(state: &SheetState) -> Option<usize> {
@@ -623,6 +1007,8 @@ pub struct App {
     pub ops_applied: usize,
     pub row_scroll: usize,
     pub col_scroll: usize,
+    help_scroll: usize,
+    about_scroll: usize,
     pub op_history: Vec<Op>,
     selection_kind: SelectionKind,
 }
@@ -644,6 +1030,8 @@ impl App {
             ops_applied: 0,
             row_scroll: 0,
             col_scroll: 0,
+            help_scroll: 0,
+            about_scroll: 0,
             op_history: Vec::new(),
             selection_kind: SelectionKind::Cells,
         }
@@ -1128,13 +1516,15 @@ impl App {
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(1),
+                Constraint::Length(1),
                 Constraint::Min(3),
                 Constraint::Length(1),
             ])
             .split(f.area());
-        let formula_area = layout[0];
-        let grid_area = layout[1];
-        let hints_area = layout[2];
+        let menubar_area = layout[0];
+        let formula_area = layout[1];
+        let grid_area = layout[2];
+        let hints_area = layout[3];
 
         let sentinel = Block::default().borders(Borders::ALL);
         let inner = sentinel.inner(grid_area);
@@ -1181,6 +1571,13 @@ impl App {
         self.row_scroll = next_row_scroll;
         self.col_scroll = next_col_scroll;
 
+        // ── Menu bar ──────────────────────────────────────────────────────────
+        let menubar = self.menu_bar_line();
+        f.render_widget(
+            Paragraph::new(menubar).style(Style::default().fg(Color::Black).bg(Color::Cyan)),
+            menubar_area,
+        );
+
         // ── Formula bar ───────────────────────────────────────────────────────
         let addr = self.cursor.to_addr(grid);
         let addr_str = addr_label(&addr, grid.main_cols());
@@ -1203,10 +1600,6 @@ impl App {
             Mode::ExportCsv { buffer } => (
                 format!(" export CSV (blank=clipboard): {buffer}_"),
                 Style::default().fg(Color::White).bg(Color::DarkGray),
-            ),
-            Mode::Help => (
-                " e·edit  v·select  t·tsv  c·csv  Alt-A·ascii  r/c·move  o·open  Ctrl-Z·undo  Alt-W·width  Alt-S·sort  q·quit".into(),
-                Style::default().fg(Color::White).bg(Color::Blue),
             ),
             Mode::ExportAscii { .. } => (
                 " export ASCII table (blank=clipboard): ".into(),
@@ -1239,16 +1632,24 @@ impl App {
                 " Quit Corro? (Q)uit, (B)ack ".into(),
                 Style::default().fg(Color::White).bg(Color::Red),
             ),
-            Mode::Menu { section } => match section {
-                MenuSection::File => (
-                    "  File: F·open-file  T·export-tsv  A·ASCII  E·export-all  O·ODT  W·width  S·sort  Esc·back".into(),
-                    Style::default().fg(Color::Black).bg(Color::Cyan),
-                ),
-                MenuSection::Help => (
-                    "  Help: ?·help  R·row-ops  C·col-ops  q·quit  Esc·back".into(),
-                    Style::default().fg(Color::Black).bg(Color::Cyan),
-                ),
-            },
+            Mode::Help => (
+                " Help - Up/Down scroll, Esc closes ".into(),
+                Style::default().fg(Color::White).bg(Color::Blue),
+            ),
+            Mode::About => (
+                " About - Up/Down scroll, Esc closes ".into(),
+                Style::default().fg(Color::White).bg(Color::Blue),
+            ),
+            Mode::Menu { .. } => {
+                let val = cell_effective_display(grid, &addr);
+                let base = format!(" {addr_str}  {val}");
+                let text = if self.status.is_empty() {
+                    base
+                } else {
+                    format!("{base}   ·  {}", self.status)
+                };
+                (text, Style::default().fg(Color::Cyan))
+            }
             _ => {
                 let val = cell_effective_display(grid, &addr);
                 let base = format!(" {addr_str}  {val}");
@@ -1264,6 +1665,43 @@ impl App {
             Paragraph::new(formula_text).style(formula_style),
             formula_area,
         );
+
+        if matches!(&self.mode, Mode::Help | Mode::About) {
+            let body = match &self.mode {
+                Mode::Help => self.help_page_body(),
+                Mode::About => self.about_page_body(),
+                _ => String::new(),
+            };
+            let inner = Block::default().borders(Borders::ALL).inner(grid_area);
+            let lines: Vec<&str> = body.lines().collect();
+            let scroll = match &self.mode {
+                Mode::Help => self.help_scroll,
+                Mode::About => self.about_scroll,
+                _ => 0,
+            };
+            let max_scroll = lines.len().saturating_sub(inner.height as usize);
+            let scroll = scroll.min(max_scroll);
+            let visible: String = lines
+                .iter()
+                .skip(scroll)
+                .take(inner.height as usize)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n");
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(match self.mode {
+                    Mode::Help => " Help ",
+                    Mode::About => " About ",
+                    _ => "",
+                });
+            let paragraph = Paragraph::new(visible)
+                .block(block)
+                .wrap(Wrap { trim: false });
+            f.render_widget(Clear, grid_area);
+            f.render_widget(paragraph, grid_area);
+            return;
+        }
 
         // ── Grid ──────────────────────────────────────────────────────────────
         let mut lines: Vec<Line> = Vec::new();
@@ -1486,6 +1924,48 @@ impl App {
             Paragraph::new(hints).style(Style::default().fg(Color::DarkGray)),
             hints_area,
         );
+
+        if let Mode::Menu { stack } = &self.mode {
+            let mut parent_area: Option<(Rect, usize)> = None;
+            let actual_depth = stack.len();
+            for (render_index, level) in Self::menu_render_levels(stack).iter().enumerate() {
+                let popup_area = menu_popup_area(f.area(), level.section, parent_area);
+                let items: Vec<ListItem> = menu_items(level.section)
+                    .iter()
+                    .map(|mi| {
+                        let label = match mi.target {
+                            MenuTarget::Submenu(sub) => {
+                                format!("{}·{} ▶", mi.shortcut, menu_title(sub))
+                            }
+                            MenuTarget::Action(_) => format!("{}·{}", mi.shortcut, mi.label),
+                        };
+                        ListItem::new(label)
+                    })
+                    .collect();
+                let mut state = ListState::default();
+                if let Some(selected) =
+                    Self::menu_selected_index(render_index, actual_depth, level.item, items.len())
+                {
+                    state.select(Some(selected));
+                }
+                let popup = List::new(items)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Plain)
+                            .title(menu_title(level.section)),
+                    )
+                    .highlight_style(
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                    .highlight_symbol("> ");
+                self.render_menu_popup(f, popup_area, popup, &mut state);
+                parent_area = Some((popup_area, level.item));
+            }
+        }
     }
 
     fn hints_line(&self) -> String {
@@ -1514,16 +1994,47 @@ impl App {
                 "  type sort columns like A,B,C   Enter·apply   Esc·cancel".into()
             }
             Mode::QuitPrompt => "  Q·quit   B·back   Esc·cancel".into(),
-            Mode::Help => {
-                let formula_examples = "Formulas: A1:=3*2  SUM(A1:B2)  IF(A1>0,1,0)  Header:^A,A  Footer:_A,A  Margins:<0,1  >0,1".to_string();
-                if self.status.is_empty() {
-                    formula_examples
-                } else {
-                    format!("{}  ·  {}", formula_examples, self.status)
-                }
+            Mode::Help => "  up/down·scroll   Esc·close   ?·help   A·about".into(),
+            Mode::About => "  up/down·scroll   Esc·close   ?·help   A·about".into(),
+            Mode::Menu { .. } => {
+                "  right·open submenu   left·back   up/down·move   Enter/letter·open   Esc·close"
+                    .into()
             }
-            Mode::Menu { .. } => "  left/right·switch   Enter/letter·open   Esc·close".into(),
         }
+    }
+
+    fn menu_bar_line(&self) -> String {
+        let (section, item) = match &self.mode {
+            Mode::Menu { stack } => stack
+                .last()
+                .map(|level| (level.section, level.item))
+                .unwrap_or((MenuSection::File, usize::MAX)),
+            _ => (MenuSection::File, usize::MAX),
+        };
+        let file = if matches!(
+            section,
+            MenuSection::File | MenuSection::Export | MenuSection::Width
+        ) {
+            "[File]"
+        } else {
+            " File "
+        };
+        let help = if section == MenuSection::Help {
+            "[Help]"
+        } else {
+            " Help "
+        };
+        let active = if item != usize::MAX {
+            format!(
+                "  {}",
+                menu_action_item(section, item)
+                    .map(|i| i.label)
+                    .unwrap_or("")
+            )
+        } else {
+            String::new()
+        };
+        format!(" {file}  {help}{active}")
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Result<bool, RunError> {
@@ -1534,7 +2045,7 @@ impl App {
         let mut mode = std::mem::replace(&mut self.mode, Mode::Normal);
 
         if key.modifiers.contains(KeyModifiers::ALT)
-            && matches!(mode, Mode::Normal | Mode::Menu { .. })
+            && matches!(mode, Mode::Normal)
             && matches!(
                 key.code,
                 KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down
@@ -1559,72 +2070,157 @@ impl App {
             }
         }
 
+        if let Mode::Menu { stack } = &mut mode {
+            match key.code {
+                KeyCode::Esc => mode = Mode::Normal,
+                KeyCode::Left | KeyCode::Char('h') => {
+                    stack.truncate(1);
+                    if let Some(level) = stack.last_mut() {
+                        level.section = menu_toggle_root_section(level.section);
+                        level.item = 0;
+                    }
+                }
+                KeyCode::Right | KeyCode::Char('l') => {
+                    let current = stack.last().copied();
+                    let current_is_submenu = current
+                        .and_then(|level| menu_action_item(level.section, level.item))
+                        .map(|menu_item| matches!(menu_item.target, MenuTarget::Submenu(_)))
+                        .unwrap_or(false);
+
+                    if current_is_submenu {
+                        if let Some(level) = current {
+                            if let Some(MenuItem {
+                                target: MenuTarget::Submenu(section),
+                                ..
+                            }) = menu_action_item(level.section, level.item)
+                            {
+                                stack.push(MenuLevel { section, item: 0 });
+                            }
+                        }
+                    } else {
+                        stack.truncate(1);
+                        if let Some(level) = stack.last_mut() {
+                            level.section = menu_toggle_root_section(level.section);
+                            level.item = 0;
+                        }
+                    }
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    let len = stack
+                        .last()
+                        .map(|level| menu_items(level.section).len())
+                        .unwrap_or(0);
+                    if len > 0 {
+                        if let Some(level) = stack.last_mut() {
+                            level.item = level.item.saturating_sub(1);
+                        }
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    let len = stack
+                        .last()
+                        .map(|level| menu_items(level.section).len())
+                        .unwrap_or(0);
+                    if len > 0 {
+                        if let Some(level) = stack.last_mut() {
+                            level.item = (level.item + 1).min(len - 1);
+                        }
+                    }
+                }
+                KeyCode::Enter => {
+                    if let Some(level) = stack.last() {
+                        if let Some(menu_item) = menu_action_item(level.section, level.item) {
+                            mode = self.menu_target_mode(stack.as_slice(), menu_item.target);
+                        }
+                    }
+                }
+                KeyCode::Char(ch) => {
+                    let upper = ch.to_ascii_uppercase();
+                    if let Some(level) = stack.last_mut() {
+                        if let Some((idx, menu_item)) = menu_items(level.section)
+                            .iter()
+                            .enumerate()
+                            .find(|(_, mi)| mi.shortcut == upper)
+                        {
+                            level.item = idx;
+                            mode = self.menu_target_mode(stack.as_slice(), menu_item.target);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            self.mode = mode;
+            return Ok(false);
+        }
+
         if key.modifiers.contains(KeyModifiers::ALT)
-            && matches!(mode, Mode::Normal | Mode::Menu { .. })
+            && matches!(mode, Mode::Normal)
             && matches!(key.code, KeyCode::Char(_))
         {
             if let KeyCode::Char(ch) = key.code {
                 match ch {
                     'f' | 'F' => {
-                        self.mode = Mode::Menu {
-                            section: MenuSection::File,
-                        };
+                        self.open_menu(MenuSection::File);
                         return Ok(false);
                     }
                     'h' | 'H' => {
-                        self.mode = Mode::Menu {
-                            section: MenuSection::Help,
-                        };
+                        self.open_menu(MenuSection::Help);
                         return Ok(false);
                     }
                     't' | 'T' => {
-                        self.mode = Mode::ExportTsv {
-                            buffer: String::new(),
-                        };
+                        self.open_menu_path(vec![MenuLevel {
+                            section: MenuSection::Export,
+                            item: 0,
+                        }]);
                         return Ok(false);
                     }
                     'a' | 'A' => {
-                        self.mode = Mode::ExportAscii {
-                            buffer: String::new(),
-                        };
+                        self.open_menu_path(vec![MenuLevel {
+                            section: MenuSection::Export,
+                            item: 2,
+                        }]);
                         return Ok(false);
                     }
                     'e' | 'E' => {
-                        self.mode = Mode::ExportAll {
-                            buffer: String::new(),
-                        };
+                        self.open_menu_path(vec![MenuLevel {
+                            section: MenuSection::Export,
+                            item: 3,
+                        }]);
                         return Ok(false);
                     }
                     'o' | 'O' => {
-                        self.mode = Mode::ExportOdt {
-                            buffer: String::new(),
-                        };
+                        self.open_menu_path(vec![MenuLevel {
+                            section: MenuSection::File,
+                            item: 0,
+                        }]);
                         return Ok(false);
                     }
                     'w' | 'W' => {
-                        self.mode = Mode::SetMaxColWidth {
-                            buffer: String::new(),
-                        };
+                        self.open_menu_path(vec![MenuLevel {
+                            section: MenuSection::Width,
+                            item: 0,
+                        }]);
                         return Ok(false);
                     }
                     'x' | 'X' => {
-                        self.mode = Mode::SetColWidth {
-                            buffer: String::new(),
-                        };
+                        self.open_menu_path(vec![MenuLevel {
+                            section: MenuSection::Width,
+                            item: 1,
+                        }]);
                         return Ok(false);
                     }
                     's' => {
-                        self.mode = Mode::SortView {
-                            buffer: String::new(),
-                            persist: false,
-                        };
+                        self.open_menu_path(vec![MenuLevel {
+                            section: MenuSection::File,
+                            item: 3,
+                        }]);
                         return Ok(false);
                     }
                     'S' => {
-                        self.mode = Mode::SortView {
-                            buffer: String::new(),
-                            persist: true,
-                        };
+                        self.open_menu_path(vec![MenuLevel {
+                            section: MenuSection::File,
+                            item: 4,
+                        }]);
                         return Ok(false);
                     }
                     _ => {}
@@ -1633,75 +2229,35 @@ impl App {
         }
 
         match &mut mode {
-            Mode::Menu { section } => match key.code {
-                KeyCode::Esc => mode = Mode::Normal,
-                KeyCode::Left | KeyCode::Char('h') => *section = MenuSection::File,
-                KeyCode::Right | KeyCode::Char('l') => *section = MenuSection::Help,
-                KeyCode::Char('f') | KeyCode::Char('F') if matches!(section, MenuSection::File) => {
-                    mode = Mode::OpenPath {
-                        buffer: self
-                            .path
-                            .as_ref()
-                            .map(|p| p.to_string_lossy().into_owned())
-                            .unwrap_or_default(),
-                    };
+            Mode::Help => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => mode = Mode::Normal,
+                KeyCode::Char('a') | KeyCode::Char('A') => {
+                    self.about_scroll = 0;
+                    mode = Mode::About;
                 }
-                KeyCode::Char('t') | KeyCode::Char('T') if matches!(section, MenuSection::File) => {
-                    mode = Mode::ExportTsv {
-                        buffer: String::new(),
-                    };
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.help_scroll = self.help_scroll.saturating_sub(1);
                 }
-                KeyCode::Char('a') | KeyCode::Char('A') if matches!(section, MenuSection::File) => {
-                    mode = Mode::ExportAscii {
-                        buffer: String::new(),
-                    };
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.help_scroll = self.help_scroll.saturating_add(1);
                 }
-                KeyCode::Char('e') | KeyCode::Char('E') if matches!(section, MenuSection::File) => {
-                    mode = Mode::ExportAll {
-                        buffer: String::new(),
-                    };
-                }
-                KeyCode::Char('o') | KeyCode::Char('O') if matches!(section, MenuSection::File) => {
-                    mode = Mode::ExportOdt {
-                        buffer: String::new(),
-                    };
-                }
-                KeyCode::Char('w') | KeyCode::Char('W') if matches!(section, MenuSection::File) => {
-                    mode = Mode::SetMaxColWidth {
-                        buffer: String::new(),
-                    };
-                }
-                KeyCode::Char('x') | KeyCode::Char('X') if matches!(section, MenuSection::File) => {
-                    mode = Mode::SetColWidth {
-                        buffer: String::new(),
-                    };
-                }
-                KeyCode::Char('s') | KeyCode::Char('S') if matches!(section, MenuSection::File) => {
-                    mode = Mode::SortView {
-                        buffer: String::new(),
-                        persist: matches!(key.code, KeyCode::Char('S')),
-                    };
-                }
-                KeyCode::Char('r') | KeyCode::Char('R') if matches!(section, MenuSection::Help) => {
-                    self.status = "Row ops: v·select full rows, then r·move to target row".into();
-                    mode = Mode::Normal;
-                }
-                KeyCode::Char('c') | KeyCode::Char('C') if matches!(section, MenuSection::Help) => {
-                    self.status =
-                        "Col ops: v·select full columns, then c·move to target column".into();
-                    mode = Mode::Normal;
-                }
-                KeyCode::Char('?') if matches!(section, MenuSection::Help) => mode = Mode::Help,
                 _ => {}
             },
-            Mode::Help => {
-                if matches!(
-                    key.code,
-                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?')
-                ) {
-                    mode = Mode::Normal;
+            Mode::About => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => mode = Mode::Normal,
+                KeyCode::Char('?') => {
+                    self.help_scroll = 0;
+                    mode = Mode::Help;
                 }
-            }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.about_scroll = self.about_scroll.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.about_scroll = self.about_scroll.saturating_add(1);
+                }
+                _ => {}
+            },
+            Mode::Menu { .. } => {}
             Mode::ExportTsv { buffer } => match key.code {
                 KeyCode::Enter => {
                     let fname = buffer.clone();
@@ -2249,6 +2805,9 @@ impl App {
                             self.status = "Selection expanded to rows".into();
                         }
                     }
+                    KeyCode::Char('?') => {
+                        mode = Mode::Help;
+                    }
                     KeyCode::Delete | KeyCode::Backspace => {
                         if !self.delete_selection() {
                             if let Some(addr) = self.addr_at(self.cursor.row, self.cursor.col) {
@@ -2310,11 +2869,6 @@ impl App {
                             .grid
                             .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
                     }
-                    KeyCode::Char('?') => {
-                        mode = Mode::Menu {
-                            section: MenuSection::Help,
-                        }
-                    }
                     KeyCode::Char(c) if !c.is_control() => {
                         let buffer = c.to_string();
                         mode = Mode::Edit {
@@ -2339,6 +2893,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     #[test]
     fn undo_restores_previous_cell_value() {
@@ -2362,6 +2917,132 @@ mod tests {
             app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }),
             Some("old")
         );
+    }
+
+    #[test]
+    fn right_enters_nested_width_submenu() {
+        let mut app = App::new(None);
+        app.mode = Mode::Menu {
+            stack: vec![MenuLevel {
+                section: MenuSection::File,
+                item: 2,
+            }],
+        };
+
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::empty()))
+            .unwrap();
+
+        match app.mode {
+            Mode::Menu { stack } => {
+                assert_eq!(stack.len(), 2);
+                assert_eq!(stack[1].section, MenuSection::Width);
+                assert_eq!(stack[1].item, 0);
+            }
+            other => panic!("unexpected mode: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn menu_preview_includes_child_submenu() {
+        let levels = App::menu_render_levels(&[MenuLevel {
+            section: MenuSection::File,
+            item: 2,
+        }]);
+
+        assert_eq!(levels.len(), 2);
+        assert_eq!(levels[0].section, MenuSection::File);
+        assert_eq!(levels[1].section, MenuSection::Width);
+    }
+
+    #[test]
+    fn submenu_popup_is_offset_right_and_down() {
+        let area = Rect::new(0, 0, 80, 20);
+        let parent = menu_popup_area(area, MenuSection::File, None);
+        let child = menu_popup_area(area, MenuSection::Width, Some((parent, 2)));
+
+        assert!(child.x > parent.x);
+        assert!(child.y > parent.y);
+        assert_eq!(child.y, parent.y + 2);
+    }
+
+    #[test]
+    fn preview_level_is_not_highlighted() {
+        assert_eq!(App::menu_selected_index(0, 1, 2, 4), Some(2));
+        assert_eq!(App::menu_selected_index(1, 1, 0, 4), None);
+    }
+
+    #[test]
+    fn left_wraps_from_help_to_file() {
+        let mut app = App::new(None);
+        app.mode = Mode::Menu {
+            stack: vec![MenuLevel {
+                section: MenuSection::Help,
+                item: 0,
+            }],
+        };
+
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::empty()))
+            .unwrap();
+
+        match &app.mode {
+            Mode::Menu { stack } => {
+                assert_eq!(stack.len(), 1);
+                assert_eq!(stack[0].section, MenuSection::File);
+            }
+            other => panic!("unexpected mode: {other:?}"),
+        }
+
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::empty()))
+            .unwrap();
+
+        match &app.mode {
+            Mode::Menu { stack } => {
+                assert_eq!(stack.len(), 1);
+                assert_eq!(stack[0].section, MenuSection::Help);
+            }
+            other => panic!("unexpected mode: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn right_descends_or_wraps() {
+        let mut app = App::new(None);
+        app.mode = Mode::Menu {
+            stack: vec![MenuLevel {
+                section: MenuSection::File,
+                item: 3,
+            }],
+        };
+
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::empty()))
+            .unwrap();
+
+        match app.mode {
+            Mode::Menu { stack } => {
+                assert_eq!(stack.len(), 1);
+                assert_eq!(stack[0].section, MenuSection::Help);
+                assert_eq!(stack[0].item, 0);
+            }
+            other => panic!("unexpected mode: {other:?}"),
+        }
+
+        app.mode = Mode::Menu {
+            stack: vec![MenuLevel {
+                section: MenuSection::File,
+                item: 1,
+            }],
+        };
+
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::empty()))
+            .unwrap();
+
+        match app.mode {
+            Mode::Menu { stack } => {
+                assert_eq!(stack.len(), 2);
+                assert_eq!(stack[1].section, MenuSection::Export);
+            }
+            other => panic!("unexpected mode: {other:?}"),
+        }
     }
 }
 

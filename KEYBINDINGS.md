@@ -50,7 +50,9 @@ Menu mode is an internal accelerator layer. It is mostly reached through `Alt` s
 | `E` | Export full prompt | Same as `Alt+E` |
 | `W` | Set default width | Same as `Alt+W` |
 | `S` | Sort view prompt | Same as `Alt+S` |
+| `X` | Exit | Opens the quit prompt |
 | `?` | Help | Same as `?` from Normal mode |
+| `A` | About | Opens the about page |
 | `Esc` | Close menu | Returns to Normal mode |
 
 ## Selection Flow
@@ -123,8 +125,9 @@ Sort order uses Excel-style main-column letters.
 
 | Key | Action | Notes |
 | --- | --- | --- |
-| `?`, `h` | Open help | From Normal mode |
-| `Esc` | Close help | Also closes the menu and most prompts |
+| `?`, `h` | Open help | From Normal mode; help is a full-page scrollable screen |
+| `A` | Open about | From Help mode or menu |
+| `Esc` | Close help/about | Also closes the menu and most prompts |
 | `q` | Open quit prompt | Normal mode only |
 | `Q` | Confirm quit | Quit prompt only |
 | `B`, `Esc` | Cancel quit prompt | Quit prompt only |
