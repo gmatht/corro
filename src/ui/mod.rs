@@ -3,7 +3,7 @@
 use crate::addr::{self, parse_cell_ref_at};
 use crate::agg::{cell_display, compute_aggregate};
 use crate::export;
-use crate::formula::cell_effective_display;
+use crate::formula::{cell_effective_display, is_formula};
 use crate::grid::MainRange;
 use crate::grid::{CellAddr, Grid, SortSpec, FOOTER_ROWS, HEADER_ROWS, MARGIN_COLS};
 use crate::io::{commit_line, commit_op, load_full, tail_apply, IoError, LogWatcher};
@@ -351,7 +351,7 @@ fn main_row_window(
     let mut hi = 0usize;
 
     for (pos, &main_row) in main_order.iter().enumerate() {
-        if g.logical_row_has_content(hr + main_row) {
+        if g.logical_row_has_content(hr + main_row) || left_margin_template_applies(g, main_row) {
             lo = lo.min(pos);
             hi = hi.max(pos);
         }
@@ -388,7 +388,7 @@ fn main_col_window(state: &SheetState, cursor: SheetCursor) -> (usize, usize) {
     let mut hi = 0usize;
 
     for c in 0..mc {
-        if g.logical_col_has_content(lm + c) {
+        if g.logical_col_has_content(lm + c) || header_template_applies(g, c) {
             lo = lo.min(c);
             hi = hi.max(c);
         }
@@ -862,7 +862,10 @@ fn trailing_blank_main_rows(state: &SheetState) -> usize {
     let g = &state.grid;
     let hr = HEADER_ROWS;
     let mr = g.main_rows();
-    match (0..mr).rev().find(|&r| g.logical_row_has_content(hr + r)) {
+    match (0..mr)
+        .rev()
+        .find(|&r| g.logical_row_has_content(hr + r) || left_margin_template_applies(g, r))
+    {
         None => mr,
         Some(last) => mr.saturating_sub(last + 1),
     }
@@ -872,10 +875,29 @@ fn trailing_blank_main_cols(state: &SheetState) -> usize {
     let g = &state.grid;
     let lm = MARGIN_COLS;
     let mc = g.main_cols();
-    match (0..mc).rev().find(|&c| g.logical_col_has_content(lm + c)) {
+    match (0..mc)
+        .rev()
+        .find(|&c| g.logical_col_has_content(lm + c) || header_template_applies(g, c))
+    {
         None => mc,
         Some(last) => mc.saturating_sub(last + 1),
     }
+}
+
+fn header_template_applies(grid: &Grid, main_col: usize) -> bool {
+    grid.get(&CellAddr::Header {
+        row: (HEADER_ROWS - 1) as u8,
+        col: (MARGIN_COLS as u32) + main_col as u32,
+    })
+    .is_some_and(is_formula)
+}
+
+fn left_margin_template_applies(grid: &Grid, main_row: usize) -> bool {
+    grid.get(&CellAddr::Left {
+        col: (MARGIN_COLS - 1) as u8,
+        row: main_row as u32,
+    })
+    .is_some_and(is_formula)
 }
 
 // ── Display-time aggregate helpers ───────────────────────────────────────────
@@ -1206,7 +1228,15 @@ impl App {
     }
 
     fn addr_at(&self, row: usize, col: usize) -> Option<CellAddr> {
-        let grid = &self.state.grid;
+        let preview_grid = if let Mode::Edit { buffer, .. } = &self.mode {
+            let mut grid = self.state.grid.clone();
+            let addr = self.cursor.to_addr(&self.state.grid);
+            grid.set(&addr, buffer.clone());
+            Some(grid)
+        } else {
+            None
+        };
+        let grid = preview_grid.as_ref().unwrap_or(&self.state.grid);
         let hr = HEADER_ROWS;
         let mr = grid.main_rows();
         let mc = grid.main_cols();
@@ -2953,7 +2983,11 @@ impl App {
                     self.mode = mode;
                     return Ok(true);
                 }
-                KeyCode::Char('b') | KeyCode::Char('B') | KeyCode::Esc => mode = Mode::Normal,
+                KeyCode::Char('b') | KeyCode::Char('B') => mode = Mode::Normal,
+                KeyCode::Esc => {
+                    self.mode = mode;
+                    return Ok(true);
+                }
                 _ => {}
             },
             Mode::OpenPath { buffer } => match key.code {
@@ -3772,6 +3806,45 @@ mod tests {
     }
 
     #[test]
+    fn startup_renders_header_template_values_without_cursor_movement() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(2, 2);
+        app.state.grid.set(
+            &CellAddr::Header {
+                row: 25,
+                col: MARGIN_COLS as u32 + 1,
+            },
+            "=A*2 -- POW2".into(),
+        );
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "7".into());
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS + 1,
+        };
+        app.mode = Mode::Edit {
+            buffer: "=A*2 -- POW2".into(),
+            formula_cursor: None,
+        };
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = |y: u16| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+
+        assert!((0..buffer.area.height).any(|y| row(y).contains("14")));
+    }
+
+    #[test]
     fn escape_cancels_edit_without_committing() {
         let mut app = App::new(None);
         app.state
@@ -3790,6 +3863,18 @@ mod tests {
             app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }),
             Some("orig")
         );
+    }
+
+    #[test]
+    fn esc_while_quit_prompted_exits() {
+        let mut app = App::new(None);
+        app.mode = Mode::QuitPrompt;
+
+        let quit = app
+            .handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()))
+            .unwrap();
+
+        assert!(quit);
     }
 
     #[test]

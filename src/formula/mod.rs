@@ -1,7 +1,7 @@
 //! `=...` cell formulas: parse, evaluate, display.
 
-use crate::addr::{parse_cell_ref_at, parse_main_range_at};
-use crate::grid::{CellAddr, Grid, MainRange};
+use crate::addr::{excel_column_name, parse_cell_ref_at, parse_main_range_at};
+use crate::grid::{CellAddr, Grid, MainRange, HEADER_ROWS, MARGIN_COLS};
 
 const DEFAULT_BUDGET: usize = 10_000;
 
@@ -25,6 +25,102 @@ fn parse_number_literal(s: &str) -> Option<f64> {
     t.parse::<f64>().ok()
 }
 
+fn split_labeled_formula(raw: &str) -> Option<(&str, &str)> {
+    let t = raw.trim();
+    let expr = t.strip_prefix('=')?;
+    let (expr, label) = expr.rsplit_once(" -- ")?;
+    let expr = expr.trim();
+    let label = label.trim();
+    if expr.is_empty() || label.is_empty() {
+        return None;
+    }
+    Some((expr, label))
+}
+
+fn rewrite_header_template(expr: &str, row: u32) -> String {
+    let mut out = String::new();
+    let bytes = expr.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b.is_ascii_alphabetic() {
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+                i += 1;
+            }
+            let token = &expr[start..i];
+            if i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'(') {
+                out.push_str(token);
+            } else {
+                out.push_str(&token.to_ascii_uppercase());
+                out.push_str(&(row + 1).to_string());
+            }
+        } else {
+            out.push(b as char);
+            i += 1;
+        }
+    }
+    out
+}
+
+fn rewrite_row_template(expr: &str, col: usize) -> String {
+    let mut out = String::new();
+    let mut chars = expr.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == ':' {
+            let mut digits = String::new();
+            while matches!(chars.peek(), Some(c) if c.is_ascii_digit()) {
+                digits.push(chars.next().unwrap());
+            }
+            if digits.is_empty() {
+                out.push(ch);
+            } else {
+                out.push_str(&excel_column_name(col));
+                out.push_str(&digits);
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn control_formula_expr(grid: &Grid, addr: &CellAddr) -> Option<String> {
+    let raw = grid.get(addr)?;
+    let (expr, _label) = split_labeled_formula(raw)?;
+    Some(expr.to_string())
+}
+
+fn control_formula_label(grid: &Grid, addr: &CellAddr) -> Option<String> {
+    let raw = grid.get(addr)?;
+    let (_expr, label) = split_labeled_formula(raw)?;
+    Some(label.to_string())
+}
+
+fn templated_formula(grid: &Grid, addr: &CellAddr) -> Option<String> {
+    let CellAddr::Main { row, col } = addr else {
+        return None;
+    };
+
+    let header_addr = CellAddr::Header {
+        row: (HEADER_ROWS - 1) as u8,
+        col: (MARGIN_COLS as u32) + *col,
+    };
+    if let Some(expr) = control_formula_expr(grid, &header_addr) {
+        return Some(format!("={}", rewrite_header_template(&expr, *row)));
+    }
+
+    let left_addr = CellAddr::Left {
+        col: (MARGIN_COLS - 1) as u8,
+        row: *row,
+    };
+    if let Some(expr) = control_formula_expr(grid, &left_addr) {
+        return Some(format!("={}", rewrite_row_template(&expr, *col as usize)));
+    }
+
+    None
+}
+
 /// True if the stored cell text is a formula (`=` prefix after trim).
 pub fn is_formula(raw: &str) -> bool {
     raw.trim_start().starts_with('=')
@@ -38,7 +134,7 @@ pub fn effective_numeric(
     budget: &mut usize,
 ) -> Option<f64> {
     let raw = grid.get(addr).unwrap_or("");
-    if !is_formula(raw) {
+    if templated_formula(grid, addr).is_none() && !is_formula(raw) {
         return parse_number_literal(raw);
     }
     match eval_cell(grid, addr, visiting, budget) {
@@ -55,9 +151,25 @@ pub fn eval_cell(
     visiting: &mut Vec<CellAddr>,
     budget: &mut usize,
 ) -> EvalResult {
+    eval_cell_inner(grid, addr, visiting, budget, true)
+}
+
+fn eval_cell_inner(
+    grid: &Grid,
+    addr: &CellAddr,
+    visiting: &mut Vec<CellAddr>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
     *budget = budget.saturating_sub(1);
     if *budget == 0 {
         return EvalResult::Error("LIMIT");
+    }
+
+    if allow_templates {
+        if let Some(formula) = templated_formula(grid, addr) {
+            return eval_expr_str(&formula[1..], grid, visiting, budget, false);
+        }
     }
 
     let raw = grid.get(addr).unwrap_or("");
@@ -73,12 +185,16 @@ pub fn eval_cell(
         };
     }
 
+    if let Some(expr) = control_formula_expr(grid, addr) {
+        return eval_expr_str(&expr, grid, visiting, budget, false);
+    }
+
     if visiting.iter().any(|a| a == addr) {
         return EvalResult::Error("CIRC");
     }
 
     visiting.push(addr.clone());
-    let r = eval_expr_str(&t[1..], grid, visiting, budget);
+    let r = eval_expr_str(&t[1..], grid, visiting, budget, false);
     visiting.pop();
     r
 }
@@ -88,6 +204,7 @@ fn eval_expr_str(
     grid: &Grid,
     visiting: &mut Vec<CellAddr>,
     budget: &mut usize,
+    allow_templates: bool,
 ) -> EvalResult {
     let mut p = Parser {
         s: expr.trim(),
@@ -101,7 +218,7 @@ fn eval_expr_str(
     if p.i != p.s.len() {
         return EvalResult::Error("PARSE");
     }
-    eval_ast(&ast, grid, visiting, budget)
+    eval_ast(&ast, grid, visiting, budget, allow_templates)
 }
 
 #[derive(Clone, Debug)]
@@ -213,14 +330,25 @@ impl<'a> Parser<'a> {
         }
 
         // Number
-        if b.is_ascii_digit() || (b == b'.' && self.s.get(self.i + 1..).and_then(|r| r.as_bytes().first()).map_or(false, |x| x.is_ascii_digit())) {
+        if b.is_ascii_digit()
+            || (b == b'.'
+                && self
+                    .s
+                    .get(self.i + 1..)
+                    .and_then(|r| r.as_bytes().first())
+                    .map_or(false, |x| x.is_ascii_digit()))
+        {
             return Ok(Ast::Number(self.parse_number()?));
         }
 
         let rest = &self.s[self.i..];
 
         // Region-style refs
-        if rest.starts_with('^') || rest.starts_with('_') || rest.starts_with('<') || rest.starts_with('>') {
+        if rest.starts_with('^')
+            || rest.starts_with('_')
+            || rest.starts_with('<')
+            || rest.starts_with('>')
+        {
             let (addr, len) = parse_cell_ref_at(rest).ok_or(())?;
             self.i += len;
             return Ok(Ast::Ref(addr));
@@ -234,7 +362,11 @@ impl<'a> Parser<'a> {
                 return Ok(Ast::Range(range));
             }
             let start = self.i;
-            while self.peek().map(|x| x.is_ascii_alphabetic()).unwrap_or(false) {
+            while self
+                .peek()
+                .map(|x| x.is_ascii_alphabetic())
+                .unwrap_or(false)
+            {
                 self.i += 1;
             }
             let letters = &self.s[start..self.i];
@@ -254,7 +386,10 @@ impl<'a> Parser<'a> {
                         return Err(());
                     }
                 }
-                return Ok(Ast::Call { name, args: arg_asts });
+                return Ok(Ast::Call {
+                    name,
+                    args: arg_asts,
+                });
             }
             self.i = start;
             let (addr, len) = parse_cell_ref_at(&self.s[self.i..]).ok_or(())?;
@@ -326,19 +461,20 @@ fn eval_ast(
     grid: &Grid,
     visiting: &mut Vec<CellAddr>,
     budget: &mut usize,
+    allow_templates: bool,
 ) -> EvalResult {
     match ast {
         Ast::Number(n) => EvalResult::Number(*n),
-        Ast::Ref(addr) => eval_cell(grid, addr, visiting, budget),
+        Ast::Ref(addr) => eval_cell_inner(grid, addr, visiting, budget, allow_templates),
         Ast::Range(_) => EvalResult::Error("RANGE"),
-        Ast::Neg(a) => match eval_ast(a, grid, visiting, budget) {
+        Ast::Neg(a) => match eval_ast(a, grid, visiting, budget, allow_templates) {
             EvalResult::Number(n) => EvalResult::Number(-n),
             e => e,
         },
-        Ast::Add(a, b) => eval_binary(a, b, grid, visiting, budget, |x, y| x + y),
-        Ast::Sub(a, b) => eval_binary(a, b, grid, visiting, budget, |x, y| x - y),
-        Ast::Mul(a, b) => eval_binary(a, b, grid, visiting, budget, |x, y| x * y),
-        Ast::Div(a, b) => eval_binary(a, b, grid, visiting, budget, |x, y| {
+        Ast::Add(a, b) => eval_binary(a, b, grid, visiting, budget, allow_templates, |x, y| x + y),
+        Ast::Sub(a, b) => eval_binary(a, b, grid, visiting, budget, allow_templates, |x, y| x - y),
+        Ast::Mul(a, b) => eval_binary(a, b, grid, visiting, budget, allow_templates, |x, y| x * y),
+        Ast::Div(a, b) => eval_binary(a, b, grid, visiting, budget, allow_templates, |x, y| {
             if y == 0.0 {
                 f64::NAN
             } else {
@@ -352,18 +488,18 @@ fn eval_ast(
                     if args.len() != 1 {
                         return EvalResult::Error("ARGS");
                     }
-                    eval_sum(&args[0], grid, visiting, budget)
+                    eval_sum(&args[0], grid, visiting, budget, allow_templates)
                 }
                 "IF" => {
                     if args.len() != 3 {
                         return EvalResult::Error("ARGS");
                     }
-                    let cond = eval_ast(&args[0], grid, visiting, budget);
+                    let cond = eval_ast(&args[0], grid, visiting, budget, allow_templates);
                     let pick = truthy(cond);
                     if pick {
-                        eval_ast(&args[1], grid, visiting, budget)
+                        eval_ast(&args[1], grid, visiting, budget, allow_templates)
                     } else {
-                        eval_ast(&args[2], grid, visiting, budget)
+                        eval_ast(&args[2], grid, visiting, budget, allow_templates)
                     }
                 }
                 _ => EvalResult::Error("FUNC"),
@@ -386,11 +522,12 @@ fn eval_binary(
     grid: &Grid,
     visiting: &mut Vec<CellAddr>,
     budget: &mut usize,
+    allow_templates: bool,
     f: fn(f64, f64) -> f64,
 ) -> EvalResult {
     let (ea, eb) = (
-        eval_ast(a, grid, visiting, budget),
-        eval_ast(b, grid, visiting, budget),
+        eval_ast(a, grid, visiting, budget, allow_templates),
+        eval_ast(b, grid, visiting, budget, allow_templates),
     );
     let na = match ea {
         EvalResult::Number(n) => n,
@@ -422,6 +559,7 @@ fn eval_sum(
     grid: &Grid,
     visiting: &mut Vec<CellAddr>,
     budget: &mut usize,
+    allow_templates: bool,
 ) -> EvalResult {
     match arg {
         Ast::Range(r) => EvalResult::Number(sum_main_range(grid, r, visiting, budget)),
@@ -434,7 +572,7 @@ fn eval_sum(
         | Ast::Add(_, _)
         | Ast::Sub(_, _)
         | Ast::Mul(_, _)
-        | Ast::Div(_, _) => match eval_ast(arg, grid, visiting, budget) {
+        | Ast::Div(_, _) => match eval_ast(arg, grid, visiting, budget, allow_templates) {
             EvalResult::Number(n) => EvalResult::Number(n),
             EvalResult::Text(s) => {
                 if let Some(n) = parse_number_literal(&s) {
@@ -471,8 +609,11 @@ fn sum_main_range(
 
 /// Display string for a cell: evaluated formula result, or raw text.
 pub fn cell_effective_display(grid: &Grid, addr: &CellAddr) -> String {
+    if let Some(label) = control_formula_label(grid, addr) {
+        return label;
+    }
     let raw = grid.get(addr).unwrap_or("");
-    if !is_formula(raw) {
+    if templated_formula(grid, addr).is_none() && !is_formula(raw) {
         return raw.to_string();
     }
     let mut visiting = Vec::new();
@@ -538,15 +679,62 @@ mod tests {
     fn if_func() {
         let mut g = Grid::new(1, 3);
         g.set(&CellAddr::Main { row: 0, col: 0 }, "0".into());
-        g.set(
-            &CellAddr::Main { row: 0, col: 2 },
-            "=IF(A1,1,2)".into(),
-        );
+        g.set(&CellAddr::Main { row: 0, col: 2 }, "=IF(A1,1,2)".into());
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
         match eval_cell(&g, &CellAddr::Main { row: 0, col: 2 }, &mut v, &mut b) {
             EvalResult::Number(n) => assert!((n - 2.0).abs() < 1e-9),
             e => panic!("expected 2 {:?}", e),
         }
+    }
+
+    #[test]
+    fn header_template_label_is_display_only() {
+        let mut g = Grid::new(2, 2);
+        g.set(
+            &CellAddr::Header {
+                row: 25,
+                col: MARGIN_COLS as u32 + 1,
+            },
+            "=A*2 -- POW2".into(),
+        );
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "7".into());
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        assert_eq!(
+            cell_effective_display(&g, &CellAddr::Main { row: 0, col: 1 }),
+            "14"
+        );
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 1 }, &mut v, &mut b) {
+            EvalResult::Number(n) => assert!((n - 14.0).abs() < 1e-9),
+            e => panic!("expected 14 {:?}", e),
+        }
+        assert_eq!(
+            cell_effective_display(
+                &g,
+                &CellAddr::Header {
+                    row: 25,
+                    col: MARGIN_COLS as u32 + 1,
+                },
+            ),
+            "POW2"
+        );
+    }
+
+    #[test]
+    fn left_margin_template_can_label_rows() {
+        let mut g = Grid::new(2, 2);
+        g.set(&CellAddr::Left { col: 9, row: 0 }, "=:1*0.1 -- TAX".into());
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "10".into());
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 0 }, &mut v, &mut b) {
+            EvalResult::Number(n) => assert!((n - 1.0).abs() < 1e-9),
+            e => panic!("expected 1 {:?}", e),
+        }
+        assert_eq!(
+            cell_effective_display(&g, &CellAddr::Left { col: 9, row: 0 }),
+            "TAX"
+        );
     }
 }
