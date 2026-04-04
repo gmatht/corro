@@ -779,6 +779,7 @@ fn visible_col_indices(
     let total = lm + mc + rm;
     let dim = dim.max(1).min(total.max(1));
     let cur = cursor.col.min(total.saturating_sub(1));
+    let cursor_in_left = cursor.col < lm;
     let cursor_in_right = cursor.col >= lm + mc;
 
     if total <= dim {
@@ -800,11 +801,17 @@ fn visible_col_indices(
         right_band.push(blank_right);
         right_band.push(cur);
     }
+    let left_band: Vec<usize> = if cursor_in_left {
+        vec![cur]
+    } else {
+        Vec::new()
+    };
     let main_span = main_hi.saturating_sub(main_lo) + 1;
-    let mut stable_band = Vec::with_capacity(main_span + 1 + right_band.len());
+    let mut stable_band = Vec::with_capacity(main_span + 1 + right_band.len() + left_band.len());
     if lm > 0 {
         stable_band.push(lm - 1);
     }
+    stable_band.extend(left_band.iter().copied());
     stable_band.extend((main_lo..=main_hi).map(|ci| lm + ci));
     stable_band.extend(right_band.iter().copied());
     stable_band.sort_unstable();
@@ -814,6 +821,7 @@ fn visible_col_indices(
     }
 
     let mut reserved: Vec<usize> = right_band;
+    reserved.extend(left_band.iter().copied());
     if lm > 0 && dim > reserved.len() {
         reserved.push(lm - 1);
     }
@@ -3945,6 +3953,58 @@ mod tests {
 
         assert_eq!(first.contains("<2"), second.contains("<2"));
         assert_eq!(first.contains("<3"), second.contains("<3"));
+    }
+
+    #[test]
+    fn moving_left_within_left_margin_steps_the_viewport_once() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 2);
+        let backend = TestBackend::new(70, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        };
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = |y: u16| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+        let leftmost = |line: &str| -> Option<usize> {
+            (0..10)
+                .filter_map(|n| {
+                    let label = format!("<{n}");
+                    line.find(&label).map(|idx| (idx, n))
+                })
+                .min_by_key(|(idx, _)| *idx)
+                .map(|(_, n)| n)
+        };
+        let initial = (0..buffer.area.height)
+            .map(row)
+            .find_map(|line| leftmost(&line))
+            .unwrap_or(0);
+
+        app.cursor.col = MARGIN_COLS - 1;
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let row2 = |y: u16| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+        let moved = (0..buffer.area.height)
+            .map(row2)
+            .find_map(|line| leftmost(&line))
+            .unwrap_or(0);
+
+        assert!(moved >= initial);
+        assert!(moved <= initial + 1);
     }
 
     #[test]
