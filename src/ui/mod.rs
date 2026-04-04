@@ -388,7 +388,10 @@ fn main_col_window(state: &SheetState, cursor: SheetCursor) -> (usize, usize) {
     let mut hi = 0usize;
 
     for c in 0..mc {
-        if g.logical_col_has_content(lm + c) || header_template_applies(g, c) {
+        if g.logical_col_has_content(lm + c)
+            || header_template_applies(g, c)
+            || right_col_agg_func(g, lm + c).is_some()
+        {
             lo = lo.min(c);
             hi = hi.max(c);
         }
@@ -795,6 +798,7 @@ fn visible_col_indices(
         .unwrap_or(right_start);
     if cursor_in_right {
         right_band.push(blank_right);
+        right_band.push(cur);
     }
     let main_span = main_hi.saturating_sub(main_lo) + 1;
     let mut stable_band = Vec::with_capacity(main_span + 1 + right_band.len());
@@ -844,9 +848,9 @@ fn visible_col_indices(
     let max_start = filtered.len().saturating_sub(available);
     let mut start = prev_start.min(max_start);
     if cur_pos < start {
-        start = cur_pos;
+        start = start.saturating_sub(1);
     } else if cur_pos >= start + available {
-        start = cur_pos + 1 - available;
+        start = (start + 1).min(max_start);
     }
     let end = (start + available).min(filtered.len());
 
@@ -875,10 +879,11 @@ fn trailing_blank_main_cols(state: &SheetState) -> usize {
     let g = &state.grid;
     let lm = MARGIN_COLS;
     let mc = g.main_cols();
-    match (0..mc)
-        .rev()
-        .find(|&c| g.logical_col_has_content(lm + c) || header_template_applies(g, c))
-    {
+    match (0..mc).rev().find(|&c| {
+        g.logical_col_has_content(lm + c)
+            || header_template_applies(g, c)
+            || right_col_agg_func(g, lm + c).is_some()
+    }) {
         None => mc,
         Some(last) => mc.saturating_sub(last + 1),
     }
@@ -890,6 +895,27 @@ fn header_template_applies(grid: &Grid, main_col: usize) -> bool {
         col: (MARGIN_COLS as u32) + main_col as u32,
     })
     .is_some_and(is_formula)
+}
+
+fn data_main_col_count(grid: &Grid) -> usize {
+    let mc = grid.main_cols();
+    for c in 0..mc {
+        if right_col_agg_func(grid, MARGIN_COLS + c).is_some() {
+            return c;
+        }
+    }
+    mc
+}
+
+fn row_total_block_start(grid: &Grid, current_main_row: u32) -> u32 {
+    let mut agg_row_start: u32 = 0;
+    for candidate in (0..current_main_row).rev() {
+        if left_margin_agg_func(grid, candidate).is_some() {
+            break;
+        }
+        agg_row_start = candidate;
+    }
+    agg_row_start
 }
 
 fn left_margin_template_applies(grid: &Grid, main_row: usize) -> bool {
@@ -1002,6 +1028,7 @@ fn footer_special_col_aggregate(
     main_cols: usize,
 ) -> Option<String> {
     let right_func = right_col_agg_func(grid, global_col)?;
+    let data_cols = data_main_col_count(grid).min(main_cols);
     let mut samples: Vec<f64> = Vec::new();
     for r in 0..main_rows {
         let row_val = compute_aggregate(
@@ -1012,7 +1039,7 @@ fn footer_special_col_aggregate(
                     row_start: r as u32,
                     row_end: r as u32 + 1,
                     col_start: 0,
-                    col_end: main_cols as u32,
+                    col_end: data_cols as u32,
                 },
             },
         );
@@ -2215,35 +2242,11 @@ impl App {
                 let cur = SheetCursor { row: r, col: c };
                 let cell_addr = cur.to_addr(grid);
 
-                let left_total_row_aggregate = || -> Option<String> {
-                    let func = left_margin_agg?;
-                    if c < lm || c >= lm + mc {
-                        return None;
-                    }
-                    let main_col = (c - lm) as u32;
-                    let mut agg_row_start: u32 = 0;
-                    for candidate in (0..main_row_idx?).rev() {
-                        if left_margin_agg_func(grid, candidate).is_some() {
-                            break;
-                        }
-                        agg_row_start = candidate;
-                    }
-                    Some(compute_aggregate(
-                        grid,
-                        &AggregateDef {
-                            func,
-                            source: MainRange {
-                                row_start: agg_row_start,
-                                row_end: main_row_idx? + 1,
-                                col_start: main_col,
-                                col_end: main_col + 1,
-                            },
-                        },
-                    ))
-                };
-
                 let text = if let Some(func) = footer_agg {
-                    if c >= lm && c < lm + mc {
+                    if right_col_agg_func(grid, c).is_some() {
+                        footer_special_col_aggregate(grid, func, c, mr, data_main_col_count(grid))
+                            .unwrap_or_else(|| cell_effective_display(grid, &cell_addr))
+                    } else if c >= lm && c < lm + mc {
                         let main_col = (c - lm) as u32;
                         compute_aggregate(
                             grid,
@@ -2257,18 +2260,15 @@ impl App {
                                 },
                             },
                         )
-                    } else if c >= lm + mc {
-                        footer_special_col_aggregate(grid, func, c, mr, mc)
-                            .unwrap_or_else(|| cell_effective_display(grid, &cell_addr))
                     } else {
                         cell_effective_display(grid, &cell_addr)
                     }
                 } else if left_margin_agg.is_some() {
-                    left_total_row_aggregate()
-                        .unwrap_or_else(|| cell_effective_display(grid, &cell_addr))
-                } else if r >= hr && r < hr + mr && c >= lm + mc {
+                    cell_effective_display(grid, &cell_addr)
+                } else if r >= hr && r < hr + mr {
                     if let Some(func) = right_col_agg_func(grid, c) {
                         let main_row = (r - hr) as u32;
+                        let data_cols = data_main_col_count(grid);
                         compute_aggregate(
                             grid,
                             &AggregateDef {
@@ -2277,7 +2277,7 @@ impl App {
                                     row_start: main_row,
                                     row_end: main_row + 1,
                                     col_start: 0,
-                                    col_end: mc as u32,
+                                    col_end: data_cols as u32,
                                 },
                             },
                         )
@@ -3842,6 +3842,160 @@ mod tests {
         };
 
         assert!((0..buffer.area.height).any(|y| row(y).contains("14")));
+    }
+
+    #[test]
+    fn startup_keeps_total_column_visible() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(4, 3);
+        app.state.grid.set(
+            &CellAddr::Header {
+                row: 25,
+                col: MARGIN_COLS as u32 + 2,
+            },
+            "TOTAL".into(),
+        );
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "1".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 1, col: 0 }, "7".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 2, col: 0 }, "0".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 3, col: 0 }, "5".into());
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = |y: u16| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+
+        assert!((0..buffer.area.height).any(|y| row(y).contains("TOTAL")));
+    }
+
+    #[test]
+    fn total_row_and_total_column_intersection_sums_row_totals() {
+        use crate::io::load_full;
+        use std::path::Path;
+
+        let mut state = SheetState::new(1, 1);
+        load_full(Path::new("test5.corro"), &mut state).unwrap();
+
+        assert_eq!(
+            footer_special_col_aggregate(
+                &state.grid,
+                AggFunc::Sum,
+                MARGIN_COLS + 2,
+                state.grid.main_rows(),
+                state.grid.main_cols(),
+            ),
+            Some("105".into())
+        );
+    }
+
+    #[test]
+    fn moving_right_in_right_margin_does_not_reveal_more_left_columns() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 2);
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS + app.state.grid.main_cols() + 0,
+        };
+
+        let backend = TestBackend::new(70, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = |y: u16| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+        let first = (0..buffer.area.height)
+            .map(row)
+            .find(|line| line.contains("<0") || line.contains("<1") || line.contains("<2"))
+            .unwrap_or_default();
+
+        app.cursor.col += 1;
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let row2 = |y: u16| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+        let second = (0..buffer.area.height)
+            .map(row2)
+            .find(|line| line.contains("<0") || line.contains("<1") || line.contains("<2"))
+            .unwrap_or_default();
+
+        assert_eq!(first.contains("<2"), second.contains("<2"));
+        assert_eq!(first.contains("<3"), second.contains("<3"));
+    }
+
+    #[test]
+    fn right_margin_moves_view_one_step_at_a_time() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 4);
+        app.state.grid.set(
+            &CellAddr::Header {
+                row: 25,
+                col: MARGIN_COLS as u32 + 3,
+            },
+            "TOTAL".into(),
+        );
+        let backend = TestBackend::new(80, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS + app.state.grid.main_cols(),
+        };
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = |y: u16| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+        let initial = (0..buffer.area.height)
+            .map(row)
+            .find(|line| line.contains(">0") || line.contains(">1"))
+            .unwrap_or_default();
+
+        app.cursor.col += 1;
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let row2 = |y: u16| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+        let moved = (0..buffer.area.height)
+            .map(row2)
+            .find(|line| line.contains(">0") || line.contains(">1"))
+            .unwrap_or_default();
+
+        assert!(initial.contains(">0"));
+        assert!(moved.contains(">1"));
+        assert!((0..buffer.area.height).any(|y| row2(y).contains("TOTAL")));
     }
 
     #[test]
