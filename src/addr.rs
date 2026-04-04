@@ -66,10 +66,7 @@ pub fn parse_cell_ref_at(s: &str) -> Option<(CellAddr, usize)> {
         }
         let col_name = &s[..col_end];
         let rest = &s[col_end..];
-        let row_digits = rest
-            .chars()
-            .take_while(|c| c.is_ascii_digit())
-            .count();
+        let row_digits = rest.chars().take_while(|c| c.is_ascii_digit()).count();
         if row_digits == 0 {
             return None;
         }
@@ -89,7 +86,7 @@ pub fn parse_cell_ref_at(s: &str) -> Option<(CellAddr, usize)> {
         ));
     }
 
-    // Header: ^X or ^X,COL
+    // Header: ^X or ^X,COL (legacy logs also use `:` and raw global column numbers)
     if bytes[0] == b'^' && bytes.len() >= 2 {
         let letter = bytes[1];
         if !letter.is_ascii_uppercase() {
@@ -99,7 +96,7 @@ pub fn parse_cell_ref_at(s: &str) -> Option<(CellAddr, usize)> {
         if s.len() == 2 {
             return Some((CellAddr::Header { row, col: 0 }, 2));
         }
-        if bytes.get(2) != Some(&b',') {
+        if !matches!(bytes.get(2), Some(b',') | Some(b':')) {
             return None;
         }
         let col_part = &s[3..];
@@ -107,7 +104,7 @@ pub fn parse_cell_ref_at(s: &str) -> Option<(CellAddr, usize)> {
         return Some((CellAddr::Header { row, col: cf.col }, 3 + cf.consumed));
     }
 
-    // Footer: _X or _X,COL
+    // Footer: _X or _X,COL (legacy logs also use `:` and raw global column numbers)
     if bytes[0] == b'_' && bytes.len() >= 2 {
         let letter = bytes[1];
         if !letter.is_ascii_uppercase() {
@@ -117,7 +114,7 @@ pub fn parse_cell_ref_at(s: &str) -> Option<(CellAddr, usize)> {
         if s.len() == 2 {
             return Some((CellAddr::Footer { row, col: 0 }, 2));
         }
-        if bytes.get(2) != Some(&b',') {
+        if !matches!(bytes.get(2), Some(b',') | Some(b':')) {
             return None;
         }
         let col_part = &s[3..];
@@ -125,16 +122,13 @@ pub fn parse_cell_ref_at(s: &str) -> Option<(CellAddr, usize)> {
         return Some((CellAddr::Footer { row, col: cf.col }, 3 + cf.consumed));
     }
 
-    // Left: <N,R
+    // Left: <N,R (legacy logs also use `:`)
     if bytes[0] == b'<' {
         let rest = &s[1..];
-        let comma = rest.find(',')?;
-        let margin_col: u8 = rest[..comma].parse().ok()?;
-        let after = &rest[comma + 1..];
-        let row_digits = after
-            .chars()
-            .take_while(|c| c.is_ascii_digit())
-            .count();
+        let sep = rest.find(|c| c == ',' || c == ':')?;
+        let margin_col: u8 = rest[..sep].parse().ok()?;
+        let after = &rest[sep + 1..];
+        let row_digits = after.chars().take_while(|c| c.is_ascii_digit()).count();
         if row_digits == 0 {
             return None;
         }
@@ -142,7 +136,7 @@ pub fn parse_cell_ref_at(s: &str) -> Option<(CellAddr, usize)> {
         if main_row == 0 {
             return None;
         }
-        let consumed = 1 + comma + 1 + row_digits;
+        let consumed = 1 + sep + 1 + row_digits;
         return Some((
             CellAddr::Left {
                 col: margin_col,
@@ -152,16 +146,13 @@ pub fn parse_cell_ref_at(s: &str) -> Option<(CellAddr, usize)> {
         ));
     }
 
-    // Right: >N,R
+    // Right: >N,R (legacy logs also use `:`)
     if bytes[0] == b'>' {
         let rest = &s[1..];
-        let comma = rest.find(',')?;
-        let margin_col: u8 = rest[..comma].parse().ok()?;
-        let after = &rest[comma + 1..];
-        let row_digits = after
-            .chars()
-            .take_while(|c| c.is_ascii_digit())
-            .count();
+        let sep = rest.find(|c| c == ',' || c == ':')?;
+        let margin_col: u8 = rest[..sep].parse().ok()?;
+        let after = &rest[sep + 1..];
+        let row_digits = after.chars().take_while(|c| c.is_ascii_digit()).count();
         if row_digits == 0 {
             return None;
         }
@@ -169,7 +160,7 @@ pub fn parse_cell_ref_at(s: &str) -> Option<(CellAddr, usize)> {
         if main_row == 0 {
             return None;
         }
-        let consumed = 1 + comma + 1 + row_digits;
+        let consumed = 1 + sep + 1 + row_digits;
         return Some((
             CellAddr::Right {
                 col: margin_col,
@@ -217,6 +208,17 @@ fn parse_global_col_fragment(s: &str) -> Option<ColFragment> {
             consumed: 1 + n_digits,
         });
     }
+    if bytes[0].is_ascii_digit() {
+        let n_digits = s.bytes().take_while(|b| b.is_ascii_digit()).count();
+        if n_digits == 0 {
+            return None;
+        }
+        let col: u32 = s[..n_digits].parse().ok()?;
+        return Some(ColFragment {
+            col,
+            consumed: n_digits,
+        });
+    }
     if bytes[0].is_ascii_uppercase() {
         let n = s.bytes().take_while(|b| b.is_ascii_uppercase()).count();
         let name = &s[..n];
@@ -232,21 +234,13 @@ fn parse_global_col_fragment(s: &str) -> Option<ColFragment> {
 /// Parse `A1:B2` at start of `s`; both ends must be main cells. Returns range + consumed length.
 pub fn parse_main_range_at(s: &str) -> Option<(crate::grid::MainRange, usize)> {
     let (a, na) = parse_cell_ref_at(s)?;
-    let CellAddr::Main {
-        row: ra,
-        col: ca,
-    } = a
-    else {
+    let CellAddr::Main { row: ra, col: ca } = a else {
         return None;
     };
     let rest = s.get(na..)?;
     let rest = rest.strip_prefix(':')?;
     let (b, nb) = parse_cell_ref_at(rest)?;
-    let CellAddr::Main {
-        row: rb,
-        col: cb,
-    } = b
-    else {
+    let CellAddr::Main { row: rb, col: cb } = b else {
         return None;
     };
     let r0 = ra.min(rb);
@@ -281,5 +275,13 @@ mod tests {
         assert_eq!(r.row_end, 2);
         assert_eq!(r.col_start, 0);
         assert_eq!(r.col_end, 2);
+    }
+
+    #[test]
+    fn legacy_special_refs_parse() {
+        assert_eq!(parse_cell_ref_at("^A:10").unwrap().1, 5);
+        assert_eq!(parse_cell_ref_at("_B:10").unwrap().1, 5);
+        assert_eq!(parse_cell_ref_at("<0:1").unwrap().1, 4);
+        assert_eq!(parse_cell_ref_at(">0:1").unwrap().1, 4);
     }
 }

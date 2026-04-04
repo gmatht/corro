@@ -1,7 +1,7 @@
 //! Append-only log operations and replay onto [`SheetState`].
 
 use crate::addr::parse_excel_column;
-use crate::grid::{CellAddr, Grid, MainRange};
+use crate::grid::{CellAddr, Grid, MainRange, SortSpec, MARGIN_COLS};
 use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -46,7 +46,7 @@ pub enum Op {
     MoveColRange { from: u32, count: u32, to: u32 },
     SetMaxColWidth { width: usize },
     SetColWidth { col: usize, width: Option<usize> },
-    SetViewSortCols { cols: Vec<usize> },
+    SetViewSortCols { cols: Vec<SortSpec> },
     Undo { target: String },
 }
 
@@ -137,7 +137,10 @@ fn parse_op_text(line: &str) -> Option<Op> {
         "SORT" => {
             let cols = parts
                 .map(|s| parse_excel_column(s).map(|c| crate::grid::MARGIN_COLS + c as usize))
-                .collect::<Option<Vec<_>>>()?;
+                .collect::<Option<Vec<_>>>()?
+                .into_iter()
+                .map(|col| SortSpec { col, desc: false })
+                .collect::<Vec<_>>();
             Some(Op::SetViewSortCols { cols })
         }
         _ => None,
@@ -170,7 +173,10 @@ impl SheetState {
                     to: *from,
                 })
             }
-            Op::SetMainSize { .. } => None,
+            Op::SetMainSize { .. } => Some(Op::SetMainSize {
+                main_rows: self.grid.main_rows() as u32,
+                main_cols: self.grid.main_cols() as u32,
+            }),
             Op::SetMaxColWidth { .. } => Some(Op::SetMaxColWidth {
                 width: self.grid.max_col_width,
             }),
@@ -287,8 +293,16 @@ fn apply_any_line(line: &str, state: &mut SheetState) -> Result<(), serde_json::
         "SORT" => {
             let cols = parts
                 .map(|s| {
-                    parse_excel_column(s)
-                        .map(|c| crate::grid::MARGIN_COLS + c as usize)
+                    let (desc, raw) = if let Some(rest) = s.strip_prefix('!') {
+                        (true, rest)
+                    } else {
+                        (false, s)
+                    };
+                    parse_excel_column(raw)
+                        .map(|c| SortSpec {
+                            col: MARGIN_COLS + c as usize,
+                            desc,
+                        })
                         .ok_or_else(|| {
                             serde_json::Error::io(std::io::Error::new(
                                 std::io::ErrorKind::InvalidData,
@@ -298,6 +312,34 @@ fn apply_any_line(line: &str, state: &mut SheetState) -> Result<(), serde_json::
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             state.grid.set_view_sort_cols(cols);
+            Ok(())
+        }
+        "SIZE" => {
+            let rows = parts
+                .next()
+                .and_then(|v| v.parse::<usize>().ok())
+                .ok_or_else(|| {
+                    serde_json::Error::io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "bad SIZE line",
+                    ))
+                })?;
+            let cols = parts
+                .next()
+                .and_then(|v| v.parse::<usize>().ok())
+                .ok_or_else(|| {
+                    serde_json::Error::io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "bad SIZE line",
+                    ))
+                })?;
+            if parts.next().is_some() {
+                return Err(serde_json::Error::io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "bad SIZE line",
+                )));
+            }
+            state.grid.set_main_size(rows, cols);
             Ok(())
         }
         _ => Err(serde_json::Error::io(std::io::Error::new(
@@ -331,7 +373,14 @@ pub fn append_op(path: &Path, op: &Op) -> std::io::Result<()> {
         Op::SetViewSortCols { cols } => format!(
             "SORT {}",
             cols.iter()
-                .map(|c| crate::addr::excel_column_name(c.saturating_sub(crate::grid::MARGIN_COLS)))
+                .map(|spec| {
+                    let name = crate::addr::excel_column_name(spec.col.saturating_sub(MARGIN_COLS));
+                    if spec.desc {
+                        format!("!{name}")
+                    } else {
+                        name
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join(" ")
         ),
@@ -382,6 +431,14 @@ mod tests {
         apply_line("COL_WIDTH B 9", &mut s).unwrap();
         assert_eq!(s.grid.max_col_width, 17);
         assert_eq!(s.grid.col_width(crate::grid::MARGIN_COLS + 1), 9);
+    }
+
+    #[test]
+    fn replay_size_line() {
+        let mut s = SheetState::new(1, 1);
+        apply_line("SIZE 7 1", &mut s).unwrap();
+        assert_eq!(s.grid.main_rows(), 7);
+        assert_eq!(s.grid.main_cols(), 1);
     }
 
     #[test]

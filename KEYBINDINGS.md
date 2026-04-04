@@ -21,6 +21,8 @@ It favors spreadsheet conventions where they fit, and documents the bindings tha
 | --- | --- | --- |
 | `Arrows`, `hjkl` | Move cursor | Moves through header, main, footer, and side margins |
 | `Shift+Arrows` | Extend selection | Starts or grows a rectangular selection |
+| `Ctrl+Shift++` | Insert rows | Inserts rows above the current row or selected rows |
+| `Alt+I` | Open Insert menu | Menu includes rows, cols, special chars, and hyperlink actions |
 | `v` | Toggle cell selection | Selects the current rectangle anchor, or clears selection |
 | `e`, `Enter` | Edit current cell | Starts with the current displayed value |
 | Any printable key | Start editing | The first typed character seeds the edit buffer |
@@ -45,6 +47,7 @@ Menu mode is an internal accelerator layer. It is mostly reached through `Alt` s
 | `F` | Open path prompt | Same as `o` / `Alt+F` |
 | `R` | Explain row ops | Returns to Normal mode with a hint in the status line |
 | `C` | Explain col ops | Returns to Normal mode with a hint in the status line |
+| `I` | Open Insert menu | Same as `Alt+I` |
 | `T` | Export TSV prompt | Same as `t` / `Alt+T` |
 | `Alt+A` / `A` | Export ASCII prompt | Opens the ASCII export prompt |
 | `E` | Export full prompt | Same as `Alt+E` |

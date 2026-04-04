@@ -5,9 +5,10 @@ use crate::agg::{cell_display, compute_aggregate};
 use crate::export;
 use crate::formula::cell_effective_display;
 use crate::grid::MainRange;
-use crate::grid::{CellAddr, Grid, FOOTER_ROWS, HEADER_ROWS, MARGIN_COLS};
+use crate::grid::{CellAddr, Grid, SortSpec, FOOTER_ROWS, HEADER_ROWS, MARGIN_COLS};
 use crate::io::{commit_line, commit_op, load_full, tail_apply, IoError, LogWatcher};
 use crate::ops::{AggFunc, AggregateDef, Op, SheetState};
+use crossterm::cursor::{Hide, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -113,6 +114,9 @@ enum Mode {
     OpenPath {
         buffer: String,
     },
+    SavePath {
+        buffer: String,
+    },
     Help,
     About,
     /// Alt-activated menu bar; letter shortcuts execute actions.
@@ -152,6 +156,7 @@ enum MenuSection {
     File,
     Export,
     Width,
+    Insert,
     Help,
 }
 
@@ -170,6 +175,7 @@ struct MenuLevel {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MenuAction {
     OpenFile,
+    SaveAs,
     Exit,
     ExportTsv,
     ExportCsv,
@@ -178,6 +184,10 @@ enum MenuAction {
     ExportOdt,
     SetMaxColWidth,
     SetColWidth,
+    InsertRows,
+    InsertCols,
+    InsertSpecialChars,
+    InsertHyperlink,
     SortView,
     SaveSort,
     HelpRows,
@@ -193,16 +203,26 @@ struct MenuItem {
     target: MenuTarget,
 }
 
-const FILE_MENU_ITEMS: [MenuItem; 6] = [
+const FILE_MENU_ITEMS: [MenuItem; 8] = [
     MenuItem {
         shortcut: 'O',
         label: "Open file",
         target: MenuTarget::Action(MenuAction::OpenFile),
     },
     MenuItem {
+        shortcut: 'A',
+        label: "Save as",
+        target: MenuTarget::Action(MenuAction::SaveAs),
+    },
+    MenuItem {
         shortcut: 'T',
         label: "Export",
         target: MenuTarget::Submenu(MenuSection::Export),
+    },
+    MenuItem {
+        shortcut: 'I',
+        label: "Insert",
+        target: MenuTarget::Submenu(MenuSection::Insert),
     },
     MenuItem {
         shortcut: 'C',
@@ -264,6 +284,29 @@ const WIDTH_MENU_ITEMS: [MenuItem; 2] = [
         shortcut: 'C',
         label: "Column width",
         target: MenuTarget::Action(MenuAction::SetColWidth),
+    },
+];
+
+const INSERT_MENU_ITEMS: [MenuItem; 4] = [
+    MenuItem {
+        shortcut: 'R',
+        label: "Rows",
+        target: MenuTarget::Action(MenuAction::InsertRows),
+    },
+    MenuItem {
+        shortcut: 'C',
+        label: "Cols",
+        target: MenuTarget::Action(MenuAction::InsertCols),
+    },
+    MenuItem {
+        shortcut: 'S',
+        label: "Special chars",
+        target: MenuTarget::Action(MenuAction::InsertSpecialChars),
+    },
+    MenuItem {
+        shortcut: 'H',
+        label: "Hyperlink",
+        target: MenuTarget::Action(MenuAction::InsertHyperlink),
     },
 ];
 
@@ -386,6 +429,7 @@ fn menu_items(section: MenuSection) -> &'static [MenuItem] {
         MenuSection::File => &FILE_MENU_ITEMS,
         MenuSection::Export => &EXPORT_MENU_ITEMS,
         MenuSection::Width => &WIDTH_MENU_ITEMS,
+        MenuSection::Insert => &INSERT_MENU_ITEMS,
         MenuSection::Help => &HELP_MENU_ITEMS,
     }
 }
@@ -395,6 +439,7 @@ fn menu_title(section: MenuSection) -> &'static str {
         MenuSection::File => "File",
         MenuSection::Export => "Export",
         MenuSection::Width => "Width",
+        MenuSection::Insert => "Insert",
         MenuSection::Help => "Help",
     }
 }
@@ -416,6 +461,7 @@ fn menu_popup_area(area: Rect, section: MenuSection, parent: Option<(Rect, usize
         MenuSection::File => 22,
         MenuSection::Export => 18,
         MenuSection::Width => 20,
+        MenuSection::Insert => 20,
         MenuSection::Help => 18,
     }
     .min(area.width.saturating_sub(2).max(1));
@@ -459,6 +505,13 @@ impl App {
                     .map(|p| p.to_string_lossy().into_owned())
                     .unwrap_or_default(),
             },
+            MenuAction::SaveAs => Mode::SavePath {
+                buffer: self
+                    .path
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            },
             MenuAction::Exit => Mode::QuitPrompt,
             MenuAction::ExportTsv => Mode::ExportTsv {
                 buffer: String::new(),
@@ -480,6 +533,22 @@ impl App {
             },
             MenuAction::SetColWidth => Mode::SetColWidth {
                 buffer: String::new(),
+            },
+            MenuAction::InsertRows => {
+                let _ = self.insert_rows_above_cursor(1);
+                Mode::Normal
+            }
+            MenuAction::InsertCols => {
+                let _ = self.insert_cols_left_of_cursor(1);
+                Mode::Normal
+            }
+            MenuAction::InsertSpecialChars => Mode::Edit {
+                buffer: self.menu_insert_special_seed(),
+                formula_cursor: None,
+            },
+            MenuAction::InsertHyperlink => Mode::Edit {
+                buffer: self.menu_insert_hyperlink_seed(),
+                formula_cursor: None,
             },
             MenuAction::SortView => Mode::SortView {
                 buffer: String::new(),
@@ -554,21 +623,23 @@ impl App {
     }
 
     fn help_page_body(&self) -> String {
-        String::from(
+        let body = String::from(
             "Corro Help\n\n\
 Basics\n\
 - Arrow keys or hjkl move the cursor.\n\
 - Enter or e starts editing the current cell.\n\
+- Header/footer/margin cells show special words like TOTAL, MAX, MEAN, MEDIAN, and COUNT; press Tab to cycle them.\n\
 - Any printable key starts editing with that character.\n\
 - = followed by arrows builds a formula reference.\n\n\
 Selection and movement\n\
 - v toggles a cell selection.\n\
-- Shift+arrows extend the selection.\n\
+- Ctrl+Shift+= inserts rows above the current row or selected rows.\n\
 - r moves selected rows.\n\
 - c exports CSV when nothing is selected, or moves selected columns when columns are selected.\n\
 - Alt+arrows move selected rows or columns by one cell.\n\n\
 Menus\n\
 - Alt+F opens File.\n\
+- Alt+I opens Insert.\n\
 - Alt+H opens Help.\n\
 - Right opens the highlighted submenu.\n\
 - Left goes back one menu level.\n\
@@ -588,7 +659,8 @@ Special rows and columns\n\
 - Footer rows use `_A` through `_Z` and can also be paired with a column like `_A,B`.\n\
 - Left-margin cells use `<col,row` with zero-based margin columns and one-based main rows.\n\
 - Right-margin cells use `>col,row` with the same coordinate style.\n\
-- In exports, these rows and columns stay visible as separate bands around the main grid.\n\n\
+- In exports, these rows and columns stay visible as separate bands around the main grid.\n\
+- Insert menu helpers seed `TOTAL` for special cells and `https://` for hyperlinks.\n\n\
 Reference examples\n\
 - Main cell: A1\n\
 - Header cell: ^A,A\n\
@@ -599,8 +671,9 @@ Quit\n\
 - q opens the quit prompt.\n\
 - Ctrl+Q exits immediately.\n\
 - Esc closes menus, prompts, help, and about.\n\
-- ? opens this help page.\n",
-        )
+- ? opens this help page.\n"
+        );
+        body
     }
 
     fn about_page_body(&self) -> String {
@@ -945,6 +1018,33 @@ fn parse_cell_shorthand(buf: &str) -> Option<(CellAddr, String)> {
     Some((addr, value_part))
 }
 
+fn special_value_choices(addr: &CellAddr) -> &'static [&'static str] {
+    match addr {
+        CellAddr::Header { .. } | CellAddr::Footer { .. } | CellAddr::Left { .. } => &[
+            "TOTAL", "SUM", "MEAN", "AVERAGE", "AVG", "MEDIAN", "MIN", "MINIMUM", "MAX", "MAXIMUM",
+            "COUNT",
+        ],
+        CellAddr::Right { .. } => &[
+            "TOTAL", "SUM", "MEAN", "AVERAGE", "AVG", "MEDIAN", "MIN", "MINIMUM", "MAX", "MAXIMUM",
+            "COUNT",
+        ],
+        CellAddr::Main { .. } => &[],
+    }
+}
+
+fn cycle_special_value(current: &str, choices: &[&'static str]) -> Option<String> {
+    if choices.is_empty() {
+        return None;
+    }
+    let trimmed = current.trim();
+    let idx = choices.iter().position(|c| c.eq_ignore_ascii_case(trimmed));
+    let next = match idx {
+        Some(i) => choices[(i + 1) % choices.len()],
+        None => choices[0],
+    };
+    Some(next.to_string())
+}
+
 // ── Clipboard helper ─────────────────────────────────────────────────────────
 
 fn copy_to_clipboard(text: &str) -> Result<(), String> {
@@ -1236,11 +1336,37 @@ impl App {
             return false;
         }
 
+        let hr = HEADER_ROWS;
+        let mr = self.state.grid.main_rows();
+        let last_main = hr + mr.saturating_sub(1);
+        let first_footer = hr + mr;
         let rows = self.view_row_order();
         let Some(pos) = rows.iter().position(|&r| r == self.cursor.row) else {
             return false;
         };
         let next_pos = if down {
+            if self.cursor.row == last_main
+                && trailing_blank_main_rows(&self.state) < NAV_BLANK_ROWS
+            {
+                self.state.grid.grow_main_row_at_bottom();
+            }
+            if self.cursor.row >= first_footer {
+                let blank_row = self
+                    .cursor
+                    .row
+                    .saturating_add(1)
+                    .min(first_footer + NAV_BLANK_ROWS - 1);
+                return if blank_row == self.cursor.row {
+                    true
+                } else {
+                    self.cursor.row = blank_row;
+                    self.cursor.clamp(&self.state.grid);
+                    self.state
+                        .grid
+                        .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
+                    true
+                };
+            }
             pos.saturating_add(1).min(rows.len().saturating_sub(1))
         } else {
             pos.saturating_sub(1)
@@ -1390,6 +1516,179 @@ impl App {
         Ok(true)
     }
 
+    fn insert_rows_above_selection(&mut self) -> Result<bool, RunError> {
+        let Some((from, to)) = self.selection_main_row_range() else {
+            return Ok(false);
+        };
+        let count = to - from + 1;
+        let main_rows = self.state.grid.main_rows() as u32;
+        let op = Op::SetMainSize {
+            main_rows: main_rows + count,
+            main_cols: self.state.grid.main_cols() as u32,
+        };
+        self.push_inverse_op(&op);
+        if let Some(ref p) = self.path.clone() {
+            commit_op(p, &mut self.offset, &mut self.state, &op)?;
+            self.ops_applied = self.ops_applied.saturating_add(1);
+            self.start_log_watcher_if_needed()?;
+        } else {
+            op.apply(&mut self.state);
+        }
+
+        let move_op = Op::MoveRowRange {
+            from,
+            count: main_rows - from,
+            to: main_rows + count,
+        };
+        self.push_inverse_op(&move_op);
+        if let Some(ref p) = self.path.clone() {
+            commit_op(p, &mut self.offset, &mut self.state, &move_op)?;
+            self.ops_applied = self.ops_applied.saturating_add(1);
+            self.start_log_watcher_if_needed()?;
+        } else {
+            move_op.apply(&mut self.state);
+        }
+
+        self.anchor = Some(SheetCursor {
+            row: HEADER_ROWS + from as usize,
+            col: MARGIN_COLS,
+        });
+        self.cursor = SheetCursor {
+            row: HEADER_ROWS + (from + count - 1) as usize,
+            col: MARGIN_COLS + self.state.grid.main_cols().saturating_sub(1),
+        };
+        self.selection_kind = SelectionKind::Rows;
+        self.status = if count == 1 {
+            format!("Inserted 1 row above row {from}")
+        } else {
+            format!("Inserted {count} rows above row {from}")
+        };
+        Ok(true)
+    }
+
+    fn insert_rows_above_cursor(&mut self, count: u32) -> Result<bool, RunError> {
+        let hr = HEADER_ROWS;
+        let original_main_rows = self.state.grid.main_rows() as u32;
+        if self.cursor.row < hr || self.cursor.row >= hr + original_main_rows as usize {
+            return Ok(false);
+        }
+        let row = (self.cursor.row - hr) as u32;
+        let op = Op::SetMainSize {
+            main_rows: original_main_rows + count,
+            main_cols: self.state.grid.main_cols() as u32,
+        };
+        self.push_inverse_op(&op);
+        if let Some(ref p) = self.path.clone() {
+            commit_op(p, &mut self.offset, &mut self.state, &op)?;
+            self.ops_applied = self.ops_applied.saturating_add(1);
+            self.start_log_watcher_if_needed()?;
+        } else {
+            op.apply(&mut self.state);
+        }
+
+        let move_op = Op::MoveRowRange {
+            from: row,
+            count: original_main_rows - row,
+            to: original_main_rows + count,
+        };
+        self.push_inverse_op(&move_op);
+        if let Some(ref p) = self.path.clone() {
+            commit_op(p, &mut self.offset, &mut self.state, &move_op)?;
+            self.ops_applied = self.ops_applied.saturating_add(1);
+            self.start_log_watcher_if_needed()?;
+        } else {
+            move_op.apply(&mut self.state);
+        }
+        self.anchor = Some(SheetCursor {
+            row: HEADER_ROWS + row as usize,
+            col: MARGIN_COLS,
+        });
+        self.cursor = SheetCursor {
+            row: HEADER_ROWS + (row + count - 1) as usize,
+            col: MARGIN_COLS + self.state.grid.main_cols().saturating_sub(1),
+        };
+        self.selection_kind = SelectionKind::Rows;
+        self.status = if count == 1 {
+            format!("Inserted 1 row above row {row}")
+        } else {
+            format!("Inserted {count} rows above row {row}")
+        };
+        Ok(true)
+    }
+
+    fn insert_cols_left_of_cursor(&mut self, count: u32) -> Result<bool, RunError> {
+        let hm = MARGIN_COLS;
+        let original_main_cols = self.state.grid.main_cols() as u32;
+        if self.cursor.row < HEADER_ROWS
+            || self.cursor.row >= HEADER_ROWS + self.state.grid.main_rows()
+        {
+            return Ok(false);
+        }
+        if self.cursor.col < hm || self.cursor.col >= hm + original_main_cols as usize {
+            return Ok(false);
+        }
+
+        let col = (self.cursor.col - hm) as u32;
+        let op = Op::SetMainSize {
+            main_rows: self.state.grid.main_rows() as u32,
+            main_cols: original_main_cols + count,
+        };
+        self.push_inverse_op(&op);
+        if let Some(ref p) = self.path.clone() {
+            commit_op(p, &mut self.offset, &mut self.state, &op)?;
+            self.ops_applied = self.ops_applied.saturating_add(1);
+            self.start_log_watcher_if_needed()?;
+        } else {
+            op.apply(&mut self.state);
+        }
+
+        let move_op = Op::MoveColRange {
+            from: col,
+            count: original_main_cols - col,
+            to: original_main_cols + count,
+        };
+        self.push_inverse_op(&move_op);
+        if let Some(ref p) = self.path.clone() {
+            commit_op(p, &mut self.offset, &mut self.state, &move_op)?;
+            self.ops_applied = self.ops_applied.saturating_add(1);
+            self.start_log_watcher_if_needed()?;
+        } else {
+            move_op.apply(&mut self.state);
+        }
+
+        self.cursor.col = hm + col as usize;
+        self.cursor.clamp(&self.state.grid);
+        self.status = if count == 1 {
+            format!("Inserted 1 column left of column {col}")
+        } else {
+            format!("Inserted {count} columns left of column {col}")
+        };
+        Ok(true)
+    }
+
+    fn menu_insert_special_seed(&self) -> String {
+        let addr = self.cursor.to_addr(&self.state.grid);
+        let current = self.state.grid.get(&addr).unwrap_or("").trim();
+        if special_value_choices(&addr)
+            .iter()
+            .any(|choice| choice.eq_ignore_ascii_case(current))
+        {
+            current.to_string()
+        } else {
+            "TOTAL".into()
+        }
+    }
+
+    fn menu_insert_hyperlink_seed(&self) -> String {
+        let addr = self.cursor.to_addr(&self.state.grid);
+        let current = self.state.grid.get(&addr).unwrap_or("").trim();
+        if current.starts_with("http://") || current.starts_with("https://") {
+            current.to_string()
+        } else {
+            "https://".into()
+        }
+    }
+
     fn move_selected_cols_by_one(&mut self, right: bool) -> Result<bool, RunError> {
         let Some((from, to)) = self.selection_main_col_range() else {
             return Ok(false);
@@ -1498,6 +1797,35 @@ impl App {
         export::export_odt_bytes(&self.state.grid).unwrap_or_default()
     }
 
+    fn save_to_path(&mut self, path: &Path) -> Result<(), RunError> {
+        let mut buf = Vec::new();
+        for row in 0..self.state.grid.main_rows() {
+            for col in 0..self.state.grid.main_cols() {
+                let addr = CellAddr::Main {
+                    row: row as u32,
+                    col: col as u32,
+                };
+                if let Some(value) = self.state.grid.get(&addr) {
+                    if !value.is_empty() {
+                        let line = format!(
+                            "SET {} {}\n",
+                            addr_label(&addr, self.state.grid.main_cols()),
+                            value
+                        );
+                        buf.extend_from_slice(line.as_bytes());
+                    }
+                }
+            }
+        }
+        std::fs::write(path, &buf)?;
+        self.path = Some(path.to_path_buf());
+        self.status = format!("Saved {}", path.display());
+        if self.watcher.is_none() {
+            self.watcher = Some(LogWatcher::new(path.to_path_buf()).map_err(IoError::from)?);
+        }
+        Ok(())
+    }
+
     #[allow(dead_code)]
     fn do_export_selection(&mut self) -> String {
         let mut buf = Vec::new();
@@ -1526,43 +1854,77 @@ impl App {
     pub fn run(&mut self) -> Result<(), RunError> {
         enable_raw_mode()?;
         let mut stdout = stdout();
-        execute!(stdout, EnterAlternateScreen)?;
+        execute!(stdout, EnterAlternateScreen, Hide)?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
 
-        loop {
-            self.sync_external()?;
-            terminal.draw(|f| self.draw(f))?;
+        let run_result = (|| -> Result<(), RunError> {
+            loop {
+                self.sync_external()?;
+                terminal.draw(|f| self.draw(f))?;
 
-            if !event::poll(std::time::Duration::from_millis(200))? {
-                continue;
-            }
-            if let Event::Key(key) = event::read()? {
-                if self.handle_key(key)? {
-                    break;
+                if !event::poll(std::time::Duration::from_millis(200))? {
+                    continue;
+                }
+                if let Event::Key(key) = event::read()? {
+                    if self.handle_key(key)? {
+                        break;
+                    }
                 }
             }
-        }
+            Ok(())
+        })();
 
-        disable_raw_mode()?;
-        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-        Ok(())
+        let disable_result = disable_raw_mode();
+        let leave_result = execute!(terminal.backend_mut(), LeaveAlternateScreen, Show);
+        let restore_result = match (disable_result, leave_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(disable_err), Ok(())) => Err(RunError::Term(disable_err)),
+            (Ok(()), Err(leave_err)) => Err(RunError::Term(leave_err)),
+            (Err(disable_err), Err(leave_err)) => Err(RunError::Term(io::Error::other(format!(
+                "disable_raw_mode failed: {disable_err}; restore failed: {leave_err}"
+            )))),
+        };
+
+        match (run_result, restore_result) {
+            (Err(run_err), Err(restore_err)) => Err(RunError::Term(io::Error::other(format!(
+                "{run_err}; cleanup failed: {restore_err}"
+            )))),
+            (Err(run_err), Ok(())) => Err(run_err),
+            (Ok(()), Err(restore_err)) => Err(restore_err),
+            (Ok(()), Ok(())) => Ok(()),
+        }
     }
 
     fn draw(&mut self, f: &mut Frame) {
+        let edit_suggestions = if let Mode::Edit { .. } = &self.mode {
+            let choices = special_value_choices(&self.cursor.to_addr(&self.state.grid));
+            (!choices.is_empty()).then_some(choices)
+        } else {
+            None
+        };
+        let suggestion_height = edit_suggestions.map(|choices| choices.len().min(6) as u16 + 2);
+        let reserve = 1 + 1 + 3 + 1;
+        let max_suggestion_height = f.area().height.saturating_sub(reserve);
+        let suggestion_height = suggestion_height.map(|h| h.min(max_suggestion_height));
+        let suggestion_height = suggestion_height.unwrap_or(0);
+        let mut constraints = vec![Constraint::Length(1), Constraint::Length(1)];
+        if suggestion_height > 0 {
+            constraints.push(Constraint::Length(suggestion_height));
+        }
+        constraints.push(Constraint::Min(3));
+        constraints.push(Constraint::Length(1));
         let layout = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Min(3),
-                Constraint::Length(1),
-            ])
+            .constraints(constraints)
             .split(f.area());
         let menubar_area = layout[0];
         let formula_area = layout[1];
-        let grid_area = layout[2];
-        let hints_area = layout[3];
+        let (suggestions_area, grid_area, hints_area) = if suggestion_height > 0 {
+            (Some(layout[2]), layout[3], layout[4])
+        } else {
+            (None, layout[2], layout[3])
+        };
 
         let sentinel = Block::default().borders(Borders::ALL);
         let inner = sentinel.inner(grid_area);
@@ -1703,6 +2065,25 @@ impl App {
             Paragraph::new(formula_text).style(formula_style),
             formula_area,
         );
+
+        if let Some(choices) = edit_suggestions {
+            let items: Vec<ListItem> = choices
+                .iter()
+                .map(|choice| ListItem::new(*choice))
+                .collect();
+            let mut state = ListState::default();
+            let suggestions = List::new(items)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Plain)
+                        .title(" Suggestions "),
+                )
+                .highlight_symbol(" ");
+            if let Some(area) = suggestions_area {
+                f.render_stateful_widget(suggestions, area, &mut state);
+            }
+        }
 
         if matches!(&self.mode, Mode::Help | Mode::About) {
             let body = match &self.mode {
@@ -2012,13 +2393,14 @@ impl App {
                 if self.anchor.is_some() {
                     "  r·move-rows   c·move-cols   v·deselect   Esc·cancel".into()
                 } else {
-                    "  shortcuts: e·edit v·select t·tsv c·csv o·open q·quit ?·help; printable letters edit cells unless reserved".into()
+                    "  shortcuts: e·edit v·select t·tsv c·csv o·open a·save as q·quit ?·help; printable letters edit cells unless reserved".into()
                 }
             }
             Mode::Edit { .. } => {
                 "  type to edit (or addr: val)   Enter·confirm   Esc·discard".into()
             }
             Mode::OpenPath { .. } => "  type file path   Enter·open   Esc·cancel".into(),
+            Mode::SavePath { .. } => "  type file path   Enter·save as   Esc·cancel".into(),
             Mode::ExportTsv { .. }
             | Mode::ExportCsv { .. }
             | Mode::ExportAscii { .. }
@@ -2051,7 +2433,7 @@ impl App {
         };
         let file = if matches!(
             section,
-            MenuSection::File | MenuSection::Export | MenuSection::Width
+            MenuSection::File | MenuSection::Export | MenuSection::Width | MenuSection::Insert
         ) {
             "[File]"
         } else {
@@ -2081,6 +2463,28 @@ impl App {
         }
 
         let mut mode = std::mem::replace(&mut self.mode, Mode::Normal);
+
+        if matches!(mode, Mode::Normal | Mode::Edit { .. })
+            && ((key.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(key.code, KeyCode::Char('=') | KeyCode::Char('+')))
+                || (matches!(key.code, KeyCode::Char('='))
+                    && key.modifiers.contains(KeyModifiers::SHIFT)))
+        {
+            if self.anchor.is_some() {
+                if !self.insert_rows_above_selection()? {
+                    if let Some((from, to)) = self.selection_main_row_range() {
+                        let count = to - from + 1;
+                        let _ = self.insert_rows_above_cursor(count)?;
+                    } else {
+                        let _ = self.insert_rows_above_cursor(1)?;
+                    }
+                }
+            } else {
+                let _ = self.insert_rows_above_cursor(1)?;
+            }
+            self.mode = mode;
+            return Ok(false);
+        }
 
         if key.modifiers.contains(KeyModifiers::ALT)
             && matches!(mode, Mode::Normal)
@@ -2224,6 +2628,10 @@ impl App {
                             section: MenuSection::Export,
                             item: 3,
                         }]);
+                        return Ok(false);
+                    }
+                    'i' | 'I' => {
+                        self.open_menu(MenuSection::Insert);
                         return Ok(false);
                     }
                     'o' | 'O' => {
@@ -2487,7 +2895,15 @@ impl App {
                             if s.is_empty() {
                                 None
                             } else {
-                                addr::parse_excel_column(s).map(|c| MARGIN_COLS + c as usize)
+                                let (desc, raw) = if let Some(rest) = s.strip_prefix('!') {
+                                    (true, rest)
+                                } else {
+                                    (false, s)
+                                };
+                                addr::parse_excel_column(raw).map(|c| SortSpec {
+                                    col: MARGIN_COLS + c as usize,
+                                    desc,
+                                })
                             }
                         })
                         .collect::<Vec<_>>();
@@ -2495,7 +2911,16 @@ impl App {
                         let line = format!(
                             "SORT {}",
                             cols.iter()
-                                .map(|c| addr::excel_column_name(c.saturating_sub(MARGIN_COLS)))
+                                .map(|spec| {
+                                    let name = addr::excel_column_name(
+                                        spec.col.saturating_sub(MARGIN_COLS),
+                                    );
+                                    if spec.desc {
+                                        format!("!{name}")
+                                    } else {
+                                        name
+                                    }
+                                })
                                 .collect::<Vec<_>>()
                                 .join(" ")
                         );
@@ -2587,6 +3012,23 @@ impl App {
                 }
                 _ => {}
             },
+            Mode::SavePath { buffer } => match key.code {
+                KeyCode::Enter => {
+                    let path = PathBuf::from(buffer.trim());
+                    if path.as_os_str().is_empty() {
+                        self.status = "Save path required".into();
+                    } else {
+                        self.save_to_path(&path)?;
+                        mode = Mode::Normal;
+                    }
+                }
+                KeyCode::Esc => mode = Mode::Normal,
+                KeyCode::Char(c) => buffer.push(c),
+                KeyCode::Backspace => {
+                    buffer.pop();
+                }
+                _ => {}
+            },
             Mode::Edit {
                 buffer,
                 formula_cursor,
@@ -2594,6 +3036,12 @@ impl App {
                 KeyCode::Enter => {
                     self.commit_edit_buffer(buffer)?;
                     mode = Mode::Normal;
+                }
+                KeyCode::Tab => {
+                    let addr = self.cursor.to_addr(&self.state.grid);
+                    if let Some(next) = cycle_special_value(buffer, special_value_choices(&addr)) {
+                        *buffer = next;
+                    }
                 }
                 KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down
                     if buffer.trim() == "=" =>
@@ -2843,6 +3291,23 @@ impl App {
                             self.status = "Selection expanded to rows".into();
                         }
                     }
+                    KeyCode::Char(ch)
+                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                            && matches!(ch, '=' | '+') =>
+                    {
+                        if self.anchor.is_some() {
+                            if !self.insert_rows_above_selection()? {
+                                if let Some((from, to)) = self.selection_main_row_range() {
+                                    let count = to - from + 1;
+                                    let _ = self.insert_rows_above_cursor(count as u32)?;
+                                } else {
+                                    let _ = self.insert_rows_above_cursor(1)?;
+                                }
+                            }
+                        } else {
+                            let _ = self.insert_rows_above_cursor(1)?;
+                        }
+                    }
                     KeyCode::Char('?') => {
                         mode = Mode::Help;
                     }
@@ -2967,7 +3432,7 @@ mod tests {
         app.mode = Mode::Menu {
             stack: vec![MenuLevel {
                 section: MenuSection::File,
-                item: 2,
+                item: 4,
             }],
         };
 
@@ -2988,7 +3453,7 @@ mod tests {
     fn menu_preview_includes_child_submenu() {
         let levels = App::menu_render_levels(&[MenuLevel {
             section: MenuSection::File,
-            item: 2,
+            item: 4,
         }]);
 
         assert_eq!(levels.len(), 2);
@@ -3026,7 +3491,10 @@ mod tests {
         app.state
             .grid
             .set(&CellAddr::Main { row: 2, col: 0 }, "10".into());
-        app.state.grid.set_view_sort_cols(vec![MARGIN_COLS]);
+        app.state.grid.set_view_sort_cols(vec![SortSpec {
+            col: MARGIN_COLS,
+            desc: false,
+        }]);
         app.cursor = SheetCursor {
             row: HEADER_ROWS + 1,
             col: MARGIN_COLS,
@@ -3038,6 +3506,345 @@ mod tests {
 
         assert_eq!(app.cursor.row, HEADER_ROWS);
         assert_eq!(app.state.grid.sorted_main_rows(), vec![1, 0, 2]);
+    }
+
+    #[test]
+    fn sorted_view_allows_two_blank_rows_before_footer() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 1);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "apple".into());
+        app.state.grid.set_view_sort_cols(vec![SortSpec {
+            col: MARGIN_COLS,
+            desc: false,
+        }]);
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        };
+        app.mode = Mode::Normal;
+
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()))
+            .unwrap();
+        assert_eq!(app.cursor.row, HEADER_ROWS + 1);
+
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()))
+            .unwrap();
+        assert_eq!(app.cursor.row, HEADER_ROWS + 2);
+
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()))
+            .unwrap();
+        assert_eq!(app.cursor.row, HEADER_ROWS + 3);
+    }
+
+    #[test]
+    fn ctrl_shift_plus_inserts_one_row_above_cursor() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(2, 1);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "top".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 1, col: 0 }, "bottom".into());
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS + 1,
+            col: MARGIN_COLS,
+        };
+        app.mode = Mode::Normal;
+
+        app.handle_key(KeyEvent::new(
+            KeyCode::Char('+'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ))
+        .unwrap();
+
+        assert_eq!(app.state.grid.main_rows(), 3);
+        assert_eq!(app.cursor.row, HEADER_ROWS + 1);
+        assert_eq!(app.state.grid.get(&CellAddr::Main { row: 1, col: 0 }), None);
+        assert_eq!(
+            app.state.grid.get(&CellAddr::Main { row: 2, col: 0 }),
+            Some("bottom")
+        );
+    }
+
+    #[test]
+    fn ctrl_shift_plus_inserts_multiple_selected_rows() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(3, 1);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "a".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 1, col: 0 }, "b".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 2, col: 0 }, "c".into());
+        app.anchor = Some(SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        });
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS + 1,
+            col: MARGIN_COLS,
+        };
+        app.selection_kind = SelectionKind::Rows;
+        app.mode = Mode::Normal;
+
+        app.handle_key(KeyEvent::new(
+            KeyCode::Char('+'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ))
+        .unwrap();
+
+        assert_eq!(app.state.grid.main_rows(), 5);
+        assert_eq!(app.cursor.row, HEADER_ROWS + 1);
+        assert_eq!(app.anchor.unwrap().row, HEADER_ROWS);
+        assert_eq!(app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }), None);
+        assert_eq!(app.state.grid.get(&CellAddr::Main { row: 1, col: 0 }), None);
+        assert_eq!(
+            app.state.grid.get(&CellAddr::Main { row: 2, col: 0 }),
+            Some("a")
+        );
+    }
+
+    #[test]
+    fn ctrl_shift_plus_falls_back_to_current_row_for_cell_selection() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(2, 1);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "top".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 1, col: 0 }, "bottom".into());
+        app.anchor = Some(SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        });
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        };
+        app.selection_kind = SelectionKind::Cells;
+        app.mode = Mode::Normal;
+
+        app.handle_key(KeyEvent::new(
+            KeyCode::Char('+'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ))
+        .unwrap();
+
+        assert_eq!(app.state.grid.main_rows(), 3);
+        assert_eq!(app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }), None);
+        assert_eq!(
+            app.state.grid.get(&CellAddr::Main { row: 1, col: 0 }),
+            Some("top")
+        );
+        assert_eq!(
+            app.state.grid.get(&CellAddr::Main { row: 2, col: 0 }),
+            Some("bottom")
+        );
+    }
+
+    #[test]
+    fn insert_menu_cols_inserts_before_cursor() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 2);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "left".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 1 }, "right".into());
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS + 1,
+        };
+        app.mode = Mode::Menu {
+            stack: vec![MenuLevel {
+                section: MenuSection::Insert,
+                item: 1,
+            }],
+        };
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .unwrap();
+
+        assert_eq!(app.state.grid.main_cols(), 3);
+        assert_eq!(
+            app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }),
+            Some("left")
+        );
+        assert_eq!(app.state.grid.get(&CellAddr::Main { row: 0, col: 1 }), None);
+        assert_eq!(
+            app.state.grid.get(&CellAddr::Main { row: 0, col: 2 }),
+            Some("right")
+        );
+    }
+
+    #[test]
+    fn insert_menu_special_chars_reuses_existing_special_value() {
+        let mut app = App::new(None);
+        app.state
+            .grid
+            .set(&CellAddr::Header { row: 0, col: 0 }, "MAX".into());
+        app.cursor = SheetCursor { row: 0, col: 0 };
+        app.mode = Mode::Menu {
+            stack: vec![MenuLevel {
+                section: MenuSection::Insert,
+                item: 2,
+            }],
+        };
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .unwrap();
+
+        match app.mode {
+            Mode::Edit { buffer, .. } => assert_eq!(buffer, "MAX"),
+            other => panic!("unexpected mode: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn insert_menu_hyperlink_reuses_existing_url() {
+        let mut app = App::new(None);
+        app.state.grid.set(
+            &CellAddr::Main { row: 0, col: 0 },
+            "https://example.com".into(),
+        );
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        };
+        app.mode = Mode::Menu {
+            stack: vec![MenuLevel {
+                section: MenuSection::Insert,
+                item: 3,
+            }],
+        };
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .unwrap();
+
+        match app.mode {
+            Mode::Edit { buffer, .. } => assert_eq!(buffer, "https://example.com"),
+            other => panic!("unexpected mode: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn special_value_choices_cover_margin_cells() {
+        assert!(!special_value_choices(&CellAddr::Header { row: 0, col: 0 }).is_empty());
+        assert!(!special_value_choices(&CellAddr::Footer { row: 0, col: 0 }).is_empty());
+        assert!(!special_value_choices(&CellAddr::Left { col: 0, row: 0 }).is_empty());
+        assert!(!special_value_choices(&CellAddr::Right { col: 0, row: 0 }).is_empty());
+        assert!(special_value_choices(&CellAddr::Main { row: 0, col: 0 }).is_empty());
+    }
+
+    #[test]
+    fn edit_mode_renders_special_suggestions_box() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(None);
+        app.cursor = SheetCursor { row: 0, col: 0 };
+        app.mode = Mode::Edit {
+            buffer: String::new(),
+            formula_cursor: None,
+        };
+
+        let backend = TestBackend::new(60, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = |y: u16| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+
+        assert!(row(2).contains("Suggestions"));
+        assert!((3..10).any(|y| row(y).contains("TOTAL")));
+        assert!((3..10).any(|y| row(y).contains("SUM")));
+    }
+
+    #[test]
+    fn escape_cancels_edit_without_committing() {
+        let mut app = App::new(None);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "orig".into());
+        app.mode = Mode::Edit {
+            buffer: "changed".into(),
+            formula_cursor: None,
+        };
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()))
+            .unwrap();
+
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(
+            app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }),
+            Some("orig")
+        );
+    }
+
+    #[test]
+    fn ctrl_shift_plus_works_while_editing() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(2, 1);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "top".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 1, col: 0 }, "bottom".into());
+        app.mode = Mode::Edit {
+            buffer: "+".into(),
+            formula_cursor: None,
+        };
+
+        app.handle_key(KeyEvent::new(
+            KeyCode::Char('+'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ))
+        .unwrap();
+
+        assert_eq!(app.state.grid.main_rows(), 3);
+        assert_eq!(app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }), None);
+        assert_eq!(
+            app.state.grid.get(&CellAddr::Main { row: 1, col: 0 }),
+            Some("top")
+        );
+    }
+
+    #[test]
+    fn tab_cycles_special_header_values() {
+        let mut app = App::new(None);
+        app.cursor = SheetCursor { row: 0, col: 0 };
+        app.mode = Mode::Edit {
+            buffer: String::new(),
+            formula_cursor: None,
+        };
+
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()))
+            .unwrap();
+
+        match &app.mode {
+            Mode::Edit { buffer, .. } => assert_eq!(buffer, "TOTAL"),
+            other => panic!("unexpected mode: {other:?}"),
+        }
+
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()))
+            .unwrap();
+
+        match &app.mode {
+            Mode::Edit { buffer, .. } => assert_eq!(buffer, "SUM"),
+            other => panic!("unexpected mode: {other:?}"),
+        }
     }
 
     #[test]
@@ -3088,9 +3895,10 @@ mod tests {
 
         match app.mode {
             Mode::Menu { stack } => {
-                assert_eq!(stack.len(), 1);
-                assert_eq!(stack[0].section, MenuSection::Help);
-                assert_eq!(stack[0].item, 0);
+                assert_eq!(stack.len(), 2);
+                assert_eq!(stack[0].section, MenuSection::File);
+                assert_eq!(stack[1].section, MenuSection::Insert);
+                assert_eq!(stack[1].item, 0);
             }
             other => panic!("unexpected mode: {other:?}"),
         }
@@ -3098,7 +3906,7 @@ mod tests {
         app.mode = Mode::Menu {
             stack: vec![MenuLevel {
                 section: MenuSection::File,
-                item: 1,
+                item: 4,
             }],
         };
 
@@ -3108,7 +3916,7 @@ mod tests {
         match app.mode {
             Mode::Menu { stack } => {
                 assert_eq!(stack.len(), 2);
-                assert_eq!(stack[1].section, MenuSection::Export);
+                assert_eq!(stack[1].section, MenuSection::Width);
             }
             other => panic!("unexpected mode: {other:?}"),
         }

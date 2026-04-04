@@ -60,6 +60,12 @@ impl MainRange {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SortSpec {
+    pub col: usize,
+    pub desc: bool,
+}
+
 /// Full sheet: dense header/footer; sparse main + left/right margins (infinite logical extent).
 #[derive(Clone, Debug)]
 pub struct Grid {
@@ -77,7 +83,7 @@ pub struct Grid {
     /// Optional per-global-column display width overrides.
     pub col_width_overrides: HashMap<usize, usize>,
     /// Optional sorted main-column view order.
-    pub view_sort_cols: Vec<usize>,
+    pub view_sort_cols: Vec<SortSpec>,
     pub header: Vec<Vec<String>>,
     pub footer: Vec<Vec<String>>,
 }
@@ -276,7 +282,7 @@ impl Grid {
         }
     }
 
-    pub fn set_view_sort_cols(&mut self, cols: Vec<usize>) {
+    pub fn set_view_sort_cols(&mut self, cols: Vec<SortSpec>) {
         self.view_sort_cols = cols;
     }
 
@@ -288,7 +294,8 @@ impl Grid {
         }
 
         rows.sort_by(|a, b| {
-            for &global_col in &self.view_sort_cols {
+            for spec in &self.view_sort_cols {
+                let global_col = spec.col;
                 if global_col < MARGIN_COLS || global_col >= MARGIN_COLS + self.main_cols() {
                     continue;
                 }
@@ -305,9 +312,7 @@ impl Grid {
                         col,
                     })
                     .unwrap_or("");
-                let oa = sort_key(va);
-                let ob = sort_key(vb);
-                let ord = oa.cmp(&ob);
+                let ord = compare_sort_values(va, vb, spec.desc);
                 if ord != std::cmp::Ordering::Equal {
                     return ord;
                 }
@@ -315,6 +320,20 @@ impl Grid {
             a.cmp(b)
         });
         rows
+    }
+
+    pub fn sort_specs_to_log(cols: &[SortSpec]) -> String {
+        cols.iter()
+            .map(|spec| {
+                let name = crate::addr::excel_column_name(spec.col.saturating_sub(MARGIN_COLS));
+                if spec.desc {
+                    format!("!{name}")
+                } else {
+                    name
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     pub fn get(&self, addr: &CellAddr) -> Option<&str> {
@@ -492,37 +511,59 @@ impl Grid {
 
 #[derive(Debug, PartialEq)]
 enum SortKey<'a> {
+    Blank,
     Text(&'a str),
     Number(f64),
 }
 
 impl<'a> Eq for SortKey<'a> {}
 
-impl<'a> Ord for SortKey<'a> {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        match (self, other) {
-            (SortKey::Text(a), SortKey::Text(b)) => a.cmp(b),
-            (SortKey::Number(a), SortKey::Number(b)) => {
-                a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-            }
-            (SortKey::Text(_), SortKey::Number(_)) => std::cmp::Ordering::Less,
-            (SortKey::Number(_), SortKey::Text(_)) => std::cmp::Ordering::Greater,
-        }
-    }
-}
-
-impl<'a> PartialOrd for SortKey<'a> {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
 fn sort_key(value: &str) -> SortKey<'_> {
     let trimmed = value.trim();
-    if let Ok(n) = trimmed.parse::<f64>() {
+    if trimmed.is_empty() {
+        SortKey::Blank
+    } else if let Ok(n) = trimmed.parse::<f64>() {
         SortKey::Number(n)
     } else {
         SortKey::Text(trimmed)
+    }
+}
+
+fn compare_sort_values(va: &str, vb: &str, desc: bool) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    match (sort_key(va), sort_key(vb)) {
+        (SortKey::Blank, SortKey::Blank) => Ordering::Equal,
+        (SortKey::Blank, _) => Ordering::Greater,
+        (_, SortKey::Blank) => Ordering::Less,
+        (SortKey::Text(a), SortKey::Text(b)) => {
+            if desc {
+                b.cmp(a)
+            } else {
+                a.cmp(b)
+            }
+        }
+        (SortKey::Number(a), SortKey::Number(b)) => {
+            if desc {
+                b.partial_cmp(&a).unwrap_or(Ordering::Equal)
+            } else {
+                a.partial_cmp(&b).unwrap_or(Ordering::Equal)
+            }
+        }
+        (SortKey::Text(_), SortKey::Number(_)) => {
+            if desc {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            }
+        }
+        (SortKey::Number(_), SortKey::Text(_)) => {
+            if desc {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            }
+        }
     }
 }
 
@@ -586,7 +627,10 @@ mod tests {
         g.set(&CellAddr::Main { row: 0, col: 0 }, "2".into());
         g.set(&CellAddr::Main { row: 1, col: 0 }, "apple".into());
         g.set(&CellAddr::Main { row: 2, col: 0 }, "10".into());
-        g.set_view_sort_cols(vec![MARGIN_COLS]);
+        g.set_view_sort_cols(vec![SortSpec {
+            col: MARGIN_COLS,
+            desc: false,
+        }]);
 
         assert_eq!(g.sorted_main_rows(), vec![1, 0, 2]);
     }

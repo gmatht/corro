@@ -245,6 +245,55 @@ mod tests {
     }
 
     #[test]
+    fn save_as_snapshot_reloads_as_log() {
+        let path = NamedTempFile::new().unwrap();
+        let mut state = SheetState::new(2, 2);
+        state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "a".into());
+        state
+            .grid
+            .set(&CellAddr::Main { row: 1, col: 0 }, "b".into());
+
+        let log = concat!("SET A1 a\n", "SET A2 b\n",);
+        fs::write(path.path(), log).unwrap();
+
+        let mut reloaded = SheetState::new(1, 1);
+        let (off, n) = load_full(path.path(), &mut reloaded).unwrap();
+        assert!(off > 0);
+        assert!(n > 0);
+        assert_eq!(
+            reloaded.grid.get(&CellAddr::Main { row: 0, col: 0 }),
+            Some("a")
+        );
+        assert_eq!(
+            reloaded.grid.get(&CellAddr::Main { row: 1, col: 0 }),
+            Some("b")
+        );
+    }
+
+    #[test]
+    fn load_legacy_test5_corro() {
+        let mut state = SheetState::new(1, 1);
+        let (off, n) = load_full(Path::new("test5.corro"), &mut state).unwrap();
+
+        assert!(off > 0);
+        assert!(n > 0);
+        assert_eq!(
+            state.grid.get(&CellAddr::Main { row: 0, col: 0 }),
+            Some("1")
+        );
+        assert_eq!(
+            state.grid.get(&CellAddr::Main { row: 1, col: 0 }),
+            Some("7")
+        );
+        assert_eq!(
+            state.grid.get(&CellAddr::Header { row: 25, col: 10 }),
+            Some("")
+        );
+    }
+
+    #[test]
     fn import_tsv_basic() {
         let mut state = SheetState::new(1, 1);
         import_tsv("Name\tAge\nAlice\t30\nBob\t25\n", &mut state);
