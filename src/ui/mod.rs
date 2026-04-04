@@ -727,7 +727,7 @@ fn visible_row_indices(
     let total = hr + mr + fr;
     let main_order = g.sorted_main_rows();
     let mut display_rows: Vec<usize> = Vec::with_capacity(total);
-    display_rows.extend(0..hr);
+    display_rows.extend((0..hr).filter(|&r| g.logical_row_has_content(r) || cursor.row == r));
     display_rows.extend(main_order.iter().copied().map(|r| hr + r));
     display_rows.extend((0..fr).map(|r| hr + mr + r));
 
