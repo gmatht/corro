@@ -2968,8 +2968,10 @@ impl App {
                 let cw = grid.col_width(c).max(1);
                 let disp = if text.chars().count() > cw {
                     format!("{}…", text.chars().take(cw).collect::<String>())
+                } else if text.trim().parse::<f64>().is_ok() {
+                    format!("{:>w$}", text, w = cw)
                 } else {
-                    format!("{:w$}", text, w = cw)
+                    format!("{:<w$}", text, w = cw)
                 };
                 let sel = self.anchor.is_some_and(|a| match self.selection_kind {
                     SelectionKind::Cells => {
@@ -3997,27 +3999,29 @@ impl App {
                     *buffer = format!("={}", self.formula_ref_for_addr(&addr));
                 }
                 KeyCode::Left | KeyCode::Right => {
-                    let len = buffer.chars().count();
-                    let cursor = self.edit_cursor.get_or_insert(len);
-                    let at_edge = match key.code {
-                        KeyCode::Left => *cursor == 0,
-                        KeyCode::Right => *cursor >= len,
-                        _ => false,
-                    };
-                    if at_edge {
-                        if key.code == KeyCode::Left {
+                    match Self::handle_text_input_key(buffer, &mut self.edit_cursor, key.code) {
+                        TextInputAction::Handled => {}
+                        TextInputAction::EdgeLeft => {
                             self.cursor.col = self.cursor.col.saturating_sub(1);
-                        } else {
-                            self.cursor.col = self.cursor.col.saturating_add(1);
+                            self.cursor.clamp(&self.state.grid);
+                            self.state
+                                .grid
+                                .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
                         }
-                        self.cursor.clamp(&self.state.grid);
-                        self.state
-                            .grid
-                            .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
-                    } else if key.code == KeyCode::Left {
-                        *cursor -= 1;
-                    } else {
-                        *cursor += 1;
+                        TextInputAction::EdgeRight => {
+                            let raw = buffer.clone();
+                            self.edit_cursor = None;
+                            self.edit_special_palette = false;
+                            *formula_cursor = None;
+                            self.commit_edit_buffer(&raw)?;
+                            self.cursor.col = self.cursor.col.saturating_add(1);
+                            self.cursor.clamp(&self.state.grid);
+                            self.state
+                                .grid
+                                .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
+                            mode = Mode::Normal;
+                        }
+                        TextInputAction::Unhandled => {}
                     }
                 }
                 KeyCode::Up => {
@@ -5526,6 +5530,74 @@ mod tests {
             .unwrap();
 
         assert_eq!(app.cursor.col, MARGIN_COLS + 1);
+    }
+
+    #[test]
+    fn right_arrow_at_edit_edge_exits_edit_mode() {
+        let mut app = App::new(None);
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        };
+        app.mode = Mode::Edit {
+            buffer: "ab".into(),
+            formula_cursor: None,
+        };
+
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::empty()))
+            .unwrap();
+
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(app.cursor.col, MARGIN_COLS + 1);
+    }
+
+    #[test]
+    fn right_arrow_from_main_cell_moves_to_next_main_cell() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 2);
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        };
+        app.mode = Mode::Normal;
+
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::empty()))
+            .unwrap();
+
+        assert_eq!(app.cursor.col, MARGIN_COLS + 1);
+        assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn numbers_right_align_and_text_left_align() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 2);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "12".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 1 }, "ab".into());
+
+        let backend = TestBackend::new(60, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let row = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .find(|line| line.contains("12") && line.contains("ab"))
+            .unwrap_or_default();
+
+        assert!(row.contains("12 ") || row.contains(" 12"));
+        assert!(row.contains("ab"));
     }
 
     #[test]

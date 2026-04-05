@@ -27,7 +27,12 @@ pub fn export_ascii_table(grid: &Grid, out: &mut dyn Write) {
     for r in row_start..row_end {
         for c in col_start..col_end {
             let val = cell_value_at(grid, r, c);
-            col_widths[c] = col_widths[c].max(val.chars().count().min(grid.col_width(c)));
+            let content_w = if val.is_empty() {
+                0
+            } else {
+                val.chars().count() + 1
+            };
+            col_widths[c] = col_widths[c].max(content_w.min(grid.col_width(c)));
         }
     }
 
@@ -418,5 +423,20 @@ mod tests {
         assert!(!s.contains(">9"));
         assert!(s.contains("Aasdf"));
         assert!(s.contains("adsf"));
+    }
+
+    #[test]
+    fn colwidth_fixture_keeps_column_a_narrow_and_b_wide() {
+        use crate::io::load_revisions;
+        use std::path::Path;
+
+        let mut state = crate::ops::SheetState::new(1, 1);
+        load_revisions(Path::new("docs/tests/colwidth.corro"), 10, &mut state).unwrap();
+
+        let mut out = Vec::new();
+        export_ascii_table(&state.grid, &mut out);
+        let s = String::from_utf8(out).unwrap();
+
+        assert_eq!(s.lines().next(), Some("+----+--------------------+"));
     }
 }
