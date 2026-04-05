@@ -32,6 +32,21 @@ fn workbook_lookup(sheet_id: u32) -> Option<Grid> {
             .map(|s| s.state.grid.clone())
     })
 }
+
+fn workbook_lookup_sheet_ref(sheet: &str) -> Option<(u32, Grid)> {
+    EVAL_WORKBOOK.with(|wb| {
+        let wb = wb.borrow();
+        let wb = wb.as_ref()?;
+        if let Some(rest) = sheet.strip_prefix("Sheet") {
+            if let Ok(id) = rest.parse::<u32>() {
+                let rec = wb.sheets.iter().find(|s| s.id == id)?;
+                return Some((rec.id, rec.state.grid.clone()));
+            }
+        }
+        let rec = wb.sheets.iter().find(|s| s.title == sheet)?;
+        Some((rec.id, rec.state.grid.clone()))
+    })
+}
 const DEFAULT_BUDGET: usize = 10_000;
 
 /// Evaluation step budget for one aggregate range scan (many cells).
@@ -434,6 +449,20 @@ impl<'a> Parser<'a> {
                 self.i += len;
                 return Ok(Ast::SheetRef { sheet_id, addr });
             }
+            let bytes = rest.as_bytes();
+            let mut j = 1usize;
+            while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                j += 1;
+            }
+            if j > 1 && j < bytes.len() && bytes[j] == b':' {
+                let sheet = &rest[1..j];
+                let after = &rest[j + 1..];
+                if let Some((sheet_id, _grid)) = workbook_lookup_sheet_ref(sheet) {
+                    let (addr, len) = parse_cell_ref_at(after).ok_or(())?;
+                    self.i += j + 1 + len;
+                    return Ok(Ast::SheetRef { sheet_id, addr });
+                }
+            }
             return Err(());
         }
 
@@ -615,6 +644,68 @@ fn eval_ast(
                     }
                     eval_sum(&args[0], grid, visiting, budget, allow_templates)
                 }
+                "AVERAGE" => eval_numeric_aggregate(
+                    &args,
+                    grid,
+                    visiting,
+                    budget,
+                    allow_templates,
+                    NumericAgg::Average,
+                ),
+                "MIN" => eval_numeric_aggregate(
+                    &args,
+                    grid,
+                    visiting,
+                    budget,
+                    allow_templates,
+                    NumericAgg::Min,
+                ),
+                "MAX" => eval_numeric_aggregate(
+                    &args,
+                    grid,
+                    visiting,
+                    budget,
+                    allow_templates,
+                    NumericAgg::Max,
+                ),
+                "COUNT" => eval_count(&args, grid, visiting, budget, allow_templates),
+                "COUNTA" => eval_counta(&args, grid, visiting, budget, allow_templates),
+                "PRODUCT" => eval_numeric_aggregate(
+                    &args,
+                    grid,
+                    visiting,
+                    budget,
+                    allow_templates,
+                    NumericAgg::Product,
+                ),
+                "ABS" => {
+                    eval_unary_numeric(&args, grid, visiting, budget, allow_templates, f64::abs)
+                }
+                "ROUND" => eval_round(&args, grid, visiting, budget, allow_templates),
+                "MOD" => {
+                    eval_binary_numeric(&args, grid, visiting, budget, allow_templates, |x, y| {
+                        x % y
+                    })
+                }
+                "SQRT" => {
+                    eval_unary_numeric(&args, grid, visiting, budget, allow_templates, f64::sqrt)
+                }
+                "PI" => {
+                    if !args.is_empty() {
+                        EvalResult::Error("ARGS")
+                    } else {
+                        EvalResult::Number(std::f64::consts::PI)
+                    }
+                }
+                "SIN" => {
+                    eval_unary_numeric(&args, grid, visiting, budget, allow_templates, f64::sin)
+                }
+                "COS" => {
+                    eval_unary_numeric(&args, grid, visiting, budget, allow_templates, f64::cos)
+                }
+                "TRIM" => eval_trim(&args, grid, visiting, budget, allow_templates),
+                "COUNTIF" => eval_countif(&args, grid, visiting, budget, allow_templates),
+                "SUMIF" => eval_sumif(&args, grid, visiting, budget, allow_templates),
                 "IF" => {
                     if args.len() != 3 {
                         return EvalResult::Error("ARGS");
@@ -711,6 +802,468 @@ fn eval_sum(
             EvalResult::Error(e) => EvalResult::Error(e),
         },
         Ast::Number(n) => EvalResult::Number(*n),
+    }
+}
+
+enum NumericAgg {
+    Average,
+    Min,
+    Max,
+    Product,
+}
+
+fn eval_numeric_aggregate(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    budget: &mut usize,
+    allow_templates: bool,
+    kind: NumericAgg,
+) -> EvalResult {
+    if args.len() != 1 {
+        return EvalResult::Error("ARGS");
+    }
+    let nums = collect_numeric_values(&args[0], grid, visiting, budget, allow_templates);
+    let Ok(nums) = nums else {
+        return EvalResult::Error(nums.err().unwrap_or("FUNC"));
+    };
+    match kind {
+        NumericAgg::Average => {
+            if nums.is_empty() {
+                EvalResult::Error("DIV0")
+            } else {
+                EvalResult::Number(nums.iter().sum::<f64>() / nums.len() as f64)
+            }
+        }
+        NumericAgg::Min => nums
+            .into_iter()
+            .min_by(|a, b| a.partial_cmp(b).unwrap())
+            .map(EvalResult::Number)
+            .unwrap_or(EvalResult::Number(0.0)),
+        NumericAgg::Max => nums
+            .into_iter()
+            .max_by(|a, b| a.partial_cmp(b).unwrap())
+            .map(EvalResult::Number)
+            .unwrap_or(EvalResult::Number(0.0)),
+        NumericAgg::Product => {
+            let prod = nums.into_iter().fold(1.0, |acc, n| acc * n);
+            EvalResult::Number(prod)
+        }
+    }
+}
+
+fn eval_unary_numeric(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    budget: &mut usize,
+    allow_templates: bool,
+    f: fn(f64) -> f64,
+) -> EvalResult {
+    if args.len() != 1 {
+        return EvalResult::Error("ARGS");
+    }
+    match eval_ast(&args[0], grid, visiting, budget, allow_templates) {
+        EvalResult::Number(n) => EvalResult::Number(f(n)),
+        EvalResult::Text(s) => parse_number_literal(&s)
+            .map(f)
+            .map(EvalResult::Number)
+            .unwrap_or(EvalResult::Error("VALUE")),
+        EvalResult::Error(e) => EvalResult::Error(e),
+    }
+}
+
+fn eval_binary_numeric(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    budget: &mut usize,
+    allow_templates: bool,
+    f: fn(f64, f64) -> f64,
+) -> EvalResult {
+    if args.len() != 2 {
+        return EvalResult::Error("ARGS");
+    }
+    eval_binary(
+        &args[0],
+        &args[1],
+        grid,
+        visiting,
+        budget,
+        allow_templates,
+        f,
+    )
+}
+
+fn eval_round(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    if args.len() != 2 {
+        return EvalResult::Error("ARGS");
+    }
+    let n = match numeric_value(eval_ast(&args[0], grid, visiting, budget, allow_templates)) {
+        Some(n) => n,
+        None => return EvalResult::Error("VALUE"),
+    };
+    let digits = match eval_ast(&args[1], grid, visiting, budget, allow_templates) {
+        EvalResult::Number(n) => n,
+        EvalResult::Text(s) => match parse_number_literal(&s) {
+            Some(n) => n,
+            None => return EvalResult::Error("VALUE"),
+        },
+        EvalResult::Error(e) => return EvalResult::Error(e),
+    };
+    let factor = 10f64.powf(digits);
+    EvalResult::Number((n * factor).round() / factor)
+}
+
+fn eval_trim(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    if args.len() != 1 {
+        return EvalResult::Error("ARGS");
+    }
+    match eval_ast(&args[0], grid, visiting, budget, allow_templates) {
+        EvalResult::Number(n) => EvalResult::Text(trim_spaces(&format!("{n}"))),
+        EvalResult::Text(s) => EvalResult::Text(trim_spaces(&s)),
+        EvalResult::Error(e) => EvalResult::Error(e),
+    }
+}
+
+fn eval_count(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    if args.len() != 1 {
+        return EvalResult::Error("ARGS");
+    }
+    match count_numeric_values(&args[0], grid, visiting, budget, allow_templates) {
+        Ok(n) => EvalResult::Number(n as f64),
+        Err(e) => EvalResult::Error(e),
+    }
+}
+
+fn eval_counta(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    if args.len() != 1 {
+        return EvalResult::Error("ARGS");
+    }
+    match count_nonempty_values(&args[0], grid, visiting, budget, allow_templates) {
+        Ok(n) => EvalResult::Number(n as f64),
+        Err(e) => EvalResult::Error(e),
+    }
+}
+
+fn eval_countif(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    if args.len() != 2 {
+        return EvalResult::Error("ARGS");
+    }
+    let Some(range) = as_main_range(&args[0]) else {
+        return EvalResult::Error("RANGE");
+    };
+    let Ok(criteria) = criteria_from_ast(&args[1], grid, visiting, budget, allow_templates) else {
+        return EvalResult::Error("VALUE");
+    };
+    let mut count = 0usize;
+    for r in range.row_start..range.row_end {
+        for c in range.col_start..range.col_end {
+            let addr = CellAddr::Main { row: r, col: c };
+            if criteria_matches(&criteria, grid, &addr, visiting, budget, allow_templates) {
+                count += 1;
+            }
+        }
+    }
+    EvalResult::Number(count as f64)
+}
+
+fn eval_sumif(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    if args.len() != 2 && args.len() != 3 {
+        return EvalResult::Error("ARGS");
+    }
+    let Some(criteria_range) = as_main_range(&args[0]) else {
+        return EvalResult::Error("RANGE");
+    };
+    let sum_range = if args.len() == 3 {
+        match as_main_range(&args[2]) {
+            Some(r) => r,
+            None => return EvalResult::Error("RANGE"),
+        }
+    } else {
+        criteria_range.clone()
+    };
+    let Ok(criteria) = criteria_from_ast(&args[1], grid, visiting, budget, allow_templates) else {
+        return EvalResult::Error("VALUE");
+    };
+    let criteria_rows = criteria_range.row_end - criteria_range.row_start;
+    let criteria_cols = criteria_range.col_end - criteria_range.col_start;
+    let sum_rows = sum_range.row_end - sum_range.row_start;
+    let sum_cols = sum_range.col_end - sum_range.col_start;
+    if criteria_rows != sum_rows || criteria_cols != sum_cols {
+        return EvalResult::Error("ARGS");
+    }
+    let mut sum = 0.0;
+    for dr in 0..criteria_rows {
+        for dc in 0..criteria_cols {
+            let crit_addr = CellAddr::Main {
+                row: criteria_range.row_start + dr,
+                col: criteria_range.col_start + dc,
+            };
+            if criteria_matches(
+                &criteria,
+                grid,
+                &crit_addr,
+                visiting,
+                budget,
+                allow_templates,
+            ) {
+                let sum_addr = CellAddr::Main {
+                    row: sum_range.row_start + dr,
+                    col: sum_range.col_start + dc,
+                };
+                if let Some(n) = effective_numeric(grid, &sum_addr, visiting, budget) {
+                    sum += n;
+                }
+            }
+        }
+    }
+    EvalResult::Number(sum)
+}
+
+fn trim_spaces(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn numeric_value(result: EvalResult) -> Option<f64> {
+    match result {
+        EvalResult::Number(n) => Some(n),
+        EvalResult::Text(s) => parse_number_literal(&s),
+        EvalResult::Error(_) => None,
+    }
+}
+
+fn as_main_range(ast: &Ast) -> Option<MainRange> {
+    match ast {
+        Ast::Range(r) => Some(r.clone()),
+        _ => None,
+    }
+}
+
+fn count_numeric_values(
+    arg: &Ast,
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> Result<usize, &'static str> {
+    match arg {
+        Ast::Range(r) => {
+            let mut n = 0usize;
+            for row in r.row_start..r.row_end {
+                for col in r.col_start..r.col_end {
+                    let addr = CellAddr::Main { row, col };
+                    if effective_numeric(grid, &addr, visiting, budget).is_some() {
+                        n += 1;
+                    }
+                }
+            }
+            Ok(n)
+        }
+        Ast::Ref(addr) => Ok(
+            if effective_numeric(grid, addr, visiting, budget).is_some() {
+                1
+            } else {
+                0
+            },
+        ),
+        _ => match eval_ast(arg, grid, visiting, budget, allow_templates) {
+            EvalResult::Number(n) => Ok((!n.is_nan()) as usize),
+            EvalResult::Text(s) => Ok(parse_number_literal(&s).is_some() as usize),
+            EvalResult::Error(e) => Err(e),
+        },
+    }
+}
+
+fn count_nonempty_values(
+    arg: &Ast,
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> Result<usize, &'static str> {
+    match arg {
+        Ast::Range(r) => {
+            let mut n = 0usize;
+            for row in r.row_start..r.row_end {
+                for col in r.col_start..r.col_end {
+                    let addr = CellAddr::Main { row, col };
+                    if grid.get(&addr).map(|s| !s.is_empty()).unwrap_or(false) {
+                        n += 1;
+                    }
+                }
+            }
+            Ok(n)
+        }
+        Ast::Ref(addr) => Ok(grid.get(addr).map(|s| !s.is_empty()).unwrap_or(false) as usize),
+        _ => match eval_ast(arg, grid, visiting, budget, allow_templates) {
+            EvalResult::Number(_) => Ok(1),
+            EvalResult::Text(s) => Ok((!s.is_empty()) as usize),
+            EvalResult::Error(e) => Err(e),
+        },
+    }
+}
+
+fn collect_numeric_values(
+    arg: &Ast,
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> Result<Vec<f64>, &'static str> {
+    match arg {
+        Ast::Range(r) => {
+            let mut out = Vec::new();
+            for row in r.row_start..r.row_end {
+                for col in r.col_start..r.col_end {
+                    let addr = CellAddr::Main { row, col };
+                    if let Some(n) = effective_numeric(grid, &addr, visiting, budget) {
+                        out.push(n);
+                    }
+                }
+            }
+            Ok(out)
+        }
+        Ast::Ref(addr) => Ok(effective_numeric(grid, addr, visiting, budget)
+            .into_iter()
+            .collect()),
+        _ => match eval_ast(arg, grid, visiting, budget, allow_templates) {
+            EvalResult::Number(n) => Ok(vec![n]),
+            EvalResult::Text(s) => Ok(parse_number_literal(&s).into_iter().collect()),
+            EvalResult::Error(e) => Err(e),
+        },
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CriteriaOp {
+    Eq,
+    Ne,
+    Gt,
+    Ge,
+    Lt,
+    Le,
+}
+
+struct Criteria {
+    op: CriteriaOp,
+    value: String,
+    numeric: Option<f64>,
+}
+
+fn criteria_from_ast(
+    ast: &Ast,
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> Result<Criteria, &'static str> {
+    let raw = match eval_ast(ast, grid, visiting, budget, allow_templates) {
+        EvalResult::Number(n) => n.to_string(),
+        EvalResult::Text(s) => s,
+        EvalResult::Error(e) => return Err(e),
+    };
+    let s = raw.trim();
+    let (op, rest) = if let Some(rest) = s.strip_prefix(">=") {
+        (CriteriaOp::Ge, rest)
+    } else if let Some(rest) = s.strip_prefix("<=") {
+        (CriteriaOp::Le, rest)
+    } else if let Some(rest) = s.strip_prefix("<>") {
+        (CriteriaOp::Ne, rest)
+    } else if let Some(rest) = s.strip_prefix('>') {
+        (CriteriaOp::Gt, rest)
+    } else if let Some(rest) = s.strip_prefix('<') {
+        (CriteriaOp::Lt, rest)
+    } else if let Some(rest) = s.strip_prefix('=') {
+        (CriteriaOp::Eq, rest)
+    } else {
+        (CriteriaOp::Eq, s)
+    };
+    Ok(Criteria {
+        op,
+        numeric: parse_number_literal(rest),
+        value: rest.to_string(),
+    })
+}
+
+fn criteria_matches(
+    criteria: &Criteria,
+    grid: &Grid,
+    addr: &CellAddr,
+    visiting: &mut Vec<CellAddr>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> bool {
+    match eval_cell_inner(grid, addr, visiting, budget, allow_templates) {
+        EvalResult::Number(n) => match criteria.numeric {
+            Some(target) => compare_f64(criteria.op, n, target),
+            None => compare_str(criteria.op, &n.to_string(), &criteria.value),
+        },
+        EvalResult::Text(s) => match criteria.numeric {
+            Some(target) => parse_number_literal(&s)
+                .map(|n| compare_f64(criteria.op, n, target))
+                .unwrap_or(false),
+            None => compare_str(criteria.op, &s, &criteria.value),
+        },
+        EvalResult::Error(_) => false,
+    }
+}
+
+fn compare_f64(op: CriteriaOp, left: f64, right: f64) -> bool {
+    match op {
+        CriteriaOp::Eq => left == right,
+        CriteriaOp::Ne => left != right,
+        CriteriaOp::Gt => left > right,
+        CriteriaOp::Ge => left >= right,
+        CriteriaOp::Lt => left < right,
+        CriteriaOp::Le => left <= right,
+    }
+}
+
+fn compare_str(op: CriteriaOp, left: &str, right: &str) -> bool {
+    match op {
+        CriteriaOp::Eq => left == right,
+        CriteriaOp::Ne => left != right,
+        CriteriaOp::Gt => left > right,
+        CriteriaOp::Ge => left >= right,
+        CriteriaOp::Lt => left < right,
+        CriteriaOp::Le => left <= right,
     }
 }
 
@@ -835,6 +1388,42 @@ mod tests {
     #[test]
     fn sheet_ref_syntax_parses() {
         let mut p = Parser { s: "#2!A1", i: 0 };
+        match p.parse_expr().unwrap() {
+            Ast::SheetRef { sheet_id, addr } => {
+                assert_eq!(sheet_id, 2);
+                assert_eq!(addr, CellAddr::Main { row: 0, col: 0 });
+            }
+            other => panic!("unexpected ast: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn named_sheet_ref_syntax_parses() {
+        let mut wb = WorkbookState::new();
+        wb.add_sheet("Sheet2".into(), crate::ops::SheetState::new(1, 1));
+        let _guard = set_eval_context(&wb);
+        let mut p = Parser {
+            s: "$Sheet2:A1",
+            i: 0,
+        };
+        match p.parse_expr().unwrap() {
+            Ast::SheetRef { sheet_id, addr } => {
+                assert_eq!(sheet_id, 2);
+                assert_eq!(addr, CellAddr::Main { row: 0, col: 0 });
+            }
+            other => panic!("unexpected ast: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn named_sheet_title_ref_parses() {
+        let mut wb = WorkbookState::new();
+        wb.add_sheet("Budget".into(), crate::ops::SheetState::new(1, 1));
+        let _guard = set_eval_context(&wb);
+        let mut p = Parser {
+            s: "$Budget:A1",
+            i: 0,
+        };
         match p.parse_expr().unwrap() {
             Ast::SheetRef { sheet_id, addr } => {
                 assert_eq!(sheet_id, 2);

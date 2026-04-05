@@ -3246,10 +3246,8 @@ impl App {
         let mut mode = std::mem::replace(&mut self.mode, Mode::Normal);
 
         if matches!(mode, Mode::Normal | Mode::Edit { .. })
-            && ((key.modifiers.contains(KeyModifiers::CONTROL)
+            && (key.modifiers.contains(KeyModifiers::CONTROL)
                 && matches!(key.code, KeyCode::Char('=') | KeyCode::Char('+')))
-                || (matches!(key.code, KeyCode::Char('='))
-                    && key.modifiers.contains(KeyModifiers::SHIFT)))
         {
             if self.anchor.is_some() {
                 if !self.insert_rows_above_selection()? {
@@ -5316,6 +5314,27 @@ mod tests {
     }
 
     #[test]
+    fn edit_mode_accepts_named_sheet_formula_refs() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 1);
+        app.mode = Mode::Normal;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('='), KeyModifiers::empty()))
+            .unwrap();
+        for ch in "$Sheet1:A1".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::empty()))
+                .unwrap();
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .unwrap();
+
+        assert_eq!(
+            app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }),
+            Some("=$Sheet1:A1")
+        );
+    }
+
+    #[test]
     fn esc_while_quit_prompted_exits() {
         let mut app = App::new(None);
         app.mode = Mode::QuitPrompt;
@@ -5699,9 +5718,20 @@ fn input_line(
     if !before.is_empty() {
         spans.push(Span::styled(before, text_style));
     }
-    spans.push(Span::styled(" ", caret_style));
+    if let Some(ch) = chars.get(cursor) {
+        spans.push(Span::styled(ch.to_string(), caret_style));
+    } else {
+        spans.push(Span::styled(" ", caret_style));
+    }
     if !after.is_empty() {
-        spans.push(Span::styled(after, text_style));
+        let tail = if cursor < chars.len() {
+            chars[cursor + 1..].iter().collect()
+        } else {
+            after
+        };
+        if !tail.is_empty() {
+            spans.push(Span::styled(tail, text_style));
+        }
     }
 
     Line::from(spans)
