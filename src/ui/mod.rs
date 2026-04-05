@@ -42,6 +42,50 @@ enum SelectionKind {
     Cols,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum OpenPathRequest {
+    Plain(PathBuf),
+    Revision { path: PathBuf, revision: usize },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OpenPathError {
+    Empty,
+    InvalidRevisionSyntax,
+}
+
+fn parse_open_path_request(raw: &str) -> Result<OpenPathRequest, OpenPathError> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return Err(OpenPathError::Empty);
+    }
+
+    for keyword in ["link", "load"] {
+        if let Some(rest) = t.strip_prefix(keyword) {
+            if !rest.is_empty() && rest.chars().next().is_some_and(|c| c.is_whitespace()) {
+                let rest = rest.trim_start();
+                let (path, revision) = rest
+                    .rsplit_once(' ')
+                    .ok_or(OpenPathError::InvalidRevisionSyntax)?;
+                let path = path.trim();
+                if path.is_empty() {
+                    return Err(OpenPathError::InvalidRevisionSyntax);
+                }
+                let revision = revision
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|_| OpenPathError::InvalidRevisionSyntax)?;
+                return Ok(OpenPathRequest::Revision {
+                    path: PathBuf::from(path),
+                    revision,
+                });
+            }
+        }
+    }
+
+    Ok(OpenPathRequest::Plain(PathBuf::from(t)))
+}
+
 #[derive(Debug, Error)]
 pub enum RunError {
     #[error("I/O: {0}")]
@@ -555,11 +599,7 @@ impl App {
         self.edit_special_palette = false;
         match action {
             MenuAction::OpenFile => Mode::OpenPath {
-                buffer: self
-                    .path
-                    .as_ref()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
+                buffer: self.open_path_prompt_buffer(),
             },
             MenuAction::SaveAs => Mode::SavePath {
                 buffer: self
@@ -711,7 +751,7 @@ Menus\n\
 - Left goes back one menu level.\n\
 - Enter or the shortcut letter opens the selected item.\n\n\
 File menu\n\
-- Open file loads a .corro, .csv, or .tsv file.\n\
+ - Open file loads a .corro, .csv, or .tsv file. Use `link <file> <revision>` to open a log at a revision.\n\
 - Export opens TSV, CSV, ASCII, full export, or ODT prompts.\n\
 - Width opens default width and per-column width prompts.\n\
 - Sort view changes the visible order of main rows.\n\
@@ -1228,6 +1268,7 @@ fn copy_to_clipboard(text: &str) -> Result<(), String> {
 
 pub struct App {
     pub path: Option<PathBuf>,
+    source_path: Option<PathBuf>,
     revision_limit: Option<usize>,
     pub offset: u64,
     pub state: SheetState,
@@ -1254,8 +1295,14 @@ impl App {
     }
 
     pub fn new_with_revision_limit(path: Option<PathBuf>, revision_limit: Option<usize>) -> Self {
+        let (path, source_path) = if revision_limit.is_some() {
+            (None, path)
+        } else {
+            (path, None)
+        };
         App {
             path,
+            source_path,
             revision_limit,
             offset: 0,
             state: SheetState::new(1, 1),
@@ -1280,8 +1327,20 @@ impl App {
         }
     }
 
+    fn open_path_prompt_buffer(&self) -> String {
+        if let (Some(path), Some(revision)) = (&self.source_path, self.revision_limit) {
+            return format!("link {} {}", path.display(), revision);
+        }
+        if let Some(path) = &self.path {
+            return path.to_string_lossy().into_owned();
+        }
+        String::new()
+    }
+
     pub fn load_initial(&mut self) -> Result<(), IoError> {
-        if let Some(ref p) = self.path.clone() {
+        let initial_path = self.path.clone().or(self.source_path.clone());
+        let linked_revision = self.revision_limit;
+        if let Some(ref p) = initial_path {
             if Path::new(p).exists() {
                 let ext = p
                     .extension()
@@ -1292,6 +1351,10 @@ impl App {
                     "tsv" => {
                         let data = std::fs::read_to_string(p).map_err(|e| IoError::Io(e))?;
                         crate::io::import_tsv(&data, &mut self.state);
+                        self.path = Some(p.clone());
+                        self.source_path = None;
+                        self.revision_limit = None;
+                        self.watcher = None;
                         for c in 0..self.state.grid.main_cols() {
                             self.state.grid.auto_fit_column(MARGIN_COLS + c);
                         }
@@ -1300,13 +1363,17 @@ impl App {
                     "csv" => {
                         let data = std::fs::read_to_string(p).map_err(|e| IoError::Io(e))?;
                         crate::io::import_csv(&data, &mut self.state);
+                        self.path = Some(p.clone());
+                        self.source_path = None;
+                        self.revision_limit = None;
+                        self.watcher = None;
                         for c in 0..self.state.grid.main_cols() {
                             self.state.grid.auto_fit_column(MARGIN_COLS + c);
                         }
                         self.status = format!("Imported CSV {}", p.display());
                     }
                     _ => {
-                        let (off, n) = match self.revision_limit {
+                        let (off, n) = match linked_revision {
                             Some(limit) => load_revisions(p, limit, &mut self.state)?,
                             None => load_full(p, &mut self.state)?,
                         };
@@ -1315,12 +1382,23 @@ impl App {
                         }
                         self.offset = off;
                         self.ops_applied = n;
-                        self.watcher = Some(LogWatcher::new(p.clone())?);
-                        self.status = format!("Loaded {}", p.display());
+                        if let Some(limit) = linked_revision {
+                            self.source_path = Some(p.clone());
+                            self.path = None;
+                            self.watcher = None;
+                            self.status = format!("Linked {} @ revision {}", p.display(), limit);
+                        } else {
+                            self.source_path = None;
+                            self.path = Some(p.clone());
+                            self.watcher = Some(LogWatcher::new(p.clone())?);
+                            self.status = format!("Loaded {}", p.display());
+                        }
                     }
                 }
             } else {
                 self.watcher = None;
+                self.source_path = None;
+                self.revision_limit = None;
                 self.status = format!("New file {}", p.display());
             }
         } else {
@@ -2016,6 +2094,8 @@ impl App {
         }
         std::fs::write(path, &buf)?;
         self.path = Some(path.to_path_buf());
+        self.source_path = None;
+        self.revision_limit = None;
         self.status = format!("Saved {}", path.display());
         if self.watcher.is_none() {
             self.watcher = Some(LogWatcher::new(path.to_path_buf()).map_err(IoError::from)?);
@@ -2568,7 +2648,9 @@ impl App {
             Mode::Edit { .. } => {
                 "  type to edit (or addr: val)   Enter·confirm   Esc·discard".into()
             }
-            Mode::OpenPath { .. } => "  type file path   Enter·open   Esc·cancel".into(),
+            Mode::OpenPath { .. } => {
+                "  type path or link <file> <revision>   Enter·open   Esc·cancel".into()
+            }
             Mode::SavePath { .. } => "  type file path   Enter·save as   Esc·cancel".into(),
             Mode::ExportTsv { .. }
             | Mode::ExportCsv { .. }
@@ -3202,58 +3284,99 @@ impl App {
                 _ => {}
             },
             Mode::OpenPath { buffer } => match key.code {
-                KeyCode::Enter => {
-                    let path = PathBuf::from(buffer.trim());
-                    self.path = Some(path.clone());
-                    self.offset = 0;
-                    self.state = SheetState::new(1, 1);
-                    if path.exists() {
-                        let ext = path
-                            .extension()
-                            .and_then(|e| e.to_str())
-                            .unwrap_or("")
-                            .to_lowercase();
-                        match ext.as_str() {
-                            "tsv" => {
-                                if let Ok(data) = std::fs::read_to_string(&path) {
-                                    crate::io::import_tsv(&data, &mut self.state);
+                KeyCode::Enter => match parse_open_path_request(buffer) {
+                    Err(OpenPathError::Empty) => {
+                        self.status = "Path required".into();
+                    }
+                    Err(OpenPathError::InvalidRevisionSyntax) => {
+                        self.status = "Link syntax: link <file> <revision>".into();
+                    }
+                    Ok(OpenPathRequest::Plain(path)) => {
+                        self.path = Some(path.clone());
+                        self.source_path = None;
+                        self.offset = 0;
+                        self.state = SheetState::new(1, 1);
+                        self.ops_applied = 0;
+                        self.revision_limit = None;
+                        if path.exists() {
+                            let ext = path
+                                .extension()
+                                .and_then(|e| e.to_str())
+                                .unwrap_or("")
+                                .to_lowercase();
+                            match ext.as_str() {
+                                "tsv" => {
+                                    if let Ok(data) = std::fs::read_to_string(&path) {
+                                        crate::io::import_tsv(&data, &mut self.state);
+                                    }
                                 }
-                            }
-                            "csv" => {
-                                if let Ok(data) = std::fs::read_to_string(&path) {
-                                    crate::io::import_csv(&data, &mut self.state);
+                                "csv" => {
+                                    if let Ok(data) = std::fs::read_to_string(&path) {
+                                        crate::io::import_csv(&data, &mut self.state);
+                                    }
                                 }
-                            }
-                            _ => {
-                                let loaded = match self.revision_limit {
-                                    Some(limit) => load_revisions(&path, limit, &mut self.state),
-                                    None => load_full(&path, &mut self.state),
-                                };
-                                if let Ok((off, n)) = loaded {
-                                    self.offset = off;
-                                    self.ops_applied = n;
+                                _ => {
+                                    let loaded = load_full(&path, &mut self.state);
+                                    if let Ok((off, n)) = loaded {
+                                        self.offset = off;
+                                        self.ops_applied = n;
+                                    }
                                 }
                             }
                         }
+                        self.watcher = if path.exists() {
+                            Some(LogWatcher::new(path.clone()).map_err(IoError::from)?)
+                        } else {
+                            None
+                        };
+                        self.cursor = SheetCursor {
+                            row: HEADER_ROWS,
+                            col: MARGIN_COLS,
+                        };
+                        self.row_scroll = 0;
+                        self.col_scroll = 0;
+                        self.status = if path.exists() {
+                            format!("Opened {}", path.display())
+                        } else {
+                            format!("New file {}", path.display())
+                        };
+                        mode = Mode::Normal;
                     }
-                    self.watcher = if path.exists() {
-                        Some(LogWatcher::new(path.clone()).map_err(IoError::from)?)
-                    } else {
-                        None
-                    };
-                    self.cursor = SheetCursor {
-                        row: HEADER_ROWS,
-                        col: MARGIN_COLS,
-                    };
-                    self.row_scroll = 0;
-                    self.col_scroll = 0;
-                    self.status = if path.exists() {
-                        format!("Opened {}", path.display())
-                    } else {
-                        format!("New file {}", path.display())
-                    };
-                    mode = Mode::Normal;
-                }
+                    Ok(OpenPathRequest::Revision { path, revision }) => {
+                        if !path.exists() {
+                            self.status = format!("Link source not found: {}", path.display());
+                        } else {
+                            let ext = path
+                                .extension()
+                                .and_then(|e| e.to_str())
+                                .unwrap_or("")
+                                .to_lowercase();
+                            if matches!(ext.as_str(), "csv" | "tsv") {
+                                self.status = "Link only works for .corro logs".into();
+                            } else if let Ok((off, n)) =
+                                load_revisions(&path, revision, &mut self.state)
+                            {
+                                self.path = None;
+                                self.source_path = Some(path.clone());
+                                self.revision_limit = Some(revision);
+                                self.offset = off;
+                                self.ops_applied = n;
+                                self.watcher = None;
+                                self.cursor = SheetCursor {
+                                    row: HEADER_ROWS,
+                                    col: MARGIN_COLS,
+                                };
+                                self.row_scroll = 0;
+                                self.col_scroll = 0;
+                                self.status =
+                                    format!("Linked {} @ revision {}", path.display(), revision);
+                                mode = Mode::Normal;
+                            } else {
+                                self.status = format!("Link load failed: {}", path.display());
+                            }
+                        }
+                    }
+                },
                 KeyCode::Esc => mode = Mode::Normal,
                 KeyCode::Char(c) => buffer.push(c),
                 KeyCode::Backspace => {
@@ -4409,6 +4532,44 @@ mod tests {
             app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }),
             Some("orig")
         );
+    }
+
+    #[test]
+    fn open_path_parses_link_revision() {
+        let parsed = parse_open_path_request("link test5.corro 2").unwrap();
+        match parsed {
+            OpenPathRequest::Revision { path, revision } => {
+                assert_eq!(path, PathBuf::from("test5.corro"));
+                assert_eq!(revision, 2);
+            }
+            other => panic!("unexpected parse: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn linked_revision_uses_source_path_and_detaches_on_save() {
+        let mut app = App::new_with_revision_limit(Some(PathBuf::from("test5.corro")), Some(2));
+        assert!(app.path.is_none());
+        assert_eq!(app.source_path, Some(PathBuf::from("test5.corro")));
+        assert_eq!(app.revision_limit, Some(2));
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        app.save_to_path(tmp.path()).unwrap();
+
+        assert_eq!(app.path, Some(tmp.path().to_path_buf()));
+        assert_eq!(app.source_path, None);
+        assert_eq!(app.revision_limit, None);
+    }
+
+    #[test]
+    fn save_clears_revision_limit() {
+        let mut app = App::new_with_revision_limit(Some(PathBuf::from("test5.corro")), Some(2));
+        app.revision_limit = Some(2);
+        let path = tempfile::NamedTempFile::new().unwrap();
+
+        app.save_to_path(path.path()).unwrap();
+
+        assert_eq!(app.revision_limit, None);
     }
 
     #[test]

@@ -48,4 +48,10 @@ mod tests {
             Some(std::path::Path::new("test5.corro"))
         );
     }
+
+    #[test]
+    fn parses_short_revision_limit() {
+        let args = Args::parse_from(["corro", "-r", "3", "test5.corro"]);
+        assert_eq!(args.revision, Some(3));
+    }
 }
