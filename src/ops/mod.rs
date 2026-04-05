@@ -35,6 +35,78 @@ impl SheetState {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct WorkbookState {
+    pub sheets: Vec<SheetRecord>,
+    pub active_sheet: usize,
+    pub next_sheet_id: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct SheetRecord {
+    pub id: u32,
+    pub title: String,
+    pub state: SheetState,
+}
+
+impl WorkbookState {
+    pub fn new() -> Self {
+        Self {
+            sheets: vec![SheetRecord {
+                id: 1,
+                title: "Sheet1".into(),
+                state: SheetState::new(1, 1),
+            }],
+            active_sheet: 0,
+            next_sheet_id: 2,
+        }
+    }
+
+    pub fn active_sheet(&self) -> &SheetState {
+        &self.sheets[self.active_sheet].state
+    }
+
+    pub fn active_sheet_mut(&mut self) -> &mut SheetState {
+        &mut self.sheets[self.active_sheet].state
+    }
+
+    pub fn ensure_active_sheet(&mut self) {
+        if self.sheets.is_empty() {
+            self.sheets.push(SheetRecord {
+                id: 1,
+                title: "Sheet1".into(),
+                state: SheetState::new(1, 1),
+            });
+            self.active_sheet = 0;
+            self.next_sheet_id = 2;
+        } else if self.active_sheet >= self.sheets.len() {
+            self.active_sheet = 0;
+        }
+    }
+
+    pub fn sheet_count(&self) -> usize {
+        self.sheets.len()
+    }
+
+    pub fn sheet_title(&self, index: usize) -> &str {
+        self.sheets
+            .get(index)
+            .map(|s| s.title.as_str())
+            .unwrap_or("")
+    }
+
+    pub fn sheet_id(&self, index: usize) -> u32 {
+        self.sheets.get(index).map(|s| s.id).unwrap_or(0)
+    }
+
+    pub fn add_sheet(&mut self, title: String, state: SheetState) -> usize {
+        let id = self.next_sheet_id;
+        self.next_sheet_id += 1;
+        self.sheets.push(SheetRecord { id, title, state });
+        self.sheets.len() - 1
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Op {
     SetCell { addr: CellAddr, value: String },
@@ -45,6 +117,31 @@ pub enum Op {
     SetColWidth { col: usize, width: Option<usize> },
     SetViewSortCols { cols: Vec<SortSpec> },
     Undo { target: String },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WorkbookOp {
+    NewSheet { id: u32, title: String },
+    ActivateSheet { id: u32 },
+    RenameSheet { id: u32, title: String },
+    SheetOp { sheet_id: u32, op: Op },
+}
+
+#[derive(Clone, Debug)]
+pub struct WorkbookSnapshot {
+    pub next_sheet_id: u32,
+    pub active_sheet_id: u32,
+    pub sheets: Vec<SheetRecord>,
+}
+
+impl WorkbookSnapshot {
+    pub fn from_workbook(workbook: &WorkbookState) -> Self {
+        Self {
+            next_sheet_id: workbook.next_sheet_id,
+            active_sheet_id: workbook.sheet_id(workbook.active_sheet),
+            sheets: workbook.sheets.clone(),
+        }
+    }
 }
 
 impl Op {

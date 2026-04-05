@@ -2,7 +2,50 @@
 
 use crate::addr::{excel_column_name, parse_cell_ref_at, parse_main_range_at};
 use crate::grid::{CellAddr, Grid, MainRange, HEADER_ROWS, MARGIN_COLS};
+use crate::ops::WorkbookState;
+use std::cell::RefCell;
 
+thread_local! {
+    static EVAL_WORKBOOK: RefCell<Option<WorkbookState>> = const { RefCell::new(None) };
+    static EVAL_ACTIVE_SHEET_ID: RefCell<u32> = const { RefCell::new(0) };
+}
+
+pub struct EvalContextGuard;
+
+impl Drop for EvalContextGuard {
+    fn drop(&mut self) {
+        EVAL_WORKBOOK.with(|wb| *wb.borrow_mut() = None);
+        EVAL_ACTIVE_SHEET_ID.with(|id| *id.borrow_mut() = 0);
+    }
+}
+
+pub fn set_eval_context(workbook: &WorkbookState) -> EvalContextGuard {
+    EVAL_WORKBOOK.with(|wb| *wb.borrow_mut() = Some(workbook.clone()));
+    EVAL_ACTIVE_SHEET_ID.with(|id| {
+        *id.borrow_mut() = workbook.sheet_id(workbook.active_sheet);
+    });
+    EvalContextGuard
+}
+
+fn current_eval_sheet_id() -> Option<u32> {
+    EVAL_ACTIVE_SHEET_ID.with(|id| {
+        let sheet_id = *id.borrow();
+        if sheet_id == 0 {
+            None
+        } else {
+            Some(sheet_id)
+        }
+    })
+}
+
+fn workbook_lookup(sheet_id: u32) -> Option<Grid> {
+    EVAL_WORKBOOK.with(|wb| {
+        wb.borrow()
+            .as_ref()
+            .and_then(|w| w.sheets.iter().find(|s| s.id == sheet_id))
+            .map(|s| s.state.grid.clone())
+    })
+}
 const DEFAULT_BUDGET: usize = 10_000;
 
 /// Evaluation step budget for one aggregate range scan (many cells).
@@ -154,6 +197,39 @@ pub fn eval_cell(
     eval_cell_inner(grid, addr, visiting, budget, true)
 }
 
+fn eval_cell_with_sheet(
+    grid: &Grid,
+    sheet_id: u32,
+    addr: &CellAddr,
+    visiting: &mut Vec<(u32, CellAddr)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    *budget = budget.saturating_sub(1);
+    if *budget == 0 {
+        return EvalResult::Error("LIMIT");
+    }
+    let raw = grid.get(addr).unwrap_or("");
+    let t = raw.trim();
+    if t.is_empty() {
+        return EvalResult::Number(0.0);
+    }
+    if !t.starts_with('=') {
+        return if let Some(n) = parse_number_literal(t) {
+            EvalResult::Number(n)
+        } else {
+            EvalResult::Text(t.to_string())
+        };
+    }
+    if visiting.iter().any(|a| a.0 == sheet_id && &a.1 == addr) {
+        return EvalResult::Error("CIRC");
+    }
+    visiting.push((sheet_id, addr.clone()));
+    let r = eval_expr_str(&t[1..], grid, &mut Vec::new(), budget, allow_templates);
+    visiting.pop();
+    r
+}
+
 fn eval_cell_inner(
     grid: &Grid,
     addr: &CellAddr,
@@ -225,6 +301,10 @@ fn eval_expr_str(
 enum Ast {
     Number(f64),
     Ref(CellAddr),
+    SheetRef {
+        sheet_id: u32,
+        addr: CellAddr,
+    },
     /// Main grid only (`A1:B2`).
     Range(MainRange),
     Neg(Box<Ast>),
@@ -355,6 +435,14 @@ impl<'a> Parser<'a> {
 
         let rest = &self.s[self.i..];
 
+        if rest.starts_with('#') {
+            if let Some((sheet_id, addr, len)) = parse_sheet_qualified_ref(rest) {
+                self.i += len;
+                return Ok(Ast::SheetRef { sheet_id, addr });
+            }
+            return Err(());
+        }
+
         // Region-style refs
         if rest.starts_with('~')
             || rest.starts_with('_')
@@ -446,6 +534,20 @@ impl<'a> Parser<'a> {
     }
 }
 
+fn parse_sheet_qualified_ref(s: &str) -> Option<(u32, CellAddr, usize)> {
+    let bytes = s.as_bytes();
+    let mut i = 1usize;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == 1 || i >= bytes.len() || bytes[i] != b'!' {
+        return None;
+    }
+    let sheet_id = std::str::from_utf8(&bytes[1..i]).ok()?.parse().ok()?;
+    let (addr, len) = parse_cell_ref_at(&s[i + 1..])?;
+    Some((sheet_id, addr, i + 1 + len))
+}
+
 fn split_top_level_args(s: &str) -> Result<Vec<&str>, ()> {
     let mut depth = 0i32;
     let mut start = 0usize;
@@ -478,6 +580,20 @@ fn eval_ast(
     match ast {
         Ast::Number(n) => EvalResult::Number(*n),
         Ast::Ref(addr) => eval_cell_inner(grid, addr, visiting, budget, allow_templates),
+        Ast::SheetRef { sheet_id, addr } => {
+            let Some(sheet_grid) = workbook_lookup(*sheet_id) else {
+                return EvalResult::Error("SHEET");
+            };
+            let mut sheet_visiting: Vec<(u32, CellAddr)> = Vec::new();
+            eval_cell_with_sheet(
+                &sheet_grid,
+                *sheet_id,
+                addr,
+                &mut sheet_visiting,
+                budget,
+                allow_templates,
+            )
+        }
         Ast::Range(_) => EvalResult::Error("RANGE"),
         Ast::Neg(a) => match eval_ast(a, grid, visiting, budget, allow_templates) {
             EvalResult::Number(n) => EvalResult::Number(-n),
@@ -588,7 +704,8 @@ fn eval_sum(
         | Ast::Sub(_, _)
         | Ast::Mul(_, _)
         | Ast::Div(_, _)
-        | Ast::Pow(_, _) => match eval_ast(arg, grid, visiting, budget, allow_templates) {
+        | Ast::Pow(_, _)
+        | Ast::SheetRef { .. } => match eval_ast(arg, grid, visiting, budget, allow_templates) {
             EvalResult::Number(n) => EvalResult::Number(n),
             EvalResult::Text(s) => {
                 if let Some(n) = parse_number_literal(&s) {
@@ -718,6 +835,18 @@ mod tests {
         match eval_cell(&g, &CellAddr::Main { row: 1, col: 0 }, &mut v, &mut b) {
             EvalResult::Number(n) => assert!((n - 7.0).abs() < 1e-9),
             e => panic!("expected 7 {:?}", e),
+        }
+    }
+
+    #[test]
+    fn sheet_ref_syntax_parses() {
+        let mut p = Parser { s: "#2!A1", i: 0 };
+        match p.parse_expr().unwrap() {
+            Ast::SheetRef { sheet_id, addr } => {
+                assert_eq!(sheet_id, 2);
+                assert_eq!(addr, CellAddr::Main { row: 0, col: 0 });
+            }
+            other => panic!("unexpected ast: {other:?}"),
         }
     }
 

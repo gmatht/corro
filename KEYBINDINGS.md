@@ -28,6 +28,8 @@ It favors spreadsheet conventions where they fit, and documents the bindings tha
 | Any printable key | Start editing | The first typed character seeds the edit buffer |
 | `o` | Open path prompt | Set or change the active file path |
 | `Alt+F` | Open path prompt | Same as `o`, via the accelerator layer |
+| `N` | New sheet | Adds a new blank sheet to the workbook |
+| `Ctrl+PageUp`, `Ctrl+PageDown` | Switch sheets | Moves to the previous / next sheet in the tab bar |
 | `t` | Export TSV prompt | Selection-aware when a selection exists |
 | `c` | Export CSV or move cols | Exports CSV when no selection exists; otherwise moves selected columns |
 | `r` | Move rows or select rows | Expands to full rows first, then moves selected rows on the next `r` |
@@ -81,18 +83,20 @@ The target must be inside the main grid, not in headers or margins.
 | `=` + `Arrows` | Formula ref builder | When the buffer is just `=`, arrow keys move the referenced cell and rewrite the formula reference |
 
 Edit mode accepts plain values or formulas beginning with `=`.
+Cross-sheet references use numeric sheet IDs in formulas, like `#2!A1`.
 It also accepts shorthand cell-targeted edits like `A1: value`, `^A:A1`, `_B:A1`, `<0: value`, and `>0: value`.
 
 ## Open Path Prompt
 
 | Key | Action | Notes |
 | --- | --- | --- |
-| `Enter` | Open path | `.tsv` and `.csv` are imported, other files are treated as append-only log files |
+| `Enter` | Open path | `.tsv` and `.csv` are imported, `link <file> <revision>` opens a log snapshot, other files are treated as append-only log files |
 | `Esc` | Cancel | Returns to Normal mode |
 | Printable characters | Edit path | Standard text entry |
 | `Backspace` | Delete character | Standard text editing |
 
 If the chosen file does not exist, Corro treats it as a new file and creates the log on first write.
+When more than one sheet exists, Corro shows a bottom tab bar with the active sheet highlighted.
 
 ## Export Prompts
 

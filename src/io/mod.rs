@@ -1,7 +1,9 @@
 //! Append-only log I/O, file watching, and tabular import for multi-instance sync.
 
 use crate::grid::CellAddr;
-use crate::ops::{append_line, append_op, apply_line, replay_lines, Op, SheetState};
+use crate::ops::{
+    append_line, append_op, apply_line, replay_lines, Op, SheetState, WorkbookSnapshot,
+};
 use notify::{RecursiveMode, Watcher};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
@@ -22,6 +24,143 @@ pub fn load_full(path: &Path, state: &mut SheetState) -> Result<(u64, usize), Io
     let data = fs::read_to_string(path)?;
     let n = replay_lines(&data, state)?;
     Ok((data.len() as u64, n))
+}
+
+pub fn save_workbook(path: &Path, workbook: &WorkbookSnapshot) -> Result<(), IoError> {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "WORKBOOK {} {}\n",
+        workbook.next_sheet_id, workbook.active_sheet_id
+    ));
+    for sheet in &workbook.sheets {
+        out.push_str(&format!("SHEET {} {}\n", sheet.id, sheet.title));
+        for row in 0..sheet.state.grid.main_rows() {
+            for col in 0..sheet.state.grid.main_cols() {
+                let addr = CellAddr::Main {
+                    row: row as u32,
+                    col: col as u32,
+                };
+                if let Some(value) = sheet.state.grid.get(&addr) {
+                    if !value.is_empty() {
+                        out.push_str(&format!("SET {} {}\n", workbook_addr_label(&addr), value));
+                    }
+                }
+            }
+        }
+        out.push_str("END_SHEET\n");
+    }
+    fs::write(path, out)?;
+    Ok(())
+}
+
+fn workbook_addr_label(addr: &CellAddr) -> String {
+    match addr {
+        CellAddr::Main { row, col } => format!(
+            "{}{}",
+            crate::addr::excel_column_name(*col as usize),
+            row + 1
+        ),
+        CellAddr::Header { row, col } => format!(
+            "~{}{}",
+            crate::grid::HEADER_ROWS - *row as usize,
+            crate::addr::excel_column_name(*col as usize)
+        ),
+        CellAddr::Footer { row, col } => format!(
+            "_{}{}",
+            *row as usize + 1,
+            crate::addr::excel_column_name(*col as usize)
+        ),
+        CellAddr::Left { col, row } => format!(
+            "[{}{}",
+            crate::addr::mirror_margin_column_name(*col as usize, true),
+            row + 1
+        ),
+        CellAddr::Right { col, row } => format!(
+            "]{}{}",
+            crate::addr::mirror_margin_column_name(*col as usize, false),
+            row + 1
+        ),
+    }
+}
+
+pub fn load_workbook_snapshot(path: &Path) -> Result<WorkbookSnapshot, IoError> {
+    let data = fs::read_to_string(path)?;
+    let mut lines = data.lines();
+    let header = lines.next().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "missing workbook header")
+    })?;
+    let mut header_parts = header.split_whitespace();
+    if header_parts.next() != Some("WORKBOOK") {
+        return Err(
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "bad workbook header").into(),
+        );
+    }
+    let next_sheet_id = header_parts
+        .next()
+        .and_then(|v| v.parse::<u32>().ok())
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "bad workbook header")
+        })?;
+    let active_sheet_id = header_parts
+        .next()
+        .and_then(|v| v.parse::<u32>().ok())
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "bad workbook header")
+        })?;
+
+    let mut sheets = Vec::new();
+    let mut current: Option<crate::ops::SheetRecord> = None;
+
+    for raw in lines {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        match parts.next() {
+            Some("SHEET") => {
+                if let Some(sheet) = current.take() {
+                    sheets.push(sheet);
+                }
+                let id = parts
+                    .next()
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .ok_or_else(|| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, "bad sheet header")
+                    })?;
+                let title = parts.collect::<Vec<_>>().join(" ");
+                current = Some(crate::ops::SheetRecord {
+                    id,
+                    title,
+                    state: SheetState::new(1, 1),
+                });
+            }
+            Some("END_SHEET") => {
+                if let Some(sheet) = current.take() {
+                    sheets.push(sheet);
+                }
+            }
+            Some(_) => {
+                if let Some(sheet) = current.as_mut() {
+                    apply_line(line, &mut sheet.state)?;
+                }
+            }
+            None => {}
+        }
+    }
+
+    if let Some(sheet) = current.take() {
+        sheets.push(sheet);
+    }
+    if sheets.is_empty() {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "empty workbook").into());
+    }
+
+    Ok(WorkbookSnapshot {
+        next_sheet_id,
+        active_sheet_id,
+        sheets,
+    })
 }
 
 /// Load at most `limit` non-empty log lines from disk and replay into `state`.
@@ -251,7 +390,7 @@ impl LogWatcher {
 mod tests {
     use super::*;
     use crate::grid::CellAddr;
-    use crate::ops::{Op, SheetState};
+    use crate::ops::{Op, SheetRecord, SheetState, WorkbookSnapshot};
     use tempfile::NamedTempFile;
 
     #[test]
@@ -346,6 +485,46 @@ mod tests {
             Some("7")
         );
         assert_eq!(state.grid.get(&CellAddr::Main { row: 2, col: 0 }), None);
+    }
+
+    #[test]
+    fn save_and_load_workbook_snapshot_roundtrip() {
+        let path = NamedTempFile::new().unwrap();
+        let mut workbook = WorkbookSnapshot {
+            next_sheet_id: 3,
+            active_sheet_id: 2,
+            sheets: vec![
+                SheetRecord {
+                    id: 1,
+                    title: "Sheet1".into(),
+                    state: SheetState::new(1, 1),
+                },
+                SheetRecord {
+                    id: 2,
+                    title: "Sheet2".into(),
+                    state: SheetState::new(1, 1),
+                },
+            ],
+        };
+        workbook.sheets[1]
+            .state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "hello".into());
+
+        save_workbook(path.path(), &workbook).unwrap();
+        let loaded = load_workbook_snapshot(path.path()).unwrap();
+
+        assert_eq!(loaded.next_sheet_id, 3);
+        assert_eq!(loaded.active_sheet_id, 2);
+        assert_eq!(loaded.sheets.len(), 2);
+        assert_eq!(loaded.sheets[1].title, "Sheet2");
+        assert_eq!(
+            loaded.sheets[1]
+                .state
+                .grid
+                .get(&CellAddr::Main { row: 0, col: 0 }),
+            Some("hello")
+        );
     }
 
     #[test]

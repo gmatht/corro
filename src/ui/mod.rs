@@ -9,7 +9,7 @@ use crate::grid::{CellAddr, Grid, SortSpec, FOOTER_ROWS, HEADER_ROWS, MARGIN_COL
 use crate::io::{
     commit_line, commit_op, load_full, load_revisions, tail_apply, IoError, LogWatcher,
 };
-use crate::ops::{AggFunc, AggregateDef, Op, SheetState};
+use crate::ops::{AggFunc, AggregateDef, Op, SheetState, WorkbookSnapshot, WorkbookState};
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
@@ -248,6 +248,7 @@ enum MenuAction {
     InsertHyperlink,
     SortView,
     SaveSort,
+    NewSheet,
     HelpRows,
     HelpCols,
     About,
@@ -261,7 +262,7 @@ struct MenuItem {
     target: MenuTarget,
 }
 
-const FILE_MENU_ITEMS: [MenuItem; 7] = [
+const FILE_MENU_ITEMS: [MenuItem; 8] = [
     MenuItem {
         shortcut: 'O',
         label: "Open file",
@@ -291,6 +292,11 @@ const FILE_MENU_ITEMS: [MenuItem; 7] = [
         shortcut: 'P',
         label: "Persist sort",
         target: MenuTarget::Action(MenuAction::SaveSort),
+    },
+    MenuItem {
+        shortcut: 'N',
+        label: "New sheet",
+        target: MenuTarget::Action(MenuAction::NewSheet),
     },
     MenuItem {
         shortcut: 'X',
@@ -677,6 +683,10 @@ impl App {
                 buffer: self.start_input_mode(String::new()),
                 persist: true,
             },
+            MenuAction::NewSheet => {
+                self.add_sheet(format!("Sheet{}", self.workbook.next_sheet_id));
+                Mode::Normal
+            }
             MenuAction::HelpRows => {
                 self.status = "Row ops: v·select full rows, then r·move to target row".into();
                 Mode::Normal
@@ -763,9 +773,11 @@ Menus\n\
 - Ctrl+; inserts the date and Ctrl+Shift+; inserts the time.\n\
 - Right opens the highlighted submenu.\n\
 - Left goes back one menu level.\n\
-- Enter or the shortcut letter opens the selected item.\n\n\
+ - Enter or the shortcut letter opens the selected item.\n\n\
 File menu\n\
  - Open file loads a .corro, .csv, or .tsv file. Use `link <file> <revision>` to open a log at a revision.\n\
+ - New sheet adds another sheet to the workbook.\n\
+ - Ctrl+PageUp and Ctrl+PageDown switch between workbook tabs.\n\
 - Export opens TSV, CSV, ASCII, full export, or ODT prompts.\n\
 - Width opens default width and per-column width prompts.\n\
 - Sort view changes the visible order of main rows.\n\
@@ -775,12 +787,12 @@ Help menu\n\
 - Row ops and Col ops show quick move tips.\n\
 - Full help opens this page.\n\n\
 Address syntax\n\
-- Main cell: A1\n\
+ - Main cell: A1\n\
  - Header cell: ~1A\n\
 - Footer cell: _1A\n\
 - Left margin: [A1\n\
 - Right margin: ]A1\n\
-- Header/footer columns still pair with main letters when needed.\n\
+ - Cross-sheet refs use numeric IDs like #2!A1.\n\
 - Logs and saved files use this syntax only.\n\n\
 Quit\n\
 - q opens the quit prompt.\n\
@@ -1286,6 +1298,7 @@ pub struct App {
     revision_limit: Option<usize>,
     pub offset: u64,
     pub state: SheetState,
+    pub workbook: WorkbookState,
     pub cursor: SheetCursor,
     pub anchor: Option<SheetCursor>,
     mode: Mode,
@@ -1321,6 +1334,7 @@ impl App {
             revision_limit,
             offset: 0,
             state: SheetState::new(1, 1),
+            workbook: WorkbookState::new(),
             cursor: SheetCursor {
                 row: HEADER_ROWS,
                 col: MARGIN_COLS,
@@ -1353,9 +1367,73 @@ impl App {
         String::new()
     }
 
+    fn current_sheet_label(&self) -> String {
+        if self.workbook.sheet_count() <= 1 {
+            return String::new();
+        }
+        self.workbook
+            .sheets
+            .iter()
+            .enumerate()
+            .map(|(idx, sheet)| {
+                if idx == self.workbook.active_sheet {
+                    format!("[{}]", sheet.title)
+                } else {
+                    sheet.title.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("  ")
+    }
+
+    fn add_sheet(&mut self, title: String) {
+        self.commit_active_sheet_cache();
+        self.workbook.add_sheet(title, SheetState::new(1, 1));
+        self.workbook.active_sheet = self.workbook.sheet_count() - 1;
+        self.sync_active_sheet_cache();
+        self.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        };
+        self.anchor = None;
+        self.status = "New sheet created".into();
+    }
+
+    fn switch_sheet(&mut self, delta: isize) {
+        let count = self.workbook.sheet_count();
+        if count <= 1 {
+            return;
+        }
+        self.commit_active_sheet_cache();
+        let active = self.workbook.active_sheet as isize;
+        let next = (active + delta).rem_euclid(count as isize) as usize;
+        self.workbook.active_sheet = next;
+        self.sync_active_sheet_cache();
+        self.cursor.clamp(&self.state.grid);
+        self.status = format!("Sheet {} of {}", next + 1, count);
+    }
+
     fn start_input_mode(&mut self, buffer: String) -> String {
         self.input_cursor = Some(buffer.chars().count());
         buffer
+    }
+
+    fn state(&self) -> &SheetState {
+        &self.state
+    }
+
+    fn state_mut(&mut self) -> &mut SheetState {
+        &mut self.state
+    }
+
+    fn sync_active_sheet_cache(&mut self) {
+        self.workbook.ensure_active_sheet();
+        self.state = self.workbook.active_sheet().clone();
+    }
+
+    fn commit_active_sheet_cache(&mut self) {
+        self.workbook.ensure_active_sheet();
+        self.workbook.sheets[self.workbook.active_sheet].state = self.state.clone();
     }
 
     fn handle_plain_text_input_key(
@@ -1428,6 +1506,26 @@ impl App {
         let linked_revision = self.revision_limit;
         if let Some(ref p) = initial_path {
             if Path::new(p).exists() {
+                if let Ok(snapshot) = crate::io::load_workbook_snapshot(p) {
+                    let active_index = snapshot
+                        .sheets
+                        .iter()
+                        .position(|s| s.id == snapshot.active_sheet_id)
+                        .unwrap_or(0);
+                    self.workbook = WorkbookState {
+                        sheets: snapshot.sheets,
+                        active_sheet: active_index,
+                        next_sheet_id: snapshot.next_sheet_id,
+                    };
+                    self.sync_active_sheet_cache();
+                    self.path = Some(p.clone());
+                    self.source_path = None;
+                    self.revision_limit = None;
+                    self.watcher = None;
+                    self.status = format!("Loaded workbook {}", p.display());
+                    self.cursor.clamp(&self.state.grid);
+                    return Ok(());
+                }
                 let ext = p
                     .extension()
                     .and_then(|e| e.to_str())
@@ -2159,26 +2257,32 @@ impl App {
     }
 
     fn save_to_path(&mut self, path: &Path) -> Result<(), RunError> {
-        let mut buf = Vec::new();
-        for row in 0..self.state.grid.main_rows() {
-            for col in 0..self.state.grid.main_cols() {
-                let addr = CellAddr::Main {
-                    row: row as u32,
-                    col: col as u32,
-                };
-                if let Some(value) = self.state.grid.get(&addr) {
-                    if !value.is_empty() {
-                        let line = format!(
-                            "SET {} {}\n",
-                            addr_label(&addr, self.state.grid.main_cols()),
-                            value
-                        );
-                        buf.extend_from_slice(line.as_bytes());
+        self.commit_active_sheet_cache();
+        if self.workbook.sheet_count() > 1 {
+            let snap = WorkbookSnapshot::from_workbook(&self.workbook);
+            crate::io::save_workbook(path, &snap)?;
+        } else {
+            let mut buf = Vec::new();
+            for row in 0..self.state.grid.main_rows() {
+                for col in 0..self.state.grid.main_cols() {
+                    let addr = CellAddr::Main {
+                        row: row as u32,
+                        col: col as u32,
+                    };
+                    if let Some(value) = self.state.grid.get(&addr) {
+                        if !value.is_empty() {
+                            let line = format!(
+                                "SET {} {}\n",
+                                addr_label(&addr, self.state.grid.main_cols()),
+                                value
+                            );
+                            buf.extend_from_slice(line.as_bytes());
+                        }
                     }
                 }
             }
+            std::fs::write(path, &buf)?;
         }
-        std::fs::write(path, &buf)?;
         self.path = Some(path.to_path_buf());
         self.source_path = None;
         self.revision_limit = None;
@@ -2260,7 +2364,9 @@ impl App {
     }
 
     fn draw(&mut self, f: &mut Frame) {
+        let _ctx = crate::formula::set_eval_context(&self.workbook);
         let special_picker = self.special_picker;
+        let has_tabs = self.workbook.sheet_count() > 1;
         let constraints = vec![
             Constraint::Length(1),
             Constraint::Length(1),
@@ -2457,6 +2563,28 @@ impl App {
             }
         };
         f.render_widget(formula_widget, formula_area);
+
+        if has_tabs {
+            let tab_style = Style::default().fg(Color::White).bg(Color::DarkGray);
+            let active_style = Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD);
+            let mut spans = Vec::new();
+            for (idx, sheet) in self.workbook.sheets.iter().enumerate() {
+                if idx > 0 {
+                    spans.push(Span::raw("  "));
+                }
+                let style = if idx == self.workbook.active_sheet {
+                    active_style
+                } else {
+                    tab_style
+                };
+                spans.push(Span::styled(format!(" {} ", sheet.title), style));
+            }
+            let tab_area = hints_area;
+            f.render_widget(Paragraph::new(Line::from(spans)).style(tab_style), tab_area);
+        }
 
         if matches!(&self.mode, Mode::Help | Mode::About) {
             let body = match &self.mode {
@@ -2685,6 +2813,16 @@ impl App {
         f.render_widget(block, grid_area);
 
         let hints = self.hints_line();
+        let hints_area = if has_tabs {
+            Rect {
+                x: hints_area.x,
+                y: hints_area.y.saturating_sub(1),
+                width: hints_area.width,
+                height: 1,
+            }
+        } else {
+            hints_area
+        };
         f.render_widget(
             Paragraph::new(hints).style(Style::default().fg(Color::DarkGray)),
             hints_area,
@@ -3078,6 +3216,10 @@ impl App {
                         }]);
                         return Ok(false);
                     }
+                    'n' | 'N' => {
+                        self.add_sheet(format!("Sheet{}", self.workbook.next_sheet_id));
+                        return Ok(false);
+                    }
                     _ => {}
                 }
             }
@@ -3115,6 +3257,20 @@ impl App {
                     }
                     _ => {}
                 }
+            }
+        }
+
+        if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(mode, Mode::Normal) {
+            match key.code {
+                KeyCode::PageUp => {
+                    self.switch_sheet(-1);
+                    return Ok(false);
+                }
+                KeyCode::PageDown => {
+                    self.switch_sheet(1);
+                    return Ok(false);
+                }
+                _ => {}
             }
         }
 
@@ -4711,6 +4867,16 @@ mod tests {
         app.save_to_path(path.path()).unwrap();
 
         assert_eq!(app.revision_limit, None);
+    }
+
+    #[test]
+    fn new_sheet_creates_second_tab() {
+        let mut app = App::new(None);
+        app.add_sheet("Sheet2".into());
+
+        assert_eq!(app.workbook.sheet_count(), 2);
+        assert_eq!(app.workbook.active_sheet, 1);
+        assert_eq!(app.workbook.sheet_title(1), "Sheet2");
     }
 
     #[test]

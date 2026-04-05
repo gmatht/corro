@@ -1,17 +1,18 @@
 # Corro design notes
 
-Corro is a Rust terminal UI (TUI) spreadsheet-like tool built around an **append-only operation log**. Multiple running instances can follow the same file and converge by **tailing and applying ops**; the newest op for a given cell wins.
+Corro is a Rust terminal UI (TUI) spreadsheet-like tool built around an **append-only operation log** and a workbook model with multiple sheets. Multiple running instances can follow the same file and converge by **tailing and applying ops**; the newest op for a given cell wins.
 
 This document summarizes the architecture and key decisions implemented so far.
 
 ## Goals
 
-- **Spreadsheet-ish editing in a TUI**: navigate, edit cells, display a small viewport.
+- **Spreadsheet-ish editing in a TUI**: navigate, edit cells, display a small viewport, and switch between sheets with a bottom tab bar.
 - **Collaborative-ish via filesystem**: append-only text log as the source of truth; instances watch and apply new lines.
 - **Structural ops**: move row/column ranges without rewriting the whole file.
 - **Formulas**: cells whose value starts with `=` evaluate for display and for numeric range aggregation.
 - **Special rows/columns**: margin labels (`SUM`, `TOTAL`, …) drive computed totals over main data (see below).
 - **Sparse “infinite” sheet**: unbounded logical size without allocating huge dense grids.
+- **Workbook tabs**: stable numeric sheet IDs, per-sheet titles, and cross-sheet formula references.
 
 Non-goals (currently):
 
@@ -166,5 +167,5 @@ Core modules:
 
 - The UI is deliberately tiny and not yet a usable spreadsheet.
 - The log format is not versioned; migrations are not handled.
-- No durability guarantees beyond append; no compaction/snapshotting.
+- Single-sheet logs remain append-only text. Multi-sheet workbooks save as workbook snapshots with sheet headers and per-sheet cell lines.
 - Formula language is minimal; errors are coarse (`#PARSE`, `#CIRC`, …).

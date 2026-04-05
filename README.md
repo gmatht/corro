@@ -1,6 +1,6 @@
 # corro (WIP)
 
-`corro` is an early-stage Rust TUI spreadsheet experiment built around an **append-only text operation log** and a small **sparse** sheet model.
+`corro` is an early-stage Rust TUI spreadsheet experiment built around an **append-only text operation log** and a small **sparse** workbook model.
 
 There is now a working prototype release: [`0.0.1`](https://github.com/gmatht/corro/releases/tag/0.0.1).
 
@@ -18,6 +18,6 @@ This is still a rough prototype and has important limitations:
 
 - Creating a new file currently depends on shell workflows (for example `touch`) rather than an in-app flow.
 - Instead of formulas, the current model uses special columns/rows, which are cleaner and harder to misuse.
-- Formula support is still worth adding in the future for broader spreadsheet compatibility and expressiveness.
+- Workbook tabs are supported with stable numeric sheet IDs and a bottom tab bar when more than one sheet exists.
 
 See `DESIGN.md` for the current architecture and decisions.
