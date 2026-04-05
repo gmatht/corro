@@ -291,40 +291,71 @@ impl Grid {
         }
     }
 
-    pub fn auto_fit_column(&mut self, global_col: usize) {
-        let mut maxw = 1usize;
+    fn content_width_for_column(&self, global_col: usize) -> Option<usize> {
+        let mut maxw = 0usize;
+        let mut saw_content = false;
         let main_cols = self.main_cols();
 
         for r in 0..HEADER_ROWS {
             if let Some(val) = self.header.get(r).and_then(|row| row.get(global_col)) {
-                maxw = maxw.max(val.chars().count());
+                if !val.is_empty() {
+                    saw_content = true;
+                    maxw = maxw.max(val.chars().count() + 1);
+                }
             }
         }
         for r in 0..FOOTER_ROWS {
             if let Some(val) = self.footer.get(r).and_then(|row| row.get(global_col)) {
-                maxw = maxw.max(val.chars().count());
+                if !val.is_empty() {
+                    saw_content = true;
+                    maxw = maxw.max(val.chars().count() + 1);
+                }
             }
         }
         for r in 0..self.extent_main_rows as usize {
             if global_col < MARGIN_COLS {
                 if let Some(val) = self.left.get(&(r as u32, global_col as u8)) {
-                    maxw = maxw.max(val.chars().count());
+                    if !val.is_empty() {
+                        saw_content = true;
+                        maxw = maxw.max(val.chars().count() + 1);
+                    }
                 }
             } else if global_col < MARGIN_COLS + main_cols {
                 let mc = global_col - MARGIN_COLS;
                 if let Some(val) = self.main_cells.get(&(r as u32, mc as u32)) {
-                    maxw = maxw.max(val.chars().count());
+                    if !val.is_empty() {
+                        saw_content = true;
+                        maxw = maxw.max(val.chars().count() + 1);
+                    }
                 }
             } else {
                 let rc = global_col - MARGIN_COLS - main_cols;
                 if let Some(val) = self.right.get(&(r as u32, rc as u8)) {
-                    maxw = maxw.max(val.chars().count());
+                    if !val.is_empty() {
+                        saw_content = true;
+                        maxw = maxw.max(val.chars().count() + 1);
+                    }
                 }
             }
         }
 
-        if maxw > self.max_col_width {
-            self.col_width_overrides.insert(global_col, maxw);
+        saw_content.then_some(maxw.max(4))
+    }
+
+    pub fn auto_fit_column(&mut self, global_col: usize) {
+        if let Some(maxw) = self.content_width_for_column(global_col) {
+            if maxw > self.max_col_width {
+                self.col_width_overrides.insert(global_col, maxw);
+            }
+        }
+    }
+
+    pub fn fit_column_to_content(&mut self, global_col: usize) {
+        if let Some(maxw) = self.content_width_for_column(global_col) {
+            self.col_width_overrides
+                .insert(global_col, maxw.min(self.max_col_width));
+        } else {
+            self.col_width_overrides.remove(&global_col);
         }
     }
 

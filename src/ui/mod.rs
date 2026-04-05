@@ -1565,6 +1565,9 @@ impl App {
                         self.workbook = workbook;
                         self.view_sheet_id = active_sheet;
                         self.sync_active_sheet_cache();
+                        for c in 0..self.state.grid.main_cols() {
+                            self.state.grid.fit_column_to_content(MARGIN_COLS + c);
+                        }
                         self.offset = data.len() as u64;
                         self.ops_applied =
                             data.lines().filter(|line| !line.trim().is_empty()).count();

@@ -427,16 +427,13 @@ mod tests {
 
     #[test]
     fn colwidth_fixture_keeps_column_a_narrow_and_b_wide() {
-        use crate::io::load_revisions;
+        use crate::io::load_workbook_snapshot;
         use std::path::Path;
 
-        let mut state = crate::ops::SheetState::new(1, 1);
-        load_revisions(Path::new("docs/tests/colwidth.corro"), 10, &mut state).unwrap();
+        let workbook = load_workbook_snapshot(Path::new("docs/tests/colwidth.corro")).unwrap();
+        let state = &workbook.sheets[0].state;
 
-        let mut out = Vec::new();
-        export_ascii_table(&state.grid, &mut out);
-        let s = String::from_utf8(out).unwrap();
-
-        assert_eq!(s.lines().next(), Some("+----+--------------------+"));
+        assert_eq!(state.grid.col_width(crate::grid::MARGIN_COLS), 4);
+        assert_eq!(state.grid.col_width(crate::grid::MARGIN_COLS + 1), 20);
     }
 }
