@@ -49,6 +49,14 @@ enum OpenPathRequest {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TextInputAction {
+    Handled,
+    EdgeLeft,
+    EdgeRight,
+    Unhandled,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OpenPathError {
     Empty,
     InvalidRevisionSyntax,
@@ -598,37 +606,43 @@ impl App {
     fn menu_action_mode(&mut self, action: MenuAction) -> Mode {
         self.edit_special_palette = false;
         match action {
-            MenuAction::OpenFile => Mode::OpenPath {
-                buffer: self.open_path_prompt_buffer(),
-            },
-            MenuAction::SaveAs => Mode::SavePath {
-                buffer: self
+            MenuAction::OpenFile => {
+                let buffer = self.open_path_prompt_buffer();
+                Mode::OpenPath {
+                    buffer: self.start_input_mode(buffer),
+                }
+            }
+            MenuAction::SaveAs => {
+                let buffer = self
                     .path
                     .as_ref()
                     .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
-            },
+                    .unwrap_or_default();
+                Mode::SavePath {
+                    buffer: self.start_input_mode(buffer),
+                }
+            }
             MenuAction::Exit => Mode::QuitPrompt,
             MenuAction::ExportTsv => Mode::ExportTsv {
-                buffer: String::new(),
+                buffer: self.start_input_mode(String::new()),
             },
             MenuAction::ExportCsv => Mode::ExportCsv {
-                buffer: String::new(),
+                buffer: self.start_input_mode(String::new()),
             },
             MenuAction::ExportAscii => Mode::ExportAscii {
-                buffer: String::new(),
+                buffer: self.start_input_mode(String::new()),
             },
             MenuAction::ExportAll => Mode::ExportAll {
-                buffer: String::new(),
+                buffer: self.start_input_mode(String::new()),
             },
             MenuAction::ExportOdt => Mode::ExportOdt {
-                buffer: String::new(),
+                buffer: self.start_input_mode(String::new()),
             },
             MenuAction::SetMaxColWidth => Mode::SetMaxColWidth {
-                buffer: String::new(),
+                buffer: self.start_input_mode(String::new()),
             },
             MenuAction::SetColWidth => Mode::SetColWidth {
-                buffer: String::new(),
+                buffer: self.start_input_mode(String::new()),
             },
             MenuAction::InsertRows => {
                 let _ = self.insert_rows_above_cursor(1);
@@ -656,11 +670,11 @@ impl App {
                 self.start_edit_mode(self.menu_insert_hyperlink_seed(), None, false)
             }
             MenuAction::SortView => Mode::SortView {
-                buffer: String::new(),
+                buffer: self.start_input_mode(String::new()),
                 persist: false,
             },
             MenuAction::SaveSort => Mode::SortView {
-                buffer: String::new(),
+                buffer: self.start_input_mode(String::new()),
                 persist: true,
             },
             MenuAction::HelpRows => {
@@ -1286,6 +1300,7 @@ pub struct App {
     selection_kind: SelectionKind,
     edit_special_palette: bool,
     edit_cursor: Option<usize>,
+    input_cursor: Option<usize>,
     special_picker: Option<usize>,
 }
 
@@ -1323,6 +1338,7 @@ impl App {
             selection_kind: SelectionKind::Cells,
             edit_special_palette: false,
             edit_cursor: None,
+            input_cursor: None,
             special_picker: None,
         }
     }
@@ -1335,6 +1351,76 @@ impl App {
             return path.to_string_lossy().into_owned();
         }
         String::new()
+    }
+
+    fn start_input_mode(&mut self, buffer: String) -> String {
+        self.input_cursor = Some(buffer.chars().count());
+        buffer
+    }
+
+    fn handle_plain_text_input_key(
+        buffer: &mut String,
+        cursor: &mut Option<usize>,
+        key: KeyCode,
+    ) -> bool {
+        !matches!(
+            Self::handle_text_input_key(buffer, cursor, key),
+            TextInputAction::Unhandled
+        )
+    }
+
+    fn handle_text_input_key(
+        buffer: &mut String,
+        cursor: &mut Option<usize>,
+        key: KeyCode,
+    ) -> TextInputAction {
+        match key {
+            KeyCode::Char(c) => {
+                let len = buffer.chars().count();
+                let cursor = cursor.get_or_insert(len);
+                let pos = (*cursor).min(len);
+                let mut chars: Vec<char> = buffer.chars().collect();
+                chars.insert(pos, c);
+                *buffer = chars.into_iter().collect();
+                *cursor = pos + 1;
+                TextInputAction::Handled
+            }
+            KeyCode::Backspace => {
+                let len = buffer.chars().count();
+                if let Some(cursor) = cursor.as_mut() {
+                    if *cursor > 0 {
+                        let pos = (*cursor).min(len);
+                        let mut chars: Vec<char> = buffer.chars().collect();
+                        if pos > 0 {
+                            chars.remove(pos - 1);
+                            *buffer = chars.into_iter().collect();
+                            *cursor = pos - 1;
+                        }
+                    }
+                } else {
+                    buffer.pop();
+                }
+                TextInputAction::Handled
+            }
+            KeyCode::Left | KeyCode::Right => {
+                let len = buffer.chars().count();
+                let cursor = cursor.get_or_insert(len);
+                match key {
+                    KeyCode::Left if *cursor == 0 => TextInputAction::EdgeLeft,
+                    KeyCode::Right if *cursor >= len => TextInputAction::EdgeRight,
+                    KeyCode::Left => {
+                        *cursor -= 1;
+                        TextInputAction::Handled
+                    }
+                    KeyCode::Right => {
+                        *cursor += 1;
+                        TextInputAction::Handled
+                    }
+                    _ => TextInputAction::Unhandled,
+                }
+            }
+            _ => TextInputAction::Unhandled,
+        }
     }
 
     pub fn load_initial(&mut self) -> Result<(), IoError> {
@@ -2245,72 +2331,110 @@ impl App {
         // ── Formula bar ───────────────────────────────────────────────────────
         let addr = self.cursor.to_addr(grid);
         let addr_str = addr_label(&addr, grid.main_cols());
-        let (formula_text, formula_style) = match &self.mode {
-            Mode::Edit { buffer, .. } => {
-                let cursor = self.edit_cursor.unwrap_or_else(|| buffer.chars().count());
-                let mut chars: Vec<char> = buffer.chars().collect();
-                let pos = cursor.min(chars.len());
-                chars.insert(pos, '|');
-                let shown: String = chars.into_iter().collect();
-                (
-                    format!(" {addr_str}  {shown}"),
-                    Style::default()
-                        .fg(Color::White)
-                        .bg(Color::DarkGray)
-                        .add_modifier(Modifier::BOLD),
-                )
-            }
-            Mode::OpenPath { buffer } => (
-                format!(" open: {buffer}_"),
-                Style::default().fg(Color::White).bg(Color::DarkGray),
-            ),
-            Mode::ExportTsv { buffer } => (
-                format!(" export TSV (blank=clipboard): {buffer}_"),
-                Style::default().fg(Color::White).bg(Color::DarkGray),
-            ),
-            Mode::ExportCsv { buffer } => (
-                format!(" export CSV (blank=clipboard): {buffer}_"),
-                Style::default().fg(Color::White).bg(Color::DarkGray),
-            ),
-            Mode::ExportAscii { .. } => (
-                " export ASCII table (blank=clipboard): ".into(),
-                Style::default().fg(Color::White).bg(Color::DarkGray),
-            ),
-            Mode::ExportAll { .. } => (
-                " export full (incl headers/margins): ".into(),
-                Style::default().fg(Color::White).bg(Color::DarkGray),
-            ),
-            Mode::ExportOdt { buffer } => (
-                format!(" export ODT: {buffer}_"),
-                Style::default().fg(Color::White).bg(Color::DarkGray),
-            ),
-            Mode::SetMaxColWidth { buffer } => (
-                format!(" max col width (default=20): {buffer}_"),
-                Style::default().fg(Color::White).bg(Color::DarkGray),
-            ),
-            Mode::SetColWidth { buffer } => (
-                format!(" col width [col=width|col]: {buffer}_"),
-                Style::default().fg(Color::White).bg(Color::DarkGray),
-            ),
-            Mode::SortView { buffer, persist } => (
+        let prompt_style = Style::default().fg(Color::White).bg(Color::DarkGray);
+        let prompt_style_bold = prompt_style.add_modifier(Modifier::BOLD);
+        let caret_style = Style::default()
+            .fg(Color::Black)
+            .bg(Color::Yellow)
+            .add_modifier(Modifier::BOLD);
+        let formula_widget = match &self.mode {
+            Mode::Edit { buffer, .. } => Paragraph::new(input_line(
+                format!(" {addr_str}  "),
+                buffer,
+                self.edit_cursor.unwrap_or_else(|| buffer.chars().count()),
+                prompt_style_bold,
+                caret_style,
+            ))
+            .style(prompt_style_bold),
+            Mode::OpenPath { buffer } => Paragraph::new(input_line(
+                " open: ".to_string(),
+                buffer,
+                self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
+                prompt_style,
+                caret_style,
+            ))
+            .style(prompt_style),
+            Mode::SavePath { buffer } => Paragraph::new(input_line(
+                " save as: ".to_string(),
+                buffer,
+                self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
+                prompt_style,
+                caret_style,
+            ))
+            .style(prompt_style),
+            Mode::ExportTsv { buffer } => Paragraph::new(input_line(
+                " export TSV (blank=clipboard): ".to_string(),
+                buffer,
+                self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
+                prompt_style,
+                caret_style,
+            ))
+            .style(prompt_style),
+            Mode::ExportCsv { buffer } => Paragraph::new(input_line(
+                " export CSV (blank=clipboard): ".to_string(),
+                buffer,
+                self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
+                prompt_style,
+                caret_style,
+            ))
+            .style(prompt_style),
+            Mode::ExportAscii { buffer } => Paragraph::new(input_line(
+                " export ASCII table (blank=clipboard): ".to_string(),
+                buffer,
+                self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
+                prompt_style,
+                caret_style,
+            ))
+            .style(prompt_style),
+            Mode::ExportAll { buffer } => Paragraph::new(input_line(
+                " export full (incl headers/margins): ".to_string(),
+                buffer,
+                self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
+                prompt_style,
+                caret_style,
+            ))
+            .style(prompt_style),
+            Mode::ExportOdt { buffer } => Paragraph::new(input_line(
+                " export ODT: ".to_string(),
+                buffer,
+                self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
+                prompt_style,
+                caret_style,
+            ))
+            .style(prompt_style),
+            Mode::SetMaxColWidth { buffer } => Paragraph::new(input_line(
+                " max col width (default=20): ".to_string(),
+                buffer,
+                self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
+                prompt_style,
+                caret_style,
+            ))
+            .style(prompt_style),
+            Mode::SetColWidth { buffer } => Paragraph::new(input_line(
+                " col width [col=width|col]: ".to_string(),
+                buffer,
+                self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
+                prompt_style,
+                caret_style,
+            ))
+            .style(prompt_style),
+            Mode::SortView { buffer, persist } => Paragraph::new(input_line(
                 format!(
-                    " sort cols [A,B,C]{}: {buffer}_",
+                    " sort cols [A,B,C]{}: ",
                     if *persist { " (save)" } else { "" }
                 ),
-                Style::default().fg(Color::White).bg(Color::DarkGray),
-            ),
-            Mode::QuitPrompt => (
-                " Quit Corro? (Q)uit, (B)ack ".into(),
-                Style::default().fg(Color::White).bg(Color::Red),
-            ),
-            Mode::Help => (
-                " Help - Up/Down scroll, Esc closes ".into(),
-                Style::default().fg(Color::White).bg(Color::Blue),
-            ),
-            Mode::About => (
-                " About - Up/Down scroll, Esc closes ".into(),
-                Style::default().fg(Color::White).bg(Color::Blue),
-            ),
+                buffer,
+                self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
+                prompt_style,
+                caret_style,
+            ))
+            .style(prompt_style),
+            Mode::QuitPrompt => Paragraph::new(" Quit Corro? (Q)uit, (B)ack ")
+                .style(Style::default().fg(Color::White).bg(Color::Red)),
+            Mode::Help => Paragraph::new(" Help - Up/Down scroll, Esc closes ")
+                .style(Style::default().fg(Color::White).bg(Color::Blue)),
+            Mode::About => Paragraph::new(" About - Up/Down scroll, Esc closes ")
+                .style(Style::default().fg(Color::White).bg(Color::Blue)),
             Mode::Menu { .. } => {
                 let val = cell_effective_display(grid, &addr);
                 let base = format!(" {addr_str}  {val}");
@@ -2319,7 +2443,7 @@ impl App {
                 } else {
                     format!("{base}   ·  {}", self.status)
                 };
-                (text, Style::default().fg(Color::Cyan))
+                Paragraph::new(text).style(Style::default().fg(Color::Cyan))
             }
             _ => {
                 let val = cell_effective_display(grid, &addr);
@@ -2329,13 +2453,10 @@ impl App {
                 } else {
                     format!("{base}   ·  {}", self.status)
                 };
-                (text, Style::default().fg(Color::Cyan))
+                Paragraph::new(text).style(Style::default().fg(Color::Cyan))
             }
         };
-        f.render_widget(
-            Paragraph::new(formula_text).style(formula_style),
-            formula_area,
-        );
+        f.render_widget(formula_widget, formula_area);
 
         if matches!(&self.mode, Mode::Help | Mode::About) {
             let body = match &self.mode {
@@ -3031,26 +3152,30 @@ impl App {
                 KeyCode::Enter => {
                     let fname = buffer.clone();
                     self.finish_export(false, &fname);
+                    self.input_cursor = None;
                     mode = Mode::Normal;
                 }
                 KeyCode::Esc => mode = Mode::Normal,
-                KeyCode::Char(c) => buffer.push(c),
-                KeyCode::Backspace => {
-                    buffer.pop();
-                }
+                _ if Self::handle_plain_text_input_key(
+                    buffer,
+                    &mut self.input_cursor,
+                    key.code,
+                ) => {}
                 _ => {}
             },
             Mode::ExportCsv { buffer } => match key.code {
                 KeyCode::Enter => {
                     let fname = buffer.clone();
                     self.finish_export(true, &fname);
+                    self.input_cursor = None;
                     mode = Mode::Normal;
                 }
                 KeyCode::Esc => mode = Mode::Normal,
-                KeyCode::Char(c) => buffer.push(c),
-                KeyCode::Backspace => {
-                    buffer.pop();
-                }
+                _ if Self::handle_plain_text_input_key(
+                    buffer,
+                    &mut self.input_cursor,
+                    key.code,
+                ) => {}
                 _ => {}
             },
             Mode::ExportAscii { buffer } => match key.code {
@@ -3069,13 +3194,15 @@ impl App {
                             Err(e) => self.status = format!("Write error: {e}"),
                         }
                     }
+                    self.input_cursor = None;
                     mode = Mode::Normal;
                 }
                 KeyCode::Esc => mode = Mode::Normal,
-                KeyCode::Char(c) => buffer.push(c),
-                KeyCode::Backspace => {
-                    buffer.pop();
-                }
+                _ if Self::handle_plain_text_input_key(
+                    buffer,
+                    &mut self.input_cursor,
+                    key.code,
+                ) => {}
                 _ => {}
             },
             Mode::ExportOdt { buffer } => match key.code {
@@ -3089,13 +3216,15 @@ impl App {
                             Err(e) => self.status = format!("Write error: {e}"),
                         }
                     }
+                    self.input_cursor = None;
                     mode = Mode::Normal;
                 }
                 KeyCode::Esc => mode = Mode::Normal,
-                KeyCode::Char(c) => buffer.push(c),
-                KeyCode::Backspace => {
-                    buffer.pop();
-                }
+                _ if Self::handle_plain_text_input_key(
+                    buffer,
+                    &mut self.input_cursor,
+                    key.code,
+                ) => {}
                 _ => {}
             },
             Mode::ExportAll { buffer } => match key.code {
@@ -3134,13 +3263,15 @@ impl App {
                             Err(e) => self.status = format!("Write error: {e}"),
                         }
                     }
+                    self.input_cursor = None;
                     mode = Mode::Normal;
                 }
                 KeyCode::Esc => mode = Mode::Normal,
-                KeyCode::Char(c) => buffer.push(c),
-                KeyCode::Backspace => {
-                    buffer.pop();
-                }
+                _ if Self::handle_plain_text_input_key(
+                    buffer,
+                    &mut self.input_cursor,
+                    key.code,
+                ) => {}
                 _ => {}
             },
             Mode::SetMaxColWidth { buffer } => match key.code {
@@ -3160,13 +3291,15 @@ impl App {
                         }
                         self.status = format!("Default column width set to {width}");
                     }
+                    self.input_cursor = None;
                     mode = Mode::Normal;
                 }
                 KeyCode::Esc => mode = Mode::Normal,
-                KeyCode::Char(c) => buffer.push(c),
-                KeyCode::Backspace => {
-                    buffer.pop();
-                }
+                _ if Self::handle_plain_text_input_key(
+                    buffer,
+                    &mut self.input_cursor,
+                    key.code,
+                ) => {}
                 _ => {}
             },
             Mode::SetColWidth { buffer } => match key.code {
@@ -3200,13 +3333,15 @@ impl App {
                         }
                         self.status = format!("Column {col} width override cleared");
                     }
+                    self.input_cursor = None;
                     mode = Mode::Normal;
                 }
                 KeyCode::Esc => mode = Mode::Normal,
-                KeyCode::Char(c) => buffer.push(c),
-                KeyCode::Backspace => {
-                    buffer.pop();
-                }
+                _ if Self::handle_plain_text_input_key(
+                    buffer,
+                    &mut self.input_cursor,
+                    key.code,
+                ) => {}
                 _ => {}
             },
             Mode::SortView { buffer, persist } => match key.code {
@@ -3262,13 +3397,15 @@ impl App {
                     } else {
                         "View sort updated".into()
                     };
+                    self.input_cursor = None;
                     mode = Mode::Normal;
                 }
                 KeyCode::Esc => mode = Mode::Normal,
-                KeyCode::Char(c) => buffer.push(c),
-                KeyCode::Backspace => {
-                    buffer.pop();
-                }
+                _ if Self::handle_plain_text_input_key(
+                    buffer,
+                    &mut self.input_cursor,
+                    key.code,
+                ) => {}
                 _ => {}
             },
             Mode::QuitPrompt => match key.code {
@@ -3378,10 +3515,11 @@ impl App {
                     }
                 },
                 KeyCode::Esc => mode = Mode::Normal,
-                KeyCode::Char(c) => buffer.push(c),
-                KeyCode::Backspace => {
-                    buffer.pop();
-                }
+                _ if Self::handle_plain_text_input_key(
+                    buffer,
+                    &mut self.input_cursor,
+                    key.code,
+                ) => {}
                 _ => {}
             },
             Mode::SavePath { buffer } => match key.code {
@@ -3391,14 +3529,16 @@ impl App {
                         self.status = "Save path required".into();
                     } else {
                         self.save_to_path(&path)?;
+                        self.input_cursor = None;
                         mode = Mode::Normal;
                     }
                 }
                 KeyCode::Esc => mode = Mode::Normal,
-                KeyCode::Char(c) => buffer.push(c),
-                KeyCode::Backspace => {
-                    buffer.pop();
-                }
+                _ if Self::handle_plain_text_input_key(
+                    buffer,
+                    &mut self.input_cursor,
+                    key.code,
+                ) => {}
                 _ => {}
             },
             Mode::Edit {
@@ -3623,12 +3763,13 @@ impl App {
                     }
                     KeyCode::Char('o') => {
                         self.edit_special_palette = false;
+                        let buffer = self
+                            .path
+                            .as_ref()
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .unwrap_or_default();
                         mode = Mode::OpenPath {
-                            buffer: self
-                                .path
-                                .as_ref()
-                                .map(|p| p.to_string_lossy().into_owned())
-                                .unwrap_or_default(),
+                            buffer: self.start_input_mode(buffer),
                         };
                     }
                     KeyCode::Char('e') | KeyCode::Enter => {
@@ -3655,7 +3796,7 @@ impl App {
                     }
                     KeyCode::Char('t') => {
                         mode = Mode::ExportTsv {
-                            buffer: String::new(),
+                            buffer: self.start_input_mode(String::new()),
                         }
                     }
                     KeyCode::Char('c') => {
@@ -3693,7 +3834,7 @@ impl App {
                             }
                         } else {
                             mode = Mode::ExportCsv {
-                                buffer: String::new(),
+                                buffer: self.start_input_mode(String::new()),
                             };
                         }
                     }
@@ -4785,11 +4926,9 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| app.draw(f)).unwrap();
         let buffer = terminal.backend().buffer();
-        assert!((0..buffer.area.height).any(|y| {
-            (0..buffer.area.width)
-                .map(|x| buffer[(x, y)].symbol())
-                .collect::<String>()
-                .contains('|')
+        assert!((0..buffer.area.width).any(|x| {
+            let cell = &buffer[(x, 1)];
+            cell.symbol() == " " && cell.style().bg == Some(Color::Yellow)
         }));
 
         app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::empty()))
@@ -4797,11 +4936,9 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(40, 6)).unwrap();
         terminal.draw(|f| app.draw(f)).unwrap();
         let buffer = terminal.backend().buffer();
-        assert!((0..buffer.area.height).any(|y| {
-            (0..buffer.area.width)
-                .map(|x| buffer[(x, y)].symbol())
-                .collect::<String>()
-                .contains('|')
+        assert!((0..buffer.area.width).any(|x| {
+            let cell = &buffer[(x, 1)];
+            cell.symbol() == " " && cell.style().bg == Some(Color::Yellow)
         }));
 
         app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::empty()))
@@ -4809,12 +4946,59 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(40, 6)).unwrap();
         terminal.draw(|f| app.draw(f)).unwrap();
         let buffer = terminal.backend().buffer();
-        assert!((0..buffer.area.height).any(|y| {
+        assert!((0..buffer.area.width).any(|x| {
+            let cell = &buffer[(x, 1)];
+            cell.symbol() == " " && cell.style().bg == Some(Color::Yellow)
+        }));
+    }
+
+    #[test]
+    fn save_path_renders_filename_as_typed() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(None);
+        app.mode = Mode::SavePath {
+            buffer: "draft.corro".into(),
+        };
+
+        let backend = TestBackend::new(60, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = |y: u16| {
             (0..buffer.area.width)
                 .map(|x| buffer[(x, y)].symbol())
                 .collect::<String>()
-                .contains('|')
+        };
+
+        assert!(row(1).contains("save as:"));
+        assert!(row(1).contains("draft.corro"));
+        assert!((0..buffer.area.width).any(|x| {
+            let cell = &buffer[(x, 1)];
+            cell.symbol() == " " && cell.style().bg == Some(Color::Yellow)
         }));
+    }
+
+    #[test]
+    fn save_path_left_and_right_move_caret() {
+        let mut app = App::new(None);
+        app.mode = Mode::SavePath {
+            buffer: "abc".into(),
+        };
+        app.input_cursor = Some(3);
+
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::empty()))
+            .unwrap();
+        assert_eq!(app.input_cursor, Some(2));
+
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::empty()))
+            .unwrap();
+        assert_eq!(app.input_cursor, Some(1));
+
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::empty()))
+            .unwrap();
+        assert_eq!(app.input_cursor, Some(2));
     }
 
     #[test]
@@ -4892,6 +5076,33 @@ fn addr_label(addr: &CellAddr, main_cols: usize) -> String {
             )
         }
     }
+}
+
+fn input_line(
+    prefix: String,
+    buffer: &str,
+    cursor: usize,
+    text_style: Style,
+    caret_style: Style,
+) -> Line<'static> {
+    let chars: Vec<char> = buffer.chars().collect();
+    let cursor = cursor.min(chars.len());
+    let before: String = chars[..cursor].iter().collect();
+    let after: String = chars[cursor..].iter().collect();
+
+    let mut spans = Vec::with_capacity(4);
+    if !prefix.is_empty() {
+        spans.push(Span::styled(prefix, text_style));
+    }
+    if !before.is_empty() {
+        spans.push(Span::styled(before, text_style));
+    }
+    spans.push(Span::styled(" ", caret_style));
+    if !after.is_empty() {
+        spans.push(Span::styled(after, text_style));
+    }
+
+    Line::from(spans)
 }
 
 fn sheet_row_label(logical_row: usize, main_rows: usize) -> String {
