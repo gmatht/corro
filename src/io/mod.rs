@@ -140,6 +140,10 @@ fn import_delimited(data: &str, state: &mut SheetState, delim: char) {
         }
     }
 
+    for ci in 0..max_cols {
+        state.grid.auto_fit_column(crate::grid::MARGIN_COLS + ci);
+    }
+
     for (ri, row) in data_rows.iter().enumerate() {
         for (ci, val) in row.iter().enumerate() {
             if !val.is_empty() {

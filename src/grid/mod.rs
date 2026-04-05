@@ -120,7 +120,10 @@ impl Grid {
 
     /// One new main column at the right (cursor moving right from the last sheet column).
     pub fn grow_main_col_at_right(&mut self) {
-        self.extent_main_cols = self.extent_main_cols.saturating_add(1);
+        let old_main_cols = self.extent_main_cols as usize;
+        let new_main_cols = old_main_cols.saturating_add(1);
+        self.remap_main_col_layout_for_resize(old_main_cols, new_main_cols);
+        self.extent_main_cols = new_main_cols as u32;
         self.resize_header_footer_width();
     }
 
@@ -160,6 +163,9 @@ impl Grid {
                 grown = true;
             }
             if mc + 1 > self.extent_main_cols {
+                let old_main_cols = self.extent_main_cols as usize;
+                let new_main_cols = mc as usize + 1;
+                self.remap_main_col_layout_for_resize(old_main_cols, new_main_cols);
                 self.extent_main_cols = mc + 1;
                 grown = true;
             }
@@ -250,8 +256,11 @@ impl Grid {
     }
 
     pub fn set_main_size(&mut self, main_rows: usize, main_cols: usize) {
+        let old_main_cols = self.extent_main_cols as usize;
+        let new_main_cols = main_cols.max(1);
+        self.remap_main_col_layout_for_resize(old_main_cols, new_main_cols);
         self.extent_main_rows = main_rows.max(1) as u32;
-        self.extent_main_cols = main_cols.max(1) as u32;
+        self.extent_main_cols = new_main_cols as u32;
         self.main_cells
             .retain(|&(r, c), _| r < self.extent_main_rows && c < self.extent_main_cols);
         self.left.retain(|&(r, _), _| r < self.extent_main_rows);
@@ -280,6 +289,131 @@ impl Grid {
                 self.col_width_overrides.remove(&global_col);
             }
         }
+    }
+
+    pub fn auto_fit_column(&mut self, global_col: usize) {
+        let mut maxw = 1usize;
+        let main_cols = self.main_cols();
+
+        for r in 0..HEADER_ROWS {
+            if let Some(val) = self.header.get(r).and_then(|row| row.get(global_col)) {
+                maxw = maxw.max(val.chars().count());
+            }
+        }
+        for r in 0..FOOTER_ROWS {
+            if let Some(val) = self.footer.get(r).and_then(|row| row.get(global_col)) {
+                maxw = maxw.max(val.chars().count());
+            }
+        }
+        for r in 0..self.extent_main_rows as usize {
+            if global_col < MARGIN_COLS {
+                if let Some(val) = self.left.get(&(r as u32, global_col as u8)) {
+                    maxw = maxw.max(val.chars().count());
+                }
+            } else if global_col < MARGIN_COLS + main_cols {
+                let mc = global_col - MARGIN_COLS;
+                if let Some(val) = self.main_cells.get(&(r as u32, mc as u32)) {
+                    maxw = maxw.max(val.chars().count());
+                }
+            } else {
+                let rc = global_col - MARGIN_COLS - main_cols;
+                if let Some(val) = self.right.get(&(r as u32, rc as u8)) {
+                    maxw = maxw.max(val.chars().count());
+                }
+            }
+        }
+
+        if maxw > self.max_col_width {
+            self.col_width_overrides.insert(global_col, maxw);
+        }
+    }
+
+    fn remap_main_col_layout_for_resize(&mut self, old_main_cols: usize, new_main_cols: usize) {
+        if old_main_cols == new_main_cols {
+            return;
+        }
+
+        let old_total = MARGIN_COLS + old_main_cols + MARGIN_COLS;
+        let new_total = MARGIN_COLS + new_main_cols + MARGIN_COLS;
+        let old_right_start = MARGIN_COLS + old_main_cols;
+        let new_right_start = MARGIN_COLS + new_main_cols;
+
+        fn remap_col(
+            col: usize,
+            new_main_cols: usize,
+            old_right_start: usize,
+            new_right_start: usize,
+        ) -> Option<usize> {
+            if col < MARGIN_COLS {
+                Some(col)
+            } else if col < old_right_start {
+                let main_idx = col - MARGIN_COLS;
+                (main_idx < new_main_cols).then_some(MARGIN_COLS + main_idx)
+            } else {
+                let right_idx = col - old_right_start;
+                Some(new_right_start + right_idx)
+            }
+        }
+
+        for row in &mut self.header {
+            let old_row = std::mem::take(row);
+            let mut new_row = vec![String::new(); new_total];
+            for (col, value) in old_row.into_iter().enumerate().take(old_total) {
+                let new_col = remap_col(col, new_main_cols, old_right_start, new_right_start);
+                if let Some(new_col) = new_col {
+                    if new_col < new_total {
+                        new_row[new_col] = value;
+                    }
+                }
+            }
+            *row = new_row;
+        }
+
+        for row in &mut self.footer {
+            let old_row = std::mem::take(row);
+            let mut new_row = vec![String::new(); new_total];
+            for (col, value) in old_row.into_iter().enumerate().take(old_total) {
+                let new_col = remap_col(col, new_main_cols, old_right_start, new_right_start);
+                if let Some(new_col) = new_col {
+                    if new_col < new_total {
+                        new_row[new_col] = value;
+                    }
+                }
+            }
+            *row = new_row;
+        }
+
+        let mut remapped = HashMap::new();
+        for (col, width) in self.col_width_overrides.drain() {
+            let new_col = remap_col(col, new_main_cols, old_right_start, new_right_start);
+            if let Some(new_col) = new_col {
+                remapped.insert(new_col, width);
+            }
+        }
+        self.col_width_overrides = remapped;
+    }
+
+    fn remap_main_col_width_overrides_for_order(&mut self, order: &[u32]) {
+        let old_main_cols = order.len();
+        if old_main_cols == 0 {
+            return;
+        }
+
+        let mut old_to_new = vec![0usize; old_main_cols];
+        for (new_pos, &old_pos) in order.iter().enumerate() {
+            old_to_new[old_pos as usize] = new_pos;
+        }
+
+        let mut remapped = HashMap::new();
+        for (col, width) in self.col_width_overrides.drain() {
+            if col < MARGIN_COLS || col >= MARGIN_COLS + old_main_cols {
+                remapped.insert(col, width);
+            } else {
+                let old_pos = col - MARGIN_COLS;
+                remapped.insert(MARGIN_COLS + old_to_new[old_pos], width);
+            }
+        }
+        self.col_width_overrides = remapped;
     }
 
     pub fn set_view_sort_cols(&mut self, cols: Vec<SortSpec>) {
@@ -384,8 +518,9 @@ impl Grid {
                 } else {
                     self.extent_main_rows = self.extent_main_rows.max(r + 1);
                     self.extent_main_cols = self.extent_main_cols.max(c + 1);
-                    self.resize_header_footer_width();
                     self.main_cells.insert((r, c), value);
+                    self.auto_fit_column(MARGIN_COLS + c as usize);
+                    self.resize_header_footer_width();
                 }
             }
             CellAddr::Left { col, row } => {
@@ -396,8 +531,9 @@ impl Grid {
                         self.left.remove(&(r, mc));
                     } else {
                         self.extent_main_rows = self.extent_main_rows.max(r + 1);
-                        self.resize_header_footer_width();
                         self.left.insert((r, mc), value);
+                        self.auto_fit_column(mc as usize);
+                        self.resize_header_footer_width();
                     }
                 }
             }
@@ -409,8 +545,11 @@ impl Grid {
                         self.right.remove(&(r, mc));
                     } else {
                         self.extent_main_rows = self.extent_main_rows.max(r + 1);
-                        self.resize_header_footer_width();
                         self.right.insert((r, mc), value);
+                        self.auto_fit_column(
+                            MARGIN_COLS + self.extent_main_cols as usize + mc as usize,
+                        );
+                        self.resize_header_footer_width();
                     }
                 }
             }
@@ -504,6 +643,8 @@ impl Grid {
                 row.splice(insert_global..insert_global, block);
             }
         }
+
+        self.remap_main_col_width_overrides_for_order(&order);
 
         self.extent_main_cols = order.len() as u32;
     }
@@ -633,5 +774,40 @@ mod tests {
         }]);
 
         assert_eq!(g.sorted_main_rows(), vec![1, 0, 2]);
+    }
+
+    #[test]
+    fn auto_fit_only_grows_touched_column() {
+        let mut g = Grid::new(1, 2);
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "short".into());
+        g.set(
+            &CellAddr::Main { row: 0, col: 1 },
+            "abcdefghijklmnopqrstuvwx".into(),
+        );
+
+        assert_eq!(g.col_width(MARGIN_COLS), 20);
+        assert!(g.col_width(MARGIN_COLS + 1) >= 24);
+    }
+
+    #[test]
+    fn widths_shift_when_main_cols_grow() {
+        let mut g = Grid::new(1, 1);
+        g.set_col_width(MARGIN_COLS + 1, Some(24));
+
+        g.grow_main_col_at_right();
+
+        assert_eq!(g.col_width(MARGIN_COLS + 1), 20);
+        assert_eq!(g.col_width(MARGIN_COLS + 2), 24);
+    }
+
+    #[test]
+    fn widths_follow_moved_main_columns() {
+        let mut g = Grid::new(1, 3);
+        g.set_col_width(MARGIN_COLS + 1, Some(24));
+
+        g.move_main_cols(1, 1, 3);
+
+        assert_eq!(g.col_width(MARGIN_COLS + 1), 20);
+        assert_eq!(g.col_width(MARGIN_COLS + 2), 24);
     }
 }

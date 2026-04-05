@@ -151,6 +151,8 @@ enum Mode {
     QuitPrompt,
 }
 
+const SPECIAL_VALUE_CHOICES: [&str; 10] = ["∞", "Σ", "Ω", "π", "μ", "Δ", "√", "φ", "λ", "θ"];
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MenuSection {
     File,
@@ -187,6 +189,8 @@ enum MenuAction {
     InsertRows,
     InsertCols,
     InsertSpecialChars,
+    InsertDate,
+    InsertTime,
     InsertHyperlink,
     SortView,
     SaveSort,
@@ -203,7 +207,7 @@ struct MenuItem {
     target: MenuTarget,
 }
 
-const FILE_MENU_ITEMS: [MenuItem; 8] = [
+const FILE_MENU_ITEMS: [MenuItem; 7] = [
     MenuItem {
         shortcut: 'O',
         label: "Open file",
@@ -218,11 +222,6 @@ const FILE_MENU_ITEMS: [MenuItem; 8] = [
         shortcut: 'T',
         label: "Export",
         target: MenuTarget::Submenu(MenuSection::Export),
-    },
-    MenuItem {
-        shortcut: 'I',
-        label: "Insert",
-        target: MenuTarget::Submenu(MenuSection::Insert),
     },
     MenuItem {
         shortcut: 'C',
@@ -243,6 +242,39 @@ const FILE_MENU_ITEMS: [MenuItem; 8] = [
         shortcut: 'X',
         label: "Exit",
         target: MenuTarget::Action(MenuAction::Exit),
+    },
+];
+
+const INSERT_ROOT_MENU_ITEMS: [MenuItem; 6] = [
+    MenuItem {
+        shortcut: 'R',
+        label: "Rows",
+        target: MenuTarget::Action(MenuAction::InsertRows),
+    },
+    MenuItem {
+        shortcut: 'C',
+        label: "Cols",
+        target: MenuTarget::Action(MenuAction::InsertCols),
+    },
+    MenuItem {
+        shortcut: 'S',
+        label: "Special Char",
+        target: MenuTarget::Action(MenuAction::InsertSpecialChars),
+    },
+    MenuItem {
+        shortcut: ';',
+        label: "Date",
+        target: MenuTarget::Action(MenuAction::InsertDate),
+    },
+    MenuItem {
+        shortcut: ':',
+        label: "Time",
+        target: MenuTarget::Action(MenuAction::InsertTime),
+    },
+    MenuItem {
+        shortcut: 'H',
+        label: "Hyperlink",
+        target: MenuTarget::Action(MenuAction::InsertHyperlink),
     },
 ];
 
@@ -284,29 +316,6 @@ const WIDTH_MENU_ITEMS: [MenuItem; 2] = [
         shortcut: 'C',
         label: "Column width",
         target: MenuTarget::Action(MenuAction::SetColWidth),
-    },
-];
-
-const INSERT_MENU_ITEMS: [MenuItem; 4] = [
-    MenuItem {
-        shortcut: 'R',
-        label: "Rows",
-        target: MenuTarget::Action(MenuAction::InsertRows),
-    },
-    MenuItem {
-        shortcut: 'C',
-        label: "Cols",
-        target: MenuTarget::Action(MenuAction::InsertCols),
-    },
-    MenuItem {
-        shortcut: 'S',
-        label: "Special chars",
-        target: MenuTarget::Action(MenuAction::InsertSpecialChars),
-    },
-    MenuItem {
-        shortcut: 'H',
-        label: "Hyperlink",
-        target: MenuTarget::Action(MenuAction::InsertHyperlink),
     },
 ];
 
@@ -430,9 +439,9 @@ fn footer_nonblank_end(state: &SheetState) -> Option<usize> {
 fn menu_items(section: MenuSection) -> &'static [MenuItem] {
     match section {
         MenuSection::File => &FILE_MENU_ITEMS,
+        MenuSection::Insert => &INSERT_ROOT_MENU_ITEMS,
         MenuSection::Export => &EXPORT_MENU_ITEMS,
         MenuSection::Width => &WIDTH_MENU_ITEMS,
-        MenuSection::Insert => &INSERT_MENU_ITEMS,
         MenuSection::Help => &HELP_MENU_ITEMS,
     }
 }
@@ -451,10 +460,21 @@ fn menu_action_item(section: MenuSection, item: usize) -> Option<MenuItem> {
     menu_items(section).get(item).copied()
 }
 
-fn menu_toggle_root_section(section: MenuSection) -> MenuSection {
+fn menu_next_root_section(section: MenuSection) -> MenuSection {
     match section {
+        MenuSection::File => MenuSection::Insert,
+        MenuSection::Insert => MenuSection::Help,
         MenuSection::Help => MenuSection::File,
         _ => MenuSection::Help,
+    }
+}
+
+fn menu_prev_root_section(section: MenuSection) -> MenuSection {
+    match section {
+        MenuSection::File => MenuSection::Help,
+        MenuSection::Insert => MenuSection::File,
+        MenuSection::Help => MenuSection::Insert,
+        _ => MenuSection::File,
     }
 }
 
@@ -499,7 +519,38 @@ impl App {
         self.mode = Mode::Menu { stack };
     }
 
+    fn start_edit_mode(
+        &mut self,
+        buffer: String,
+        formula_cursor: Option<SheetCursor>,
+        special_palette: bool,
+    ) -> Mode {
+        let cursor = if buffer.trim() == "=" {
+            1
+        } else {
+            buffer.chars().count()
+        };
+        self.edit_cursor = Some(cursor);
+        self.edit_special_palette = special_palette;
+        Mode::Edit {
+            buffer,
+            formula_cursor,
+        }
+    }
+
+    fn open_special_picker(&mut self) {
+        self.special_picker = Some(0);
+        self.mode = Mode::Normal;
+    }
+
+    fn commit_special_choice(&mut self, idx: usize) {
+        let choice = SPECIAL_VALUE_CHOICES[idx];
+        let buffer = choice.to_string();
+        self.mode = self.start_edit_mode(buffer, None, true);
+    }
+
     fn menu_action_mode(&mut self, action: MenuAction) -> Mode {
+        self.edit_special_palette = false;
         match action {
             MenuAction::OpenFile => Mode::OpenPath {
                 buffer: self
@@ -545,14 +596,23 @@ impl App {
                 let _ = self.insert_cols_left_of_cursor(1);
                 Mode::Normal
             }
-            MenuAction::InsertSpecialChars => Mode::Edit {
-                buffer: self.menu_insert_special_seed(),
-                formula_cursor: None,
-            },
-            MenuAction::InsertHyperlink => Mode::Edit {
-                buffer: self.menu_insert_hyperlink_seed(),
-                formula_cursor: None,
-            },
+            MenuAction::InsertSpecialChars => {
+                self.open_special_picker();
+                Mode::Normal
+            }
+            MenuAction::InsertDate => self.start_edit_mode(
+                chrono::Local::now().format("%Y-%m-%d").to_string(),
+                None,
+                false,
+            ),
+            MenuAction::InsertTime => self.start_edit_mode(
+                chrono::Local::now().format("%H:%M:%S").to_string(),
+                None,
+                false,
+            ),
+            MenuAction::InsertHyperlink => {
+                self.start_edit_mode(self.menu_insert_hyperlink_seed(), None, false)
+            }
             MenuAction::SortView => Mode::SortView {
                 buffer: String::new(),
                 persist: false,
@@ -641,9 +701,10 @@ Selection and movement\n\
 - c exports CSV when nothing is selected, or moves selected columns when columns are selected.\n\
 - Alt+arrows move selected rows or columns by one cell.\n\n\
 Menus\n\
-- Alt+F opens File.\n\
-- Alt+I opens Insert.\n\
-- Alt+H opens Help.\n\
+ - Alt+F opens File.\n\
+ - Alt+I opens Insert.\n\
+ - Alt+H opens Help.\n\
+ - Ctrl+; inserts the date and Ctrl+Shift+; inserts the time.\n\
 - Right opens the highlighted submenu.\n\
 - Left goes back one menu level.\n\
 - Enter or the shortcut letter opens the selected item.\n\n\
@@ -1077,15 +1138,31 @@ fn parse_cell_shorthand(buf: &str) -> Option<(CellAddr, String)> {
 
 fn special_value_choices(addr: &CellAddr) -> &'static [&'static str] {
     match addr {
-        CellAddr::Header { .. } | CellAddr::Footer { .. } | CellAddr::Left { .. } => &[
-            "TOTAL", "SUM", "MEAN", "AVERAGE", "AVG", "MEDIAN", "MIN", "MINIMUM", "MAX", "MAXIMUM",
-            "COUNT",
-        ],
-        CellAddr::Right { .. } => &[
-            "TOTAL", "SUM", "MEAN", "AVERAGE", "AVG", "MEDIAN", "MIN", "MINIMUM", "MAX", "MAXIMUM",
-            "COUNT",
-        ],
+        CellAddr::Header { .. } | CellAddr::Footer { .. } | CellAddr::Left { .. } => {
+            &SPECIAL_VALUE_CHOICES
+        }
+        CellAddr::Right { .. } => &SPECIAL_VALUE_CHOICES,
         CellAddr::Main { .. } => &[],
+    }
+}
+
+fn special_value_for_digit(digit: char) -> Option<&'static str> {
+    special_choice_index_for_digit(digit).map(|i| SPECIAL_VALUE_CHOICES[i])
+}
+
+fn special_choice_label(idx: usize) -> Option<char> {
+    match idx {
+        0..=8 => char::from_digit((idx + 1) as u32, 10),
+        9 => Some('0'),
+        _ => None,
+    }
+}
+
+fn special_choice_index_for_digit(digit: char) -> Option<usize> {
+    match digit {
+        '1'..='9' => Some((digit as u8 - b'1') as usize),
+        '0' => Some(9),
+        _ => None,
     }
 }
 
@@ -1168,6 +1245,9 @@ pub struct App {
     about_scroll: usize,
     pub op_history: Vec<Op>,
     selection_kind: SelectionKind,
+    edit_special_palette: bool,
+    edit_cursor: Option<usize>,
+    special_picker: Option<usize>,
 }
 
 impl App {
@@ -1191,6 +1271,9 @@ impl App {
             about_scroll: 0,
             op_history: Vec::new(),
             selection_kind: SelectionKind::Cells,
+            edit_special_palette: false,
+            edit_cursor: None,
+            special_picker: None,
         }
     }
 
@@ -1206,15 +1289,24 @@ impl App {
                     "tsv" => {
                         let data = std::fs::read_to_string(p).map_err(|e| IoError::Io(e))?;
                         crate::io::import_tsv(&data, &mut self.state);
+                        for c in 0..self.state.grid.main_cols() {
+                            self.state.grid.auto_fit_column(MARGIN_COLS + c);
+                        }
                         self.status = format!("Imported TSV {}", p.display());
                     }
                     "csv" => {
                         let data = std::fs::read_to_string(p).map_err(|e| IoError::Io(e))?;
                         crate::io::import_csv(&data, &mut self.state);
+                        for c in 0..self.state.grid.main_cols() {
+                            self.state.grid.auto_fit_column(MARGIN_COLS + c);
+                        }
                         self.status = format!("Imported CSV {}", p.display());
                     }
                     _ => {
                         let (off, n) = load_full(p, &mut self.state)?;
+                        for c in 0..self.state.grid.main_cols() {
+                            self.state.grid.auto_fit_column(MARGIN_COLS + c);
+                        }
                         self.offset = off;
                         self.ops_applied = n;
                         self.watcher = Some(LogWatcher::new(p.clone())?);
@@ -1322,7 +1414,7 @@ impl App {
                 };
                 if self.state.grid.get(&addr).is_some_and(|v| !v.is_empty()) {
                     let op = Op::SetCell {
-                        addr,
+                        addr: addr.clone(),
                         value: String::new(),
                     };
                     self.push_inverse_op(&op);
@@ -1330,6 +1422,9 @@ impl App {
                         let _ = commit_op(p, &mut self.offset, &mut self.state, &op);
                     } else {
                         op.apply(&mut self.state);
+                    }
+                    if let CellAddr::Main { col, .. } = addr {
+                        self.state.grid.auto_fit_column(MARGIN_COLS + col as usize);
                     }
                     did_any = true;
                 }
@@ -1513,12 +1608,16 @@ impl App {
     }
 
     fn commit_edit_buffer(&mut self, buffer: &str) -> Result<(), RunError> {
+        self.edit_special_palette = false;
         let (addr, value) = if let Some((a, v)) = parse_cell_shorthand(buffer) {
             (a, v)
         } else {
             (self.cursor.to_addr(&self.state.grid), buffer.to_string())
         };
-        let op = Op::SetCell { addr, value };
+        let op = Op::SetCell {
+            addr: addr.clone(),
+            value,
+        };
         self.push_inverse_op(&op);
         if let Some(ref p) = self.path.clone() {
             commit_op(p, &mut self.offset, &mut self.state, &op)?;
@@ -1529,6 +1628,22 @@ impl App {
             self.status = "No file — edit in memory only".into();
         }
         Ok(())
+    }
+
+    fn autofit_column_from_current_cell(&mut self, addr: CellAddr) {
+        match addr {
+            CellAddr::Main { col, .. } => {
+                self.state.grid.auto_fit_column(MARGIN_COLS + col as usize)
+            }
+            CellAddr::Left { col, .. } => self.state.grid.auto_fit_column(col as usize),
+            CellAddr::Right { col, .. } => self
+                .state
+                .grid
+                .auto_fit_column(MARGIN_COLS + self.state.grid.main_cols() + col as usize),
+            CellAddr::Header { col, .. } | CellAddr::Footer { col, .. } => {
+                self.state.grid.auto_fit_column(col as usize)
+            }
+        }
     }
 
     fn move_selected_rows_by_one(&mut self, down: bool) -> Result<bool, RunError> {
@@ -1740,7 +1855,7 @@ impl App {
         {
             current.to_string()
         } else {
-            "TOTAL".into()
+            "∞".into()
         }
     }
 
@@ -1962,34 +2077,21 @@ impl App {
     }
 
     fn draw(&mut self, f: &mut Frame) {
-        let edit_suggestions = if let Mode::Edit { .. } = &self.mode {
-            let choices = special_value_choices(&self.cursor.to_addr(&self.state.grid));
-            (!choices.is_empty()).then_some(choices)
-        } else {
-            None
-        };
-        let suggestion_height = edit_suggestions.map(|choices| choices.len().min(6) as u16 + 2);
-        let reserve = 1 + 1 + 3 + 1;
-        let max_suggestion_height = f.area().height.saturating_sub(reserve);
-        let suggestion_height = suggestion_height.map(|h| h.min(max_suggestion_height));
-        let suggestion_height = suggestion_height.unwrap_or(0);
-        let mut constraints = vec![Constraint::Length(1), Constraint::Length(1)];
-        if suggestion_height > 0 {
-            constraints.push(Constraint::Length(suggestion_height));
-        }
-        constraints.push(Constraint::Min(3));
-        constraints.push(Constraint::Length(1));
+        let special_picker = self.special_picker;
+        let constraints = vec![
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(3),
+            Constraint::Length(1),
+        ];
         let layout = Layout::default()
             .direction(Direction::Vertical)
             .constraints(constraints)
             .split(f.area());
         let menubar_area = layout[0];
         let formula_area = layout[1];
-        let (suggestions_area, grid_area, hints_area) = if suggestion_height > 0 {
-            (Some(layout[2]), layout[3], layout[4])
-        } else {
-            (None, layout[2], layout[3])
-        };
+        let grid_area = layout[2];
+        let hints_area = layout[3];
 
         let sentinel = Block::default().borders(Borders::ALL);
         let inner = sentinel.inner(grid_area);
@@ -2047,13 +2149,20 @@ impl App {
         let addr = self.cursor.to_addr(grid);
         let addr_str = addr_label(&addr, grid.main_cols());
         let (formula_text, formula_style) = match &self.mode {
-            Mode::Edit { buffer, .. } => (
-                format!(" {addr_str}  {buffer}_"),
-                Style::default()
-                    .fg(Color::White)
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-            ),
+            Mode::Edit { buffer, .. } => {
+                let cursor = self.edit_cursor.unwrap_or_else(|| buffer.chars().count());
+                let mut chars: Vec<char> = buffer.chars().collect();
+                let pos = cursor.min(chars.len());
+                chars.insert(pos, '|');
+                let shown: String = chars.into_iter().collect();
+                (
+                    format!(" {addr_str}  {shown}"),
+                    Style::default()
+                        .fg(Color::White)
+                        .bg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
+                )
+            }
             Mode::OpenPath { buffer } => (
                 format!(" open: {buffer}_"),
                 Style::default().fg(Color::White).bg(Color::DarkGray),
@@ -2131,25 +2240,6 @@ impl App {
             formula_area,
         );
 
-        if let Some(choices) = edit_suggestions {
-            let items: Vec<ListItem> = choices
-                .iter()
-                .map(|choice| ListItem::new(*choice))
-                .collect();
-            let mut state = ListState::default();
-            let suggestions = List::new(items)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_type(BorderType::Plain)
-                        .title(" Suggestions "),
-                )
-                .highlight_symbol(" ");
-            if let Some(area) = suggestions_area {
-                f.render_stateful_widget(suggestions, area, &mut state);
-            }
-        }
-
         if matches!(&self.mode, Mode::Help | Mode::About) {
             let body = match &self.mode {
                 Mode::Help => self.help_page_body(),
@@ -2208,7 +2298,7 @@ impl App {
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD)
                 };
-                let w = grid.col_width(c).min(CELL_W).max(1);
+                let w = grid.col_width(c).max(1);
                 spans.push(Span::styled(format!("{:>w$}", name, w = w), style));
             }
             lines.push(Line::from(spans));
@@ -2295,7 +2385,7 @@ impl App {
                 } else {
                     cell_effective_display(grid, &cell_addr)
                 };
-                let cw = grid.col_width(c).min(CELL_W).max(1);
+                let cw = grid.col_width(c).max(1);
                 let disp = if text.chars().count() > cw {
                     format!("{}…", text.chars().take(cw).collect::<String>())
                 } else {
@@ -2423,6 +2513,30 @@ impl App {
                 parent_area = Some((popup_area, level.item));
             }
         }
+
+        if let Some(selected) = special_picker {
+            let items: Vec<ListItem> = SPECIAL_VALUE_CHOICES
+                .iter()
+                .enumerate()
+                .map(|(idx, choice)| {
+                    let label = special_choice_label(idx).unwrap_or('?');
+                    ListItem::new(format!("{label}: {choice}"))
+                })
+                .collect();
+            let mut state = ListState::default();
+            state.select(Some(selected));
+            let picker = List::new(items)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Plain)
+                        .title(" Suggestions "),
+                )
+                .highlight_symbol("▸ ");
+            let area = centered_rect(50, 60, f.area());
+            f.render_widget(Clear, area);
+            f.render_stateful_widget(picker, area, &mut state);
+        }
     }
 
     fn hints_line(&self) -> String {
@@ -2471,11 +2585,16 @@ impl App {
         };
         let file = if matches!(
             section,
-            MenuSection::File | MenuSection::Export | MenuSection::Width | MenuSection::Insert
+            MenuSection::File | MenuSection::Export | MenuSection::Width
         ) {
             "[File]"
         } else {
             " File "
+        };
+        let insert = if section == MenuSection::Insert {
+            "[Insert]"
+        } else {
+            " Insert "
         };
         let help = if section == MenuSection::Help {
             "[Help]"
@@ -2492,12 +2611,44 @@ impl App {
         } else {
             String::new()
         };
-        format!(" {file}  {help}{active}")
+        format!(" {file}  {insert}  {help}{active}")
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Result<bool, RunError> {
         if key.kind == KeyEventKind::Release {
             return Ok(false);
+        }
+
+        if let Some(selected) = self.special_picker {
+            match key.code {
+                KeyCode::Esc => {
+                    self.special_picker = None;
+                    return Ok(false);
+                }
+                KeyCode::Enter => {
+                    self.commit_special_choice(selected);
+                    self.special_picker = None;
+                    return Ok(false);
+                }
+                KeyCode::Left | KeyCode::Up => {
+                    self.special_picker = Some(selected.saturating_sub(1));
+                    return Ok(false);
+                }
+                KeyCode::Right | KeyCode::Down => {
+                    self.special_picker = Some((selected + 1).min(SPECIAL_VALUE_CHOICES.len() - 1));
+                    return Ok(false);
+                }
+                KeyCode::Char(c) if c.is_ascii_digit() => {
+                    if let Some(idx) = c.to_digit(10).map(|i| i as usize) {
+                        if idx < SPECIAL_VALUE_CHOICES.len() {
+                            self.commit_special_choice(idx);
+                            self.special_picker = None;
+                            return Ok(false);
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
 
         let mut mode = std::mem::replace(&mut self.mode, Mode::Normal);
@@ -2556,7 +2707,7 @@ impl App {
                 KeyCode::Left | KeyCode::Char('h') => {
                     stack.truncate(1);
                     if let Some(level) = stack.last_mut() {
-                        level.section = menu_toggle_root_section(level.section);
+                        level.section = menu_prev_root_section(level.section);
                         level.item = 0;
                     }
                 }
@@ -2580,7 +2731,7 @@ impl App {
                     } else {
                         stack.truncate(1);
                         if let Some(level) = stack.last_mut() {
-                            level.section = menu_toggle_root_section(level.section);
+                            level.section = menu_next_root_section(level.section);
                             level.item = 0;
                         }
                     }
@@ -2634,7 +2785,7 @@ impl App {
         }
 
         if key.modifiers.contains(KeyModifiers::ALT)
-            && matches!(mode, Mode::Normal)
+            && matches!(mode, Mode::Normal | Mode::Edit { .. })
             && matches!(key.code, KeyCode::Char(_))
         {
             if let KeyCode::Char(ch) = key.code {
@@ -2705,6 +2856,41 @@ impl App {
                             section: MenuSection::File,
                             item: 4,
                         }]);
+                        return Ok(false);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(mode, Mode::Normal)
+            && matches!(key.code, KeyCode::Char(_))
+        {
+            if let KeyCode::Char(ch) = key.code {
+                match ch {
+                    ';' if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                        let buffer = chrono::Local::now().format("%H:%M:%S").to_string();
+                        self.mode = Mode::Edit {
+                            buffer,
+                            formula_cursor: None,
+                        };
+                        return Ok(false);
+                    }
+                    ':' => {
+                        let buffer = chrono::Local::now().format("%H:%M:%S").to_string();
+                        self.mode = Mode::Edit {
+                            buffer,
+                            formula_cursor: None,
+                        };
+                        return Ok(false);
+                    }
+                    ';' => {
+                        let buffer = chrono::Local::now().format("%Y-%m-%d").to_string();
+                        self.mode = Mode::Edit {
+                            buffer,
+                            formula_cursor: None,
+                        };
                         return Ok(false);
                     }
                     _ => {}
@@ -3077,18 +3263,26 @@ impl App {
             } => match key.code {
                 KeyCode::Enter => {
                     self.commit_edit_buffer(buffer)?;
+                    self.edit_cursor = None;
                     mode = Mode::Normal;
                 }
                 KeyCode::Tab => {
                     let addr = self.cursor.to_addr(&self.state.grid);
                     if let Some(next) = cycle_special_value(buffer, special_value_choices(&addr)) {
+                        self.edit_cursor = Some(next.chars().count());
                         *buffer = next;
                     }
                 }
+                KeyCode::Char(c) if self.edit_special_palette && c.is_ascii_digit() => {
+                    if let Some(choice) = special_value_for_digit(c) {
+                        self.edit_cursor = Some(choice.chars().count());
+                        *buffer = choice.to_string();
+                    }
+                }
                 KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down
-                    if buffer.trim() == "=" =>
+                    if formula_cursor.is_some() =>
                 {
-                    let temp = formula_cursor.get_or_insert(self.cursor);
+                    let temp = formula_cursor.as_mut().unwrap();
                     match key.code {
                         KeyCode::Left if temp.col > 0 => temp.col = temp.col.saturating_sub(1),
                         KeyCode::Right => temp.col = temp.col.saturating_add(1),
@@ -3100,7 +3294,32 @@ impl App {
                     let addr = temp.to_addr(&self.state.grid);
                     *buffer = format!("={}", self.formula_ref_for_addr(&addr));
                 }
+                KeyCode::Left | KeyCode::Right => {
+                    let len = buffer.chars().count();
+                    let cursor = self.edit_cursor.get_or_insert(len);
+                    let at_edge = match key.code {
+                        KeyCode::Left => *cursor == 0,
+                        KeyCode::Right => *cursor >= len,
+                        _ => false,
+                    };
+                    if at_edge {
+                        if key.code == KeyCode::Left {
+                            self.cursor.col = self.cursor.col.saturating_sub(1);
+                        } else {
+                            self.cursor.col = self.cursor.col.saturating_add(1);
+                        }
+                        self.cursor.clamp(&self.state.grid);
+                        self.state
+                            .grid
+                            .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
+                    } else if key.code == KeyCode::Left {
+                        *cursor -= 1;
+                    } else {
+                        *cursor += 1;
+                    }
+                }
                 KeyCode::Up => {
+                    self.edit_cursor = None;
                     let raw = buffer.clone();
                     self.commit_edit_buffer(&raw)?;
                     if self.cursor.row > 0 {
@@ -3112,16 +3331,18 @@ impl App {
                         .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
                     let addr = self.cursor.to_addr(&self.state.grid);
                     let cur = cell_display(&self.state.grid, &addr);
-                    mode = Mode::Edit {
-                        buffer: cur.clone(),
-                        formula_cursor: if cur.trim() == "=" {
+                    mode = self.start_edit_mode(
+                        cur.clone(),
+                        if cur.trim() == "=" {
                             Some(self.cursor)
                         } else {
                             None
                         },
-                    };
+                        false,
+                    );
                 }
                 KeyCode::Down => {
+                    self.edit_cursor = None;
                     let raw = buffer.clone();
                     self.commit_edit_buffer(&raw)?;
                     let hr = HEADER_ROWS;
@@ -3138,19 +3359,49 @@ impl App {
                         .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
                     let addr = self.cursor.to_addr(&self.state.grid);
                     let cur = cell_display(&self.state.grid, &addr);
-                    mode = Mode::Edit {
-                        buffer: cur.clone(),
-                        formula_cursor: if cur.trim() == "=" {
+                    mode = self.start_edit_mode(
+                        cur.clone(),
+                        if cur.trim() == "=" {
                             Some(self.cursor)
                         } else {
                             None
                         },
-                    };
+                        false,
+                    );
                 }
-                KeyCode::Esc => mode = Mode::Normal,
-                KeyCode::Char(c) => buffer.push(c),
+                KeyCode::Esc => {
+                    self.edit_cursor = None;
+                    self.edit_special_palette = false;
+                    *formula_cursor = None;
+                    mode = Mode::Normal;
+                }
+                KeyCode::Char(c) => {
+                    *formula_cursor = None;
+                    self.edit_special_palette = false;
+                    let len = buffer.chars().count();
+                    let cursor = self.edit_cursor.get_or_insert(len);
+                    let pos = (*cursor).min(len);
+                    let mut chars: Vec<char> = buffer.chars().collect();
+                    chars.insert(pos, c);
+                    *buffer = chars.into_iter().collect();
+                    *cursor = pos + 1;
+                }
                 KeyCode::Backspace => {
-                    buffer.pop();
+                    *formula_cursor = None;
+                    let len = buffer.chars().count();
+                    if let Some(cursor) = self.edit_cursor.as_mut() {
+                        if *cursor > 0 {
+                            let pos = (*cursor).min(len);
+                            let mut chars: Vec<char> = buffer.chars().collect();
+                            if pos > 0 {
+                                chars.remove(pos - 1);
+                                *buffer = chars.into_iter().collect();
+                                *cursor = pos - 1;
+                            }
+                        }
+                    } else {
+                        buffer.pop();
+                    }
                 }
                 _ => {}
             },
@@ -3227,6 +3478,7 @@ impl App {
                             .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
                     }
                     KeyCode::Char('o') => {
+                        self.edit_special_palette = false;
                         mode = Mode::OpenPath {
                             buffer: self
                                 .path
@@ -3236,16 +3488,18 @@ impl App {
                         };
                     }
                     KeyCode::Char('e') | KeyCode::Enter => {
+                        self.edit_special_palette = false;
                         let addr = self.cursor.to_addr(&self.state.grid);
                         let cur = cell_display(&self.state.grid, &addr);
-                        mode = Mode::Edit {
-                            buffer: cur.clone(),
-                            formula_cursor: if cur.trim() == "=" {
+                        mode = self.start_edit_mode(
+                            cur.clone(),
+                            if cur.trim() == "=" {
                                 Some(self.cursor)
                             } else {
                                 None
                             },
-                        };
+                            false,
+                        );
                     }
                     KeyCode::Char('v') => {
                         self.anchor = if self.anchor.is_none() {
@@ -3419,15 +3673,17 @@ impl App {
                         }
                     }
                     KeyCode::Char(c) if !c.is_control() => {
+                        self.edit_special_palette = false;
                         let buffer = c.to_string();
-                        mode = Mode::Edit {
-                            formula_cursor: if buffer.trim() == "=" {
+                        mode = self.start_edit_mode(
+                            buffer.clone(),
+                            if buffer.trim() == "=" {
                                 Some(self.cursor)
                             } else {
                                 None
                             },
-                            buffer,
-                        };
+                            false,
+                        );
                     }
                     _ => {}
                 }
@@ -3474,7 +3730,7 @@ mod tests {
         app.mode = Mode::Menu {
             stack: vec![MenuLevel {
                 section: MenuSection::File,
-                item: 4,
+                item: 2,
             }],
         };
 
@@ -3484,7 +3740,7 @@ mod tests {
         match app.mode {
             Mode::Menu { stack } => {
                 assert_eq!(stack.len(), 2);
-                assert_eq!(stack[1].section, MenuSection::Width);
+                assert_eq!(stack[1].section, MenuSection::Export);
                 assert_eq!(stack[1].item, 0);
             }
             other => panic!("unexpected mode: {other:?}"),
@@ -3495,12 +3751,12 @@ mod tests {
     fn menu_preview_includes_child_submenu() {
         let levels = App::menu_render_levels(&[MenuLevel {
             section: MenuSection::File,
-            item: 4,
+            item: 2,
         }]);
 
         assert_eq!(levels.len(), 2);
         assert_eq!(levels[0].section, MenuSection::File);
-        assert_eq!(levels[1].section, MenuSection::Width);
+        assert_eq!(levels[1].section, MenuSection::Export);
     }
 
     #[test]
@@ -3732,7 +3988,7 @@ mod tests {
         let mut app = App::new(None);
         app.state
             .grid
-            .set(&CellAddr::Header { row: 0, col: 0 }, "MAX".into());
+            .set(&CellAddr::Header { row: 0, col: 0 }, "∞".into());
         app.cursor = SheetCursor { row: 0, col: 0 };
         app.mode = Mode::Menu {
             stack: vec![MenuLevel {
@@ -3744,10 +4000,41 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
             .unwrap();
 
-        match app.mode {
-            Mode::Edit { buffer, .. } => assert_eq!(buffer, "MAX"),
-            other => panic!("unexpected mode: {other:?}"),
-        }
+        assert_eq!(app.special_picker, Some(0));
+    }
+
+    #[test]
+    fn insert_menu_unicode_characters_are_available() {
+        let mut app = App::new(None);
+        app.cursor = SheetCursor { row: 0, col: 0 };
+        app.mode = Mode::Menu {
+            stack: vec![MenuLevel {
+                section: MenuSection::Insert,
+                item: 2,
+            }],
+        };
+
+        let items = menu_items(MenuSection::Insert);
+        assert!(items.iter().any(|i| i.label == "Special Char"));
+        assert!(items.iter().any(|i| i.label == "Date"));
+        assert!(items.iter().any(|i| i.label == "Time"));
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .unwrap();
+
+        assert!(app.special_picker.is_some());
+    }
+
+    #[test]
+    fn insert_menu_special_seed_uses_unicode_symbols() {
+        let mut app = App::new(None);
+        app.cursor = SheetCursor { row: 0, col: 0 };
+        let seed = app.menu_insert_special_seed();
+        assert_eq!(seed, "∞");
+        let choices = special_value_choices(&app.cursor.to_addr(&app.state.grid));
+        assert!(choices.contains(&"∞"));
+        assert!(choices.contains(&"Σ"));
+        assert!(choices.contains(&"Ω"));
     }
 
     #[test]
@@ -3764,7 +4051,7 @@ mod tests {
         app.mode = Mode::Menu {
             stack: vec![MenuLevel {
                 section: MenuSection::Insert,
-                item: 3,
+                item: 5,
             }],
         };
 
@@ -3808,9 +4095,7 @@ mod tests {
                 .collect::<String>()
         };
 
-        assert!(row(2).contains("Suggestions"));
-        assert!((3..10).any(|y| row(y).contains("TOTAL")));
-        assert!((3..10).any(|y| row(y).contains("SUM")));
+        assert!(!row(2).contains("Suggestions"));
     }
 
     #[test]
@@ -4008,6 +4293,32 @@ mod tests {
     }
 
     #[test]
+    fn widened_column_shows_full_cell_text() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 1);
+        app.state.grid.set_col_width(MARGIN_COLS, Some(24));
+        app.state.grid.set(
+            &CellAddr::Main { row: 0, col: 0 },
+            "abcdefghijklmnopqrstuvwx".into(),
+        );
+
+        let backend = TestBackend::new(80, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = |y: u16| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+
+        assert!((0..buffer.area.height).any(|y| row(y).contains("abcdefghijklmnopqrstuvwx")));
+    }
+
+    #[test]
     fn right_margin_moves_view_one_step_at_a_time() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
@@ -4133,7 +4444,7 @@ mod tests {
             .unwrap();
 
         match &app.mode {
-            Mode::Edit { buffer, .. } => assert_eq!(buffer, "TOTAL"),
+            Mode::Edit { buffer, .. } => assert_eq!(buffer, "∞"),
             other => panic!("unexpected mode: {other:?}"),
         }
 
@@ -4141,7 +4452,7 @@ mod tests {
             .unwrap();
 
         match &app.mode {
-            Mode::Edit { buffer, .. } => assert_eq!(buffer, "SUM"),
+            Mode::Edit { buffer, .. } => assert_eq!(buffer, "Σ"),
             other => panic!("unexpected mode: {other:?}"),
         }
     }
@@ -4162,7 +4473,7 @@ mod tests {
         match &app.mode {
             Mode::Menu { stack } => {
                 assert_eq!(stack.len(), 1);
-                assert_eq!(stack[0].section, MenuSection::File);
+                assert_eq!(stack[0].section, MenuSection::Insert);
             }
             other => panic!("unexpected mode: {other:?}"),
         }
@@ -4173,10 +4484,155 @@ mod tests {
         match &app.mode {
             Mode::Menu { stack } => {
                 assert_eq!(stack.len(), 1);
-                assert_eq!(stack[0].section, MenuSection::Help);
+                assert_eq!(stack[0].section, MenuSection::File);
             }
             other => panic!("unexpected mode: {other:?}"),
         }
+    }
+
+    #[test]
+    fn left_cycles_through_root_menus() {
+        let mut app = App::new(None);
+        app.mode = Mode::Menu {
+            stack: vec![MenuLevel {
+                section: MenuSection::Help,
+                item: 0,
+            }],
+        };
+
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::empty()))
+            .unwrap();
+
+        match &app.mode {
+            Mode::Menu { stack } => {
+                assert_eq!(stack.len(), 1);
+                assert_eq!(stack[0].section, MenuSection::Insert);
+            }
+            other => panic!("unexpected mode: {other:?}"),
+        }
+
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::empty()))
+            .unwrap();
+
+        match &app.mode {
+            Mode::Menu { stack } => {
+                assert_eq!(stack.len(), 1);
+                assert_eq!(stack[0].section, MenuSection::File);
+            }
+            other => panic!("unexpected mode: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn insert_menu_digit_shortcut_uses_palette_symbol() {
+        let mut app = App::new(None);
+        app.mode = Mode::Menu {
+            stack: vec![MenuLevel {
+                section: MenuSection::Insert,
+                item: 2,
+            }],
+        };
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .unwrap();
+        assert_eq!(app.special_picker, Some(0));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::empty()))
+            .unwrap();
+
+        assert!(matches!(app.mode, Mode::Edit { .. }));
+    }
+
+    #[test]
+    fn special_picker_labels_use_digit_hotkeys() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(None);
+        app.special_picker = Some(0);
+
+        let backend = TestBackend::new(60, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = |y: u16| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+
+        assert!((0..buffer.area.height).any(|y| row(y).contains("Suggestions")));
+        assert!((0..buffer.area.height).any(|y| row(y).contains("1: ∞")));
+        assert!((0..buffer.area.height).any(|y| row(y).contains("2: Σ")));
+    }
+
+    #[test]
+    fn arrow_right_at_text_end_moves_to_next_cell() {
+        let mut app = App::new(None);
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        };
+        app.mode = Mode::Edit {
+            buffer: "ab".into(),
+            formula_cursor: None,
+        };
+
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::empty()))
+            .unwrap();
+
+        assert_eq!(app.cursor.col, MARGIN_COLS + 1);
+    }
+
+    #[test]
+    fn formula_arrows_stay_in_select_cell_mode_until_non_arrow() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(None);
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        };
+        app.mode = Mode::Edit {
+            buffer: "=".into(),
+            formula_cursor: Some(app.cursor),
+        };
+
+        let backend = TestBackend::new(40, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        assert!((0..buffer.area.height).any(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+                .contains('|')
+        }));
+
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::empty()))
+            .unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(40, 6)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        assert!((0..buffer.area.height).any(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+                .contains('|')
+        }));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::empty()))
+            .unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(40, 6)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        assert!((0..buffer.area.height).any(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+                .contains('|')
+        }));
     }
 
     #[test]
@@ -4185,7 +4641,7 @@ mod tests {
         app.mode = Mode::Menu {
             stack: vec![MenuLevel {
                 section: MenuSection::File,
-                item: 3,
+                item: 2,
             }],
         };
 
@@ -4196,7 +4652,7 @@ mod tests {
             Mode::Menu { stack } => {
                 assert_eq!(stack.len(), 2);
                 assert_eq!(stack[0].section, MenuSection::File);
-                assert_eq!(stack[1].section, MenuSection::Insert);
+                assert_eq!(stack[1].section, MenuSection::Export);
                 assert_eq!(stack[1].item, 0);
             }
             other => panic!("unexpected mode: {other:?}"),
@@ -4205,7 +4661,7 @@ mod tests {
         app.mode = Mode::Menu {
             stack: vec![MenuLevel {
                 section: MenuSection::File,
-                item: 4,
+                item: 3,
             }],
         };
 
@@ -4278,4 +4734,23 @@ fn formula_col_fragment(global_col: usize, main_cols: usize) -> String {
     } else {
         format!(">{}", global_col - m - main_cols)
     }
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup_layout[1])[1]
 }
