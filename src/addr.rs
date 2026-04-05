@@ -1,6 +1,6 @@
 //! Shared cell-address parsing (Excel columns, global column suffixes, single-cell refs).
 
-use crate::grid::{CellAddr, MARGIN_COLS};
+use crate::grid::CellAddr;
 
 /// Parse Excel-style column name `A`..`ZZZ` → 0-based main column index.
 pub fn parse_excel_column(name: &str) -> Option<u32> {
@@ -26,25 +26,25 @@ pub fn excel_column_name(main_col_index: usize) -> String {
     s.chars().rev().collect()
 }
 
-/// Resolve `COL` after `^X,` or `_X,`: `<n`, `>n`, or main column letters.
-pub fn resolve_global_col(col_part: &str) -> Option<u32> {
-    let bytes = col_part.as_bytes();
-    if bytes.is_empty() {
+/// 10-column margin label (`A` nearest the main grid, `J` farthest).
+pub fn mirror_margin_column_name(margin_col_index: usize, left_side: bool) -> String {
+    let idx = margin_col_index.min(9);
+    let _ = left_side;
+    ((b'A' + idx as u8) as char).to_string()
+}
+
+fn parse_mirror_margin_column_name(name: &str, left_side: bool) -> Option<u8> {
+    let mut chars = name.chars();
+    let ch = chars.next()?;
+    if chars.next().is_some() || !ch.is_ascii_uppercase() {
         return None;
     }
-    if bytes[0] == b'<' {
-        let n: u32 = col_part[1..].parse().ok()?;
-        return Some((MARGIN_COLS as u32).checked_sub(1)?.checked_sub(n)?);
+    let idx = (ch as u8 - b'A') as usize;
+    if idx > 9 {
+        return None;
     }
-    if bytes[0] == b'>' {
-        let n: u32 = col_part[1..].parse().ok()?;
-        return Some(n);
-    }
-    if bytes[0].is_ascii_uppercase() {
-        let col = parse_excel_column(col_part)?;
-        return Some(MARGIN_COLS as u32 + col);
-    }
-    None
+    let _ = left_side;
+    Some(idx as u8)
 }
 
 /// Parse one cell reference at the start of `s` (no leading whitespace).
@@ -86,48 +86,62 @@ pub fn parse_cell_ref_at(s: &str) -> Option<(CellAddr, usize)> {
         ));
     }
 
-    // Header: ^X or ^X,COL (legacy logs also use `:` and raw global column numbers)
-    if bytes[0] == b'^' && bytes.len() >= 2 {
-        let letter = bytes[1];
-        if !letter.is_ascii_uppercase() {
-            return None;
-        }
-        let row = b'Z' - letter;
-        if s.len() == 2 {
-            return Some((CellAddr::Header { row, col: 0 }, 2));
-        }
-        if !matches!(bytes.get(2), Some(b',') | Some(b':')) {
-            return None;
-        }
-        let col_part = &s[3..];
-        let cf = parse_global_col_fragment(col_part)?;
-        return Some((CellAddr::Header { row, col: cf.col }, 3 + cf.consumed));
-    }
-
-    // Footer: _X or _X,COL (legacy logs also use `:` and raw global column numbers)
-    if bytes[0] == b'_' && bytes.len() >= 2 {
-        let letter = bytes[1];
-        if !letter.is_ascii_uppercase() {
-            return None;
-        }
-        let row = letter - b'A';
-        if s.len() == 2 {
-            return Some((CellAddr::Footer { row, col: 0 }, 2));
-        }
-        if !matches!(bytes.get(2), Some(b',') | Some(b':')) {
-            return None;
-        }
-        let col_part = &s[3..];
-        let cf = parse_global_col_fragment(col_part)?;
-        return Some((CellAddr::Footer { row, col: cf.col }, 3 + cf.consumed));
-    }
-
-    // Left: <N,R (legacy logs also use `:`)
-    if bytes[0] == b'<' {
+    // Header/footer: ^<row>[COL] / _<row>[COL], where COL is absolute sheet column letters.
+    if bytes[0] == b'^' || bytes[0] == b'_' {
+        let is_header = bytes[0] == b'^';
         let rest = &s[1..];
-        let sep = rest.find(|c| c == ',' || c == ':')?;
-        let margin_col: u8 = rest[..sep].parse().ok()?;
-        let after = &rest[sep + 1..];
+        let row_digits = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+        if row_digits > 0 {
+            let row_num: usize = rest[..row_digits].parse().ok()?;
+            let row = if is_header {
+                if row_num == 0 || row_num > crate::grid::HEADER_ROWS {
+                    return None;
+                }
+                (crate::grid::HEADER_ROWS - row_num) as u8
+            } else {
+                if row_num == 0 || row_num > crate::grid::FOOTER_ROWS {
+                    return None;
+                }
+                (row_num - 1) as u8
+            };
+
+            let after = &rest[row_digits..];
+            if after.is_empty() {
+                return Some((
+                    if is_header {
+                        CellAddr::Header { row, col: 0 }
+                    } else {
+                        CellAddr::Footer { row, col: 0 }
+                    },
+                    1 + row_digits,
+                ));
+            }
+            let col_digits = after.chars().take_while(|c| c.is_ascii_uppercase()).count();
+            if col_digits == 0 {
+                return None;
+            }
+            let col = parse_excel_column(&after[..col_digits])?;
+            return Some((
+                if is_header {
+                    CellAddr::Header { row, col }
+                } else {
+                    CellAddr::Footer { row, col }
+                },
+                1 + row_digits + col_digits,
+            ));
+        }
+    }
+
+    // Mirrored margins: [A1..[J1 / ]A1..]J1.
+    if bytes[0] == b'[' || bytes[0] == b']' {
+        let left_side = bytes[0] == b'[';
+        let rest = &s[1..];
+        let col_len = rest.chars().take_while(|c| c.is_ascii_uppercase()).count();
+        if col_len != 1 {
+            return None;
+        }
+        let col = parse_mirror_margin_column_name(&rest[..col_len], left_side)?;
+        let after = &rest[col_len..];
         let row_digits = after.chars().take_while(|c| c.is_ascii_digit()).count();
         if row_digits == 0 {
             return None;
@@ -136,98 +150,23 @@ pub fn parse_cell_ref_at(s: &str) -> Option<(CellAddr, usize)> {
         if main_row == 0 {
             return None;
         }
-        let consumed = 1 + sep + 1 + row_digits;
+        let consumed = 1 + col_len + row_digits;
         return Some((
-            CellAddr::Left {
-                col: margin_col,
-                row: main_row - 1,
+            if left_side {
+                CellAddr::Left {
+                    col,
+                    row: main_row - 1,
+                }
+            } else {
+                CellAddr::Right {
+                    col,
+                    row: main_row - 1,
+                }
             },
             consumed,
         ));
     }
 
-    // Right: >N,R (legacy logs also use `:`)
-    if bytes[0] == b'>' {
-        let rest = &s[1..];
-        let sep = rest.find(|c| c == ',' || c == ':')?;
-        let margin_col: u8 = rest[..sep].parse().ok()?;
-        let after = &rest[sep + 1..];
-        let row_digits = after.chars().take_while(|c| c.is_ascii_digit()).count();
-        if row_digits == 0 {
-            return None;
-        }
-        let main_row: u32 = after[..row_digits].parse().ok()?;
-        if main_row == 0 {
-            return None;
-        }
-        let consumed = 1 + sep + 1 + row_digits;
-        return Some((
-            CellAddr::Right {
-                col: margin_col,
-                row: main_row - 1,
-            },
-            consumed,
-        ));
-    }
-
-    None
-}
-
-struct ColFragment {
-    col: u32,
-    consumed: usize,
-}
-
-fn parse_global_col_fragment(s: &str) -> Option<ColFragment> {
-    let bytes = s.as_bytes();
-    if bytes.is_empty() {
-        return None;
-    }
-    if bytes[0] == b'<' {
-        let rest = &s[1..];
-        let n_digits = rest.bytes().take_while(|b| b.is_ascii_digit()).count();
-        if n_digits == 0 {
-            return None;
-        }
-        let n: u32 = rest[..n_digits].parse().ok()?;
-        let col = (MARGIN_COLS as u32).checked_sub(1)?.checked_sub(n)?;
-        return Some(ColFragment {
-            col,
-            consumed: 1 + n_digits,
-        });
-    }
-    if bytes[0] == b'>' {
-        let rest = &s[1..];
-        let n_digits = rest.bytes().take_while(|b| b.is_ascii_digit()).count();
-        if n_digits == 0 {
-            return None;
-        }
-        let v: u32 = rest[..n_digits].parse().ok()?;
-        return Some(ColFragment {
-            col: v,
-            consumed: 1 + n_digits,
-        });
-    }
-    if bytes[0].is_ascii_digit() {
-        let n_digits = s.bytes().take_while(|b| b.is_ascii_digit()).count();
-        if n_digits == 0 {
-            return None;
-        }
-        let col: u32 = s[..n_digits].parse().ok()?;
-        return Some(ColFragment {
-            col,
-            consumed: n_digits,
-        });
-    }
-    if bytes[0].is_ascii_uppercase() {
-        let n = s.bytes().take_while(|b| b.is_ascii_uppercase()).count();
-        let name = &s[..n];
-        let col = parse_excel_column(name)?;
-        return Some(ColFragment {
-            col: MARGIN_COLS as u32 + col,
-            consumed: n,
-        });
-    }
     None
 }
 
@@ -279,9 +218,9 @@ mod tests {
 
     #[test]
     fn legacy_special_refs_parse() {
-        assert_eq!(parse_cell_ref_at("^A:10").unwrap().1, 5);
-        assert_eq!(parse_cell_ref_at("_B:10").unwrap().1, 5);
-        assert_eq!(parse_cell_ref_at("<0:1").unwrap().1, 4);
-        assert_eq!(parse_cell_ref_at(">0:1").unwrap().1, 4);
+        assert_eq!(parse_cell_ref_at("^1A").unwrap().1, 3);
+        assert_eq!(parse_cell_ref_at("_1A").unwrap().1, 3);
+        assert_eq!(parse_cell_ref_at("[A1").unwrap().1, 3);
+        assert_eq!(parse_cell_ref_at("]A1").unwrap().1, 3);
     }
 }

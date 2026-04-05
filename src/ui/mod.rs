@@ -22,7 +22,7 @@ use std::io::{self, stdout};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
-/// Width of the row-label gutter (`^A`, ` 1 `, `_B`).
+/// Width of the row-label gutter (`^1`, ` 1 `, `_1`).
 const ROW_LABEL_CHARS: usize = 5;
 /// Fixed cell display width in terminal columns.
 const CELL_W: usize = 12;
@@ -691,7 +691,7 @@ impl App {
 Basics\n\
 - Arrow keys or hjkl move the cursor.\n\
 - Enter or e starts editing the current cell.\n\
-- Header/footer/margin cells show special words like TOTAL, MAX, MEAN, MEDIAN, and COUNT; press Tab to cycle them.\n\
+- Header/footer/margin cells use the active address syntax.\n\
 - Any printable key starts editing with that character.\n\
 - = followed by arrows builds a formula reference.\n\n\
 Selection and movement\n\
@@ -701,10 +701,10 @@ Selection and movement\n\
 - c exports CSV when nothing is selected, or moves selected columns when columns are selected.\n\
 - Alt+arrows move selected rows or columns by one cell.\n\n\
 Menus\n\
- - Alt+F opens File.\n\
- - Alt+I opens Insert.\n\
- - Alt+H opens Help.\n\
- - Ctrl+; inserts the date and Ctrl+Shift+; inserts the time.\n\
+- Alt+F opens File.\n\
+- Alt+I opens Insert.\n\
+- Alt+H opens Help.\n\
+- Ctrl+; inserts the date and Ctrl+Shift+; inserts the time.\n\
 - Right opens the highlighted submenu.\n\
 - Left goes back one menu level.\n\
 - Enter or the shortcut letter opens the selected item.\n\n\
@@ -718,24 +718,19 @@ Help menu\n\
 - About shows the version and a short description.\n\
 - Row ops and Col ops show quick move tips.\n\
 - Full help opens this page.\n\n\
-Special rows and columns\n\
-- Header rows use `^A` through `^Z` and can be paired with a column like `^A,B`.\n\
-- Footer rows use `_A` through `_Z` and can also be paired with a column like `_A,B`.\n\
-- Left-margin cells use `<col,row` with zero-based margin columns and one-based main rows.\n\
-- Right-margin cells use `>col,row` with the same coordinate style.\n\
-- In exports, these rows and columns stay visible as separate bands around the main grid.\n\
-- Insert menu helpers seed `TOTAL` for special cells and `https://` for hyperlinks.\n\n\
-Reference examples\n\
+Address syntax\n\
 - Main cell: A1\n\
-- Header cell: ^A,A\n\
-- Footer cell: _A,A\n\
-- Left margin: <0,1\n\
-- Right margin: >0,1\n\n\
+- Header cell: ^1A\n\
+- Footer cell: _1A\n\
+- Left margin: [A1\n\
+- Right margin: ]A1\n\
+- Header/footer columns still pair with main letters when needed.\n\
+- Logs and saved files use this syntax only.\n\n\
 Quit\n\
 - q opens the quit prompt.\n\
 - Ctrl+Q exits immediately.\n\
 - Esc closes menus, prompts, help, and about.\n\
-- ? opens this help page.\n"
+- ? opens this help page.\n",
         );
         body
     }
@@ -746,7 +741,7 @@ Quit\n\
             name = env!("CARGO_PKG_NAME"),
             version = env!("CARGO_PKG_VERSION"),
             about = env!("CARGO_PKG_DESCRIPTION"),
-            details = "Corro is a terminal spreadsheet with an append-only JSONL log, sparse sheet storage, menu-driven exports, and undo via inverse ops.",
+            details = "Corro is a terminal spreadsheet with an append-only text log, sparse sheet storage, menu-driven exports, and undo via inverse ops.",
         )
     }
 
@@ -1922,20 +1917,28 @@ impl App {
     fn formula_ref_for_addr(&self, addr: &CellAddr) -> String {
         match addr {
             CellAddr::Header { row, col } => format!(
-                "^{},{}",
-                (b'Z' - *row) as char,
+                "^{}{}",
+                HEADER_ROWS - *row as usize,
                 formula_col_fragment(*col as usize, self.state.grid.main_cols())
             ),
             CellAddr::Footer { row, col } => format!(
-                "_{},{}",
-                (b'A' + *row) as char,
+                "_{}{}",
+                *row as usize + 1,
                 formula_col_fragment(*col as usize, self.state.grid.main_cols())
             ),
             CellAddr::Main { row, col } => {
                 format!("{}{}", addr::excel_column_name(*col as usize), row + 1)
             }
-            CellAddr::Left { col, row } => format!("<{},{}", col, row + 1),
-            CellAddr::Right { col, row } => format!(">{},{}", col, row + 1),
+            CellAddr::Left { col, row } => format!(
+                "[{}{}",
+                addr::mirror_margin_column_name(*col as usize, true),
+                row + 1
+            ),
+            CellAddr::Right { col, row } => format!(
+                "]{}{}",
+                addr::mirror_margin_column_name(*col as usize, false),
+                row + 1
+            ),
         }
     }
 
@@ -4348,7 +4351,7 @@ mod tests {
         };
         let initial = (0..buffer.area.height)
             .map(row)
-            .find(|line| line.contains(">0") || line.contains(">1"))
+            .find(|line| line.contains("]A") || line.contains("]B"))
             .unwrap_or_default();
 
         app.cursor.col += 1;
@@ -4361,11 +4364,11 @@ mod tests {
         };
         let moved = (0..buffer.area.height)
             .map(row2)
-            .find(|line| line.contains(">0") || line.contains(">1"))
+            .find(|line| line.contains("]A") || line.contains("]B"))
             .unwrap_or_default();
 
-        assert!(initial.contains(">0"));
-        assert!(moved.contains(">1"));
+        assert!(initial.contains("]A"));
+        assert!(moved.contains("]B"));
         assert!((0..buffer.area.height).any(|y| row2(y).contains("TOTAL")));
     }
 
@@ -4684,55 +4687,71 @@ fn addr_label(addr: &CellAddr, main_cols: usize) -> String {
     match addr {
         CellAddr::Header { row, col } => format!(
             "^{}:{}",
-            (b'Z' - *row) as char,
+            HEADER_ROWS - *row as usize,
             col_header_label(*col as usize, main_cols)
         ),
         CellAddr::Footer { row, col } => format!(
             "_{}:{}",
-            (b'A' + *row) as char,
+            *row as usize + 1,
             col_header_label(*col as usize, main_cols)
         ),
         CellAddr::Main { row, col } => {
             format!("{}{}", addr::excel_column_name(*col as usize), row + 1)
         }
         CellAddr::Left { col, row } => {
-            format!("<{}:{}", MARGIN_COLS - 1 - (*col as usize), row + 1)
+            format!(
+                "[{}{}",
+                addr::mirror_margin_column_name(*col as usize, true),
+                row + 1
+            )
         }
-        CellAddr::Right { col, row } => format!(">{}:{}", col, row + 1),
+        CellAddr::Right { col, row } => {
+            format!(
+                "]{}{}",
+                addr::mirror_margin_column_name(*col as usize, false),
+                row + 1
+            )
+        }
     }
 }
 
 fn sheet_row_label(logical_row: usize, main_rows: usize) -> String {
     let hr = HEADER_ROWS;
     if logical_row < hr {
-        format!("^{}", (b'Z' - logical_row as u8) as char)
+        format!("^{}", hr - logical_row)
     } else if logical_row < hr + main_rows {
         format!("{}", logical_row - hr + 1)
     } else {
         let fr = logical_row - hr - main_rows;
-        format!("_{}", (b'A' + fr as u8) as char)
+        format!("_{}", fr + 1)
     }
 }
 
 fn col_header_label(global_col: usize, main_cols: usize) -> String {
     let m = MARGIN_COLS;
     if global_col < m {
-        format!("<{}", m - 1 - global_col)
+        format!("[{}", addr::mirror_margin_column_name(global_col, true))
     } else if global_col < m + main_cols {
         addr::excel_column_name(global_col - m)
     } else {
-        format!(">{}", global_col - m - main_cols)
+        format!(
+            "]{}",
+            addr::mirror_margin_column_name(global_col - m - main_cols, false)
+        )
     }
 }
 
 fn formula_col_fragment(global_col: usize, main_cols: usize) -> String {
     let m = MARGIN_COLS;
     if global_col < m {
-        format!("<{}", m - 1 - global_col)
+        format!("[{}", addr::mirror_margin_column_name(global_col, true))
     } else if global_col < m + main_cols {
         addr::excel_column_name(global_col - m)
     } else {
-        format!(">{}", global_col - m - main_cols)
+        format!(
+            "]{}",
+            addr::mirror_margin_column_name(global_col - m - main_cols, false)
+        )
     }
 }
 

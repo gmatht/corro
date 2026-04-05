@@ -2,13 +2,11 @@
 
 use crate::addr::parse_excel_column;
 use crate::grid::{CellAddr, Grid, MainRange, SortSpec, MARGIN_COLS};
-use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AggFunc {
     Sum,
     Mean,
@@ -18,7 +16,7 @@ pub enum AggFunc {
     Count,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AggregateDef {
     pub func: AggFunc,
     pub source: MainRange,
@@ -37,8 +35,7 @@ impl SheetState {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Op {
     SetCell { addr: CellAddr, value: String },
     SetMainSize { main_rows: u32, main_cols: u32 },
@@ -90,15 +87,31 @@ impl Op {
 
 fn addr_text(addr: &CellAddr) -> String {
     match addr {
-        CellAddr::Header { row, col } => format!("^{}:{}", (b'Z' - *row) as char, col),
-        CellAddr::Footer { row, col } => format!("_{}:{}", (b'A' + *row) as char, col),
+        CellAddr::Header { row, col } => format!(
+            "^{}{}",
+            crate::grid::HEADER_ROWS - *row as usize,
+            crate::addr::excel_column_name(*col as usize)
+        ),
+        CellAddr::Footer { row, col } => format!(
+            "_{}{}",
+            *row as usize + 1,
+            crate::addr::excel_column_name(*col as usize)
+        ),
         CellAddr::Main { row, col } => format!(
             "{}{}",
             crate::addr::excel_column_name(*col as usize),
             row + 1
         ),
-        CellAddr::Left { col, row } => format!("<{}:{}", col, row + 1),
-        CellAddr::Right { col, row } => format!(">{}:{}", col, row + 1),
+        CellAddr::Left { col, row } => format!(
+            "[{}{}",
+            crate::addr::mirror_margin_column_name(*col as usize, true),
+            row + 1
+        ),
+        CellAddr::Right { col, row } => format!(
+            "]{}{}",
+            crate::addr::mirror_margin_column_name(*col as usize, false),
+            row + 1
+        ),
     }
 }
 
@@ -190,8 +203,8 @@ impl SheetState {
     }
 }
 
-/// Replay JSONL from a string (full load).
-pub fn replay_lines(data: &str, state: &mut SheetState) -> Result<usize, serde_json::Error> {
+/// Replay text log lines from a string (full load).
+pub fn replay_lines(data: &str, state: &mut SheetState) -> Result<usize, std::io::Error> {
     let mut n = 0usize;
     for line in data.lines() {
         let t = line.trim();
@@ -205,7 +218,7 @@ pub fn replay_lines(data: &str, state: &mut SheetState) -> Result<usize, serde_j
 }
 
 /// Parse a single line and apply; used when tailing.
-pub fn apply_line(line: &str, state: &mut SheetState) -> Result<(), serde_json::Error> {
+pub fn apply_line(line: &str, state: &mut SheetState) -> Result<(), std::io::Error> {
     let t = line.trim();
     if t.is_empty() {
         return Ok(());
@@ -213,7 +226,7 @@ pub fn apply_line(line: &str, state: &mut SheetState) -> Result<(), serde_json::
     apply_any_line(t, state)
 }
 
-fn apply_any_line(line: &str, state: &mut SheetState) -> Result<(), serde_json::Error> {
+fn apply_any_line(line: &str, state: &mut SheetState) -> Result<(), std::io::Error> {
     if line.starts_with("<<<<<<<") || line.starts_with("=======") || line.starts_with(">>>>>>>") {
         return Ok(());
     }
@@ -226,66 +239,37 @@ fn apply_any_line(line: &str, state: &mut SheetState) -> Result<(), serde_json::
         op.apply(state);
         return Ok(());
     }
-    if let Ok(op) = serde_json::from_str::<Op>(line) {
-        op.apply(state);
-        return Ok(());
-    }
-
     let mut parts = line.split_whitespace();
     let cmd = match parts.next() {
         Some(cmd) => cmd.to_ascii_uppercase(),
         None => return Ok(()),
     };
 
+    let bad = |msg: &'static str| std::io::Error::new(std::io::ErrorKind::InvalidData, msg);
+
     match cmd.as_str() {
         "MAX_COL_WIDTH" => {
             let width = parts
                 .next()
                 .and_then(|w| w.parse::<usize>().ok())
-                .ok_or_else(|| {
-                    serde_json::Error::io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "bad MAX_COL_WIDTH line",
-                    ))
-                })?;
+                .ok_or_else(|| bad("bad MAX_COL_WIDTH line"))?;
             if parts.next().is_some() {
-                return Err(serde_json::Error::io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "bad MAX_COL_WIDTH line",
-                )));
+                return Err(bad("bad MAX_COL_WIDTH line"));
             }
             state.grid.set_max_col_width(width);
             Ok(())
         }
         "COL_WIDTH" => {
-            let col_name = parts.next().ok_or_else(|| {
-                serde_json::Error::io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "bad COL_WIDTH line",
-                ))
-            })?;
+            let col_name = parts.next().ok_or_else(|| bad("bad COL_WIDTH line"))?;
             let col = parse_excel_column(col_name)
                 .map(|c| crate::grid::MARGIN_COLS + c as usize)
-                .ok_or_else(|| {
-                    serde_json::Error::io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "bad COL_WIDTH line",
-                    ))
-                })?;
+                .ok_or_else(|| bad("bad COL_WIDTH line"))?;
             let width = match parts.next() {
-                Some(w) => Some(w.parse::<usize>().map_err(|_| {
-                    serde_json::Error::io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "bad COL_WIDTH line",
-                    ))
-                })?),
+                Some(w) => Some(w.parse::<usize>().map_err(|_| bad("bad COL_WIDTH line"))?),
                 None => None,
             };
             if parts.next().is_some() {
-                return Err(serde_json::Error::io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "bad COL_WIDTH line",
-                )));
+                return Err(bad("bad COL_WIDTH line"));
             }
             state.grid.set_col_width(col, width);
             Ok(())
@@ -303,12 +287,7 @@ fn apply_any_line(line: &str, state: &mut SheetState) -> Result<(), serde_json::
                             col: MARGIN_COLS + c as usize,
                             desc,
                         })
-                        .ok_or_else(|| {
-                            serde_json::Error::io(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                "bad SORT line",
-                            ))
-                        })
+                        .ok_or_else(|| bad("bad SORT line"))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             state.grid.set_view_sort_cols(cols);
@@ -318,38 +297,22 @@ fn apply_any_line(line: &str, state: &mut SheetState) -> Result<(), serde_json::
             let rows = parts
                 .next()
                 .and_then(|v| v.parse::<usize>().ok())
-                .ok_or_else(|| {
-                    serde_json::Error::io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "bad SIZE line",
-                    ))
-                })?;
+                .ok_or_else(|| bad("bad SIZE line"))?;
             let cols = parts
                 .next()
                 .and_then(|v| v.parse::<usize>().ok())
-                .ok_or_else(|| {
-                    serde_json::Error::io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "bad SIZE line",
-                    ))
-                })?;
+                .ok_or_else(|| bad("bad SIZE line"))?;
             if parts.next().is_some() {
-                return Err(serde_json::Error::io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "bad SIZE line",
-                )));
+                return Err(bad("bad SIZE line"));
             }
             state.grid.set_main_size(rows, cols);
             Ok(())
         }
-        _ => Err(serde_json::Error::io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "unrecognized log line",
-        ))),
+        _ => Err(bad("unrecognized log line")),
     }
 }
 
-/// Append one op as JSONL to `path` (creates file if missing).
+/// Append one op as text to `path` (creates file if missing).
 pub fn append_op(path: &Path, op: &Op) -> std::io::Result<()> {
     let mut f = OpenOptions::new().create(true).append(true).open(path)?;
     let line = match op {
@@ -403,26 +366,6 @@ pub fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use crate::grid::CellAddr;
-
-    #[test]
-    fn replay_set_cell() {
-        let mut s = SheetState::new(2, 2);
-        let json = r#"{"op":"set_cell","addr":{"kind":"main","row":0,"col":0},"value":"x"}"#;
-        apply_line(json, &mut s).unwrap();
-        assert_eq!(s.grid.get(&CellAddr::Main { row: 0, col: 0 }), Some("x"));
-    }
-
-    #[test]
-    fn op_json_roundtrip() {
-        let op = Op::MoveRowRange {
-            from: 0,
-            count: 2,
-            to: 3,
-        };
-        let j = serde_json::to_string(&op).unwrap();
-        let back: Op = serde_json::from_str(&j).unwrap();
-        assert_eq!(op, back);
-    }
 
     #[test]
     fn replay_doc_settings_lines() {

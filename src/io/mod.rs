@@ -13,8 +13,6 @@ use thiserror::Error;
 pub enum IoError {
     #[error("I/O: {0}")]
     Io(#[from] std::io::Error),
-    #[error("JSON: {0}")]
-    Json(#[from] serde_json::Error),
     #[error("Notify: {0}")]
     Notify(#[from] notify::Error),
 }

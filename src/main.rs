@@ -5,9 +5,12 @@ use corro::ui::App;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(name = "corro", about = "Terminal spreadsheet with append-only JSONL log")]
+#[command(
+    name = "corro",
+    about = "Terminal spreadsheet with append-only text log"
+)]
 struct Args {
-    /// Path to the `.corro` log file (JSONL). Created on first write.
+    /// Path to the `.corro` log file. Created on first write.
     #[arg(value_name = "FILE")]
     file: Option<PathBuf>,
 }
