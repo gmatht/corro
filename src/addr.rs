@@ -29,8 +29,34 @@ pub fn excel_column_name(main_col_index: usize) -> String {
 /// 10-column margin label (`A` nearest the main grid, `J` farthest).
 pub fn mirror_margin_column_name(margin_col_index: usize, left_side: bool) -> String {
     let idx = margin_col_index.min(9);
-    let _ = left_side;
+    let idx = if left_side { 9 - idx } else { idx };
     ((b'A' + idx as u8) as char).to_string()
+}
+
+/// Parse a sheet id prefix like `$12` at the start of `s`.
+pub fn parse_sheet_id_prefix_at(s: &str) -> Option<(u32, usize)> {
+    let bytes = s.as_bytes();
+    if bytes.first().copied()? != b'$' {
+        return None;
+    }
+    let mut i = 1usize;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == 1 {
+        return None;
+    }
+    let sheet_id = std::str::from_utf8(&bytes[1..i]).ok()?.parse().ok()?;
+    Some((sheet_id, i))
+}
+
+/// Parse a sheet-qualified cell ref like `$2:A1` at the start of `s`.
+pub fn parse_sheet_qualified_cell_ref_at(s: &str) -> Option<(u32, CellAddr, usize)> {
+    let (sheet_id, prefix_len) = parse_sheet_id_prefix_at(s)?;
+    let rest = s.get(prefix_len..)?;
+    let rest = rest.strip_prefix(':')?;
+    let (addr, addr_len) = parse_cell_ref_at(rest)?;
+    Some((sheet_id, addr, prefix_len + 1 + addr_len))
 }
 
 fn parse_mirror_margin_column_name(name: &str, left_side: bool) -> Option<u8> {
@@ -43,8 +69,11 @@ fn parse_mirror_margin_column_name(name: &str, left_side: bool) -> Option<u8> {
     if idx > 9 {
         return None;
     }
-    let _ = left_side;
-    Some(idx as u8)
+    Some(if left_side {
+        (9 - idx) as u8
+    } else {
+        idx as u8
+    })
 }
 
 /// Parse one cell reference at the start of `s` (no leading whitespace).
@@ -132,7 +161,7 @@ pub fn parse_cell_ref_at(s: &str) -> Option<(CellAddr, usize)> {
         }
     }
 
-    // Mirrored margins: [A1..[J1 / ]A1..]J1.
+    // Mirrored margins: [J1..[A1 / ]A1..]J1.
     if bytes[0] == b'[' || bytes[0] == b']' {
         let left_side = bytes[0] == b'[';
         let rest = &s[1..];
@@ -222,5 +251,23 @@ mod tests {
         assert_eq!(parse_cell_ref_at("_1A").unwrap().1, 3);
         assert_eq!(parse_cell_ref_at("[A1").unwrap().1, 3);
         assert_eq!(parse_cell_ref_at("]A1").unwrap().1, 3);
+    }
+
+    #[test]
+    fn left_margin_is_mirrored_from_the_main_grid() {
+        assert_eq!(mirror_margin_column_name(0, true), "J");
+        assert_eq!(mirror_margin_column_name(9, true), "A");
+        assert_eq!(
+            parse_cell_ref_at("[A1").unwrap().0,
+            CellAddr::Left { col: 9, row: 0 }
+        );
+    }
+
+    #[test]
+    fn sheet_qualified_cell_refs_parse() {
+        let (sheet_id, addr, len) = parse_sheet_qualified_cell_ref_at("$12:A5").unwrap();
+        assert_eq!(sheet_id, 12);
+        assert_eq!(addr, CellAddr::Main { row: 4, col: 0 });
+        assert_eq!(len, 6);
     }
 }

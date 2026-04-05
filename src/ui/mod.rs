@@ -6,10 +6,8 @@ use crate::export;
 use crate::formula::{cell_effective_display, is_formula};
 use crate::grid::MainRange;
 use crate::grid::{CellAddr, Grid, SortSpec, FOOTER_ROWS, HEADER_ROWS, MARGIN_COLS};
-use crate::io::{
-    commit_line, commit_op, load_full, load_revisions, tail_apply, IoError, LogWatcher,
-};
-use crate::ops::{AggFunc, AggregateDef, Op, SheetState, WorkbookSnapshot, WorkbookState};
+use crate::io::{commit_line, commit_workbook_op, load_full, load_revisions, IoError, LogWatcher};
+use crate::ops::{AggFunc, AggregateDef, Op, SheetState, WorkbookState};
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
@@ -1315,6 +1313,7 @@ pub struct App {
     edit_cursor: Option<usize>,
     input_cursor: Option<usize>,
     special_picker: Option<usize>,
+    view_sheet_id: u32,
 }
 
 impl App {
@@ -1354,6 +1353,7 @@ impl App {
             edit_cursor: None,
             input_cursor: None,
             special_picker: None,
+            view_sheet_id: 1,
         }
     }
 
@@ -1376,7 +1376,7 @@ impl App {
             .iter()
             .enumerate()
             .map(|(idx, sheet)| {
-                if idx == self.workbook.active_sheet {
+                if self.workbook.sheet_id(idx) == self.view_sheet_id {
                     format!("[{}]", sheet.title)
                 } else {
                     sheet.title.clone()
@@ -1388,26 +1388,52 @@ impl App {
 
     fn add_sheet(&mut self, title: String) {
         self.commit_active_sheet_cache();
+        let id = self.workbook.next_sheet_id;
+        let log_title = title.clone();
         self.workbook.add_sheet(title, SheetState::new(1, 1));
-        self.workbook.active_sheet = self.workbook.sheet_count() - 1;
+        self.view_sheet_id = id;
         self.sync_active_sheet_cache();
         self.cursor = SheetCursor {
             row: HEADER_ROWS,
             col: MARGIN_COLS,
         };
         self.anchor = None;
+        if let Some(ref p) = self.path.clone() {
+            let mut active_sheet = self.view_sheet_id;
+            if let Err(e) = commit_workbook_op(
+                p,
+                &mut self.offset,
+                &mut self.workbook,
+                &mut active_sheet,
+                &crate::ops::WorkbookOp::NewSheet {
+                    id,
+                    title: log_title,
+                },
+            ) {
+                self.status = format!("Log write error: {e}");
+                return;
+            }
+            self.ops_applied = self.ops_applied.saturating_add(1);
+            if let Err(e) = self.start_log_watcher_if_needed() {
+                self.status = format!("Watcher error: {e}");
+                return;
+            }
+        }
         self.status = "New sheet created".into();
     }
 
     fn switch_sheet(&mut self, delta: isize) {
+        self.commit_active_sheet_cache();
         let count = self.workbook.sheet_count();
         if count <= 1 {
             return;
         }
-        self.commit_active_sheet_cache();
-        let active = self.workbook.active_sheet as isize;
+        let active = self
+            .workbook
+            .sheet_index_by_id(self.view_sheet_id)
+            .unwrap_or(0) as isize;
         let next = (active + delta).rem_euclid(count as isize) as usize;
-        self.workbook.active_sheet = next;
+        self.view_sheet_id = self.workbook.sheet_id(next);
         self.sync_active_sheet_cache();
         self.cursor.clamp(&self.state.grid);
         self.status = format!("Sheet {} of {}", next + 1, count);
@@ -1428,12 +1454,21 @@ impl App {
 
     fn sync_active_sheet_cache(&mut self) {
         self.workbook.ensure_active_sheet();
-        self.state = self.workbook.active_sheet().clone();
+        if let Some(idx) = self.workbook.sheet_index_by_id(self.view_sheet_id) {
+            self.workbook.active_sheet = idx;
+            self.state = self.workbook.sheets[idx].state.clone();
+        } else {
+            self.view_sheet_id = self.workbook.sheet_id(self.workbook.active_sheet);
+            self.state = self.workbook.active_sheet().clone();
+        }
     }
 
     fn commit_active_sheet_cache(&mut self) {
         self.workbook.ensure_active_sheet();
-        self.workbook.sheets[self.workbook.active_sheet].state = self.state.clone();
+        if let Some(idx) = self.workbook.sheet_index_by_id(self.view_sheet_id) {
+            self.workbook.active_sheet = idx;
+            self.workbook.sheets[idx].state = self.state.clone();
+        }
     }
 
     fn handle_plain_text_input_key(
@@ -1506,32 +1541,41 @@ impl App {
         let linked_revision = self.revision_limit;
         if let Some(ref p) = initial_path {
             if Path::new(p).exists() {
-                if let Ok(snapshot) = crate::io::load_workbook_snapshot(p) {
-                    let active_index = snapshot
-                        .sheets
-                        .iter()
-                        .position(|s| s.id == snapshot.active_sheet_id)
-                        .unwrap_or(0);
-                    self.workbook = WorkbookState {
-                        sheets: snapshot.sheets,
-                        active_sheet: active_index,
-                        next_sheet_id: snapshot.next_sheet_id,
-                    };
-                    self.sync_active_sheet_cache();
-                    self.path = Some(p.clone());
-                    self.source_path = None;
-                    self.revision_limit = None;
-                    self.watcher = None;
-                    self.status = format!("Loaded workbook {}", p.display());
-                    self.cursor.clamp(&self.state.grid);
-                    return Ok(());
-                }
                 let ext = p
                     .extension()
                     .and_then(|e| e.to_str())
                     .unwrap_or("")
                     .to_lowercase();
                 match ext.as_str() {
+                    "corro" => {
+                        let data = std::fs::read_to_string(p).map_err(|e| IoError::Io(e))?;
+                        let mut workbook = WorkbookState::new();
+                        let mut active_sheet = workbook.sheet_id(workbook.active_sheet);
+                        for line in data.lines() {
+                            let t = line.trim();
+                            if t.is_empty() {
+                                continue;
+                            }
+                            crate::ops::apply_log_line_to_workbook(
+                                t,
+                                &mut workbook,
+                                &mut active_sheet,
+                            )?;
+                        }
+                        self.workbook = workbook;
+                        self.view_sheet_id = active_sheet;
+                        self.sync_active_sheet_cache();
+                        self.offset = data.len() as u64;
+                        self.ops_applied =
+                            data.lines().filter(|line| !line.trim().is_empty()).count();
+                        self.path = Some(p.clone());
+                        self.source_path = None;
+                        self.revision_limit = None;
+                        self.watcher = Some(LogWatcher::new(p.clone())?);
+                        self.status = format!("Loaded workbook {}", p.display());
+                        self.cursor.clamp(&self.state.grid);
+                        return Ok(());
+                    }
                     "tsv" => {
                         let data = std::fs::read_to_string(p).map_err(|e| IoError::Io(e))?;
                         crate::io::import_tsv(&data, &mut self.state);
@@ -1687,7 +1731,18 @@ impl App {
                     };
                     self.push_inverse_op(&op);
                     if let Some(ref p) = self.path.clone() {
-                        let _ = commit_op(p, &mut self.offset, &mut self.state, &op);
+                        let mut active_sheet = self.view_sheet_id;
+                        let _ = commit_workbook_op(
+                            p,
+                            &mut self.offset,
+                            &mut self.workbook,
+                            &mut active_sheet,
+                            &crate::ops::WorkbookOp::SheetOp {
+                                sheet_id: self.view_sheet_id,
+                                op,
+                            },
+                        );
+                        self.sync_active_sheet_cache();
                     } else {
                         op.apply(&mut self.state);
                     }
@@ -1709,19 +1764,38 @@ impl App {
         if let Some(w) = &self.watcher {
             if w.poll_dirty() {
                 if let Some(ref p) = self.path {
-                    match tail_apply(p, self.offset, &mut self.state) {
+                    match crate::io::tail_apply_workbook(
+                        p,
+                        self.offset,
+                        &mut self.workbook,
+                        &mut self.view_sheet_id,
+                    ) {
                         Ok(new_off) => {
                             self.offset = new_off;
+                            self.sync_active_sheet_cache();
                             self.status = "External change applied".into();
                         }
                         Err(_) => {
-                            self.state = SheetState::new(1, 1);
-                            let (off, n) = match self.revision_limit {
-                                Some(limit) => load_revisions(p, limit, &mut self.state)?,
-                                None => load_full(p, &mut self.state)?,
-                            };
-                            self.offset = off;
-                            self.ops_applied = n;
+                            let data = std::fs::read_to_string(p).map_err(IoError::Io)?;
+                            let mut workbook = WorkbookState::new();
+                            let mut active_sheet = workbook.sheet_id(workbook.active_sheet);
+                            for line in data.lines() {
+                                let t = line.trim();
+                                if t.is_empty() {
+                                    continue;
+                                }
+                                crate::ops::apply_log_line_to_workbook(
+                                    t,
+                                    &mut workbook,
+                                    &mut active_sheet,
+                                )?;
+                            }
+                            self.workbook = workbook;
+                            self.view_sheet_id = active_sheet;
+                            self.sync_active_sheet_cache();
+                            self.offset = data.len() as u64;
+                            self.ops_applied =
+                                data.lines().filter(|line| !line.trim().is_empty()).count();
                             self.status = "File reset; full reload".into();
                         }
                     }
@@ -1885,14 +1959,28 @@ impl App {
         } else {
             (self.cursor.to_addr(&self.state.grid), buffer.to_string())
         };
+        if self.state.grid.get(&addr).unwrap_or("") == value {
+            return Ok(());
+        }
         let op = Op::SetCell {
             addr: addr.clone(),
             value,
         };
         self.push_inverse_op(&op);
         if let Some(ref p) = self.path.clone() {
-            commit_op(p, &mut self.offset, &mut self.state, &op)?;
+            let mut active_sheet = self.view_sheet_id;
+            commit_workbook_op(
+                p,
+                &mut self.offset,
+                &mut self.workbook,
+                &mut active_sheet,
+                &crate::ops::WorkbookOp::SheetOp {
+                    sheet_id: self.view_sheet_id,
+                    op,
+                },
+            )?;
             self.ops_applied = self.ops_applied.saturating_add(1);
+            self.sync_active_sheet_cache();
             self.start_log_watcher_if_needed()?;
         } else {
             op.apply(&mut self.state);
@@ -1941,8 +2029,19 @@ impl App {
         };
         self.push_inverse_op(&op);
         if let Some(ref p) = self.path.clone() {
-            commit_op(p, &mut self.offset, &mut self.state, &op)?;
+            let mut active_sheet = self.view_sheet_id;
+            commit_workbook_op(
+                p,
+                &mut self.offset,
+                &mut self.workbook,
+                &mut active_sheet,
+                &crate::ops::WorkbookOp::SheetOp {
+                    sheet_id: self.view_sheet_id,
+                    op,
+                },
+            )?;
             self.ops_applied = self.ops_applied.saturating_add(1);
+            self.sync_active_sheet_cache();
             self.start_log_watcher_if_needed()?;
         } else {
             op.apply(&mut self.state);
@@ -1979,8 +2078,19 @@ impl App {
         };
         self.push_inverse_op(&op);
         if let Some(ref p) = self.path.clone() {
-            commit_op(p, &mut self.offset, &mut self.state, &op)?;
+            let mut active_sheet = self.view_sheet_id;
+            commit_workbook_op(
+                p,
+                &mut self.offset,
+                &mut self.workbook,
+                &mut active_sheet,
+                &crate::ops::WorkbookOp::SheetOp {
+                    sheet_id: self.view_sheet_id,
+                    op: op.clone(),
+                },
+            )?;
             self.ops_applied = self.ops_applied.saturating_add(1);
+            self.sync_active_sheet_cache();
             self.start_log_watcher_if_needed()?;
         } else {
             op.apply(&mut self.state);
@@ -1993,8 +2103,19 @@ impl App {
         };
         self.push_inverse_op(&move_op);
         if let Some(ref p) = self.path.clone() {
-            commit_op(p, &mut self.offset, &mut self.state, &move_op)?;
+            let mut active_sheet = self.view_sheet_id;
+            commit_workbook_op(
+                p,
+                &mut self.offset,
+                &mut self.workbook,
+                &mut active_sheet,
+                &crate::ops::WorkbookOp::SheetOp {
+                    sheet_id: self.view_sheet_id,
+                    op: move_op,
+                },
+            )?;
             self.ops_applied = self.ops_applied.saturating_add(1);
+            self.sync_active_sheet_cache();
             self.start_log_watcher_if_needed()?;
         } else {
             move_op.apply(&mut self.state);
@@ -2030,8 +2151,19 @@ impl App {
         };
         self.push_inverse_op(&op);
         if let Some(ref p) = self.path.clone() {
-            commit_op(p, &mut self.offset, &mut self.state, &op)?;
+            let mut active_sheet = self.view_sheet_id;
+            commit_workbook_op(
+                p,
+                &mut self.offset,
+                &mut self.workbook,
+                &mut active_sheet,
+                &crate::ops::WorkbookOp::SheetOp {
+                    sheet_id: self.view_sheet_id,
+                    op: op.clone(),
+                },
+            )?;
             self.ops_applied = self.ops_applied.saturating_add(1);
+            self.sync_active_sheet_cache();
             self.start_log_watcher_if_needed()?;
         } else {
             op.apply(&mut self.state);
@@ -2044,8 +2176,19 @@ impl App {
         };
         self.push_inverse_op(&move_op);
         if let Some(ref p) = self.path.clone() {
-            commit_op(p, &mut self.offset, &mut self.state, &move_op)?;
+            let mut active_sheet = self.view_sheet_id;
+            commit_workbook_op(
+                p,
+                &mut self.offset,
+                &mut self.workbook,
+                &mut active_sheet,
+                &crate::ops::WorkbookOp::SheetOp {
+                    sheet_id: self.view_sheet_id,
+                    op: move_op.clone(),
+                },
+            )?;
             self.ops_applied = self.ops_applied.saturating_add(1);
+            self.sync_active_sheet_cache();
             self.start_log_watcher_if_needed()?;
         } else {
             move_op.apply(&mut self.state);
@@ -2086,8 +2229,19 @@ impl App {
         };
         self.push_inverse_op(&op);
         if let Some(ref p) = self.path.clone() {
-            commit_op(p, &mut self.offset, &mut self.state, &op)?;
+            let mut active_sheet = self.view_sheet_id;
+            commit_workbook_op(
+                p,
+                &mut self.offset,
+                &mut self.workbook,
+                &mut active_sheet,
+                &crate::ops::WorkbookOp::SheetOp {
+                    sheet_id: self.view_sheet_id,
+                    op: op.clone(),
+                },
+            )?;
             self.ops_applied = self.ops_applied.saturating_add(1);
+            self.sync_active_sheet_cache();
             self.start_log_watcher_if_needed()?;
         } else {
             op.apply(&mut self.state);
@@ -2100,8 +2254,19 @@ impl App {
         };
         self.push_inverse_op(&move_op);
         if let Some(ref p) = self.path.clone() {
-            commit_op(p, &mut self.offset, &mut self.state, &move_op)?;
+            let mut active_sheet = self.view_sheet_id;
+            commit_workbook_op(
+                p,
+                &mut self.offset,
+                &mut self.workbook,
+                &mut active_sheet,
+                &crate::ops::WorkbookOp::SheetOp {
+                    sheet_id: self.view_sheet_id,
+                    op: move_op.clone(),
+                },
+            )?;
             self.ops_applied = self.ops_applied.saturating_add(1);
+            self.sync_active_sheet_cache();
             self.start_log_watcher_if_needed()?;
         } else {
             move_op.apply(&mut self.state);
@@ -2164,8 +2329,19 @@ impl App {
         };
         self.push_inverse_op(&op);
         if let Some(ref p) = self.path.clone() {
-            commit_op(p, &mut self.offset, &mut self.state, &op)?;
+            let mut active_sheet = self.view_sheet_id;
+            commit_workbook_op(
+                p,
+                &mut self.offset,
+                &mut self.workbook,
+                &mut active_sheet,
+                &crate::ops::WorkbookOp::SheetOp {
+                    sheet_id: self.view_sheet_id,
+                    op: op.clone(),
+                },
+            )?;
             self.ops_applied = self.ops_applied.saturating_add(1);
+            self.sync_active_sheet_cache();
             self.start_log_watcher_if_needed()?;
         } else {
             op.apply(&mut self.state);
@@ -2258,31 +2434,89 @@ impl App {
 
     fn save_to_path(&mut self, path: &Path) -> Result<(), RunError> {
         self.commit_active_sheet_cache();
-        if self.workbook.sheet_count() > 1 {
-            let snap = WorkbookSnapshot::from_workbook(&self.workbook);
-            crate::io::save_workbook(path, &snap)?;
-        } else {
-            let mut buf = Vec::new();
-            for row in 0..self.state.grid.main_rows() {
-                for col in 0..self.state.grid.main_cols() {
+        let mut buf = String::new();
+        for sheet in &self.workbook.sheets {
+            buf.push_str(
+                &crate::ops::WorkbookOp::NewSheet {
+                    id: sheet.id,
+                    title: sheet.title.clone(),
+                }
+                .to_log_line(),
+            );
+            buf.push('\n');
+            for row in 0..sheet.state.grid.main_rows() {
+                for col in 0..sheet.state.grid.main_cols() {
                     let addr = CellAddr::Main {
                         row: row as u32,
                         col: col as u32,
                     };
-                    if let Some(value) = self.state.grid.get(&addr) {
+                    if let Some(value) = sheet.state.grid.get(&addr) {
                         if !value.is_empty() {
-                            let line = format!(
-                                "SET {} {}\n",
-                                addr_label(&addr, self.state.grid.main_cols()),
-                                value
+                            buf.push_str(
+                                &crate::ops::WorkbookOp::SheetOp {
+                                    sheet_id: sheet.id,
+                                    op: Op::SetCell {
+                                        addr: addr.clone(),
+                                        value: value.to_string(),
+                                    },
+                                }
+                                .to_log_line(),
                             );
-                            buf.extend_from_slice(line.as_bytes());
+                            buf.push('\n');
                         }
                     }
                 }
             }
-            std::fs::write(path, &buf)?;
+            buf.push_str(
+                &crate::ops::WorkbookOp::SheetOp {
+                    sheet_id: sheet.id,
+                    op: Op::SetMainSize {
+                        main_rows: sheet.state.grid.main_rows() as u32,
+                        main_cols: sheet.state.grid.main_cols() as u32,
+                    },
+                }
+                .to_log_line(),
+            );
+            buf.push('\n');
+            if sheet.state.grid.max_col_width != 20 {
+                buf.push_str(
+                    &crate::ops::WorkbookOp::SheetOp {
+                        sheet_id: sheet.id,
+                        op: Op::SetMaxColWidth {
+                            width: sheet.state.grid.max_col_width,
+                        },
+                    }
+                    .to_log_line(),
+                );
+                buf.push('\n');
+            }
+            for (col, width) in &sheet.state.grid.col_width_overrides {
+                buf.push_str(
+                    &crate::ops::WorkbookOp::SheetOp {
+                        sheet_id: sheet.id,
+                        op: Op::SetColWidth {
+                            col: *col,
+                            width: Some(*width),
+                        },
+                    }
+                    .to_log_line(),
+                );
+                buf.push('\n');
+            }
+            if !sheet.state.grid.view_sort_cols.is_empty() {
+                buf.push_str(
+                    &crate::ops::WorkbookOp::SheetOp {
+                        sheet_id: sheet.id,
+                        op: Op::SetViewSortCols {
+                            cols: sheet.state.grid.view_sort_cols.clone(),
+                        },
+                    }
+                    .to_log_line(),
+                );
+                buf.push('\n');
+            }
         }
+        std::fs::write(path, buf)?;
         self.path = Some(path.to_path_buf());
         self.source_path = None;
         self.revision_limit = None;
@@ -3260,14 +3494,44 @@ impl App {
             }
         }
 
-        if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(mode, Mode::Normal) {
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(mode, Mode::Normal | Mode::Edit { .. })
+        {
             match key.code {
                 KeyCode::PageUp => {
                     self.switch_sheet(-1);
+                    if matches!(&mode, Mode::Edit { .. }) {
+                        let addr = self.cursor.to_addr(&self.state.grid);
+                        let cur = cell_display(&self.state.grid, &addr);
+                        mode = self.start_edit_mode(
+                            cur.clone(),
+                            if cur.trim() == "=" {
+                                Some(self.cursor)
+                            } else {
+                                None
+                            },
+                            false,
+                        );
+                    }
+                    self.mode = mode;
                     return Ok(false);
                 }
                 KeyCode::PageDown => {
                     self.switch_sheet(1);
+                    if matches!(&mode, Mode::Edit { .. }) {
+                        let addr = self.cursor.to_addr(&self.state.grid);
+                        let cur = cell_display(&self.state.grid, &addr);
+                        mode = self.start_edit_mode(
+                            cur.clone(),
+                            if cur.trim() == "=" {
+                                Some(self.cursor)
+                            } else {
+                                None
+                            },
+                            false,
+                        );
+                    }
+                    self.mode = mode;
                     return Ok(false);
                 }
                 _ => {}
@@ -3853,12 +4117,21 @@ impl App {
                 if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('z') {
                     if let Some(undo_op) = self.op_history.pop() {
                         if let Some(ref p) = self.path.clone() {
-                            if let Err(e) =
-                                commit_op(p, &mut self.offset, &mut self.state, &undo_op)
-                            {
+                            let mut active_sheet = self.view_sheet_id;
+                            if let Err(e) = commit_workbook_op(
+                                p,
+                                &mut self.offset,
+                                &mut self.workbook,
+                                &mut active_sheet,
+                                &crate::ops::WorkbookOp::SheetOp {
+                                    sheet_id: self.view_sheet_id,
+                                    op: undo_op.clone(),
+                                },
+                            ) {
                                 self.status = format!("Undo failed: {}", e);
                             } else {
                                 self.ops_applied = self.ops_applied.saturating_add(1);
+                                self.sync_active_sheet_cache();
                                 self.status = "Undo applied".to_string();
                             }
                         } else {
@@ -3972,8 +4245,19 @@ impl App {
                                     };
                                     self.push_inverse_op(&op);
                                     if let Some(ref p) = self.path.clone() {
-                                        commit_op(p, &mut self.offset, &mut self.state, &op)?;
+                                        let mut active_sheet = self.view_sheet_id;
+                                        commit_workbook_op(
+                                            p,
+                                            &mut self.offset,
+                                            &mut self.workbook,
+                                            &mut active_sheet,
+                                            &crate::ops::WorkbookOp::SheetOp {
+                                                sheet_id: self.view_sheet_id,
+                                                op: op.clone(),
+                                            },
+                                        )?;
                                         self.ops_applied = self.ops_applied.saturating_add(1);
+                                        self.sync_active_sheet_cache();
                                         self.start_log_watcher_if_needed()?;
                                     } else {
                                         op.apply(&mut self.state);
@@ -4013,8 +4297,19 @@ impl App {
                                 };
                                 self.push_inverse_op(&op);
                                 if let Some(ref p) = self.path.clone() {
-                                    commit_op(p, &mut self.offset, &mut self.state, &op)?;
+                                    let mut active_sheet = self.view_sheet_id;
+                                    commit_workbook_op(
+                                        p,
+                                        &mut self.offset,
+                                        &mut self.workbook,
+                                        &mut active_sheet,
+                                        &crate::ops::WorkbookOp::SheetOp {
+                                            sheet_id: self.view_sheet_id,
+                                            op: op.clone(),
+                                        },
+                                    )?;
                                     self.ops_applied = self.ops_applied.saturating_add(1);
+                                    self.sync_active_sheet_cache();
                                     self.start_log_watcher_if_needed()?;
                                 } else {
                                     op.apply(&mut self.state);
@@ -4051,14 +4346,30 @@ impl App {
                     KeyCode::Delete | KeyCode::Backspace => {
                         if !self.delete_selection() {
                             if let Some(addr) = self.addr_at(self.cursor.row, self.cursor.col) {
+                                if self.state.grid.get(&addr).unwrap_or("").is_empty() {
+                                    self.status = "Cell already blank".into();
+                                    self.mode = mode;
+                                    return Ok(false);
+                                }
                                 let op = Op::SetCell {
                                     addr,
                                     value: String::new(),
                                 };
                                 self.push_inverse_op(&op);
                                 if let Some(ref p) = self.path.clone() {
-                                    commit_op(p, &mut self.offset, &mut self.state, &op)?;
+                                    let mut active_sheet = self.view_sheet_id;
+                                    commit_workbook_op(
+                                        p,
+                                        &mut self.offset,
+                                        &mut self.workbook,
+                                        &mut active_sheet,
+                                        &crate::ops::WorkbookOp::SheetOp {
+                                            sheet_id: self.view_sheet_id,
+                                            op: op.clone(),
+                                        },
+                                    )?;
                                     self.ops_applied = self.ops_applied.saturating_add(1);
+                                    self.sync_active_sheet_cache();
                                     self.start_log_watcher_if_needed()?;
                                 } else {
                                     op.apply(&mut self.state);
@@ -4734,6 +5045,36 @@ mod tests {
     }
 
     #[test]
+    fn left_margin_labels_are_mirrored() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 1);
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: 0,
+        };
+
+        let backend = TestBackend::new(70, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = |y: u16| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+
+        let line = (0..buffer.area.height)
+            .map(row)
+            .find(|line| line.contains("[A") || line.contains("[B") || line.contains("[C"))
+            .unwrap_or_default();
+
+        assert!(line.contains("[A"));
+    }
+
+    #[test]
     fn widened_column_shows_full_cell_text() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
@@ -4875,8 +5216,103 @@ mod tests {
         app.add_sheet("Sheet2".into());
 
         assert_eq!(app.workbook.sheet_count(), 2);
-        assert_eq!(app.workbook.active_sheet, 1);
+        assert_eq!(app.view_sheet_id, 2);
         assert_eq!(app.workbook.sheet_title(1), "Sheet2");
+    }
+
+    #[test]
+    fn new_sheet_is_logged_for_live_file() {
+        let path = tempfile::NamedTempFile::new().unwrap();
+        let mut app = App::new(Some(path.path().to_path_buf()));
+
+        app.add_sheet("Sheet2".into());
+
+        let log = std::fs::read_to_string(path.path()).unwrap();
+        assert!(log.contains("$2:NEW_SHEET Sheet2"));
+    }
+
+    #[test]
+    fn workbook_edit_updates_visible_sheet_immediately() {
+        let path = tempfile::NamedTempFile::new().unwrap();
+        let mut app = App::new(Some(path.path().to_path_buf()));
+        app.add_sheet("Sheet2".into());
+
+        app.mode = Mode::Edit {
+            buffer: "Sheet2 value".into(),
+            formula_cursor: None,
+        };
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        };
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .unwrap();
+
+        assert_eq!(
+            app.workbook
+                .sheets
+                .iter()
+                .find(|sheet| sheet.id == 2)
+                .and_then(|sheet| sheet.state.grid.get(&CellAddr::Main { row: 0, col: 0 })),
+            Some("Sheet2 value")
+        );
+        assert_eq!(
+            app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }),
+            Some("Sheet2 value")
+        );
+    }
+
+    #[test]
+    fn ctrl_page_switch_works_in_edit_mode() {
+        let mut app = App::new(None);
+        app.add_sheet("Sheet2".into());
+        app.mode = Mode::Edit {
+            buffer: "x".into(),
+            formula_cursor: None,
+        };
+
+        app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::CONTROL))
+            .unwrap();
+        assert_eq!(app.view_sheet_id, 1);
+        assert!(matches!(app.mode, Mode::Edit { .. }));
+
+        app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::CONTROL))
+            .unwrap();
+
+        assert_eq!(app.view_sheet_id, 2);
+        assert!(matches!(app.mode, Mode::Edit { .. }));
+    }
+
+    #[test]
+    fn ctrl_page_switch_resets_edit_buffer_to_target_sheet() {
+        let mut app = App::new(None);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "sheet1".into());
+        app.add_sheet("Sheet2".into());
+        app.workbook
+            .sheets
+            .iter_mut()
+            .find(|sheet| sheet.id == 2)
+            .unwrap()
+            .state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "sheet2".into());
+        app.view_sheet_id = 1;
+        app.sync_active_sheet_cache();
+        app.mode = Mode::Edit {
+            buffer: "sheet1".into(),
+            formula_cursor: None,
+        };
+
+        app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::CONTROL))
+            .unwrap();
+
+        match app.mode {
+            Mode::Edit { buffer, .. } => assert_eq!(buffer, "sheet2"),
+            other => panic!("unexpected mode: {other:?}"),
+        }
     }
 
     #[test]

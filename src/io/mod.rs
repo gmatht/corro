@@ -2,7 +2,8 @@
 
 use crate::grid::CellAddr;
 use crate::ops::{
-    append_line, append_op, apply_line, replay_lines, Op, SheetState, WorkbookSnapshot,
+    append_line, append_op, apply_line, apply_log_line_to_workbook, replay_lines, Op, SheetState,
+    WorkbookOp, WorkbookSnapshot, WorkbookState,
 };
 use notify::{RecursiveMode, Watcher};
 use std::fs;
@@ -234,6 +235,58 @@ pub fn commit_line(
     append_line(path, line)?;
     *offset = tail_apply(path, *offset, state)?;
     Ok(())
+}
+
+pub fn commit_workbook_op(
+    path: &Path,
+    offset: &mut u64,
+    workbook: &mut WorkbookState,
+    active_sheet: &mut u32,
+    op: &WorkbookOp,
+) -> Result<(), IoError> {
+    append_line(path, &op.to_log_line())?;
+    *offset = tail_apply_workbook(path, *offset, workbook, active_sheet)?;
+    Ok(())
+}
+
+pub fn commit_sheet_log_line(
+    path: &Path,
+    offset: &mut u64,
+    workbook: &mut WorkbookState,
+    active_sheet: &mut u32,
+    line: &str,
+) -> Result<(), IoError> {
+    append_line(path, line)?;
+    *offset = tail_apply_workbook(path, *offset, workbook, active_sheet)?;
+    Ok(())
+}
+
+pub fn tail_apply_workbook(
+    path: &Path,
+    byte_offset: u64,
+    workbook: &mut WorkbookState,
+    active_sheet: &mut u32,
+) -> Result<u64, IoError> {
+    let meta = fs::metadata(path)?;
+    let len = meta.len();
+    if len < byte_offset {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "file shrank; full reload required",
+        )
+        .into());
+    }
+    if len == byte_offset {
+        return Ok(byte_offset);
+    }
+    let mut f = fs::File::open(path)?;
+    f.seek(SeekFrom::Start(byte_offset))?;
+    let mut rest = String::new();
+    f.read_to_string(&mut rest)?;
+    for line in rest.lines() {
+        apply_log_line_to_workbook(line, workbook, active_sheet)?;
+    }
+    Ok(len)
 }
 
 // ── Tabular import ───────────────────────────────────────────────────────────

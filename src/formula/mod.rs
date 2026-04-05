@@ -1,13 +1,14 @@
 //! `=...` cell formulas: parse, evaluate, display.
 
-use crate::addr::{excel_column_name, parse_cell_ref_at, parse_main_range_at};
+use crate::addr::{
+    excel_column_name, parse_cell_ref_at, parse_main_range_at, parse_sheet_qualified_cell_ref_at,
+};
 use crate::grid::{CellAddr, Grid, MainRange, HEADER_ROWS, MARGIN_COLS};
 use crate::ops::WorkbookState;
 use std::cell::RefCell;
 
 thread_local! {
     static EVAL_WORKBOOK: RefCell<Option<WorkbookState>> = const { RefCell::new(None) };
-    static EVAL_ACTIVE_SHEET_ID: RefCell<u32> = const { RefCell::new(0) };
 }
 
 pub struct EvalContextGuard;
@@ -15,27 +16,12 @@ pub struct EvalContextGuard;
 impl Drop for EvalContextGuard {
     fn drop(&mut self) {
         EVAL_WORKBOOK.with(|wb| *wb.borrow_mut() = None);
-        EVAL_ACTIVE_SHEET_ID.with(|id| *id.borrow_mut() = 0);
     }
 }
 
 pub fn set_eval_context(workbook: &WorkbookState) -> EvalContextGuard {
     EVAL_WORKBOOK.with(|wb| *wb.borrow_mut() = Some(workbook.clone()));
-    EVAL_ACTIVE_SHEET_ID.with(|id| {
-        *id.borrow_mut() = workbook.sheet_id(workbook.active_sheet);
-    });
     EvalContextGuard
-}
-
-fn current_eval_sheet_id() -> Option<u32> {
-    EVAL_ACTIVE_SHEET_ID.with(|id| {
-        let sheet_id = *id.borrow();
-        if sheet_id == 0 {
-            None
-        } else {
-            Some(sheet_id)
-        }
-    })
 }
 
 fn workbook_lookup(sheet_id: u32) -> Option<Grid> {
@@ -437,6 +423,14 @@ impl<'a> Parser<'a> {
 
         if rest.starts_with('#') {
             if let Some((sheet_id, addr, len)) = parse_sheet_qualified_ref(rest) {
+                self.i += len;
+                return Ok(Ast::SheetRef { sheet_id, addr });
+            }
+            return Err(());
+        }
+
+        if rest.starts_with('$') {
+            if let Some((sheet_id, addr, len)) = parse_sheet_qualified_cell_ref_at(rest) {
                 self.i += len;
                 return Ok(Ast::SheetRef { sheet_id, addr });
             }

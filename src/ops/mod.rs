@@ -1,6 +1,9 @@
 //! Append-only log operations and replay onto [`SheetState`].
 
-use crate::addr::parse_excel_column;
+use crate::addr::{
+    parse_cell_ref_at, parse_excel_column, parse_sheet_id_prefix_at,
+    parse_sheet_qualified_cell_ref_at,
+};
 use crate::grid::{CellAddr, Grid, MainRange, SortSpec, MARGIN_COLS};
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -105,6 +108,25 @@ impl WorkbookState {
         self.sheets.push(SheetRecord { id, title, state });
         self.sheets.len() - 1
     }
+
+    pub fn add_sheet_record(&mut self, record: SheetRecord) -> usize {
+        self.next_sheet_id = self.next_sheet_id.max(record.id.saturating_add(1));
+        self.sheets.push(record);
+        self.sheets.len() - 1
+    }
+
+    pub fn sheet_index_by_id(&self, id: u32) -> Option<usize> {
+        self.sheets.iter().position(|s| s.id == id)
+    }
+
+    pub fn sheet_mut_by_index(&mut self, index: usize) -> Option<&mut SheetState> {
+        self.sheets.get_mut(index).map(|sheet| &mut sheet.state)
+    }
+
+    pub fn sheet_mut_by_id(&mut self, id: u32) -> Option<&mut SheetState> {
+        let index = self.sheet_index_by_id(id)?;
+        self.sheets.get_mut(index).map(|sheet| &mut sheet.state)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -125,6 +147,10 @@ pub enum WorkbookOp {
     ActivateSheet { id: u32 },
     RenameSheet { id: u32, title: String },
     SheetOp { sheet_id: u32, op: Op },
+}
+
+fn sheet_prefix(sheet_id: u32) -> String {
+    format!("${sheet_id}:")
 }
 
 #[derive(Clone, Debug)]
@@ -219,7 +245,9 @@ fn parse_op_text(line: &str) -> Option<Op> {
         "SET" => {
             let addr = parts.next()?;
             let value = parts.collect::<Vec<_>>().join(" ");
-            let (addr, _) = crate::addr::parse_cell_ref_at(addr)?;
+            let (addr, _) = crate::addr::parse_sheet_qualified_cell_ref_at(addr)
+                .map(|(_, addr, len)| (addr, len))
+                .or_else(|| crate::addr::parse_cell_ref_at(addr))?;
             Some(Op::SetCell { addr, value })
         }
         "MOVE" => {
@@ -254,6 +282,174 @@ fn parse_op_text(line: &str) -> Option<Op> {
             Some(Op::SetViewSortCols { cols })
         }
         _ => None,
+    }
+}
+
+pub fn parse_op_line(line: &str) -> Option<Op> {
+    parse_op_text(line)
+}
+
+impl Op {
+    pub fn to_log_line(&self) -> String {
+        match self {
+            Op::SetCell { addr, value } => format!("SET {} {}", addr_text(addr), value),
+            Op::MoveRowRange { from, count, to } => format!("MOVE ROW {from} {count} {to}"),
+            Op::MoveColRange { from, count, to } => format!("MOVE COL {from} {count} {to}"),
+            Op::SetMainSize {
+                main_rows,
+                main_cols,
+            } => format!("SIZE {main_rows} {main_cols}"),
+            Op::SetMaxColWidth { width } => format!("MAX_COL_WIDTH {width}"),
+            Op::SetColWidth { col, width } => {
+                let name =
+                    crate::addr::excel_column_name(col.saturating_sub(crate::grid::MARGIN_COLS));
+                match width {
+                    Some(w) => format!("COL_WIDTH {name} {w}"),
+                    None => format!("COL_WIDTH {name}"),
+                }
+            }
+            Op::SetViewSortCols { cols } => format!(
+                "SORT {}",
+                cols.iter()
+                    .map(|spec| {
+                        let name =
+                            crate::addr::excel_column_name(spec.col.saturating_sub(MARGIN_COLS));
+                        if spec.desc {
+                            format!("!{name}")
+                        } else {
+                            name
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ),
+            Op::Undo { target } => format!("UNDO {target}"),
+        }
+    }
+}
+
+impl WorkbookOp {
+    pub fn to_log_line(&self) -> String {
+        match self {
+            WorkbookOp::NewSheet { id, title } => format!("${id}:NEW_SHEET {title}"),
+            WorkbookOp::ActivateSheet { id } => format!("${id}:ACTIVATE_SHEET"),
+            WorkbookOp::RenameSheet { id, title } => format!("${id}:RENAME_SHEET {title}"),
+            WorkbookOp::SheetOp { sheet_id, op } => match op {
+                Op::SetCell { addr, value } => {
+                    format!("SET ${sheet_id}:{} {value}", addr_text(addr))
+                }
+                _ => format!("{}{}", sheet_prefix(*sheet_id), op.to_log_line()),
+            },
+        }
+    }
+}
+
+fn parse_sheet_set_addr(addr: &str) -> Option<(u32, CellAddr, usize)> {
+    if let Some(parsed) = parse_sheet_qualified_cell_ref_at(addr) {
+        return Some(parsed);
+    }
+
+    let (sheet_id, prefix_len) = parse_sheet_id_prefix_at(addr)?;
+    let rest = addr.get(prefix_len..)?;
+    let cell_ref = rest.strip_prefix("::")?;
+    let (cell_addr, cell_len) = parse_cell_ref_at(cell_ref)?;
+    Some((sheet_id, cell_addr, prefix_len + 2 + cell_len))
+}
+
+pub fn parse_workbook_line(line: &str) -> Result<WorkbookOp, std::io::Error> {
+    let t = line.trim();
+    if let Some(rest) = t.strip_prefix("SET ") {
+        let mut parts = rest.split_whitespace();
+        let addr = parts
+            .next()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad SET line"))?;
+        if let Some((sheet_id, addr, len)) = parse_sheet_set_addr(addr) {
+            let value = rest.get(len..).unwrap_or("").trim_start().to_string();
+            return Ok(WorkbookOp::SheetOp {
+                sheet_id,
+                op: Op::SetCell { addr, value },
+            });
+        }
+    }
+    let (sheet_id, prefix_len) = parse_sheet_id_prefix_at(t)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "missing sheet id"))?;
+    let rest = t
+        .get(prefix_len..)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad sheet prefix"))?;
+    let rest = rest
+        .strip_prefix(':')
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad sheet prefix"))?;
+    let mut parts = rest.split_whitespace();
+    let cmd = parts
+        .next()
+        .map(|s| s.to_ascii_uppercase())
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "empty line"))?;
+    let bad = |msg: &'static str| std::io::Error::new(std::io::ErrorKind::InvalidData, msg);
+
+    match cmd.as_str() {
+        "NEW_SHEET" => {
+            let title = parts.collect::<Vec<_>>().join(" ");
+            Ok(WorkbookOp::NewSheet {
+                id: sheet_id,
+                title,
+            })
+        }
+        "ACTIVATE_SHEET" => Ok(WorkbookOp::ActivateSheet { id: sheet_id }),
+        "RENAME_SHEET" => {
+            let title = parts.collect::<Vec<_>>().join(" ");
+            Ok(WorkbookOp::RenameSheet {
+                id: sheet_id,
+                title,
+            })
+        }
+        _ => {
+            let op = parse_op_line(rest).ok_or_else(|| bad("bad sheet op line"))?;
+            Ok(WorkbookOp::SheetOp { sheet_id, op })
+        }
+    }
+}
+
+pub fn apply_workbook_op(
+    workbook: &mut WorkbookState,
+    active_sheet: &mut u32,
+    op: WorkbookOp,
+) -> Result<(), std::io::Error> {
+    let bad = |msg: &'static str| std::io::Error::new(std::io::ErrorKind::InvalidData, msg);
+    match op {
+        WorkbookOp::NewSheet { id, title } => {
+            if workbook.sheet_index_by_id(id).is_none() {
+                workbook.add_sheet_record(SheetRecord {
+                    id,
+                    title,
+                    state: SheetState::new(1, 1),
+                });
+            }
+            Ok(())
+        }
+        WorkbookOp::ActivateSheet { id } => {
+            let idx = workbook
+                .sheet_index_by_id(id)
+                .ok_or_else(|| bad("unknown sheet id"))?;
+            workbook.active_sheet = idx;
+            *active_sheet = id;
+            Ok(())
+        }
+        WorkbookOp::RenameSheet { id, title } => {
+            let sheet = workbook
+                .sheets
+                .iter_mut()
+                .find(|s| s.id == id)
+                .ok_or_else(|| bad("unknown sheet id"))?;
+            sheet.title = title;
+            Ok(())
+        }
+        WorkbookOp::SheetOp { sheet_id, op } => {
+            let sheet = workbook
+                .sheet_mut_by_id(sheet_id)
+                .ok_or_else(|| bad("unknown sheet id"))?;
+            op.apply(sheet);
+            Ok(())
+        }
     }
 }
 
@@ -321,6 +517,34 @@ pub fn apply_line(line: &str, state: &mut SheetState) -> Result<(), std::io::Err
         return Ok(());
     }
     apply_any_line(t, state)
+}
+
+pub fn apply_log_line_to_workbook(
+    line: &str,
+    workbook: &mut WorkbookState,
+    active_sheet: &mut u32,
+) -> Result<(), std::io::Error> {
+    let t = line.trim();
+    if t.is_empty() {
+        return Ok(());
+    }
+    if let Ok(op) = parse_workbook_line(t) {
+        return apply_workbook_op(workbook, active_sheet, op);
+    }
+    if let Some(op) = parse_op_line(t) {
+        return apply_workbook_op(
+            workbook,
+            active_sheet,
+            WorkbookOp::SheetOp {
+                sheet_id: *active_sheet,
+                op,
+            },
+        );
+    }
+    let sheet = workbook.sheet_mut_by_id(*active_sheet).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "unknown active sheet")
+    })?;
+    apply_any_line(t, sheet)
 }
 
 fn apply_any_line(line: &str, state: &mut SheetState) -> Result<(), std::io::Error> {
@@ -503,5 +727,32 @@ mod tests {
         let mut s = SheetState::new(1, 1);
         apply_line("TOTAL", &mut s).unwrap();
         apply_line("SUM", &mut s).unwrap();
+    }
+
+    #[test]
+    fn workbook_sheet_set_log_line_uses_single_colon() {
+        let op = WorkbookOp::SheetOp {
+            sheet_id: 2,
+            op: Op::SetCell {
+                addr: CellAddr::Main { row: 1, col: 0 },
+                value: "is A2".into(),
+            },
+        };
+        assert_eq!(op.to_log_line(), "SET $2:A2 is A2");
+    }
+
+    #[test]
+    fn workbook_sheet_set_parser_accepts_legacy_double_colon() {
+        let op = parse_workbook_line("SET $2::A2 is A2").unwrap();
+        assert_eq!(
+            op,
+            WorkbookOp::SheetOp {
+                sheet_id: 2,
+                op: Op::SetCell {
+                    addr: CellAddr::Main { row: 1, col: 0 },
+                    value: "is A2".into(),
+                },
+            }
+        );
     }
 }
