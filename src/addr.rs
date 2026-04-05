@@ -86,9 +86,9 @@ pub fn parse_cell_ref_at(s: &str) -> Option<(CellAddr, usize)> {
         ));
     }
 
-    // Header/footer: ^<row>[COL] / _<row>[COL], where COL is absolute sheet column letters.
-    if bytes[0] == b'^' || bytes[0] == b'_' {
-        let is_header = bytes[0] == b'^';
+    // Header/footer: ~<row>[COL] / _<row>[COL], where COL is absolute sheet column letters.
+    if bytes[0] == b'~' || bytes[0] == b'_' {
+        let is_header = bytes[0] == b'~';
         let rest = &s[1..];
         let row_digits = rest.chars().take_while(|c| c.is_ascii_digit()).count();
         if row_digits > 0 {
@@ -218,7 +218,7 @@ mod tests {
 
     #[test]
     fn legacy_special_refs_parse() {
-        assert_eq!(parse_cell_ref_at("^1A").unwrap().1, 3);
+        assert_eq!(parse_cell_ref_at("~1A").unwrap().1, 3);
         assert_eq!(parse_cell_ref_at("_1A").unwrap().1, 3);
         assert_eq!(parse_cell_ref_at("[A1").unwrap().1, 3);
         assert_eq!(parse_cell_ref_at("]A1").unwrap().1, 3);

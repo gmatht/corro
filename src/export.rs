@@ -131,7 +131,7 @@ fn col_header_label(global_col: usize, main_cols: usize) -> String {
 fn sheet_row_label(logical_row: usize, main_rows: usize) -> String {
     let hr = HEADER_ROWS;
     if logical_row < hr {
-        format!("^{}", (b'Z' - logical_row as u8) as char)
+        format!("~{}", (b'Z' - logical_row as u8) as char)
     } else if logical_row < hr + main_rows {
         format!("{}", logical_row - hr + 1)
     } else {

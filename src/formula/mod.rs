@@ -344,7 +344,7 @@ impl<'a> Parser<'a> {
         let rest = &self.s[self.i..];
 
         // Region-style refs
-        if rest.starts_with('^')
+        if rest.starts_with('~')
             || rest.starts_with('_')
             || rest.starts_with('<')
             || rest.starts_with('>')

@@ -1,4 +1,4 @@
-//! Five-region sheet layout: headers ^A–^Z, footers _A–_Z, margins <0–<9 and >0–>9, and main data.
+//! Five-region sheet layout: headers ~A–~Z, footers _A–_Z, margins <0–<9 and >0–>9, and main data.
 //! Main and margin cells use sparse storage for unbounded logical size.
 
 use serde::{Deserialize, Serialize};
@@ -13,7 +13,7 @@ pub const MARGIN_COLS: usize = 10;
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CellAddr {
-    /// `^` row: `row` 0 = ^A … 25 = ^Z; `col` is global column index.
+    /// `~` row: `row` 0 = ~A … 25 = ~Z; `col` is global column index.
     Header { row: u8, col: u32 },
     /// `_` row: same indexing as headers.
     Footer { row: u8, col: u32 },
@@ -29,7 +29,7 @@ impl fmt::Display for CellAddr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             CellAddr::Header { row, col } => {
-                write!(f, "^{}(col {})", header_label(*row), col)
+                write!(f, "~{}(col {})", header_label(*row), col)
             }
             CellAddr::Footer { row, col } => {
                 write!(f, "_{}(col {})", header_label(*row), col)

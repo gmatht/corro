@@ -88,7 +88,7 @@ impl Op {
 fn addr_text(addr: &CellAddr) -> String {
     match addr {
         CellAddr::Header { row, col } => format!(
-            "^{}{}",
+            "~{}{}",
             crate::grid::HEADER_ROWS - *row as usize,
             crate::addr::excel_column_name(*col as usize)
         ),

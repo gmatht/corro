@@ -22,7 +22,7 @@ use std::io::{self, stdout};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
-/// Width of the row-label gutter (`^1`, ` 1 `, `_1`).
+/// Width of the row-label gutter (`~1`, ` 1 `, `_1`).
 const ROW_LABEL_CHARS: usize = 5;
 /// Fixed cell display width in terminal columns.
 const CELL_W: usize = 12;
@@ -720,7 +720,7 @@ Help menu\n\
 - Full help opens this page.\n\n\
 Address syntax\n\
 - Main cell: A1\n\
-- Header cell: ^1A\n\
+ - Header cell: ~1A\n\
 - Footer cell: _1A\n\
 - Left margin: [A1\n\
 - Right margin: ]A1\n\
@@ -1917,7 +1917,7 @@ impl App {
     fn formula_ref_for_addr(&self, addr: &CellAddr) -> String {
         match addr {
             CellAddr::Header { row, col } => format!(
-                "^{}{}",
+                "~{}{}",
                 HEADER_ROWS - *row as usize,
                 formula_col_fragment(*col as usize, self.state.grid.main_cols())
             ),
@@ -4686,7 +4686,7 @@ mod tests {
 fn addr_label(addr: &CellAddr, main_cols: usize) -> String {
     match addr {
         CellAddr::Header { row, col } => format!(
-            "^{}:{}",
+            "~{}:{}",
             HEADER_ROWS - *row as usize,
             col_header_label(*col as usize, main_cols)
         ),
@@ -4718,7 +4718,7 @@ fn addr_label(addr: &CellAddr, main_cols: usize) -> String {
 fn sheet_row_label(logical_row: usize, main_rows: usize) -> String {
     let hr = HEADER_ROWS;
     if logical_row < hr {
-        format!("^{}", hr - logical_row)
+        format!("~{}", hr - logical_row)
     } else if logical_row < hr + main_rows {
         format!("{}", logical_row - hr + 1)
     } else {
