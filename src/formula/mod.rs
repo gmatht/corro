@@ -7,6 +7,8 @@ use crate::grid::{CellAddr, Grid, MainRange, HEADER_ROWS, MARGIN_COLS};
 use crate::ops::WorkbookState;
 use std::cell::RefCell;
 
+mod functions;
+
 thread_local! {
     static EVAL_WORKBOOK: RefCell<Option<WorkbookState>> = const { RefCell::new(None) };
 }
@@ -636,90 +638,7 @@ fn eval_ast(
             x.powf(y)
         }),
         Ast::Call { name, args } => {
-            let u = name.to_ascii_uppercase();
-            match u.as_str() {
-                "SUM" => {
-                    if args.len() != 1 {
-                        return EvalResult::Error("ARGS");
-                    }
-                    eval_sum(&args[0], grid, visiting, budget, allow_templates)
-                }
-                "AVERAGE" => eval_numeric_aggregate(
-                    &args,
-                    grid,
-                    visiting,
-                    budget,
-                    allow_templates,
-                    NumericAgg::Average,
-                ),
-                "MIN" => eval_numeric_aggregate(
-                    &args,
-                    grid,
-                    visiting,
-                    budget,
-                    allow_templates,
-                    NumericAgg::Min,
-                ),
-                "MAX" => eval_numeric_aggregate(
-                    &args,
-                    grid,
-                    visiting,
-                    budget,
-                    allow_templates,
-                    NumericAgg::Max,
-                ),
-                "COUNT" => eval_count(&args, grid, visiting, budget, allow_templates),
-                "COUNTA" => eval_counta(&args, grid, visiting, budget, allow_templates),
-                "PRODUCT" => eval_numeric_aggregate(
-                    &args,
-                    grid,
-                    visiting,
-                    budget,
-                    allow_templates,
-                    NumericAgg::Product,
-                ),
-                "ABS" => {
-                    eval_unary_numeric(&args, grid, visiting, budget, allow_templates, f64::abs)
-                }
-                "ROUND" => eval_round(&args, grid, visiting, budget, allow_templates),
-                "MOD" => {
-                    eval_binary_numeric(&args, grid, visiting, budget, allow_templates, |x, y| {
-                        x % y
-                    })
-                }
-                "SQRT" => {
-                    eval_unary_numeric(&args, grid, visiting, budget, allow_templates, f64::sqrt)
-                }
-                "PI" => {
-                    if !args.is_empty() {
-                        EvalResult::Error("ARGS")
-                    } else {
-                        EvalResult::Number(std::f64::consts::PI)
-                    }
-                }
-                "SIN" => {
-                    eval_unary_numeric(&args, grid, visiting, budget, allow_templates, f64::sin)
-                }
-                "COS" => {
-                    eval_unary_numeric(&args, grid, visiting, budget, allow_templates, f64::cos)
-                }
-                "TRIM" => eval_trim(&args, grid, visiting, budget, allow_templates),
-                "COUNTIF" => eval_countif(&args, grid, visiting, budget, allow_templates),
-                "SUMIF" => eval_sumif(&args, grid, visiting, budget, allow_templates),
-                "IF" => {
-                    if args.len() != 3 {
-                        return EvalResult::Error("ARGS");
-                    }
-                    let cond = eval_ast(&args[0], grid, visiting, budget, allow_templates);
-                    let pick = truthy(cond);
-                    if pick {
-                        eval_ast(&args[1], grid, visiting, budget, allow_templates)
-                    } else {
-                        eval_ast(&args[2], grid, visiting, budget, allow_templates)
-                    }
-                }
-                _ => EvalResult::Error("FUNC"),
-            }
+            functions::eval_builtin(name, args, grid, visiting, budget, allow_templates)
         }
     }
 }

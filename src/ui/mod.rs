@@ -2886,7 +2886,6 @@ impl App {
                 spans.push(Span::styled(format!("{:>w$}", name, w = w), style));
                 if c == lm - 1 && lm > 0 && col_ixs.contains(&lm) {
                     spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
-                    spans.push(Span::raw(" "));
                 }
             }
             lines.push(Line::from(spans));
@@ -5645,7 +5644,7 @@ mod tests {
             " [File]   Insert    Help\n",
             " A1  Hello World   ·  Loaded workbook test5.corro\n",
             "┌ corro  13r × 2c  ops 221─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐\n",
-            "│                       [A│            A            B                  ]A                  ]B                  ]C                          │\n",
+            "│                       [A│           A            B                  ]A                  ]B                  ]C                           │\n",
             "│  ~1                     │            POW2         TOTAL               MAX                                                                │\n",
             "│   1                     │Hello World #VALUE                                                                                              │\n",
             "│   2                     │[B          #VALUE                                                                                              │\n",
