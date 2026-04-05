@@ -232,6 +232,7 @@ enum Ast {
     Sub(Box<Ast>, Box<Ast>),
     Mul(Box<Ast>, Box<Ast>),
     Div(Box<Ast>, Box<Ast>),
+    Pow(Box<Ast>, Box<Ast>),
     Call {
         name: String,
         args: Vec<Ast>,
@@ -311,7 +312,18 @@ impl<'a> Parser<'a> {
             let inner = self.parse_unary()?;
             return Ok(Ast::Neg(Box::new(inner)));
         }
-        self.parse_primary()
+        self.parse_power()
+    }
+
+    fn parse_power(&mut self) -> Result<Ast, ()> {
+        let left = self.parse_primary()?;
+        self.skip_ws();
+        if self.peek() == Some(b'^') {
+            self.i += 1;
+            let right = self.parse_unary()?;
+            return Ok(Ast::Pow(Box::new(left), Box::new(right)));
+        }
+        Ok(left)
     }
 
     fn parse_primary(&mut self) -> Result<Ast, ()> {
@@ -481,6 +493,9 @@ fn eval_ast(
                 x / y
             }
         }),
+        Ast::Pow(a, b) => eval_binary(a, b, grid, visiting, budget, allow_templates, |x, y| {
+            x.powf(y)
+        }),
         Ast::Call { name, args } => {
             let u = name.to_ascii_uppercase();
             match u.as_str() {
@@ -572,7 +587,8 @@ fn eval_sum(
         | Ast::Add(_, _)
         | Ast::Sub(_, _)
         | Ast::Mul(_, _)
-        | Ast::Div(_, _) => match eval_ast(arg, grid, visiting, budget, allow_templates) {
+        | Ast::Div(_, _)
+        | Ast::Pow(_, _) => match eval_ast(arg, grid, visiting, budget, allow_templates) {
             EvalResult::Number(n) => EvalResult::Number(n),
             EvalResult::Text(s) => {
                 if let Some(n) = parse_number_literal(&s) {
@@ -645,6 +661,49 @@ mod tests {
         match eval_cell(&g, &CellAddr::Main { row: 0, col: 0 }, &mut v, &mut b) {
             EvalResult::Number(n) => assert!((n - 7.0).abs() < 1e-9),
             e => panic!("expected number {:?}", e),
+        }
+    }
+
+    #[test]
+    fn formula_pow() {
+        let mut g = Grid::new(1, 1);
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "=2^3".into());
+        g.set(&CellAddr::Main { row: 0, col: 1 }, "=4^0.5".into());
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 0 }, &mut v, &mut b) {
+            EvalResult::Number(n) => assert!((n - 8.0).abs() < 1e-9),
+            e => panic!("expected 8 {:?}", e),
+        }
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 1 }, &mut v, &mut b) {
+            EvalResult::Number(n) => assert!((n - 2.0).abs() < 1e-9),
+            e => panic!("expected 2 {:?}", e),
+        }
+    }
+
+    #[test]
+    fn power_is_right_associative() {
+        let mut g = Grid::new(1, 1);
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "=2^3^2".into());
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 0 }, &mut v, &mut b) {
+            EvalResult::Number(n) => assert!((n - 512.0).abs() < 1e-9),
+            e => panic!("expected 512 {:?}", e),
+        }
+    }
+
+    #[test]
+    fn unary_minus_binds_weaker_than_power() {
+        let mut g = Grid::new(1, 1);
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "=-2^2".into());
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 0 }, &mut v, &mut b) {
+            EvalResult::Number(n) => assert!((n + 4.0).abs() < 1e-9),
+            e => panic!("expected -4 {:?}", e),
         }
     }
 

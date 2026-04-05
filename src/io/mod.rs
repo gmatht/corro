@@ -24,6 +24,31 @@ pub fn load_full(path: &Path, state: &mut SheetState) -> Result<(u64, usize), Io
     Ok((data.len() as u64, n))
 }
 
+/// Load at most `limit` non-empty log lines from disk and replay into `state`.
+pub fn load_revisions(
+    path: &Path,
+    limit: usize,
+    state: &mut SheetState,
+) -> Result<(u64, usize), IoError> {
+    let data = fs::read_to_string(path)?;
+    if limit == 0 {
+        return Ok((data.len() as u64, 0));
+    }
+    let mut n = 0usize;
+    for line in data.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        apply_line(t, state)?;
+        n += 1;
+        if n >= limit {
+            break;
+        }
+    }
+    Ok((data.len() as u64, n))
+}
+
 /// Read new bytes from `path` starting at `byte_offset`, apply appended log lines, return new EOF offset.
 pub fn tail_apply(path: &Path, byte_offset: u64, state: &mut SheetState) -> Result<u64, IoError> {
     let meta = fs::metadata(path)?;
@@ -277,10 +302,10 @@ mod tests {
     #[test]
     fn load_legacy_test5_corro() {
         let mut state = SheetState::new(1, 1);
-        let (off, n) = load_full(Path::new("test5.corro"), &mut state).unwrap();
+        let (off, n) = load_revisions(Path::new("test5.corro"), 2, &mut state).unwrap();
 
         assert!(off > 0);
-        assert!(n > 0);
+        assert_eq!(n, 2);
         assert_eq!(
             state.grid.get(&CellAddr::Main { row: 0, col: 0 }),
             Some("1")
@@ -293,6 +318,34 @@ mod tests {
             state.grid.get(&CellAddr::Header { row: 25, col: 10 }),
             Some("")
         );
+    }
+
+    #[test]
+    fn load_revisions_zero_loads_nothing() {
+        let mut state = SheetState::new(1, 1);
+        let (off, n) = load_revisions(Path::new("test5.corro"), 0, &mut state).unwrap();
+
+        assert!(off > 0);
+        assert_eq!(n, 0);
+        assert_eq!(state.grid.get(&CellAddr::Main { row: 0, col: 0 }), None);
+    }
+
+    #[test]
+    fn load_revisions_limits_replay() {
+        let mut state = SheetState::new(1, 1);
+        let (off, n) = load_revisions(Path::new("test5.corro"), 2, &mut state).unwrap();
+
+        assert!(off > 0);
+        assert_eq!(n, 2);
+        assert_eq!(
+            state.grid.get(&CellAddr::Main { row: 0, col: 0 }),
+            Some("1")
+        );
+        assert_eq!(
+            state.grid.get(&CellAddr::Main { row: 1, col: 0 }),
+            Some("7")
+        );
+        assert_eq!(state.grid.get(&CellAddr::Main { row: 2, col: 0 }), None);
     }
 
     #[test]

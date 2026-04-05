@@ -10,6 +10,10 @@ use std::path::PathBuf;
     about = "Terminal spreadsheet with append-only text log"
 )]
 struct Args {
+    /// Load at most this many revisions from a log file.
+    #[arg(short = 'r', long = "revision", value_name = "N")]
+    revision: Option<usize>,
+
     /// Path to the `.corro` log file. Created on first write.
     #[arg(value_name = "FILE")]
     file: Option<PathBuf>,
@@ -24,8 +28,24 @@ fn main() {
 
 fn try_main() -> Result<(), corro::ui::RunError> {
     let args = Args::parse();
-    let mut app = App::new(args.file);
+    let mut app = App::new_with_revision_limit(args.file, args.revision);
     app.load_initial()?;
     app.run()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Args;
+    use clap::Parser;
+
+    #[test]
+    fn parses_revision_limit() {
+        let args = Args::parse_from(["corro", "--revision", "2", "test5.corro"]);
+        assert_eq!(args.revision, Some(2));
+        assert_eq!(
+            args.file.as_deref(),
+            Some(std::path::Path::new("test5.corro"))
+        );
+    }
 }

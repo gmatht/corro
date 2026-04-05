@@ -6,7 +6,9 @@ use crate::export;
 use crate::formula::{cell_effective_display, is_formula};
 use crate::grid::MainRange;
 use crate::grid::{CellAddr, Grid, SortSpec, FOOTER_ROWS, HEADER_ROWS, MARGIN_COLS};
-use crate::io::{commit_line, commit_op, load_full, tail_apply, IoError, LogWatcher};
+use crate::io::{
+    commit_line, commit_op, load_full, load_revisions, tail_apply, IoError, LogWatcher,
+};
 use crate::ops::{AggFunc, AggregateDef, Op, SheetState};
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -1226,6 +1228,7 @@ fn copy_to_clipboard(text: &str) -> Result<(), String> {
 
 pub struct App {
     pub path: Option<PathBuf>,
+    revision_limit: Option<usize>,
     pub offset: u64,
     pub state: SheetState,
     pub cursor: SheetCursor,
@@ -1247,8 +1250,13 @@ pub struct App {
 
 impl App {
     pub fn new(path: Option<PathBuf>) -> Self {
+        Self::new_with_revision_limit(path, None)
+    }
+
+    pub fn new_with_revision_limit(path: Option<PathBuf>, revision_limit: Option<usize>) -> Self {
         App {
             path,
+            revision_limit,
             offset: 0,
             state: SheetState::new(1, 1),
             cursor: SheetCursor {
@@ -1298,7 +1306,10 @@ impl App {
                         self.status = format!("Imported CSV {}", p.display());
                     }
                     _ => {
-                        let (off, n) = load_full(p, &mut self.state)?;
+                        let (off, n) = match self.revision_limit {
+                            Some(limit) => load_revisions(p, limit, &mut self.state)?,
+                            None => load_full(p, &mut self.state)?,
+                        };
                         for c in 0..self.state.grid.main_cols() {
                             self.state.grid.auto_fit_column(MARGIN_COLS + c);
                         }
@@ -1443,7 +1454,10 @@ impl App {
                         }
                         Err(_) => {
                             self.state = SheetState::new(1, 1);
-                            let (off, n) = load_full(p, &mut self.state)?;
+                            let (off, n) = match self.revision_limit {
+                                Some(limit) => load_revisions(p, limit, &mut self.state)?,
+                                None => load_full(p, &mut self.state)?,
+                            };
                             self.offset = off;
                             self.ops_applied = n;
                             self.status = "File reset; full reload".into();
@@ -3211,7 +3225,11 @@ impl App {
                                 }
                             }
                             _ => {
-                                if let Ok((off, n)) = load_full(&path, &mut self.state) {
+                                let loaded = match self.revision_limit {
+                                    Some(limit) => load_revisions(&path, limit, &mut self.state),
+                                    None => load_full(&path, &mut self.state),
+                                };
+                                if let Ok((off, n)) = loaded {
                                     self.offset = off;
                                     self.ops_applied = n;
                                 }
@@ -4182,11 +4200,11 @@ mod tests {
 
     #[test]
     fn total_row_and_total_column_intersection_sums_row_totals() {
-        use crate::io::load_full;
+        use crate::io::load_revisions;
         use std::path::Path;
 
         let mut state = SheetState::new(1, 1);
-        load_full(Path::new("test5.corro"), &mut state).unwrap();
+        load_revisions(Path::new("test5.corro"), 141, &mut state).unwrap();
 
         assert_eq!(
             footer_special_col_aggregate(
