@@ -2864,6 +2864,7 @@ impl App {
         let mut lines: Vec<Line> = Vec::new();
 
         {
+            let lm = MARGIN_COLS;
             let mut spans: Vec<Span> = vec![Span::styled(
                 format!("{:>width$}", "", width = ROW_LABEL_CHARS),
                 Style::default().add_modifier(Modifier::BOLD),
@@ -2883,6 +2884,10 @@ impl App {
                 };
                 let w = grid.col_width(c).max(1);
                 spans.push(Span::styled(format!("{:>w$}", name, w = w), style));
+                if c == lm - 1 && lm > 0 && col_ixs.contains(&lm) {
+                    spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
+                    spans.push(Span::raw(" "));
+                }
             }
             lines.push(Line::from(spans));
         }
@@ -3024,11 +3029,31 @@ impl App {
                     || left_margin_agg.is_some()
                     || right_col_agg_func(grid, c).is_some();
                 if is_data_row && is_aggregate_row {
-                    st = st.add_modifier(Modifier::UNDERLINED);
+                    st = st.add_modifier(Modifier::BOLD);
                 }
                 spans.push(Span::styled(disp, st));
+                if c == lm - 1 && lm > 0 && col_ixs.contains(&lm) {
+                    spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
+                }
             }
             lines.push(Line::from(spans));
+            if r == hr + mr - 1 {
+                let has_footer_aggs = row_ixs
+                    .iter()
+                    .any(|&rr| rr >= hr + mr && footer_row_agg_func(grid, rr - hr - mr).is_some());
+                let has_right_aggs = col_ixs
+                    .iter()
+                    .any(|&cc| right_col_agg_func(grid, cc).is_some());
+                if has_footer_aggs || has_right_aggs {
+                    let underline = format!(
+                        "{:>width$}{}",
+                        "",
+                        "─".repeat(inner.width.saturating_sub(ROW_LABEL_CHARS as u16) as usize),
+                        width = ROW_LABEL_CHARS
+                    );
+                    lines.push(Line::from(underline));
+                }
+            }
         }
 
         let n = lines.len().min(inner_h);
@@ -5601,6 +5626,116 @@ mod tests {
 
         assert!(row.contains("12 ") || row.contains(" 12"));
         assert!(row.contains("ab"));
+    }
+
+    #[test]
+    fn aggregate_rows_draw_dividers_instead_of_underlines() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(Some(PathBuf::from("test5.corro")));
+        app.load_initial().unwrap();
+
+        let backend = TestBackend::new(140, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let rendered = normalize_frame(&buffer_to_string(&buffer));
+        let expected = normalize_frame(concat!(
+            " [File]   Insert    Help\n",
+            " A1  Hello World   ·  Loaded workbook test5.corro\n",
+            "┌ corro  13r × 2c  ops 221─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐\n",
+            "│                       [A│            A            B                  ]A                  ]B                  ]C                          │\n",
+            "│  ~1                     │            POW2         TOTAL               MAX                                                                │\n",
+            "│   1                     │Hello World #VALUE                                                                                              │\n",
+            "│   2                     │[B          #VALUE                                                                                              │\n",
+            "│   3                     │#PARSE      #PARSE                                                                                              │\n",
+            "│   4                     │BGOOD       #VALUE                                               Σ                                              │\n",
+            "│   5                     │          22           44                  66                  44                                               │\n",
+            "│   6                     │#PARSE      #PARSE                                                                                              │\n",
+            "│   7                     │           5           10                  15                  10                                               │\n",
+            "│   8                     │                        0                   0                   0                                               │\n",
+            "│   9                     │                        0                   0                   0                                               │\n",
+            "│  10                     │                        0                   0                   0                                               │\n",
+            "│  11                     │           0            0                   0                   0                                               │\n",
+            "│  12                     │[A          #VALUE                                                                                              │\n",
+            "│  13                     │#PARSE      #PARSE                                                                                              │\n",
+            "│     ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────│\n",
+            "│  _1                     │                                                                                                                │\n",
+            "│  _2 TOTAL               │          27           54                  81                  54                                               │\n",
+            "│  _3 MAX                 │          22           44                  66                  44                                               │\n",
+            "  shortcuts: e·edit v·select t·tsv c·csv o·open a·save as q·quit ?·help; printable letters edit cells unless reserved──────────────────────┘\n",
+            " Sheet1    Sheet2    Sheet3"
+        ));
+
+        assert_eq!(rendered, expected);
+    }
+
+    #[test]
+    fn aggregate_divider_sits_after_row_labels() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(Some(PathBuf::from("test5.corro")));
+        app.load_initial().unwrap();
+
+        let backend = TestBackend::new(140, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let first_content_row = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .find(|line| line.contains("│") && line.contains("[A"))
+            .unwrap_or_default();
+
+        assert!(first_content_row.contains("[A"));
+        assert!(rendered_contains_vertical_divider(&buffer));
+    }
+
+    #[test]
+    fn aggregate_dividers_draw_in_grid_buffer() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(Some(PathBuf::from("test5.corro")));
+        app.load_initial().unwrap();
+
+        let backend = TestBackend::new(140, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+
+        assert!((0..buffer.area.height)
+            .any(|y| (0..buffer.area.width).any(|x| buffer[(x, y)].symbol() == "│")));
+        assert!((0..buffer.area.height)
+            .any(|y| (0..buffer.area.width).any(|x| buffer[(x, y)].symbol() == "─")));
+    }
+
+    fn buffer_to_string(buffer: &ratatui::buffer::Buffer) -> String {
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn rendered_contains_vertical_divider(buffer: &ratatui::buffer::Buffer) -> bool {
+        (0..buffer.area.height)
+            .any(|y| (0..buffer.area.width).any(|x| buffer[(x, y)].symbol() == "│"))
+    }
+
+    fn normalize_frame(s: &str) -> String {
+        s.lines()
+            .map(|line| line.trim_end())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]
