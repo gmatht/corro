@@ -14,9 +14,7 @@ fn collect_numbers(grid: &Grid, range: &MainRange) -> Vec<f64> {
     for r in range.row_start..range.row_end {
         for c in range.col_start..range.col_end {
             let addr = CellAddr::Main { row: r, col: c };
-            if let Some(n) =
-                formula::effective_numeric(grid, &addr, &mut visiting, &mut budget)
-            {
+            if let Some(n) = formula::effective_numeric(grid, &addr, &mut visiting, &mut budget) {
                 v.push(n);
             }
         }
@@ -98,14 +96,8 @@ mod tests {
     #[test]
     fn sum_mean() {
         let mut g = Grid::new(2, 2);
-        g.set(
-            &CellAddr::Main { row: 0, col: 0 },
-            "2".into(),
-        );
-        g.set(
-            &CellAddr::Main { row: 0, col: 1 },
-            "3".into(),
-        );
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "2".into());
+        g.set(&CellAddr::Main { row: 0, col: 1 }, "3".into());
         let def = AggregateDef {
             func: AggFunc::Sum,
             source: MainRange {

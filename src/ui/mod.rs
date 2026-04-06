@@ -2,6 +2,7 @@
 
 use crate::addr::{self, parse_cell_ref_at};
 use crate::agg::{cell_display, compute_aggregate};
+use crate::balance::{self, BalanceDirection};
 use crate::export;
 use crate::formula::{cell_effective_display, is_formula};
 use crate::grid::MainRange;
@@ -162,6 +163,7 @@ enum Mode {
     Edit {
         buffer: String,
         formula_cursor: Option<SheetCursor>,
+        fit_to_content_on_commit: bool,
     },
     OpenPath {
         buffer: String,
@@ -198,6 +200,11 @@ enum Mode {
     },
     SortView {
         buffer: String,
+        persist: bool,
+    },
+    BalanceBooks {
+        buffer: String,
+        direction: BalanceDirection,
         persist: bool,
     },
     QuitPrompt,
@@ -246,6 +253,7 @@ enum MenuAction {
     InsertHyperlink,
     SortView,
     SaveSort,
+    BalanceBooks,
     NewSheet,
     HelpRows,
     HelpCols,
@@ -260,7 +268,7 @@ struct MenuItem {
     target: MenuTarget,
 }
 
-const FILE_MENU_ITEMS: [MenuItem; 8] = [
+const FILE_MENU_ITEMS: [MenuItem; 9] = [
     MenuItem {
         shortcut: 'O',
         label: "Open file",
@@ -290,6 +298,11 @@ const FILE_MENU_ITEMS: [MenuItem; 8] = [
         shortcut: 'P',
         label: "Persist sort",
         target: MenuTarget::Action(MenuAction::SaveSort),
+    },
+    MenuItem {
+        shortcut: 'B',
+        label: "Balance books",
+        target: MenuTarget::Action(MenuAction::BalanceBooks),
     },
     MenuItem {
         shortcut: 'N',
@@ -582,6 +595,7 @@ impl App {
         buffer: String,
         formula_cursor: Option<SheetCursor>,
         special_palette: bool,
+        fit_to_content_on_commit: bool,
     ) -> Mode {
         let cursor = if buffer.trim() == "=" {
             1
@@ -590,9 +604,11 @@ impl App {
         };
         self.edit_cursor = Some(cursor);
         self.edit_special_palette = special_palette;
+        self.pending_fit_to_content_on_commit = fit_to_content_on_commit;
         Mode::Edit {
             buffer,
             formula_cursor,
+            fit_to_content_on_commit,
         }
     }
 
@@ -604,7 +620,7 @@ impl App {
     fn commit_special_choice(&mut self, idx: usize) {
         let choice = SPECIAL_VALUE_CHOICES[idx];
         let buffer = choice.to_string();
-        self.mode = self.start_edit_mode(buffer, None, true);
+        self.mode = self.start_edit_mode(buffer, None, true, false);
     }
 
     fn menu_action_mode(&mut self, action: MenuAction) -> Mode {
@@ -664,14 +680,16 @@ impl App {
                 chrono::Local::now().format("%Y-%m-%d").to_string(),
                 None,
                 false,
+                true,
             ),
             MenuAction::InsertTime => self.start_edit_mode(
                 chrono::Local::now().format("%H:%M:%S").to_string(),
                 None,
                 false,
+                true,
             ),
             MenuAction::InsertHyperlink => {
-                self.start_edit_mode(self.menu_insert_hyperlink_seed(), None, false)
+                self.start_edit_mode(self.menu_insert_hyperlink_seed(), None, false, false)
             }
             MenuAction::SortView => Mode::SortView {
                 buffer: self.start_input_mode(String::new()),
@@ -679,6 +697,11 @@ impl App {
             },
             MenuAction::SaveSort => Mode::SortView {
                 buffer: self.start_input_mode(String::new()),
+                persist: true,
+            },
+            MenuAction::BalanceBooks => Mode::BalanceBooks {
+                buffer: self.start_input_mode(String::new()),
+                direction: BalanceDirection::PosToNeg,
                 persist: true,
             },
             MenuAction::NewSheet => {
@@ -1314,6 +1337,7 @@ pub struct App {
     input_cursor: Option<usize>,
     special_picker: Option<usize>,
     view_sheet_id: u32,
+    pending_fit_to_content_on_commit: bool,
 }
 
 impl App {
@@ -1354,6 +1378,7 @@ impl App {
             input_cursor: None,
             special_picker: None,
             view_sheet_id: 1,
+            pending_fit_to_content_on_commit: false,
         }
     }
 
@@ -1963,6 +1988,7 @@ impl App {
             (self.cursor.to_addr(&self.state.grid), buffer.to_string())
         };
         if self.state.grid.get(&addr).unwrap_or("") == value {
+            self.pending_fit_to_content_on_commit = false;
             return Ok(());
         }
         let op = Op::SetCell {
@@ -1989,7 +2015,43 @@ impl App {
             op.apply(&mut self.state);
             self.status = "No file — edit in memory only".into();
         }
+        if self.pending_fit_to_content_on_commit {
+            self.fit_column_to_content_from_current_cell(addr.clone());
+            self.commit_active_sheet_cache();
+            self.pending_fit_to_content_on_commit = false;
+        }
         Ok(())
+    }
+
+    fn fit_column_to_content_from_current_cell(&mut self, addr: CellAddr) {
+        match addr {
+            CellAddr::Main { col, .. } => self.state.grid.set_col_width(
+                MARGIN_COLS + col as usize,
+                self.state
+                    .grid
+                    .content_width_for_column(MARGIN_COLS + col as usize)
+                    .map(|w| w.saturating_sub(1)),
+            ),
+            CellAddr::Left { col, .. } => self.state.grid.fit_column_to_content(col as usize),
+            CellAddr::Right { col, .. } => self.state.grid.set_col_width(
+                MARGIN_COLS + self.state.grid.main_cols() + col as usize,
+                self.state
+                    .grid
+                    .content_width_for_column(
+                        MARGIN_COLS + self.state.grid.main_cols() + col as usize,
+                    )
+                    .map(|w| w.saturating_sub(1)),
+            ),
+            CellAddr::Header { col, .. } | CellAddr::Footer { col, .. } => {
+                self.state.grid.set_col_width(
+                    col as usize,
+                    self.state
+                        .grid
+                        .content_width_for_column(col as usize)
+                        .map(|w| w.saturating_sub(1)),
+                )
+            }
+        }
     }
 
     fn autofit_column_from_current_cell(&mut self, addr: CellAddr) {
@@ -2777,6 +2839,26 @@ impl App {
                 caret_style,
             ))
             .style(prompt_style),
+            Mode::BalanceBooks {
+                buffer,
+                direction,
+                persist,
+            } => Paragraph::new(input_line(
+                format!(
+                    " balance books [{}] {} {}: ",
+                    buffer,
+                    match direction {
+                        BalanceDirection::PosToNeg => "+→-",
+                        BalanceDirection::NegToPos => "-→+",
+                    },
+                    if *persist { "report" } else { "view" }
+                ),
+                buffer,
+                self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
+                prompt_style,
+                caret_style,
+            ))
+            .style(prompt_style),
             Mode::QuitPrompt => Paragraph::new(" Quit Corro? (Q)uit, (B)ack ")
                 .style(Style::default().fg(Color::White).bg(Color::Red)),
             Mode::Help => Paragraph::new(" Help - Up/Down scroll, Esc closes ")
@@ -3181,6 +3263,14 @@ impl App {
             Mode::SortView { .. } => {
                 "  type sort columns like A,B,C   Enter·apply   Esc·cancel".into()
             }
+            Mode::BalanceBooks { direction, persist, .. } => format!(
+                "  type numeric col or blank=auto   d·toggle dir({})   r/v output({})   Enter·run   Esc·cancel",
+                match direction {
+                    BalanceDirection::PosToNeg => "+→-",
+                    BalanceDirection::NegToPos => "-→+",
+                },
+                if *persist { "report" } else { "view" }
+            ),
             Mode::QuitPrompt => "  Q·quit   B·back   Esc·cancel".into(),
             Mode::Help => "  up/down·scroll   Esc·close   ?·help   A·about".into(),
             Mode::About => "  up/down·scroll   Esc·close   ?·help   A·about".into(),
@@ -3492,6 +3582,7 @@ impl App {
                         self.mode = Mode::Edit {
                             buffer,
                             formula_cursor: None,
+                            fit_to_content_on_commit: false,
                         };
                         return Ok(false);
                     }
@@ -3500,6 +3591,7 @@ impl App {
                         self.mode = Mode::Edit {
                             buffer,
                             formula_cursor: None,
+                            fit_to_content_on_commit: false,
                         };
                         return Ok(false);
                     }
@@ -3508,6 +3600,7 @@ impl App {
                         self.mode = Mode::Edit {
                             buffer,
                             formula_cursor: None,
+                            fit_to_content_on_commit: true,
                         };
                         return Ok(false);
                     }
@@ -3533,6 +3626,7 @@ impl App {
                                 None
                             },
                             false,
+                            false,
                         );
                     }
                     self.mode = mode;
@@ -3550,6 +3644,7 @@ impl App {
                             } else {
                                 None
                             },
+                            false,
                             false,
                         );
                     }
@@ -3850,6 +3945,104 @@ impl App {
                 ) => {}
                 _ => {}
             },
+            Mode::BalanceBooks {
+                buffer,
+                direction,
+                persist,
+            } => match key.code {
+                KeyCode::Char('d') | KeyCode::Char('D') => {
+                    *direction = match direction {
+                        BalanceDirection::PosToNeg => BalanceDirection::NegToPos,
+                        BalanceDirection::NegToPos => BalanceDirection::PosToNeg,
+                    };
+                }
+                KeyCode::Char('v') | KeyCode::Char('V') => {
+                    *persist = false;
+                }
+                KeyCode::Char('r') | KeyCode::Char('R') => {
+                    *persist = true;
+                }
+                KeyCode::Enter => {
+                    let col = if buffer.trim().is_empty() {
+                        balance::choose_balance_column(&self.state.grid)
+                    } else {
+                        addr::parse_excel_column(buffer.trim()).map(|c| MARGIN_COLS + c as usize)
+                    };
+                    let Some(col) = col else {
+                        self.status = "No balance column found".into();
+                        self.input_cursor = None;
+                        mode = Mode::Normal;
+                        self.mode = mode;
+                        return Ok(false);
+                    };
+                    let report = balance::build_balance_report(&self.state.grid, col, *direction);
+                    let report_sheet = balance::report_sheet(
+                        &report,
+                        self.workbook.sheet_title(self.workbook.active_sheet),
+                    );
+                    if *persist {
+                        let title = format!("Balance {}", self.workbook.next_sheet_id);
+                        self.commit_active_sheet_cache();
+                        let id = self.workbook.next_sheet_id;
+                        self.workbook.add_sheet(title.clone(), report_sheet.clone());
+                        self.view_sheet_id = id;
+                        self.sync_active_sheet_cache();
+                        if let Some(ref p) = self.path.clone() {
+                            let mut active_sheet = self.view_sheet_id;
+                            commit_workbook_op(
+                                p,
+                                &mut self.offset,
+                                &mut self.workbook,
+                                &mut active_sheet,
+                                &crate::ops::WorkbookOp::NewSheet {
+                                    id,
+                                    title: title.clone(),
+                                },
+                            )?;
+                            self.ops_applied = self.ops_applied.saturating_add(1);
+                            self.start_log_watcher_if_needed()?;
+                            for row in 0..report_sheet.grid.main_rows() {
+                                for col_idx in 0..report_sheet.grid.main_cols() {
+                                    let addr = CellAddr::Main {
+                                        row: row as u32,
+                                        col: col_idx as u32,
+                                    };
+                                    if let Some(value) = report_sheet.grid.get(&addr) {
+                                        if !value.is_empty() {
+                                            commit_workbook_op(
+                                                p,
+                                                &mut self.offset,
+                                                &mut self.workbook,
+                                                &mut active_sheet,
+                                                &crate::ops::WorkbookOp::SheetOp {
+                                                    sheet_id: id,
+                                                    op: Op::SetCell {
+                                                        addr: addr.clone(),
+                                                        value: value.to_string(),
+                                                    },
+                                                },
+                                            )?;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        self.status = format!("Balance report saved as {}", title);
+                    } else {
+                        self.state = report_sheet.clone();
+                        self.status = "Balance report generated".into();
+                    }
+                    self.input_cursor = None;
+                    mode = Mode::Normal;
+                }
+                KeyCode::Esc => mode = Mode::Normal,
+                _ if Self::handle_plain_text_input_key(
+                    buffer,
+                    &mut self.input_cursor,
+                    key.code,
+                ) => {}
+                _ => {}
+            },
             Mode::QuitPrompt => match key.code {
                 KeyCode::Char('q') | KeyCode::Char('Q') => {
                     self.mode = mode;
@@ -3986,6 +4179,7 @@ impl App {
             Mode::Edit {
                 buffer,
                 formula_cursor,
+                fit_to_content_on_commit: _,
             } => match key.code {
                 KeyCode::Enter => {
                     self.commit_edit_buffer(buffer)?;
@@ -4067,6 +4261,7 @@ impl App {
                             None
                         },
                         false,
+                        false,
                     );
                 }
                 KeyCode::Down => {
@@ -4094,6 +4289,7 @@ impl App {
                         } else {
                             None
                         },
+                        false,
                         false,
                     );
                 }
@@ -4236,6 +4432,7 @@ impl App {
                             } else {
                                 None
                             },
+                            false,
                             false,
                         );
                     }
@@ -4458,6 +4655,7 @@ impl App {
                             } else {
                                 None
                             },
+                            false,
                             false,
                         );
                     }
@@ -4859,6 +5057,7 @@ mod tests {
         app.mode = Mode::Edit {
             buffer: String::new(),
             formula_cursor: None,
+            fit_to_content_on_commit: false,
         };
 
         let backend = TestBackend::new(60, 16);
@@ -4898,6 +5097,7 @@ mod tests {
         app.mode = Mode::Edit {
             buffer: "=A*2 -- POW2".into(),
             formula_cursor: None,
+            fit_to_content_on_commit: false,
         };
 
         let backend = TestBackend::new(80, 24);
@@ -4954,6 +5154,23 @@ mod tests {
         };
 
         assert!(row(1).contains("6.283"));
+    }
+
+    #[test]
+    fn inserted_date_fits_column_exactly() {
+        let mut app = App::new(None);
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        };
+        app.mode = app.start_edit_mode("2024-01-02".into(), None, false, true);
+        if let Mode::Edit { buffer, .. } = &app.mode {
+            let raw = buffer.clone();
+            app.commit_edit_buffer(&raw).unwrap();
+        } else {
+            panic!("expected edit mode");
+        }
+        assert_eq!(app.state.grid.col_width(MARGIN_COLS), 10);
     }
 
     #[test]
@@ -5233,6 +5450,7 @@ mod tests {
         app.mode = Mode::Edit {
             buffer: "changed".into(),
             formula_cursor: None,
+            fit_to_content_on_commit: false,
         };
 
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()))
@@ -5313,6 +5531,7 @@ mod tests {
         app.mode = Mode::Edit {
             buffer: "Sheet2 value".into(),
             formula_cursor: None,
+            fit_to_content_on_commit: false,
         };
         app.cursor = SheetCursor {
             row: HEADER_ROWS,
@@ -5343,6 +5562,7 @@ mod tests {
         app.mode = Mode::Edit {
             buffer: "x".into(),
             formula_cursor: None,
+            fit_to_content_on_commit: false,
         };
 
         app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::CONTROL))
@@ -5377,6 +5597,7 @@ mod tests {
         app.mode = Mode::Edit {
             buffer: "sheet1".into(),
             formula_cursor: None,
+            fit_to_content_on_commit: false,
         };
 
         app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::CONTROL))
@@ -5434,6 +5655,7 @@ mod tests {
         app.mode = Mode::Edit {
             buffer: "+".into(),
             formula_cursor: None,
+            fit_to_content_on_commit: false,
         };
 
         app.handle_key(KeyEvent::new(
@@ -5457,6 +5679,7 @@ mod tests {
         app.mode = Mode::Edit {
             buffer: String::new(),
             formula_cursor: None,
+            fit_to_content_on_commit: false,
         };
 
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()))
@@ -5595,6 +5818,7 @@ mod tests {
         app.mode = Mode::Edit {
             buffer: "ab".into(),
             formula_cursor: None,
+            fit_to_content_on_commit: false,
         };
 
         app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::empty()))
@@ -5613,6 +5837,7 @@ mod tests {
         app.mode = Mode::Edit {
             buffer: "ab".into(),
             formula_cursor: None,
+            fit_to_content_on_commit: false,
         };
 
         app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::empty()))
@@ -5804,6 +6029,7 @@ mod tests {
         app.mode = Mode::Edit {
             buffer: "=".into(),
             formula_cursor: Some(app.cursor),
+            fit_to_content_on_commit: false,
         };
 
         let backend = TestBackend::new(40, 6);

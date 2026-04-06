@@ -298,6 +298,25 @@ fn eval_binary_numeric(
     )
 }
 
+pub(crate) fn parse_date_serial_literal(s: &str) -> Option<f64> {
+    let t = s.trim();
+    if t.len() != 10 {
+        return None;
+    }
+    let bytes = t.as_bytes();
+    if bytes[4] != b'-' || bytes[7] != b'-' {
+        return None;
+    }
+    let year = t[0..4].parse::<i32>().ok()?;
+    let month = t[5..7].parse::<u32>().ok()?;
+    let day = t[8..10].parse::<u32>().ok()?;
+    NaiveDate::from_ymd_opt(year, month, day).map(date_to_serial)
+}
+
+pub(crate) fn parse_numeric_or_date_literal(s: &str) -> Option<f64> {
+    parse_number_literal(s).or_else(|| parse_date_serial_literal(s))
+}
+
 fn eval_round(
     args: &[Ast],
     grid: &Grid,
@@ -630,7 +649,7 @@ fn eval_text(
         .scalar_coerce()
     {
         EvalResult::Number(n) => n,
-        EvalResult::Text(s) => match parse_number_literal(&s) {
+        EvalResult::Text(s) => match parse_numeric_or_date_literal(&s) {
             Some(n) => n,
             None => return EvalResult::Text(s),
         },
@@ -2590,7 +2609,7 @@ fn trim_spaces(s: &str) -> String {
 fn numeric_value(result: EvalResult) -> Option<f64> {
     match result {
         EvalResult::Number(n) => Some(n),
-        EvalResult::Text(s) => parse_number_literal(&s),
+        EvalResult::Text(s) => parse_numeric_or_date_literal(&s),
         EvalResult::Error(_) => None,
         EvalResult::Array(_) => None,
     }

@@ -146,6 +146,7 @@ pub enum WorkbookOp {
     NewSheet { id: u32, title: String },
     ActivateSheet { id: u32 },
     RenameSheet { id: u32, title: String },
+    BalanceReport { id: u32, title: String },
     SheetOp { sheet_id: u32, op: Op },
 }
 
@@ -340,6 +341,7 @@ impl WorkbookOp {
             WorkbookOp::NewSheet { id, title } => format!("${id}:NEW_SHEET {title}"),
             WorkbookOp::ActivateSheet { id } => format!("${id}:ACTIVATE_SHEET"),
             WorkbookOp::RenameSheet { id, title } => format!("${id}:RENAME_SHEET {title}"),
+            WorkbookOp::BalanceReport { id, title } => format!("${id}:BALANCE_REPORT {title}"),
             WorkbookOp::SheetOp { sheet_id, op } => match op {
                 Op::SetCell { addr, value } => {
                     format!("SET ${sheet_id}:{} {value}", addr_text(addr))
@@ -408,6 +410,13 @@ pub fn parse_workbook_line(line: &str) -> Result<WorkbookOp, std::io::Error> {
                 title,
             })
         }
+        "BALANCE_REPORT" => {
+            let title = parts.collect::<Vec<_>>().join(" ");
+            Ok(WorkbookOp::BalanceReport {
+                id: sheet_id,
+                title,
+            })
+        }
         _ => {
             let op = parse_op_line(rest).ok_or_else(|| bad("bad sheet op line"))?;
             Ok(WorkbookOp::SheetOp { sheet_id, op })
@@ -441,6 +450,15 @@ pub fn apply_workbook_op(
             Ok(())
         }
         WorkbookOp::RenameSheet { id, title } => {
+            let sheet = workbook
+                .sheets
+                .iter_mut()
+                .find(|s| s.id == id)
+                .ok_or_else(|| bad("unknown sheet id"))?;
+            sheet.title = title;
+            Ok(())
+        }
+        WorkbookOp::BalanceReport { id, title } => {
             let sheet = workbook
                 .sheets
                 .iter_mut()

@@ -297,7 +297,7 @@ impl Grid {
         }
     }
 
-    fn content_width_for_column(&self, global_col: usize) -> Option<usize> {
+    pub fn content_width_for_column(&self, global_col: usize) -> Option<usize> {
         let mut maxw = 0usize;
         let mut saw_content = false;
         let main_cols = self.main_cols();

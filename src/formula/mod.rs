@@ -225,11 +225,11 @@ pub fn effective_numeric(
 ) -> Option<f64> {
     let raw = grid.get(addr).unwrap_or("");
     if templated_formula(grid, addr).is_none() && !is_formula(raw) {
-        return parse_number_literal(raw);
+        return functions::parse_numeric_or_date_literal(raw);
     }
     match eval_cell(grid, addr, visiting, budget) {
         EvalResult::Number(n) if !n.is_nan() => Some(n),
-        EvalResult::Text(s) => parse_number_literal(&s),
+        EvalResult::Text(s) => functions::parse_numeric_or_date_literal(&s),
         _ => None,
     }
 }
@@ -809,7 +809,9 @@ fn eval_ast(
 fn truthy(e: EvalResult) -> bool {
     match e.scalar_coerce() {
         EvalResult::Number(n) => n != 0.0 && !n.is_nan(),
-        EvalResult::Text(s) => parse_number_literal(&s).map(|n| n != 0.0).unwrap_or(false),
+        EvalResult::Text(s) => functions::parse_numeric_or_date_literal(&s)
+            .map(|n| n != 0.0)
+            .unwrap_or(false),
         EvalResult::Error(_) => false,
         EvalResult::Array(_) => false,
     }
@@ -832,7 +834,7 @@ fn eval_binary(
     let na = match ea {
         EvalResult::Number(n) => n,
         EvalResult::Text(s) => {
-            if let Some(n) = parse_number_literal(&s) {
+            if let Some(n) = functions::parse_numeric_or_date_literal(&s) {
                 n
             } else {
                 return EvalResult::Error("VALUE");
@@ -844,7 +846,7 @@ fn eval_binary(
     let nb = match eb {
         EvalResult::Number(n) => n,
         EvalResult::Text(s) => {
-            if let Some(n) = parse_number_literal(&s) {
+            if let Some(n) = functions::parse_numeric_or_date_literal(&s) {
                 n
             } else {
                 return EvalResult::Error("VALUE");
@@ -1635,36 +1637,48 @@ mod tests {
     #[test]
     fn date_time_functions_work() {
         let mut g = Grid::new(1, 7);
-        g.set(&CellAddr::Main { row: 0, col: 0 }, "=DATE(2024,1,2)".into());
-        g.set(&CellAddr::Main { row: 0, col: 1 }, "=YEAR(A1)".into());
-        g.set(&CellAddr::Main { row: 0, col: 2 }, "=MONTH(A1)".into());
-        g.set(&CellAddr::Main { row: 0, col: 3 }, "=DAY(A1)".into());
-        g.set(&CellAddr::Main { row: 0, col: 4 }, "=HOUR(NOW())".into());
-        g.set(&CellAddr::Main { row: 0, col: 5 }, "=MINUTE(NOW())".into());
-        g.set(&CellAddr::Main { row: 0, col: 6 }, "=SECOND(NOW())".into());
-        let mut v = Vec::new();
-        let mut b = DEFAULT_BUDGET;
-        match eval_cell(&g, &CellAddr::Main { row: 0, col: 0 }, &mut v, &mut b) {
-            EvalResult::Number(n) => assert!(n > 45000.0),
-            e => panic!("expected serial {:?}", e),
-        }
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "2024-01-02".into());
+        g.set(&CellAddr::Main { row: 0, col: 1 }, "=A1+1".into());
+        g.set(&CellAddr::Main { row: 0, col: 2 }, "=YEAR(A1)".into());
+        g.set(&CellAddr::Main { row: 0, col: 3 }, "=MONTH(A1)".into());
+        g.set(&CellAddr::Main { row: 0, col: 4 }, "=DAY(A1)".into());
+        g.set(&CellAddr::Main { row: 0, col: 5 }, "=HOUR(NOW())".into());
+        g.set(&CellAddr::Main { row: 0, col: 6 }, "=MINUTE(NOW())".into());
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
         match eval_cell(&g, &CellAddr::Main { row: 0, col: 1 }, &mut v, &mut b) {
+            EvalResult::Number(n) => assert!(n > 45000.0),
+            e => panic!("expected date arithmetic {:?}", e),
+        }
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 2 }, &mut v, &mut b) {
             EvalResult::Number(n) => assert!((n - 2024.0).abs() < 1e-9),
             e => panic!("expected year {:?}", e),
         }
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
-        match eval_cell(&g, &CellAddr::Main { row: 0, col: 2 }, &mut v, &mut b) {
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 3 }, &mut v, &mut b) {
             EvalResult::Number(n) => assert!((n - 1.0).abs() < 1e-9),
             e => panic!("expected month {:?}", e),
         }
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
-        match eval_cell(&g, &CellAddr::Main { row: 0, col: 3 }, &mut v, &mut b) {
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 4 }, &mut v, &mut b) {
             EvalResult::Number(n) => assert!((n - 2.0).abs() < 1e-9),
             e => panic!("expected day {:?}", e),
+        }
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 5 }, &mut v, &mut b) {
+            EvalResult::Number(n) => assert!((0.0..24.0).contains(&n)),
+            e => panic!("expected hour {:?}", e),
+        }
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 6 }, &mut v, &mut b) {
+            EvalResult::Number(n) => assert!((0.0..60.0).contains(&n)),
+            e => panic!("expected minute {:?}", e),
         }
     }
 
