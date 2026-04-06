@@ -272,6 +272,40 @@ fn addr_text(addr: &CellAddr) -> String {
     }
 }
 
+fn encode_log_value(value: &str) -> String {
+    let mut out = String::new();
+    for b in value.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+fn decode_log_value(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return None;
+            }
+            let hi = (bytes[i + 1] as char).to_digit(16)? as u8;
+            let lo = (bytes[i + 2] as char).to_digit(16)? as u8;
+            out.push((hi << 4) | lo);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
 fn parse_op_text(line: &str) -> Option<Op> {
     let mut parts = line.split_whitespace();
     let cmd = parts.next()?.to_ascii_uppercase();
@@ -287,7 +321,7 @@ fn parse_op_text(line: &str) -> Option<Op> {
             for token in parts {
                 let (addr, value) = token.split_once('=')?;
                 let (addr, _) = parse_log_addr(addr, 0)?;
-                cells.push((addr, value.to_string()));
+                cells.push((addr, decode_log_value(value)?));
             }
             Some(Op::FillRange { cells })
         }
@@ -338,7 +372,7 @@ impl Op {
                 "FILL {}",
                 cells
                     .iter()
-                    .map(|(addr, value)| format!("{}={value}", addr_text(addr)))
+                    .map(|(addr, value)| format!("{}={}", addr_text(addr), encode_log_value(value)))
                     .collect::<Vec<_>>()
                     .join(" ")
             ),
@@ -709,7 +743,15 @@ impl SheetState {
                     to: *from,
                 })
             }
-            Op::FillRange { .. } => None,
+            Op::FillRange { cells } => Some(Op::FillRange {
+                cells: cells
+                    .iter()
+                    .map(|(addr, _)| {
+                        let prev_value = self.grid.get(addr).unwrap_or("").to_string();
+                        (addr.clone(), prev_value)
+                    })
+                    .collect(),
+            }),
             Op::SetMainSize { .. } => Some(Op::SetMainSize {
                 main_rows: self.grid.main_rows() as u32,
                 main_cols: self.grid.main_cols() as u32,
@@ -875,7 +917,7 @@ pub fn append_op(path: &Path, op: &Op) -> std::io::Result<()> {
             "FILL {}",
             cells
                 .iter()
-                .map(|(addr, value)| format!("{}={value}", addr_text(addr)))
+                .map(|(addr, value)| format!("{}={}", addr_text(addr), encode_log_value(value)))
                 .collect::<Vec<_>>()
                 .join(" ")
         ),

@@ -4,6 +4,7 @@ use crate::addr::{self, parse_cell_ref_at};
 use crate::agg::{cell_display, compute_aggregate};
 use crate::balance::{self, BalanceDirection};
 use crate::export;
+use crate::formula::translate_formula_text_by_offset;
 use crate::formula::{cell_effective_display, is_formula};
 use crate::grid::MainRange;
 use crate::grid::{CellAddr, Grid, SortSpec, FOOTER_ROWS, HEADER_ROWS, MARGIN_COLS};
@@ -46,6 +47,12 @@ enum SelectionEdgeDirection {
     Left,
     Right,
     Up,
+    Down,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FillDirection {
+    Right,
     Down,
 }
 
@@ -710,7 +717,7 @@ impl App {
             MenuAction::BalanceBooks => Mode::BalanceBooks {
                 buffer: self.start_input_mode(String::new()),
                 direction: BalanceDirection::PosToNeg,
-                persist: true,
+                persist: false,
             },
             MenuAction::NewSheet => {
                 self.add_sheet(format!("Sheet{}", self.workbook.next_sheet_id));
@@ -1190,22 +1197,41 @@ fn footer_special_col_aggregate(
     main_rows: usize,
     main_cols: usize,
 ) -> Option<String> {
-    let right_func = right_col_agg_func(grid, global_col)?;
-    let data_cols = data_main_col_count(grid).min(main_cols);
+    let row_func = right_col_agg_func(grid, global_col);
     let mut samples: Vec<f64> = Vec::new();
     for r in 0..main_rows {
-        let row_val = compute_aggregate(
-            grid,
-            &AggregateDef {
-                func: right_func,
-                source: MainRange {
-                    row_start: r as u32,
-                    row_end: r as u32 + 1,
-                    col_start: 0,
-                    col_end: data_cols as u32,
+        let row_val = if let Some(func) = row_func {
+            compute_aggregate(
+                grid,
+                &AggregateDef {
+                    func,
+                    source: MainRange {
+                        row_start: r as u32,
+                        row_end: r as u32 + 1,
+                        col_start: 0,
+                        col_end: main_cols as u32,
+                    },
                 },
-            },
-        );
+            )
+        } else if global_col < MARGIN_COLS {
+            String::new()
+        } else if global_col < MARGIN_COLS + main_cols {
+            cell_effective_display(
+                grid,
+                &CellAddr::Main {
+                    row: r as u32,
+                    col: (global_col - MARGIN_COLS) as u32,
+                },
+            )
+        } else {
+            cell_effective_display(
+                grid,
+                &CellAddr::Right {
+                    col: (global_col - MARGIN_COLS - main_cols) as u8,
+                    row: r as u32,
+                },
+            )
+        };
         if let Some(n) = parse_num(&row_val) {
             samples.push(n);
         }
@@ -1276,48 +1302,108 @@ fn cycle_special_value(current: &str, choices: &[&'static str]) -> Option<String
 // ── Clipboard helper ─────────────────────────────────────────────────────────
 
 fn copy_to_clipboard(text: &str) -> Result<(), String> {
+    #[cfg(test)]
+    {
+        set_test_clipboard(Some(text.to_string()));
+        return Ok(());
+    }
+    #[cfg(not(test))]
+    {
+        #[cfg(target_os = "windows")]
+        {
+            use std::process::{Command, Stdio};
+            let mut child = Command::new("clip")
+                .stdin(Stdio::piped())
+                .spawn()
+                .map_err(|e| format!("clip: {e}"))?;
+            if let Some(mut stdin) = child.stdin.take() {
+                use std::io::Write;
+                stdin
+                    .write_all(text.as_bytes())
+                    .map_err(|e| format!("clip stdin: {e}"))?;
+            }
+            child.wait().map_err(|e| format!("clip wait: {e}"))?;
+            Ok(())
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            use std::process::{Command, Stdio};
+            // Try xclip, then pbcopy
+            let cmd = if Command::new("xclip").arg("-version").output().is_ok() {
+                "xclip"
+            } else {
+                "pbcopy"
+            };
+            let mut child = Command::new(cmd)
+                .args(if cmd == "xclip" {
+                    &["-selection", "clipboard"][..]
+                } else {
+                    &[][..]
+                })
+                .stdin(Stdio::piped())
+                .spawn()
+                .map_err(|e| format!("{cmd}: {e}"))?;
+            if let Some(mut stdin) = child.stdin.take() {
+                use std::io::Write;
+                stdin
+                    .write_all(text.as_bytes())
+                    .map_err(|e| format!("{cmd} stdin: {e}"))?;
+            }
+            child.wait().map_err(|e| format!("{cmd} wait: {e}"))?;
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_CLIPBOARD: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_test_clipboard(text: Option<String>) {
+    TEST_CLIPBOARD.with(|cell| *cell.borrow_mut() = text);
+}
+
+#[cfg(test)]
+fn test_clipboard_text() -> Option<String> {
+    TEST_CLIPBOARD.with(|cell| cell.borrow().clone())
+}
+
+fn read_clipboard() -> Result<String, String> {
+    #[cfg(test)]
+    if let Some(text) = TEST_CLIPBOARD.with(|cell| cell.borrow().clone()) {
+        return Ok(text);
+    }
     #[cfg(target_os = "windows")]
     {
-        use std::process::{Command, Stdio};
-        let mut child = Command::new("clip")
-            .stdin(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("clip: {e}"))?;
-        if let Some(mut stdin) = child.stdin.take() {
-            use std::io::Write;
-            stdin
-                .write_all(text.as_bytes())
-                .map_err(|e| format!("clip stdin: {e}"))?;
+        use std::process::Command;
+        let output = Command::new("powershell")
+            .args(["-NoProfile", "-Command", "Get-Clipboard"])
+            .output()
+            .map_err(|e| format!("powershell: {e}"))?;
+        if !output.status.success() {
+            return Err("powershell: Get-Clipboard failed".into());
         }
-        child.wait().map_err(|e| format!("clip wait: {e}"))?;
-        Ok(())
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
     #[cfg(not(target_os = "windows"))]
     {
-        use std::process::{Command, Stdio};
-        // Try xclip, then pbcopy
-        let cmd = if Command::new("xclip").arg("-version").output().is_ok() {
-            "xclip"
+        use std::process::Command;
+        let output = if Command::new("xclip").arg("-version").output().is_ok() {
+            Command::new("xclip")
+                .args(["-selection", "clipboard", "-o"])
+                .output()
+                .map_err(|e| format!("xclip: {e}"))?
         } else {
-            "pbcopy"
+            Command::new("pbpaste")
+                .output()
+                .map_err(|e| format!("pbpaste: {e}"))?
         };
-        let mut child = Command::new(cmd)
-            .args(if cmd == "xclip" {
-                &["-selection", "clipboard"][..]
-            } else {
-                &[][..]
-            })
-            .stdin(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("{cmd}: {e}"))?;
-        if let Some(mut stdin) = child.stdin.take() {
-            use std::io::Write;
-            stdin
-                .write_all(text.as_bytes())
-                .map_err(|e| format!("{cmd} stdin: {e}"))?;
+        if !output.status.success() {
+            return Err("clipboard read failed".into());
         }
-        child.wait().map_err(|e| format!("{cmd} wait: {e}"))?;
-        Ok(())
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 }
 
@@ -1351,6 +1437,18 @@ pub struct App {
 }
 
 impl App {
+    fn insert_text_into_buffer(buffer: &mut String, cursor: &mut Option<usize>, text: &str) {
+        let len = buffer.chars().count();
+        let pos = cursor.get_or_insert(len);
+        let pos = (*pos).min(len);
+        let mut chars: Vec<char> = buffer.chars().collect();
+        for (i, ch) in text.chars().enumerate() {
+            chars.insert(pos + i, ch);
+        }
+        *buffer = chars.into_iter().collect();
+        *cursor = Some(pos + text.chars().count());
+    }
+
     pub fn new(path: Option<PathBuf>) -> Self {
         Self::new_with_revision_limit(path, None)
     }
@@ -1787,6 +1885,185 @@ impl App {
         self.cursor = cursor;
         self.selection_kind = SelectionKind::Cells;
         true
+    }
+
+    fn fill_row_pattern(&self) -> Option<Op> {
+        if self.selection_kind != SelectionKind::Cells {
+            return None;
+        }
+        let (rows, cols) = self.current_selection_range()?;
+        if rows.len() != 1 || cols.len() < 2 {
+            return None;
+        }
+        let row = rows[0];
+        if row < HEADER_ROWS || row >= HEADER_ROWS + self.state.grid.main_rows() {
+            return None;
+        }
+        if cols[0] < MARGIN_COLS || *cols.last()? >= MARGIN_COLS + self.state.grid.main_cols() {
+            return None;
+        }
+        let main_row = (row - HEADER_ROWS) as u32;
+        let start_col = (cols[0] - MARGIN_COLS) as u32;
+        let end_col = (*cols.last()? - MARGIN_COLS) as u32;
+        let seed: Vec<String> = (start_col..=end_col)
+            .map(|col| {
+                self.state
+                    .grid
+                    .get(&CellAddr::Main { row: main_row, col })
+                    .map(str::to_string)
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let mut cells = Vec::new();
+        for col in (end_col + 1)..self.state.grid.main_cols() as u32 {
+            let value =
+                self.infer_fill_value(&seed, (col - end_col) as i32, FillDirection::Right)?;
+            cells.push((CellAddr::Main { row: main_row, col }, value));
+        }
+        if cells.is_empty() {
+            None
+        } else {
+            Some(Op::FillRange { cells })
+        }
+    }
+
+    fn fill_col_pattern(&self) -> Option<Op> {
+        if self.selection_kind != SelectionKind::Cells {
+            return None;
+        }
+        let (rows, cols) = self.current_selection_range()?;
+        if cols.len() != 1 || rows.len() < 2 {
+            return None;
+        }
+        let col = cols[0];
+        if col < MARGIN_COLS || col >= MARGIN_COLS + self.state.grid.main_cols() {
+            return None;
+        }
+        if rows[0] < HEADER_ROWS || *rows.last()? >= HEADER_ROWS + self.state.grid.main_rows() {
+            return None;
+        }
+        let main_col = (col - MARGIN_COLS) as u32;
+        let start_row = (rows[0] - HEADER_ROWS) as u32;
+        let end_row = (*rows.last()? - HEADER_ROWS) as u32;
+        let seed: Vec<String> = (start_row..=end_row)
+            .map(|row| {
+                self.state
+                    .grid
+                    .get(&CellAddr::Main { row, col: main_col })
+                    .map(str::to_string)
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let mut cells = Vec::new();
+        for row in (end_row + 1)..self.state.grid.main_rows() as u32 {
+            let value =
+                self.infer_fill_value(&seed, (row - end_row) as i32, FillDirection::Down)?;
+            cells.push((CellAddr::Main { row, col: main_col }, value));
+        }
+        if cells.is_empty() {
+            None
+        } else {
+            Some(Op::FillRange { cells })
+        }
+    }
+
+    fn infer_fill_value(
+        &self,
+        seed: &[String],
+        offset_from_last: i32,
+        direction: FillDirection,
+    ) -> Option<String> {
+        let last = seed.last()?.clone();
+        if is_formula(&last) {
+            let (row_delta, col_delta) = match direction {
+                FillDirection::Right => (0, offset_from_last),
+                FillDirection::Down => (offset_from_last, 0),
+            };
+            if let Some(translated) = translate_formula_text_by_offset(&last, row_delta, col_delta)
+            {
+                return Some(translated);
+            }
+        }
+        if let Some(v) = Self::infer_numeric_fill(seed, offset_from_last) {
+            return Some(v);
+        }
+        if let Some(v) = Self::infer_named_sequence_fill(seed, offset_from_last) {
+            return Some(v);
+        }
+        if let Some(v) = Self::infer_suffix_fill(seed, offset_from_last) {
+            return Some(v);
+        }
+        Some(last)
+    }
+
+    fn infer_numeric_fill(seed: &[String], offset_from_last: i32) -> Option<String> {
+        if !seed.iter().all(|v| v.trim().parse::<f64>().is_ok()) {
+            return None;
+        }
+        let last = seed.last()?.trim().parse::<f64>().ok()?;
+        let prev = if seed.len() >= 2 {
+            seed[seed.len() - 2].trim().parse::<f64>().ok()?
+        } else {
+            last
+        };
+        let step = last - prev;
+        Some(format!("{}", last + step * offset_from_last as f64))
+    }
+
+    fn infer_named_sequence_fill(seed: &[String], offset_from_last: i32) -> Option<String> {
+        const WEEKDAYS: [&str; 7] = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"];
+        const MONTHS: [&str; 12] = [
+            "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC",
+        ];
+        let normalized: Vec<String> = seed.iter().map(|v| v.trim().to_ascii_uppercase()).collect();
+        let last = normalized.last()?.as_str();
+        if normalized.iter().all(|v| WEEKDAYS.contains(&v.as_str())) {
+            let idx = WEEKDAYS.iter().position(|&v| v == last)?;
+            return Some(
+                WEEKDAYS
+                    [(idx as i32 + offset_from_last).rem_euclid(WEEKDAYS.len() as i32) as usize]
+                    .to_string(),
+            );
+        }
+        if normalized.iter().all(|v| MONTHS.contains(&v.as_str())) {
+            let idx = MONTHS.iter().position(|&v| v == last)?;
+            return Some(
+                MONTHS[(idx as i32 + offset_from_last).rem_euclid(MONTHS.len() as i32) as usize]
+                    .to_string(),
+            );
+        }
+        None
+    }
+
+    fn infer_suffix_fill(seed: &[String], offset_from_last: i32) -> Option<String> {
+        let last = seed.last()?.trim();
+        let (prefix, digits) = Self::split_trailing_digits(last)?;
+        if seed
+            .iter()
+            .any(|v| Self::split_trailing_digits(v.trim()).is_none_or(|(p, _)| p != prefix))
+        {
+            return None;
+        }
+        let width = digits.len();
+        let last_num = digits.parse::<i64>().ok()?;
+        let prev_num = if seed.len() >= 2 {
+            let (_, prev_digits) = Self::split_trailing_digits(seed[seed.len() - 2].trim())?;
+            prev_digits.parse::<i64>().ok()?
+        } else {
+            last_num
+        };
+        let next = last_num + (last_num - prev_num) * offset_from_last as i64;
+        Some(format!("{prefix}{next:0width$}"))
+    }
+
+    fn split_trailing_digits(s: &str) -> Option<(&str, &str)> {
+        let bytes = s.as_bytes();
+        let mut i = bytes.len();
+        while i > 0 && bytes[i - 1].is_ascii_digit() {
+            i -= 1;
+        }
+        if i == bytes.len() {
+            return None;
+        }
+        Some((&s[..i], &s[i..]))
     }
 
     fn addr_at(&self, row: usize, col: usize) -> Option<CellAddr> {
@@ -2693,11 +2970,114 @@ impl App {
 
     #[allow(dead_code)]
     fn do_export_selection(&mut self) -> String {
-        let mut buf = Vec::new();
-        let rows: Vec<usize> = (0..self.state.grid.main_rows()).collect();
-        let cols: Vec<usize> = (MARGIN_COLS..MARGIN_COLS + self.state.grid.main_cols()).collect();
-        export::export_selection(&self.state.grid, &mut buf, &rows, &cols);
-        String::from_utf8_lossy(&buf).into_owned()
+        self.selection_tsv_text()
+    }
+
+    fn selection_tsv_text(&self) -> String {
+        let (rows, cols) = self
+            .current_selection_range()
+            .unwrap_or_else(|| (vec![self.cursor.row], vec![self.cursor.col]));
+
+        let mut out = String::new();
+        for (ri, row) in rows.iter().enumerate() {
+            if ri > 0 {
+                out.push('\n');
+            }
+            for (ci, col) in cols.iter().enumerate() {
+                if ci > 0 {
+                    out.push('\t');
+                }
+                if let Some(addr) = self.addr_at(*row, *col) {
+                    out.push_str(self.state.grid.get(&addr).unwrap_or(""));
+                }
+            }
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out
+    }
+
+    fn apply_pasted_tsv(&mut self, text: &str, preserve_formulas: bool) -> Result<(), RunError> {
+        let rows: Vec<&str> = text.lines().collect();
+        if rows.is_empty() {
+            self.status = "Clipboard is empty".into();
+            return Ok(());
+        }
+        let row_count = rows.len();
+        let col_count = rows
+            .iter()
+            .map(|line| line.split('\t').count())
+            .max()
+            .unwrap_or(0);
+        if col_count == 0 {
+            self.status = "Clipboard is empty".into();
+            return Ok(());
+        }
+
+        let start_row = self.cursor.row;
+        let start_col = self.cursor.col;
+        let needed_rows = start_row.saturating_sub(HEADER_ROWS) + row_count;
+        let needed_cols = start_col.saturating_sub(MARGIN_COLS) + col_count;
+        if needed_rows > self.state.grid.main_rows() || needed_cols > self.state.grid.main_cols() {
+            self.state.grid.set_main_size(
+                self.state.grid.main_rows().max(needed_rows),
+                self.state.grid.main_cols().max(needed_cols),
+            );
+        }
+
+        let mut did_any = false;
+        for (r_off, line) in rows.iter().enumerate() {
+            for (c_off, value) in line.split('\t').enumerate() {
+                let row = start_row.saturating_add(r_off);
+                let col = start_col.saturating_add(c_off);
+                if let Some(addr) = self.addr_at(row, col) {
+                    let mut value = value.to_string();
+                    if !preserve_formulas && value.trim_start().starts_with('=') {
+                        value = value.trim_start_matches('=').to_string();
+                    }
+                    let op = Op::SetCell {
+                        addr: addr.clone(),
+                        value,
+                    };
+                    self.push_inverse_op(&op);
+                    if let Some(ref p) = self.path.clone() {
+                        let mut active_sheet = self.view_sheet_id;
+                        commit_workbook_op(
+                            p,
+                            &mut self.offset,
+                            &mut self.workbook,
+                            &mut active_sheet,
+                            &crate::ops::WorkbookOp::SheetOp {
+                                sheet_id: self.view_sheet_id,
+                                op,
+                            },
+                        )?;
+                        self.ops_applied = self.ops_applied.saturating_add(1);
+                        self.sync_active_sheet_cache();
+                        self.start_log_watcher_if_needed()?;
+                    } else {
+                        op.apply(&mut self.state);
+                    }
+                    did_any = true;
+                }
+            }
+        }
+        self.status = if did_any {
+            if preserve_formulas {
+                "Clipboard pasted".into()
+            } else {
+                "Clipboard pasted as values".into()
+            }
+        } else {
+            "Clipboard paste produced no cells".into()
+        };
+        Ok(())
+    }
+
+    fn paste_from_clipboard(&mut self, preserve_formulas: bool) -> Result<(), RunError> {
+        let text = read_clipboard().map_err(io::Error::other)?;
+        self.apply_pasted_tsv(&text, preserve_formulas)
     }
 
     fn finish_export(&mut self, csv: bool, filename: &str) {
@@ -2935,26 +3315,7 @@ impl App {
                 caret_style,
             ))
             .style(prompt_style),
-            Mode::BalanceBooks {
-                buffer,
-                direction,
-                persist,
-            } => Paragraph::new(input_line(
-                format!(
-                    " balance books [{}] {} {}: ",
-                    buffer,
-                    match direction {
-                        BalanceDirection::PosToNeg => "+→-",
-                        BalanceDirection::NegToPos => "-→+",
-                    },
-                    if *persist { "report" } else { "view" }
-                ),
-                buffer,
-                self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
-                prompt_style,
-                caret_style,
-            ))
-            .style(prompt_style),
+            Mode::BalanceBooks { .. } => Paragraph::new(" ").style(prompt_style),
             Mode::QuitPrompt => Paragraph::new(" Quit Corro? (Q)uit, (B)ack ")
                 .style(Style::default().fg(Color::White).bg(Color::Red)),
             Mode::Help => Paragraph::new(" Help - Up/Down scroll, Esc closes ")
@@ -3043,6 +3404,40 @@ impl App {
             return;
         }
 
+        if matches!(&self.mode, Mode::BalanceBooks { .. }) {
+            let area = centered_rect(72, 64, f.area());
+            f.render_widget(Clear, area);
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Plain)
+                .title(Span::styled(
+                    " Balance books ",
+                    Style::default().fg(Color::Cyan),
+                ));
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+            let body = match &self.mode {
+                Mode::BalanceBooks {
+                    buffer,
+                    direction,
+                    persist,
+                } => self.balance_dialog_lines(
+                    buffer,
+                    *direction,
+                    *persist,
+                    self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
+                    Style::default().fg(Color::White),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(Color::Black).bg(Color::Yellow),
+                ),
+                _ => Vec::new(),
+            };
+            f.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), inner);
+            return;
+        }
+
         // ── Grid ──────────────────────────────────────────────────────────────
         let mut lines: Vec<Line> = Vec::new();
 
@@ -3118,7 +3513,7 @@ impl App {
 
                 let text = if let Some(func) = footer_agg {
                     if right_col_agg_func(grid, c).is_some() {
-                        footer_special_col_aggregate(grid, func, c, mr, data_main_col_count(grid))
+                        footer_special_col_aggregate(grid, func, c, mr, mc)
                             .unwrap_or_else(|| cell_effective_display(grid, &cell_addr))
                     } else if c >= lm && c < lm + mc {
                         let main_col = (c - lm) as u32;
@@ -3359,14 +3754,9 @@ impl App {
             Mode::SortView { .. } => {
                 "  type sort columns like A,B,C   Enter·apply   Esc·cancel".into()
             }
-            Mode::BalanceBooks { direction, persist, .. } => format!(
-                "  type numeric col or blank=auto   d·toggle dir({})   r/v output({})   Enter·run   Esc·cancel",
-                match direction {
-                    BalanceDirection::PosToNeg => "+→-",
-                    BalanceDirection::NegToPos => "-→+",
-                },
-                if *persist { "report" } else { "view" }
-            ),
+            Mode::BalanceBooks { .. } => {
+                "  type column letter or blank for auto   d·toggle direction   v=view   r=report   Enter·run   Esc·cancel".into()
+            }
             Mode::QuitPrompt => "  Q·quit   B·back   Esc·cancel".into(),
             Mode::Help => "  up/down·scroll   Esc·close   ?·help   A·about".into(),
             Mode::About => "  up/down·scroll   Esc·close   ?·help   A·about".into(),
@@ -3416,9 +3806,79 @@ impl App {
         format!(" {file}  {insert}  {help}{active}")
     }
 
+    fn balance_dialog_lines(
+        &self,
+        buffer: &str,
+        direction: BalanceDirection,
+        persist: bool,
+        cursor: usize,
+        text_style: Style,
+        heading_style: Style,
+        caret_style: Style,
+    ) -> Vec<Line<'static>> {
+        let header = format!(
+            "Column: {}    Direction: {}    Output: {}",
+            if buffer.trim().is_empty() {
+                "auto"
+            } else {
+                buffer.trim()
+            },
+            match direction {
+                BalanceDirection::PosToNeg => "+→-",
+                BalanceDirection::NegToPos => "-→+",
+            },
+            if persist { "report sheet" } else { "view only" }
+        );
+
+        vec![
+            Line::from(Span::styled(header, heading_style)),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Balance rows into groups that sum to zero. The selected numeric column is used to score rows; all other columns are copied unchanged.",
+                text_style,
+            )),
+            Line::from(""),
+            Line::from(Span::styled("Controls:", heading_style)),
+            Line::from(Span::styled("  Enter: run balance", text_style)),
+            Line::from(Span::styled("  d: toggle direction", text_style)),
+            Line::from(Span::styled("  v: preview in current sheet", text_style)),
+            Line::from(Span::styled("  r: create persisted report", text_style)),
+            Line::from(Span::styled("  Esc: cancel", text_style)),
+            Line::from(""),
+            Line::from(Span::styled("Input: ", heading_style)),
+            input_line(String::new(), buffer, cursor, text_style, caret_style),
+        ]
+    }
+
     fn handle_key(&mut self, key: KeyEvent) -> Result<bool, RunError> {
         if key.kind == KeyEventKind::Release {
             return Ok(false);
+        }
+
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let super_key = key.modifiers.contains(KeyModifiers::SUPER);
+
+        if matches!(self.mode, Mode::Normal)
+            && !super_key
+            && !key.modifiers.contains(KeyModifiers::ALT)
+        {
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+            {
+                let data = self.selection_tsv_text();
+                match copy_to_clipboard(&data) {
+                    Ok(()) => self.status = "Selection copied to clipboard".into(),
+                    Err(e) => self.status = format!("Clipboard error: {e}"),
+                }
+                return Ok(false);
+            }
+
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V'))
+            {
+                self.paste_from_clipboard(!shift)?;
+                return Ok(false);
+            }
         }
 
         if let Some(selected) = self.special_picker {
@@ -4281,6 +4741,17 @@ impl App {
                 formula_cursor,
                 fit_to_content_on_commit: _,
             } => match key.code {
+                KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    *formula_cursor = None;
+                    self.edit_special_palette = false;
+                    let paste = read_clipboard().map_err(io::Error::other)?;
+                    let text = if key.modifiers.contains(KeyModifiers::SHIFT) {
+                        paste.strip_prefix('=').unwrap_or(&paste).to_string()
+                    } else {
+                        paste
+                    };
+                    Self::insert_text_into_buffer(buffer, &mut self.edit_cursor, &text);
+                }
                 KeyCode::Enter => {
                     self.commit_edit_buffer(buffer)?;
                     self.edit_cursor = None;
@@ -4470,6 +4941,74 @@ impl App {
                     }
                     self.mode = mode;
                     return Ok(false);
+                }
+
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    || key.modifiers.contains(KeyModifiers::SUPER)
+                {
+                    match key.code {
+                        KeyCode::Char('d') | KeyCode::Char('D') => {
+                            if let Some(op) = self.fill_row_pattern() {
+                                self.push_inverse_op(&op);
+                                if let Some(ref p) = self.path.clone() {
+                                    let mut active_sheet = self.view_sheet_id;
+                                    commit_workbook_op(
+                                        p,
+                                        &mut self.offset,
+                                        &mut self.workbook,
+                                        &mut active_sheet,
+                                        &crate::ops::WorkbookOp::SheetOp {
+                                            sheet_id: self.view_sheet_id,
+                                            op: op.clone(),
+                                        },
+                                    )?;
+                                    self.ops_applied = self.ops_applied.saturating_add(1);
+                                    self.sync_active_sheet_cache();
+                                    self.start_log_watcher_if_needed()?;
+                                } else {
+                                    op.apply(&mut self.state);
+                                }
+                                self.status = "Filled row pattern".into();
+                            } else {
+                                self.status =
+                                    "Select a single row of cells, then press Ctrl+D / Cmd+D"
+                                        .into();
+                            }
+                            self.mode = mode;
+                            return Ok(false);
+                        }
+                        KeyCode::Char('r') | KeyCode::Char('R') => {
+                            if let Some(op) = self.fill_col_pattern() {
+                                self.push_inverse_op(&op);
+                                if let Some(ref p) = self.path.clone() {
+                                    let mut active_sheet = self.view_sheet_id;
+                                    commit_workbook_op(
+                                        p,
+                                        &mut self.offset,
+                                        &mut self.workbook,
+                                        &mut active_sheet,
+                                        &crate::ops::WorkbookOp::SheetOp {
+                                            sheet_id: self.view_sheet_id,
+                                            op: op.clone(),
+                                        },
+                                    )?;
+                                    self.ops_applied = self.ops_applied.saturating_add(1);
+                                    self.sync_active_sheet_cache();
+                                    self.start_log_watcher_if_needed()?;
+                                } else {
+                                    op.apply(&mut self.state);
+                                }
+                                self.status = "Filled column pattern".into();
+                            } else {
+                                self.status =
+                                    "Select a single column of cells, then press Ctrl+R / Cmd+R"
+                                        .into();
+                            }
+                            self.mode = mode;
+                            return Ok(false);
+                        }
+                        _ => {}
+                    }
                 }
 
                 let ctrl_or_cmd = key.modifiers.contains(KeyModifiers::CONTROL)
@@ -5046,6 +5585,104 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_d_fills_single_selected_row() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 4);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "1".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 1 }, "2".into());
+        app.anchor = Some(SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        });
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS + 1,
+        };
+        app.selection_kind = SelectionKind::Cells;
+        app.mode = Mode::Normal;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL))
+            .unwrap();
+
+        assert_eq!(
+            app.state.grid.get(&CellAddr::Main { row: 0, col: 2 }),
+            Some("3")
+        );
+        assert_eq!(
+            app.state.grid.get(&CellAddr::Main { row: 0, col: 3 }),
+            Some("4")
+        );
+    }
+
+    #[test]
+    fn ctrl_r_fills_single_selected_column() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(4, 1);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "mon".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 1, col: 0 }, "tue".into());
+        app.anchor = Some(SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        });
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS + 1,
+            col: MARGIN_COLS,
+        };
+        app.selection_kind = SelectionKind::Cells;
+        app.mode = Mode::Normal;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL))
+            .unwrap();
+
+        assert_eq!(
+            app.state.grid.get(&CellAddr::Main { row: 2, col: 0 }),
+            Some("WED")
+        );
+        assert_eq!(
+            app.state.grid.get(&CellAddr::Main { row: 3, col: 0 }),
+            Some("THU")
+        );
+    }
+
+    #[test]
+    fn ctrl_d_rejects_multirow_selection() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(2, 1);
+        app.anchor = Some(SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        });
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS + 1,
+            col: MARGIN_COLS,
+        };
+        app.selection_kind = SelectionKind::Cells;
+        app.mode = Mode::Normal;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL))
+            .unwrap();
+
+        assert!(app
+            .state
+            .grid
+            .get(&CellAddr::Main { row: 0, col: 0 })
+            .is_none());
+        assert!(app
+            .state
+            .grid
+            .get(&CellAddr::Main { row: 1, col: 0 })
+            .is_none());
+    }
+
+    #[test]
     fn cmd_shift_right_extends_to_last_nonblank_cell_in_row() {
         let mut app = App::new(None);
         app.state.grid.set_main_size(1, 5);
@@ -5535,11 +6172,19 @@ mod tests {
 
     #[test]
     fn total_row_and_total_column_intersection_sums_row_totals() {
-        use crate::io::load_revisions;
-        use std::path::Path;
-
-        let mut state = SheetState::new(1, 1);
-        load_revisions(Path::new("test5.corro"), 141, &mut state).unwrap();
+        let mut state = SheetState::new(4, 3);
+        state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 2 }, "1".into());
+        state
+            .grid
+            .set(&CellAddr::Main { row: 1, col: 2 }, "2".into());
+        state
+            .grid
+            .set(&CellAddr::Main { row: 2, col: 2 }, "3".into());
+        state
+            .grid
+            .set(&CellAddr::Main { row: 3, col: 2 }, "4".into());
 
         assert_eq!(
             footer_special_col_aggregate(
@@ -5549,7 +6194,7 @@ mod tests {
                 state.grid.main_rows(),
                 state.grid.main_cols(),
             ),
-            Some(format!("{}", 105.0 + 3.0 * std::f64::consts::PI))
+            Some("10".into())
         );
     }
 
@@ -5857,6 +6502,152 @@ mod tests {
         assert_eq!(
             app.cursor.to_addr(&app.state.grid),
             CellAddr::Main { row: 0, col: 1 }
+        );
+    }
+
+    #[test]
+    fn ctrl_c_copies_selected_cells() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(2, 2);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "a".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 1 }, "b".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 1, col: 0 }, "c".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 1, col: 1 }, "d".into());
+        app.anchor = Some(SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        });
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS + 1,
+            col: MARGIN_COLS + 1,
+        };
+        app.mode = Mode::Normal;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+            .unwrap();
+
+        let copied = test_clipboard_text().unwrap();
+        assert_eq!(copied, "a\tb\nc\td\n");
+    }
+
+    #[test]
+    fn ctrl_v_pastes_tsv_cells() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 1);
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        };
+
+        set_test_clipboard(Some("x\ty\n1\t2\n".into()));
+        app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL))
+            .unwrap();
+
+        assert_eq!(app.state.grid.main_rows(), 2);
+        assert_eq!(app.state.grid.main_cols(), 2);
+        assert_eq!(
+            app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }),
+            Some("x")
+        );
+        assert_eq!(
+            app.state.grid.get(&CellAddr::Main { row: 0, col: 1 }),
+            Some("y")
+        );
+        assert_eq!(
+            app.state.grid.get(&CellAddr::Main { row: 1, col: 0 }),
+            Some("1")
+        );
+        assert_eq!(
+            app.state.grid.get(&CellAddr::Main { row: 1, col: 1 }),
+            Some("2")
+        );
+    }
+
+    #[test]
+    fn ctrl_shift_v_pastes_values_only_in_normal_mode() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 1);
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        };
+
+        set_test_clipboard(Some("=A1".into()));
+        app.handle_key(KeyEvent::new(
+            KeyCode::Char('v'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ))
+        .unwrap();
+
+        assert_eq!(
+            app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }),
+            Some("A1")
+        );
+    }
+
+    #[test]
+    fn ctrl_shift_v_pastes_values_only_in_edit_mode() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 1);
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        };
+        app.mode = Mode::Edit {
+            buffer: "=".into(),
+            formula_cursor: None,
+            fit_to_content_on_commit: false,
+        };
+
+        set_test_clipboard(Some("=A1".into()));
+        app.handle_key(KeyEvent::new(
+            KeyCode::Char('v'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ))
+        .unwrap();
+
+        match &app.mode {
+            Mode::Edit { buffer, .. } => assert_eq!(buffer, "=A1"),
+            other => panic!("unexpected mode: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_pasted_tsv_expands_sheet() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 1);
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        };
+
+        app.apply_pasted_tsv("x\ty\n1\t2\n", true).unwrap();
+
+        assert_eq!(app.state.grid.main_rows(), 2);
+        assert_eq!(app.state.grid.main_cols(), 2);
+        assert_eq!(
+            app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }),
+            Some("x")
+        );
+        assert_eq!(
+            app.state.grid.get(&CellAddr::Main { row: 0, col: 1 }),
+            Some("y")
+        );
+        assert_eq!(
+            app.state.grid.get(&CellAddr::Main { row: 1, col: 0 }),
+            Some("1")
+        );
+        assert_eq!(
+            app.state.grid.get(&CellAddr::Main { row: 1, col: 1 }),
+            Some("2")
         );
     }
 
@@ -6281,10 +7072,54 @@ mod tests {
             }
         }
 
-        assert!(saw_underlined_tilde_row);
-        assert!(saw_underlined_last_data_row);
+        assert!(!saw_underlined_tilde_row);
+        assert!(!saw_underlined_last_data_row);
         assert!(saw_left_divider);
         assert!(saw_right_divider);
+    }
+
+    #[test]
+    fn balance_books_reorders_rows_in_place() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(3, 2);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "10".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 1 }, "a".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 1, col: 0 }, "-10".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 1, col: 1 }, "b".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 2, col: 0 }, "5".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 2, col: 1 }, "c".into());
+
+        app.mode = Mode::BalanceBooks {
+            buffer: String::new(),
+            direction: BalanceDirection::PosToNeg,
+            persist: false,
+        };
+
+        // Simulate Enter on the balance action path.
+        let _ = app.handle_key(crossterm::event::KeyEvent::from(
+            crossterm::event::KeyCode::Enter,
+        ));
+
+        assert_eq!(
+            app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }),
+            Some("10")
+        );
+        assert_eq!(
+            app.state.grid.get(&CellAddr::Main { row: 1, col: 0 }),
+            Some("-10")
+        );
     }
 
     #[test]

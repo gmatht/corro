@@ -22,6 +22,8 @@ It favors spreadsheet conventions where they fit, and documents the bindings tha
 | `Arrows`, `hjkl` | Move cursor | Moves through header, main, footer, and side margins |
 | `Shift+Arrows` | Extend selection | Starts or grows a rectangular selection |
 | `Ctrl+Shift+Arrows` / `Cmd+Shift+Arrows` | Extend to edge | Extends the selection to the last nonblank cell in that row or column |
+| `Ctrl+D` / `Cmd+D` | Fill right | Repeats or extends a single selected row to the right |
+| `Ctrl+R` / `Cmd+R` | Fill down | Repeats or extends a single selected column downward |
 | `Ctrl+Shift++` | Insert rows | Inserts rows above the current row or selected rows |
 | `Alt+I` | Open Insert menu | Menu includes rows, cols, special chars, and hyperlink actions |
 | `v` | Toggle cell selection | Selects the current rectangle anchor, or clears selection |

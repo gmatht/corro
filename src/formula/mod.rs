@@ -231,6 +231,136 @@ fn translate_range(range: &MainRange, ctx: &FormulaCopyContext) -> Option<MainRa
     })
 }
 
+pub fn translate_formula_text_by_offset(
+    raw: &str,
+    row_delta: i32,
+    col_delta: i32,
+) -> Option<String> {
+    if row_delta == 0 && col_delta == 0 {
+        return Some(raw.trim().to_string());
+    }
+    let t = raw.trim();
+    let (expr, label) =
+        split_labeled_formula(t).map_or((t, None), |(expr, label)| (expr, Some(label)));
+    if !expr.starts_with('=') {
+        return None;
+    }
+    let mut parser = Parser {
+        s: &expr[1..],
+        i: 0,
+    };
+    let ast = parser.parse_expr().ok()?;
+    parser.skip_ws();
+    if parser.i != parser.s.len() {
+        return None;
+    }
+    let translated = translate_ast_by_offset(&ast, row_delta, col_delta)?;
+    let mut out = format!("={}", render_ast(&translated));
+    if let Some(label) = label {
+        out.push_str(" -- ");
+        out.push_str(label);
+    }
+    Some(out)
+}
+
+fn translate_cell_addr_by_offset(
+    addr: &CellAddr,
+    row_delta: i32,
+    col_delta: i32,
+) -> Option<CellAddr> {
+    let shift_u32 = |v: u32, delta: i32| -> Option<u32> {
+        if delta >= 0 {
+            v.checked_add(delta as u32)
+        } else {
+            v.checked_sub(delta.unsigned_abs())
+        }
+    };
+    match addr {
+        CellAddr::Header { row, col } => Some(CellAddr::Header {
+            row: shift_u32(*row as u32, row_delta)? as u8,
+            col: shift_u32(*col, col_delta)?,
+        }),
+        CellAddr::Footer { row, col } => Some(CellAddr::Footer {
+            row: shift_u32(*row as u32, row_delta)? as u8,
+            col: shift_u32(*col, col_delta)?,
+        }),
+        CellAddr::Main { row, col } => Some(CellAddr::Main {
+            row: shift_u32(*row, row_delta)?,
+            col: shift_u32(*col, col_delta)?,
+        }),
+        CellAddr::Left { col, row } => Some(CellAddr::Left {
+            col: shift_u32(*col as u32, col_delta)? as u8,
+            row: shift_u32(*row, row_delta)?,
+        }),
+        CellAddr::Right { col, row } => Some(CellAddr::Right {
+            col: shift_u32(*col as u32, col_delta)? as u8,
+            row: shift_u32(*row, row_delta)?,
+        }),
+    }
+}
+
+fn translate_range_by_offset(
+    range: &MainRange,
+    row_delta: i32,
+    _col_delta: i32,
+) -> Option<MainRange> {
+    let shift_u32 = |v: u32, delta: i32| -> Option<u32> {
+        if delta >= 0 {
+            v.checked_add(delta as u32)
+        } else {
+            v.checked_sub(delta.unsigned_abs())
+        }
+    };
+    Some(MainRange {
+        row_start: shift_u32(range.row_start, row_delta)?,
+        row_end: shift_u32(range.row_end, row_delta)?,
+        col_start: range.col_start,
+        col_end: range.col_end,
+    })
+}
+
+fn translate_ast_by_offset(ast: &Ast, row_delta: i32, col_delta: i32) -> Option<Ast> {
+    Some(match ast {
+        Ast::Number(n) => Ast::Number(*n),
+        Ast::Text(s) => Ast::Text(s.clone()),
+        Ast::Name(name) => Ast::Name(name.clone()),
+        Ast::Ref(addr) => Ast::Ref(translate_cell_addr_by_offset(addr, row_delta, col_delta)?),
+        Ast::SheetRef { sheet_id, addr } => Ast::SheetRef {
+            sheet_id: *sheet_id,
+            addr: translate_cell_addr_by_offset(addr, row_delta, col_delta)?,
+        },
+        Ast::Range(range) => Ast::Range(translate_range_by_offset(range, row_delta, col_delta)?),
+        Ast::Neg(a) => Ast::Neg(Box::new(translate_ast_by_offset(a, row_delta, col_delta)?)),
+        Ast::Add(a, b) => Ast::Add(
+            Box::new(translate_ast_by_offset(a, row_delta, col_delta)?),
+            Box::new(translate_ast_by_offset(b, row_delta, col_delta)?),
+        ),
+        Ast::Sub(a, b) => Ast::Sub(
+            Box::new(translate_ast_by_offset(a, row_delta, col_delta)?),
+            Box::new(translate_ast_by_offset(b, row_delta, col_delta)?),
+        ),
+        Ast::Mul(a, b) => Ast::Mul(
+            Box::new(translate_ast_by_offset(a, row_delta, col_delta)?),
+            Box::new(translate_ast_by_offset(b, row_delta, col_delta)?),
+        ),
+        Ast::Div(a, b) => Ast::Div(
+            Box::new(translate_ast_by_offset(a, row_delta, col_delta)?),
+            Box::new(translate_ast_by_offset(b, row_delta, col_delta)?),
+        ),
+        Ast::Pow(a, b) => Ast::Pow(
+            Box::new(translate_ast_by_offset(a, row_delta, col_delta)?),
+            Box::new(translate_ast_by_offset(b, row_delta, col_delta)?),
+        ),
+        Ast::Call { name, args } => Ast::Call {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|a| translate_ast_by_offset(a, row_delta, col_delta))
+                .collect::<Option<Vec<_>>>()?,
+        },
+    })
+}
+
 fn translate_ast(ast: &Ast, ctx: &FormulaCopyContext) -> Option<Ast> {
     Some(match ast {
         Ast::Number(n) => Ast::Number(*n),
