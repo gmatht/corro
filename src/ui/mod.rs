@@ -2870,6 +2870,8 @@ impl App {
 
         {
             let lm = MARGIN_COLS;
+            let mc = grid.main_cols();
+            let show_right_divider = col_ixs.contains(&(lm + mc));
             let mut spans: Vec<Span> = vec![Span::styled(
                 format!("{:>width$}", "", width = ROW_LABEL_CHARS),
                 Style::default().add_modifier(Modifier::BOLD),
@@ -2892,6 +2894,9 @@ impl App {
                 if c == lm - 1 && lm > 0 && col_ixs.contains(&lm) {
                     spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
                 }
+                if c == lm + mc - 1 && show_right_divider {
+                    spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
+                }
             }
             lines.push(Line::from(spans));
         }
@@ -2900,6 +2905,7 @@ impl App {
         let mr = grid.main_rows();
         let lm = MARGIN_COLS;
         let mc = grid.main_cols();
+        let show_right_divider = col_ixs.contains(&(lm + mc));
         let max_data_lines = inner_h.saturating_sub(1);
         for &r in row_ixs.iter().take(max_data_lines) {
             let active_row = r == self.cursor.row;
@@ -3037,6 +3043,9 @@ impl App {
                 }
                 spans.push(Span::styled(disp, st));
                 if c == lm - 1 && lm > 0 && col_ixs.contains(&lm) {
+                    spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
+                }
+                if c == lm + mc - 1 && show_right_divider {
                     spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
                 }
             }
@@ -5649,7 +5658,7 @@ mod tests {
             " [File]   Insert    Help\n",
             " A1  Hello World   ·  Loaded workbook test5.corro\n",
             "┌ corro  13r × 2c  ops 221─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐\n",
-            "│                       [A│           A            B                  ]A                  ]B                  ]C                           │\n",
+            "│                       [A│           A            B                  │]A                  ]B                  ]C                           │\n",
             "│  ~1                     │            POW2         TOTAL               MAX                                                                │\n",
             "│   1                     │Hello World #VALUE                                                                                              │\n",
             "│   2                     │[B          #VALUE                                                                                              │\n",
