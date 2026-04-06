@@ -3034,8 +3034,9 @@ impl App {
                 } else {
                     Style::default()
                 };
+                let is_tilde_row = r == hr.saturating_sub(1);
                 let is_last_data_row = r == hr + mr - 1;
-                if is_last_data_row {
+                if is_tilde_row || is_last_data_row {
                     st = st.add_modifier(Modifier::UNDERLINED);
                 }
                 spans.push(Span::styled(disp, st));
@@ -5633,22 +5634,29 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| app.draw(f)).unwrap();
         let buffer = terminal.backend().buffer();
+        let mut saw_underlined_tilde_row = false;
         let mut saw_underlined_last_data_row = false;
         let mut saw_left_divider = false;
         let mut saw_right_divider = false;
+        let mut tilde_row_y: Option<u16> = None;
         let mut last_data_row_y: Option<u16> = None;
         for y in 0..buffer.area.height {
             let line = (0..buffer.area.width)
                 .map(|x| buffer[(x, y)].symbol())
                 .collect::<String>();
+            if line.contains("│  ~1") && line.contains("POW2") {
+                tilde_row_y = Some(y);
+            }
             if line.contains("│  13") && line.contains("#NAME") {
                 last_data_row_y = Some(y);
-                break;
             }
         }
         for y in 0..buffer.area.height {
             for x in 0..buffer.area.width {
                 let cell = &buffer[(x, y)];
+                if tilde_row_y == Some(y) && cell.modifier.contains(Modifier::UNDERLINED) {
+                    saw_underlined_tilde_row = true;
+                }
                 if last_data_row_y == Some(y) && cell.modifier.contains(Modifier::UNDERLINED) {
                     saw_underlined_last_data_row = true;
                 }
@@ -5661,6 +5669,7 @@ mod tests {
             }
         }
 
+        assert!(saw_underlined_tilde_row);
         assert!(saw_underlined_last_data_row);
         assert!(saw_left_divider);
         assert!(saw_right_divider);

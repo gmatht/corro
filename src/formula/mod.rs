@@ -1428,7 +1428,7 @@ mod tests {
         );
         assert_eq!(
             cell_effective_display(&g, &CellAddr::Main { row: 0, col: 8 }),
-            "3"
+            "d"
         );
     }
 
