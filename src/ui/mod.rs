@@ -2784,7 +2784,7 @@ impl App {
             Mode::About => Paragraph::new(" About - Up/Down scroll, Esc closes ")
                 .style(Style::default().fg(Color::White).bg(Color::Blue)),
             Mode::Menu { .. } => {
-                let val = cell_effective_display(grid, &addr);
+                let val = formula_bar_value(grid, &addr);
                 let base = format!(" {addr_str}  {val}");
                 let text = if self.status.is_empty() {
                     base
@@ -2794,7 +2794,7 @@ impl App {
                 Paragraph::new(text).style(Style::default().fg(Color::Cyan))
             }
             _ => {
-                let val = cell_effective_display(grid, &addr);
+                let val = formula_bar_value(grid, &addr);
                 let base = format!(" {addr_str}  {val}");
                 let text = if self.status.is_empty() {
                     base
@@ -2985,7 +2985,7 @@ impl App {
                 };
                 let cw = grid.col_width(c).max(1);
                 let disp = if text.chars().count() > cw {
-                    format!("{}…", text.chars().take(cw).collect::<String>())
+                    truncate_with_ellipsis(&text, cw)
                 } else if text.trim().parse::<f64>().is_ok() {
                     format!("{:>w$}", text, w = cw)
                 } else {
@@ -4914,6 +4914,40 @@ mod tests {
     }
 
     #[test]
+    fn formula_bar_keeps_raw_pi_text() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 1);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "=π".into());
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        };
+
+        let backend = TestBackend::new(40, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = |y: u16| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+
+        assert!((0..buffer.area.height).any(|y| row(y).contains("=π")));
+    }
+
+    #[test]
+    fn long_grid_values_truncate_one_char_shorter() {
+        assert_eq!(truncate_with_ellipsis("abcdef", 4), "abc…");
+        assert_eq!(truncate_with_ellipsis("abcdef", 1), "…");
+    }
+
+    #[test]
     fn startup_keeps_total_column_visible() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
@@ -5949,6 +5983,20 @@ fn input_line(
     }
 
     Line::from(spans)
+}
+
+fn formula_bar_value(grid: &Grid, addr: &CellAddr) -> String {
+    let raw = cell_display(grid, addr);
+    if raw.is_empty() {
+        cell_effective_display(grid, addr)
+    } else {
+        raw
+    }
+}
+
+fn truncate_with_ellipsis(text: &str, width: usize) -> String {
+    let keep = width.saturating_sub(1);
+    format!("{}…", text.chars().take(keep).collect::<String>())
 }
 
 fn sheet_row_label(logical_row: usize, main_rows: usize) -> String {
