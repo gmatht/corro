@@ -33,6 +33,55 @@ pub fn mirror_margin_column_name(margin_col_index: usize, left_side: bool) -> St
     ((b'A' + idx as u8) as char).to_string()
 }
 
+/// UI-style column fragment for display and formulas.
+pub fn ui_column_fragment(global_col: usize, main_cols: usize) -> String {
+    let m = crate::grid::MARGIN_COLS;
+    if global_col < m {
+        format!("[{}", mirror_margin_column_name(global_col, true))
+    } else if global_col < m + main_cols {
+        excel_column_name(global_col - m)
+    } else {
+        format!(
+            "]{}",
+            mirror_margin_column_name(global_col - m - main_cols, false)
+        )
+    }
+}
+
+/// Parse the UI-style footer/header column fragment after the row number.
+pub fn parse_ui_column_fragment(s: &str, main_cols: usize) -> Option<(u32, usize)> {
+    if let Some(rest) = s.strip_prefix('[') {
+        let col_len = rest.chars().take_while(|c| c.is_ascii_uppercase()).count();
+        if col_len != 1 {
+            return None;
+        }
+        let col = parse_mirror_margin_column_name(&rest[..col_len], true)?;
+        return Some((col as u32, 1 + col_len));
+    }
+    if let Some(rest) = s.strip_prefix(']') {
+        let col_len = rest.chars().take_while(|c| c.is_ascii_uppercase()).count();
+        if col_len != 1 {
+            return None;
+        }
+        let col = parse_mirror_margin_column_name(&rest[..col_len], false)?;
+        return Some((
+            crate::grid::MARGIN_COLS as u32 + main_cols as u32 + col as u32,
+            1 + col_len,
+        ));
+    }
+    let col_len = s.chars().take_while(|c| c.is_ascii_uppercase()).count();
+    if col_len == 0 {
+        return None;
+    }
+    let col = parse_excel_column(&s[..col_len])?;
+    Some((crate::grid::MARGIN_COLS as u32 + col, col_len))
+}
+
+/// Back-compat alias for the UI-style column fragment.
+pub fn ui_column_name(global_col: usize, main_cols: usize) -> String {
+    ui_column_fragment(global_col, main_cols)
+}
+
 /// Parse a sheet id prefix like `$12` at the start of `s`.
 pub fn parse_sheet_id_prefix_at(s: &str) -> Option<(u32, usize)> {
     let bytes = s.as_bytes();
@@ -59,7 +108,7 @@ pub fn parse_sheet_qualified_cell_ref_at(s: &str) -> Option<(u32, CellAddr, usiz
     Some((sheet_id, addr, prefix_len + 1 + addr_len))
 }
 
-fn parse_mirror_margin_column_name(name: &str, left_side: bool) -> Option<u8> {
+pub(crate) fn parse_mirror_margin_column_name(name: &str, left_side: bool) -> Option<u8> {
     let mut chars = name.chars();
     let ch = chars.next()?;
     if chars.next().is_some() || !ch.is_ascii_uppercase() {

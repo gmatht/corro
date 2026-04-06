@@ -68,12 +68,12 @@ fn workbook_addr_label(addr: &CellAddr) -> String {
         CellAddr::Header { row, col } => format!(
             "~{}{}",
             crate::grid::HEADER_ROWS - *row as usize,
-            crate::addr::excel_column_name(*col as usize)
+            crate::addr::ui_column_fragment(*col as usize, 0)
         ),
         CellAddr::Footer { row, col } => format!(
             "_{}{}",
             *row as usize + 1,
-            crate::addr::excel_column_name(*col as usize)
+            crate::addr::ui_column_fragment(*col as usize, 0)
         ),
         CellAddr::Left { col, row } => format!(
             "[{}{}",
@@ -260,7 +260,10 @@ pub fn commit_workbook_op(
     active_sheet: &mut u32,
     op: &WorkbookOp,
 ) -> Result<(), IoError> {
-    append_line(path, &op.to_log_line())?;
+    append_line(
+        path,
+        &op.to_log_line(workbook.active_sheet().grid.main_cols()),
+    )?;
     *offset = tail_apply_workbook(path, *offset, workbook, active_sheet)?;
     Ok(())
 }

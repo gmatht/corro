@@ -1,8 +1,7 @@
 //! Append-only log operations and replay onto [`SheetState`].
 
 use crate::addr::{
-    parse_cell_ref_at, parse_excel_column, parse_sheet_id_prefix_at,
-    parse_sheet_qualified_cell_ref_at,
+    parse_cell_ref_at, parse_excel_column, parse_sheet_id_prefix_at, parse_ui_column_fragment,
 };
 use crate::grid::{CellAddr, Grid, MainRange, SortSpec, MARGIN_COLS};
 use std::fs::OpenOptions;
@@ -135,6 +134,7 @@ pub enum Op {
     SetMainSize { main_rows: u32, main_cols: u32 },
     MoveRowRange { from: u32, count: u32, to: u32 },
     MoveColRange { from: u32, count: u32, to: u32 },
+    FillRange { cells: Vec<(CellAddr, String)> },
     SetMaxColWidth { width: usize },
     SetColWidth { col: usize, width: Option<usize> },
     SetViewSortCols { cols: Vec<SortSpec> },
@@ -220,6 +220,12 @@ impl Op {
                     .move_main_cols(*from as usize, *count as usize, *to as usize);
                 state.grid.bump_volatile_seed();
             }
+            Op::FillRange { cells } => {
+                for (addr, value) in cells {
+                    state.grid.set(addr, value.clone());
+                }
+                state.grid.bump_volatile_seed();
+            }
             Op::SetMaxColWidth { width } => {
                 state.grid.set_max_col_width(*width);
             }
@@ -239,13 +245,15 @@ fn addr_text(addr: &CellAddr) -> String {
         CellAddr::Header { row, col } => format!(
             "~{}{}",
             crate::grid::HEADER_ROWS - *row as usize,
-            crate::addr::excel_column_name(*col as usize)
+            crate::addr::ui_column_fragment(*col as usize, 0)
         ),
-        CellAddr::Footer { row, col } => format!(
-            "_{}{}",
-            *row as usize + 1,
-            crate::addr::excel_column_name(*col as usize)
-        ),
+        CellAddr::Footer { row, col } => {
+            format!(
+                "_{}{}",
+                *row as usize + 1,
+                crate::addr::ui_column_fragment(*col as usize, 0)
+            )
+        }
         CellAddr::Main { row, col } => format!(
             "{}{}",
             crate::addr::excel_column_name(*col as usize),
@@ -271,10 +279,17 @@ fn parse_op_text(line: &str) -> Option<Op> {
         "SET" => {
             let addr = parts.next()?;
             let value = parts.collect::<Vec<_>>().join(" ");
-            let (addr, _) = crate::addr::parse_sheet_qualified_cell_ref_at(addr)
-                .map(|(_, addr, len)| (addr, len))
-                .or_else(|| crate::addr::parse_cell_ref_at(addr))?;
+            let (addr, _) = parse_log_addr(addr, 0)?;
             Some(Op::SetCell { addr, value })
+        }
+        "FILL" => {
+            let mut cells = Vec::new();
+            for token in parts {
+                let (addr, value) = token.split_once('=')?;
+                let (addr, _) = parse_log_addr(addr, 0)?;
+                cells.push((addr, value.to_string()));
+            }
+            Some(Op::FillRange { cells })
         }
         "MOVE" => {
             let kind = parts.next()?.to_ascii_uppercase();
@@ -319,6 +334,14 @@ impl Op {
     pub fn to_log_line(&self) -> String {
         match self {
             Op::SetCell { addr, value } => format!("SET {} {}", addr_text(addr), value),
+            Op::FillRange { cells } => format!(
+                "FILL {}",
+                cells
+                    .iter()
+                    .map(|(addr, value)| format!("{}={value}", addr_text(addr)))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ),
             Op::MoveRowRange { from, count, to } => format!("MOVE ROW {from} {count} {to}"),
             Op::MoveColRange { from, count, to } => format!("MOVE COL {from} {count} {to}"),
             Op::SetMainSize {
@@ -355,7 +378,7 @@ impl Op {
 }
 
 impl WorkbookOp {
-    pub fn to_log_line(&self) -> String {
+    pub fn to_log_line(&self, main_cols: usize) -> String {
         match self {
             WorkbookOp::NewSheet { id, title } => format!("${id}:NEW_SHEET {title}"),
             WorkbookOp::ActivateSheet { id } => format!("${id}:ACTIVATE_SHEET"),
@@ -389,15 +412,80 @@ impl WorkbookOp {
 }
 
 fn parse_sheet_set_addr(addr: &str) -> Option<(u32, CellAddr, usize)> {
-    if let Some(parsed) = parse_sheet_qualified_cell_ref_at(addr) {
-        return Some(parsed);
-    }
-
     let (sheet_id, prefix_len) = parse_sheet_id_prefix_at(addr)?;
     let rest = addr.get(prefix_len..)?;
-    let cell_ref = rest.strip_prefix("::")?;
-    let (cell_addr, cell_len) = parse_cell_ref_at(cell_ref)?;
-    Some((sheet_id, cell_addr, prefix_len + 2 + cell_len))
+    let cell_ref = rest.strip_prefix(':')?;
+    let (cell_addr, cell_len) = parse_log_addr(cell_ref, 0)?;
+    Some((sheet_id, cell_addr, prefix_len + 1 + cell_len))
+}
+
+fn parse_log_addr(addr: &str, main_cols: usize) -> Option<(CellAddr, usize)> {
+    let bytes = addr.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+    match bytes[0] {
+        b'~' => {
+            let rest = &addr[1..];
+            let row_digits = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+            if row_digits == 0 {
+                return None;
+            }
+            let row_num: usize = rest[..row_digits].parse().ok()?;
+            let row = if row_num == 0 || row_num > crate::grid::HEADER_ROWS {
+                return None;
+            } else {
+                (crate::grid::HEADER_ROWS - row_num) as u8
+            };
+            let after = &rest[row_digits..];
+            let (col, col_len) = parse_ui_column_fragment(after, main_cols)?;
+            Some((CellAddr::Header { row, col }, 1 + row_digits + col_len))
+        }
+        b'_' => {
+            let rest = &addr[1..];
+            let row_digits = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+            if row_digits == 0 {
+                return None;
+            }
+            let row_num: usize = rest[..row_digits].parse().ok()?;
+            let row = if row_num == 0 || row_num > crate::grid::FOOTER_ROWS {
+                return None;
+            } else {
+                (row_num - 1) as u8
+            };
+            let after = &rest[row_digits..];
+            let (col, col_len) = parse_ui_column_fragment(after, main_cols)?;
+            Some((CellAddr::Footer { row, col }, 1 + row_digits + col_len))
+        }
+        b'[' | b']' => {
+            let left_side = bytes[0] == b'[';
+            let rest = &addr[1..];
+            let col_len = rest.chars().take_while(|c| c.is_ascii_uppercase()).count();
+            if col_len != 1 {
+                return None;
+            }
+            let col = crate::addr::parse_mirror_margin_column_name(&rest[..col_len], left_side)?;
+            let after = &rest[col_len..];
+            let row_digits = after.chars().take_while(|c| c.is_ascii_digit()).count();
+            if row_digits == 0 {
+                return None;
+            }
+            let row: u32 = after[..row_digits].parse().ok()?;
+            if row == 0 {
+                return None;
+            }
+            let consumed = 1 + col_len + row_digits;
+            Some((
+                if left_side {
+                    CellAddr::Left { col, row: row - 1 }
+                } else {
+                    CellAddr::Right { col, row: row - 1 }
+                },
+                consumed,
+            ))
+        }
+        _ => parse_cell_ref_at(addr),
+    }
 }
 
 pub fn parse_workbook_line(line: &str) -> Result<WorkbookOp, std::io::Error> {
@@ -407,11 +495,14 @@ pub fn parse_workbook_line(line: &str) -> Result<WorkbookOp, std::io::Error> {
         let addr = parts
             .next()
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad SET line"))?;
-        if let Some((sheet_id, addr, len)) = parse_sheet_set_addr(addr) {
+        if let Some((sheet_id, cell_addr, len)) = parse_sheet_set_addr(addr) {
             let value = rest.get(len..).unwrap_or("").trim_start().to_string();
             return Ok(WorkbookOp::SheetOp {
                 sheet_id,
-                op: Op::SetCell { addr, value },
+                op: Op::SetCell {
+                    addr: cell_addr,
+                    value,
+                },
             });
         }
     }
@@ -618,6 +709,7 @@ impl SheetState {
                     to: *from,
                 })
             }
+            Op::FillRange { .. } => None,
             Op::SetMainSize { .. } => Some(Op::SetMainSize {
                 main_rows: self.grid.main_rows() as u32,
                 main_cols: self.grid.main_cols() as u32,
@@ -779,6 +871,14 @@ pub fn append_op(path: &Path, op: &Op) -> std::io::Result<()> {
         Op::SetCell { addr, value } => format!("SET {} {}", addr_text(addr), value),
         Op::MoveRowRange { from, count, to } => format!("MOVE ROW {from} {count} {to}"),
         Op::MoveColRange { from, count, to } => format!("MOVE COL {from} {count} {to}"),
+        Op::FillRange { cells } => format!(
+            "FILL {}",
+            cells
+                .iter()
+                .map(|(addr, value)| format!("{}={value}", addr_text(addr)))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ),
         Op::SetMainSize {
             main_rows,
             main_cols,
@@ -877,12 +977,12 @@ mod tests {
                 value: "is A2".into(),
             },
         };
-        assert_eq!(op.to_log_line(), "SET $2:A2 is A2");
+        assert_eq!(op.to_log_line(1), "SET $2:A2 is A2");
     }
 
     #[test]
-    fn workbook_sheet_set_parser_accepts_legacy_double_colon() {
-        let op = parse_workbook_line("SET $2::A2 is A2").unwrap();
+    fn workbook_sheet_set_parser_accepts_ui_notation() {
+        let op = parse_workbook_line("SET $2:A2 is A2").unwrap();
         assert_eq!(
             op,
             WorkbookOp::SheetOp {
@@ -893,6 +993,19 @@ mod tests {
                 },
             }
         );
+    }
+
+    #[test]
+    fn fill_range_round_trips_through_log_line() {
+        let op = Op::FillRange {
+            cells: vec![
+                (CellAddr::Main { row: 0, col: 0 }, "1".into()),
+                (CellAddr::Main { row: 0, col: 1 }, "2".into()),
+            ],
+        };
+        let line = op.to_log_line();
+        assert_eq!(line, "FILL A1=1 B1=2");
+        assert_eq!(parse_op_line(&line), Some(op));
     }
 
     #[test]

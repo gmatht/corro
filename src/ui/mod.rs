@@ -2605,7 +2605,7 @@ impl App {
                     id: sheet.id,
                     title: sheet.title.clone(),
                 }
-                .to_log_line(),
+                .to_log_line(sheet.state.grid.main_cols()),
             );
             buf.push('\n');
             for row in 0..sheet.state.grid.main_rows() {
@@ -2624,7 +2624,7 @@ impl App {
                                         value: value.to_string(),
                                     },
                                 }
-                                .to_log_line(),
+                                .to_log_line(sheet.state.grid.main_cols()),
                             );
                             buf.push('\n');
                         }
@@ -2639,7 +2639,7 @@ impl App {
                         main_cols: sheet.state.grid.main_cols() as u32,
                     },
                 }
-                .to_log_line(),
+                .to_log_line(sheet.state.grid.main_cols()),
             );
             buf.push('\n');
             if sheet.state.grid.max_col_width != 20 {
@@ -2650,7 +2650,7 @@ impl App {
                             width: sheet.state.grid.max_col_width,
                         },
                     }
-                    .to_log_line(),
+                    .to_log_line(sheet.state.grid.main_cols()),
                 );
                 buf.push('\n');
             }
@@ -2663,7 +2663,7 @@ impl App {
                             width: Some(*width),
                         },
                     }
-                    .to_log_line(),
+                    .to_log_line(sheet.state.grid.main_cols()),
                 );
                 buf.push('\n');
             }
@@ -2675,7 +2675,7 @@ impl App {
                             cols: sheet.state.grid.view_sort_cols.clone(),
                         },
                     }
-                    .to_log_line(),
+                    .to_log_line(sheet.state.grid.main_cols()),
                 );
                 buf.push('\n');
             }

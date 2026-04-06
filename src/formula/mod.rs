@@ -139,10 +139,14 @@ fn render_addr(addr: &CellAddr) -> String {
         CellAddr::Header { row, col } => format!(
             "~{}{}",
             HEADER_ROWS - *row as usize,
-            excel_column_name(*col as usize)
+            crate::addr::ui_column_fragment(*col as usize, 0)
         ),
         CellAddr::Footer { row, col } => {
-            format!("_{}{}", *row as usize + 1, excel_column_name(*col as usize))
+            format!(
+                "_{}{}",
+                *row as usize + 1,
+                crate::addr::ui_column_fragment(*col as usize, 0)
+            )
         }
         CellAddr::Main { row, col } => format!("{}{}", excel_column_name(*col as usize), row + 1),
         CellAddr::Left { col, row } => format!(
