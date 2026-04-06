@@ -905,45 +905,58 @@ fn sum_main_range(
 }
 
 pub fn refresh_spills(grid: &mut Grid) {
-    grid.clear_spills();
-    let anchors: Vec<(CellAddr, String)> = grid
-        .main_cells
-        .iter()
-        .map(|((row, col), value)| {
-            (
-                CellAddr::Main {
-                    row: *row,
-                    col: *col,
-                },
-                value.clone(),
-            )
-        })
-        .collect();
-    for (addr, raw) in anchors {
-        if !is_formula(&raw) {
-            continue;
-        }
-        let mut visiting = Vec::new();
-        let mut budget = DEFAULT_BUDGET;
-        if let EvalResult::Array(rows) = eval_cell(grid, &addr, &mut visiting, &mut budget) {
-            let CellAddr::Main { row: ar, col: ac } = addr else {
+    let mut prev_followers = grid.spill_followers.clone();
+    let mut prev_errors = grid.spill_errors.clone();
+    for _ in 0..8 {
+        grid.clear_spills();
+        let mut anchors: Vec<(CellAddr, String)> = grid
+            .main_cells
+            .iter()
+            .map(|((row, col), value)| {
+                (
+                    CellAddr::Main {
+                        row: *row,
+                        col: *col,
+                    },
+                    value.clone(),
+                )
+            })
+            .collect();
+        anchors.sort_by_key(|(addr, _)| match addr {
+            CellAddr::Main { row, col } => (*row, *col),
+            _ => (u32::MAX, u32::MAX),
+        });
+        for (addr, raw) in anchors {
+            if !is_formula(&raw) {
                 continue;
-            };
-            for (r, row) in rows.iter().enumerate() {
-                for (c, cell) in row.iter().enumerate() {
-                    if r == 0 && c == 0 {
-                        continue;
+            }
+            let mut visiting = Vec::new();
+            let mut budget = DEFAULT_BUDGET;
+            if let EvalResult::Array(rows) = eval_cell(grid, &addr, &mut visiting, &mut budget) {
+                let CellAddr::Main { row: ar, col: ac } = addr else {
+                    continue;
+                };
+                for (r, row) in rows.iter().enumerate() {
+                    for (c, cell) in row.iter().enumerate() {
+                        if r == 0 && c == 0 {
+                            continue;
+                        }
+                        grid.set_spill_value(
+                            CellAddr::Main {
+                                row: ar + r as u32,
+                                col: ac + c as u32,
+                            },
+                            eval_result_to_string(cell),
+                        );
                     }
-                    grid.set_spill_value(
-                        CellAddr::Main {
-                            row: ar + r as u32,
-                            col: ac + c as u32,
-                        },
-                        eval_result_to_string(cell),
-                    );
                 }
             }
         }
+        if grid.spill_followers == prev_followers && grid.spill_errors == prev_errors {
+            break;
+        }
+        prev_followers = grid.spill_followers.clone();
+        prev_errors = grid.spill_errors.clone();
     }
 }
 
@@ -1256,6 +1269,245 @@ mod tests {
             cell_effective_display(&g, &CellAddr::Main { row: 0, col: 3 }),
             "a"
         );
+    }
+
+    #[test]
+    fn iferror_and_ifna() {
+        let mut g = Grid::new(1, 4);
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "1".into());
+        g.set(&CellAddr::Main { row: 0, col: 1 }, "2".into());
+        g.set(
+            &CellAddr::Main { row: 0, col: 2 },
+            "=IFERROR(VLOOKUP(9,A1:B1,2),\"x\")".into(),
+        );
+        g.set(
+            &CellAddr::Main { row: 0, col: 3 },
+            "=IFNA(VLOOKUP(9,A1:B1,2),\"y\")".into(),
+        );
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 2 }, &mut v, &mut b) {
+            EvalResult::Text(s) => assert_eq!(s, "x"),
+            e => panic!("expected x {:?}", e),
+        }
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 3 }, &mut v, &mut b) {
+            EvalResult::Text(s) => assert_eq!(s, "y"),
+            e => panic!("expected y {:?}", e),
+        }
+    }
+
+    #[test]
+    fn index_and_match_work() {
+        let mut g = Grid::new(2, 4);
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "a".into());
+        g.set(&CellAddr::Main { row: 0, col: 1 }, "b".into());
+        g.set(&CellAddr::Main { row: 1, col: 0 }, "c".into());
+        g.set(&CellAddr::Main { row: 1, col: 1 }, "d".into());
+        g.set(
+            &CellAddr::Main { row: 0, col: 2 },
+            "=MATCH(\"c\",A1:A2,0)".into(),
+        );
+        g.set(
+            &CellAddr::Main { row: 0, col: 3 },
+            "=INDEX(A1:B2,2,2)".into(),
+        );
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 2 }, &mut v, &mut b) {
+            EvalResult::Number(n) => assert!((n - 2.0).abs() < 1e-9),
+            e => panic!("expected 2 {:?}", e),
+        }
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 3 }, &mut v, &mut b) {
+            EvalResult::Text(s) => assert_eq!(s, "d"),
+            e => panic!("expected d {:?}", e),
+        }
+    }
+
+    #[test]
+    fn countifs_sumifs_averageifs_work() {
+        let mut g = Grid::new(2, 4);
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "a".into());
+        g.set(&CellAddr::Main { row: 0, col: 1 }, "1".into());
+        g.set(&CellAddr::Main { row: 1, col: 0 }, "a".into());
+        g.set(&CellAddr::Main { row: 1, col: 1 }, "3".into());
+        g.set(
+            &CellAddr::Main { row: 0, col: 2 },
+            "=COUNTIFS(A1:A2,\"a\")".into(),
+        );
+        g.set(
+            &CellAddr::Main { row: 0, col: 3 },
+            "=SUMIFS(B1:B2,A1:A2,\"a\")".into(),
+        );
+        g.set(
+            &CellAddr::Main { row: 1, col: 2 },
+            "=AVERAGEIFS(B1:B2,A1:A2,\"a\")".into(),
+        );
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 2 }, &mut v, &mut b) {
+            EvalResult::Number(n) => assert!((n - 2.0).abs() < 1e-9),
+            e => panic!("expected 2 {:?}", e),
+        }
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 3 }, &mut v, &mut b) {
+            EvalResult::Number(n) => assert!((n - 4.0).abs() < 1e-9),
+            e => panic!("expected 4 {:?}", e),
+        }
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 1, col: 2 }, &mut v, &mut b) {
+            EvalResult::Number(n) => assert!((n - 2.0).abs() < 1e-9),
+            e => panic!("expected 2 {:?}", e),
+        }
+    }
+
+    #[test]
+    fn sort_take_drop_choose_work() {
+        let mut g = Grid::new(4, 9);
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "3".into());
+        g.set(&CellAddr::Main { row: 1, col: 0 }, "1".into());
+        g.set(&CellAddr::Main { row: 2, col: 0 }, "2".into());
+        g.set(&CellAddr::Main { row: 0, col: 1 }, "b".into());
+        g.set(&CellAddr::Main { row: 1, col: 1 }, "d".into());
+        g.set(&CellAddr::Main { row: 0, col: 3 }, "=SORT(A1:A3)".into());
+        g.set(&CellAddr::Main { row: 0, col: 4 }, "=TAKE(A1:A3,2)".into());
+        g.set(&CellAddr::Main { row: 0, col: 5 }, "=DROP(A1:A3,1)".into());
+        g.set(
+            &CellAddr::Main { row: 0, col: 6 },
+            "=CHOOSECOLS(A1:B2,2)".into(),
+        );
+        g.set(
+            &CellAddr::Main { row: 0, col: 7 },
+            "=CHOOSEROWS(A1:B2,2)".into(),
+        );
+        refresh_spills(&mut g);
+        assert_eq!(
+            cell_effective_display(&g, &CellAddr::Main { row: 0, col: 3 }),
+            "1"
+        );
+        assert_eq!(
+            cell_effective_display(&g, &CellAddr::Main { row: 1, col: 3 }),
+            "2"
+        );
+        assert_eq!(
+            cell_effective_display(&g, &CellAddr::Main { row: 2, col: 3 }),
+            "3"
+        );
+        assert_eq!(
+            cell_effective_display(&g, &CellAddr::Main { row: 0, col: 4 }),
+            "3"
+        );
+        assert_eq!(
+            cell_effective_display(&g, &CellAddr::Main { row: 1, col: 4 }),
+            "1"
+        );
+        assert_eq!(
+            cell_effective_display(&g, &CellAddr::Main { row: 0, col: 5 }),
+            "1"
+        );
+        assert_eq!(
+            cell_effective_display(&g, &CellAddr::Main { row: 1, col: 5 }),
+            "2"
+        );
+        assert_eq!(
+            cell_effective_display(&g, &CellAddr::Main { row: 0, col: 6 }),
+            "b"
+        );
+        assert_eq!(
+            cell_effective_display(&g, &CellAddr::Main { row: 1, col: 6 }),
+            "d"
+        );
+        assert_eq!(
+            cell_effective_display(&g, &CellAddr::Main { row: 0, col: 7 }),
+            "1"
+        );
+        assert_eq!(
+            cell_effective_display(&g, &CellAddr::Main { row: 0, col: 8 }),
+            "3"
+        );
+    }
+
+    #[test]
+    fn text_functions_work() {
+        let mut g = Grid::new(1, 5);
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "=LEN(\"abc\")".into());
+        g.set(
+            &CellAddr::Main { row: 0, col: 1 },
+            "=LEFT(\"abcd\",2)".into(),
+        );
+        g.set(
+            &CellAddr::Main { row: 0, col: 2 },
+            "=RIGHT(\"abcd\",2)".into(),
+        );
+        g.set(
+            &CellAddr::Main { row: 0, col: 3 },
+            "=MID(\"abcd\",2,2)".into(),
+        );
+        g.set(
+            &CellAddr::Main { row: 0, col: 4 },
+            "=CONCAT(\"a\",\"b\",\"c\")".into(),
+        );
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 0 }, &mut v, &mut b) {
+            EvalResult::Number(n) => assert!((n - 3.0).abs() < 1e-9),
+            e => panic!("expected 3 {:?}", e),
+        }
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 1 }, &mut v, &mut b) {
+            EvalResult::Text(s) => assert_eq!(s, "ab"),
+            e => panic!("expected ab {:?}", e),
+        }
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 2 }, &mut v, &mut b) {
+            EvalResult::Text(s) => assert_eq!(s, "cd"),
+            e => panic!("expected cd {:?}", e),
+        }
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 3 }, &mut v, &mut b) {
+            EvalResult::Text(s) => assert_eq!(s, "bc"),
+            e => panic!("expected bc {:?}", e),
+        }
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 4 }, &mut v, &mut b) {
+            EvalResult::Text(s) => assert_eq!(s, "abc"),
+            e => panic!("expected abc {:?}", e),
+        }
+    }
+
+    #[test]
+    fn boolean_functions_work() {
+        let mut g = Grid::new(1, 3);
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "=AND(1,2,3)".into());
+        g.set(&CellAddr::Main { row: 0, col: 1 }, "=OR(0,0,1)".into());
+        g.set(&CellAddr::Main { row: 0, col: 2 }, "=NOT(0)".into());
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 0 }, &mut v, &mut b) {
+            EvalResult::Number(n) => assert!((n - 1.0).abs() < 1e-9),
+            e => panic!("expected 1 {:?}", e),
+        }
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 1 }, &mut v, &mut b) {
+            EvalResult::Number(n) => assert!((n - 1.0).abs() < 1e-9),
+            e => panic!("expected 1 {:?}", e),
+        }
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 2 }, &mut v, &mut b) {
+            EvalResult::Number(n) => assert!((n - 1.0).abs() < 1e-9),
+            e => panic!("expected 1 {:?}", e),
+        }
     }
 
     #[test]

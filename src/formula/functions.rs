@@ -128,15 +128,36 @@ pub(crate) fn eval_builtin(
             f64::cos,
         ),
         "TRIM" => eval_trim(&args, grid, visiting, bindings, budget, allow_templates),
+        "LEN" => eval_len(&args, grid, visiting, bindings, budget, allow_templates),
+        "LEFT" => eval_left(&args, grid, visiting, bindings, budget, allow_templates),
+        "RIGHT" => eval_right(&args, grid, visiting, bindings, budget, allow_templates),
+        "MID" => eval_mid(&args, grid, visiting, bindings, budget, allow_templates),
+        "CONCAT" => eval_concat(&args, grid, visiting, bindings, budget, allow_templates),
+        "TEXTJOIN" => eval_textjoin(&args, grid, visiting, bindings, budget, allow_templates),
+        "AND" => eval_and(&args, grid, visiting, bindings, budget, allow_templates),
+        "OR" => eval_or(&args, grid, visiting, bindings, budget, allow_templates),
+        "NOT" => eval_not(&args, grid, visiting, bindings, budget, allow_templates),
+        "IFERROR" => eval_iferror(&args, grid, visiting, bindings, budget, allow_templates),
+        "IFNA" => eval_ifna(&args, grid, visiting, bindings, budget, allow_templates),
         "COUNTIF" => eval_countif(&args, grid, visiting, bindings, budget, allow_templates),
         "SUMIF" => eval_sumif(&args, grid, visiting, bindings, budget, allow_templates),
+        "COUNTIFS" => eval_countifs(&args, grid, visiting, bindings, budget, allow_templates),
+        "SUMIFS" => eval_sumifs(&args, grid, visiting, bindings, budget, allow_templates),
+        "AVERAGEIFS" => eval_averageifs(&args, grid, visiting, bindings, budget, allow_templates),
         "LOOKUP" => eval_lookup(&args, grid, visiting, bindings, budget, allow_templates),
         "VLOOKUP" => eval_vlookup(&args, grid, visiting, bindings, budget, allow_templates),
         "XLOOKUP" => eval_xlookup(&args, grid, visiting, bindings, budget, allow_templates),
+        "MATCH" => eval_match(&args, grid, visiting, bindings, budget, allow_templates),
+        "INDEX" => eval_index(&args, grid, visiting, bindings, budget, allow_templates),
         "LET" => eval_let(&args, grid, visiting, bindings, budget, allow_templates),
         "SEQUENCE" => eval_sequence(&args, grid, visiting, bindings, budget, allow_templates),
         "FILTER" => eval_filter(&args, grid, visiting, bindings, budget, allow_templates),
         "UNIQUE" => eval_unique(&args, grid, visiting, bindings, budget, allow_templates),
+        "SORT" => eval_sort(&args, grid, visiting, bindings, budget, allow_templates),
+        "TAKE" => eval_take(&args, grid, visiting, bindings, budget, allow_templates),
+        "DROP" => eval_drop(&args, grid, visiting, bindings, budget, allow_templates),
+        "CHOOSECOLS" => eval_choosecols(&args, grid, visiting, bindings, budget, allow_templates),
+        "CHOOSEROWS" => eval_chooserows(&args, grid, visiting, bindings, budget, allow_templates),
         "IF" => {
             if args.len() != 3 {
                 return EvalResult::Error("ARGS");
@@ -301,6 +322,1087 @@ fn eval_trim(
         EvalResult::Text(s) => EvalResult::Text(trim_spaces(&s)),
         EvalResult::Error(e) => EvalResult::Error(e),
         EvalResult::Array(_) => EvalResult::Error("CALC"),
+    }
+}
+
+fn eval_iferror(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    if args.len() != 2 {
+        return EvalResult::Error("ARGS");
+    }
+    let value = eval_ast(&args[0], grid, visiting, bindings, budget, allow_templates);
+    if matches!(value, EvalResult::Error(_) | EvalResult::Array(_)) {
+        eval_ast(&args[1], grid, visiting, bindings, budget, allow_templates)
+    } else {
+        value
+    }
+}
+
+fn eval_ifna(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    if args.len() != 2 {
+        return EvalResult::Error("ARGS");
+    }
+    let value = eval_ast(&args[0], grid, visiting, bindings, budget, allow_templates);
+    match value {
+        EvalResult::Error("NA") | EvalResult::Error("PARSE") => {
+            eval_ast(&args[1], grid, visiting, bindings, budget, allow_templates)
+        }
+        _ => value,
+    }
+}
+
+fn eval_len(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    if args.len() != 1 {
+        return EvalResult::Error("ARGS");
+    }
+    match eval_ast(&args[0], grid, visiting, bindings, budget, allow_templates).scalar_coerce() {
+        EvalResult::Text(s) => EvalResult::Number(s.chars().count() as f64),
+        EvalResult::Number(n) => EvalResult::Number(format!("{n}").chars().count() as f64),
+        EvalResult::Error(e) => EvalResult::Error(e),
+        EvalResult::Array(_) => EvalResult::Error("CALC"),
+    }
+}
+
+fn eval_left(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    if args.len() != 1 && args.len() != 2 {
+        return EvalResult::Error("ARGS");
+    }
+    let text = match eval_ast(&args[0], grid, visiting, bindings, budget, allow_templates)
+        .scalar_coerce()
+    {
+        EvalResult::Text(s) => s,
+        EvalResult::Number(n) => n.to_string(),
+        EvalResult::Error(e) => return EvalResult::Error(e),
+        EvalResult::Array(_) => return EvalResult::Error("CALC"),
+    };
+    let n = if args.len() == 2 {
+        match numeric_value(eval_ast(
+            &args[1],
+            grid,
+            visiting,
+            bindings,
+            budget,
+            allow_templates,
+        )) {
+            Some(v) if v >= 0.0 => v as usize,
+            _ => return EvalResult::Error("VALUE"),
+        }
+    } else {
+        1
+    };
+    EvalResult::Text(text.chars().take(n).collect())
+}
+
+fn eval_right(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    if args.len() != 1 && args.len() != 2 {
+        return EvalResult::Error("ARGS");
+    }
+    let text = match eval_ast(&args[0], grid, visiting, bindings, budget, allow_templates)
+        .scalar_coerce()
+    {
+        EvalResult::Text(s) => s,
+        EvalResult::Number(n) => n.to_string(),
+        EvalResult::Error(e) => return EvalResult::Error(e),
+        EvalResult::Array(_) => return EvalResult::Error("CALC"),
+    };
+    let n = if args.len() == 2 {
+        match numeric_value(eval_ast(
+            &args[1],
+            grid,
+            visiting,
+            bindings,
+            budget,
+            allow_templates,
+        )) {
+            Some(v) if v >= 0.0 => v as usize,
+            _ => return EvalResult::Error("VALUE"),
+        }
+    } else {
+        1
+    };
+    let chars: Vec<char> = text.chars().collect();
+    let start = chars.len().saturating_sub(n);
+    EvalResult::Text(chars[start..].iter().collect())
+}
+
+fn eval_mid(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    if args.len() != 3 {
+        return EvalResult::Error("ARGS");
+    }
+    let text = match eval_ast(&args[0], grid, visiting, bindings, budget, allow_templates)
+        .scalar_coerce()
+    {
+        EvalResult::Text(s) => s,
+        EvalResult::Number(n) => n.to_string(),
+        EvalResult::Error(e) => return EvalResult::Error(e),
+        EvalResult::Array(_) => return EvalResult::Error("CALC"),
+    };
+    let start = match numeric_value(eval_ast(
+        &args[1],
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+    )) {
+        Some(v) if v >= 1.0 => v as usize,
+        _ => return EvalResult::Error("VALUE"),
+    };
+    let len = match numeric_value(eval_ast(
+        &args[2],
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+    )) {
+        Some(v) if v >= 0.0 => v as usize,
+        _ => return EvalResult::Error("VALUE"),
+    };
+    let chars: Vec<char> = text.chars().collect();
+    let start = start.saturating_sub(1);
+    EvalResult::Text(chars.into_iter().skip(start).take(len).collect())
+}
+
+fn eval_concat(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    let mut out = String::new();
+    for arg in args {
+        match eval_ast(arg, grid, visiting, bindings, budget, allow_templates).scalar_coerce() {
+            EvalResult::Number(n) => out.push_str(&n.to_string()),
+            EvalResult::Text(s) => out.push_str(&s),
+            EvalResult::Error(e) => return EvalResult::Error(e),
+            EvalResult::Array(_) => return EvalResult::Error("CALC"),
+        }
+    }
+    EvalResult::Text(out)
+}
+
+fn eval_textjoin(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    if args.len() < 2 {
+        return EvalResult::Error("ARGS");
+    }
+    let delim = match eval_ast(&args[0], grid, visiting, bindings, budget, allow_templates)
+        .scalar_coerce()
+    {
+        EvalResult::Text(s) => s,
+        EvalResult::Number(n) => n.to_string(),
+        EvalResult::Error(e) => return EvalResult::Error(e),
+        EvalResult::Array(_) => return EvalResult::Error("CALC"),
+    };
+    let mut parts = Vec::new();
+    for arg in &args[1..] {
+        let value =
+            eval_ast(arg, grid, visiting, bindings, budget, allow_templates).scalar_coerce();
+        match value {
+            EvalResult::Number(n) => parts.push(n.to_string()),
+            EvalResult::Text(s) => {
+                if !s.is_empty() {
+                    parts.push(s);
+                }
+            }
+            EvalResult::Error(e) => return EvalResult::Error(e),
+            EvalResult::Array(_) => return EvalResult::Error("CALC"),
+        }
+    }
+    EvalResult::Text(parts.join(&delim))
+}
+
+fn eval_not(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    if args.len() != 1 {
+        return EvalResult::Error("ARGS");
+    }
+    EvalResult::Number(
+        if super::truthy(eval_ast(
+            &args[0],
+            grid,
+            visiting,
+            bindings,
+            budget,
+            allow_templates,
+        )) {
+            0.0
+        } else {
+            1.0
+        },
+    )
+}
+
+fn eval_and(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    for arg in args {
+        if !super::truthy(eval_ast(
+            arg,
+            grid,
+            visiting,
+            bindings,
+            budget,
+            allow_templates,
+        )) {
+            return EvalResult::Number(0.0);
+        }
+    }
+    EvalResult::Number(1.0)
+}
+
+fn eval_or(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    for arg in args {
+        if super::truthy(eval_ast(
+            arg,
+            grid,
+            visiting,
+            bindings,
+            budget,
+            allow_templates,
+        )) {
+            return EvalResult::Number(1.0);
+        }
+    }
+    EvalResult::Number(0.0)
+}
+
+fn eval_match(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    if args.len() < 2 || args.len() > 3 {
+        return EvalResult::Error("ARGS");
+    }
+    if args.len() == 3 {
+        let mt = match numeric_value(eval_ast(
+            &args[2],
+            grid,
+            visiting,
+            bindings,
+            budget,
+            allow_templates,
+        )) {
+            Some(n) => n,
+            None => return EvalResult::Error("VALUE"),
+        };
+        if mt != 0.0 {
+            return EvalResult::Error("NA");
+        }
+    }
+    let lookup_value = match eval_ast(&args[0], grid, visiting, bindings, budget, allow_templates)
+        .scalar_coerce()
+    {
+        EvalResult::Number(n) => LookupValue::Number(n),
+        EvalResult::Text(s) => parse_number_literal(&s)
+            .map(LookupValue::Number)
+            .unwrap_or(LookupValue::Text(s)),
+        EvalResult::Error(e) => return EvalResult::Error(e),
+        EvalResult::Array(_) => return EvalResult::Error("CALC"),
+    };
+    let matrix =
+        match collect_matrix_values(&args[1], grid, visiting, bindings, budget, allow_templates) {
+            Ok(m) => m,
+            Err(e) => return EvalResult::Error(e),
+        };
+    let mut idx = 1u32;
+    for row in matrix {
+        for cell in row {
+            let candidate = match cell.scalar_coerce() {
+                EvalResult::Number(n) => LookupValue::Number(n),
+                EvalResult::Text(s) => parse_number_literal(&s)
+                    .map(LookupValue::Number)
+                    .unwrap_or(LookupValue::Text(s)),
+                EvalResult::Error(_) => {
+                    idx += 1;
+                    continue;
+                }
+                EvalResult::Array(_) => {
+                    idx += 1;
+                    continue;
+                }
+            };
+            if candidate == lookup_value {
+                return EvalResult::Number(idx as f64);
+            }
+            idx += 1;
+        }
+    }
+    EvalResult::Error("NA")
+}
+
+fn eval_index(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    if args.len() != 2 && args.len() != 3 {
+        return EvalResult::Error("ARGS");
+    }
+    let matrix =
+        match collect_matrix_values(&args[0], grid, visiting, bindings, budget, allow_templates) {
+            Ok(m) => m,
+            Err(e) => return EvalResult::Error(e),
+        };
+    if matrix.is_empty() || matrix[0].is_empty() {
+        return EvalResult::Error("REF");
+    }
+    let row = match numeric_value(eval_ast(
+        &args[1],
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+    )) {
+        Some(n) if n >= 1.0 => n as usize,
+        _ => return EvalResult::Error("VALUE"),
+    };
+    let col = if args.len() == 3 {
+        match numeric_value(eval_ast(
+            &args[2],
+            grid,
+            visiting,
+            bindings,
+            budget,
+            allow_templates,
+        )) {
+            Some(n) if n >= 1.0 => n as usize,
+            _ => return EvalResult::Error("VALUE"),
+        }
+    } else if matrix.len() == 1 {
+        row
+    } else {
+        1
+    };
+    if row == 0 || col == 0 {
+        return EvalResult::Error("REF");
+    }
+    if row > matrix.len() {
+        return EvalResult::Error("REF");
+    }
+    let row_idx = row - 1;
+    if col > matrix[row_idx].len() {
+        return EvalResult::Error("REF");
+    }
+    matrix[row_idx][col - 1].clone()
+}
+
+fn eval_countifs(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    if args.len() < 2 || !args.len().is_multiple_of(2) {
+        return EvalResult::Error("ARGS");
+    }
+    let pairs =
+        match collect_criteria_pairs(args, grid, visiting, bindings, budget, allow_templates) {
+            Ok(p) => p,
+            Err(e) => return EvalResult::Error(e),
+        };
+    let Some((first_range, _)) = pairs.first() else {
+        return EvalResult::Error("ARGS");
+    };
+    let mut count = 0usize;
+    for dr in 0..range_height(first_range) {
+        for dc in 0..range_width(first_range) {
+            let mut ok = true;
+            for (range, criteria) in &pairs {
+                let addr = CellAddr::Main {
+                    row: range.row_start + dr,
+                    col: range.col_start + dc,
+                };
+                if !criteria_matches(criteria, grid, &addr, visiting, budget, allow_templates) {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                count += 1;
+            }
+        }
+    }
+    EvalResult::Number(count as f64)
+}
+
+fn eval_sumifs(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    if args.len() < 3 || args.len().is_multiple_of(2) {
+        return EvalResult::Error("ARGS");
+    }
+    let Some(sum_range) = as_main_range(&args[0]) else {
+        return EvalResult::Error("RANGE");
+    };
+    let pairs = match collect_criteria_pairs(
+        &args[1..],
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+    ) {
+        Ok(p) => p,
+        Err(e) => return EvalResult::Error(e),
+    };
+    if pairs.iter().any(|(range, _)| {
+        range_height(range) != range_height(&sum_range)
+            || range_width(range) != range_width(&sum_range)
+    }) {
+        return EvalResult::Error("ARGS");
+    }
+    let mut sum = 0.0;
+    for dr in 0..range_height(&sum_range) {
+        for dc in 0..range_width(&sum_range) {
+            let mut ok = true;
+            for (range, criteria) in &pairs {
+                let addr = CellAddr::Main {
+                    row: range.row_start + dr,
+                    col: range.col_start + dc,
+                };
+                if !criteria_matches(criteria, grid, &addr, visiting, budget, allow_templates) {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                let addr = CellAddr::Main {
+                    row: sum_range.row_start + dr,
+                    col: sum_range.col_start + dc,
+                };
+                if let Some(n) = super::effective_numeric(grid, &addr, visiting, budget) {
+                    sum += n;
+                }
+            }
+        }
+    }
+    EvalResult::Number(sum)
+}
+
+fn eval_averageifs(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    match eval_sumifs(args, grid, visiting, bindings, budget, allow_templates) {
+        EvalResult::Number(sum) => {
+            let sum_range = match as_main_range(&args[0]) {
+                Some(r) => r,
+                None => return EvalResult::Error("RANGE"),
+            };
+            let pairs = match collect_criteria_pairs(
+                &args[1..],
+                grid,
+                visiting,
+                bindings,
+                budget,
+                allow_templates,
+            ) {
+                Ok(p) => p,
+                Err(e) => return EvalResult::Error(e),
+            };
+            let mut count = 0usize;
+            for dr in 0..range_height(&sum_range) {
+                for dc in 0..range_width(&sum_range) {
+                    let mut ok = true;
+                    for (range, criteria) in &pairs {
+                        let addr = CellAddr::Main {
+                            row: range.row_start + dr,
+                            col: range.col_start + dc,
+                        };
+                        if !criteria_matches(
+                            criteria,
+                            grid,
+                            &addr,
+                            visiting,
+                            budget,
+                            allow_templates,
+                        ) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if ok {
+                        let addr = CellAddr::Main {
+                            row: sum_range.row_start + dr,
+                            col: sum_range.col_start + dc,
+                        };
+                        if super::effective_numeric(grid, &addr, visiting, budget).is_some() {
+                            count += 1;
+                        }
+                    }
+                }
+            }
+            if count == 0 {
+                EvalResult::Error("DIV0")
+            } else {
+                EvalResult::Number(sum / count as f64)
+            }
+        }
+        other => other,
+    }
+}
+
+fn eval_sort(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    if args.is_empty() || args.len() > 4 {
+        return EvalResult::Error("ARGS");
+    }
+    let mut matrix =
+        match collect_matrix_values(&args[0], grid, visiting, bindings, budget, allow_templates) {
+            Ok(m) => m,
+            Err(e) => return EvalResult::Error(e),
+        };
+    let sort_index = if args.len() >= 2 {
+        match numeric_value(eval_ast(
+            &args[1],
+            grid,
+            visiting,
+            bindings,
+            budget,
+            allow_templates,
+        )) {
+            Some(n) if n >= 1.0 => n as usize,
+            _ => return EvalResult::Error("VALUE"),
+        }
+    } else {
+        1
+    };
+    let sort_order = if args.len() >= 3 {
+        match numeric_value(eval_ast(
+            &args[2],
+            grid,
+            visiting,
+            bindings,
+            budget,
+            allow_templates,
+        )) {
+            Some(n) if n < 0.0 => -1,
+            Some(_) => 1,
+            None => return EvalResult::Error("VALUE"),
+        }
+    } else {
+        1
+    };
+    let by_col = if args.len() == 4 {
+        super::truthy(eval_ast(
+            &args[3],
+            grid,
+            visiting,
+            bindings,
+            budget,
+            allow_templates,
+        ))
+    } else {
+        false
+    };
+    if by_col {
+        transpose_matrix(&mut matrix);
+    }
+    let key_col = sort_index.saturating_sub(1);
+    if matrix.is_empty() || key_col >= matrix[0].len() {
+        return EvalResult::Error("REF");
+    }
+    matrix.sort_by(|a, b| {
+        compare_eval_cells(&a[key_col], &b[key_col]).then(std::cmp::Ordering::Equal)
+    });
+    if sort_order < 0 {
+        matrix.reverse();
+    }
+    if by_col {
+        transpose_matrix(&mut matrix);
+    }
+    EvalResult::Array(matrix)
+}
+
+fn eval_take(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    if args.len() < 2 || args.len() > 3 {
+        return EvalResult::Error("ARGS");
+    }
+    let matrix =
+        match collect_matrix_values(&args[0], grid, visiting, bindings, budget, allow_templates) {
+            Ok(m) => m,
+            Err(e) => return EvalResult::Error(e),
+        };
+    slice_take_drop(
+        matrix,
+        &args[1],
+        args.get(2),
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+        true,
+    )
+}
+
+fn eval_drop(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    if args.len() < 2 || args.len() > 3 {
+        return EvalResult::Error("ARGS");
+    }
+    let matrix =
+        match collect_matrix_values(&args[0], grid, visiting, bindings, budget, allow_templates) {
+            Ok(m) => m,
+            Err(e) => return EvalResult::Error(e),
+        };
+    slice_take_drop(
+        matrix,
+        &args[1],
+        args.get(2),
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+        false,
+    )
+}
+
+fn eval_choosecols(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    if args.len() < 2 {
+        return EvalResult::Error("ARGS");
+    }
+    let matrix =
+        match collect_matrix_values(&args[0], grid, visiting, bindings, budget, allow_templates) {
+            Ok(m) => m,
+            Err(e) => return EvalResult::Error(e),
+        };
+    choose_axes(
+        matrix,
+        &args[1..],
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+        true,
+    )
+}
+
+fn eval_chooserows(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    if args.len() < 2 {
+        return EvalResult::Error("ARGS");
+    }
+    let matrix =
+        match collect_matrix_values(&args[0], grid, visiting, bindings, budget, allow_templates) {
+            Ok(m) => m,
+            Err(e) => return EvalResult::Error(e),
+        };
+    choose_axes(
+        matrix,
+        &args[1..],
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+        false,
+    )
+}
+
+fn collect_matrix_values(
+    arg: &Ast,
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> Result<Vec<Vec<EvalResult>>, &'static str> {
+    match arg {
+        Ast::Range(r) => {
+            let mut out = Vec::new();
+            for row in r.row_start..r.row_end {
+                let mut out_row = Vec::new();
+                for col in r.col_start..r.col_end {
+                    let addr = CellAddr::Main { row, col };
+                    out_row.push(
+                        eval_cell_inner(grid, &addr, visiting, budget, allow_templates)
+                            .scalar_coerce(),
+                    );
+                }
+                out.push(out_row);
+            }
+            Ok(out)
+        }
+        Ast::Ref(addr) => Ok(vec![vec![eval_cell_inner(
+            grid,
+            addr,
+            visiting,
+            budget,
+            allow_templates,
+        )
+        .scalar_coerce()]]),
+        _ => match eval_ast(arg, grid, visiting, bindings, budget, allow_templates) {
+            EvalResult::Array(rows) => Ok(rows),
+            other => Ok(vec![vec![other]]),
+        },
+    }
+}
+
+fn collect_criteria_pairs(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> Result<Vec<(MainRange, Criteria)>, &'static str> {
+    if args.len() < 2 || !args.len().is_multiple_of(2) {
+        return Err("ARGS");
+    }
+    let mut out = Vec::new();
+    for pair in args.chunks(2) {
+        let Some(range) = as_main_range(&pair[0]) else {
+            return Err("RANGE");
+        };
+        let criteria =
+            criteria_from_ast(&pair[1], grid, visiting, bindings, budget, allow_templates)?;
+        out.push((range, criteria));
+    }
+    let base = out[0].0.clone();
+    if out.iter().any(|(r, _)| {
+        range_height(r) != range_height(&base) || range_width(r) != range_width(&base)
+    }) {
+        return Err("ARGS");
+    }
+    Ok(out)
+}
+
+fn range_height(r: &MainRange) -> u32 {
+    r.row_end.saturating_sub(r.row_start)
+}
+
+fn range_width(r: &MainRange) -> u32 {
+    r.col_end.saturating_sub(r.col_start)
+}
+
+fn compare_eval_cells(a: &EvalResult, b: &EvalResult) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let a = a.clone().scalar_coerce();
+    let b = b.clone().scalar_coerce();
+    match (a, b) {
+        (EvalResult::Number(x), EvalResult::Number(y)) => {
+            x.partial_cmp(&y).unwrap_or(Ordering::Equal)
+        }
+        (EvalResult::Text(x), EvalResult::Text(y)) => x.cmp(&y),
+        (EvalResult::Number(_), EvalResult::Text(_)) => Ordering::Less,
+        (EvalResult::Text(_), EvalResult::Number(_)) => Ordering::Greater,
+        (EvalResult::Error(x), EvalResult::Error(y)) => x.cmp(y),
+        (EvalResult::Error(_), _) => Ordering::Greater,
+        (_, EvalResult::Error(_)) => Ordering::Less,
+        _ => Ordering::Equal,
+    }
+}
+
+fn transpose_matrix(matrix: &mut Vec<Vec<EvalResult>>) {
+    if matrix.is_empty() {
+        return;
+    }
+    let rows = matrix.len();
+    let cols = matrix.iter().map(|r| r.len()).max().unwrap_or(0);
+    let mut out = vec![vec![EvalResult::Error("CALC"); rows]; cols];
+    for (r, row) in matrix.iter().enumerate() {
+        for (c, cell) in row.iter().enumerate() {
+            out[c][r] = cell.clone();
+        }
+    }
+    *matrix = out;
+}
+
+fn slice_take_drop(
+    matrix: Vec<Vec<EvalResult>>,
+    row_arg: &Ast,
+    col_arg: Option<&Ast>,
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+    take: bool,
+) -> EvalResult {
+    let rows_n = match numeric_value(eval_ast(
+        row_arg,
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+    )) {
+        Some(n) if n.is_finite() => n as isize,
+        _ => return EvalResult::Error("VALUE"),
+    };
+    let cols_n = if let Some(col_arg) = col_arg {
+        match numeric_value(eval_ast(
+            col_arg,
+            grid,
+            visiting,
+            bindings,
+            budget,
+            allow_templates,
+        )) {
+            Some(n) if n.is_finite() => n as isize,
+            _ => return EvalResult::Error("VALUE"),
+        }
+    } else {
+        0
+    };
+    let mut out = matrix;
+    if take {
+        out = slice_rows(out, rows_n, true);
+        if col_arg.is_some() {
+            out = slice_cols(out, cols_n, true);
+        }
+    } else {
+        out = slice_rows(out, rows_n, false);
+        if col_arg.is_some() {
+            out = slice_cols(out, cols_n, false);
+        }
+    }
+    EvalResult::Array(out)
+}
+
+fn slice_rows(mut matrix: Vec<Vec<EvalResult>>, n: isize, take: bool) -> Vec<Vec<EvalResult>> {
+    if matrix.is_empty() {
+        return matrix;
+    }
+    let len = matrix.len() as isize;
+    let n = if n < 0 { len + n } else { n };
+    if take {
+        if n >= 0 {
+            matrix.truncate(n.min(len) as usize);
+            matrix
+        } else {
+            let keep = (len + n).max(0) as usize;
+            matrix.into_iter().take(keep).collect()
+        }
+    } else if n >= 0 {
+        matrix.into_iter().skip(n.min(len) as usize).collect()
+    } else {
+        let keep = (len + n).max(0) as usize;
+        matrix.truncate(keep);
+        matrix
+    }
+}
+
+fn slice_cols(matrix: Vec<Vec<EvalResult>>, n: isize, take: bool) -> Vec<Vec<EvalResult>> {
+    if matrix.is_empty() {
+        return matrix;
+    }
+    let len = matrix[0].len() as isize;
+    let n = if n < 0 { len + n } else { n };
+    matrix
+        .into_iter()
+        .map(|mut row| {
+            if take {
+                row.truncate(n.min(len) as usize);
+                row
+            } else if n >= 0 {
+                row.into_iter().skip(n.min(len) as usize).collect()
+            } else {
+                let keep = (len + n).max(0) as usize;
+                row.truncate(keep);
+                row
+            }
+        })
+        .collect()
+}
+
+fn choose_axes(
+    matrix: Vec<Vec<EvalResult>>,
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+    cols: bool,
+) -> EvalResult {
+    let mut indices = Vec::new();
+    for arg in args {
+        let idx = match numeric_value(eval_ast(
+            arg,
+            grid,
+            visiting,
+            bindings,
+            budget,
+            allow_templates,
+        )) {
+            Some(n) if n.is_finite() && n != 0.0 => n as isize,
+            _ => return EvalResult::Error("VALUE"),
+        };
+        indices.push(idx);
+    }
+    if cols {
+        let mut out = Vec::new();
+        for row in matrix {
+            let mut new_row = Vec::new();
+            for idx in &indices {
+                let j = resolve_index(*idx, row.len());
+                let Some(j) = j else {
+                    return EvalResult::Error("REF");
+                };
+                new_row.push(row[j].clone());
+            }
+            out.push(new_row);
+        }
+        EvalResult::Array(out)
+    } else {
+        let mut out = Vec::new();
+        for idx in indices {
+            let j = match resolve_index(idx, matrix.len()) {
+                Some(v) => v,
+                None => return EvalResult::Error("REF"),
+            };
+            out.push(matrix[j].clone());
+        }
+        EvalResult::Array(out)
+    }
+}
+
+fn resolve_index(idx: isize, len: usize) -> Option<usize> {
+    if idx > 0 {
+        let i = idx as usize - 1;
+        (i < len).then_some(i)
+    } else if idx < 0 {
+        let i = len as isize + idx;
+        (i >= 0).then_some(i as usize)
+    } else {
+        None
+    }
+}
+
+fn text_from_result(result: EvalResult) -> Option<String> {
+    match result {
+        EvalResult::Number(n) => Some(n.to_string()),
+        EvalResult::Text(s) => Some(s),
+        EvalResult::Error(_) => None,
+        EvalResult::Array(rows) => rows
+            .into_iter()
+            .next()
+            .and_then(|row| row.into_iter().next())
+            .and_then(text_from_result),
     }
 }
 

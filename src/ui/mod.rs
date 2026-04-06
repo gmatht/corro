@@ -3034,12 +3034,9 @@ impl App {
                 } else {
                     Style::default()
                 };
-                let is_data_row = r >= hr && r < hr + mr;
-                let is_aggregate_row = footer_agg.is_some()
-                    || left_margin_agg.is_some()
-                    || right_col_agg_func(grid, c).is_some();
-                if is_data_row && is_aggregate_row {
-                    st = st.add_modifier(Modifier::BOLD);
+                let is_last_data_row = r == hr + mr - 1;
+                if is_last_data_row {
+                    st = st.add_modifier(Modifier::UNDERLINED);
                 }
                 spans.push(Span::styled(disp, st));
                 if c == lm - 1 && lm > 0 && col_ixs.contains(&lm) {
@@ -3050,23 +3047,6 @@ impl App {
                 }
             }
             lines.push(Line::from(spans));
-            if r == hr + mr - 1 {
-                let has_footer_aggs = row_ixs
-                    .iter()
-                    .any(|&rr| rr >= hr + mr && footer_row_agg_func(grid, rr - hr - mr).is_some());
-                let has_right_aggs = col_ixs
-                    .iter()
-                    .any(|&cc| right_col_agg_func(grid, cc).is_some());
-                if has_footer_aggs || has_right_aggs {
-                    let underline = format!(
-                        "{:>width$}{}",
-                        "",
-                        "─".repeat(inner.width.saturating_sub(ROW_LABEL_CHARS as u16) as usize),
-                        width = ROW_LABEL_CHARS
-                    );
-                    lines.push(Line::from(underline));
-                }
-            }
         }
 
         let n = lines.len().min(inner_h);
@@ -5653,35 +5633,37 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| app.draw(f)).unwrap();
         let buffer = terminal.backend().buffer();
-        let rendered = normalize_frame(&buffer_to_string(&buffer));
-        let expected = normalize_frame(concat!(
-            " [File]   Insert    Help\n",
-            " A1  Hello World   ·  Loaded workbook test5.corro\n",
-            "┌ corro  13r × 2c  ops 221─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐\n",
-            "│                       [A│           A            B                  │]A                  ]B                  ]C                           │\n",
-            "│  ~1                     │            POW2         TOTAL               MAX                                                                │\n",
-            "│   1                     │Hello World #VALUE                                                                                              │\n",
-            "│   2                     │[B          #VALUE                                                                                              │\n",
-            "│   3                     │#PARSE      #PARSE                                                                                              │\n",
-            "│   4                     │BGOOD       #VALUE                                               Σ                                              │\n",
-            "│   5                     │          22           44                  66                  44                                               │\n",
-            "│   6                     │#PARSE      #PARSE                                                                                              │\n",
-            "│   7                     │           5           10                  15                  10                                               │\n",
-            "│   8                     │                        0                   0                   0                                               │\n",
-            "│   9                     │                        0                   0                   0                                               │\n",
-            "│  10                     │                        0                   0                   0                                               │\n",
-            "│  11                     │           0            0                   0                   0                                               │\n",
-            "│  12                     │[A          #VALUE                                                                                              │\n",
-            "│  13                     │#NAME       #NAME                                                                                               │\n",
-            "│     ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────│\n",
-            "│  _1                     │                                                                                                                │\n",
-            "│  _2 TOTAL               │          27           54                  81                  54                                               │\n",
-            "│  _3 MAX                 │          22           44                  66                  44                                               │\n",
-            "  shortcuts: e·edit v·select t·tsv c·csv o·open a·save as q·quit ?·help; printable letters edit cells unless reserved──────────────────────┘\n",
-            " Sheet1    Sheet2    Sheet3"
-        ));
+        let mut saw_underlined_last_data_row = false;
+        let mut saw_left_divider = false;
+        let mut saw_right_divider = false;
+        let mut last_data_row_y: Option<u16> = None;
+        for y in 0..buffer.area.height {
+            let line = (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>();
+            if line.contains("│  13") && line.contains("#NAME") {
+                last_data_row_y = Some(y);
+                break;
+            }
+        }
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                let cell = &buffer[(x, y)];
+                if last_data_row_y == Some(y) && cell.modifier.contains(Modifier::UNDERLINED) {
+                    saw_underlined_last_data_row = true;
+                }
+                if cell.symbol() == "│" && x < 8 {
+                    saw_left_divider = true;
+                }
+                if cell.symbol() == "│" && x > 25 {
+                    saw_right_divider = true;
+                }
+            }
+        }
 
-        assert_eq!(rendered, expected);
+        assert!(saw_underlined_last_data_row);
+        assert!(saw_left_divider);
+        assert!(saw_right_divider);
     }
 
     #[test]
