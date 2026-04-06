@@ -143,11 +143,30 @@ pub enum Op {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WorkbookOp {
-    NewSheet { id: u32, title: String },
-    ActivateSheet { id: u32 },
-    RenameSheet { id: u32, title: String },
-    BalanceReport { id: u32, title: String },
-    SheetOp { sheet_id: u32, op: Op },
+    NewSheet {
+        id: u32,
+        title: String,
+    },
+    ActivateSheet {
+        id: u32,
+    },
+    RenameSheet {
+        id: u32,
+        title: String,
+    },
+    BalanceReport {
+        id: u32,
+        title: String,
+        source_sheet_id: u32,
+        amount_col: usize,
+        direction: crate::balance::BalanceDirection,
+        row_order: Vec<usize>,
+        preserve_formulas: bool,
+    },
+    SheetOp {
+        sheet_id: u32,
+        op: Op,
+    },
 }
 
 fn sheet_prefix(sheet_id: u32) -> String {
@@ -341,7 +360,24 @@ impl WorkbookOp {
             WorkbookOp::NewSheet { id, title } => format!("${id}:NEW_SHEET {title}"),
             WorkbookOp::ActivateSheet { id } => format!("${id}:ACTIVATE_SHEET"),
             WorkbookOp::RenameSheet { id, title } => format!("${id}:RENAME_SHEET {title}"),
-            WorkbookOp::BalanceReport { id, title } => format!("${id}:BALANCE_REPORT {title}"),
+            WorkbookOp::BalanceReport {
+                id,
+                title,
+                source_sheet_id,
+                amount_col,
+                direction,
+                row_order,
+                preserve_formulas,
+            } => format!(
+                "${id}:BALANCE_REPORT {title} {source_sheet_id} {amount_col} {:?} {} {}",
+                direction,
+                if *preserve_formulas { 1 } else { 0 },
+                row_order
+                    .iter()
+                    .map(|n| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
             WorkbookOp::SheetOp { sheet_id, op } => match op {
                 Op::SetCell { addr, value } => {
                     format!("SET ${sheet_id}:{} {value}", addr_text(addr))
@@ -411,10 +447,43 @@ pub fn parse_workbook_line(line: &str) -> Result<WorkbookOp, std::io::Error> {
             })
         }
         "BALANCE_REPORT" => {
-            let title = parts.collect::<Vec<_>>().join(" ");
+            let title = parts
+                .next()
+                .ok_or_else(|| bad("bad balance line"))?
+                .to_string();
+            let source_sheet_id = parts
+                .next()
+                .and_then(|v| v.parse::<u32>().ok())
+                .ok_or_else(|| bad("bad balance line"))?;
+            let amount_col = parts
+                .next()
+                .and_then(|v| v.parse::<usize>().ok())
+                .ok_or_else(|| bad("bad balance line"))?;
+            let direction = match parts.next() {
+                Some("PosToNeg") => crate::balance::BalanceDirection::PosToNeg,
+                Some("NegToPos") => crate::balance::BalanceDirection::NegToPos,
+                _ => return Err(bad("bad balance line")),
+            };
+            let preserve_formulas = match parts.next() {
+                Some("1") => true,
+                Some("0") => false,
+                _ => return Err(bad("bad balance line")),
+            };
+            let row_order = parts
+                .next()
+                .unwrap_or("")
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .map(|s| s.parse::<usize>().map_err(|_| bad("bad balance line")))
+                .collect::<Result<Vec<_>, _>>()?;
             Ok(WorkbookOp::BalanceReport {
                 id: sheet_id,
                 title,
+                source_sheet_id,
+                amount_col,
+                direction,
+                row_order,
+                preserve_formulas,
             })
         }
         _ => {
@@ -458,13 +527,58 @@ pub fn apply_workbook_op(
             sheet.title = title;
             Ok(())
         }
-        WorkbookOp::BalanceReport { id, title } => {
+        WorkbookOp::BalanceReport {
+            id,
+            title,
+            source_sheet_id,
+            amount_col,
+            direction,
+            row_order,
+            preserve_formulas,
+        } => {
+            let source = workbook
+                .sheets
+                .iter()
+                .find(|s| s.id == source_sheet_id)
+                .ok_or_else(|| bad("unknown sheet id"))?
+                .clone();
+            let report = crate::balance::BalanceReport {
+                direction,
+                amount_col,
+                groups: Vec::new(),
+                leftovers: row_order,
+            };
+            let plan = crate::balance::balance_copy_plan(
+                source_sheet_id,
+                source.title.clone(),
+                id,
+                title,
+                amount_col,
+                source.state.grid.main_rows(),
+                &report,
+                preserve_formulas,
+            );
+            let mut target_state =
+                SheetState::new(source.state.grid.main_rows(), source.state.grid.main_cols());
+            crate::balance::apply_balance_copy(&source.state, &mut target_state, &plan);
+            if workbook.sheet_index_by_id(id).is_none() {
+                workbook.add_sheet_record(SheetRecord {
+                    id,
+                    title: plan.target_title.clone(),
+                    state: target_state.clone(),
+                });
+            }
             let sheet = workbook
                 .sheets
                 .iter_mut()
                 .find(|s| s.id == id)
                 .ok_or_else(|| bad("unknown sheet id"))?;
-            sheet.title = title;
+            sheet.title = plan.target_title;
+            sheet.state = target_state;
+            workbook.active_sheet = workbook
+                .sheet_index_by_id(id)
+                .unwrap_or(workbook.active_sheet);
+            *active_sheet = id;
             Ok(())
         }
         WorkbookOp::SheetOp { sheet_id, op } => {
@@ -778,6 +892,58 @@ mod tests {
                     value: "is A2".into(),
                 },
             }
+        );
+    }
+
+    #[test]
+    fn balance_report_replays_as_copied_sheet() {
+        let mut workbook = WorkbookState::new();
+        workbook.add_sheet("Src".into(), SheetState::new(2, 2));
+        let src_idx = workbook.sheet_index_by_id(1).unwrap();
+        workbook.sheets[src_idx]
+            .state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "10".into());
+        workbook.sheets[src_idx]
+            .state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 1 }, "=A1".into());
+        workbook.sheets[src_idx]
+            .state
+            .grid
+            .set(&CellAddr::Main { row: 1, col: 0 }, "-10".into());
+        workbook.sheets[src_idx]
+            .state
+            .grid
+            .set(&CellAddr::Main { row: 1, col: 1 }, "=A2".into());
+
+        let op = WorkbookOp::BalanceReport {
+            id: 2,
+            title: "Dst".into(),
+            source_sheet_id: 1,
+            amount_col: 0,
+            direction: crate::balance::BalanceDirection::PosToNeg,
+            row_order: vec![1, 0],
+            preserve_formulas: true,
+        };
+
+        let mut active_sheet = workbook.sheet_id(workbook.active_sheet);
+        apply_workbook_op(&mut workbook, &mut active_sheet, op).unwrap();
+
+        let dst = workbook.sheet_index_by_id(2).unwrap();
+        assert_eq!(
+            workbook.sheets[dst]
+                .state
+                .grid
+                .get(&CellAddr::Main { row: 0, col: 1 }),
+            Some("=A1")
+        );
+        assert_eq!(
+            workbook.sheets[dst]
+                .state
+                .grid
+                .get(&CellAddr::Main { row: 1, col: 1 }),
+            Some("=A2")
         );
     }
 }

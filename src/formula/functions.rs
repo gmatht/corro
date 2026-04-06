@@ -51,6 +51,7 @@ pub(crate) fn eval_builtin(
         ),
         "COUNT" => eval_count(&args, grid, visiting, bindings, budget, allow_templates),
         "COUNTA" => eval_counta(&args, grid, visiting, bindings, budget, allow_templates),
+        "COUNTBLANK" => eval_countblank(&args, grid, visiting, bindings, budget, allow_templates),
         "PRODUCT" => eval_numeric_aggregate(
             &args,
             grid,
@@ -138,6 +139,11 @@ pub(crate) fn eval_builtin(
         "FIND" => eval_find(&args, grid, visiting, bindings, budget, allow_templates),
         "SEARCH" => eval_search(&args, grid, visiting, bindings, budget, allow_templates),
         "TEXT" => eval_text(&args, grid, visiting, bindings, budget, allow_templates),
+        "ISNUMBER" => eval_isnumber(&args, grid, visiting, bindings, budget, allow_templates),
+        "ISTEXT" => eval_istext(&args, grid, visiting, bindings, budget, allow_templates),
+        "ISBLANK" => eval_isblank(&args, grid, visiting, bindings, budget, allow_templates),
+        "ISERROR" => eval_iserror(&args, grid, visiting, bindings, budget, allow_templates),
+        "ISNA" => eval_isna(&args, grid, visiting, bindings, budget, allow_templates),
         "TODAY" => eval_today(&args),
         "NOW" => eval_now(&args),
         "DATE" => eval_date(&args, grid, visiting, bindings, budget, allow_templates),
@@ -178,11 +184,14 @@ pub(crate) fn eval_builtin(
         "XMATCH" => eval_xmatch(&args, grid, visiting, bindings, budget, allow_templates),
         "INDEX" => eval_index(&args, grid, visiting, bindings, budget, allow_templates),
         "LET" => eval_let(&args, grid, visiting, bindings, budget, allow_templates),
+        "CHOOSE" => eval_choose(&args, grid, visiting, bindings, budget, allow_templates),
+        "SWITCH" => eval_switch(&args, grid, visiting, bindings, budget, allow_templates),
         "IFS" => eval_ifs(&args, grid, visiting, bindings, budget, allow_templates),
         "SEQUENCE" => eval_sequence(&args, grid, visiting, bindings, budget, allow_templates),
         "FILTER" => eval_filter(&args, grid, visiting, bindings, budget, allow_templates),
         "UNIQUE" => eval_unique(&args, grid, visiting, bindings, budget, allow_templates),
         "SORT" => eval_sort(&args, grid, visiting, bindings, budget, allow_templates),
+        "SORTBY" => eval_sortby(&args, grid, visiting, bindings, budget, allow_templates),
         "TAKE" => eval_take(&args, grid, visiting, bindings, budget, allow_templates),
         "DROP" => eval_drop(&args, grid, visiting, bindings, budget, allow_templates),
         "CHOOSECOLS" => eval_choosecols(&args, grid, visiting, bindings, budget, allow_templates),
@@ -2475,6 +2484,241 @@ fn eval_counta(
     }
 }
 
+fn eval_countblank(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    if args.len() != 1 {
+        return EvalResult::Error("ARGS");
+    }
+    let count = match &args[0] {
+        Ast::Range(r) => count_blank_range(grid, r, visiting, budget, allow_templates),
+        Ast::Ref(addr) => usize::from(cell_is_blank_for_count(
+            grid,
+            addr,
+            visiting,
+            budget,
+            allow_templates,
+        )),
+        Ast::SheetRef { sheet_id, addr } => {
+            let Some(sheet_grid) = super::workbook_lookup(*sheet_id) else {
+                return EvalResult::Error("SHEET");
+            };
+            usize::from(cell_is_blank_for_count(
+                &sheet_grid,
+                addr,
+                &mut Vec::new(),
+                budget,
+                allow_templates,
+            ))
+        }
+        _ => usize::from(matches!(
+            eval_ast(&args[0], grid, visiting, bindings, budget, allow_templates).scalar_coerce(),
+            EvalResult::Text(s) if s.is_empty()
+        )),
+    };
+    EvalResult::Number(count as f64)
+}
+
+fn eval_isnumber(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    unary_is_pred(
+        args,
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+        |v| matches!(v.scalar_coerce(), EvalResult::Number(_)),
+    )
+}
+
+fn eval_istext(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    unary_is_pred(
+        args,
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+        |v| matches!(v.scalar_coerce(), EvalResult::Text(_)),
+    )
+}
+
+fn eval_isblank(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    if args.len() != 1 {
+        return EvalResult::Error("ARGS");
+    }
+    EvalResult::Number(
+        if matches_blank_ref(&args[0], grid, visiting, bindings, budget, allow_templates) {
+            1.0
+        } else {
+            0.0
+        },
+    )
+}
+
+fn eval_iserror(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    unary_is_pred(
+        args,
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+        |v| matches!(v.scalar_coerce(), EvalResult::Error(_)),
+    )
+}
+
+fn eval_isna(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    unary_is_pred(
+        args,
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+        |v| matches!(v.scalar_coerce(), EvalResult::Error("NA")),
+    )
+}
+
+fn unary_is_pred<F>(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+    pred: F,
+) -> EvalResult
+where
+    F: Fn(EvalResult) -> bool,
+{
+    if args.len() != 1 {
+        return EvalResult::Error("ARGS");
+    }
+    EvalResult::Number(pred(eval_ast(
+        &args[0],
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+    )) as u8 as f64)
+}
+
+fn matches_blank_ref(
+    ast: &Ast,
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> bool {
+    match ast {
+        Ast::Ref(addr) => cell_is_blank_raw(grid, addr),
+        Ast::SheetRef { sheet_id, addr } => {
+            let Some(sheet_grid) = super::workbook_lookup(*sheet_id) else {
+                return false;
+            };
+            cell_is_blank_raw(&sheet_grid, addr)
+        }
+        _ => matches!(
+            eval_ast(ast, grid, visiting, bindings, budget, allow_templates).scalar_coerce(),
+            EvalResult::Text(s) if s.is_empty()
+        ),
+    }
+}
+
+fn cell_is_blank_raw(grid: &Grid, addr: &CellAddr) -> bool {
+    match grid.get(addr) {
+        None => true,
+        Some(raw) => raw.trim().is_empty(),
+    }
+}
+
+fn cell_is_blank_for_count(
+    grid: &Grid,
+    addr: &CellAddr,
+    visiting: &mut Vec<CellAddr>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> bool {
+    match grid.get(addr) {
+        None => true,
+        Some(raw) => {
+            let t = raw.trim();
+            if t.is_empty() {
+                true
+            } else if t.starts_with('=') {
+                matches!(
+                    eval_cell_inner(grid, addr, visiting, budget, allow_templates).scalar_coerce(),
+                    EvalResult::Text(s) if s.is_empty()
+                )
+            } else {
+                false
+            }
+        }
+    }
+}
+
+fn count_blank_range(
+    grid: &Grid,
+    range: &MainRange,
+    visiting: &mut Vec<CellAddr>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> usize {
+    let mut count = 0usize;
+    for r in range.row_start..range.row_end {
+        for c in range.col_start..range.col_end {
+            let addr = CellAddr::Main { row: r, col: c };
+            if cell_is_blank_for_count(grid, &addr, visiting, budget, allow_templates) {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
 fn eval_countif(
     args: &[Ast],
     grid: &Grid,
@@ -3098,6 +3342,142 @@ fn eval_let(
     );
     bindings.truncate(base_len);
     result
+}
+
+fn eval_choose(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    if args.len() < 2 {
+        return EvalResult::Error("ARGS");
+    }
+    let index = match numeric_value(eval_ast(
+        &args[0],
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+    )) {
+        Some(n) if n >= 1.0 => n as usize,
+        _ => return EvalResult::Error("VALUE"),
+    };
+    let choice = args.get(index);
+    match choice {
+        Some(ast) => eval_ast(ast, grid, visiting, bindings, budget, allow_templates),
+        None => EvalResult::Error("VALUE"),
+    }
+}
+
+fn eval_switch(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    if args.len() < 3 {
+        return EvalResult::Error("ARGS");
+    }
+    let expr =
+        eval_ast(&args[0], grid, visiting, bindings, budget, allow_templates).scalar_coerce();
+    let mut i = 1usize;
+    while i + 1 < args.len() {
+        let case =
+            eval_ast(&args[i], grid, visiting, bindings, budget, allow_templates).scalar_coerce();
+        if case == expr {
+            return eval_ast(
+                &args[i + 1],
+                grid,
+                visiting,
+                bindings,
+                budget,
+                allow_templates,
+            );
+        }
+        i += 2;
+    }
+    if args.len().is_multiple_of(2) {
+        eval_ast(
+            &args[args.len() - 1],
+            grid,
+            visiting,
+            bindings,
+            budget,
+            allow_templates,
+        )
+    } else {
+        EvalResult::Error("NA")
+    }
+}
+
+fn eval_sortby(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    if args.len() < 3 || args.len().is_multiple_of(2) {
+        return EvalResult::Error("ARGS");
+    }
+    let mut matrix =
+        match collect_matrix_values(&args[0], grid, visiting, bindings, budget, allow_templates) {
+            Ok(m) => m,
+            Err(e) => return EvalResult::Error(e),
+        };
+    let mut keys = Vec::new();
+    for pair in args[1..].chunks(2) {
+        let key_matrix = match collect_matrix_values(
+            &pair[0],
+            grid,
+            visiting,
+            bindings,
+            budget,
+            allow_templates,
+        ) {
+            Ok(m) => m,
+            Err(e) => return EvalResult::Error(e),
+        };
+        let order = match numeric_value(eval_ast(
+            &pair[1],
+            grid,
+            visiting,
+            bindings,
+            budget,
+            allow_templates,
+        )) {
+            Some(n) if n < 0.0 => -1,
+            Some(_) => 1,
+            None => return EvalResult::Error("VALUE"),
+        };
+        keys.push((key_matrix, order));
+    }
+    if matrix.is_empty() {
+        return EvalResult::Array(matrix);
+    }
+    let row_count = matrix.len();
+    if keys.iter().any(|(k, _)| k.len() != row_count) {
+        return EvalResult::Error("ARGS");
+    }
+    let mut idxs: Vec<usize> = (0..row_count).collect();
+    idxs.sort_by(|&a, &b| {
+        for (key_matrix, order) in &keys {
+            let ord = compare_eval_cells(&key_matrix[a][0], &key_matrix[b][0]);
+            if ord != std::cmp::Ordering::Equal {
+                return if *order < 0 { ord.reverse() } else { ord };
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+    let sorted = idxs.into_iter().map(|i| matrix[i].clone()).collect();
+    EvalResult::Array(sorted)
 }
 
 fn eval_sequence(

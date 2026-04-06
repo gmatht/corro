@@ -13,6 +13,13 @@ thread_local! {
     static EVAL_WORKBOOK: RefCell<Option<WorkbookState>> = const { RefCell::new(None) };
 }
 
+#[derive(Clone, Debug)]
+pub struct FormulaCopyContext {
+    pub source_sheet_id: u32,
+    pub target_sheet_id: u32,
+    pub row_map: Vec<u32>,
+}
+
 pub struct EvalContextGuard;
 
 impl Drop for EvalContextGuard {
@@ -125,6 +132,172 @@ fn split_labeled_formula(raw: &str) -> Option<(&str, &str)> {
         return None;
     }
     Some((expr, label))
+}
+
+fn render_addr(addr: &CellAddr) -> String {
+    match addr {
+        CellAddr::Header { row, col } => format!(
+            "~{}{}",
+            HEADER_ROWS - *row as usize,
+            excel_column_name(*col as usize)
+        ),
+        CellAddr::Footer { row, col } => {
+            format!("_{}{}", *row as usize + 1, excel_column_name(*col as usize))
+        }
+        CellAddr::Main { row, col } => format!("{}{}", excel_column_name(*col as usize), row + 1),
+        CellAddr::Left { col, row } => format!(
+            "[{}{}",
+            crate::addr::mirror_margin_column_name(*col as usize, true),
+            row + 1
+        ),
+        CellAddr::Right { col, row } => format!(
+            "]{}{}",
+            crate::addr::mirror_margin_column_name(*col as usize, false),
+            row + 1
+        ),
+    }
+}
+
+fn render_ast(ast: &Ast) -> String {
+    match ast {
+        Ast::Number(n) => format!("{n}"),
+        Ast::Text(s) => format!("\"{}\"", s.replace('"', "\"\"")),
+        Ast::Name(name) => name.clone(),
+        Ast::Ref(addr) => render_addr(addr),
+        Ast::SheetRef { sheet_id, addr } => format!("#{sheet_id}!{}", render_addr(addr)),
+        Ast::Range(range) => format!(
+            "{}:{}",
+            render_addr(&CellAddr::Main {
+                row: range.row_start,
+                col: range.col_start,
+            }),
+            render_addr(&CellAddr::Main {
+                row: range.row_end.saturating_sub(1),
+                col: range.col_end.saturating_sub(1),
+            })
+        ),
+        Ast::Neg(a) => format!("(-{})", render_ast(a)),
+        Ast::Add(a, b) => format!("({}+{})", render_ast(a), render_ast(b)),
+        Ast::Sub(a, b) => format!("({}-{})", render_ast(a), render_ast(b)),
+        Ast::Mul(a, b) => format!("({}*{})", render_ast(a), render_ast(b)),
+        Ast::Div(a, b) => format!("({}/{})", render_ast(a), render_ast(b)),
+        Ast::Pow(a, b) => format!("({}^{})", render_ast(a), render_ast(b)),
+        Ast::Call { name, args } => format!(
+            "{}({})",
+            name,
+            args.iter().map(render_ast).collect::<Vec<_>>().join(",")
+        ),
+    }
+}
+
+fn translate_addr(addr: &CellAddr, ctx: &FormulaCopyContext) -> Option<CellAddr> {
+    match addr {
+        CellAddr::Header { .. } | CellAddr::Footer { .. } => Some(addr.clone()),
+        CellAddr::Main { row, col } => Some(CellAddr::Main {
+            row: *ctx.row_map.get(*row as usize)?,
+            col: *col,
+        }),
+        CellAddr::Left { col, row } => Some(CellAddr::Left {
+            col: *col,
+            row: *ctx.row_map.get(*row as usize)?,
+        }),
+        CellAddr::Right { col, row } => Some(CellAddr::Right {
+            col: *col,
+            row: *ctx.row_map.get(*row as usize)?,
+        }),
+    }
+}
+
+fn translate_range(range: &MainRange, ctx: &FormulaCopyContext) -> Option<MainRange> {
+    let mut mapped_rows = Vec::new();
+    for row in range.row_start..range.row_end {
+        mapped_rows.push(*ctx.row_map.get(row as usize)?);
+    }
+    if mapped_rows.is_empty() {
+        return Some(range.clone());
+    }
+    if !mapped_rows.windows(2).all(|w| w[1] == w[0] + 1) {
+        return None;
+    }
+    Some(MainRange {
+        row_start: *mapped_rows.first()?,
+        row_end: mapped_rows.last().copied()?.saturating_add(1),
+        col_start: range.col_start,
+        col_end: range.col_end,
+    })
+}
+
+fn translate_ast(ast: &Ast, ctx: &FormulaCopyContext) -> Option<Ast> {
+    Some(match ast {
+        Ast::Number(n) => Ast::Number(*n),
+        Ast::Text(s) => Ast::Text(s.clone()),
+        Ast::Name(name) => Ast::Name(name.clone()),
+        Ast::Ref(addr) => Ast::Ref(translate_addr(addr, ctx)?),
+        Ast::SheetRef { sheet_id, addr } => {
+            if *sheet_id == ctx.source_sheet_id {
+                Ast::Ref(translate_addr(addr, ctx)?)
+            } else {
+                Ast::SheetRef {
+                    sheet_id: *sheet_id,
+                    addr: addr.clone(),
+                }
+            }
+        }
+        Ast::Range(range) => Ast::Range(translate_range(range, ctx)?),
+        Ast::Neg(a) => Ast::Neg(Box::new(translate_ast(a, ctx)?)),
+        Ast::Add(a, b) => Ast::Add(
+            Box::new(translate_ast(a, ctx)?),
+            Box::new(translate_ast(b, ctx)?),
+        ),
+        Ast::Sub(a, b) => Ast::Sub(
+            Box::new(translate_ast(a, ctx)?),
+            Box::new(translate_ast(b, ctx)?),
+        ),
+        Ast::Mul(a, b) => Ast::Mul(
+            Box::new(translate_ast(a, ctx)?),
+            Box::new(translate_ast(b, ctx)?),
+        ),
+        Ast::Div(a, b) => Ast::Div(
+            Box::new(translate_ast(a, ctx)?),
+            Box::new(translate_ast(b, ctx)?),
+        ),
+        Ast::Pow(a, b) => Ast::Pow(
+            Box::new(translate_ast(a, ctx)?),
+            Box::new(translate_ast(b, ctx)?),
+        ),
+        Ast::Call { name, args } => Ast::Call {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|a| translate_ast(a, ctx))
+                .collect::<Option<Vec<_>>>()?,
+        },
+    })
+}
+
+pub fn translate_formula_text(raw: &str, ctx: &FormulaCopyContext) -> Option<String> {
+    let t = raw.trim();
+    let (expr, label) =
+        split_labeled_formula(t).map_or((t, None), |(expr, label)| (expr, Some(label)));
+    if !expr.starts_with('=') {
+        return None;
+    }
+    let mut parser = Parser {
+        s: &expr[1..],
+        i: 0,
+    };
+    let ast = parser.parse_expr().ok()?;
+    parser.skip_ws();
+    if parser.i != parser.s.len() {
+        return None;
+    }
+    let translated = translate_ast(&ast, ctx)?;
+    let mut out = format!("={}", render_ast(&translated));
+    if let Some(label) = label {
+        out.push_str(" -- ");
+        out.push_str(label);
+    }
+    Some(out)
 }
 
 fn rewrite_header_template(expr: &str, row: u32) -> String {
@@ -1164,6 +1337,17 @@ mod tests {
     }
 
     #[test]
+    fn translate_formula_text_rewrites_row_refs() {
+        let ctx = FormulaCopyContext {
+            source_sheet_id: 1,
+            target_sheet_id: 2,
+            row_map: vec![1, 0],
+        };
+        let out = translate_formula_text("=A1+B2", &ctx).expect("translated formula");
+        assert_eq!(out, "=(A2+B1)");
+    }
+
+    #[test]
     fn math_constants_evaluate() {
         let mut g = Grid::new(1, 3);
         g.set(&CellAddr::Main { row: 0, col: 0 }, "=sin(π)".into());
@@ -1718,6 +1902,104 @@ mod tests {
             e => panic!("expected rand {:?}", e),
         };
         assert!((first - changed).abs() > 1e-12);
+    }
+
+    #[test]
+    fn practical_batch_functions_work() {
+        let mut g = Grid::new(3, 8);
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "a".into());
+        g.set(&CellAddr::Main { row: 0, col: 1 }, "".into());
+        g.set(&CellAddr::Main { row: 1, col: 0 }, "1".into());
+        g.set(&CellAddr::Main { row: 1, col: 1 }, "text".into());
+        g.set(
+            &CellAddr::Main { row: 2, col: 0 },
+            "=COUNTBLANK(A1:B2)".into(),
+        );
+        g.set(&CellAddr::Main { row: 0, col: 2 }, "=ISNUMBER(A2)".into());
+        g.set(&CellAddr::Main { row: 0, col: 3 }, "=ISTEXT(B2)".into());
+        g.set(&CellAddr::Main { row: 0, col: 4 }, "=ISBLANK(B1)".into());
+        g.set(
+            &CellAddr::Main { row: 0, col: 5 },
+            "=ISERROR(XMATCH(\"z\",A1:A2))".into(),
+        );
+        g.set(
+            &CellAddr::Main { row: 0, col: 6 },
+            "=SWITCH(2,1,\"one\",2,\"two\",\"default\")".into(),
+        );
+        g.set(
+            &CellAddr::Main { row: 0, col: 7 },
+            "=CHOOSE(2,\"x\",\"y\",\"z\")".into(),
+        );
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 2, col: 0 }, &mut v, &mut b) {
+            EvalResult::Number(n) => assert!((n - 1.0).abs() < 1e-9),
+            e => panic!("expected 1 {:?}", e),
+        }
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 2 }, &mut v, &mut b) {
+            EvalResult::Number(n) => assert!((n - 1.0).abs() < 1e-9),
+            e => panic!("expected 1 {:?}", e),
+        }
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 3 }, &mut v, &mut b) {
+            EvalResult::Number(n) => assert!((n - 1.0).abs() < 1e-9),
+            e => panic!("expected 1 {:?}", e),
+        }
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 4 }, &mut v, &mut b) {
+            EvalResult::Number(n) => assert!((n - 1.0).abs() < 1e-9),
+            e => panic!("expected 1 {:?}", e),
+        }
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 5 }, &mut v, &mut b) {
+            EvalResult::Number(n) => assert!((n - 1.0).abs() < 1e-9),
+            e => panic!("expected 1 {:?}", e),
+        }
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 6 }, &mut v, &mut b) {
+            EvalResult::Text(s) => assert_eq!(s, "two"),
+            e => panic!("expected two {:?}", e),
+        }
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 7 }, &mut v, &mut b) {
+            EvalResult::Text(s) => assert_eq!(s, "y"),
+            e => panic!("expected y {:?}", e),
+        }
+    }
+
+    #[test]
+    fn sortby_spills_sorted_rows() {
+        let mut g = Grid::new(3, 6);
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "b".into());
+        g.set(&CellAddr::Main { row: 1, col: 0 }, "a".into());
+        g.set(&CellAddr::Main { row: 2, col: 0 }, "c".into());
+        g.set(&CellAddr::Main { row: 0, col: 1 }, "2".into());
+        g.set(&CellAddr::Main { row: 1, col: 1 }, "1".into());
+        g.set(&CellAddr::Main { row: 2, col: 1 }, "3".into());
+        g.set(
+            &CellAddr::Main { row: 0, col: 2 },
+            "=SORTBY(A1:B3,B1:B3,1)".into(),
+        );
+        refresh_spills(&mut g);
+        assert_eq!(
+            cell_effective_display(&g, &CellAddr::Main { row: 0, col: 2 }),
+            "a"
+        );
+        assert_eq!(
+            cell_effective_display(&g, &CellAddr::Main { row: 1, col: 2 }),
+            "b"
+        );
+        assert_eq!(
+            cell_effective_display(&g, &CellAddr::Main { row: 2, col: 2 }),
+            "c"
+        );
     }
 
     #[test]

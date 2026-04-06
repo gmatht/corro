@@ -41,6 +41,14 @@ enum SelectionKind {
     Cols,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SelectionEdgeDirection {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum OpenPathRequest {
     Plain(PathBuf),
@@ -783,6 +791,8 @@ Basics\n\
 - = followed by arrows builds a formula reference.\n\n\
 Selection and movement\n\
 - v toggles a cell selection.\n\
+- Shift+Arrow grows the selection one cell at a time.\n\
+- Ctrl/Cmd+Shift+Arrow extends the selection to the edge of the current nonblank run.\n\
 - Ctrl+Shift+= inserts rows above the current row or selected rows.\n\
 - r moves selected rows.\n\
 - c exports CSV when nothing is selected, or moves selected columns when columns are selected.\n\
@@ -1692,6 +1702,91 @@ impl App {
         let c0 = a.col.min(b.col);
         let c1 = a.col.max(b.col);
         Some(((r0..=r1).collect(), (c0..=c1).collect()))
+    }
+
+    fn selection_cell_is_nonblank(&self, row: usize, col: usize) -> bool {
+        self.state
+            .grid
+            .get(&SheetCursor { row, col }.to_addr(&self.state.grid))
+            .is_some_and(|value| !value.is_empty())
+    }
+
+    fn selection_edge_cursor(&self, direction: SelectionEdgeDirection) -> Option<SheetCursor> {
+        let total_rows = self.state.grid.total_logical_rows();
+        let total_cols = self.state.grid.total_cols();
+        if total_rows == 0 || total_cols == 0 {
+            return None;
+        }
+
+        let row = self.cursor.row.min(total_rows - 1);
+        let col = self.cursor.col.min(total_cols - 1);
+
+        match direction {
+            SelectionEdgeDirection::Right => {
+                let mut edge_col = if self.selection_cell_is_nonblank(row, col) {
+                    col
+                } else {
+                    (col + 1..total_cols).find(|&c| self.selection_cell_is_nonblank(row, c))?
+                };
+                while edge_col + 1 < total_cols
+                    && self.selection_cell_is_nonblank(row, edge_col + 1)
+                {
+                    edge_col += 1;
+                }
+                Some(SheetCursor { row, col: edge_col })
+            }
+            SelectionEdgeDirection::Left => {
+                let mut edge_col = if self.selection_cell_is_nonblank(row, col) {
+                    col
+                } else {
+                    (0..col)
+                        .rev()
+                        .find(|&c| self.selection_cell_is_nonblank(row, c))?
+                };
+                while edge_col > 0 && self.selection_cell_is_nonblank(row, edge_col - 1) {
+                    edge_col -= 1;
+                }
+                Some(SheetCursor { row, col: edge_col })
+            }
+            SelectionEdgeDirection::Down => {
+                let mut edge_row = if self.selection_cell_is_nonblank(row, col) {
+                    row
+                } else {
+                    (row + 1..total_rows).find(|&r| self.selection_cell_is_nonblank(r, col))?
+                };
+                while edge_row + 1 < total_rows
+                    && self.selection_cell_is_nonblank(edge_row + 1, col)
+                {
+                    edge_row += 1;
+                }
+                Some(SheetCursor { row: edge_row, col })
+            }
+            SelectionEdgeDirection::Up => {
+                let mut edge_row = if self.selection_cell_is_nonblank(row, col) {
+                    row
+                } else {
+                    (0..row)
+                        .rev()
+                        .find(|&r| self.selection_cell_is_nonblank(r, col))?
+                };
+                while edge_row > 0 && self.selection_cell_is_nonblank(edge_row - 1, col) {
+                    edge_row -= 1;
+                }
+                Some(SheetCursor { row: edge_row, col })
+            }
+        }
+    }
+
+    fn extend_selection_to_edge(&mut self, direction: SelectionEdgeDirection) -> bool {
+        let Some(cursor) = self.selection_edge_cursor(direction) else {
+            return false;
+        };
+        if self.anchor.is_none() {
+            self.anchor = Some(self.cursor);
+        }
+        self.cursor = cursor;
+        self.selection_kind = SelectionKind::Cells;
+        true
     }
 
     fn addr_at(&self, row: usize, col: usize) -> Option<CellAddr> {
@@ -2748,12 +2843,13 @@ impl App {
             .bg(Color::Yellow)
             .add_modifier(Modifier::BOLD);
         let formula_widget = match &self.mode {
-            Mode::Edit { buffer, .. } => Paragraph::new(input_line(
+            Mode::Edit { buffer, .. } => Paragraph::new(input_line_with_suffix(
                 format!(" {addr_str}  "),
                 buffer,
                 self.edit_cursor.unwrap_or_else(|| buffer.chars().count()),
                 prompt_style_bold,
                 caret_style,
+                formula_edit_preview(grid, &addr, buffer),
             ))
             .style(prompt_style_bold),
             Mode::OpenPath { buffer } => Paragraph::new(input_line(
@@ -3976,14 +4072,26 @@ impl App {
                         return Ok(false);
                     };
                     let report = balance::build_balance_report(&self.state.grid, col, *direction);
-                    let report_sheet = balance::report_sheet(
-                        &report,
-                        self.workbook.sheet_title(self.workbook.active_sheet),
-                    );
+                    let source_sheet_id = self.workbook.sheet_id(self.workbook.active_sheet);
+                    let source_title = self
+                        .workbook
+                        .sheet_title(self.workbook.active_sheet)
+                        .to_string();
                     if *persist {
-                        let title = format!("Balance {}", self.workbook.next_sheet_id);
+                        let title = format!("Balance-{}", self.workbook.next_sheet_id);
                         self.commit_active_sheet_cache();
                         let id = self.workbook.next_sheet_id;
+                        let plan = balance::balance_copy_plan(
+                            source_sheet_id,
+                            source_title.clone(),
+                            id,
+                            title.clone(),
+                            col,
+                            self.state.grid.main_rows(),
+                            &report,
+                            true,
+                        );
+                        let report_sheet = balance::materialize_report_sheet(&self.state, &plan);
                         self.workbook.add_sheet(title.clone(), report_sheet.clone());
                         self.view_sheet_id = id;
                         self.sync_active_sheet_cache();
@@ -3994,42 +4102,34 @@ impl App {
                                 &mut self.offset,
                                 &mut self.workbook,
                                 &mut active_sheet,
-                                &crate::ops::WorkbookOp::NewSheet {
+                                &crate::ops::WorkbookOp::BalanceReport {
                                     id,
                                     title: title.clone(),
+                                    source_sheet_id,
+                                    amount_col: col,
+                                    direction: *direction,
+                                    row_order: plan.row_order.clone(),
+                                    preserve_formulas: true,
                                 },
                             )?;
                             self.ops_applied = self.ops_applied.saturating_add(1);
                             self.start_log_watcher_if_needed()?;
-                            for row in 0..report_sheet.grid.main_rows() {
-                                for col_idx in 0..report_sheet.grid.main_cols() {
-                                    let addr = CellAddr::Main {
-                                        row: row as u32,
-                                        col: col_idx as u32,
-                                    };
-                                    if let Some(value) = report_sheet.grid.get(&addr) {
-                                        if !value.is_empty() {
-                                            commit_workbook_op(
-                                                p,
-                                                &mut self.offset,
-                                                &mut self.workbook,
-                                                &mut active_sheet,
-                                                &crate::ops::WorkbookOp::SheetOp {
-                                                    sheet_id: id,
-                                                    op: Op::SetCell {
-                                                        addr: addr.clone(),
-                                                        value: value.to_string(),
-                                                    },
-                                                },
-                                            )?;
-                                        }
-                                    }
-                                }
-                            }
                         }
                         self.status = format!("Balance report saved as {}", title);
                     } else {
-                        self.state = report_sheet.clone();
+                        let plan = balance::balance_copy_plan(
+                            source_sheet_id,
+                            source_title,
+                            self.workbook.sheet_id(self.workbook.active_sheet),
+                            self.workbook
+                                .sheet_title(self.workbook.active_sheet)
+                                .to_string(),
+                            col,
+                            self.state.grid.main_rows(),
+                            &report,
+                            true,
+                        );
+                        self.state = balance::materialize_report_sheet(&self.state, &plan);
                         self.status = "Balance report generated".into();
                     }
                     self.input_cursor = None;
@@ -4230,6 +4330,13 @@ impl App {
                             self.edit_special_palette = false;
                             *formula_cursor = None;
                             self.commit_edit_buffer(&raw)?;
+                            let lm = MARGIN_COLS;
+                            let mc = self.state.grid.main_cols();
+                            if self.cursor.col == lm + mc.saturating_sub(1)
+                                && trailing_blank_main_cols(&self.state) < NAV_BLANK_COLS
+                            {
+                                self.state.grid.grow_main_col_at_right();
+                            }
                             self.cursor.col = self.cursor.col.saturating_add(1);
                             self.cursor.clamp(&self.state.grid);
                             self.state
@@ -4365,12 +4472,29 @@ impl App {
                     return Ok(false);
                 }
 
+                let ctrl_or_cmd = key.modifiers.contains(KeyModifiers::CONTROL)
+                    || key.modifiers.contains(KeyModifiers::SUPER);
+
                 match key.code {
                     KeyCode::Esc => {
                         self.anchor = None;
                         if self.anchor.is_none() {
                             mode = Mode::QuitPrompt;
                         }
+                    }
+                    KeyCode::Left if key.modifiers.contains(KeyModifiers::SHIFT) && ctrl_or_cmd => {
+                        let _ = self.extend_selection_to_edge(SelectionEdgeDirection::Left);
+                    }
+                    KeyCode::Right
+                        if key.modifiers.contains(KeyModifiers::SHIFT) && ctrl_or_cmd =>
+                    {
+                        let _ = self.extend_selection_to_edge(SelectionEdgeDirection::Right);
+                    }
+                    KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) && ctrl_or_cmd => {
+                        let _ = self.extend_selection_to_edge(SelectionEdgeDirection::Up);
+                    }
+                    KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) && ctrl_or_cmd => {
+                        let _ = self.extend_selection_to_edge(SelectionEdgeDirection::Down);
                     }
                     KeyCode::Left if key.modifiers.contains(KeyModifiers::SHIFT) => {
                         if self.cursor.col > 0 {
@@ -4922,6 +5046,162 @@ mod tests {
     }
 
     #[test]
+    fn cmd_shift_right_extends_to_last_nonblank_cell_in_row() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 5);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 2 }, "mid".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 3 }, "end".into());
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS + 1,
+        };
+        app.mode = Mode::Normal;
+
+        app.handle_key(KeyEvent::new(
+            KeyCode::Right,
+            KeyModifiers::SHIFT | KeyModifiers::SUPER,
+        ))
+        .unwrap();
+
+        assert_eq!(
+            app.anchor,
+            Some(SheetCursor {
+                row: HEADER_ROWS,
+                col: MARGIN_COLS + 1,
+            })
+        );
+        assert_eq!(
+            app.cursor,
+            SheetCursor {
+                row: HEADER_ROWS,
+                col: MARGIN_COLS + 3,
+            }
+        );
+        assert_eq!(app.selection_kind, SelectionKind::Cells);
+    }
+
+    #[test]
+    fn ctrl_shift_left_extends_to_first_nonblank_cell_in_row() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 5);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "start".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 1 }, "next".into());
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS + 3,
+        };
+        app.mode = Mode::Normal;
+
+        app.handle_key(KeyEvent::new(
+            KeyCode::Left,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ))
+        .unwrap();
+
+        assert_eq!(
+            app.anchor,
+            Some(SheetCursor {
+                row: HEADER_ROWS,
+                col: MARGIN_COLS + 3,
+            })
+        );
+        assert_eq!(
+            app.cursor,
+            SheetCursor {
+                row: HEADER_ROWS,
+                col: MARGIN_COLS,
+            }
+        );
+        assert_eq!(app.selection_kind, SelectionKind::Cells);
+    }
+
+    #[test]
+    fn ctrl_shift_down_extends_to_last_nonblank_cell_in_column() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(5, 1);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 2, col: 0 }, "mid".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 3, col: 0 }, "end".into());
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS + 1,
+            col: MARGIN_COLS,
+        };
+        app.mode = Mode::Normal;
+
+        app.handle_key(KeyEvent::new(
+            KeyCode::Down,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ))
+        .unwrap();
+
+        assert_eq!(
+            app.anchor,
+            Some(SheetCursor {
+                row: HEADER_ROWS + 1,
+                col: MARGIN_COLS,
+            })
+        );
+        assert_eq!(
+            app.cursor,
+            SheetCursor {
+                row: HEADER_ROWS + 3,
+                col: MARGIN_COLS,
+            }
+        );
+        assert_eq!(app.selection_kind, SelectionKind::Cells);
+    }
+
+    #[test]
+    fn ctrl_shift_up_extends_to_first_nonblank_cell_in_column() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(5, 1);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "top".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 1, col: 0 }, "next".into());
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS + 3,
+            col: MARGIN_COLS,
+        };
+        app.mode = Mode::Normal;
+
+        app.handle_key(KeyEvent::new(
+            KeyCode::Up,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ))
+        .unwrap();
+
+        assert_eq!(
+            app.anchor,
+            Some(SheetCursor {
+                row: HEADER_ROWS + 3,
+                col: MARGIN_COLS,
+            })
+        );
+        assert_eq!(
+            app.cursor,
+            SheetCursor {
+                row: HEADER_ROWS,
+                col: MARGIN_COLS,
+            }
+        );
+        assert_eq!(app.selection_kind, SelectionKind::Cells);
+    }
+
+    #[test]
     fn insert_menu_cols_inserts_before_cursor() {
         let mut app = App::new(None);
         app.state.grid.set_main_size(1, 2);
@@ -5114,7 +5394,7 @@ mod tests {
     }
 
     #[test]
-    fn formula_bar_keeps_raw_pi_text() {
+    fn formula_bar_shows_evaluated_formula_text() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
@@ -5138,7 +5418,7 @@ mod tests {
                 .collect::<String>()
         };
 
-        assert!(row(1).contains("π"));
+        assert!(row(1).contains("3.141"));
 
         app.state
             .grid
@@ -5154,6 +5434,40 @@ mod tests {
         };
 
         assert!(row(1).contains("6.283"));
+
+        app.mode = Mode::Edit {
+            buffer: "=2*π".into(),
+            formula_cursor: None,
+            fit_to_content_on_commit: false,
+        };
+        let backend = TestBackend::new(40, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = |y: u16| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+
+        assert!(row(1).contains("6.283"));
+
+        app.mode = Mode::Edit {
+            buffer: "=π".into(),
+            formula_cursor: None,
+            fit_to_content_on_commit: false,
+        };
+        let backend = TestBackend::new(40, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = |y: u16| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+
+        assert!(row(1).contains("=π"));
     }
 
     #[test]
@@ -5520,6 +5834,30 @@ mod tests {
 
         let log = std::fs::read_to_string(path.path()).unwrap();
         assert!(log.contains("$2:NEW_SHEET Sheet2"));
+    }
+
+    #[test]
+    fn zerosum_right_from_a_in_edit_mode_moves_to_b() {
+        let mut app = App::new(Some(PathBuf::from("docs/test/zerosum.corro")));
+        app.load_initial().unwrap();
+
+        assert_eq!(
+            app.cursor.to_addr(&app.state.grid),
+            CellAddr::Main { row: 0, col: 0 }
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .unwrap();
+        assert!(matches!(app.mode, Mode::Edit { .. }));
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::empty()))
+            .unwrap();
+
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(app.state.grid.main_cols(), 2);
+        assert_eq!(
+            app.cursor.to_addr(&app.state.grid),
+            CellAddr::Main { row: 0, col: 1 }
+        );
     }
 
     #[test]
@@ -6195,6 +6533,17 @@ fn input_line(
     text_style: Style,
     caret_style: Style,
 ) -> Line<'static> {
+    input_line_with_suffix(prefix, buffer, cursor, text_style, caret_style, None)
+}
+
+fn input_line_with_suffix(
+    prefix: String,
+    buffer: &str,
+    cursor: usize,
+    text_style: Style,
+    caret_style: Style,
+    suffix: Option<String>,
+) -> Line<'static> {
     let chars: Vec<char> = buffer.chars().collect();
     let cursor = cursor.min(chars.len());
     let before: String = chars[..cursor].iter().collect();
@@ -6222,8 +6571,26 @@ fn input_line(
             spans.push(Span::styled(tail, text_style));
         }
     }
+    if let Some(suffix) = suffix {
+        if !suffix.is_empty() {
+            spans.push(Span::styled(suffix, text_style));
+        }
+    }
 
     Line::from(spans)
+}
+
+fn formula_edit_preview(grid: &Grid, addr: &CellAddr, buffer: &str) -> Option<String> {
+    let trimmed = buffer.trim();
+    if trimmed.is_empty() || !trimmed.starts_with('=') {
+        return None;
+    }
+    if matches!(trimmed, "=π" | "=e" | "=c") {
+        return None;
+    }
+    let mut preview_grid = grid.clone();
+    preview_grid.set(addr, trimmed.to_string());
+    Some(cell_effective_display(&preview_grid, addr))
 }
 
 fn formula_bar_value(grid: &Grid, addr: &CellAddr) -> String {
@@ -6232,11 +6599,7 @@ fn formula_bar_value(grid: &Grid, addr: &CellAddr) -> String {
     if trimmed.is_empty() {
         return String::new();
     }
-    if let Some(expr) = trimmed.strip_prefix('=') {
-        let expr = expr.trim();
-        if matches!(expr, "π" | "e" | "c") {
-            return expr.to_string();
-        }
+    if trimmed.starts_with('=') {
         return cell_effective_display(grid, addr);
     }
     raw
