@@ -2,6 +2,8 @@ use super::{
     eval_ast, eval_binary, eval_cell_inner, eval_sum, parse_number_literal, Ast, EvalResult,
 };
 use crate::grid::{CellAddr, Grid, MainRange};
+use chrono::{Datelike, Local, NaiveDate, NaiveDateTime, Timelike};
+use std::hash::{Hash, Hasher};
 
 pub(crate) fn eval_builtin(
     name: &str,
@@ -128,6 +130,31 @@ pub(crate) fn eval_builtin(
             f64::cos,
         ),
         "TRIM" => eval_trim(&args, grid, visiting, bindings, budget, allow_templates),
+        "UPPER" => eval_upper(&args, grid, visiting, bindings, budget, allow_templates),
+        "LOWER" => eval_lower(&args, grid, visiting, bindings, budget, allow_templates),
+        "PROPER" => eval_proper(&args, grid, visiting, bindings, budget, allow_templates),
+        "SUBSTITUTE" => eval_substitute(&args, grid, visiting, bindings, budget, allow_templates),
+        "REPLACE" => eval_replace(&args, grid, visiting, bindings, budget, allow_templates),
+        "FIND" => eval_find(&args, grid, visiting, bindings, budget, allow_templates),
+        "SEARCH" => eval_search(&args, grid, visiting, bindings, budget, allow_templates),
+        "TEXT" => eval_text(&args, grid, visiting, bindings, budget, allow_templates),
+        "TODAY" => eval_today(&args),
+        "NOW" => eval_now(&args),
+        "DATE" => eval_date(&args, grid, visiting, bindings, budget, allow_templates),
+        "YEAR" => eval_year(&args, grid, visiting, bindings, budget, allow_templates),
+        "MONTH" => eval_month(&args, grid, visiting, bindings, budget, allow_templates),
+        "DAY" => eval_day(&args, grid, visiting, bindings, budget, allow_templates),
+        "HOUR" => eval_hour(&args, grid, visiting, bindings, budget, allow_templates),
+        "MINUTE" => eval_minute(&args, grid, visiting, bindings, budget, allow_templates),
+        "SECOND" => eval_second(&args, grid, visiting, bindings, budget, allow_templates),
+        "ROUNDUP" => eval_roundup(&args, grid, visiting, bindings, budget, allow_templates),
+        "ROUNDDOWN" => eval_rounddown(&args, grid, visiting, bindings, budget, allow_templates),
+        "INT" => eval_int(&args, grid, visiting, bindings, budget, allow_templates),
+        "CEILING" => eval_ceiling(&args, grid, visiting, bindings, budget, allow_templates),
+        "FLOOR" => eval_floor(&args, grid, visiting, bindings, budget, allow_templates),
+        "RAND" => eval_rand(&args, grid, visiting, bindings, budget, allow_templates),
+        "RANDBETWEEN" => eval_randbetween(&args, grid, visiting, bindings, budget, allow_templates),
+        "SUMPRODUCT" => eval_sumproduct(&args, grid, visiting, bindings, budget, allow_templates),
         "LEN" => eval_len(&args, grid, visiting, bindings, budget, allow_templates),
         "LEFT" => eval_left(&args, grid, visiting, bindings, budget, allow_templates),
         "RIGHT" => eval_right(&args, grid, visiting, bindings, budget, allow_templates),
@@ -148,8 +175,10 @@ pub(crate) fn eval_builtin(
         "VLOOKUP" => eval_vlookup(&args, grid, visiting, bindings, budget, allow_templates),
         "XLOOKUP" => eval_xlookup(&args, grid, visiting, bindings, budget, allow_templates),
         "MATCH" => eval_match(&args, grid, visiting, bindings, budget, allow_templates),
+        "XMATCH" => eval_xmatch(&args, grid, visiting, bindings, budget, allow_templates),
         "INDEX" => eval_index(&args, grid, visiting, bindings, budget, allow_templates),
         "LET" => eval_let(&args, grid, visiting, bindings, budget, allow_templates),
+        "IFS" => eval_ifs(&args, grid, visiting, bindings, budget, allow_templates),
         "SEQUENCE" => eval_sequence(&args, grid, visiting, bindings, budget, allow_templates),
         "FILTER" => eval_filter(&args, grid, visiting, bindings, budget, allow_templates),
         "UNIQUE" => eval_unique(&args, grid, visiting, bindings, budget, allow_templates),
@@ -323,6 +352,898 @@ fn eval_trim(
         EvalResult::Error(e) => EvalResult::Error(e),
         EvalResult::Array(_) => EvalResult::Error("CALC"),
     }
+}
+
+fn eval_upper(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    if args.len() != 1 {
+        return EvalResult::Error("ARGS");
+    }
+    match eval_text_arg(&args[0], grid, visiting, bindings, budget, allow_templates) {
+        Ok(s) => EvalResult::Text(s.to_ascii_uppercase()),
+        Err(e) => EvalResult::Error(e),
+    }
+}
+
+fn eval_lower(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    if args.len() != 1 {
+        return EvalResult::Error("ARGS");
+    }
+    match eval_text_arg(&args[0], grid, visiting, bindings, budget, allow_templates) {
+        Ok(s) => EvalResult::Text(s.to_ascii_lowercase()),
+        Err(e) => EvalResult::Error(e),
+    }
+}
+
+fn eval_proper(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    if args.len() != 1 {
+        return EvalResult::Error("ARGS");
+    }
+    let s = match eval_text_arg(&args[0], grid, visiting, bindings, budget, allow_templates) {
+        Ok(s) => s,
+        Err(e) => return EvalResult::Error(e),
+    };
+    let mut out = String::with_capacity(s.len());
+    let mut new_word = true;
+    for ch in s.chars() {
+        if ch.is_ascii_alphabetic() {
+            if new_word {
+                out.push(ch.to_ascii_uppercase());
+            } else {
+                out.push(ch.to_ascii_lowercase());
+            }
+            new_word = false;
+        } else {
+            out.push(ch);
+            new_word = ch.is_whitespace() || ch == '_' || ch == '-';
+        }
+    }
+    EvalResult::Text(out)
+}
+
+fn eval_substitute(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    if args.len() < 3 || args.len() > 4 {
+        return EvalResult::Error("ARGS");
+    }
+    let text = match eval_text_arg(&args[0], grid, visiting, bindings, budget, allow_templates) {
+        Ok(s) => s,
+        Err(e) => return EvalResult::Error(e),
+    };
+    let old = match eval_text_arg(&args[1], grid, visiting, bindings, budget, allow_templates) {
+        Ok(s) => s,
+        Err(e) => return EvalResult::Error(e),
+    };
+    let new = match eval_text_arg(&args[2], grid, visiting, bindings, budget, allow_templates) {
+        Ok(s) => s,
+        Err(e) => return EvalResult::Error(e),
+    };
+    let instance = if args.len() == 4 {
+        match numeric_value(eval_ast(
+            &args[3],
+            grid,
+            visiting,
+            bindings,
+            budget,
+            allow_templates,
+        )) {
+            Some(n) if n >= 1.0 => n as usize,
+            _ => return EvalResult::Error("VALUE"),
+        }
+    } else {
+        0
+    };
+    if instance == 0 {
+        EvalResult::Text(text.replace(&old, &new))
+    } else {
+        let mut out = String::new();
+        let mut count = 0usize;
+        let mut i = 0usize;
+        while let Some(pos) = text[i..].find(&old) {
+            let start = i + pos;
+            let end = start + old.len();
+            out.push_str(&text[i..start]);
+            count += 1;
+            if count == instance {
+                out.push_str(&new);
+                out.push_str(&text[end..]);
+                return EvalResult::Text(out);
+            }
+            out.push_str(&old);
+            i = end;
+        }
+        EvalResult::Text(text)
+    }
+}
+
+fn eval_replace(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    if args.len() != 4 {
+        return EvalResult::Error("ARGS");
+    }
+    let text = match eval_text_arg(&args[0], grid, visiting, bindings, budget, allow_templates) {
+        Ok(s) => s,
+        Err(e) => return EvalResult::Error(e),
+    };
+    let start = match numeric_value(eval_ast(
+        &args[1],
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+    )) {
+        Some(n) if n >= 1.0 => n as usize - 1,
+        _ => return EvalResult::Error("VALUE"),
+    };
+    let len = match numeric_value(eval_ast(
+        &args[2],
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+    )) {
+        Some(n) if n >= 0.0 => n as usize,
+        _ => return EvalResult::Error("VALUE"),
+    };
+    let new = match eval_text_arg(&args[3], grid, visiting, bindings, budget, allow_templates) {
+        Ok(s) => s,
+        Err(e) => return EvalResult::Error(e),
+    };
+    let chars: Vec<char> = text.chars().collect();
+    let start = start.min(chars.len());
+    let end = (start + len).min(chars.len());
+    let mut out = String::new();
+    out.extend(chars[..start].iter());
+    out.push_str(&new);
+    out.extend(chars[end..].iter());
+    EvalResult::Text(out)
+}
+
+fn eval_find(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    if args.len() < 2 || args.len() > 3 {
+        return EvalResult::Error("ARGS");
+    }
+    let needle = match eval_text_arg(&args[0], grid, visiting, bindings, budget, allow_templates) {
+        Ok(s) => s,
+        Err(e) => return EvalResult::Error(e),
+    };
+    let hay = match eval_text_arg(&args[1], grid, visiting, bindings, budget, allow_templates) {
+        Ok(s) => s,
+        Err(e) => return EvalResult::Error(e),
+    };
+    let start = if args.len() == 3 {
+        match numeric_value(eval_ast(
+            &args[2],
+            grid,
+            visiting,
+            bindings,
+            budget,
+            allow_templates,
+        )) {
+            Some(n) if n >= 1.0 => n as usize - 1,
+            _ => return EvalResult::Error("VALUE"),
+        }
+    } else {
+        0
+    };
+    let start = start.min(hay.len());
+    match hay[start..].find(&needle) {
+        Some(pos) => EvalResult::Number((start + pos + 1) as f64),
+        None => EvalResult::Error("VALUE"),
+    }
+}
+
+fn eval_search(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    if args.len() < 2 || args.len() > 3 {
+        return EvalResult::Error("ARGS");
+    }
+    let needle = match eval_text_arg(&args[0], grid, visiting, bindings, budget, allow_templates) {
+        Ok(s) => s.to_ascii_lowercase(),
+        Err(e) => return EvalResult::Error(e),
+    };
+    let hay = match eval_text_arg(&args[1], grid, visiting, bindings, budget, allow_templates) {
+        Ok(s) => s.to_ascii_lowercase(),
+        Err(e) => return EvalResult::Error(e),
+    };
+    let start = if args.len() == 3 {
+        match numeric_value(eval_ast(
+            &args[2],
+            grid,
+            visiting,
+            bindings,
+            budget,
+            allow_templates,
+        )) {
+            Some(n) if n >= 1.0 => n as usize - 1,
+            _ => return EvalResult::Error("VALUE"),
+        }
+    } else {
+        0
+    };
+    let start = start.min(hay.len());
+    match hay[start..].find(&needle) {
+        Some(pos) => EvalResult::Number((start + pos + 1) as f64),
+        None => EvalResult::Error("VALUE"),
+    }
+}
+
+fn eval_text(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    if args.len() != 2 {
+        return EvalResult::Error("ARGS");
+    }
+    let value = match eval_ast(&args[0], grid, visiting, bindings, budget, allow_templates)
+        .scalar_coerce()
+    {
+        EvalResult::Number(n) => n,
+        EvalResult::Text(s) => match parse_number_literal(&s) {
+            Some(n) => n,
+            None => return EvalResult::Text(s),
+        },
+        EvalResult::Error(e) => return EvalResult::Error(e),
+        EvalResult::Array(_) => return EvalResult::Error("CALC"),
+    };
+    let fmt = match eval_text_arg(&args[1], grid, visiting, bindings, budget, allow_templates) {
+        Ok(s) => s,
+        Err(e) => return EvalResult::Error(e),
+    };
+    if let Some(decimals) = fmt.strip_prefix("0.") {
+        let digits = decimals.len();
+        EvalResult::Text(format!("{:.*}", digits, value))
+    } else if fmt == "0" {
+        EvalResult::Text(format!("{}", value.round() as i64))
+    } else {
+        EvalResult::Text(value.to_string())
+    }
+}
+
+fn eval_today(args: &[Ast]) -> EvalResult {
+    if !args.is_empty() {
+        return EvalResult::Error("ARGS");
+    }
+    let now = Local::now().date_naive();
+    EvalResult::Number(date_to_serial(now))
+}
+
+fn eval_now(args: &[Ast]) -> EvalResult {
+    if !args.is_empty() {
+        return EvalResult::Error("ARGS");
+    }
+    let now = Local::now().naive_local();
+    EvalResult::Number(datetime_to_serial(now))
+}
+
+fn eval_date(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    if args.len() != 3 {
+        return EvalResult::Error("ARGS");
+    }
+    let year = match numeric_value(eval_ast(
+        &args[0],
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+    )) {
+        Some(n) => n as i32,
+        None => return EvalResult::Error("VALUE"),
+    };
+    let month = match numeric_value(eval_ast(
+        &args[1],
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+    )) {
+        Some(n) => n as u32,
+        None => return EvalResult::Error("VALUE"),
+    };
+    let day = match numeric_value(eval_ast(
+        &args[2],
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+    )) {
+        Some(n) => n as u32,
+        None => return EvalResult::Error("VALUE"),
+    };
+    match NaiveDate::from_ymd_opt(year, month, day) {
+        Some(d) => EvalResult::Number(date_to_serial(d)),
+        None => EvalResult::Error("VALUE"),
+    }
+}
+
+fn eval_year(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    date_component(
+        args,
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+        |dt| dt.year() as f64,
+    )
+}
+
+fn eval_month(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    date_component(
+        args,
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+        |dt| dt.month() as f64,
+    )
+}
+
+fn eval_day(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    date_component(
+        args,
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+        |dt| dt.day() as f64,
+    )
+}
+
+fn eval_hour(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    time_component(
+        args,
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+        |dt| dt.hour() as f64,
+    )
+}
+
+fn eval_minute(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    time_component(
+        args,
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+        |dt| dt.minute() as f64,
+    )
+}
+
+fn eval_second(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    time_component(
+        args,
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+        |dt| dt.second() as f64,
+    )
+}
+
+fn eval_roundup(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    round_with_mode(
+        args,
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+        true,
+    )
+}
+
+fn eval_rounddown(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    round_with_mode(
+        args,
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+        false,
+    )
+}
+
+fn eval_int(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    if args.len() != 1 {
+        return EvalResult::Error("ARGS");
+    }
+    match numeric_value(eval_ast(
+        &args[0],
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+    )) {
+        Some(n) => EvalResult::Number(n.floor()),
+        None => EvalResult::Error("VALUE"),
+    }
+}
+
+fn eval_ceiling(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    if args.len() != 2 {
+        return EvalResult::Error("ARGS");
+    }
+    let n = match numeric_value(eval_ast(
+        &args[0],
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+    )) {
+        Some(v) => v,
+        None => return EvalResult::Error("VALUE"),
+    };
+    let significance = match numeric_value(eval_ast(
+        &args[1],
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+    )) {
+        Some(v) if v != 0.0 => v,
+        _ => return EvalResult::Error("VALUE"),
+    };
+    EvalResult::Number((n / significance).ceil() * significance)
+}
+
+fn eval_floor(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    if args.len() != 2 {
+        return EvalResult::Error("ARGS");
+    }
+    let n = match numeric_value(eval_ast(
+        &args[0],
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+    )) {
+        Some(v) => v,
+        None => return EvalResult::Error("VALUE"),
+    };
+    let significance = match numeric_value(eval_ast(
+        &args[1],
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+    )) {
+        Some(v) if v != 0.0 => v,
+        _ => return EvalResult::Error("VALUE"),
+    };
+    EvalResult::Number((n / significance).floor() * significance)
+}
+
+fn eval_rand(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    _bindings: &mut Vec<(String, EvalResult)>,
+    _budget: &mut usize,
+    _allow_templates: bool,
+) -> EvalResult {
+    if !args.is_empty() {
+        return EvalResult::Error("ARGS");
+    }
+    EvalResult::Number(deterministic_rand(
+        grid,
+        current_addr_hash(visiting),
+        None,
+        None,
+    ))
+}
+
+fn eval_randbetween(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    if args.len() != 2 {
+        return EvalResult::Error("ARGS");
+    }
+    let low = match numeric_value(eval_ast(
+        &args[0],
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+    )) {
+        Some(v) => v.floor() as i64,
+        None => return EvalResult::Error("VALUE"),
+    };
+    let high = match numeric_value(eval_ast(
+        &args[1],
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+    )) {
+        Some(v) => v.floor() as i64,
+        None => return EvalResult::Error("VALUE"),
+    };
+    if low > high {
+        return EvalResult::Error("VALUE");
+    }
+    let n = deterministic_rand(
+        grid,
+        current_addr_hash(visiting),
+        Some(low as u64),
+        Some(high as u64),
+    );
+    let span = (high - low + 1) as f64;
+    EvalResult::Number(low as f64 + (n * span).floor())
+}
+
+fn date_component<F>(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+    f: F,
+) -> EvalResult
+where
+    F: Fn(&NaiveDateTime) -> f64,
+{
+    if args.len() != 1 {
+        return EvalResult::Error("ARGS");
+    }
+    let serial = match numeric_value(eval_ast(
+        &args[0],
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+    )) {
+        Some(v) => v,
+        None => return EvalResult::Error("VALUE"),
+    };
+    match serial_to_datetime(serial) {
+        Some(dt) => EvalResult::Number(f(&dt)),
+        None => EvalResult::Error("VALUE"),
+    }
+}
+
+fn time_component<F>(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+    f: F,
+) -> EvalResult
+where
+    F: Fn(&NaiveDateTime) -> f64,
+{
+    date_component(args, grid, visiting, bindings, budget, allow_templates, f)
+}
+
+fn round_with_mode(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+    up: bool,
+) -> EvalResult {
+    if args.len() != 1 && args.len() != 2 {
+        return EvalResult::Error("ARGS");
+    }
+    let n = match numeric_value(eval_ast(
+        &args[0],
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+    )) {
+        Some(v) => v,
+        None => return EvalResult::Error("VALUE"),
+    };
+    let digits = if args.len() == 2 {
+        match numeric_value(eval_ast(
+            &args[1],
+            grid,
+            visiting,
+            bindings,
+            budget,
+            allow_templates,
+        )) {
+            Some(v) => v,
+            None => return EvalResult::Error("VALUE"),
+        }
+    } else {
+        0.0
+    };
+    let factor = 10f64.powf(digits);
+    let scaled = n * factor;
+    let rounded = if up { scaled.ceil() } else { scaled.floor() };
+    EvalResult::Number(rounded / factor)
+}
+
+fn date_to_serial(date: NaiveDate) -> f64 {
+    let epoch = NaiveDate::from_ymd_opt(1899, 12, 30).expect("valid epoch");
+    (date - epoch).num_days() as f64
+}
+
+fn datetime_to_serial(dt: NaiveDateTime) -> f64 {
+    let date_serial = date_to_serial(dt.date());
+    date_serial + (dt.time().num_seconds_from_midnight() as f64) / 86_400.0
+}
+
+fn serial_to_datetime(serial: f64) -> Option<NaiveDateTime> {
+    let epoch = NaiveDate::from_ymd_opt(1899, 12, 30)?.and_hms_opt(0, 0, 0)?;
+    let days = serial.floor() as i64;
+    let frac = serial - serial.floor();
+    let secs = (frac * 86_400.0).round() as i64;
+    epoch
+        .checked_add_signed(chrono::Duration::days(days))?
+        .checked_add_signed(chrono::Duration::seconds(secs))
+}
+
+fn current_addr_hash(visiting: &[CellAddr]) -> Option<u64> {
+    visiting.last().map(|addr| {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        Hash::hash(addr, &mut hasher);
+        hasher.finish()
+    })
+}
+
+fn deterministic_rand(grid: &Grid, c: Option<u64>, a: Option<u64>, b: Option<u64>) -> f64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    Hash::hash(&grid.volatile_seed, &mut hasher);
+    Hash::hash(&c, &mut hasher);
+    Hash::hash(&a, &mut hasher);
+    Hash::hash(&b, &mut hasher);
+    let v = hasher.finish();
+    (v as f64) / (u64::MAX as f64)
+}
+
+fn eval_text_arg(
+    ast: &Ast,
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> Result<String, &'static str> {
+    match eval_ast(ast, grid, visiting, bindings, budget, allow_templates).scalar_coerce() {
+        EvalResult::Number(n) => Ok(n.to_string()),
+        EvalResult::Text(s) => Ok(s),
+        EvalResult::Error(e) => Err(e),
+        EvalResult::Array(_) => Err("CALC"),
+    }
+}
+
+fn eval_sumproduct(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    if args.is_empty() {
+        return EvalResult::Error("ARGS");
+    }
+    let mut matrices = Vec::new();
+    for arg in args {
+        match collect_matrix_values(arg, grid, visiting, bindings, budget, allow_templates) {
+            Ok(m) => matrices.push(m),
+            Err(e) => return EvalResult::Error(e),
+        }
+    }
+    let rows = matrices[0].len();
+    let cols = matrices[0].first().map(|r| r.len()).unwrap_or(0);
+    if rows == 0 || cols == 0 {
+        return EvalResult::Number(0.0);
+    }
+    if matrices
+        .iter()
+        .any(|m| m.len() != rows || m.iter().any(|r| r.len() != cols))
+    {
+        return EvalResult::Error("ARGS");
+    }
+    let mut sum = 0.0;
+    for r in 0..rows {
+        for c in 0..cols {
+            let mut prod = 1.0;
+            for m in &matrices {
+                let v = match m[r][c].clone().scalar_coerce() {
+                    EvalResult::Number(n) => n,
+                    EvalResult::Text(s) => match parse_number_literal(&s) {
+                        Some(n) => n,
+                        None => return EvalResult::Error("VALUE"),
+                    },
+                    EvalResult::Error(e) => return EvalResult::Error(e),
+                    EvalResult::Array(_) => return EvalResult::Error("CALC"),
+                };
+                prod *= v;
+            }
+            sum += prod;
+        }
+    }
+    EvalResult::Number(sum)
+}
+
+fn eval_ifs(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    if args.len() < 2 || !args.len().is_multiple_of(2) {
+        return EvalResult::Error("ARGS");
+    }
+    for pair in args.chunks(2) {
+        let cond = eval_ast(&pair[0], grid, visiting, bindings, budget, allow_templates);
+        if super::truthy(cond) {
+            return eval_ast(&pair[1], grid, visiting, bindings, budget, allow_templates);
+        }
+    }
+    EvalResult::Error("NA")
 }
 
 fn eval_iferror(
@@ -698,6 +1619,101 @@ fn eval_match(
                 return EvalResult::Number(idx as f64);
             }
             idx += 1;
+        }
+    }
+    EvalResult::Error("NA")
+}
+
+fn eval_xmatch(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    if args.len() < 2 || args.len() > 4 {
+        return EvalResult::Error("ARGS");
+    }
+    let lookup_value = match eval_ast(&args[0], grid, visiting, bindings, budget, allow_templates)
+        .scalar_coerce()
+    {
+        EvalResult::Number(n) => LookupValue::Number(n),
+        EvalResult::Text(s) => parse_number_literal(&s)
+            .map(LookupValue::Number)
+            .unwrap_or(LookupValue::Text(s)),
+        EvalResult::Error(e) => return EvalResult::Error(e),
+        EvalResult::Array(_) => return EvalResult::Error("CALC"),
+    };
+    let matrix =
+        match collect_matrix_values(&args[1], grid, visiting, bindings, budget, allow_templates) {
+            Ok(m) => m,
+            Err(e) => return EvalResult::Error(e),
+        };
+    let search_mode = if args.len() >= 3 {
+        match numeric_value(eval_ast(
+            &args[2],
+            grid,
+            visiting,
+            bindings,
+            budget,
+            allow_templates,
+        )) {
+            Some(n) => n as i32,
+            None => return EvalResult::Error("VALUE"),
+        }
+    } else {
+        1
+    };
+    if args.len() >= 4 {
+        let mode = match numeric_value(eval_ast(
+            &args[3],
+            grid,
+            visiting,
+            bindings,
+            budget,
+            allow_templates,
+        )) {
+            Some(n) => n as i32,
+            None => return EvalResult::Error("VALUE"),
+        };
+        if mode != 0 {
+            return EvalResult::Error("NA");
+        }
+    }
+    let mut flat = Vec::new();
+    for row in matrix {
+        for cell in row {
+            flat.push(cell.scalar_coerce());
+        }
+    }
+    if search_mode >= 0 {
+        for (i, cell) in flat.iter().enumerate() {
+            let candidate = match cell.clone() {
+                EvalResult::Number(n) => LookupValue::Number(n),
+                EvalResult::Text(s) => parse_number_literal(&s)
+                    .map(LookupValue::Number)
+                    .unwrap_or(LookupValue::Text(s)),
+                EvalResult::Error(_) => continue,
+                EvalResult::Array(_) => continue,
+            };
+            if candidate == lookup_value {
+                return EvalResult::Number((i + 1) as f64);
+            }
+        }
+    } else {
+        for (i, cell) in flat.iter().enumerate().rev() {
+            let candidate = match cell.clone() {
+                EvalResult::Number(n) => LookupValue::Number(n),
+                EvalResult::Text(s) => parse_number_literal(&s)
+                    .map(LookupValue::Number)
+                    .unwrap_or(LookupValue::Text(s)),
+                EvalResult::Error(_) => continue,
+                EvalResult::Array(_) => continue,
+            };
+            if candidate == lookup_value {
+                return EvalResult::Number((i + 1) as f64);
+            }
         }
     }
     EvalResult::Error("NA")

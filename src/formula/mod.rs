@@ -51,6 +51,8 @@ fn workbook_lookup_sheet_ref(sheet: &str) -> Option<(u32, Grid)> {
 }
 const DEFAULT_BUDGET: usize = 10_000;
 
+const SPEED_OF_LIGHT_MPS: f64 = 299_792_458.0;
+
 /// Evaluation step budget for one aggregate range scan (many cells).
 pub const EVAL_BUDGET_AGG: usize = 1_000_000;
 
@@ -98,6 +100,19 @@ fn parse_number_literal(s: &str) -> Option<f64> {
         return None;
     }
     t.parse::<f64>().ok()
+}
+
+fn resolve_name(name: &str, bindings: &[(String, EvalResult)]) -> Option<EvalResult> {
+    if let Some((_, value)) = bindings.iter().rev().find(|(n, _)| n == name) {
+        return Some(value.clone());
+    }
+
+    match name {
+        "π" => Some(EvalResult::Number(std::f64::consts::PI)),
+        "e" => Some(EvalResult::Number(std::f64::consts::E)),
+        "c" => Some(EvalResult::Number(SPEED_OF_LIGHT_MPS)),
+        _ => None,
+    }
 }
 
 fn split_labeled_formula(raw: &str) -> Option<(&str, &str)> {
@@ -512,6 +527,13 @@ impl<'a> Parser<'a> {
             return Err(());
         }
 
+        if let Some(ch) = self.s[self.i..].chars().next() {
+            if ch == 'π' {
+                self.i += ch.len_utf8();
+                return Ok(Ast::Name(ch.to_string()));
+            }
+        }
+
         if rest.starts_with('$') {
             if let Some((sheet_id, addr, len)) = parse_sheet_qualified_cell_ref_at(rest) {
                 self.i += len;
@@ -567,7 +589,11 @@ impl<'a> Parser<'a> {
                 let inner_end = self.scan_balanced_from(self.i)?;
                 let inner = &self.s[self.i..inner_end];
                 self.i = inner_end + 1;
-                let args = split_top_level_args(inner)?;
+                let args = if inner.trim().is_empty() {
+                    Vec::new()
+                } else {
+                    split_top_level_args(inner)?
+                };
                 let mut arg_asts = Vec::with_capacity(args.len());
                 for a in args {
                     let mut sub = Parser { s: a.trim(), i: 0 };
@@ -689,12 +715,7 @@ fn eval_ast(
     match ast {
         Ast::Number(n) => EvalResult::Number(*n),
         Ast::Text(s) => EvalResult::Text(s.clone()),
-        Ast::Name(name) => bindings
-            .iter()
-            .rev()
-            .find(|(n, _)| n == name)
-            .map(|(_, v)| v.clone())
-            .unwrap_or(EvalResult::Error("NAME")),
+        Ast::Name(name) => resolve_name(name, bindings).unwrap_or(EvalResult::Error("NAME")),
         Ast::Ref(addr) => eval_cell_inner(grid, addr, visiting, budget, allow_templates),
         Ast::SheetRef { sheet_id, addr } => {
             let Some(sheet_grid) = workbook_lookup(*sheet_id) else {
@@ -879,8 +900,6 @@ fn eval_sum(
             EvalResult::Array(_) => EvalResult::Error("CALC"),
         },
         Ast::Number(n) => EvalResult::Number(*n),
-        Ast::Text(s) => EvalResult::Text(s.clone()),
-        Ast::Name(_) => EvalResult::Error("NAME"),
     }
 }
 
@@ -1134,6 +1153,51 @@ mod tests {
             &CellAddr::Main { row: 0, col: 0 },
             "=LET(x, 1, x, x + 2, x)".into(),
         );
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 0 }, &mut v, &mut b) {
+            EvalResult::Number(n) => assert!((n - 3.0).abs() < 1e-9),
+            e => panic!("expected 3 {:?}", e),
+        }
+    }
+
+    #[test]
+    fn math_constants_evaluate() {
+        let mut g = Grid::new(1, 3);
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "=sin(π)".into());
+        g.set(&CellAddr::Main { row: 0, col: 1 }, "=e".into());
+        g.set(&CellAddr::Main { row: 0, col: 2 }, "=c".into());
+
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 0 }, &mut v, &mut b) {
+            EvalResult::Number(n) => assert!(n.abs() < 1e-12),
+            e => panic!("expected 0 {:?}", e),
+        }
+
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 1 }, &mut v, &mut b) {
+            EvalResult::Number(n) => assert!((n - std::f64::consts::E).abs() < 1e-12),
+            e => panic!("expected e {:?}", e),
+        }
+
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 2 }, &mut v, &mut b) {
+            EvalResult::Number(n) => assert!((n - SPEED_OF_LIGHT_MPS).abs() < 1e-12),
+            e => panic!("expected c {:?}", e),
+        }
+    }
+
+    #[test]
+    fn let_can_shadow_pi_constant() {
+        let mut g = Grid::new(1, 1);
+        g.set(
+            &CellAddr::Main { row: 0, col: 0 },
+            "=LET(π, 2, π + 1)".into(),
+        );
+
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
         match eval_cell(&g, &CellAddr::Main { row: 0, col: 0 }, &mut v, &mut b) {
@@ -1481,6 +1545,213 @@ mod tests {
         match eval_cell(&g, &CellAddr::Main { row: 0, col: 4 }, &mut v, &mut b) {
             EvalResult::Text(s) => assert_eq!(s, "abc"),
             e => panic!("expected abc {:?}", e),
+        }
+    }
+
+    #[test]
+    fn text_casing_and_replace_work() {
+        let mut g = Grid::new(1, 7);
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "=UPPER(\"Abc\")".into());
+        g.set(&CellAddr::Main { row: 0, col: 1 }, "=LOWER(\"AbC\")".into());
+        g.set(
+            &CellAddr::Main { row: 0, col: 2 },
+            "=PROPER(\"hello world\")".into(),
+        );
+        g.set(
+            &CellAddr::Main { row: 0, col: 3 },
+            "=SUBSTITUTE(\"a-b-a\",\"a\",\"x\")".into(),
+        );
+        g.set(
+            &CellAddr::Main { row: 0, col: 4 },
+            "=REPLACE(\"abcdef\",2,3,\"ZZ\")".into(),
+        );
+        g.set(
+            &CellAddr::Main { row: 0, col: 5 },
+            "=FIND(\"cd\",\"abcdef\")".into(),
+        );
+        g.set(
+            &CellAddr::Main { row: 0, col: 6 },
+            "=SEARCH(\"CD\",\"abCdEf\")".into(),
+        );
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 0 }, &mut v, &mut b) {
+            EvalResult::Text(s) => assert_eq!(s, "ABC"),
+            e => panic!("expected ABC {:?}", e),
+        }
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 1 }, &mut v, &mut b) {
+            EvalResult::Text(s) => assert_eq!(s, "abc"),
+            e => panic!("expected abc {:?}", e),
+        }
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 2 }, &mut v, &mut b) {
+            EvalResult::Text(s) => assert_eq!(s, "Hello World"),
+            e => panic!("expected Hello World {:?}", e),
+        }
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 3 }, &mut v, &mut b) {
+            EvalResult::Text(s) => assert_eq!(s, "x-b-x"),
+            e => panic!("expected x-b-x {:?}", e),
+        }
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 4 }, &mut v, &mut b) {
+            EvalResult::Text(s) => assert_eq!(s, "aZZef"),
+            e => panic!("expected aZZef {:?}", e),
+        }
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 5 }, &mut v, &mut b) {
+            EvalResult::Number(n) => assert!((n - 3.0).abs() < 1e-9),
+            e => panic!("expected 3 {:?}", e),
+        }
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 6 }, &mut v, &mut b) {
+            EvalResult::Number(n) => assert!((n - 3.0).abs() < 1e-9),
+            e => panic!("expected 3 {:?}", e),
+        }
+    }
+
+    #[test]
+    fn text_formatting_works() {
+        let mut g = Grid::new(1, 1);
+        g.set(
+            &CellAddr::Main { row: 0, col: 0 },
+            "=TEXT(12.345,\"0.00\")".into(),
+        );
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 0 }, &mut v, &mut b) {
+            EvalResult::Text(s) => assert_eq!(s, "12.35"),
+            e => panic!("expected 12.35 {:?}", e),
+        }
+    }
+
+    #[test]
+    fn date_time_functions_work() {
+        let mut g = Grid::new(1, 7);
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "=DATE(2024,1,2)".into());
+        g.set(&CellAddr::Main { row: 0, col: 1 }, "=YEAR(A1)".into());
+        g.set(&CellAddr::Main { row: 0, col: 2 }, "=MONTH(A1)".into());
+        g.set(&CellAddr::Main { row: 0, col: 3 }, "=DAY(A1)".into());
+        g.set(&CellAddr::Main { row: 0, col: 4 }, "=HOUR(NOW())".into());
+        g.set(&CellAddr::Main { row: 0, col: 5 }, "=MINUTE(NOW())".into());
+        g.set(&CellAddr::Main { row: 0, col: 6 }, "=SECOND(NOW())".into());
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 0 }, &mut v, &mut b) {
+            EvalResult::Number(n) => assert!(n > 45000.0),
+            e => panic!("expected serial {:?}", e),
+        }
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 1 }, &mut v, &mut b) {
+            EvalResult::Number(n) => assert!((n - 2024.0).abs() < 1e-9),
+            e => panic!("expected year {:?}", e),
+        }
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 2 }, &mut v, &mut b) {
+            EvalResult::Number(n) => assert!((n - 1.0).abs() < 1e-9),
+            e => panic!("expected month {:?}", e),
+        }
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 3 }, &mut v, &mut b) {
+            EvalResult::Number(n) => assert!((n - 2.0).abs() < 1e-9),
+            e => panic!("expected day {:?}", e),
+        }
+    }
+
+    #[test]
+    fn rand_is_deterministic_per_seed() {
+        let mut g = Grid::new(1, 2);
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "=RAND()".into());
+        g.set(
+            &CellAddr::Main { row: 0, col: 1 },
+            "=RANDBETWEEN(1,10)".into(),
+        );
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        let first = match eval_cell(&g, &CellAddr::Main { row: 0, col: 0 }, &mut v, &mut b) {
+            EvalResult::Number(n) => n,
+            e => panic!("expected rand {:?}", e),
+        };
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        let second = match eval_cell(&g, &CellAddr::Main { row: 0, col: 0 }, &mut v, &mut b) {
+            EvalResult::Number(n) => n,
+            e => panic!("expected rand {:?}", e),
+        };
+        assert!((first - second).abs() < 1e-12);
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        let between = match eval_cell(&g, &CellAddr::Main { row: 0, col: 1 }, &mut v, &mut b) {
+            EvalResult::Number(n) => n,
+            e => panic!("expected randbetween {:?}", e),
+        };
+        assert!((1.0..=10.0).contains(&between));
+        g.bump_volatile_seed();
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        let changed = match eval_cell(&g, &CellAddr::Main { row: 0, col: 0 }, &mut v, &mut b) {
+            EvalResult::Number(n) => n,
+            e => panic!("expected rand {:?}", e),
+        };
+        assert!((first - changed).abs() > 1e-12);
+    }
+
+    #[test]
+    fn sumproduct_works() {
+        let mut g = Grid::new(2, 3);
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "1".into());
+        g.set(&CellAddr::Main { row: 0, col: 1 }, "2".into());
+        g.set(&CellAddr::Main { row: 1, col: 0 }, "3".into());
+        g.set(&CellAddr::Main { row: 1, col: 1 }, "4".into());
+        g.set(
+            &CellAddr::Main { row: 0, col: 2 },
+            "=SUMPRODUCT(A1:B2)".into(),
+        );
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 2 }, &mut v, &mut b) {
+            EvalResult::Number(n) => assert!((n - 10.0).abs() < 1e-9),
+            e => panic!("expected 10 {:?}", e),
+        }
+    }
+
+    #[test]
+    fn ifs_works() {
+        let mut g = Grid::new(1, 1);
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "=IFS(0,1,1,2)".into());
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 0 }, &mut v, &mut b) {
+            EvalResult::Number(n) => assert!((n - 2.0).abs() < 1e-9),
+            e => panic!("expected 2 {:?}", e),
+        }
+    }
+
+    #[test]
+    fn xmatch_works() {
+        let mut g = Grid::new(1, 4);
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "a".into());
+        g.set(&CellAddr::Main { row: 0, col: 1 }, "b".into());
+        g.set(&CellAddr::Main { row: 0, col: 2 }, "c".into());
+        g.set(
+            &CellAddr::Main { row: 0, col: 3 },
+            "=XMATCH(\"b\",A1:C1)".into(),
+        );
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 3 }, &mut v, &mut b) {
+            EvalResult::Number(n) => assert!((n - 2.0).abs() < 1e-9),
+            e => panic!("expected 2 {:?}", e),
         }
     }
 

@@ -4969,7 +4969,7 @@ mod tests {
                 state.grid.main_rows(),
                 state.grid.main_cols(),
             ),
-            Some("105".into())
+            Some(format!("{}", 105.0 + 3.0 * std::f64::consts::PI))
         );
     }
 

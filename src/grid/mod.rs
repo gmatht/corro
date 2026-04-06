@@ -88,6 +88,7 @@ pub struct Grid {
     pub footer: Vec<Vec<String>>,
     pub(crate) spill_followers: HashMap<CellAddr, String>,
     pub(crate) spill_errors: HashMap<CellAddr, &'static str>,
+    pub(crate) volatile_seed: u64,
 }
 
 impl Default for Grid {
@@ -111,6 +112,7 @@ impl Grid {
             footer: Vec::new(),
             spill_followers: HashMap::new(),
             spill_errors: HashMap::new(),
+            volatile_seed: 0,
         };
         g.resize_header_footer_width();
         g
@@ -609,6 +611,10 @@ impl Grid {
 
     pub(crate) fn set_spill_error(&mut self, addr: CellAddr, err: &'static str) {
         self.spill_errors.insert(addr, err);
+    }
+
+    pub(crate) fn bump_volatile_seed(&mut self) {
+        self.volatile_seed = self.volatile_seed.wrapping_add(1);
     }
 
     pub fn move_main_rows(&mut self, from: usize, count: usize, to: usize) {

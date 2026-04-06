@@ -158,6 +158,7 @@ pub struct WorkbookSnapshot {
     pub next_sheet_id: u32,
     pub active_sheet_id: u32,
     pub sheets: Vec<SheetRecord>,
+    pub volatile_seed: u64,
 }
 
 impl WorkbookSnapshot {
@@ -166,6 +167,7 @@ impl WorkbookSnapshot {
             next_sheet_id: workbook.next_sheet_id,
             active_sheet_id: workbook.sheet_id(workbook.active_sheet),
             sheets: workbook.sheets.clone(),
+            volatile_seed: workbook.active_sheet().grid.volatile_seed,
         }
     }
 }
@@ -175,6 +177,7 @@ impl Op {
         match self {
             Op::SetCell { addr, value } => {
                 state.grid.set(addr, value.clone());
+                state.grid.bump_volatile_seed();
             }
             Op::SetMainSize {
                 main_rows,
@@ -183,16 +186,19 @@ impl Op {
                 state
                     .grid
                     .set_main_size(*main_rows as usize, *main_cols as usize);
+                state.grid.bump_volatile_seed();
             }
             Op::MoveRowRange { from, count, to } => {
                 state
                     .grid
                     .move_main_rows(*from as usize, *count as usize, *to as usize);
+                state.grid.bump_volatile_seed();
             }
             Op::MoveColRange { from, count, to } => {
                 state
                     .grid
                     .move_main_cols(*from as usize, *count as usize, *to as usize);
+                state.grid.bump_volatile_seed();
             }
             Op::SetMaxColWidth { width } => {
                 state.grid.set_max_col_width(*width);
@@ -448,6 +454,7 @@ pub fn apply_workbook_op(
                 .sheet_mut_by_id(sheet_id)
                 .ok_or_else(|| bad("unknown sheet id"))?;
             op.apply(sheet);
+            sheet.grid.bump_volatile_seed();
             Ok(())
         }
     }

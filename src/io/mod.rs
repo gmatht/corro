@@ -35,6 +35,10 @@ pub fn save_workbook(path: &Path, workbook: &WorkbookSnapshot) -> Result<(), IoE
     ));
     for sheet in &workbook.sheets {
         out.push_str(&format!("SHEET {} {}\n", sheet.id, sheet.title));
+        out.push_str(&format!(
+            "VOLATILE_SEED {}\n",
+            sheet.state.grid.volatile_seed
+        ));
         for row in 0..sheet.state.grid.main_rows() {
             for col in 0..sheet.state.grid.main_cols() {
                 let addr = CellAddr::Main {
@@ -136,6 +140,17 @@ pub fn load_workbook_snapshot(path: &Path) -> Result<WorkbookSnapshot, IoError> 
                     state: SheetState::new(1, 1),
                 });
             }
+            Some("VOLATILE_SEED") => {
+                if let Some(sheet) = current.as_mut() {
+                    let seed = parts
+                        .next()
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .ok_or_else(|| {
+                            std::io::Error::new(std::io::ErrorKind::InvalidData, "bad seed line")
+                        })?;
+                    sheet.state.grid.volatile_seed = seed;
+                }
+            }
             Some("END_SHEET") => {
                 if let Some(sheet) = current.take() {
                     sheets.push(sheet);
@@ -161,6 +176,7 @@ pub fn load_workbook_snapshot(path: &Path) -> Result<WorkbookSnapshot, IoError> 
         next_sheet_id,
         active_sheet_id,
         sheets,
+        volatile_seed: 0,
     })
 }
 
@@ -546,6 +562,7 @@ mod tests {
         let mut workbook = WorkbookSnapshot {
             next_sheet_id: 3,
             active_sheet_id: 2,
+            volatile_seed: 0,
             sheets: vec![
                 SheetRecord {
                     id: 1,
