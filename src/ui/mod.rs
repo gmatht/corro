@@ -4938,7 +4938,22 @@ mod tests {
                 .collect::<String>()
         };
 
-        assert!((0..buffer.area.height).any(|y| row(y).contains("=π")));
+        assert!(row(1).contains("π"));
+
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "=2*π".into());
+        let backend = TestBackend::new(40, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = |y: u16| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+
+        assert!(row(1).contains("6.283"));
     }
 
     #[test]
@@ -5987,11 +6002,18 @@ fn input_line(
 
 fn formula_bar_value(grid: &Grid, addr: &CellAddr) -> String {
     let raw = cell_display(grid, addr);
-    if raw.is_empty() {
-        cell_effective_display(grid, addr)
-    } else {
-        raw
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
     }
+    if let Some(expr) = trimmed.strip_prefix('=') {
+        let expr = expr.trim();
+        if matches!(expr, "π" | "e" | "c") {
+            return expr.to_string();
+        }
+        return cell_effective_display(grid, addr);
+    }
+    raw
 }
 
 fn truncate_with_ellipsis(text: &str, width: usize) -> String {
