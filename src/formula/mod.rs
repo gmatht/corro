@@ -59,8 +59,37 @@ pub const EVAL_BUDGET_AGG: usize = 1_000_000;
 pub enum EvalResult {
     Number(f64),
     Text(String),
+    Array(Vec<Vec<EvalResult>>),
     /// Display as `#msg` in the UI.
     Error(&'static str),
+}
+
+impl EvalResult {
+    pub(crate) fn scalar_coerce(self) -> EvalResult {
+        match self {
+            EvalResult::Array(rows) => rows
+                .into_iter()
+                .next()
+                .and_then(|row| row.into_iter().next())
+                .unwrap_or(EvalResult::Error("CALC"))
+                .scalar_coerce(),
+            other => other,
+        }
+    }
+
+    fn top_left(&self) -> Option<&EvalResult> {
+        match self {
+            EvalResult::Array(rows) => rows.first().and_then(|row| row.first()),
+            _ => Some(self),
+        }
+    }
+
+    fn as_text(&self) -> Option<&str> {
+        match self {
+            EvalResult::Text(s) => Some(s.as_str()),
+            _ => None,
+        }
+    }
 }
 
 fn parse_number_literal(s: &str) -> Option<f64> {
@@ -205,6 +234,7 @@ fn eval_cell_with_sheet(
     sheet_id: u32,
     addr: &CellAddr,
     visiting: &mut Vec<(u32, CellAddr)>,
+    bindings: &mut Vec<(String, EvalResult)>,
     budget: &mut usize,
     allow_templates: bool,
 ) -> EvalResult {
@@ -228,7 +258,14 @@ fn eval_cell_with_sheet(
         return EvalResult::Error("CIRC");
     }
     visiting.push((sheet_id, addr.clone()));
-    let r = eval_expr_str(&t[1..], grid, &mut Vec::new(), budget, allow_templates);
+    let r = eval_expr_str(
+        &t[1..],
+        grid,
+        &mut Vec::new(),
+        bindings,
+        budget,
+        allow_templates,
+    );
     visiting.pop();
     r
 }
@@ -247,7 +284,14 @@ fn eval_cell_inner(
 
     if allow_templates {
         if let Some(formula) = templated_formula(grid, addr) {
-            return eval_expr_str(&formula[1..], grid, visiting, budget, false);
+            return eval_expr_str(
+                &formula[1..],
+                grid,
+                visiting,
+                &mut Vec::new(),
+                budget,
+                false,
+            );
         }
     }
 
@@ -265,7 +309,7 @@ fn eval_cell_inner(
     }
 
     if let Some(expr) = control_formula_expr(grid, addr) {
-        return eval_expr_str(&expr, grid, visiting, budget, false);
+        return eval_expr_str(&expr, grid, visiting, &mut Vec::new(), budget, false);
     }
 
     if visiting.iter().any(|a| a == addr) {
@@ -273,7 +317,7 @@ fn eval_cell_inner(
     }
 
     visiting.push(addr.clone());
-    let r = eval_expr_str(&t[1..], grid, visiting, budget, false);
+    let r = eval_expr_str(&t[1..], grid, visiting, &mut Vec::new(), budget, false);
     visiting.pop();
     r
 }
@@ -282,6 +326,7 @@ fn eval_expr_str(
     expr: &str,
     grid: &Grid,
     visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
     budget: &mut usize,
     allow_templates: bool,
 ) -> EvalResult {
@@ -297,12 +342,14 @@ fn eval_expr_str(
     if p.i != p.s.len() {
         return EvalResult::Error("PARSE");
     }
-    eval_ast(&ast, grid, visiting, budget, allow_templates)
+    eval_ast(&ast, grid, visiting, bindings, budget, allow_templates)
 }
 
 #[derive(Clone, Debug)]
 enum Ast {
     Number(f64),
+    Text(String),
+    Name(String),
     Ref(CellAddr),
     SheetRef {
         sheet_id: u32,
@@ -413,6 +460,25 @@ impl<'a> Parser<'a> {
         self.skip_ws();
         let b = self.peek().ok_or(())?;
 
+        if b == b'"' {
+            self.i += 1;
+            let mut out = String::new();
+            while let Some(ch) = self.peek() {
+                self.i += 1;
+                if ch == b'"' {
+                    if self.peek() == Some(b'"') {
+                        out.push('"');
+                        self.i += 1;
+                    } else {
+                        return Ok(Ast::Text(out));
+                    }
+                } else {
+                    out.push(ch as char);
+                }
+            }
+            return Err(());
+        }
+
         if b == b'(' {
             self.i += 1;
             let e = self.parse_expr()?;
@@ -479,24 +545,24 @@ impl<'a> Parser<'a> {
             return Ok(Ast::Ref(addr));
         }
 
-        // Letter: A1:B2, sum( … ), or A1
-        if b.is_ascii_alphabetic() {
-            let rest = &self.s[self.i..];
-            if let Some((range, len)) = parse_main_range_at(rest) {
-                self.i += len;
-                return Ok(Ast::Range(range));
-            }
+        // Letter: A1:B2, sum( … ), A1, or bare name.
+        if b.is_ascii_alphabetic() || b == b'_' {
             let start = self.i;
             while self
                 .peek()
-                .map(|x| x.is_ascii_alphabetic())
+                .map(|x| x.is_ascii_alphanumeric() || x == b'_')
                 .unwrap_or(false)
             {
                 self.i += 1;
             }
-            let letters = &self.s[start..self.i];
+            let token = &self.s[start..self.i];
+            let rest = &self.s[start..];
+            if let Some((range, len)) = parse_main_range_at(rest) {
+                self.i = start + len;
+                return Ok(Ast::Range(range));
+            }
             if self.peek() == Some(b'(') {
-                let name = letters.to_string();
+                let name = token.to_string();
                 self.i += 1;
                 let inner_end = self.scan_balanced_from(self.i)?;
                 let inner = &self.s[self.i..inner_end];
@@ -516,10 +582,11 @@ impl<'a> Parser<'a> {
                     args: arg_asts,
                 });
             }
-            self.i = start;
-            let (addr, len) = parse_cell_ref_at(&self.s[self.i..]).ok_or(())?;
-            self.i += len;
-            return Ok(Ast::Ref(addr));
+            if let Some((addr, len)) = parse_cell_ref_at(rest) {
+                self.i = start + len;
+                return Ok(Ast::Ref(addr));
+            }
+            return Ok(Ast::Name(token.to_string()));
         }
 
         Err(())
@@ -542,10 +609,18 @@ impl<'a> Parser<'a> {
         let bytes = self.s.as_bytes();
         let mut depth = 1usize;
         let mut i = from;
+        let mut in_string = false;
         while i < bytes.len() {
             match bytes[i] {
-                b'(' => depth += 1,
-                b')' => {
+                b'"' => {
+                    if in_string && i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                        i += 1;
+                    } else {
+                        in_string = !in_string;
+                    }
+                }
+                b'(' if !in_string => depth += 1,
+                b')' if !in_string => {
                     depth -= 1;
                     if depth == 0 {
                         return Ok(i);
@@ -577,11 +652,19 @@ fn split_top_level_args(s: &str) -> Result<Vec<&str>, ()> {
     let mut depth = 0i32;
     let mut start = 0usize;
     let mut out = Vec::new();
+    let mut in_string = false;
     for (i, c) in s.char_indices() {
         match c {
-            '(' => depth += 1,
-            ')' => depth -= 1,
-            ',' if depth == 0 => {
+            '"' => {
+                if in_string {
+                    in_string = false;
+                } else {
+                    in_string = true;
+                }
+            }
+            '(' if !in_string => depth += 1,
+            ')' if !in_string => depth -= 1,
+            ',' if depth == 0 && !in_string => {
                 out.push(s[start..i].trim());
                 start = i + c.len_utf8();
             }
@@ -599,55 +682,115 @@ fn eval_ast(
     ast: &Ast,
     grid: &Grid,
     visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
     budget: &mut usize,
     allow_templates: bool,
 ) -> EvalResult {
     match ast {
         Ast::Number(n) => EvalResult::Number(*n),
+        Ast::Text(s) => EvalResult::Text(s.clone()),
+        Ast::Name(name) => bindings
+            .iter()
+            .rev()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.clone())
+            .unwrap_or(EvalResult::Error("NAME")),
         Ast::Ref(addr) => eval_cell_inner(grid, addr, visiting, budget, allow_templates),
         Ast::SheetRef { sheet_id, addr } => {
             let Some(sheet_grid) = workbook_lookup(*sheet_id) else {
                 return EvalResult::Error("SHEET");
             };
             let mut sheet_visiting: Vec<(u32, CellAddr)> = Vec::new();
+            let mut sheet_bindings: Vec<(String, EvalResult)> = Vec::new();
             eval_cell_with_sheet(
                 &sheet_grid,
                 *sheet_id,
                 addr,
                 &mut sheet_visiting,
+                &mut sheet_bindings,
                 budget,
                 allow_templates,
             )
         }
         Ast::Range(_) => EvalResult::Error("RANGE"),
-        Ast::Neg(a) => match eval_ast(a, grid, visiting, budget, allow_templates) {
+        Ast::Neg(a) => match eval_ast(a, grid, visiting, bindings, budget, allow_templates) {
             EvalResult::Number(n) => EvalResult::Number(-n),
             e => e,
         },
-        Ast::Add(a, b) => eval_binary(a, b, grid, visiting, budget, allow_templates, |x, y| x + y),
-        Ast::Sub(a, b) => eval_binary(a, b, grid, visiting, budget, allow_templates, |x, y| x - y),
-        Ast::Mul(a, b) => eval_binary(a, b, grid, visiting, budget, allow_templates, |x, y| x * y),
-        Ast::Div(a, b) => eval_binary(a, b, grid, visiting, budget, allow_templates, |x, y| {
-            if y == 0.0 {
-                f64::NAN
-            } else {
-                x / y
-            }
-        }),
-        Ast::Pow(a, b) => eval_binary(a, b, grid, visiting, budget, allow_templates, |x, y| {
-            x.powf(y)
-        }),
-        Ast::Call { name, args } => {
-            functions::eval_builtin(name, args, grid, visiting, budget, allow_templates)
-        }
+        Ast::Add(a, b) => eval_binary(
+            a,
+            b,
+            grid,
+            visiting,
+            bindings,
+            budget,
+            allow_templates,
+            |x, y| x + y,
+        ),
+        Ast::Sub(a, b) => eval_binary(
+            a,
+            b,
+            grid,
+            visiting,
+            bindings,
+            budget,
+            allow_templates,
+            |x, y| x - y,
+        ),
+        Ast::Mul(a, b) => eval_binary(
+            a,
+            b,
+            grid,
+            visiting,
+            bindings,
+            budget,
+            allow_templates,
+            |x, y| x * y,
+        ),
+        Ast::Div(a, b) => eval_binary(
+            a,
+            b,
+            grid,
+            visiting,
+            bindings,
+            budget,
+            allow_templates,
+            |x, y| {
+                if y == 0.0 {
+                    f64::NAN
+                } else {
+                    x / y
+                }
+            },
+        ),
+        Ast::Pow(a, b) => eval_binary(
+            a,
+            b,
+            grid,
+            visiting,
+            bindings,
+            budget,
+            allow_templates,
+            |x, y| x.powf(y),
+        ),
+        Ast::Call { name, args } => functions::eval_builtin(
+            name,
+            args,
+            grid,
+            visiting,
+            bindings,
+            budget,
+            allow_templates,
+        ),
     }
 }
 
 fn truthy(e: EvalResult) -> bool {
-    match e {
+    match e.scalar_coerce() {
         EvalResult::Number(n) => n != 0.0 && !n.is_nan(),
         EvalResult::Text(s) => parse_number_literal(&s).map(|n| n != 0.0).unwrap_or(false),
         EvalResult::Error(_) => false,
+        EvalResult::Array(_) => false,
     }
 }
 
@@ -656,13 +799,14 @@ fn eval_binary(
     b: &Ast,
     grid: &Grid,
     visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
     budget: &mut usize,
     allow_templates: bool,
     f: fn(f64, f64) -> f64,
 ) -> EvalResult {
     let (ea, eb) = (
-        eval_ast(a, grid, visiting, budget, allow_templates),
-        eval_ast(b, grid, visiting, budget, allow_templates),
+        eval_ast(a, grid, visiting, bindings, budget, allow_templates).scalar_coerce(),
+        eval_ast(b, grid, visiting, bindings, budget, allow_templates).scalar_coerce(),
     );
     let na = match ea {
         EvalResult::Number(n) => n,
@@ -674,6 +818,7 @@ fn eval_binary(
             }
         }
         EvalResult::Error(e) => return EvalResult::Error(e),
+        EvalResult::Array(_) => return EvalResult::Error("CALC"),
     };
     let nb = match eb {
         EvalResult::Number(n) => n,
@@ -685,6 +830,7 @@ fn eval_binary(
             }
         }
         EvalResult::Error(e) => return EvalResult::Error(e),
+        EvalResult::Array(_) => return EvalResult::Error("CALC"),
     };
     EvalResult::Number(f(na, nb))
 }
@@ -709,7 +855,18 @@ fn eval_sum(
         | Ast::Mul(_, _)
         | Ast::Div(_, _)
         | Ast::Pow(_, _)
-        | Ast::SheetRef { .. } => match eval_ast(arg, grid, visiting, budget, allow_templates) {
+        | Ast::Text(_)
+        | Ast::Name(_)
+        | Ast::SheetRef { .. } => match eval_ast(
+            arg,
+            grid,
+            visiting,
+            &mut Vec::new(),
+            budget,
+            allow_templates,
+        )
+        .scalar_coerce()
+        {
             EvalResult::Number(n) => EvalResult::Number(n),
             EvalResult::Text(s) => {
                 if let Some(n) = parse_number_literal(&s) {
@@ -719,8 +876,11 @@ fn eval_sum(
                 }
             }
             EvalResult::Error(e) => EvalResult::Error(e),
+            EvalResult::Array(_) => EvalResult::Error("CALC"),
         },
         Ast::Number(n) => EvalResult::Number(*n),
+        Ast::Text(s) => EvalResult::Text(s.clone()),
+        Ast::Name(_) => EvalResult::Error("NAME"),
     }
 }
 
@@ -744,10 +904,78 @@ fn sum_main_range(
     s
 }
 
+pub fn refresh_spills(grid: &mut Grid) {
+    grid.clear_spills();
+    let anchors: Vec<(CellAddr, String)> = grid
+        .main_cells
+        .iter()
+        .map(|((row, col), value)| {
+            (
+                CellAddr::Main {
+                    row: *row,
+                    col: *col,
+                },
+                value.clone(),
+            )
+        })
+        .collect();
+    for (addr, raw) in anchors {
+        if !is_formula(&raw) {
+            continue;
+        }
+        let mut visiting = Vec::new();
+        let mut budget = DEFAULT_BUDGET;
+        if let EvalResult::Array(rows) = eval_cell(grid, &addr, &mut visiting, &mut budget) {
+            let CellAddr::Main { row: ar, col: ac } = addr else {
+                continue;
+            };
+            for (r, row) in rows.iter().enumerate() {
+                for (c, cell) in row.iter().enumerate() {
+                    if r == 0 && c == 0 {
+                        continue;
+                    }
+                    grid.set_spill_value(
+                        CellAddr::Main {
+                            row: ar + r as u32,
+                            col: ac + c as u32,
+                        },
+                        eval_result_to_string(cell),
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn eval_result_to_string(result: &EvalResult) -> String {
+    match result {
+        EvalResult::Number(n) => {
+            if n.is_nan() {
+                "#NUM!".to_string()
+            } else {
+                format!("{n}")
+            }
+        }
+        EvalResult::Text(s) => s.clone(),
+        EvalResult::Error(e) => format!("#{e}"),
+        EvalResult::Array(rows) => rows
+            .first()
+            .and_then(|row| row.first())
+            .map(eval_result_to_string)
+            .unwrap_or_else(|| "#CALC".to_string()),
+    }
+}
+
 /// Display string for a cell: evaluated formula result, or raw text.
 pub fn cell_effective_display(grid: &Grid, addr: &CellAddr) -> String {
     if let Some(label) = control_formula_label(grid, addr) {
         return label;
+    }
+    if let Some(err) = grid.spill_error(addr) {
+        return format!("#{err}");
+    }
+    if let Some(v) = grid.spill_followers.get(addr) {
+        return v.clone();
     }
     let raw = grid.get(addr).unwrap_or("");
     if templated_formula(grid, addr).is_none() && !is_formula(raw) {
@@ -765,6 +993,11 @@ pub fn cell_effective_display(grid: &Grid, addr: &CellAddr) -> String {
         }
         EvalResult::Text(s) => s,
         EvalResult::Error(e) => format!("#{e}"),
+        EvalResult::Array(rows) => rows
+            .first()
+            .and_then(|row| row.first())
+            .map(eval_result_to_string)
+            .unwrap_or_else(|| "#CALC".to_string()),
     }
 }
 
@@ -840,6 +1073,189 @@ mod tests {
             EvalResult::Number(n) => assert!((n - 7.0).abs() < 1e-9),
             e => panic!("expected 7 {:?}", e),
         }
+    }
+
+    #[test]
+    fn quoted_text_literal_parses() {
+        let mut g = Grid::new(1, 1);
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "=\"hi\"".into());
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 0 }, &mut v, &mut b) {
+            EvalResult::Text(s) => assert_eq!(s, "hi"),
+            e => panic!("expected text {:?}", e),
+        }
+    }
+
+    #[test]
+    fn quoted_text_escape_parses() {
+        let mut g = Grid::new(1, 1);
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "=\"a\"\"b\"".into());
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 0 }, &mut v, &mut b) {
+            EvalResult::Text(s) => assert_eq!(s, "a\"b"),
+            e => panic!("expected escaped text {:?}", e),
+        }
+    }
+
+    #[test]
+    fn let_binds_names() {
+        let mut g = Grid::new(1, 1);
+        g.set(
+            &CellAddr::Main { row: 0, col: 0 },
+            "=LET(x, 2, y, x + 3, x + y)".into(),
+        );
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 0 }, &mut v, &mut b) {
+            EvalResult::Number(n) => assert!((n - 7.0).abs() < 1e-9),
+            e => panic!("expected 7 {:?}", e),
+        }
+    }
+
+    #[test]
+    fn let_supports_shadowing() {
+        let mut g = Grid::new(1, 1);
+        g.set(
+            &CellAddr::Main { row: 0, col: 0 },
+            "=LET(x, 1, x, x + 2, x)".into(),
+        );
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 0 }, &mut v, &mut b) {
+            EvalResult::Number(n) => assert!((n - 3.0).abs() < 1e-9),
+            e => panic!("expected 3 {:?}", e),
+        }
+    }
+
+    #[test]
+    fn bare_name_is_parse_error_outside_let() {
+        let mut p = Parser { s: "x", i: 0 };
+        assert!(p.parse_expr().is_ok());
+        let mut g = Grid::new(1, 1);
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "=x".into());
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 0 }, &mut v, &mut b) {
+            EvalResult::Error(e) => assert_eq!(e, "NAME"),
+            e => panic!("expected NAME {:?}", e),
+        }
+    }
+
+    #[test]
+    fn countif_quoted_text_criteria() {
+        let mut g = Grid::new(1, 3);
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "a".into());
+        g.set(&CellAddr::Main { row: 0, col: 1 }, "b".into());
+        g.set(
+            &CellAddr::Main { row: 0, col: 2 },
+            "=COUNTIF(A1:C1,\"a\")".into(),
+        );
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 2 }, &mut v, &mut b) {
+            EvalResult::Number(n) => assert!((n - 1.0).abs() < 1e-9),
+            e => panic!("expected 1 {:?}", e),
+        }
+    }
+
+    #[test]
+    fn xlookup_exact_match() {
+        let mut g = Grid::new(1, 5);
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "b".into());
+        g.set(&CellAddr::Main { row: 0, col: 1 }, "a".into());
+        g.set(&CellAddr::Main { row: 0, col: 2 }, "20".into());
+        g.set(&CellAddr::Main { row: 0, col: 3 }, "30".into());
+        g.set(
+            &CellAddr::Main { row: 0, col: 4 },
+            "=XLOOKUP(\"a\", A1:B1, C1:D1)".into(),
+        );
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 4 }, &mut v, &mut b) {
+            EvalResult::Number(n) => assert!((n - 30.0).abs() < 1e-9),
+            e => panic!("expected 30 {:?}", e),
+        }
+    }
+
+    #[test]
+    fn xlookup_if_not_found() {
+        let mut g = Grid::new(1, 4);
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "a".into());
+        g.set(&CellAddr::Main { row: 0, col: 1 }, "10".into());
+        g.set(&CellAddr::Main { row: 0, col: 2 }, "30".into());
+        g.set(
+            &CellAddr::Main { row: 0, col: 3 },
+            "=XLOOKUP(\"z\", A1:A1, B1:B1, \"missing\")".into(),
+        );
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 3 }, &mut v, &mut b) {
+            EvalResult::Text(s) => assert_eq!(s, "missing"),
+            e => panic!("expected missing {:?}", e),
+        }
+    }
+
+    #[test]
+    fn sequence_spills() {
+        let mut g = Grid::new(1, 1);
+        g.set(
+            &CellAddr::Main { row: 0, col: 0 },
+            "=SEQUENCE(2,2,1,1)".into(),
+        );
+        refresh_spills(&mut g);
+        assert_eq!(
+            cell_effective_display(&g, &CellAddr::Main { row: 0, col: 0 }),
+            "1"
+        );
+        assert_eq!(
+            cell_effective_display(&g, &CellAddr::Main { row: 0, col: 1 }),
+            "2"
+        );
+        assert_eq!(
+            cell_effective_display(&g, &CellAddr::Main { row: 1, col: 0 }),
+            "3"
+        );
+        assert_eq!(
+            cell_effective_display(&g, &CellAddr::Main { row: 1, col: 1 }),
+            "4"
+        );
+    }
+
+    #[test]
+    fn unique_deduplicates() {
+        let mut g = Grid::new(1, 4);
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "a".into());
+        g.set(&CellAddr::Main { row: 0, col: 1 }, "a".into());
+        g.set(&CellAddr::Main { row: 0, col: 2 }, "b".into());
+        g.set(&CellAddr::Main { row: 0, col: 3 }, "=UNIQUE(A1:C1)".into());
+        refresh_spills(&mut g);
+        assert_eq!(
+            cell_effective_display(&g, &CellAddr::Main { row: 0, col: 3 }),
+            "a"
+        );
+        assert_eq!(
+            cell_effective_display(&g, &CellAddr::Main { row: 1, col: 3 }),
+            "b"
+        );
+    }
+
+    #[test]
+    fn filter_applies_mask() {
+        let mut g = Grid::new(1, 4);
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "a".into());
+        g.set(&CellAddr::Main { row: 0, col: 1 }, "b".into());
+        g.set(&CellAddr::Main { row: 0, col: 2 }, "1".into());
+        g.set(
+            &CellAddr::Main { row: 0, col: 3 },
+            "=FILTER(A1:B1, C1:D1)".into(),
+        );
+        refresh_spills(&mut g);
+        assert_eq!(
+            cell_effective_display(&g, &CellAddr::Main { row: 0, col: 3 }),
+            "a"
+        );
     }
 
     #[test]

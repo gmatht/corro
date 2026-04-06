@@ -2398,6 +2398,7 @@ impl App {
     }
 
     fn do_export(&mut self, csv: bool) -> String {
+        crate::formula::refresh_spills(&mut self.state.grid);
         let mut buf = Vec::new();
         if csv {
             export::export_csv(&self.state.grid, &mut buf);
@@ -2420,18 +2421,21 @@ impl App {
     }
 
     fn do_export_ascii(&mut self) -> String {
+        crate::formula::refresh_spills(&mut self.state.grid);
         let mut buf = Vec::new();
         export::export_ascii_table(&self.state.grid, &mut buf);
         String::from_utf8_lossy(&buf).into_owned()
     }
 
     fn do_export_all(&mut self) -> String {
+        crate::formula::refresh_spills(&mut self.state.grid);
         let mut buf = Vec::new();
         export::export_all(&self.state.grid, &mut buf);
         String::from_utf8_lossy(&buf).into_owned()
     }
 
     fn do_export_odt(&mut self) -> Vec<u8> {
+        crate::formula::refresh_spills(&mut self.state.grid);
         export::export_odt_bytes(&self.state.grid).unwrap_or_default()
     }
 
@@ -2602,6 +2606,7 @@ impl App {
 
     fn draw(&mut self, f: &mut Frame) {
         let _ctx = crate::formula::set_eval_context(&self.workbook);
+        crate::formula::refresh_spills(&mut self.state.grid);
         let special_picker = self.special_picker;
         let has_tabs = self.workbook.sheet_count() > 1;
         let constraints = vec![
@@ -5658,7 +5663,7 @@ mod tests {
             "│  10                     │                        0                   0                   0                                               │\n",
             "│  11                     │           0            0                   0                   0                                               │\n",
             "│  12                     │[A          #VALUE                                                                                              │\n",
-            "│  13                     │#PARSE      #PARSE                                                                                              │\n",
+            "│  13                     │#NAME       #NAME                                                                                               │\n",
             "│     ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────│\n",
             "│  _1                     │                                                                                                                │\n",
             "│  _2 TOTAL               │          27           54                  81                  54                                               │\n",

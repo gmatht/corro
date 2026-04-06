@@ -86,6 +86,8 @@ pub struct Grid {
     pub view_sort_cols: Vec<SortSpec>,
     pub header: Vec<Vec<String>>,
     pub footer: Vec<Vec<String>>,
+    pub(crate) spill_followers: HashMap<CellAddr, String>,
+    pub(crate) spill_errors: HashMap<CellAddr, &'static str>,
 }
 
 impl Default for Grid {
@@ -107,6 +109,8 @@ impl Grid {
             view_sort_cols: Vec::new(),
             header: Vec::new(),
             footer: Vec::new(),
+            spill_followers: HashMap::new(),
+            spill_errors: HashMap::new(),
         };
         g.resize_header_footer_width();
         g
@@ -502,6 +506,9 @@ impl Grid {
     }
 
     pub fn get(&self, addr: &CellAddr) -> Option<&str> {
+        if let Some(v) = self.spill_followers.get(addr) {
+            return Some(v.as_str());
+        }
         match addr {
             CellAddr::Header { row, col } => {
                 let r = *row as usize;
@@ -523,6 +530,10 @@ impl Grid {
             CellAddr::Left { col, row } => self.left.get(&(*row, *col)).map(|s| s.as_str()),
             CellAddr::Right { col, row } => self.right.get(&(*row, *col)).map(|s| s.as_str()),
         }
+    }
+
+    pub(crate) fn spill_error(&self, addr: &CellAddr) -> Option<&'static str> {
+        self.spill_errors.get(addr).copied()
     }
 
     pub fn set(&mut self, addr: &CellAddr, value: String) {
@@ -585,6 +596,19 @@ impl Grid {
                 }
             }
         }
+    }
+
+    pub(crate) fn clear_spills(&mut self) {
+        self.spill_followers.clear();
+        self.spill_errors.clear();
+    }
+
+    pub(crate) fn set_spill_value(&mut self, addr: CellAddr, value: String) {
+        self.spill_followers.insert(addr, value);
+    }
+
+    pub(crate) fn set_spill_error(&mut self, addr: CellAddr, err: &'static str) {
+        self.spill_errors.insert(addr, err);
     }
 
     pub fn move_main_rows(&mut self, from: usize, count: usize, to: usize) {
