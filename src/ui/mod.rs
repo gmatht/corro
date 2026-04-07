@@ -711,30 +711,11 @@ impl App {
                     self.status = "Nothing to cut".into();
                 } else {
                     let data = self.selection_tsv_text();
-                    match copy_to_clipboard(&data) {
-                        Ok(()) => {
-                            let op = Op::FillRange {
-                                cells: cells.clone(),
-                            };
-                            self.push_inverse_op(&op);
-                            if let Some(ref p) = self.path.clone() {
-                                let mut active_sheet = self.view_sheet_id;
-                                let _ = commit_workbook_op(
-                                    p,
-                                    &mut self.offset,
-                                    &mut self.workbook,
-                                    &mut active_sheet,
-                                    &crate::ops::WorkbookOp::SheetOp {
-                                        sheet_id: self.view_sheet_id,
-                                        op,
-                                    },
-                                );
-                                self.ops_applied = self.ops_applied.saturating_add(1);
-                                self.sync_active_sheet_cache();
-                                let _ = self.start_log_watcher_if_needed();
-                            } else {
-                                op.apply(&mut self.state);
-                            }
+                    let op = Op::FillRange {
+                        cells: cells.clone(),
+                    };
+                    if self.copy_selection_to_clipboard(&data) {
+                        if self.apply_single_op(op).is_ok() {
                             for (addr, _) in cells {
                                 if let CellAddr::Main { col, .. } = addr {
                                     self.state.grid.auto_fit_column(MARGIN_COLS + col as usize);
@@ -742,20 +723,21 @@ impl App {
                             }
                             self.status = "Selection cut".into();
                         }
-                        Err(e) => self.status = format!("Clipboard error: {e}"),
                     }
                 }
                 Mode::Normal
             }
             MenuAction::Copy => {
                 let data = self.selection_tsv_text();
-                match copy_to_clipboard(&data) {
-                    Ok(()) => self.status = "Selection copied to clipboard".into(),
-                    Err(e) => self.status = format!("Clipboard error: {e}"),
+                self.copy_selection_to_clipboard(&data);
+                Mode::Normal
+            }
+            MenuAction::Paste => {
+                if let Err(e) = self.paste_from_clipboard(true) {
+                    self.status = format!("Clipboard error: {e}");
                 }
                 Mode::Normal
             }
-            MenuAction::Paste => Mode::Normal,
             MenuAction::Find => Mode::Find {
                 buffer: self.start_input_mode(String::new()),
             },
@@ -3133,11 +3115,51 @@ impl App {
         out
     }
 
-    fn apply_pasted_tsv(&mut self, text: &str, preserve_formulas: bool) -> Result<(), RunError> {
+    fn copy_selection_to_clipboard(&mut self, data: &str) -> bool {
+        match copy_to_clipboard(data) {
+            Ok(()) => {
+                self.status = "Selection copied to clipboard".into();
+                true
+            }
+            Err(e) => {
+                self.status = format!("Clipboard error: {e}");
+                false
+            }
+        }
+    }
+
+    fn apply_single_op(&mut self, op: Op) -> Result<(), RunError> {
+        self.push_inverse_op(&op);
+        if let Some(ref p) = self.path.clone() {
+            let mut active_sheet = self.view_sheet_id;
+            commit_workbook_op(
+                p,
+                &mut self.offset,
+                &mut self.workbook,
+                &mut active_sheet,
+                &crate::ops::WorkbookOp::SheetOp {
+                    sheet_id: self.view_sheet_id,
+                    op,
+                },
+            )?;
+            self.ops_applied = self.ops_applied.saturating_add(1);
+            self.sync_active_sheet_cache();
+            self.start_log_watcher_if_needed()?;
+        } else {
+            op.apply(&mut self.state);
+        }
+        Ok(())
+    }
+
+    fn parse_pasted_tsv_cells(
+        text: &str,
+        start: SheetCursor,
+        preserve_formulas: bool,
+        state: &SheetState,
+    ) -> Vec<(CellAddr, String)> {
         let rows: Vec<&str> = text.lines().collect();
         if rows.is_empty() {
-            self.status = "Clipboard is empty".into();
-            return Ok(());
+            return Vec::new();
         }
         let row_count = rows.len();
         let col_count = rows
@@ -3146,73 +3168,66 @@ impl App {
             .max()
             .unwrap_or(0);
         if col_count == 0 {
-            self.status = "Clipboard is empty".into();
-            return Ok(());
+            return Vec::new();
         }
 
-        let start_row = self.cursor.row;
-        let start_col = self.cursor.col;
-        let needed_rows = start_row.saturating_sub(HEADER_ROWS) + row_count;
-        let needed_cols = start_col.saturating_sub(MARGIN_COLS) + col_count;
-        if needed_rows > self.state.grid.main_rows() || needed_cols > self.state.grid.main_cols() {
-            self.state.grid.set_main_size(
-                self.state.grid.main_rows().max(needed_rows),
-                self.state.grid.main_cols().max(needed_cols),
+        let needed_rows = start.row.saturating_sub(HEADER_ROWS) + row_count;
+        let needed_cols = start.col.saturating_sub(MARGIN_COLS) + col_count;
+        let mut grid = state.grid.clone();
+        if needed_rows > grid.main_rows() || needed_cols > grid.main_cols() {
+            grid.set_main_size(
+                grid.main_rows().max(needed_rows),
+                grid.main_cols().max(needed_cols),
             );
         }
 
-        let mut did_any = false;
+        let mut cells = Vec::new();
         for (r_off, line) in rows.iter().enumerate() {
             for (c_off, value) in line.split('\t').enumerate() {
-                let row = start_row.saturating_add(r_off);
-                let col = start_col.saturating_add(c_off);
-                if let Some(addr) = self.addr_at(row, col) {
-                    let mut value = value.to_string();
-                    if !preserve_formulas && value.trim_start().starts_with('=') {
-                        value = value.trim_start_matches('=').to_string();
-                    }
-                    let op = Op::SetCell {
-                        addr: addr.clone(),
-                        value,
-                    };
-                    self.push_inverse_op(&op);
-                    if let Some(ref p) = self.path.clone() {
-                        let mut active_sheet = self.view_sheet_id;
-                        commit_workbook_op(
-                            p,
-                            &mut self.offset,
-                            &mut self.workbook,
-                            &mut active_sheet,
-                            &crate::ops::WorkbookOp::SheetOp {
-                                sheet_id: self.view_sheet_id,
-                                op,
-                            },
-                        )?;
-                        self.ops_applied = self.ops_applied.saturating_add(1);
-                        self.sync_active_sheet_cache();
-                        self.start_log_watcher_if_needed()?;
-                    } else {
-                        op.apply(&mut self.state);
-                    }
-                    did_any = true;
+                let row = start.row.saturating_add(r_off);
+                let col = start.col.saturating_add(c_off);
+                let addr = SheetCursor { row, col }.to_addr(&grid);
+                if row >= HEADER_ROWS + grid.main_rows() + FOOTER_ROWS || col >= grid.total_cols() {
+                    continue;
                 }
+                let mut value = value.to_string();
+                if !preserve_formulas && value.trim_start().starts_with('=') {
+                    value = value.trim_start_matches('=').to_string();
+                }
+                cells.push((addr, value));
             }
         }
-        self.status = if did_any {
-            if preserve_formulas {
-                "Clipboard pasted".into()
-            } else {
-                "Clipboard pasted as values".into()
-            }
+        cells
+    }
+
+    fn paste_pasted_tsv_cells(
+        &mut self,
+        cells: Vec<(CellAddr, String)>,
+        preserve_formulas: bool,
+    ) -> Result<(), RunError> {
+        if cells.is_empty() {
+            self.status = "Clipboard paste produced no cells".into();
+            return Ok(());
+        }
+        self.apply_single_op(Op::FillRange { cells })?;
+        self.status = if preserve_formulas {
+            "Clipboard pasted".into()
         } else {
-            "Clipboard paste produced no cells".into()
+            "Clipboard pasted as values".into()
         };
         Ok(())
     }
 
+    fn apply_pasted_tsv(&mut self, text: &str, preserve_formulas: bool) -> Result<(), RunError> {
+        let cells = Self::parse_pasted_tsv_cells(text, self.cursor, preserve_formulas, &self.state);
+        self.paste_pasted_tsv_cells(cells, preserve_formulas)
+    }
+
     fn paste_from_clipboard(&mut self, preserve_formulas: bool) -> Result<(), RunError> {
         let text = read_clipboard().map_err(io::Error::other)?;
-        self.apply_pasted_tsv(&text, preserve_formulas)
+        let cells =
+            Self::parse_pasted_tsv_cells(&text, self.cursor, preserve_formulas, &self.state);
+        self.paste_pasted_tsv_cells(cells, preserve_formulas)
     }
 
     fn finish_export(&mut self, csv: bool, filename: &str) {
@@ -4179,10 +4194,7 @@ impl App {
                 && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
             {
                 let data = self.selection_tsv_text();
-                match copy_to_clipboard(&data) {
-                    Ok(()) => self.status = "Selection copied to clipboard".into(),
-                    Err(e) => self.status = format!("Clipboard error: {e}"),
-                }
+                self.copy_selection_to_clipboard(&data);
                 return Ok(false);
             }
 
@@ -6877,6 +6889,68 @@ mod tests {
     }
 
     #[test]
+    fn edit_menu_copy_copies_selected_cells() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 1);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "copy me".into());
+        app.anchor = Some(SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        });
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        };
+        app.mode = Mode::Menu {
+            stack: vec![MenuLevel {
+                section: MenuSection::Edit,
+                item: 1,
+            }],
+        };
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .unwrap();
+
+        assert_eq!(test_clipboard_text().as_deref(), Some("copy me\n"));
+    }
+
+    #[test]
+    fn ctrl_c_and_edit_menu_copy_share_clipboard_output() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 1);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "shared".into());
+        app.anchor = Some(SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        });
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        };
+
+        app.mode = Mode::Normal;
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+            .unwrap();
+        let ctrl_copy = test_clipboard_text().unwrap();
+
+        set_test_clipboard(None);
+        app.mode = Mode::Menu {
+            stack: vec![MenuLevel {
+                section: MenuSection::Edit,
+                item: 1,
+            }],
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .unwrap();
+
+        assert_eq!(ctrl_copy, test_clipboard_text().unwrap());
+    }
+
+    #[test]
     fn ctrl_v_pastes_tsv_cells() {
         let mut app = App::new(None);
         app.state.grid.set_main_size(1, 1);
@@ -6887,6 +6961,66 @@ mod tests {
 
         set_test_clipboard(Some("x\ty\n1\t2\n".into()));
         app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL))
+            .unwrap();
+
+        assert_eq!(app.state.grid.main_rows(), 2);
+        assert_eq!(app.state.grid.main_cols(), 2);
+        assert_eq!(
+            app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }),
+            Some("x")
+        );
+        assert_eq!(
+            app.state.grid.get(&CellAddr::Main { row: 0, col: 1 }),
+            Some("y")
+        );
+        assert_eq!(
+            app.state.grid.get(&CellAddr::Main { row: 1, col: 0 }),
+            Some("1")
+        );
+        assert_eq!(
+            app.state.grid.get(&CellAddr::Main { row: 1, col: 1 }),
+            Some("2")
+        );
+    }
+
+    #[test]
+    fn paste_logs_as_single_fill_op() {
+        let path = tempfile::NamedTempFile::new().unwrap();
+        let mut app = App::new(Some(path.path().to_path_buf()));
+        app.state.grid.set_main_size(1, 1);
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        };
+
+        set_test_clipboard(Some("x\ty\n1\t2\n".into()));
+        app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL))
+            .unwrap();
+
+        let log = std::fs::read_to_string(path.path()).unwrap();
+        assert!(
+            log.contains("FILL A1=x B1=y A2=1 B2=2") || log.contains("FILL A1=x B1=y C2=1 D2=2")
+        );
+        assert_eq!(app.ops_applied, 1);
+    }
+
+    #[test]
+    fn edit_menu_paste_pastes_tsv_cells() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 1);
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        };
+        app.mode = Mode::Menu {
+            stack: vec![MenuLevel {
+                section: MenuSection::Edit,
+                item: 2,
+            }],
+        };
+
+        set_test_clipboard(Some("x\ty\n1\t2\n".into()));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
             .unwrap();
 
         assert_eq!(app.state.grid.main_rows(), 2);
