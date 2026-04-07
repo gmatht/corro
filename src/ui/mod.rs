@@ -207,6 +207,12 @@ enum Mode {
     ExportOdt {
         buffer: String,
     },
+    Find {
+        buffer: String,
+    },
+    Replace {
+        buffer: String,
+    },
     SetMaxColWidth {
         buffer: String,
     },
@@ -229,6 +235,9 @@ enum Mode {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BalanceBooksFocus {
     Column,
+    ReportViewOnly,
+    ReportPersisted,
+    // Match the sign-pairing direction.
     PosToNeg,
     NegToPos,
     Generate,
@@ -239,6 +248,7 @@ const SPECIAL_VALUE_CHOICES: [&str; 10] = ["∞", "Σ", "Ω", "π", "μ", "Δ", 
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MenuSection {
+    Edit,
     File,
     Export,
     Width,
@@ -260,6 +270,11 @@ struct MenuLevel {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MenuAction {
+    Cut,
+    Copy,
+    Paste,
+    Find,
+    Replace,
     OpenFile,
     SaveAs,
     Exit,
@@ -292,6 +307,34 @@ struct MenuItem {
     label: &'static str,
     target: MenuTarget,
 }
+
+const EDIT_MENU_ITEMS: [MenuItem; 5] = [
+    MenuItem {
+        shortcut: 'X',
+        label: "Cut",
+        target: MenuTarget::Action(MenuAction::Cut),
+    },
+    MenuItem {
+        shortcut: 'C',
+        label: "Copy",
+        target: MenuTarget::Action(MenuAction::Copy),
+    },
+    MenuItem {
+        shortcut: 'P',
+        label: "Paste",
+        target: MenuTarget::Action(MenuAction::Paste),
+    },
+    MenuItem {
+        shortcut: 'F',
+        label: "Find",
+        target: MenuTarget::Action(MenuAction::Find),
+    },
+    MenuItem {
+        shortcut: 'R',
+        label: "Replace",
+        target: MenuTarget::Action(MenuAction::Replace),
+    },
+];
 
 const FILE_MENU_ITEMS: [MenuItem; 9] = [
     MenuItem {
@@ -534,6 +577,7 @@ fn footer_nonblank_end(state: &SheetState) -> Option<usize> {
 
 fn menu_items(section: MenuSection) -> &'static [MenuItem] {
     match section {
+        MenuSection::Edit => &EDIT_MENU_ITEMS,
         MenuSection::File => &FILE_MENU_ITEMS,
         MenuSection::Insert => &INSERT_ROOT_MENU_ITEMS,
         MenuSection::Export => &EXPORT_MENU_ITEMS,
@@ -544,6 +588,7 @@ fn menu_items(section: MenuSection) -> &'static [MenuItem] {
 
 fn menu_title(section: MenuSection) -> &'static str {
     match section {
+        MenuSection::Edit => "Edit",
         MenuSection::File => "File",
         MenuSection::Export => "Export",
         MenuSection::Width => "Width",
@@ -558,17 +603,19 @@ fn menu_action_item(section: MenuSection, item: usize) -> Option<MenuItem> {
 
 fn menu_next_root_section(section: MenuSection) -> MenuSection {
     match section {
-        MenuSection::File => MenuSection::Insert,
+        MenuSection::File => MenuSection::Edit,
+        MenuSection::Edit => MenuSection::Insert,
         MenuSection::Insert => MenuSection::Help,
         MenuSection::Help => MenuSection::File,
-        _ => MenuSection::Help,
+        _ => MenuSection::File,
     }
 }
 
 fn menu_prev_root_section(section: MenuSection) -> MenuSection {
     match section {
         MenuSection::File => MenuSection::Help,
-        MenuSection::Insert => MenuSection::File,
+        MenuSection::Edit => MenuSection::File,
+        MenuSection::Insert => MenuSection::Edit,
         MenuSection::Help => MenuSection::Insert,
         _ => MenuSection::File,
     }
@@ -577,6 +624,7 @@ fn menu_prev_root_section(section: MenuSection) -> MenuSection {
 fn menu_popup_area(area: Rect, section: MenuSection, parent: Option<(Rect, usize)>) -> Rect {
     let items = menu_items(section).len() as u16;
     let width = match section {
+        MenuSection::Edit => 18,
         MenuSection::File => 22,
         MenuSection::Export => 18,
         MenuSection::Width => 20,
@@ -651,6 +699,63 @@ impl App {
     fn menu_action_mode(&mut self, action: MenuAction) -> Mode {
         self.edit_special_palette = false;
         match action {
+            MenuAction::Cut => {
+                let cells = self.selection_clear_cells();
+                if cells.is_empty() {
+                    self.status = "Nothing to cut".into();
+                } else {
+                    let data = self.selection_tsv_text();
+                    match copy_to_clipboard(&data) {
+                        Ok(()) => {
+                            let op = Op::FillRange {
+                                cells: cells.clone(),
+                            };
+                            self.push_inverse_op(&op);
+                            if let Some(ref p) = self.path.clone() {
+                                let mut active_sheet = self.view_sheet_id;
+                                let _ = commit_workbook_op(
+                                    p,
+                                    &mut self.offset,
+                                    &mut self.workbook,
+                                    &mut active_sheet,
+                                    &crate::ops::WorkbookOp::SheetOp {
+                                        sheet_id: self.view_sheet_id,
+                                        op,
+                                    },
+                                );
+                                self.ops_applied = self.ops_applied.saturating_add(1);
+                                self.sync_active_sheet_cache();
+                                let _ = self.start_log_watcher_if_needed();
+                            } else {
+                                op.apply(&mut self.state);
+                            }
+                            for (addr, _) in cells {
+                                if let CellAddr::Main { col, .. } = addr {
+                                    self.state.grid.auto_fit_column(MARGIN_COLS + col as usize);
+                                }
+                            }
+                            self.status = "Selection cut".into();
+                        }
+                        Err(e) => self.status = format!("Clipboard error: {e}"),
+                    }
+                }
+                Mode::Normal
+            }
+            MenuAction::Copy => {
+                let data = self.selection_tsv_text();
+                match copy_to_clipboard(&data) {
+                    Ok(()) => self.status = "Selection copied to clipboard".into(),
+                    Err(e) => self.status = format!("Clipboard error: {e}"),
+                }
+                Mode::Normal
+            }
+            MenuAction::Paste => Mode::Normal,
+            MenuAction::Find => Mode::Find {
+                buffer: self.start_input_mode(String::new()),
+            },
+            MenuAction::Replace => Mode::Replace {
+                buffer: self.start_input_mode(String::new()),
+            },
             MenuAction::OpenFile => {
                 let buffer = self.open_path_prompt_buffer();
                 Mode::OpenPath {
@@ -725,7 +830,11 @@ impl App {
                 persist: true,
             },
             MenuAction::BalanceBooks => Mode::BalanceBooks {
-                buffer: self.start_input_mode(String::new()),
+                buffer: self.start_input_mode(
+                    balance::choose_balance_column(&self.state.grid)
+                        .map(addr::excel_column_name)
+                        .unwrap_or_default(),
+                ),
                 direction: BalanceDirection::PosToNeg,
                 persist: false,
                 focus: BalanceBooksFocus::Column,
@@ -2126,49 +2235,58 @@ impl App {
     }
 
     fn delete_selection(&mut self) -> bool {
-        let Some((rows, cols)) = self.current_selection_range() else {
+        let cells = self.selection_clear_cells();
+        if cells.is_empty() {
             return false;
+        }
+        let op = Op::FillRange {
+            cells: cells.clone(),
         };
-        let mut did_any = false;
+        self.push_inverse_op(&op);
+        if let Some(ref p) = self.path.clone() {
+            let mut active_sheet = self.view_sheet_id;
+            let _ = commit_workbook_op(
+                p,
+                &mut self.offset,
+                &mut self.workbook,
+                &mut active_sheet,
+                &crate::ops::WorkbookOp::SheetOp {
+                    sheet_id: self.view_sheet_id,
+                    op,
+                },
+            );
+            self.sync_active_sheet_cache();
+        } else {
+            op.apply(&mut self.state);
+        }
+        for (addr, _) in cells {
+            if let CellAddr::Main { col, .. } = addr {
+                self.state.grid.auto_fit_column(MARGIN_COLS + col as usize);
+            }
+        }
+        if true {
+            self.status = "Selection deleted".into();
+            self.anchor = None;
+        }
+        true
+    }
+
+    fn selection_clear_cells(&self) -> Vec<(CellAddr, String)> {
+        let Some((rows, cols)) = self.current_selection_range() else {
+            return Vec::new();
+        };
+        let mut cells = Vec::new();
         for r in rows {
             for c in cols.iter().copied() {
                 let Some(addr) = self.addr_at(r, c) else {
                     continue;
                 };
                 if self.state.grid.get(&addr).is_some_and(|v| !v.is_empty()) {
-                    let op = Op::SetCell {
-                        addr: addr.clone(),
-                        value: String::new(),
-                    };
-                    self.push_inverse_op(&op);
-                    if let Some(ref p) = self.path.clone() {
-                        let mut active_sheet = self.view_sheet_id;
-                        let _ = commit_workbook_op(
-                            p,
-                            &mut self.offset,
-                            &mut self.workbook,
-                            &mut active_sheet,
-                            &crate::ops::WorkbookOp::SheetOp {
-                                sheet_id: self.view_sheet_id,
-                                op,
-                            },
-                        );
-                        self.sync_active_sheet_cache();
-                    } else {
-                        op.apply(&mut self.state);
-                    }
-                    if let CellAddr::Main { col, .. } = addr {
-                        self.state.grid.auto_fit_column(MARGIN_COLS + col as usize);
-                    }
-                    did_any = true;
+                    cells.push((addr, String::new()));
                 }
             }
         }
-        if did_any {
-            self.status = "Selection deleted".into();
-            self.anchor = None;
-        }
-        did_any
+        cells
     }
 
     fn sync_external(&mut self) -> Result<(), IoError> {
@@ -3299,6 +3417,22 @@ impl App {
                 caret_style,
             ))
             .style(prompt_style),
+            Mode::Find { buffer } => Paragraph::new(input_line(
+                " find text: ".to_string(),
+                buffer,
+                self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
+                prompt_style,
+                caret_style,
+            ))
+            .style(prompt_style),
+            Mode::Replace { buffer } => Paragraph::new(input_line(
+                " replace text: ".to_string(),
+                buffer,
+                self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
+                prompt_style,
+                caret_style,
+            ))
+            .style(prompt_style),
             Mode::SetMaxColWidth { buffer } => Paragraph::new(input_line(
                 " max col width (default=20): ".to_string(),
                 buffer,
@@ -3767,8 +3901,10 @@ impl App {
             Mode::SortView { .. } => {
                 "  type sort columns like A,B,C   Enter·apply   Esc·cancel".into()
             }
+            Mode::Find { .. } => "  type search text   Enter·find next   Esc·cancel".into(),
+            Mode::Replace { .. } => "  type search/replace text   Enter·apply   Esc·cancel".into(),
             Mode::BalanceBooks { .. } => {
-                "  type column letter or blank for auto   d·toggle direction   v=view   r=report   Enter·run   Esc·cancel".into()
+                "  Tab/Shift+Tab·move focus   Enter/Space·select   Esc·cancel".into()
             }
             Mode::QuitPrompt => "  Q·quit   B·back   Esc·cancel".into(),
             Mode::Help => "  up/down·scroll   Esc·close   ?·help   A·about".into(),
@@ -3796,6 +3932,11 @@ impl App {
         } else {
             " File "
         };
+        let edit = if section == MenuSection::Edit {
+            "[Edit]"
+        } else {
+            " Edit "
+        };
         let insert = if section == MenuSection::Insert {
             "[Insert]"
         } else {
@@ -3816,7 +3957,7 @@ impl App {
         } else {
             String::new()
         };
-        format!(" {file}  {insert}  {help}{active}")
+        format!(" {file}  {edit}  {insert}  {help}{active}")
     }
 
     fn balance_dialog_lines(
@@ -3830,24 +3971,15 @@ impl App {
         heading_style: Style,
         caret_style: Style,
     ) -> Vec<Line<'static>> {
-        let header = format!(
-            "Column: {}    Output: {}",
-            if buffer.trim().is_empty() {
-                "auto"
-            } else {
-                buffer.trim()
-            },
-            if persist { "report sheet" } else { "view only" }
-        );
-        let pos_to_neg = match direction {
-            BalanceDirection::PosToNeg => "(X) Match +ve number with multiple -ve numbers",
-            BalanceDirection::NegToPos => "( ) Match +ve number with multiple -ve numbers",
-        };
-        let neg_to_pos = match direction {
-            BalanceDirection::NegToPos => "(X) Match -ve number with multiple +ve numbers",
-            BalanceDirection::PosToNeg => "( ) Match -ve number with multiple +ve numbers",
-        };
-        let dir_style = |selected: bool| {
+        let header = " Balance books ".to_string();
+        let column_focused = matches!(focus, BalanceBooksFocus::Column);
+        let report_view_focused = matches!(focus, BalanceBooksFocus::ReportViewOnly);
+        let report_persisted_focused = matches!(focus, BalanceBooksFocus::ReportPersisted);
+        let pos_to_neg_focused = matches!(focus, BalanceBooksFocus::PosToNeg);
+        let neg_to_pos_focused = matches!(focus, BalanceBooksFocus::NegToPos);
+        let generate_focused = matches!(focus, BalanceBooksFocus::Generate);
+        let cancel_focused = matches!(focus, BalanceBooksFocus::Cancel);
+        let selected_style = |selected: bool| {
             if selected {
                 Style::default()
                     .fg(Color::Black)
@@ -3867,6 +3999,15 @@ impl App {
                 heading_style
             }
         };
+        let checkbox_line = |label: &str, checked: bool, selected: bool| {
+            let style = selected_style(selected);
+            Line::from(vec![
+                Span::styled("  ", text_style),
+                Span::styled(if checked { "[X]" } else { "[ ]" }, style),
+                Span::styled(" ", text_style),
+                Span::styled(label.to_string(), style),
+            ])
+        };
 
         vec![
             Line::from(Span::styled(header, heading_style)),
@@ -3876,38 +4017,54 @@ impl App {
                 text_style,
             )),
             Line::from(""),
-            Line::from(Span::styled("Controls:", heading_style)),
-            Line::from(Span::styled("  Tab/Shift+Tab: move focus", text_style)),
-            Line::from(Span::styled("  Enter/Space: activate", text_style)),
-            Line::from(Span::styled("  Esc: cancel", text_style)),
+            Line::from(Span::styled("Column to Balance:", heading_style)),
+            input_line(
+                "  ".to_string(),
+                buffer,
+                cursor,
+                text_style,
+                if column_focused { caret_style } else { text_style },
+            ),
             Line::from(""),
-            Line::from(vec![
-                Span::styled("  ", text_style),
-                Span::styled(pos_to_neg, dir_style(matches!(focus, BalanceBooksFocus::PosToNeg))),
-            ]),
-            Line::from(vec![
-                Span::styled("  ", text_style),
-                Span::styled(neg_to_pos, dir_style(matches!(focus, BalanceBooksFocus::NegToPos))),
-            ]),
+            Line::from(Span::styled("Report Type:", heading_style)),
+            checkbox_line("View only", !persist, report_view_focused),
+            checkbox_line("Persisted report", persist, report_persisted_focused),
+            Line::from(""),
+            Line::from(Span::styled("Balance direction:", heading_style)),
+            checkbox_line(
+                "Match +ve number with multiple -ve numbers",
+                matches!(direction, BalanceDirection::PosToNeg),
+                pos_to_neg_focused,
+            ),
+            checkbox_line(
+                "Match -ve number with multiple +ve numbers",
+                matches!(direction, BalanceDirection::NegToPos),
+                neg_to_pos_focused,
+            ),
             Line::from(""),
             Line::from(vec![
                 Span::styled("  [ ", text_style),
-                Span::styled("Generate", button_style(matches!(focus, BalanceBooksFocus::Generate))),
+                Span::styled("Generate", button_style(generate_focused)),
                 Span::styled(" ]", text_style),
                 Span::styled("   ", text_style),
                 Span::styled("[ ", text_style),
-                Span::styled("Cancel", button_style(matches!(focus, BalanceBooksFocus::Cancel))),
+                Span::styled("Cancel", button_style(cancel_focused)),
                 Span::styled(" ]", text_style),
             ]),
-            Line::from(""),
-            Line::from(Span::styled("Input: ", heading_style)),
-            input_line(String::new(), buffer, cursor, text_style, caret_style),
         ]
     }
 
     fn cycle_balance_focus(focus: BalanceBooksFocus, backwards: bool) -> BalanceBooksFocus {
         use BalanceBooksFocus::*;
-        let order = [Column, PosToNeg, NegToPos, Generate, Cancel];
+        let order = [
+            Column,
+            ReportViewOnly,
+            ReportPersisted,
+            PosToNeg,
+            NegToPos,
+            Generate,
+            Cancel,
+        ];
         let idx = order.iter().position(|item| *item == focus).unwrap_or(0);
         let next = if backwards {
             (idx + order.len() - 1) % order.len()
@@ -3926,7 +4083,7 @@ impl App {
         let col = if buffer.trim().is_empty() {
             balance::choose_balance_column(&self.state.grid)
         } else {
-            addr::parse_excel_column(buffer.trim()).map(|c| MARGIN_COLS + c as usize)
+            addr::parse_excel_column(buffer.trim()).map(|c| c as usize)
         };
         let Some(col) = col else {
             self.status = "No balance column found".into();
@@ -4027,6 +4184,14 @@ impl App {
                 && matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V'))
             {
                 self.paste_from_clipboard(!shift)?;
+                return Ok(false);
+            }
+
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && shift
+                && matches!(key.code, KeyCode::Char('p') | KeyCode::Char('P'))
+            {
+                self.paste_from_clipboard(true)?;
                 return Ok(false);
             }
         }
@@ -4223,10 +4388,14 @@ impl App {
                         return Ok(false);
                     }
                     'e' | 'E' => {
-                        self.open_menu_path(vec![MenuLevel {
-                            section: MenuSection::Export,
-                            item: 3,
-                        }]);
+                        if shift {
+                            self.open_menu_path(vec![MenuLevel {
+                                section: MenuSection::Export,
+                                item: 3,
+                            }]);
+                        } else {
+                            self.open_menu(MenuSection::Edit);
+                        }
                         return Ok(false);
                     }
                     'i' | 'I' => {
@@ -4391,6 +4560,20 @@ impl App {
                 _ => {}
             },
             Mode::Menu { .. } => {}
+            Mode::Replace { buffer } => match key.code {
+                KeyCode::Enter => {
+                    self.status = format!("Replace queued: {}", buffer);
+                    self.input_cursor = None;
+                    mode = Mode::Normal;
+                }
+                KeyCode::Esc => mode = Mode::Normal,
+                _ if Self::handle_plain_text_input_key(
+                    buffer,
+                    &mut self.input_cursor,
+                    key.code,
+                ) => {}
+                _ => {}
+            },
             Mode::ExportTsv { buffer } => match key.code {
                 KeyCode::Enter => {
                     let fname = buffer.clone();
@@ -4663,37 +4846,22 @@ impl App {
                 KeyCode::BackTab => {
                     *focus = Self::cycle_balance_focus(*focus, true);
                 }
-                KeyCode::Left | KeyCode::Right => {
-                    if matches!(focus, BalanceBooksFocus::Column) {
-                        if Self::handle_plain_text_input_key(
-                            buffer,
-                            &mut self.input_cursor,
-                            key.code,
-                        ) {
-                        } else if matches!(key.code, KeyCode::Left)
-                            && self.input_cursor.unwrap_or_else(|| buffer.chars().count()) == 0
-                        {
-                            *focus = BalanceBooksFocus::Cancel;
-                        } else if matches!(key.code, KeyCode::Right)
-                            && self.input_cursor.unwrap_or_else(|| buffer.chars().count())
-                                == buffer.chars().count()
-                        {
-                            *focus = BalanceBooksFocus::PosToNeg;
-                        }
-                    }
-                }
                 KeyCode::Up => {
                     *focus = match *focus {
                         BalanceBooksFocus::Generate => BalanceBooksFocus::NegToPos,
                         BalanceBooksFocus::Cancel => BalanceBooksFocus::Generate,
                         BalanceBooksFocus::NegToPos => BalanceBooksFocus::PosToNeg,
-                        BalanceBooksFocus::PosToNeg => BalanceBooksFocus::Column,
+                        BalanceBooksFocus::PosToNeg => BalanceBooksFocus::ReportPersisted,
+                        BalanceBooksFocus::ReportPersisted => BalanceBooksFocus::ReportViewOnly,
+                        BalanceBooksFocus::ReportViewOnly => BalanceBooksFocus::Column,
                         BalanceBooksFocus::Column => BalanceBooksFocus::Column,
                     };
                 }
                 KeyCode::Down => {
                     *focus = match *focus {
                         BalanceBooksFocus::Column => BalanceBooksFocus::PosToNeg,
+                        BalanceBooksFocus::ReportViewOnly => BalanceBooksFocus::ReportPersisted,
+                        BalanceBooksFocus::ReportPersisted => BalanceBooksFocus::PosToNeg,
                         BalanceBooksFocus::PosToNeg => BalanceBooksFocus::NegToPos,
                         BalanceBooksFocus::NegToPos => BalanceBooksFocus::Generate,
                         BalanceBooksFocus::Generate => BalanceBooksFocus::Cancel,
@@ -4701,6 +4869,14 @@ impl App {
                     };
                 }
                 KeyCode::Char(' ') | KeyCode::Enter => match focus {
+                    BalanceBooksFocus::Column => {
+                        if key.code == KeyCode::Enter {
+                            self.run_balance_books(buffer, *direction, *persist)?;
+                            return Ok(false);
+                        }
+                    }
+                    BalanceBooksFocus::ReportViewOnly => *persist = false,
+                    BalanceBooksFocus::ReportPersisted => *persist = true,
                     BalanceBooksFocus::PosToNeg => *direction = BalanceDirection::PosToNeg,
                     BalanceBooksFocus::NegToPos => *direction = BalanceDirection::NegToPos,
                     BalanceBooksFocus::Generate => {
@@ -4710,25 +4886,7 @@ impl App {
                     BalanceBooksFocus::Cancel => {
                         mode = Mode::Normal;
                     }
-                    BalanceBooksFocus::Column => {
-                        if key.code == KeyCode::Enter {
-                            self.run_balance_books(buffer, *direction, *persist)?;
-                            return Ok(false);
-                        }
-                    }
                 },
-                KeyCode::Char('d') | KeyCode::Char('D') => {
-                    *direction = match direction {
-                        BalanceDirection::PosToNeg => BalanceDirection::NegToPos,
-                        BalanceDirection::NegToPos => BalanceDirection::PosToNeg,
-                    };
-                }
-                KeyCode::Char('v') | KeyCode::Char('V') => {
-                    *persist = false;
-                }
-                KeyCode::Char('r') | KeyCode::Char('R') => {
-                    *persist = true;
-                }
                 KeyCode::Esc => mode = Mode::Normal,
                 _ if matches!(focus, BalanceBooksFocus::Column)
                     && Self::handle_plain_text_input_key(
@@ -4871,6 +5029,24 @@ impl App {
                 ) => {}
                 _ => {}
             },
+            Mode::Find { buffer } => match key.code {
+                KeyCode::Enter => {
+                    self.status = if buffer.trim().is_empty() {
+                        "Find cancelled".into()
+                    } else {
+                        format!("Find: {}", buffer.trim())
+                    };
+                    self.input_cursor = None;
+                    mode = Mode::Normal;
+                }
+                KeyCode::Esc => mode = Mode::Normal,
+                _ if Self::handle_plain_text_input_key(
+                    buffer,
+                    &mut self.input_cursor,
+                    key.code,
+                ) => {}
+                _ => {}
+            },
             Mode::Edit {
                 buffer,
                 formula_cursor,
@@ -4886,6 +5062,12 @@ impl App {
                         paste
                     };
                     Self::insert_text_into_buffer(buffer, &mut self.edit_cursor, &text);
+                }
+                KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    *formula_cursor = None;
+                    self.edit_special_palette = false;
+                    let paste = read_clipboard().map_err(io::Error::other)?;
+                    Self::insert_text_into_buffer(buffer, &mut self.edit_cursor, &paste);
                 }
                 KeyCode::Enter => {
                     self.commit_edit_buffer(buffer)?;
@@ -6756,6 +6938,87 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_shift_p_pastes_raw_clipboard_in_edit_mode() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 1);
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        };
+        app.mode = Mode::Edit {
+            buffer: String::new(),
+            formula_cursor: None,
+            fit_to_content_on_commit: false,
+        };
+
+        set_test_clipboard(Some("=A1".into()));
+        app.handle_key(KeyEvent::new(
+            KeyCode::Char('p'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ))
+        .unwrap();
+
+        match &app.mode {
+            Mode::Edit { buffer, .. } => assert_eq!(buffer, "=A1"),
+            other => panic!("unexpected mode: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn find_menu_opens_prompt() {
+        let mut app = App::new(None);
+
+        app.mode = Mode::Menu {
+            stack: vec![MenuLevel {
+                section: MenuSection::Edit,
+                item: 3,
+            }],
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .unwrap();
+
+        match &app.mode {
+            Mode::Find { buffer } => assert!(buffer.is_empty()),
+            other => panic!("unexpected mode: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn alt_e_opens_edit_menu() {
+        let mut app = App::new(None);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::ALT))
+            .unwrap();
+
+        match &app.mode {
+            Mode::Menu { stack } => {
+                assert_eq!(stack.len(), 1);
+                assert_eq!(stack[0].section, MenuSection::Edit);
+            }
+            other => panic!("unexpected mode: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replace_menu_opens_prompt() {
+        let mut app = App::new(None);
+
+        app.mode = Mode::Menu {
+            stack: vec![MenuLevel {
+                section: MenuSection::Edit,
+                item: 4,
+            }],
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .unwrap();
+
+        match &app.mode {
+            Mode::Replace { buffer } => assert!(buffer.is_empty()),
+            other => panic!("unexpected mode: {other:?}"),
+        }
+    }
+
+    #[test]
     fn apply_pasted_tsv_expands_sheet() {
         let mut app = App::new(None);
         app.state.grid.set_main_size(1, 1);
@@ -6964,7 +7227,7 @@ mod tests {
     }
 
     #[test]
-    fn left_wraps_from_help_to_file() {
+    fn left_wraps_from_help_to_edit() {
         let mut app = App::new(None);
         app.mode = Mode::Menu {
             stack: vec![MenuLevel {
@@ -6990,7 +7253,7 @@ mod tests {
         match &app.mode {
             Mode::Menu { stack } => {
                 assert_eq!(stack.len(), 1);
-                assert_eq!(stack[0].section, MenuSection::File);
+                assert_eq!(stack[0].section, MenuSection::Edit);
             }
             other => panic!("unexpected mode: {other:?}"),
         }
@@ -7023,7 +7286,7 @@ mod tests {
         match &app.mode {
             Mode::Menu { stack } => {
                 assert_eq!(stack.len(), 1);
-                assert_eq!(stack[0].section, MenuSection::File);
+                assert_eq!(stack[0].section, MenuSection::Edit);
             }
             other => panic!("unexpected mode: {other:?}"),
         }
@@ -7265,7 +7528,7 @@ mod tests {
             "A",
             BalanceDirection::PosToNeg,
             false,
-            BalanceBooksFocus::PosToNeg,
+            BalanceBooksFocus::Column,
             1,
             Style::default(),
             Style::default(),
@@ -7282,10 +7545,11 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(rendered.contains("(X) Match +ve number with multiple -ve numbers"));
-        assert!(rendered.contains("( ) Match -ve number with multiple +ve numbers"));
-        assert!(rendered.contains("v: view in current sheet"));
-        assert!(rendered.contains("r: create report sheet"));
+        assert!(rendered.contains("Column to Balance:"));
+        assert!(rendered.contains("Report Type:"));
+        assert!(rendered.contains("[X] View only"));
+        assert!(rendered.contains("[ ] Persisted report"));
+        assert!(rendered.contains("Balance direction:"));
     }
 
     #[test]
@@ -7297,6 +7561,24 @@ mod tests {
             persist: false,
             focus: BalanceBooksFocus::Column,
         };
+
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()))
+            .unwrap();
+        match app.mode {
+            Mode::BalanceBooks { focus, .. } => {
+                assert_eq!(focus, BalanceBooksFocus::ReportViewOnly)
+            }
+            other => panic!("unexpected mode: {other:?}"),
+        }
+
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()))
+            .unwrap();
+        match app.mode {
+            Mode::BalanceBooks { focus, .. } => {
+                assert_eq!(focus, BalanceBooksFocus::ReportPersisted)
+            }
+            other => panic!("unexpected mode: {other:?}"),
+        }
 
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()))
             .unwrap();
@@ -7323,6 +7605,31 @@ mod tests {
             .unwrap();
         match app.mode {
             Mode::BalanceBooks { focus, .. } => assert_eq!(focus, BalanceBooksFocus::Cancel),
+            other => panic!("unexpected mode: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn balance_dialog_prefills_mixed_sign_column() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(2, 2);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "7".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 1, col: 0 }, "8".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 1 }, "10".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 1, col: 1 }, "-10".into());
+
+        app.mode = app.menu_action_mode(MenuAction::BalanceBooks);
+
+        match app.mode {
+            Mode::BalanceBooks { buffer, .. } => assert_eq!(buffer, "B"),
             other => panic!("unexpected mode: {other:?}"),
         }
     }

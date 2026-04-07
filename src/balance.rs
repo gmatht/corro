@@ -91,6 +91,7 @@ pub fn format_amount_cents(cents: i64) -> String {
 }
 
 pub fn choose_balance_column(grid: &Grid) -> Option<usize> {
+    let mut first_numeric = None;
     for col in 0..grid.main_cols() {
         let mut saw_pos = false;
         let mut saw_neg = false;
@@ -100,6 +101,7 @@ pub fn choose_balance_column(grid: &Grid) -> Option<usize> {
                 col: col as u32,
             };
             if let Some(amount) = parse_amount_cents(grid.get(&addr).unwrap_or("")) {
+                first_numeric.get_or_insert(col);
                 saw_pos |= amount > 0;
                 saw_neg |= amount < 0;
             }
@@ -108,7 +110,7 @@ pub fn choose_balance_column(grid: &Grid) -> Option<usize> {
             }
         }
     }
-    None
+    first_numeric
 }
 
 pub fn source_rows_from_grid(grid: &Grid, col: usize) -> Vec<BalanceSourceRow> {
@@ -506,5 +508,16 @@ mod tests {
             Some("UNMATCHED")
         );
         assert_eq!(out.grid.get(&CellAddr::Main { row: 3, col: 0 }), Some("5"));
+    }
+
+    #[test]
+    fn choose_balance_column_prefers_mixed_sign_column() {
+        let mut grid = Grid::new(2, 3);
+        grid.set(&CellAddr::Main { row: 0, col: 0 }, "7".into());
+        grid.set(&CellAddr::Main { row: 1, col: 0 }, "8".into());
+        grid.set(&CellAddr::Main { row: 0, col: 1 }, "10".into());
+        grid.set(&CellAddr::Main { row: 1, col: 1 }, "-10".into());
+
+        assert_eq!(choose_balance_column(&grid), Some(1));
     }
 }

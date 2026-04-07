@@ -25,6 +25,8 @@ It favors spreadsheet conventions where they fit, and documents the bindings tha
 | `Ctrl+D` / `Cmd+D` | Fill right | Repeats or extends a single selected row to the right |
 | `Ctrl+R` / `Cmd+R` | Fill down | Repeats or extends a single selected column downward |
 | `Ctrl+Shift++` | Insert rows | Inserts rows above the current row or selected rows |
+| `Alt+E` | Open Edit menu | Menu includes cut, copy, paste, find, and replace |
+| `Ctrl+Shift+P` | Paste | Same as `Ctrl+V` in this build |
 | `Alt+I` | Open Insert menu | Menu includes rows, cols, special chars, and hyperlink actions |
 | `v` | Toggle cell selection | Selects the current rectangle anchor, or clears selection |
 | `e`, `Enter` | Edit current cell | Starts with the current displayed value |
@@ -118,7 +120,6 @@ Export actions:
 | `c` | CSV export of the main sheet when no selection exists |
 | `Alt+T` / `T` | TSV export prompt |
 | `Alt+A` / `A` | ASCII table export prompt |
-| `Alt+E` / `E` | Full-sheet export prompt, including headers and margins |
 
 ## Width and Sort
 
