@@ -635,9 +635,15 @@ fn menu_popup_area(area: Rect, section: MenuSection, parent: Option<(Rect, usize
     let height = items.saturating_add(2).min(area.height.max(3));
     let (x, y) = parent
         .map(|(p, item)| (p.x.saturating_add(p.width), p.y.saturating_add(item as u16)))
-        .unwrap_or_else(|| match section {
-            MenuSection::Help => (area.x.saturating_add(9), area.y.saturating_add(1)),
-            _ => (area.x.saturating_add(1), area.y.saturating_add(1)),
+        .unwrap_or_else(|| {
+            let x = match section {
+                MenuSection::File => 1,
+                MenuSection::Edit => 9,
+                MenuSection::Insert => 17,
+                MenuSection::Help => 27,
+                _ => 1,
+            };
+            (area.x.saturating_add(x), area.y.saturating_add(1))
         });
     let x = x.min(
         area.x
@@ -5722,6 +5728,21 @@ mod tests {
         assert!(child.x > parent.x);
         assert!(child.y > parent.y);
         assert_eq!(child.y, parent.y + 2);
+    }
+
+    #[test]
+    fn root_menu_popups_align_under_top_bar_items() {
+        let area = Rect::new(0, 0, 80, 20);
+
+        let file = menu_popup_area(area, MenuSection::File, None);
+        let edit = menu_popup_area(area, MenuSection::Edit, None);
+        let insert = menu_popup_area(area, MenuSection::Insert, None);
+        let help = menu_popup_area(area, MenuSection::Help, None);
+
+        assert_eq!(file.x, 1);
+        assert_eq!(edit.x, 9);
+        assert_eq!(insert.x, 17);
+        assert_eq!(help.x, 27);
     }
 
     #[test]
