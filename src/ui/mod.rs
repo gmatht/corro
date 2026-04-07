@@ -221,8 +221,18 @@ enum Mode {
         buffer: String,
         direction: BalanceDirection,
         persist: bool,
+        focus: BalanceBooksFocus,
     },
     QuitPrompt,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BalanceBooksFocus {
+    Column,
+    PosToNeg,
+    NegToPos,
+    Generate,
+    Cancel,
 }
 
 const SPECIAL_VALUE_CHOICES: [&str; 10] = ["∞", "Σ", "Ω", "π", "μ", "Δ", "√", "φ", "λ", "θ"];
@@ -718,6 +728,7 @@ impl App {
                 buffer: self.start_input_mode(String::new()),
                 direction: BalanceDirection::PosToNeg,
                 persist: false,
+                focus: BalanceBooksFocus::Column,
             },
             MenuAction::NewSheet => {
                 self.add_sheet(format!("Sheet{}", self.workbook.next_sheet_id));
@@ -3421,10 +3432,12 @@ impl App {
                     buffer,
                     direction,
                     persist,
+                    focus,
                 } => self.balance_dialog_lines(
                     buffer,
                     *direction,
                     *persist,
+                    *focus,
                     self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
                     Style::default().fg(Color::White),
                     Style::default()
@@ -3811,24 +3824,49 @@ impl App {
         buffer: &str,
         direction: BalanceDirection,
         persist: bool,
+        focus: BalanceBooksFocus,
         cursor: usize,
         text_style: Style,
         heading_style: Style,
         caret_style: Style,
     ) -> Vec<Line<'static>> {
         let header = format!(
-            "Column: {}    Direction: {}    Output: {}",
+            "Column: {}    Output: {}",
             if buffer.trim().is_empty() {
                 "auto"
             } else {
                 buffer.trim()
             },
-            match direction {
-                BalanceDirection::PosToNeg => "+→-",
-                BalanceDirection::NegToPos => "-→+",
-            },
             if persist { "report sheet" } else { "view only" }
         );
+        let pos_to_neg = match direction {
+            BalanceDirection::PosToNeg => "(X) Match +ve number with multiple -ve numbers",
+            BalanceDirection::NegToPos => "( ) Match +ve number with multiple -ve numbers",
+        };
+        let neg_to_pos = match direction {
+            BalanceDirection::NegToPos => "(X) Match -ve number with multiple +ve numbers",
+            BalanceDirection::PosToNeg => "( ) Match -ve number with multiple +ve numbers",
+        };
+        let dir_style = |selected: bool| {
+            if selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                text_style
+            }
+        };
+        let button_style = |selected: bool| {
+            if selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                heading_style
+            }
+        };
 
         vec![
             Line::from(Span::styled(header, heading_style)),
@@ -3839,15 +3877,127 @@ impl App {
             )),
             Line::from(""),
             Line::from(Span::styled("Controls:", heading_style)),
-            Line::from(Span::styled("  Enter: run balance", text_style)),
-            Line::from(Span::styled("  d: toggle direction", text_style)),
-            Line::from(Span::styled("  v: preview in current sheet", text_style)),
-            Line::from(Span::styled("  r: create persisted report", text_style)),
+            Line::from(Span::styled("  Tab/Shift+Tab: move focus", text_style)),
+            Line::from(Span::styled("  Enter/Space: activate", text_style)),
             Line::from(Span::styled("  Esc: cancel", text_style)),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  ", text_style),
+                Span::styled(pos_to_neg, dir_style(matches!(focus, BalanceBooksFocus::PosToNeg))),
+            ]),
+            Line::from(vec![
+                Span::styled("  ", text_style),
+                Span::styled(neg_to_pos, dir_style(matches!(focus, BalanceBooksFocus::NegToPos))),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  [ ", text_style),
+                Span::styled("Generate", button_style(matches!(focus, BalanceBooksFocus::Generate))),
+                Span::styled(" ]", text_style),
+                Span::styled("   ", text_style),
+                Span::styled("[ ", text_style),
+                Span::styled("Cancel", button_style(matches!(focus, BalanceBooksFocus::Cancel))),
+                Span::styled(" ]", text_style),
+            ]),
             Line::from(""),
             Line::from(Span::styled("Input: ", heading_style)),
             input_line(String::new(), buffer, cursor, text_style, caret_style),
         ]
+    }
+
+    fn cycle_balance_focus(focus: BalanceBooksFocus, backwards: bool) -> BalanceBooksFocus {
+        use BalanceBooksFocus::*;
+        let order = [Column, PosToNeg, NegToPos, Generate, Cancel];
+        let idx = order.iter().position(|item| *item == focus).unwrap_or(0);
+        let next = if backwards {
+            (idx + order.len() - 1) % order.len()
+        } else {
+            (idx + 1) % order.len()
+        };
+        order[next]
+    }
+
+    fn run_balance_books(
+        &mut self,
+        buffer: &str,
+        direction: BalanceDirection,
+        persist: bool,
+    ) -> Result<(), RunError> {
+        let col = if buffer.trim().is_empty() {
+            balance::choose_balance_column(&self.state.grid)
+        } else {
+            addr::parse_excel_column(buffer.trim()).map(|c| MARGIN_COLS + c as usize)
+        };
+        let Some(col) = col else {
+            self.status = "No balance column found".into();
+            self.input_cursor = None;
+            self.mode = Mode::Normal;
+            return Ok(());
+        };
+        let report = balance::build_balance_report(&self.state.grid, col, direction);
+        let source_sheet_id = self.workbook.sheet_id(self.workbook.active_sheet);
+        let source_title = self
+            .workbook
+            .sheet_title(self.workbook.active_sheet)
+            .to_string();
+        if persist {
+            let title = format!("Balance-{}", self.workbook.next_sheet_id);
+            self.commit_active_sheet_cache();
+            let id = self.workbook.next_sheet_id;
+            let plan = balance::balance_copy_plan(
+                source_sheet_id,
+                source_title.clone(),
+                id,
+                title.clone(),
+                col,
+                self.state.grid.main_rows(),
+                &report,
+                true,
+            );
+            let report_sheet = balance::materialize_report_sheet(&self.state, &plan);
+            self.workbook.add_sheet(title.clone(), report_sheet.clone());
+            self.view_sheet_id = id;
+            self.sync_active_sheet_cache();
+            if let Some(ref p) = self.path.clone() {
+                let mut active_sheet = self.view_sheet_id;
+                commit_workbook_op(
+                    p,
+                    &mut self.offset,
+                    &mut self.workbook,
+                    &mut active_sheet,
+                    &crate::ops::WorkbookOp::BalanceReport {
+                        id,
+                        title: title.clone(),
+                        source_sheet_id,
+                        amount_col: col,
+                        direction,
+                        row_order: plan.row_order.clone(),
+                        preserve_formulas: true,
+                    },
+                )?;
+                self.ops_applied = self.ops_applied.saturating_add(1);
+                self.start_log_watcher_if_needed()?;
+            }
+            self.status = format!("Balance report saved as {}", title);
+        } else {
+            let plan = balance::balance_copy_plan(
+                source_sheet_id,
+                source_title,
+                self.workbook.sheet_id(self.workbook.active_sheet),
+                self.workbook
+                    .sheet_title(self.workbook.active_sheet)
+                    .to_string(),
+                col,
+                self.state.grid.main_rows(),
+                &report,
+                true,
+            );
+            self.state = balance::materialize_report_sheet(&self.state, &plan);
+            self.status = "Balance report generated".into();
+        }
+        self.input_cursor = None;
+        self.mode = Mode::Normal;
+        Ok(())
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Result<bool, RunError> {
@@ -4505,7 +4655,68 @@ impl App {
                 buffer,
                 direction,
                 persist,
+                focus,
             } => match key.code {
+                KeyCode::Tab => {
+                    *focus = Self::cycle_balance_focus(*focus, false);
+                }
+                KeyCode::BackTab => {
+                    *focus = Self::cycle_balance_focus(*focus, true);
+                }
+                KeyCode::Left | KeyCode::Right => {
+                    if matches!(focus, BalanceBooksFocus::Column) {
+                        if Self::handle_plain_text_input_key(
+                            buffer,
+                            &mut self.input_cursor,
+                            key.code,
+                        ) {
+                        } else if matches!(key.code, KeyCode::Left)
+                            && self.input_cursor.unwrap_or_else(|| buffer.chars().count()) == 0
+                        {
+                            *focus = BalanceBooksFocus::Cancel;
+                        } else if matches!(key.code, KeyCode::Right)
+                            && self.input_cursor.unwrap_or_else(|| buffer.chars().count())
+                                == buffer.chars().count()
+                        {
+                            *focus = BalanceBooksFocus::PosToNeg;
+                        }
+                    }
+                }
+                KeyCode::Up => {
+                    *focus = match *focus {
+                        BalanceBooksFocus::Generate => BalanceBooksFocus::NegToPos,
+                        BalanceBooksFocus::Cancel => BalanceBooksFocus::Generate,
+                        BalanceBooksFocus::NegToPos => BalanceBooksFocus::PosToNeg,
+                        BalanceBooksFocus::PosToNeg => BalanceBooksFocus::Column,
+                        BalanceBooksFocus::Column => BalanceBooksFocus::Column,
+                    };
+                }
+                KeyCode::Down => {
+                    *focus = match *focus {
+                        BalanceBooksFocus::Column => BalanceBooksFocus::PosToNeg,
+                        BalanceBooksFocus::PosToNeg => BalanceBooksFocus::NegToPos,
+                        BalanceBooksFocus::NegToPos => BalanceBooksFocus::Generate,
+                        BalanceBooksFocus::Generate => BalanceBooksFocus::Cancel,
+                        BalanceBooksFocus::Cancel => BalanceBooksFocus::Cancel,
+                    };
+                }
+                KeyCode::Char(' ') | KeyCode::Enter => match focus {
+                    BalanceBooksFocus::PosToNeg => *direction = BalanceDirection::PosToNeg,
+                    BalanceBooksFocus::NegToPos => *direction = BalanceDirection::NegToPos,
+                    BalanceBooksFocus::Generate => {
+                        self.run_balance_books(buffer, *direction, *persist)?;
+                        return Ok(false);
+                    }
+                    BalanceBooksFocus::Cancel => {
+                        mode = Mode::Normal;
+                    }
+                    BalanceBooksFocus::Column => {
+                        if key.code == KeyCode::Enter {
+                            self.run_balance_books(buffer, *direction, *persist)?;
+                            return Ok(false);
+                        }
+                    }
+                },
                 KeyCode::Char('d') | KeyCode::Char('D') => {
                     *direction = match direction {
                         BalanceDirection::PosToNeg => BalanceDirection::NegToPos,
@@ -4518,89 +4729,13 @@ impl App {
                 KeyCode::Char('r') | KeyCode::Char('R') => {
                     *persist = true;
                 }
-                KeyCode::Enter => {
-                    let col = if buffer.trim().is_empty() {
-                        balance::choose_balance_column(&self.state.grid)
-                    } else {
-                        addr::parse_excel_column(buffer.trim()).map(|c| MARGIN_COLS + c as usize)
-                    };
-                    let Some(col) = col else {
-                        self.status = "No balance column found".into();
-                        self.input_cursor = None;
-                        mode = Mode::Normal;
-                        self.mode = mode;
-                        return Ok(false);
-                    };
-                    let report = balance::build_balance_report(&self.state.grid, col, *direction);
-                    let source_sheet_id = self.workbook.sheet_id(self.workbook.active_sheet);
-                    let source_title = self
-                        .workbook
-                        .sheet_title(self.workbook.active_sheet)
-                        .to_string();
-                    if *persist {
-                        let title = format!("Balance-{}", self.workbook.next_sheet_id);
-                        self.commit_active_sheet_cache();
-                        let id = self.workbook.next_sheet_id;
-                        let plan = balance::balance_copy_plan(
-                            source_sheet_id,
-                            source_title.clone(),
-                            id,
-                            title.clone(),
-                            col,
-                            self.state.grid.main_rows(),
-                            &report,
-                            true,
-                        );
-                        let report_sheet = balance::materialize_report_sheet(&self.state, &plan);
-                        self.workbook.add_sheet(title.clone(), report_sheet.clone());
-                        self.view_sheet_id = id;
-                        self.sync_active_sheet_cache();
-                        if let Some(ref p) = self.path.clone() {
-                            let mut active_sheet = self.view_sheet_id;
-                            commit_workbook_op(
-                                p,
-                                &mut self.offset,
-                                &mut self.workbook,
-                                &mut active_sheet,
-                                &crate::ops::WorkbookOp::BalanceReport {
-                                    id,
-                                    title: title.clone(),
-                                    source_sheet_id,
-                                    amount_col: col,
-                                    direction: *direction,
-                                    row_order: plan.row_order.clone(),
-                                    preserve_formulas: true,
-                                },
-                            )?;
-                            self.ops_applied = self.ops_applied.saturating_add(1);
-                            self.start_log_watcher_if_needed()?;
-                        }
-                        self.status = format!("Balance report saved as {}", title);
-                    } else {
-                        let plan = balance::balance_copy_plan(
-                            source_sheet_id,
-                            source_title,
-                            self.workbook.sheet_id(self.workbook.active_sheet),
-                            self.workbook
-                                .sheet_title(self.workbook.active_sheet)
-                                .to_string(),
-                            col,
-                            self.state.grid.main_rows(),
-                            &report,
-                            true,
-                        );
-                        self.state = balance::materialize_report_sheet(&self.state, &plan);
-                        self.status = "Balance report generated".into();
-                    }
-                    self.input_cursor = None;
-                    mode = Mode::Normal;
-                }
                 KeyCode::Esc => mode = Mode::Normal,
-                _ if Self::handle_plain_text_input_key(
-                    buffer,
-                    &mut self.input_cursor,
-                    key.code,
-                ) => {}
+                _ if matches!(focus, BalanceBooksFocus::Column)
+                    && Self::handle_plain_text_input_key(
+                        buffer,
+                        &mut self.input_cursor,
+                        key.code,
+                    ) => {}
                 _ => {}
             },
             Mode::QuitPrompt => match key.code {
@@ -7105,6 +7240,7 @@ mod tests {
             buffer: String::new(),
             direction: BalanceDirection::PosToNeg,
             persist: false,
+            focus: BalanceBooksFocus::Column,
         };
 
         // Simulate Enter on the balance action path.
@@ -7120,6 +7256,118 @@ mod tests {
             app.state.grid.get(&CellAddr::Main { row: 1, col: 0 }),
             Some("-10")
         );
+    }
+
+    #[test]
+    fn balance_dialog_shows_checkbox_style_choices() {
+        let app = App::new(None);
+        let lines = app.balance_dialog_lines(
+            "A",
+            BalanceDirection::PosToNeg,
+            false,
+            BalanceBooksFocus::PosToNeg,
+            1,
+            Style::default(),
+            Style::default(),
+            Style::default(),
+        );
+        let rendered = lines
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .into_iter()
+                    .map(|span| span.content.to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("(X) Match +ve number with multiple -ve numbers"));
+        assert!(rendered.contains("( ) Match -ve number with multiple +ve numbers"));
+        assert!(rendered.contains("v: view in current sheet"));
+        assert!(rendered.contains("r: create report sheet"));
+    }
+
+    #[test]
+    fn balance_dialog_tabs_between_controls() {
+        let mut app = App::new(None);
+        app.mode = Mode::BalanceBooks {
+            buffer: String::new(),
+            direction: BalanceDirection::PosToNeg,
+            persist: false,
+            focus: BalanceBooksFocus::Column,
+        };
+
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()))
+            .unwrap();
+        match app.mode {
+            Mode::BalanceBooks { focus, .. } => assert_eq!(focus, BalanceBooksFocus::PosToNeg),
+            other => panic!("unexpected mode: {other:?}"),
+        }
+
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()))
+            .unwrap();
+        match app.mode {
+            Mode::BalanceBooks { focus, .. } => assert_eq!(focus, BalanceBooksFocus::NegToPos),
+            other => panic!("unexpected mode: {other:?}"),
+        }
+
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()))
+            .unwrap();
+        match app.mode {
+            Mode::BalanceBooks { focus, .. } => assert_eq!(focus, BalanceBooksFocus::Generate),
+            other => panic!("unexpected mode: {other:?}"),
+        }
+
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()))
+            .unwrap();
+        match app.mode {
+            Mode::BalanceBooks { focus, .. } => assert_eq!(focus, BalanceBooksFocus::Cancel),
+            other => panic!("unexpected mode: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn balance_dialog_enter_on_generate_runs_balance() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(2, 1);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "10".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 1, col: 0 }, "-10".into());
+        app.mode = Mode::BalanceBooks {
+            buffer: String::new(),
+            direction: BalanceDirection::PosToNeg,
+            persist: false,
+            focus: BalanceBooksFocus::Generate,
+        };
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .unwrap();
+
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(
+            app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }),
+            Some("10")
+        );
+    }
+
+    #[test]
+    fn balance_dialog_escape_cancels() {
+        let mut app = App::new(None);
+        app.mode = Mode::BalanceBooks {
+            buffer: String::new(),
+            direction: BalanceDirection::PosToNeg,
+            persist: false,
+            focus: BalanceBooksFocus::Generate,
+        };
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()))
+            .unwrap();
+
+        assert!(matches!(app.mode, Mode::Normal));
     }
 
     #[test]
