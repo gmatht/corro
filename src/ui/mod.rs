@@ -9,8 +9,9 @@ use crate::formula::{cell_effective_display, is_formula};
 use crate::grid::MainRange;
 use crate::grid::{CellAddr, Grid, SortSpec, FOOTER_ROWS, HEADER_ROWS, MARGIN_COLS};
 use crate::io::{
-    commit_line, commit_workbook_op, load_full, load_revisions, load_revisions_partial,
-    load_workbook_revisions, load_workbook_revisions_partial, IoError, LogWatcher, PartialReplay,
+    commit_line, commit_workbook_op, load_full, load_full_partial, load_revisions,
+    load_revisions_partial, load_workbook_revisions, load_workbook_revisions_partial, IoError,
+    LogWatcher, PartialReplay,
 };
 use crate::ops::{AggFunc, AggregateDef, Op, SheetState, WorkbookState};
 use crossterm::cursor::{Hide, Show};
@@ -722,6 +723,7 @@ impl App {
         special_palette: bool,
         fit_to_content_on_commit: bool,
     ) -> Mode {
+        self.edit_target_addr = Some(self.cursor.to_addr(&self.state.grid));
         let cursor = if buffer.trim() == "=" {
             1
         } else {
@@ -1269,14 +1271,104 @@ fn data_main_col_count(grid: &Grid) -> usize {
 }
 
 fn row_total_block_start(grid: &Grid, current_main_row: u32) -> u32 {
-    let mut agg_row_start: u32 = 0;
     for candidate in (0..current_main_row).rev() {
         if left_margin_agg_func(grid, candidate).is_some() {
+            return candidate + 1;
+        }
+    }
+    0
+}
+
+fn previous_raw_block(grid: &Grid, current_main_row: u32) -> Option<(u32, u32)> {
+    let mut end = current_main_row;
+    while end > 0 {
+        let prev_agg = (0..end)
+            .rev()
+            .find(|&r| left_margin_agg_func(grid, r).is_some())?;
+        let start = (0..prev_agg)
+            .rev()
+            .find(|&r| left_margin_agg_func(grid, r).is_some())
+            .map_or(0, |r| r + 1);
+        if start < prev_agg {
+            return Some((start, prev_agg));
+        }
+        end = prev_agg;
+    }
+    None
+}
+
+fn left_margin_main_col_aggregate(
+    grid: &Grid,
+    func: AggFunc,
+    current_main_row: u32,
+    main_col: u32,
+) -> String {
+    let mut end = current_main_row;
+    while let Some((start, block_end)) = previous_raw_block(grid, end) {
+        let text = compute_aggregate(
+            grid,
+            &AggregateDef {
+                func,
+                source: MainRange {
+                    row_start: start,
+                    row_end: block_end,
+                    col_start: main_col,
+                    col_end: main_col + 1,
+                },
+            },
+        );
+        if !text.is_empty() {
+            return text;
+        }
+        if start == 0 {
             break;
         }
-        agg_row_start = candidate;
+        end = start;
     }
-    agg_row_start
+    String::new()
+}
+
+fn left_margin_special_col_aggregate(
+    grid: &Grid,
+    subtotal_func: AggFunc,
+    global_col: usize,
+    row_start: u32,
+    row_end: u32,
+    data_cols: usize,
+) -> Option<String> {
+    let col_func = right_col_agg_func(grid, global_col)?;
+    let collect = |row_start: u32, row_end: u32| -> Vec<f64> {
+        let mut samples: Vec<f64> = Vec::new();
+        for r in row_start..row_end {
+            let row_val = compute_aggregate(
+                grid,
+                &AggregateDef {
+                    func: col_func,
+                    source: MainRange {
+                        row_start: r,
+                        row_end: r + 1,
+                        col_start: 0,
+                        col_end: data_cols as u32,
+                    },
+                },
+            );
+            if let Some(n) = parse_num(&row_val) {
+                samples.push(n);
+            }
+        }
+        samples
+    };
+
+    let mut samples = collect(row_start, row_end);
+    let mut end = row_start;
+    while samples.is_empty() && end > 0 {
+        let Some((fallback_start, fallback_end)) = previous_raw_block(grid, end) else {
+            break;
+        };
+        samples = collect(fallback_start, fallback_end);
+        end = fallback_start;
+    }
+    Some(fold_numbers(subtotal_func, &samples))
 }
 
 fn left_margin_template_applies(grid: &Grid, main_row: usize) -> bool {
@@ -1626,6 +1718,7 @@ pub struct App {
     input_cursor: Option<usize>,
     special_picker: Option<usize>,
     view_sheet_id: u32,
+    edit_target_addr: Option<CellAddr>,
     pending_fit_to_content_on_commit: bool,
     clipboard_snapshot: Option<(MainRange, String)>,
 }
@@ -1682,6 +1775,7 @@ impl App {
             input_cursor: None,
             special_picker: None,
             view_sheet_id: 1,
+            edit_target_addr: None,
             pending_fit_to_content_on_commit: false,
             clipboard_snapshot: None,
         }
@@ -2745,7 +2839,12 @@ impl App {
         let (addr, value) = if let Some((a, v)) = parse_cell_shorthand(buffer) {
             (a, v)
         } else {
-            (self.cursor.to_addr(&self.state.grid), buffer.to_string())
+            (
+                self.edit_target_addr
+                    .clone()
+                    .unwrap_or_else(|| self.cursor.to_addr(&self.state.grid)),
+                buffer.to_string(),
+            )
         };
         if self.state.grid.get(&addr).unwrap_or("") == value {
             self.pending_fit_to_content_on_commit = false;
@@ -3725,7 +3824,8 @@ impl App {
 
         // ── Formula bar ───────────────────────────────────────────────────────
         let addr = self.cursor.to_addr(grid);
-        let addr_str = addr_label(&addr, grid.main_cols());
+        let edit_addr = self.edit_target_addr.clone().unwrap_or(addr.clone());
+        let addr_str = addr_label(&edit_addr, grid.main_cols());
         let prompt_style = Style::default().fg(Color::White).bg(Color::DarkGray);
         let prompt_style_bold = prompt_style.add_modifier(Modifier::BOLD);
         let caret_style = Style::default()
@@ -3739,7 +3839,7 @@ impl App {
                 self.edit_cursor.unwrap_or_else(|| buffer.chars().count()),
                 prompt_style_bold,
                 caret_style,
-                formula_edit_preview(grid, &addr, buffer),
+                formula_edit_preview(grid, &edit_addr, buffer),
             ))
             .style(prompt_style_bold),
             Mode::OpenPath { buffer } => Paragraph::new(input_line(
@@ -3984,6 +4084,7 @@ impl App {
 
         // ── Grid ──────────────────────────────────────────────────────────────
         let mut lines: Vec<Line> = Vec::new();
+        let mut line_bold: Vec<bool> = Vec::new();
 
         {
             let lm = MARGIN_COLS;
@@ -4038,6 +4139,7 @@ impl App {
                 format!("{:>4} ", sheet_row_label(r, grid.main_rows())),
                 row_label_style,
             )];
+            let mut row_has_agg = false;
             let footer_agg = if r >= hr + mr {
                 footer_row_agg_func(grid, r - hr - mr)
             } else {
@@ -4055,12 +4157,18 @@ impl App {
             for &c in &col_ixs {
                 let cur = SheetCursor { row: r, col: c };
                 let cell_addr = cur.to_addr(grid);
+                let right_col_agg = right_col_agg_func(grid, c);
 
+                let mut is_agg_cell = false;
                 let text = if let Some(func) = footer_agg {
-                    if right_col_agg_func(grid, c).is_some() {
+                    if right_col_agg.is_some() {
+                        is_agg_cell = true;
+                        row_has_agg = true;
                         footer_special_col_aggregate(grid, func, c, mr, mc)
                             .unwrap_or_else(|| cell_effective_display(grid, &cell_addr))
                     } else if c >= lm && c < lm + mc {
+                        is_agg_cell = true;
+                        row_has_agg = true;
                         let main_col = (c - lm) as u32;
                         compute_aggregate(
                             grid,
@@ -4081,24 +4189,28 @@ impl App {
                     (left_margin_agg, left_margin_block_start, main_row_idx)
                 {
                     if c >= lm && c < lm + mc {
+                        is_agg_cell = true;
+                        row_has_agg = true;
                         let main_col = (c - lm) as u32;
-                        compute_aggregate(
+                        left_margin_main_col_aggregate(grid, func, main_row, main_col)
+                    } else if right_col_agg.is_some() {
+                        is_agg_cell = true;
+                        left_margin_special_col_aggregate(
                             grid,
-                            &AggregateDef {
-                                func,
-                                source: MainRange {
-                                    row_start: block_start,
-                                    row_end: main_row,
-                                    col_start: main_col,
-                                    col_end: main_col + 1,
-                                },
-                            },
+                            func,
+                            c,
+                            block_start,
+                            main_row,
+                            data_main_col_count(grid),
                         )
+                        .unwrap_or_else(|| cell_effective_display(grid, &cell_addr))
                     } else {
                         cell_effective_display(grid, &cell_addr)
                     }
                 } else if r >= hr && r < hr + mr {
-                    if let Some(func) = right_col_agg_func(grid, c) {
+                    if let Some(func) = right_col_agg {
+                        is_agg_cell = true;
+                        row_has_agg = true;
                         let main_row = (r - hr) as u32;
                         let data_cols = data_main_col_count(grid);
                         compute_aggregate(
@@ -4170,6 +4282,9 @@ impl App {
                 } else {
                     Style::default()
                 };
+                if is_agg_cell && !is_cur && !sel {
+                    st = st.fg(Color::Cyan).add_modifier(Modifier::BOLD);
+                }
                 let is_tilde_row = r == hr.saturating_sub(1);
                 let is_last_data_row = r == hr + mr - 1;
                 if is_tilde_row || is_last_data_row {
@@ -4184,6 +4299,7 @@ impl App {
                 }
             }
             lines.push(Line::from(spans));
+            line_bold.push(row_has_agg);
         }
 
         let n = lines.len().min(inner_h);
@@ -4197,10 +4313,11 @@ impl App {
                 .constraints(constraints)
                 .split(inner);
             for i in 0..n {
-                f.render_widget(
-                    Paragraph::new(lines[i].clone()).left_aligned(),
-                    row_areas[i],
-                );
+                let mut para = Paragraph::new(lines[i].clone()).left_aligned();
+                if line_bold.get(i).copied().unwrap_or(false) {
+                    para = para.style(Style::default().add_modifier(Modifier::BOLD));
+                }
+                f.render_widget(para, row_areas[i]);
             }
         }
 
@@ -5514,6 +5631,10 @@ impl App {
                 formula_cursor,
                 fit_to_content_on_commit: _,
             } => match key.code {
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.edit_special_palette = false;
+                    let _ = copy_to_clipboard(buffer);
+                }
                 KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     *formula_cursor = None;
                     self.edit_special_palette = false;
@@ -5523,16 +5644,32 @@ impl App {
                     } else {
                         paste
                     };
-                    Self::insert_text_into_buffer(buffer, &mut self.edit_cursor, &text);
+                    *buffer = text;
+                    self.edit_cursor = Some(buffer.chars().count());
+                }
+                KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.edit_special_palette = false;
+                    let _ = copy_to_clipboard(buffer);
+                    *formula_cursor = None;
+                    buffer.clear();
+                    self.edit_cursor = Some(0);
                 }
                 KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     *formula_cursor = None;
                     self.edit_special_palette = false;
                     let paste = read_clipboard().map_err(io::Error::other)?;
-                    Self::insert_text_into_buffer(buffer, &mut self.edit_cursor, &paste);
+                    *buffer = paste;
+                    self.edit_cursor = Some(buffer.chars().count());
                 }
                 KeyCode::Enter => {
                     mode = self.commit_edit_and_move_down(buffer)?;
+                }
+                KeyCode::Delete => {
+                    self.edit_special_palette = false;
+                    *formula_cursor = None;
+                    buffer.clear();
+                    self.edit_cursor = Some(0);
+                    mode = self.commit_edit_buffer(buffer).map(|_| Mode::Normal)?;
                 }
                 KeyCode::Tab => {
                     let addr = self.cursor.to_addr(&self.state.grid);
@@ -6279,7 +6416,7 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()))
             .unwrap();
-        assert_eq!(app.cursor.row, HEADER_ROWS);
+        assert_eq!(app.cursor.row, HEADER_ROWS + 1);
 
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()))
             .unwrap();
@@ -6352,8 +6489,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(app.state.grid.main_rows(), 5);
-        assert_eq!(app.cursor.row, HEADER_ROWS + 1);
-        assert_eq!(app.anchor.unwrap().row, HEADER_ROWS);
+        assert_eq!(app.cursor.row, HEADER_ROWS);
+        assert!(app.anchor.is_none());
         assert_eq!(app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }), None);
         assert_eq!(app.state.grid.get(&CellAddr::Main { row: 1, col: 0 }), None);
         assert_eq!(
@@ -7182,9 +7319,237 @@ mod tests {
             .find(|line| line.contains("TOTAL"))
             .unwrap_or_default();
 
+        println!("{}", line);
+
         assert!(line.contains("TOTAL"));
         assert!(line.contains("33"));
         assert!(line.contains("99"));
+    }
+
+    #[test]
+    fn left_margin_total_rows_include_right_margin_subtotals_of_totals() {
+        let mut state = SheetState::new(6, 2);
+        state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "11".into());
+        state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 1 }, "1".into());
+        state
+            .grid
+            .set(&CellAddr::Main { row: 1, col: 0 }, "22".into());
+        state
+            .grid
+            .set(&CellAddr::Main { row: 1, col: 1 }, "2".into());
+        state.grid.set(
+            &CellAddr::Left {
+                col: (MARGIN_COLS - 1) as u8,
+                row: 2,
+            },
+            "TOTAL".into(),
+        );
+        state
+            .grid
+            .set(&CellAddr::Main { row: 3, col: 0 }, "33".into());
+        state
+            .grid
+            .set(&CellAddr::Main { row: 3, col: 1 }, "3".into());
+        state
+            .grid
+            .set(&CellAddr::Main { row: 4, col: 0 }, "44".into());
+        state
+            .grid
+            .set(&CellAddr::Main { row: 4, col: 1 }, "4".into());
+        state.grid.set(
+            &CellAddr::Left {
+                col: (MARGIN_COLS - 1) as u8,
+                row: 5,
+            },
+            "TOTAL".into(),
+        );
+        let right_col = MARGIN_COLS + state.grid.main_cols() + 1;
+        state.grid.set(
+            &CellAddr::Header {
+                row: (HEADER_ROWS - 1) as u8,
+                col: right_col as u32,
+            },
+            "TOTAL".into(),
+        );
+
+        assert_eq!(
+            left_margin_special_col_aggregate(&state.grid, AggFunc::Sum, right_col, 0, 2, 2),
+            Some("36".into())
+        );
+        assert_eq!(
+            left_margin_special_col_aggregate(&state.grid, AggFunc::Sum, right_col, 3, 5, 2),
+            Some("84".into())
+        );
+    }
+
+    #[test]
+    fn aggregate_columns_render_in_cyan() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(6, 2);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "11".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 1 }, "1".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 1, col: 0 }, "22".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 1, col: 1 }, "2".into());
+        app.state.grid.set(
+            &CellAddr::Left {
+                col: (MARGIN_COLS - 1) as u8,
+                row: 2,
+            },
+            "TOTAL".into(),
+        );
+        app.state.grid.set(
+            &CellAddr::Header {
+                row: (HEADER_ROWS - 1) as u8,
+                col: (MARGIN_COLS + app.state.grid.main_cols() + 1) as u32,
+            },
+            "TOTAL".into(),
+        );
+
+        let backend = TestBackend::new(96, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let saw_cyan_numeric = (0..buffer.area.height).any(|y| {
+            (0..buffer.area.width).any(|x| {
+                let cell = &buffer[(x, y)];
+                cell.style().fg == Some(Color::Cyan) && cell.symbol().trim().parse::<f64>().is_ok()
+            })
+        });
+        assert!(saw_cyan_numeric);
+    }
+
+    #[test]
+    fn left_margin_max_uses_previous_total_row() {
+        let mut state = SheetState::new(6, 2);
+        state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "11".into());
+        state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 1 }, "1".into());
+        state
+            .grid
+            .set(&CellAddr::Main { row: 1, col: 0 }, "22".into());
+        state
+            .grid
+            .set(&CellAddr::Main { row: 1, col: 1 }, "2".into());
+        state.grid.set(
+            &CellAddr::Left {
+                col: (MARGIN_COLS - 1) as u8,
+                row: 2,
+            },
+            "TOTAL".into(),
+        );
+        state
+            .grid
+            .set(&CellAddr::Main { row: 3, col: 0 }, "33".into());
+        state
+            .grid
+            .set(&CellAddr::Main { row: 3, col: 1 }, "3".into());
+        state
+            .grid
+            .set(&CellAddr::Main { row: 4, col: 0 }, "44".into());
+        state
+            .grid
+            .set(&CellAddr::Main { row: 4, col: 1 }, "4".into());
+        state.grid.set(
+            &CellAddr::Left {
+                col: (MARGIN_COLS - 1) as u8,
+                row: 5,
+            },
+            "MAX".into(),
+        );
+
+        let right_col = MARGIN_COLS + state.grid.main_cols() + 1;
+        state.grid.set(
+            &CellAddr::Header {
+                row: (HEADER_ROWS - 1) as u8,
+                col: right_col as u32,
+            },
+            "TOTAL".into(),
+        );
+
+        assert_eq!(row_total_block_start(&state.grid, 5), 3);
+        assert_eq!(
+            left_margin_special_col_aggregate(&state.grid, AggFunc::Max, right_col, 3, 5, 2),
+            Some("48".into())
+        );
+    }
+
+    #[test]
+    fn stacked_left_margin_max_falls_back_to_previous_raw_block() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(4, 2);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "11".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 1 }, "1".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 1, col: 0 }, "22".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 1, col: 1 }, "2".into());
+        app.state.grid.set(
+            &CellAddr::Left {
+                col: (MARGIN_COLS - 1) as u8,
+                row: 2,
+            },
+            "TOTAL".into(),
+        );
+        app.state.grid.set(
+            &CellAddr::Left {
+                col: (MARGIN_COLS - 1) as u8,
+                row: 3,
+            },
+            "MAX".into(),
+        );
+        app.state.grid.set(
+            &CellAddr::Header {
+                row: (HEADER_ROWS - 1) as u8,
+                col: (MARGIN_COLS + app.state.grid.main_cols() + 1) as u32,
+            },
+            "TOTAL".into(),
+        );
+
+        let backend = TestBackend::new(90, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = |y: u16| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+
+        let max_line = (0..buffer.area.height)
+            .map(row)
+            .find(|line| line.contains("MAX"))
+            .unwrap_or_default();
+
+        assert!(max_line.contains("22"));
+        assert!(max_line.contains("2"));
     }
 
     #[test]
@@ -7647,7 +8012,7 @@ mod tests {
         .unwrap();
 
         match &app.mode {
-            Mode::Edit { buffer, .. } => assert_eq!(buffer, "=A1"),
+            Mode::Edit { buffer, .. } => assert_eq!(buffer, "A1"),
             other => panic!("unexpected mode: {other:?}"),
         }
     }
@@ -7942,6 +8307,75 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::empty()))
             .unwrap();
         assert_eq!(app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }), None);
+    }
+
+    #[test]
+    fn edit_mode_clipboard_ops_target_whole_cell() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 1);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "hello".into());
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        };
+        app.mode = Mode::Edit {
+            buffer: "hello".into(),
+            formula_cursor: None,
+            fit_to_content_on_commit: false,
+        };
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::empty()))
+            .unwrap();
+        assert_eq!(app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }), None);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .unwrap();
+        assert_eq!(
+            app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }),
+            Some("hello")
+        );
+    }
+
+    #[test]
+    fn edit_mode_formula_bar_stays_on_original_cell_when_moving_left() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 2);
+        app.state.grid.set(
+            &CellAddr::Main { row: 0, col: 0 },
+            "=A*0.1 -- TAX TAX".into(),
+        );
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        };
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .unwrap();
+        app.mode = Mode::Edit {
+            buffer: "=A*0.1 -- TAX TAX".into(),
+            formula_cursor: None,
+            fit_to_content_on_commit: false,
+        };
+        app.edit_target_addr = Some(CellAddr::Main { row: 0, col: 0 });
+
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::empty()))
+            .unwrap();
+
+        assert_eq!(app.cursor.col, MARGIN_COLS);
+        assert_eq!(
+            app.edit_target_addr,
+            Some(CellAddr::Main { row: 0, col: 0 })
+        );
+        assert_eq!(
+            app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }),
+            Some("=A*0.1 -- TAX TAX")
+        );
     }
 
     #[test]
@@ -8272,7 +8706,7 @@ mod tests {
         assert_eq!(app.view_sheet_id, 4);
         assert_eq!(app.workbook.sheet_title(3), "Sheet1 Copy");
         assert_eq!(app.state.grid.main_rows(), 15);
-        assert_eq!(app.state.grid.main_cols(), 5);
+        assert_eq!(app.state.grid.main_cols(), 7);
     }
 
     #[test]
