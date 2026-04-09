@@ -2535,6 +2535,35 @@ impl App {
         Ok(())
     }
 
+    fn commit_edit_and_move_down(&mut self, buffer: &str) -> Result<Mode, RunError> {
+        self.edit_cursor = None;
+        self.commit_edit_buffer(buffer)?;
+
+        let hr = HEADER_ROWS;
+        let last_main = hr + self.state.grid.main_rows().saturating_sub(1);
+        if self.cursor.row == last_main && trailing_blank_main_rows(&self.state) < NAV_BLANK_ROWS {
+            self.state.grid.grow_main_row_at_bottom();
+        }
+        self.cursor.row = self.cursor.row.saturating_add(1);
+        self.cursor.clamp(&self.state.grid);
+        self.state
+            .grid
+            .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
+
+        let addr = self.cursor.to_addr(&self.state.grid);
+        let cur = cell_display(&self.state.grid, &addr);
+        Ok(self.start_edit_mode(
+            cur.clone(),
+            if cur.trim() == "=" {
+                Some(self.cursor)
+            } else {
+                None
+            },
+            false,
+            false,
+        ))
+    }
+
     fn fit_column_to_content_from_current_cell(&mut self, addr: CellAddr) {
         match addr {
             CellAddr::Main { col, .. } => self.state.grid.set_col_width(
@@ -5177,9 +5206,7 @@ impl App {
                     Self::insert_text_into_buffer(buffer, &mut self.edit_cursor, &paste);
                 }
                 KeyCode::Enter => {
-                    self.commit_edit_buffer(buffer)?;
-                    self.edit_cursor = None;
-                    mode = Mode::Normal;
+                    mode = self.commit_edit_and_move_down(buffer)?;
                 }
                 KeyCode::Tab => {
                     let addr = self.cursor.to_addr(&self.state.grid);
@@ -5267,33 +5294,7 @@ impl App {
                     );
                 }
                 KeyCode::Down => {
-                    self.edit_cursor = None;
-                    let raw = buffer.clone();
-                    self.commit_edit_buffer(&raw)?;
-                    let hr = HEADER_ROWS;
-                    let last_main = hr + self.state.grid.main_rows().saturating_sub(1);
-                    if self.cursor.row == last_main
-                        && trailing_blank_main_rows(&self.state) < NAV_BLANK_ROWS
-                    {
-                        self.state.grid.grow_main_row_at_bottom();
-                    }
-                    self.cursor.row = self.cursor.row.saturating_add(1);
-                    self.cursor.clamp(&self.state.grid);
-                    self.state
-                        .grid
-                        .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
-                    let addr = self.cursor.to_addr(&self.state.grid);
-                    let cur = cell_display(&self.state.grid, &addr);
-                    mode = self.start_edit_mode(
-                        cur.clone(),
-                        if cur.trim() == "=" {
-                            Some(self.cursor)
-                        } else {
-                            None
-                        },
-                        false,
-                        false,
-                    );
+                    mode = self.commit_edit_and_move_down(buffer)?;
                 }
                 KeyCode::Esc => {
                     self.edit_cursor = None;
@@ -7363,6 +7364,31 @@ mod tests {
         assert_eq!(
             app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }),
             Some("Sheet2 value")
+        );
+    }
+
+    #[test]
+    fn enter_in_edit_mode_commits_and_moves_down() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(2, 1);
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        };
+        app.mode = Mode::Edit {
+            buffer: "first".into(),
+            formula_cursor: None,
+            fit_to_content_on_commit: false,
+        };
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .unwrap();
+
+        assert!(matches!(app.mode, Mode::Edit { .. }));
+        assert_eq!(app.cursor.row, HEADER_ROWS + 1);
+        assert_eq!(
+            app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }),
+            Some("first")
         );
     }
 
