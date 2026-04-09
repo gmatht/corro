@@ -2,8 +2,8 @@
 
 use crate::grid::CellAddr;
 use crate::ops::{
-    append_line, append_op, apply_line, apply_log_line_to_workbook, replay_lines, Op, SheetState,
-    WorkbookOp, WorkbookSnapshot, WorkbookState,
+    append_line, append_op, apply_line, apply_log_line_to_workbook, replay_lines,
+    replay_lines_partial, Op, SheetState, WorkbookOp, WorkbookSnapshot, WorkbookState,
 };
 use notify::{RecursiveMode, Watcher};
 use std::fs;
@@ -20,11 +20,81 @@ pub enum IoError {
     Notify(#[from] notify::Error),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartialReplay {
+    pub op_count: usize,
+    pub failed_line: Option<usize>,
+    pub error: Option<String>,
+}
+
 /// Load entire file from disk and replay into `state`. Returns `(byte_len, op_count)`.
 pub fn load_full(path: &Path, state: &mut SheetState) -> Result<(u64, usize), IoError> {
     let data = fs::read_to_string(path)?;
     let n = replay_lines(&data, state)?;
     Ok((data.len() as u64, n))
+}
+
+pub fn load_full_partial(
+    path: &Path,
+    state: &mut SheetState,
+) -> Result<(u64, PartialReplay), IoError> {
+    let data = fs::read_to_string(path)?;
+    let (n, failed_line, error) = replay_lines_partial(&data, state)?;
+    Ok((
+        data.len() as u64,
+        PartialReplay {
+            op_count: n,
+            failed_line,
+            error: error.map(|e| e.to_string()),
+        },
+    ))
+}
+
+pub fn load_revisions_partial(
+    path: &Path,
+    limit: usize,
+    state: &mut SheetState,
+) -> Result<(u64, PartialReplay), IoError> {
+    let data = fs::read_to_string(path)?;
+    if limit == 0 {
+        return Ok((
+            data.len() as u64,
+            PartialReplay {
+                op_count: 0,
+                failed_line: None,
+                error: None,
+            },
+        ));
+    }
+    let mut n = 0usize;
+    for (idx, line) in data.lines().enumerate() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if let Err(err) = apply_line(t, state) {
+            return Ok((
+                data.len() as u64,
+                PartialReplay {
+                    op_count: n,
+                    failed_line: Some(idx + 1),
+                    error: Some(err.to_string()),
+                },
+            ));
+        }
+        n += 1;
+        if n >= limit {
+            break;
+        }
+    }
+    Ok((
+        data.len() as u64,
+        PartialReplay {
+            op_count: n,
+            failed_line: None,
+            error: None,
+        },
+    ))
 }
 
 /// Load at most `limit` log entries from disk and replay into a workbook snapshot.
@@ -51,6 +121,54 @@ pub fn load_workbook_revisions(
         }
     }
     Ok((data.len() as u64, n))
+}
+
+pub fn load_workbook_revisions_partial(
+    path: &Path,
+    limit: usize,
+    workbook: &mut WorkbookState,
+    active_sheet: &mut u32,
+) -> Result<(u64, PartialReplay), IoError> {
+    let data = fs::read_to_string(path)?;
+    if limit == 0 {
+        return Ok((
+            data.len() as u64,
+            PartialReplay {
+                op_count: 0,
+                failed_line: None,
+                error: None,
+            },
+        ));
+    }
+    let mut n = 0usize;
+    for (idx, line) in data.lines().enumerate() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if let Err(err) = apply_log_line_to_workbook(t, workbook, active_sheet) {
+            return Ok((
+                data.len() as u64,
+                PartialReplay {
+                    op_count: n,
+                    failed_line: Some(idx + 1),
+                    error: Some(err.to_string()),
+                },
+            ));
+        }
+        n += 1;
+        if n >= limit {
+            break;
+        }
+    }
+    Ok((
+        data.len() as u64,
+        PartialReplay {
+            op_count: n,
+            failed_line: None,
+            error: None,
+        },
+    ))
 }
 
 pub fn save_workbook(path: &Path, workbook: &WorkbookSnapshot) -> Result<(), IoError> {
@@ -583,6 +701,26 @@ mod tests {
             Some("7")
         );
         assert_eq!(state.grid.get(&CellAddr::Main { row: 2, col: 0 }), None);
+    }
+
+    #[test]
+    fn load_revisions_partial_reports_bad_line() {
+        let tmp = NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "SET A1 1\nBAD LINE\nSET A2 2\n").unwrap();
+        let mut state = SheetState::new(1, 1);
+        let (_, replay) = load_revisions_partial(tmp.path(), usize::MAX, &mut state).unwrap();
+
+        assert_eq!(replay.op_count, 1);
+        assert_eq!(replay.failed_line, Some(2));
+        assert!(replay
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("unrecognized"));
+        assert_eq!(
+            state.grid.get(&CellAddr::Main { row: 0, col: 0 }),
+            Some("1")
+        );
     }
 
     #[test]

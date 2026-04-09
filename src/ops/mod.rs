@@ -954,6 +954,25 @@ pub fn replay_lines(data: &str, state: &mut SheetState) -> Result<usize, std::io
     Ok(n)
 }
 
+/// Replay text log lines until the first malformed entry.
+pub fn replay_lines_partial(
+    data: &str,
+    state: &mut SheetState,
+) -> Result<(usize, Option<usize>, Option<std::io::Error>), std::io::Error> {
+    let mut n = 0usize;
+    for (idx, line) in data.lines().enumerate() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if let Err(err) = apply_any_line(t, state) {
+            return Ok((n, Some(idx + 1), Some(err)));
+        }
+        n += 1;
+    }
+    Ok((n, None, None))
+}
+
 /// Parse a single line and apply; used when tailing.
 pub fn apply_line(line: &str, state: &mut SheetState) -> Result<(), std::io::Error> {
     let t = line.trim();

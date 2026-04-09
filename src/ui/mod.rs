@@ -9,8 +9,8 @@ use crate::formula::{cell_effective_display, is_formula};
 use crate::grid::MainRange;
 use crate::grid::{CellAddr, Grid, SortSpec, FOOTER_ROWS, HEADER_ROWS, MARGIN_COLS};
 use crate::io::{
-    commit_line, commit_workbook_op, load_full, load_revisions, load_workbook_revisions, IoError,
-    LogWatcher,
+    commit_line, commit_workbook_op, load_full, load_revisions, load_revisions_partial,
+    load_workbook_revisions, load_workbook_revisions_partial, IoError, LogWatcher, PartialReplay,
 };
 use crate::ops::{AggFunc, AggregateDef, Op, SheetState, WorkbookState};
 use crossterm::cursor::{Hide, Show};
@@ -289,6 +289,7 @@ enum MenuAction {
     Find,
     Replace,
     OpenFile,
+    Replay,
     SaveAs,
     RenameSheet,
     CopySheet,
@@ -352,7 +353,7 @@ const EDIT_MENU_ITEMS: [MenuItem; 5] = [
     },
 ];
 
-const FILE_MENU_ITEMS: [MenuItem; 7] = [
+const FILE_MENU_ITEMS: [MenuItem; 8] = [
     MenuItem {
         shortcut: 'O',
         label: "Open file",
@@ -387,6 +388,11 @@ const FILE_MENU_ITEMS: [MenuItem; 7] = [
         shortcut: 'X',
         label: "Exit",
         target: MenuTarget::Action(MenuAction::Exit),
+    },
+    MenuItem {
+        shortcut: 'R',
+        label: "Replay",
+        target: MenuTarget::Action(MenuAction::Replay),
     },
 ];
 
@@ -785,6 +791,31 @@ impl App {
                 buffer: self.start_input_mode(String::new()),
             },
             MenuAction::OpenFile => {
+                let buffer = self.open_path_prompt_buffer();
+                Mode::OpenPath {
+                    buffer: self.start_input_mode(buffer),
+                }
+            }
+            MenuAction::Replay => {
+                if let Some(path) = self.path.clone().or(self.source_path.clone()) {
+                    if path.exists() {
+                        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                            if ext.eq_ignore_ascii_case("corro") {
+                                self.revision_browse = true;
+                                self.revision_browse_limit = usize::MAX;
+                                self.source_path = Some(path.clone());
+                                self.path = None;
+                                if let Ok((off, replay)) = load_full_partial(&path, &mut self.state)
+                                {
+                                    self.offset = off;
+                                    self.ops_applied = replay.op_count;
+                                    self.status = Self::replay_status("Replayed", &path, &replay);
+                                }
+                                return Mode::RevisionBrowse;
+                            }
+                        }
+                    }
+                }
                 let buffer = self.open_path_prompt_buffer();
                 Mode::OpenPath {
                     buffer: self.start_input_mode(buffer),
@@ -1856,6 +1887,15 @@ impl App {
         }
     }
 
+    fn replay_status(prefix: &str, path: &Path, replay: &PartialReplay) -> String {
+        match (replay.failed_line, replay.error.as_deref()) {
+            (Some(line), Some(err)) => {
+                format!("{prefix} {} stopped at line {line}: {err}", path.display())
+            }
+            _ => format!("{prefix} {}", path.display()),
+        }
+    }
+
     fn reload_revision_browse(&mut self) -> Result<(), IoError> {
         let Some(path) = self.source_path.clone() else {
             return Ok(());
@@ -1983,17 +2023,12 @@ impl App {
                         let data = std::fs::read_to_string(p).map_err(|e| IoError::Io(e))?;
                         let mut workbook = WorkbookState::new();
                         let mut active_sheet = workbook.sheet_id(workbook.active_sheet);
-                        for line in data.lines() {
-                            let t = line.trim();
-                            if t.is_empty() {
-                                continue;
-                            }
-                            crate::ops::apply_log_line_to_workbook(
-                                t,
-                                &mut workbook,
-                                &mut active_sheet,
-                            )?;
-                        }
+                        let (_, replay) = load_workbook_revisions_partial(
+                            p,
+                            usize::MAX,
+                            &mut workbook,
+                            &mut active_sheet,
+                        )?;
                         self.workbook = workbook;
                         self.view_sheet_id = active_sheet;
                         self.sync_active_sheet_cache();
@@ -2001,13 +2036,12 @@ impl App {
                             self.state.grid.fit_column_to_content(MARGIN_COLS + c);
                         }
                         self.offset = data.len() as u64;
-                        self.ops_applied =
-                            data.lines().filter(|line| !line.trim().is_empty()).count();
+                        self.ops_applied = replay.op_count;
                         self.path = Some(p.clone());
                         self.source_path = None;
                         self.revision_limit = None;
                         self.watcher = Some(LogWatcher::new(p.clone())?);
-                        self.status = format!("Loaded workbook {}", p.display());
+                        self.status = Self::replay_status("Loaded workbook", p, &replay);
                         self.cursor.clamp(&self.state.grid);
                         return Ok(());
                     }
@@ -2041,7 +2075,7 @@ impl App {
                             self.state = SheetState::new(1, 1);
                             let mut active_sheet =
                                 self.workbook.sheet_id(self.workbook.active_sheet);
-                            let (off, n) = load_workbook_revisions(
+                            let (off, replay) = load_workbook_revisions_partial(
                                 p,
                                 self.revision_browse_limit,
                                 &mut self.workbook,
@@ -2053,15 +2087,11 @@ impl App {
                                 self.state.grid.fit_column_to_content(MARGIN_COLS + c);
                             }
                             self.offset = off;
-                            self.ops_applied = n;
+                            self.ops_applied = replay.op_count;
                             self.path = None;
                             self.source_path = Some(p.clone());
                             self.watcher = None;
-                            self.status = format!(
-                                "Browsing {} @ revision {}",
-                                p.display(),
-                                self.revision_browse_limit
-                            );
+                            self.status = Self::replay_status("Browsing", p, &replay);
                             self.cursor.clamp(&self.state.grid);
                             return Ok(());
                         }
@@ -2945,15 +2975,12 @@ impl App {
             move_op.apply(&mut self.state);
         }
 
-        self.anchor = Some(SheetCursor {
+        self.cursor = SheetCursor {
             row: HEADER_ROWS + from as usize,
             col: MARGIN_COLS,
-        });
-        self.cursor = SheetCursor {
-            row: HEADER_ROWS + (from + count - 1) as usize,
-            col: MARGIN_COLS + self.state.grid.main_cols().saturating_sub(1),
         };
-        self.selection_kind = SelectionKind::Rows;
+        self.anchor = None;
+        self.selection_kind = SelectionKind::Cells;
         self.status = if count == 1 {
             format!("Inserted 1 row above row {from}")
         } else {
@@ -3017,15 +3044,12 @@ impl App {
         } else {
             move_op.apply(&mut self.state);
         }
-        self.anchor = Some(SheetCursor {
+        self.cursor = SheetCursor {
             row: HEADER_ROWS + row as usize,
             col: MARGIN_COLS,
-        });
-        self.cursor = SheetCursor {
-            row: HEADER_ROWS + (row + count - 1) as usize,
-            col: MARGIN_COLS + self.state.grid.main_cols().saturating_sub(1),
         };
-        self.selection_kind = SelectionKind::Rows;
+        self.anchor = None;
+        self.selection_kind = SelectionKind::Cells;
         self.status = if count == 1 {
             format!("Inserted 1 row above row {row}")
         } else {
@@ -4026,6 +4050,7 @@ impl App {
             };
 
             let left_margin_agg = main_row_idx.and_then(|mri| left_margin_agg_func(grid, mri));
+            let left_margin_block_start = main_row_idx.map(|mri| row_total_block_start(grid, mri));
 
             for &c in &col_ixs {
                 let cur = SheetCursor { row: r, col: c };
@@ -4052,8 +4077,26 @@ impl App {
                     } else {
                         cell_effective_display(grid, &cell_addr)
                     }
-                } else if left_margin_agg.is_some() {
-                    cell_effective_display(grid, &cell_addr)
+                } else if let (Some(func), Some(block_start), Some(main_row)) =
+                    (left_margin_agg, left_margin_block_start, main_row_idx)
+                {
+                    if c >= lm && c < lm + mc {
+                        let main_col = (c - lm) as u32;
+                        compute_aggregate(
+                            grid,
+                            &AggregateDef {
+                                func,
+                                source: MainRange {
+                                    row_start: block_start,
+                                    row_end: main_row,
+                                    col_start: main_col,
+                                    col_end: main_col + 1,
+                                },
+                            },
+                        )
+                    } else {
+                        cell_effective_display(grid, &cell_addr)
+                    }
                 } else if r >= hr && r < hr + mr {
                     if let Some(func) = right_col_agg_func(grid, c) {
                         let main_row = (r - hr) as u32;
@@ -5334,7 +5377,7 @@ impl App {
                         self.status = "Path required".into();
                     }
                     Err(OpenPathError::InvalidRevisionSyntax) => {
-                        self.status = "Link syntax: link <file> <revision>".into();
+                        self.status = "Syntax: link <file> <revision>".into();
                     }
                     Ok(OpenPathRequest::Plain(path)) => {
                         self.path = Some(path.clone());
@@ -5398,14 +5441,14 @@ impl App {
                                 .to_lowercase();
                             if matches!(ext.as_str(), "csv" | "tsv") {
                                 self.status = "Link only works for .corro logs".into();
-                            } else if let Ok((off, n)) =
-                                load_revisions(&path, revision, &mut self.state)
+                            } else if let Ok((off, replay)) =
+                                load_revisions_partial(&path, revision, &mut self.state)
                             {
                                 self.path = None;
                                 self.source_path = Some(path.clone());
                                 self.revision_limit = Some(revision);
                                 self.offset = off;
-                                self.ops_applied = n;
+                                self.ops_applied = replay.op_count;
                                 self.watcher = None;
                                 self.cursor = SheetCursor {
                                     row: HEADER_ROWS,
@@ -5413,11 +5456,10 @@ impl App {
                                 };
                                 self.row_scroll = 0;
                                 self.col_scroll = 0;
-                                self.status =
-                                    format!("Linked {} @ revision {}", path.display(), revision);
+                                self.status = Self::replay_status("Linked", &path, &replay);
                                 mode = Mode::Normal;
                             } else {
-                                self.status = format!("Link load failed: {}", path.display());
+                                self.status = format!("Load failed: {}", path.display());
                             }
                         }
                     }
@@ -5672,6 +5714,22 @@ impl App {
                     return Ok(false);
                 }
 
+                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('x') {
+                    if !self.delete_selection() {
+                        let addr = self.cursor.to_addr(&self.state.grid);
+                        if self.state.grid.get(&addr).is_some() {
+                            let op = Op::FillRange {
+                                cells: vec![(addr, String::new())],
+                            };
+                            if self.apply_single_op(op).is_ok() {
+                                self.status = "Cell cut".into();
+                            }
+                        }
+                    }
+                    self.mode = mode;
+                    return Ok(false);
+                }
+
                 if key.modifiers.contains(KeyModifiers::CONTROL)
                     || key.modifiers.contains(KeyModifiers::SUPER)
                 {
@@ -5748,6 +5806,21 @@ impl App {
                         self.anchor = None;
                         if self.anchor.is_none() {
                             mode = Mode::QuitPrompt;
+                        }
+                    }
+                    KeyCode::Delete => {
+                        if !self.delete_selection() {
+                            let addr = self.cursor.to_addr(&self.state.grid);
+                            if self.state.grid.get(&addr).is_some() {
+                                let op = Op::FillRange {
+                                    cells: vec![(addr, String::new())],
+                                };
+                                if self.apply_single_op(op).is_ok() {
+                                    self.status = "Cell deleted".into();
+                                }
+                            } else {
+                                self.status = "Nothing to delete".into();
+                            }
                         }
                     }
                     KeyCode::Left if key.modifiers.contains(KeyModifiers::SHIFT) && ctrl_or_cmd => {
@@ -5956,7 +6029,7 @@ impl App {
                     KeyCode::Char('?') => {
                         mode = Mode::Help;
                     }
-                    KeyCode::Delete | KeyCode::Backspace => {
+                    KeyCode::Backspace => {
                         if !self.delete_selection() {
                             if let Some(addr) = self.addr_at(self.cursor.row, self.cursor.col) {
                                 if self.state.grid.get(&addr).unwrap_or("").is_empty() {
@@ -6206,7 +6279,7 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()))
             .unwrap();
-        assert_eq!(app.cursor.row, HEADER_ROWS + 1);
+        assert_eq!(app.cursor.row, HEADER_ROWS);
 
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()))
             .unwrap();
@@ -7068,6 +7141,53 @@ mod tests {
     }
 
     #[test]
+    fn left_margin_total_row_computes_subtotals() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(3, 2);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "11".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 1 }, "44".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 1, col: 0 }, "22".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 1, col: 1 }, "55".into());
+        app.state.grid.set(
+            &CellAddr::Left {
+                col: (MARGIN_COLS - 1) as u8,
+                row: 2,
+            },
+            "TOTAL".into(),
+        );
+
+        let backend = TestBackend::new(80, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = |y: u16| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+
+        let line = (0..buffer.area.height)
+            .map(row)
+            .find(|line| line.contains("TOTAL"))
+            .unwrap_or_default();
+
+        assert!(line.contains("TOTAL"));
+        assert!(line.contains("33"));
+        assert!(line.contains("99"));
+    }
+
+    #[test]
     fn widened_column_shows_full_cell_text() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
@@ -7202,6 +7322,12 @@ mod tests {
         app.save_to_path(path.path()).unwrap();
 
         assert_eq!(app.revision_limit, None);
+    }
+
+    #[test]
+    fn file_menu_includes_replay() {
+        let items = menu_items(MenuSection::File);
+        assert!(items.iter().any(|item| item.label == "Replay"));
     }
 
     #[test]
@@ -7772,6 +7898,53 @@ mod tests {
     }
 
     #[test]
+    fn formula_entry_preserves_main_grid_formula_text() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 2);
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS + 1,
+        };
+        app.mode = Mode::Edit {
+            buffer: "=A*0.1 -- TAX TAX".into(),
+            formula_cursor: None,
+            fit_to_content_on_commit: false,
+        };
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .unwrap();
+
+        assert_eq!(
+            app.state.grid.get(&CellAddr::Main { row: 0, col: 1 }),
+            Some("=A*0.1 -- TAX TAX")
+        );
+    }
+
+    #[test]
+    fn ctrl_x_cuts_current_cell_and_delete_clears_it() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 1);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "hello".into());
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        };
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL))
+            .unwrap();
+        assert_eq!(app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }), None);
+
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "hello".into());
+        app.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::empty()))
+            .unwrap();
+        assert_eq!(app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }), None);
+    }
+
+    #[test]
     fn esc_while_quit_prompted_exits() {
         let mut app = App::new(None);
         app.mode = Mode::QuitPrompt;
@@ -8098,8 +8271,24 @@ mod tests {
         assert_eq!(app.workbook.sheet_count(), 4);
         assert_eq!(app.view_sheet_id, 4);
         assert_eq!(app.workbook.sheet_title(3), "Sheet1 Copy");
-        assert_eq!(app.state.grid.main_rows(), 13);
+        assert_eq!(app.state.grid.main_rows(), 15);
         assert_eq!(app.state.grid.main_cols(), 5);
+    }
+
+    #[test]
+    fn insert_row_returns_to_normal_cell_mode() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(2, 2);
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        };
+
+        app.insert_rows_above_cursor(1).unwrap();
+
+        assert_eq!(app.selection_kind, SelectionKind::Cells);
+        assert!(app.anchor.is_none());
+        assert_eq!(app.cursor.row, HEADER_ROWS);
     }
 
     #[test]
