@@ -27,6 +27,32 @@ pub fn load_full(path: &Path, state: &mut SheetState) -> Result<(u64, usize), Io
     Ok((data.len() as u64, n))
 }
 
+/// Load at most `limit` log entries from disk and replay into a workbook snapshot.
+pub fn load_workbook_revisions(
+    path: &Path,
+    limit: usize,
+    workbook: &mut WorkbookState,
+    active_sheet: &mut u32,
+) -> Result<(u64, usize), IoError> {
+    let data = fs::read_to_string(path)?;
+    if limit == 0 {
+        return Ok((data.len() as u64, 0));
+    }
+    let mut n = 0usize;
+    for line in data.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        apply_log_line_to_workbook(t, workbook, active_sheet)?;
+        n += 1;
+        if n >= limit {
+            break;
+        }
+    }
+    Ok((data.len() as u64, n))
+}
+
 pub fn save_workbook(path: &Path, workbook: &WorkbookSnapshot) -> Result<(), IoError> {
     let mut out = String::new();
     out.push_str(&format!(
@@ -598,6 +624,21 @@ mod tests {
                 .get(&CellAddr::Main { row: 0, col: 0 }),
             Some("hello")
         );
+    }
+
+    #[test]
+    fn workbook_replay_test5_corro_reports_first_failing_line() {
+        let data = fs::read_to_string(Path::new("test5.corro")).unwrap();
+        let mut workbook = WorkbookState::new();
+        let mut active_sheet = workbook.sheet_id(workbook.active_sheet);
+        for (idx, line) in data.lines().enumerate() {
+            let t = line.trim();
+            if t.is_empty() {
+                continue;
+            }
+            apply_log_line_to_workbook(t, &mut workbook, &mut active_sheet)
+                .unwrap_or_else(|e| panic!("line {}: {} ({e})", idx + 1, t));
+        }
     }
 
     #[test]

@@ -177,12 +177,20 @@ pub enum WorkbookOp {
         id: u32,
         title: String,
     },
+    CopySheet {
+        source_id: u32,
+        id: u32,
+        title: String,
+    },
     ActivateSheet {
         id: u32,
     },
     RenameSheet {
         id: u32,
         title: String,
+    },
+    MoveSheet {
+        id: u32,
     },
     BalanceReport {
         id: u32,
@@ -415,6 +423,14 @@ fn parse_op_text(line: &str) -> Option<Op> {
                 _ => None,
             }
         }
+        "SIZE" => {
+            let rows = parts.next()?.parse::<u32>().ok()?;
+            let cols = parts.next()?.parse::<u32>().ok()?;
+            Some(Op::SetMainSize {
+                main_rows: rows,
+                main_cols: cols,
+            })
+        }
         "MAX_COL_WIDTH" => parts
             .next()?
             .parse::<usize>()
@@ -501,8 +517,14 @@ impl WorkbookOp {
     pub fn to_log_line(&self, main_cols: usize) -> String {
         match self {
             WorkbookOp::NewSheet { id, title } => format!("${id}:NEW_SHEET {title}"),
+            WorkbookOp::CopySheet {
+                source_id,
+                id,
+                title,
+            } => format!("${id}:COPY_SHEET {source_id} {title}"),
             WorkbookOp::ActivateSheet { id } => format!("${id}:ACTIVATE_SHEET"),
             WorkbookOp::RenameSheet { id, title } => format!("${id}:RENAME_SHEET {title}"),
+            WorkbookOp::MoveSheet { id } => format!("${id}:MOVE_SHEET"),
             WorkbookOp::BalanceReport {
                 id,
                 title,
@@ -649,6 +671,18 @@ pub fn parse_workbook_line(line: &str) -> Result<WorkbookOp, std::io::Error> {
                 title,
             })
         }
+        "COPY_SHEET" => {
+            let source_id = parts
+                .next()
+                .and_then(|v| v.parse::<u32>().ok())
+                .ok_or_else(|| bad("bad sheet copy line"))?;
+            let title = parts.collect::<Vec<_>>().join(" ");
+            Ok(WorkbookOp::CopySheet {
+                source_id,
+                id: sheet_id,
+                title,
+            })
+        }
         "ACTIVATE_SHEET" => Ok(WorkbookOp::ActivateSheet { id: sheet_id }),
         "RENAME_SHEET" => {
             let title = parts.collect::<Vec<_>>().join(" ");
@@ -657,6 +691,7 @@ pub fn parse_workbook_line(line: &str) -> Result<WorkbookOp, std::io::Error> {
                 title,
             })
         }
+        "MOVE_SHEET" => Ok(WorkbookOp::MoveSheet { id: sheet_id }),
         "BALANCE_REPORT" => {
             let title = parts
                 .next()
@@ -721,6 +756,33 @@ pub fn apply_workbook_op(
             }
             Ok(())
         }
+        WorkbookOp::CopySheet {
+            source_id,
+            id,
+            title,
+        } => {
+            let source = workbook
+                .sheets
+                .iter()
+                .find(|s| s.id == source_id)
+                .ok_or_else(|| bad("unknown sheet id"))?
+                .clone();
+            if let Some(idx) = workbook.sheet_index_by_id(id) {
+                workbook.sheets[idx].title = title;
+                workbook.sheets[idx].state = source.state.clone();
+            } else {
+                workbook.add_sheet_record(SheetRecord {
+                    id,
+                    title,
+                    state: source.state,
+                });
+            }
+            workbook.active_sheet = workbook
+                .sheet_index_by_id(id)
+                .unwrap_or(workbook.active_sheet);
+            *active_sheet = id;
+            Ok(())
+        }
         WorkbookOp::ActivateSheet { id } => {
             let idx = workbook
                 .sheet_index_by_id(id)
@@ -736,6 +798,18 @@ pub fn apply_workbook_op(
                 .find(|s| s.id == id)
                 .ok_or_else(|| bad("unknown sheet id"))?;
             sheet.title = title;
+            Ok(())
+        }
+        WorkbookOp::MoveSheet { id } => {
+            let idx = workbook
+                .sheet_index_by_id(id)
+                .ok_or_else(|| bad("unknown sheet id"))?;
+            let sheet = workbook.sheets.remove(idx);
+            workbook.sheets.push(sheet);
+            workbook.active_sheet = workbook
+                .sheet_index_by_id(id)
+                .unwrap_or(workbook.active_sheet);
+            *active_sheet = id;
             Ok(())
         }
         WorkbookOp::BalanceReport {
@@ -1225,5 +1299,56 @@ mod tests {
                 .get(&CellAddr::Main { row: 1, col: 1 }),
             Some("=A2")
         );
+    }
+
+    #[test]
+    fn copy_sheet_replays_as_one_log_op() {
+        let mut workbook = WorkbookState::new();
+        workbook.sheets[0]
+            .state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "src".into());
+        let mut active_sheet = workbook.sheet_id(workbook.active_sheet);
+        apply_workbook_op(
+            &mut workbook,
+            &mut active_sheet,
+            WorkbookOp::CopySheet {
+                source_id: 1,
+                id: 2,
+                title: "Copy".into(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(workbook.sheet_count(), 2);
+        assert_eq!(workbook.sheets[1].id, 2);
+        assert_eq!(workbook.sheets[1].title, "Copy");
+        assert_eq!(
+            workbook.sheets[1]
+                .state
+                .grid
+                .get(&CellAddr::Main { row: 0, col: 0 }),
+            Some("src")
+        );
+    }
+
+    #[test]
+    fn move_sheet_preserves_ids_while_reordering() {
+        let mut workbook = WorkbookState::new();
+        workbook.add_sheet("Two".into(), SheetState::new(1, 1));
+        workbook.add_sheet("Three".into(), SheetState::new(1, 1));
+        let mut active_sheet = workbook.sheet_id(workbook.active_sheet);
+        apply_workbook_op(
+            &mut workbook,
+            &mut active_sheet,
+            WorkbookOp::MoveSheet { id: 1 },
+        )
+        .unwrap();
+
+        assert_eq!(
+            workbook.sheets.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![2, 3, 1]
+        );
+        assert_eq!(active_sheet, 1);
     }
 }

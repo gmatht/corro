@@ -8,7 +8,10 @@ use crate::formula::translate_formula_text_by_offset;
 use crate::formula::{cell_effective_display, is_formula};
 use crate::grid::MainRange;
 use crate::grid::{CellAddr, Grid, SortSpec, FOOTER_ROWS, HEADER_ROWS, MARGIN_COLS};
-use crate::io::{commit_line, commit_workbook_op, load_full, load_revisions, IoError, LogWatcher};
+use crate::io::{
+    commit_line, commit_workbook_op, load_full, load_revisions, load_workbook_revisions, IoError,
+    LogWatcher,
+};
 use crate::ops::{AggFunc, AggregateDef, Op, SheetState, WorkbookState};
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -175,6 +178,7 @@ impl SheetCursor {
 #[derive(Clone, Debug)]
 enum Mode {
     Normal,
+    RevisionBrowse,
     Edit {
         buffer: String,
         formula_cursor: Option<SheetCursor>,
@@ -182,6 +186,14 @@ enum Mode {
     },
     OpenPath {
         buffer: String,
+    },
+    SheetRename {
+        buffer: String,
+        sheet_id: u32,
+    },
+    SheetCopy {
+        buffer: String,
+        source_id: u32,
     },
     SavePath {
         buffer: String,
@@ -250,6 +262,7 @@ const SPECIAL_VALUE_CHOICES: [&str; 10] = ["∞", "Σ", "Ω", "π", "μ", "Δ", 
 enum MenuSection {
     Edit,
     File,
+    Sheet,
     Export,
     Width,
     Insert,
@@ -277,6 +290,9 @@ enum MenuAction {
     Replace,
     OpenFile,
     SaveAs,
+    RenameSheet,
+    CopySheet,
+    MoveSheet,
     Exit,
     ExportTsv,
     ExportCsv,
@@ -336,7 +352,7 @@ const EDIT_MENU_ITEMS: [MenuItem; 5] = [
     },
 ];
 
-const FILE_MENU_ITEMS: [MenuItem; 9] = [
+const FILE_MENU_ITEMS: [MenuItem; 7] = [
     MenuItem {
         shortcut: 'O',
         label: "Open file",
@@ -368,19 +384,37 @@ const FILE_MENU_ITEMS: [MenuItem; 9] = [
         target: MenuTarget::Action(MenuAction::SaveSort),
     },
     MenuItem {
-        shortcut: 'B',
-        label: "Balance books",
-        target: MenuTarget::Action(MenuAction::BalanceBooks),
+        shortcut: 'X',
+        label: "Exit",
+        target: MenuTarget::Action(MenuAction::Exit),
     },
+];
+
+const SHEET_MENU_ITEMS: [MenuItem; 5] = [
     MenuItem {
         shortcut: 'N',
         label: "New sheet",
         target: MenuTarget::Action(MenuAction::NewSheet),
     },
     MenuItem {
-        shortcut: 'X',
-        label: "Exit",
-        target: MenuTarget::Action(MenuAction::Exit),
+        shortcut: 'R',
+        label: "Rename sheet",
+        target: MenuTarget::Action(MenuAction::RenameSheet),
+    },
+    MenuItem {
+        shortcut: 'C',
+        label: "Copy sheet",
+        target: MenuTarget::Action(MenuAction::CopySheet),
+    },
+    MenuItem {
+        shortcut: 'M',
+        label: "Move sheet",
+        target: MenuTarget::Action(MenuAction::MoveSheet),
+    },
+    MenuItem {
+        shortcut: 'B',
+        label: "Balance books",
+        target: MenuTarget::Action(MenuAction::BalanceBooks),
     },
 ];
 
@@ -579,6 +613,7 @@ fn menu_items(section: MenuSection) -> &'static [MenuItem] {
     match section {
         MenuSection::Edit => &EDIT_MENU_ITEMS,
         MenuSection::File => &FILE_MENU_ITEMS,
+        MenuSection::Sheet => &SHEET_MENU_ITEMS,
         MenuSection::Insert => &INSERT_ROOT_MENU_ITEMS,
         MenuSection::Export => &EXPORT_MENU_ITEMS,
         MenuSection::Width => &WIDTH_MENU_ITEMS,
@@ -590,6 +625,7 @@ fn menu_title(section: MenuSection) -> &'static str {
     match section {
         MenuSection::Edit => "Edit",
         MenuSection::File => "File",
+        MenuSection::Sheet => "Sheet",
         MenuSection::Export => "Export",
         MenuSection::Width => "Width",
         MenuSection::Insert => "Insert",
@@ -606,17 +642,19 @@ fn menu_next_root_section(section: MenuSection) -> MenuSection {
         MenuSection::File => MenuSection::Edit,
         MenuSection::Edit => MenuSection::Insert,
         MenuSection::Insert => MenuSection::Help,
-        MenuSection::Help => MenuSection::File,
+        MenuSection::Help => MenuSection::Sheet,
+        MenuSection::Sheet => MenuSection::File,
         _ => MenuSection::File,
     }
 }
 
 fn menu_prev_root_section(section: MenuSection) -> MenuSection {
     match section {
-        MenuSection::File => MenuSection::Help,
+        MenuSection::File => MenuSection::Sheet,
         MenuSection::Edit => MenuSection::File,
         MenuSection::Insert => MenuSection::Edit,
         MenuSection::Help => MenuSection::Insert,
+        MenuSection::Sheet => MenuSection::Help,
         _ => MenuSection::File,
     }
 }
@@ -626,6 +664,7 @@ fn menu_popup_area(area: Rect, section: MenuSection, parent: Option<(Rect, usize
     let width = match section {
         MenuSection::Edit => 18,
         MenuSection::File => 22,
+        MenuSection::Sheet => 20,
         MenuSection::Export => 18,
         MenuSection::Width => 20,
         MenuSection::Insert => 20,
@@ -641,6 +680,7 @@ fn menu_popup_area(area: Rect, section: MenuSection, parent: Option<(Rect, usize
                 MenuSection::Edit => 9,
                 MenuSection::Insert => 17,
                 MenuSection::Help => 27,
+                MenuSection::Sheet => 36,
                 _ => 1,
             };
             (area.x.saturating_add(x), area.y.saturating_add(1))
@@ -759,6 +799,18 @@ impl App {
                 Mode::SavePath {
                     buffer: self.start_input_mode(buffer),
                 }
+            }
+            MenuAction::RenameSheet => Mode::SheetRename {
+                buffer: self.start_input_mode(self.current_sheet_title()),
+                sheet_id: self.view_sheet_id,
+            },
+            MenuAction::CopySheet => Mode::SheetCopy {
+                buffer: self.start_input_mode(format!("{} Copy", self.current_sheet_title())),
+                source_id: self.view_sheet_id,
+            },
+            MenuAction::MoveSheet => {
+                let _ = self.move_current_sheet_to_end();
+                Mode::Normal
             }
             MenuAction::Exit => Mode::QuitPrompt,
             MenuAction::ExportTsv => Mode::ExportTsv {
@@ -1521,6 +1573,8 @@ pub struct App {
     pub path: Option<PathBuf>,
     source_path: Option<PathBuf>,
     revision_limit: Option<usize>,
+    revision_browse: bool,
+    revision_browse_limit: usize,
     pub offset: u64,
     pub state: SheetState,
     pub workbook: WorkbookState,
@@ -1572,6 +1626,8 @@ impl App {
             path,
             source_path,
             revision_limit,
+            revision_browse: false,
+            revision_browse_limit: 1,
             offset: 0,
             state: SheetState::new(1, 1),
             workbook: WorkbookState::new(),
@@ -1598,6 +1654,14 @@ impl App {
             pending_fit_to_content_on_commit: false,
             clipboard_snapshot: None,
         }
+    }
+
+    pub fn new_with_revision_browser(path: Option<PathBuf>) -> Self {
+        let mut app = Self::new(None);
+        app.source_path = path;
+        app.revision_browse = true;
+        app.mode = Mode::RevisionBrowse;
+        app
     }
 
     fn open_path_prompt_buffer(&self) -> String {
@@ -1627,6 +1691,15 @@ impl App {
             })
             .collect::<Vec<_>>()
             .join("  ")
+    }
+
+    fn current_sheet_title(&self) -> String {
+        self.workbook
+            .sheets
+            .iter()
+            .find(|sheet| sheet.id == self.view_sheet_id)
+            .map(|sheet| sheet.title.clone())
+            .unwrap_or_default()
     }
 
     fn add_sheet(&mut self, title: String) {
@@ -1663,6 +1736,83 @@ impl App {
             }
         }
         self.status = "New sheet created".into();
+    }
+
+    fn rename_current_sheet(&mut self, title: String) -> Result<(), RunError> {
+        self.commit_active_sheet_cache();
+        let id = self.view_sheet_id;
+        if let Some(ref p) = self.path.clone() {
+            let mut active_sheet = id;
+            commit_workbook_op(
+                p,
+                &mut self.offset,
+                &mut self.workbook,
+                &mut active_sheet,
+                &crate::ops::WorkbookOp::RenameSheet { id, title },
+            )?;
+            self.ops_applied = self.ops_applied.saturating_add(1);
+            self.start_log_watcher_if_needed()?;
+        } else if let Some(sheet) = self.workbook.sheets.iter_mut().find(|s| s.id == id) {
+            sheet.title = title;
+        }
+        self.sync_active_sheet_cache();
+        self.status = "Sheet renamed".into();
+        Ok(())
+    }
+
+    fn copy_current_sheet(&mut self, title: String) -> Result<(), RunError> {
+        self.commit_active_sheet_cache();
+        let source_id = self.view_sheet_id;
+        let id = self.workbook.next_sheet_id;
+        if let Some(ref p) = self.path.clone() {
+            let mut active_sheet = source_id;
+            commit_workbook_op(
+                p,
+                &mut self.offset,
+                &mut self.workbook,
+                &mut active_sheet,
+                &crate::ops::WorkbookOp::CopySheet {
+                    source_id,
+                    id,
+                    title: title.clone(),
+                },
+            )?;
+            self.ops_applied = self.ops_applied.saturating_add(1);
+            self.start_log_watcher_if_needed()?;
+        } else if let Some(source) = self.workbook.sheets.iter().find(|s| s.id == source_id) {
+            self.workbook.add_sheet_record(crate::ops::SheetRecord {
+                id,
+                title,
+                state: source.state.clone(),
+            });
+        }
+        self.view_sheet_id = id;
+        self.sync_active_sheet_cache();
+        self.status = "Sheet copied".into();
+        Ok(())
+    }
+
+    fn move_current_sheet_to_end(&mut self) -> Result<(), RunError> {
+        self.commit_active_sheet_cache();
+        let id = self.view_sheet_id;
+        if let Some(ref p) = self.path.clone() {
+            let mut active_sheet = id;
+            commit_workbook_op(
+                p,
+                &mut self.offset,
+                &mut self.workbook,
+                &mut active_sheet,
+                &crate::ops::WorkbookOp::MoveSheet { id },
+            )?;
+            self.ops_applied = self.ops_applied.saturating_add(1);
+            self.start_log_watcher_if_needed()?;
+        } else if let Some(idx) = self.workbook.sheet_index_by_id(id) {
+            let sheet = self.workbook.sheets.remove(idx);
+            self.workbook.sheets.push(sheet);
+        }
+        self.sync_active_sheet_cache();
+        self.status = "Sheet moved to end".into();
+        Ok(())
     }
 
     fn switch_sheet(&mut self, delta: isize) {
@@ -1704,6 +1854,44 @@ impl App {
             self.view_sheet_id = self.workbook.sheet_id(self.workbook.active_sheet);
             self.state = self.workbook.active_sheet().clone();
         }
+    }
+
+    fn reload_revision_browse(&mut self) -> Result<(), IoError> {
+        let Some(path) = self.source_path.clone() else {
+            return Ok(());
+        };
+        self.workbook = WorkbookState::new();
+        self.state = SheetState::new(1, 1);
+        self.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        };
+        self.anchor = None;
+        self.row_scroll = 0;
+        self.col_scroll = 0;
+        self.path = None;
+        self.watcher = None;
+        let mut active_sheet = self.workbook.sheet_id(self.workbook.active_sheet);
+        let (off, n) = load_workbook_revisions(
+            &path,
+            self.revision_browse_limit,
+            &mut self.workbook,
+            &mut active_sheet,
+        )?;
+        self.view_sheet_id = active_sheet;
+        self.sync_active_sheet_cache();
+        for c in 0..self.state.grid.main_cols() {
+            self.state.grid.auto_fit_column(MARGIN_COLS + c);
+        }
+        self.offset = off;
+        self.ops_applied = n;
+        self.status = format!(
+            "Browsing {} @ revision {}",
+            path.display(),
+            self.revision_browse_limit
+        );
+        self.cursor.clamp(&self.state.grid);
+        Ok(())
     }
 
     fn commit_active_sheet_cache(&mut self) {
@@ -1782,6 +1970,7 @@ impl App {
     pub fn load_initial(&mut self) -> Result<(), IoError> {
         let initial_path = self.path.clone().or(self.source_path.clone());
         let linked_revision = self.revision_limit;
+        let browsing = self.revision_browse;
         if let Some(ref p) = initial_path {
             if Path::new(p).exists() {
                 let ext = p
@@ -1847,6 +2036,35 @@ impl App {
                         self.status = format!("Imported CSV {}", p.display());
                     }
                     _ => {
+                        if browsing {
+                            self.workbook = WorkbookState::new();
+                            self.state = SheetState::new(1, 1);
+                            let mut active_sheet =
+                                self.workbook.sheet_id(self.workbook.active_sheet);
+                            let (off, n) = load_workbook_revisions(
+                                p,
+                                self.revision_browse_limit,
+                                &mut self.workbook,
+                                &mut active_sheet,
+                            )?;
+                            self.view_sheet_id = active_sheet;
+                            self.sync_active_sheet_cache();
+                            for c in 0..self.state.grid.main_cols() {
+                                self.state.grid.fit_column_to_content(MARGIN_COLS + c);
+                            }
+                            self.offset = off;
+                            self.ops_applied = n;
+                            self.path = None;
+                            self.source_path = Some(p.clone());
+                            self.watcher = None;
+                            self.status = format!(
+                                "Browsing {} @ revision {}",
+                                p.display(),
+                                self.revision_browse_limit
+                            );
+                            self.cursor.clamp(&self.state.grid);
+                            return Ok(());
+                        }
                         let (off, n) = match linked_revision {
                             Some(limit) => load_revisions(p, limit, &mut self.state)?,
                             None => load_full(p, &mut self.state)?,
@@ -3508,6 +3726,22 @@ impl App {
                 caret_style,
             ))
             .style(prompt_style),
+            Mode::SheetRename { buffer, .. } => Paragraph::new(input_line(
+                " rename sheet: ".to_string(),
+                buffer,
+                self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
+                prompt_style,
+                caret_style,
+            ))
+            .style(prompt_style),
+            Mode::SheetCopy { buffer, .. } => Paragraph::new(input_line(
+                " copy sheet as: ".to_string(),
+                buffer,
+                self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
+                prompt_style,
+                caret_style,
+            ))
+            .style(prompt_style),
             Mode::SavePath { buffer } => Paragraph::new(input_line(
                 " save as: ".to_string(),
                 buffer,
@@ -4018,7 +4252,7 @@ impl App {
                 if self.anchor.is_some() {
                     "  r·move-rows   c·move-cols   v·deselect   Esc·cancel".into()
                 } else {
-                    "  shortcuts: e·edit v·select t·tsv c·csv o·open a·save as q·quit ?·help; printable letters edit cells unless reserved".into()
+                    "  type to edit; F2·edit; Ctrl+V·paste; Ctrl+S·save; F1·help".into()
                 }
             }
             Mode::Edit { .. } => {
@@ -4027,6 +4261,9 @@ impl App {
             Mode::OpenPath { .. } => {
                 "  type path or link <file> <revision>   Enter·open   Esc·cancel".into()
             }
+            Mode::RevisionBrowse => "  left/right·step revisions   Enter·close   Esc·close".into(),
+            Mode::SheetRename { .. } => "  type sheet title   Enter·rename   Esc·cancel".into(),
+            Mode::SheetCopy { .. } => "  type sheet title   Enter·copy   Esc·cancel".into(),
             Mode::SavePath { .. } => "  type file path   Enter·save as   Esc·cancel".into(),
             Mode::ExportTsv { .. }
             | Mode::ExportCsv { .. }
@@ -4086,6 +4323,11 @@ impl App {
         } else {
             " Help "
         };
+        let sheet = if section == MenuSection::Sheet {
+            "[Sheet]"
+        } else {
+            " Sheet "
+        };
         let active = if item != usize::MAX {
             format!(
                 "  {}",
@@ -4096,7 +4338,7 @@ impl App {
         } else {
             String::new()
         };
-        format!(" {file}  {edit}  {insert}  {help}{active}")
+        format!(" {file}  {edit}  {insert}  {help}  {sheet}{active}")
     }
 
     fn balance_dialog_lines(
@@ -4364,6 +4606,33 @@ impl App {
             }
         }
 
+        if matches!(self.mode, Mode::RevisionBrowse) {
+            match key.code {
+                KeyCode::Esc | KeyCode::Enter => {
+                    self.mode = Mode::Normal;
+                    return Ok(false);
+                }
+                KeyCode::Left => {
+                    if self.revision_browse_limit > 1 {
+                        self.revision_browse_limit -= 1;
+                        self.reload_revision_browse()?;
+                    }
+                    self.mode = Mode::RevisionBrowse;
+                    return Ok(false);
+                }
+                KeyCode::Right => {
+                    self.revision_browse_limit = self.revision_browse_limit.saturating_add(1);
+                    self.reload_revision_browse()?;
+                    self.mode = Mode::RevisionBrowse;
+                    return Ok(false);
+                }
+                _ => {
+                    self.mode = Mode::RevisionBrowse;
+                    return Ok(false);
+                }
+            }
+        }
+
         let mut mode = std::mem::replace(&mut self.mode, Mode::Normal);
 
         if matches!(mode, Mode::Normal | Mode::Edit { .. })
@@ -4538,6 +4807,10 @@ impl App {
                         self.open_menu(MenuSection::Insert);
                         return Ok(false);
                     }
+                    's' | 'S' => {
+                        self.open_menu(MenuSection::Sheet);
+                        return Ok(false);
+                    }
                     'o' | 'O' => {
                         self.open_menu_path(vec![MenuLevel {
                             section: MenuSection::File,
@@ -4557,24 +4830,6 @@ impl App {
                             section: MenuSection::Width,
                             item: 1,
                         }]);
-                        return Ok(false);
-                    }
-                    's' => {
-                        self.open_menu_path(vec![MenuLevel {
-                            section: MenuSection::File,
-                            item: 3,
-                        }]);
-                        return Ok(false);
-                    }
-                    'S' => {
-                        self.open_menu_path(vec![MenuLevel {
-                            section: MenuSection::File,
-                            item: 4,
-                        }]);
-                        return Ok(false);
-                    }
-                    'n' | 'N' => {
-                        self.add_sheet(format!("Sheet{}", self.workbook.next_sheet_id));
                         return Ok(false);
                     }
                     _ => {}
@@ -4695,11 +4950,40 @@ impl App {
                 }
                 _ => {}
             },
+            Mode::RevisionBrowse => {}
             Mode::Menu { .. } => {}
             Mode::Replace { buffer } => match key.code {
                 KeyCode::Enter => {
                     self.status = format!("Replace queued: {}", buffer);
                     self.input_cursor = None;
+                    mode = Mode::Normal;
+                }
+                KeyCode::Esc => mode = Mode::Normal,
+                _ if Self::handle_plain_text_input_key(
+                    buffer,
+                    &mut self.input_cursor,
+                    key.code,
+                ) => {}
+                _ => {}
+            },
+            Mode::SheetRename { buffer, .. } => match key.code {
+                KeyCode::Enter => {
+                    self.input_cursor = None;
+                    self.rename_current_sheet(buffer.clone())?;
+                    mode = Mode::Normal;
+                }
+                KeyCode::Esc => mode = Mode::Normal,
+                _ if Self::handle_plain_text_input_key(
+                    buffer,
+                    &mut self.input_cursor,
+                    key.code,
+                ) => {}
+                _ => {}
+            },
+            Mode::SheetCopy { buffer, .. } => match key.code {
+                KeyCode::Enter => {
+                    self.input_cursor = None;
+                    self.copy_current_sheet(buffer.clone())?;
                     mode = Mode::Normal;
                 }
                 KeyCode::Esc => mode = Mode::Normal,
@@ -5333,6 +5617,26 @@ impl App {
                 _ => {}
             },
             Mode::Normal => {
+                if matches!(key.code, KeyCode::Char(c) if !c.is_control())
+                    && key.modifiers.is_empty()
+                {
+                    if let KeyCode::Char(c) = key.code {
+                        self.edit_special_palette = false;
+                        let buffer = c.to_string();
+                        mode = self.start_edit_mode(
+                            buffer.clone(),
+                            if buffer.trim() == "=" {
+                                Some(self.cursor)
+                            } else {
+                                None
+                            },
+                            false,
+                            false,
+                        );
+                    }
+                    self.mode = mode;
+                    return Ok(false);
+                }
                 if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('q') {
                     self.mode = mode;
                     return Ok(true);
@@ -7787,6 +8091,18 @@ mod tests {
     }
 
     #[test]
+    fn load_initial_handles_legacy_test5_workbook() {
+        let mut app = App::new(Some(PathBuf::from("test5.corro")));
+        app.load_initial().unwrap();
+
+        assert_eq!(app.workbook.sheet_count(), 4);
+        assert_eq!(app.view_sheet_id, 4);
+        assert_eq!(app.workbook.sheet_title(3), "Sheet1 Copy");
+        assert_eq!(app.state.grid.main_rows(), 13);
+        assert_eq!(app.state.grid.main_cols(), 5);
+    }
+
+    #[test]
     fn balance_books_reorders_rows_in_place() {
         let mut app = App::new(None);
         app.state.grid.set_main_size(3, 2);
@@ -8126,6 +8442,18 @@ mod tests {
             let cell = &buffer[(x, 1)];
             cell.symbol() == " " && cell.style().bg == Some(Color::Yellow)
         }));
+    }
+
+    #[test]
+    fn printable_key_starts_editing_in_normal_mode() {
+        let mut app = App::new(None);
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::empty()))
+            .unwrap();
+
+        assert!(matches!(app.mode, Mode::Edit { .. }));
+        if let Mode::Edit { buffer, .. } = &app.mode {
+            assert_eq!(buffer, "x");
+        }
     }
 
     #[test]
