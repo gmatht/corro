@@ -1,7 +1,8 @@
 //! Append-only log operations and replay onto [`SheetState`].
 
 use crate::addr::{
-    parse_cell_ref_at, parse_excel_column, parse_sheet_id_prefix_at, parse_ui_column_fragment,
+    parse_cell_ref_at, parse_excel_column, parse_main_range_at, parse_sheet_id_prefix_at,
+    parse_ui_column_fragment,
 };
 use crate::grid::{CellAddr, Grid, MainRange, SortSpec, MARGIN_COLS};
 use std::fs::OpenOptions;
@@ -130,15 +131,44 @@ impl WorkbookState {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Op {
-    SetCell { addr: CellAddr, value: String },
-    SetMainSize { main_rows: u32, main_cols: u32 },
-    MoveRowRange { from: u32, count: u32, to: u32 },
-    MoveColRange { from: u32, count: u32, to: u32 },
-    FillRange { cells: Vec<(CellAddr, String)> },
-    SetMaxColWidth { width: usize },
-    SetColWidth { col: usize, width: Option<usize> },
-    SetViewSortCols { cols: Vec<SortSpec> },
-    Undo { target: String },
+    SetCell {
+        addr: CellAddr,
+        value: String,
+    },
+    SetMainSize {
+        main_rows: u32,
+        main_cols: u32,
+    },
+    MoveRowRange {
+        from: u32,
+        count: u32,
+        to: u32,
+    },
+    MoveColRange {
+        from: u32,
+        count: u32,
+        to: u32,
+    },
+    FillRange {
+        cells: Vec<(CellAddr, String)>,
+    },
+    CopyFromTo {
+        source: MainRange,
+        target: MainRange,
+    },
+    SetMaxColWidth {
+        width: usize,
+    },
+    SetColWidth {
+        col: usize,
+        width: Option<usize>,
+    },
+    SetViewSortCols {
+        cols: Vec<SortSpec>,
+    },
+    Undo {
+        target: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -226,6 +256,33 @@ impl Op {
                 }
                 state.grid.bump_volatile_seed();
             }
+            Op::CopyFromTo { source, target } => {
+                let rows = source.row_end.saturating_sub(source.row_start);
+                let cols = source.col_end.saturating_sub(source.col_start);
+                let target_rows = target.row_end.saturating_sub(target.row_start);
+                let target_cols = target.col_end.saturating_sub(target.col_start);
+                let rows = rows.min(target_rows);
+                let cols = cols.min(target_cols);
+
+                let mut cells = Vec::with_capacity(rows.saturating_mul(cols) as usize);
+                for r in 0..rows {
+                    for c in 0..cols {
+                        let src = CellAddr::Main {
+                            row: source.row_start + r,
+                            col: source.col_start + c,
+                        };
+                        let dst = CellAddr::Main {
+                            row: target.row_start + r,
+                            col: target.col_start + c,
+                        };
+                        cells.push((dst, state.grid.get(&src).unwrap_or("").to_string()));
+                    }
+                }
+                for (addr, value) in cells {
+                    state.grid.set(&addr, value);
+                }
+                state.grid.bump_volatile_seed();
+            }
             Op::SetMaxColWidth { width } => {
                 state.grid.set_max_col_width(*width);
             }
@@ -270,6 +327,18 @@ fn addr_text(addr: &CellAddr) -> String {
             row + 1
         ),
     }
+}
+
+fn main_range_text(range: &MainRange) -> String {
+    let start = CellAddr::Main {
+        row: range.row_start,
+        col: range.col_start,
+    };
+    let end = CellAddr::Main {
+        row: range.row_end.saturating_sub(1),
+        col: range.col_end.saturating_sub(1),
+    };
+    format!("{}:{}", addr_text(&start), addr_text(&end))
 }
 
 fn encode_log_value(value: &str) -> String {
@@ -325,6 +394,16 @@ fn parse_op_text(line: &str) -> Option<Op> {
             }
             Some(Op::FillRange { cells })
         }
+        "COPY_FROM_TO" => {
+            let source_text = parts.next()?;
+            let target_text = parts.next()?;
+            if parts.next().is_some() {
+                return None;
+            }
+            let (source, _) = parse_main_range_at(source_text)?;
+            let (target, _) = parse_main_range_at(target_text)?;
+            Some(Op::CopyFromTo { source, target })
+        }
         "MOVE" => {
             let kind = parts.next()?.to_ascii_uppercase();
             let from = parts.next()?.parse::<u32>().ok()?;
@@ -376,6 +455,13 @@ impl Op {
                     .collect::<Vec<_>>()
                     .join(" ")
             ),
+            Op::CopyFromTo { source, target } => {
+                format!(
+                    "COPY_FROM_TO {} {}",
+                    main_range_text(source),
+                    main_range_text(target)
+                )
+            }
             Op::MoveRowRange { from, count, to } => format!("MOVE ROW {from} {count} {to}"),
             Op::MoveColRange { from, count, to } => format!("MOVE COL {from} {count} {to}"),
             Op::SetMainSize {
@@ -752,6 +838,17 @@ impl SheetState {
                     })
                     .collect(),
             }),
+            Op::CopyFromTo { target, .. } => {
+                let mut cells = Vec::new();
+                for r in target.row_start..target.row_end {
+                    for c in target.col_start..target.col_end {
+                        let addr = CellAddr::Main { row: r, col: c };
+                        let prev_value = self.grid.get(&addr).unwrap_or("").to_string();
+                        cells.push((addr, prev_value));
+                    }
+                }
+                Some(Op::FillRange { cells })
+            }
             Op::SetMainSize { .. } => Some(Op::SetMainSize {
                 main_rows: self.grid.main_rows() as u32,
                 main_cols: self.grid.main_cols() as u32,
@@ -921,6 +1018,13 @@ pub fn append_op(path: &Path, op: &Op) -> std::io::Result<()> {
                 .collect::<Vec<_>>()
                 .join(" ")
         ),
+        Op::CopyFromTo { source, target } => {
+            format!(
+                "COPY_FROM_TO {} {}",
+                main_range_text(source),
+                main_range_text(target)
+            )
+        }
         Op::SetMainSize {
             main_rows,
             main_cols,
@@ -1047,6 +1151,27 @@ mod tests {
         };
         let line = op.to_log_line();
         assert_eq!(line, "FILL A1=1 B1=2");
+        assert_eq!(parse_op_line(&line), Some(op));
+    }
+
+    #[test]
+    fn copy_from_to_round_trips_through_log_line() {
+        let op = Op::CopyFromTo {
+            source: MainRange {
+                row_start: 0,
+                row_end: 2,
+                col_start: 0,
+                col_end: 2,
+            },
+            target: MainRange {
+                row_start: 2,
+                row_end: 4,
+                col_start: 1,
+                col_end: 3,
+            },
+        };
+        let line = op.to_log_line();
+        assert_eq!(line, "COPY_FROM_TO A1:B2 B3:C4");
         assert_eq!(parse_op_line(&line), Some(op));
     }
 

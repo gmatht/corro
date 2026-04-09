@@ -1542,6 +1542,7 @@ pub struct App {
     special_picker: Option<usize>,
     view_sheet_id: u32,
     pending_fit_to_content_on_commit: bool,
+    clipboard_snapshot: Option<(MainRange, String)>,
 }
 
 impl App {
@@ -1595,6 +1596,7 @@ impl App {
             special_picker: None,
             view_sheet_id: 1,
             pending_fit_to_content_on_commit: false,
+            clipboard_snapshot: None,
         }
     }
 
@@ -2469,6 +2471,27 @@ impl App {
         Some(((c0 - left) as u32, (c1 - left) as u32))
     }
 
+    fn selection_main_range(&self) -> Option<MainRange> {
+        if self.selection_kind != SelectionKind::Cells {
+            return None;
+        }
+        let (rows, cols) = self.current_selection_range()?;
+        let (row_start, row_end) = (*rows.first()?, *rows.last()?);
+        let (col_start, col_end) = (*cols.first()?, *cols.last()?);
+        if row_start < HEADER_ROWS || row_end >= HEADER_ROWS + self.state.grid.main_rows() {
+            return None;
+        }
+        if col_start < MARGIN_COLS || col_end >= MARGIN_COLS + self.state.grid.main_cols() {
+            return None;
+        }
+        Some(MainRange {
+            row_start: (row_start - HEADER_ROWS) as u32,
+            row_end: (row_end - HEADER_ROWS + 1) as u32,
+            col_start: (col_start - MARGIN_COLS) as u32,
+            col_end: (col_end - MARGIN_COLS + 1) as u32,
+        })
+    }
+
     fn commit_edit_buffer(&mut self, buffer: &str) -> Result<(), RunError> {
         self.edit_special_palette = false;
         let (addr, value) = if let Some((a, v)) = parse_cell_shorthand(buffer) {
@@ -3118,6 +3141,9 @@ impl App {
     fn copy_selection_to_clipboard(&mut self, data: &str) -> bool {
         match copy_to_clipboard(data) {
             Ok(()) => {
+                self.clipboard_snapshot = self
+                    .selection_main_range()
+                    .map(|range| (range, data.to_string()));
                 self.status = "Selection copied to clipboard".into();
                 true
             }
@@ -3218,6 +3244,52 @@ impl App {
         Ok(())
     }
 
+    fn try_paste_from_snapshot(&mut self, preserve_formulas: bool) -> Result<bool, RunError> {
+        let Some((source, snapshot)) = self.clipboard_snapshot.clone() else {
+            return Ok(false);
+        };
+        let Some(target) = self.paste_target_main_range(&source) else {
+            return Ok(false);
+        };
+        if snapshot != self.selection_tsv_text_for_main_range(source.clone()) {
+            return Ok(false);
+        }
+        self.apply_single_op(Op::CopyFromTo { source, target })?;
+        self.status = if preserve_formulas {
+            "Clipboard pasted".into()
+        } else {
+            "Clipboard pasted as values".into()
+        };
+        Ok(true)
+    }
+
+    fn selection_tsv_text_for_main_range(&self, range: MainRange) -> String {
+        let rows = (range.row_start..range.row_end)
+            .map(|r| HEADER_ROWS + r as usize)
+            .collect::<Vec<_>>();
+        let cols = (range.col_start..range.col_end)
+            .map(|c| MARGIN_COLS + c as usize)
+            .collect::<Vec<_>>();
+        let mut out = String::new();
+        for (ri, row) in rows.iter().enumerate() {
+            if ri > 0 {
+                out.push('\n');
+            }
+            for (ci, col) in cols.iter().enumerate() {
+                if ci > 0 {
+                    out.push('\t');
+                }
+                if let Some(addr) = self.addr_at(*row, *col) {
+                    out.push_str(self.state.grid.get(&addr).unwrap_or(""));
+                }
+            }
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out
+    }
+
     fn apply_pasted_tsv(&mut self, text: &str, preserve_formulas: bool) -> Result<(), RunError> {
         let cells = Self::parse_pasted_tsv_cells(text, self.cursor, preserve_formulas, &self.state);
         self.paste_pasted_tsv_cells(cells, preserve_formulas)
@@ -3227,6 +3299,9 @@ impl App {
         let text = read_clipboard().map_err(io::Error::other)?;
         let cells =
             Self::parse_pasted_tsv_cells(&text, self.cursor, preserve_formulas, &self.state);
+        if self.try_paste_from_snapshot(preserve_formulas)? {
+            return Ok(());
+        }
         self.paste_pasted_tsv_cells(cells, preserve_formulas)
     }
 
@@ -3244,6 +3319,20 @@ impl App {
                 Err(e) => self.status = format!("Write error: {e}"),
             }
         }
+    }
+
+    fn paste_target_main_range(&self, source: &MainRange) -> Option<MainRange> {
+        if self.cursor.row < HEADER_ROWS || self.cursor.col < MARGIN_COLS {
+            return None;
+        }
+        let row_start = (self.cursor.row - HEADER_ROWS) as u32;
+        let col_start = (self.cursor.col - MARGIN_COLS) as u32;
+        Some(MainRange {
+            row_start,
+            row_end: row_start + source.row_end.saturating_sub(source.row_start),
+            col_start,
+            col_end: col_start + source.col_end.saturating_sub(source.col_start),
+        })
     }
 
     pub fn run(&mut self) -> Result<(), RunError> {
@@ -6948,6 +7037,46 @@ mod tests {
             .unwrap();
 
         assert_eq!(ctrl_copy, test_clipboard_text().unwrap());
+    }
+
+    #[test]
+    fn paste_uses_copy_from_to_when_snapshot_matches() {
+        let path = tempfile::NamedTempFile::new().unwrap();
+        let mut app = App::new(Some(path.path().to_path_buf()));
+        app.state.grid.set_main_size(3, 3);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "1".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 1 }, "2".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 1, col: 0 }, "3".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 1, col: 1 }, "4".into());
+        app.anchor = Some(SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        });
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS + 1,
+            col: MARGIN_COLS + 1,
+        };
+        app.mode = Mode::Normal;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+            .unwrap();
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS + 1,
+            col: MARGIN_COLS + 1,
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL))
+            .unwrap();
+
+        let log = std::fs::read_to_string(path.path()).unwrap();
+        assert!(log.contains("COPY_FROM_TO A1:B2 B2:C3"));
     }
 
     #[test]
