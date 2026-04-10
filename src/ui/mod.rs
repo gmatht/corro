@@ -3345,12 +3345,12 @@ impl App {
             CellAddr::Header { row, col } => format!(
                 "~{}{}",
                 HEADER_ROWS - *row as usize,
-                formula_col_fragment(*col as usize, self.state.grid.main_cols())
+                col_header_label(*col as usize, self.state.grid.main_cols())
             ),
             CellAddr::Footer { row, col } => format!(
                 "_{}{}",
                 *row as usize + 1,
-                formula_col_fragment(*col as usize, self.state.grid.main_cols())
+                col_header_label(*col as usize, self.state.grid.main_cols())
             ),
             CellAddr::Main { row, col } => {
                 format!("{}{}", addr::excel_column_name(*col as usize), row + 1)
@@ -3852,166 +3852,20 @@ impl App {
         // ── Formula bar ───────────────────────────────────────────────────────
         let addr = self.cursor.to_addr(grid);
         let edit_addr = self.edit_target_addr.clone().unwrap_or(addr.clone());
-        let addr_str = addr_label(&edit_addr, grid.main_cols());
         let prompt_style = Style::default().fg(Color::White).bg(Color::DarkGray);
         let prompt_style_bold = prompt_style.add_modifier(Modifier::BOLD);
         let caret_style = Style::default()
             .fg(Color::Black)
             .bg(Color::Yellow)
             .add_modifier(Modifier::BOLD);
-        let formula_widget = match &self.mode {
-            Mode::Edit { buffer, .. } => Paragraph::new(input_line_with_suffix(
-                format!(" {addr_str}  "),
-                buffer,
-                self.edit_cursor.unwrap_or_else(|| buffer.chars().count()),
-                prompt_style_bold,
-                caret_style,
-                formula_edit_preview(grid, &edit_addr, buffer),
-            ))
-            .style(prompt_style_bold),
-            Mode::OpenPath { buffer } => Paragraph::new(input_line(
-                " open: ".to_string(),
-                buffer,
-                self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
-                prompt_style,
-                caret_style,
-            ))
-            .style(prompt_style),
-            Mode::SheetRename { buffer, .. } => Paragraph::new(input_line(
-                " rename sheet: ".to_string(),
-                buffer,
-                self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
-                prompt_style,
-                caret_style,
-            ))
-            .style(prompt_style),
-            Mode::SheetCopy { buffer, .. } => Paragraph::new(input_line(
-                " copy sheet as: ".to_string(),
-                buffer,
-                self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
-                prompt_style,
-                caret_style,
-            ))
-            .style(prompt_style),
-            Mode::SavePath { buffer } => Paragraph::new(input_line(
-                " save as: ".to_string(),
-                buffer,
-                self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
-                prompt_style,
-                caret_style,
-            ))
-            .style(prompt_style),
-            Mode::ExportTsv { buffer } => Paragraph::new(input_line(
-                " export TSV (blank=clipboard): ".to_string(),
-                buffer,
-                self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
-                prompt_style,
-                caret_style,
-            ))
-            .style(prompt_style),
-            Mode::ExportCsv { buffer } => Paragraph::new(input_line(
-                " export CSV (blank=clipboard): ".to_string(),
-                buffer,
-                self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
-                prompt_style,
-                caret_style,
-            ))
-            .style(prompt_style),
-            Mode::ExportAscii { buffer } => Paragraph::new(input_line(
-                " export ASCII table (blank=clipboard): ".to_string(),
-                buffer,
-                self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
-                prompt_style,
-                caret_style,
-            ))
-            .style(prompt_style),
-            Mode::ExportAll { buffer } => Paragraph::new(input_line(
-                " export full (incl headers/margins): ".to_string(),
-                buffer,
-                self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
-                prompt_style,
-                caret_style,
-            ))
-            .style(prompt_style),
-            Mode::ExportOdt { buffer } => Paragraph::new(input_line(
-                " export ODS: ".to_string(),
-                buffer,
-                self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
-                prompt_style,
-                caret_style,
-            ))
-            .style(prompt_style),
-            Mode::Find { buffer } => Paragraph::new(input_line(
-                " find text: ".to_string(),
-                buffer,
-                self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
-                prompt_style,
-                caret_style,
-            ))
-            .style(prompt_style),
-            Mode::Replace { buffer } => Paragraph::new(input_line(
-                " replace text: ".to_string(),
-                buffer,
-                self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
-                prompt_style,
-                caret_style,
-            ))
-            .style(prompt_style),
-            Mode::SetMaxColWidth { buffer } => Paragraph::new(input_line(
-                " max col width (default=20): ".to_string(),
-                buffer,
-                self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
-                prompt_style,
-                caret_style,
-            ))
-            .style(prompt_style),
-            Mode::SetColWidth { buffer } => Paragraph::new(input_line(
-                " col width [col=width|col]: ".to_string(),
-                buffer,
-                self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
-                prompt_style,
-                caret_style,
-            ))
-            .style(prompt_style),
-            Mode::SortView { buffer, persist } => Paragraph::new(input_line(
-                format!(
-                    " sort cols [A,B,C]{}: ",
-                    if *persist { " (save)" } else { "" }
-                ),
-                buffer,
-                self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
-                prompt_style,
-                caret_style,
-            ))
-            .style(prompt_style),
-            Mode::BalanceBooks { .. } => Paragraph::new(" ").style(prompt_style),
-            Mode::QuitPrompt => Paragraph::new(" Quit Corro? (Q)uit, (B)ack ")
-                .style(Style::default().fg(Color::White).bg(Color::Red)),
-            Mode::Help => Paragraph::new(" Help - Up/Down scroll, Esc closes ")
-                .style(Style::default().fg(Color::White).bg(Color::Blue)),
-            Mode::About => Paragraph::new(" About - Up/Down scroll, Esc closes ")
-                .style(Style::default().fg(Color::White).bg(Color::Blue)),
-            Mode::Menu { .. } => {
-                let val = formula_bar_value(grid, &addr);
-                let base = format!(" {addr_str}  {val}");
-                let text = if self.status.is_empty() {
-                    base
-                } else {
-                    format!("{base}   ·  {}", self.status)
-                };
-                Paragraph::new(text).style(Style::default().fg(Color::Cyan))
-            }
-            _ => {
-                let val = formula_bar_value(grid, &addr);
-                let base = format!(" {addr_str}  {val}");
-                let text = if self.status.is_empty() {
-                    base
-                } else {
-                    format!("{base}   ·  {}", self.status)
-                };
-                Paragraph::new(text).style(Style::default().fg(Color::Cyan))
-            }
-        };
+        let formula_widget = self.mode_prompt_widget(
+            grid,
+            &addr,
+            &edit_addr,
+            prompt_style,
+            prompt_style_bold,
+            caret_style,
+        );
         f.render_widget(formula_widget, formula_area);
 
         if has_tabs {
@@ -4036,40 +3890,7 @@ impl App {
             f.render_widget(Paragraph::new(Line::from(spans)).style(tab_style), tab_area);
         }
 
-        if matches!(&self.mode, Mode::Help | Mode::About) {
-            let body = match &self.mode {
-                Mode::Help => self.help_page_body(),
-                Mode::About => self.about_page_body(),
-                _ => String::new(),
-            };
-            let inner = Block::default().borders(Borders::ALL).inner(grid_area);
-            let lines: Vec<&str> = body.lines().collect();
-            let scroll = match &self.mode {
-                Mode::Help => self.help_scroll,
-                Mode::About => self.about_scroll,
-                _ => 0,
-            };
-            let max_scroll = lines.len().saturating_sub(inner.height as usize);
-            let scroll = scroll.min(max_scroll);
-            let visible: String = lines
-                .iter()
-                .skip(scroll)
-                .take(inner.height as usize)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join("\n");
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .title(match self.mode {
-                    Mode::Help => " Help ",
-                    Mode::About => " About ",
-                    _ => "",
-                });
-            let paragraph = Paragraph::new(visible)
-                .block(block)
-                .wrap(Wrap { trim: false });
-            f.render_widget(Clear, grid_area);
-            f.render_widget(paragraph, grid_area);
+        if self.render_help_about_overlay(f, grid_area) {
             return;
         }
 
@@ -6289,6 +6110,206 @@ impl App {
 
         self.mode = mode;
         Ok(false)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn mode_prompt_widget<'a>(
+        &self,
+        grid: &'a Grid,
+        addr: &CellAddr,
+        edit_addr: &CellAddr,
+        prompt_style: Style,
+        prompt_style_bold: Style,
+        caret_style: Style,
+    ) -> Paragraph<'a> {
+        let addr_str = addr_label(edit_addr, grid.main_cols());
+        match &self.mode {
+            Mode::Edit { buffer, .. } => Paragraph::new(input_line_with_suffix(
+                format!(" {addr_str}  "),
+                buffer,
+                self.edit_cursor.unwrap_or_else(|| buffer.chars().count()),
+                prompt_style_bold,
+                caret_style,
+                formula_edit_preview(grid, edit_addr, buffer),
+            ))
+            .style(prompt_style_bold),
+            Mode::OpenPath { buffer } => Paragraph::new(input_line(
+                " open: ".to_string(),
+                buffer,
+                self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
+                prompt_style,
+                caret_style,
+            ))
+            .style(prompt_style),
+            Mode::SheetRename { buffer, .. } => Paragraph::new(input_line(
+                " rename sheet: ".to_string(),
+                buffer,
+                self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
+                prompt_style,
+                caret_style,
+            ))
+            .style(prompt_style),
+            Mode::SheetCopy { buffer, .. } => Paragraph::new(input_line(
+                " copy sheet as: ".to_string(),
+                buffer,
+                self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
+                prompt_style,
+                caret_style,
+            ))
+            .style(prompt_style),
+            Mode::SavePath { buffer } => Paragraph::new(input_line(
+                " save as: ".to_string(),
+                buffer,
+                self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
+                prompt_style,
+                caret_style,
+            ))
+            .style(prompt_style),
+            Mode::ExportTsv { buffer } => Paragraph::new(input_line(
+                " export TSV (blank=clipboard): ".to_string(),
+                buffer,
+                self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
+                prompt_style,
+                caret_style,
+            ))
+            .style(prompt_style),
+            Mode::ExportCsv { buffer } => Paragraph::new(input_line(
+                " export CSV (blank=clipboard): ".to_string(),
+                buffer,
+                self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
+                prompt_style,
+                caret_style,
+            ))
+            .style(prompt_style),
+            Mode::ExportAscii { buffer } => Paragraph::new(input_line(
+                " export ASCII table (blank=clipboard): ".to_string(),
+                buffer,
+                self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
+                prompt_style,
+                caret_style,
+            ))
+            .style(prompt_style),
+            Mode::ExportAll { buffer } => Paragraph::new(input_line(
+                " export full (incl headers/margins): ".to_string(),
+                buffer,
+                self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
+                prompt_style,
+                caret_style,
+            ))
+            .style(prompt_style),
+            Mode::ExportOdt { buffer } => Paragraph::new(input_line(
+                " export ODS: ".to_string(),
+                buffer,
+                self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
+                prompt_style,
+                caret_style,
+            ))
+            .style(prompt_style),
+            Mode::Find { buffer } => Paragraph::new(input_line(
+                " find text: ".to_string(),
+                buffer,
+                self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
+                prompt_style,
+                caret_style,
+            ))
+            .style(prompt_style),
+            Mode::Replace { buffer } => Paragraph::new(input_line(
+                " replace text: ".to_string(),
+                buffer,
+                self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
+                prompt_style,
+                caret_style,
+            ))
+            .style(prompt_style),
+            Mode::SetMaxColWidth { buffer } => Paragraph::new(input_line(
+                " max col width (default=20): ".to_string(),
+                buffer,
+                self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
+                prompt_style,
+                caret_style,
+            ))
+            .style(prompt_style),
+            Mode::SetColWidth { buffer } => Paragraph::new(input_line(
+                " col width [col=width|col]: ".to_string(),
+                buffer,
+                self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
+                prompt_style,
+                caret_style,
+            ))
+            .style(prompt_style),
+            Mode::SortView { buffer, persist } => Paragraph::new(input_line(
+                format!(
+                    " sort cols [A,B,C]{}: ",
+                    if *persist { " (save)" } else { "" }
+                ),
+                buffer,
+                self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
+                prompt_style,
+                caret_style,
+            ))
+            .style(prompt_style),
+            Mode::BalanceBooks { .. } => Paragraph::new(" ").style(prompt_style),
+            Mode::QuitPrompt => Paragraph::new(" Quit Corro? (Q)uit, (B)ack ")
+                .style(Style::default().fg(Color::White).bg(Color::Red)),
+            Mode::Help => Paragraph::new(" Help - Up/Down scroll, Esc closes ")
+                .style(Style::default().fg(Color::White).bg(Color::Blue)),
+            Mode::About => Paragraph::new(" About - Up/Down scroll, Esc closes ")
+                .style(Style::default().fg(Color::White).bg(Color::Blue)),
+            Mode::Menu { .. } | Mode::Normal | Mode::RevisionBrowse => {
+                let val = formula_bar_value(grid, addr);
+                let base = format!(" {addr_str}  {val}");
+                let text = if self.status.is_empty() {
+                    base
+                } else {
+                    format!("{base}   ·  {}", self.status)
+                };
+                Paragraph::new(text).style(Style::default().fg(Color::Cyan))
+            }
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn render_help_about_overlay(&self, f: &mut Frame, grid_area: Rect) -> bool {
+        if !matches!(&self.mode, Mode::Help | Mode::About) {
+            return false;
+        }
+
+        let body = match &self.mode {
+            Mode::Help => self.help_page_body(),
+            Mode::About => self.about_page_body(),
+            _ => String::new(),
+        };
+        let inner = Block::default().borders(Borders::ALL).inner(grid_area);
+        let lines: Vec<&str> = body.lines().collect();
+        let scroll = match &self.mode {
+            Mode::Help => self.help_scroll,
+            Mode::About => self.about_scroll,
+            _ => 0,
+        };
+        let max_scroll = lines.len().saturating_sub(inner.height as usize);
+        let scroll = scroll.min(max_scroll);
+        let visible: String = lines
+            .iter()
+            .skip(scroll)
+            .take(inner.height as usize)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(match self.mode {
+                Mode::Help => " Help ",
+                Mode::About => " About ",
+                _ => "",
+            });
+        let paragraph = Paragraph::new(visible)
+            .block(block)
+            .wrap(Wrap { trim: false });
+        f.render_widget(Clear, grid_area);
+        f.render_widget(paragraph, grid_area);
+        true
     }
 }
 
@@ -9536,20 +9557,6 @@ fn sheet_row_label(logical_row: usize, main_rows: usize) -> String {
 }
 
 fn col_header_label(global_col: usize, main_cols: usize) -> String {
-    let m = MARGIN_COLS;
-    if global_col < m {
-        format!("[{}", addr::mirror_margin_column_name(global_col, true))
-    } else if global_col < m + main_cols {
-        addr::excel_column_name(global_col - m)
-    } else {
-        format!(
-            "]{}",
-            addr::mirror_margin_column_name(global_col - m - main_cols, false)
-        )
-    }
-}
-
-fn formula_col_fragment(global_col: usize, main_cols: usize) -> String {
     let m = MARGIN_COLS;
     if global_col < m {
         format!("[{}", addr::mirror_margin_column_name(global_col, true))
