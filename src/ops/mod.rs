@@ -115,6 +115,18 @@ impl WorkbookState {
         self.sheets.len() - 1
     }
 
+    pub fn from_snapshot(snapshot: &WorkbookSnapshot) -> Self {
+        let mut workbook = Self {
+            sheets: snapshot.sheets.clone(),
+            active_sheet: 0,
+            next_sheet_id: snapshot.next_sheet_id,
+        };
+        workbook.active_sheet = workbook
+            .sheet_index_by_id(snapshot.active_sheet_id)
+            .unwrap_or(0);
+        workbook
+    }
+
     pub fn sheet_index_by_id(&self, id: u32) -> Option<usize> {
         self.sheets.iter().position(|s| s.id == id)
     }
@@ -580,7 +592,11 @@ fn parse_log_addr(addr: &str, main_cols: usize) -> Option<(CellAddr, usize)> {
                 (crate::grid::HEADER_ROWS - row_num) as u8
             };
             let after = &rest[row_digits..];
-            let (col, col_len) = parse_ui_column_fragment(after, main_cols)?;
+            let col_len = after.chars().take_while(|c| c.is_ascii_uppercase()).count();
+            if col_len == 0 {
+                return None;
+            }
+            let col = crate::addr::parse_excel_column(&after[..col_len])?;
             Some((CellAddr::Header { row, col }, 1 + row_digits + col_len))
         }
         b'_' => {
@@ -596,7 +612,11 @@ fn parse_log_addr(addr: &str, main_cols: usize) -> Option<(CellAddr, usize)> {
                 (row_num - 1) as u8
             };
             let after = &rest[row_digits..];
-            let (col, col_len) = parse_ui_column_fragment(after, main_cols)?;
+            let col_len = after.chars().take_while(|c| c.is_ascii_uppercase()).count();
+            if col_len == 0 {
+                return None;
+            }
+            let col = crate::addr::parse_excel_column(&after[..col_len])?;
             Some((CellAddr::Footer { row, col }, 1 + row_digits + col_len))
         }
         b'[' | b']' => {
@@ -1232,6 +1252,32 @@ mod tests {
                 },
             }
         );
+    }
+
+    #[test]
+    fn workbook_log_parser_keeps_header_footer_columns_absolute() {
+        let header = parse_workbook_line("SET $1:~1K x").unwrap();
+        let footer = parse_workbook_line("SET $1:_1K y").unwrap();
+        assert!(matches!(
+            header,
+            WorkbookOp::SheetOp {
+                op: Op::SetCell {
+                    addr: CellAddr::Header { col: 10, .. },
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            footer,
+            WorkbookOp::SheetOp {
+                op: Op::SetCell {
+                    addr: CellAddr::Footer { col: 10, .. },
+                    ..
+                },
+                ..
+            }
+        ));
     }
 
     #[test]

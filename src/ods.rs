@@ -66,8 +66,8 @@ fn ods_manifest_xml() -> String {
 }
 
 fn ods_content_xml(grid: &Grid) -> String {
-    let tc = visible_ods_cols(grid);
-    let rows = visible_ods_rows(grid);
+    let tc = ods_col_end(grid);
+    let row_end = ods_row_end(grid);
     let mut s = String::from(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:of="urn:oasis:names:tc:opendocument:xmlns:of:1.2" office:version="1.2"><office:body><office:spreadsheet><table:table>"#,
@@ -77,11 +77,14 @@ fn ods_content_xml(grid: &Grid) -> String {
         s.push_str("<table:table-column table:number-columns-repeated=\"1\"/>");
     }
 
-    for r in rows {
+    for r in 0..row_end {
         s.push_str("<table:table-row>");
-        for c in 0..tc {
+        let mut c = 0usize;
+        while c < tc {
             let global_col = c;
-            s.push_str(&ods_cell_xml(grid, r, global_col));
+            let cell = ods_cell_xml(grid, r, global_col);
+            s.push_str(&cell);
+            c += 1;
         }
         s.push_str("</table:table-row>");
     }
@@ -89,22 +92,16 @@ fn ods_content_xml(grid: &Grid) -> String {
     s
 }
 
-fn visible_ods_rows(grid: &Grid) -> Vec<usize> {
-    let hr = HEADER_ROWS;
-    let mr = grid.main_rows();
-    let fr = FOOTER_ROWS;
-    let mut rows = Vec::new();
-    for r in 0..hr + mr + fr {
-        if grid.logical_row_has_content(r) {
-            rows.push(r);
-        }
+fn ods_row_end(grid: &Grid) -> usize {
+    let mut end = HEADER_ROWS + grid.main_rows() + FOOTER_ROWS;
+    while end > 0 && !grid.logical_row_has_content(end - 1) {
+        end -= 1;
     }
-    rows
+    end.max(1)
 }
 
-fn visible_ods_cols(grid: &Grid) -> usize {
-    let tc = grid.total_cols();
-    let mut end = tc;
+fn ods_col_end(grid: &Grid) -> usize {
+    let mut end = grid.total_cols();
     while end > 0 && !grid.logical_col_has_content(end - 1) {
         end -= 1;
     }
@@ -268,6 +265,7 @@ fn parse_ods_content(xml: &str) -> Result<WorkbookState, OdsError> {
     let mut pending_value = String::new();
     let mut pending_formula: Option<String> = None;
     let mut in_p = false;
+    let mut in_cell = false;
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -290,15 +288,24 @@ fn parse_ods_content(xml: &str) -> Result<WorkbookState, OdsError> {
                     pending_value.clear();
                 }
                 b"table:table-cell" => {
+                    in_cell = true;
                     pending_value.clear();
                     pending_formula = attr_value(&e, b"table:formula");
                 }
                 _ => {}
             },
+            Ok(Event::Empty(e)) => match e.name().as_ref() {
+                b"table:table-cell" => {
+                    if let Some(sheet) = current_sheet.as_mut() {
+                        set_ods_cell(&mut sheet.state, row_idx, col_idx, None, "");
+                    }
+                    col_idx += 1;
+                }
+                _ => {}
+            },
             Ok(Event::Text(t)) => {
-                if in_p {
-                    pending_value
-                        .push_str(&t.unescape().map_err(|e| OdsError::Xml(e.to_string()))?);
+                if in_p || in_cell {
+                    pending_value.push_str(&String::from_utf8_lossy(t.as_ref()));
                 }
             }
             Ok(Event::End(e)) => match e.name().as_ref() {
@@ -313,6 +320,7 @@ fn parse_ods_content(xml: &str) -> Result<WorkbookState, OdsError> {
                             &pending_value,
                         );
                     }
+                    in_cell = false;
                     col_idx += 1;
                 }
                 b"table:table-row" => row_idx += 1,
@@ -332,6 +340,11 @@ fn parse_ods_content(xml: &str) -> Result<WorkbookState, OdsError> {
 
     if workbook.sheets.is_empty() {
         return Err(OdsError::Xml("no sheets found".into()));
+    }
+    for sheet in &mut workbook.sheets {
+        let rows = ods_row_end_for_sheet(&sheet.state.grid);
+        let cols = ods_col_end_for_sheet(&sheet.state.grid);
+        sheet.state.grid.set_main_size(rows.max(1), cols.max(1));
     }
     let snapshot = WorkbookSnapshot {
         next_sheet_id: workbook.next_sheet_id,
@@ -390,6 +403,14 @@ fn set_ods_cell(
     }
 }
 
+fn ods_row_end_for_sheet(grid: &Grid) -> usize {
+    HEADER_ROWS + grid.main_rows() + FOOTER_ROWS
+}
+
+fn ods_col_end_for_sheet(grid: &Grid) -> usize {
+    grid.total_cols()
+}
+
 fn attr_value(e: &quick_xml::events::BytesStart<'_>, key: &[u8]) -> Option<String> {
     for a in e.attributes().flatten() {
         if a.key.as_ref() == key {
@@ -427,5 +448,40 @@ mod tests {
                 .get(&CellAddr::Main { row: 0, col: 0 }),
             Some("42")
         );
+    }
+
+    #[test]
+    fn export_trims_trailing_blank_rows_and_columns() {
+        let mut grid = Grid::new(2, 2);
+        grid.set(&CellAddr::Main { row: 0, col: 0 }, "42".into());
+        let content = exported_content_xml(&grid);
+        assert_eq!(content.matches("<table:table-row>").count(), 27);
+        assert_eq!(content.matches("<table:table-column").count(), 11);
+    }
+
+    #[test]
+    fn export_converts_total_to_subtotal_formula() {
+        let mut grid = Grid::new(1, 1);
+        grid.set(
+            &CellAddr::Header {
+                row: 0,
+                col: MARGIN_COLS as u32,
+            },
+            "TOTAL".into(),
+        );
+        let content = exported_content_xml(&grid);
+        assert!(content.contains(r#"table:formula="of:=SUBTOTAL(9;A1:A1)""#));
+    }
+
+    fn exported_content_xml(grid: &Grid) -> String {
+        let bytes = export_ods_bytes(grid).unwrap();
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let mut content = String::new();
+        archive
+            .by_name("content.xml")
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
+        content
     }
 }

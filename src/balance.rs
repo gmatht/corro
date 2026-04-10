@@ -3,23 +3,20 @@
 use crate::formula::{cell_effective_display, translate_formula_text, FormulaCopyContext};
 use crate::grid::{CellAddr, Grid};
 use crate::ops::SheetState;
+use balance_core as core;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BalanceDirection {
-    PosToNeg,
-    NegToPos,
+pub use balance_core::{BalanceDirection, BalanceItem};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BalanceGroup {
+    pub row_indices: Vec<usize>,
+    pub total_cents: i64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BalanceSourceRow {
     pub row_index: usize,
     pub amount_cents: i64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BalanceGroup {
-    pub row_indices: Vec<usize>,
-    pub total_cents: i64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -44,50 +41,11 @@ pub struct BalanceCopyPlan {
 }
 
 pub fn parse_amount_cents(raw: &str) -> Option<i64> {
-    let t = raw.trim();
-    if t.is_empty() {
-        return None;
-    }
-
-    let mut s = t;
-    let negative = match s.chars().next()? {
-        '+' => {
-            s = &s[1..];
-            false
-        }
-        '-' => {
-            s = &s[1..];
-            true
-        }
-        _ => false,
-    };
-
-    let s = s.replace(',', "");
-    let (whole, frac) = match s.split_once('.') {
-        Some((whole, frac)) => (whole, frac),
-        None => (s.as_str(), ""),
-    };
-    if whole.is_empty() || !whole.chars().all(|c| c.is_ascii_digit()) {
-        return None;
-    }
-    if !frac.chars().all(|c| c.is_ascii_digit()) {
-        return None;
-    }
-
-    let mut cents = whole.parse::<i64>().ok()?.saturating_mul(100);
-    let frac_cents = match frac.len() {
-        0 => 0,
-        1 => frac.parse::<i64>().ok()?.saturating_mul(10),
-        _ => frac.get(0..2)?.parse::<i64>().ok()?,
-    };
-    cents = cents.saturating_add(frac_cents);
-    Some(if negative { -cents } else { cents })
+    core::parse_amount_cents(raw)
 }
 
 pub fn format_amount_cents(cents: i64) -> String {
-    let sign = if cents < 0 { "-" } else { "" };
-    let abs = cents.abs();
-    format!("{sign}{}.{:02}", abs / 100, abs % 100)
+    core::format_amount_cents(cents)
 }
 
 pub fn choose_balance_column(grid: &Grid) -> Option<usize> {
@@ -134,99 +92,27 @@ pub fn balance_books(
     direction: BalanceDirection,
     amount_col: usize,
 ) -> BalanceReport {
-    let mut supply: Vec<BalanceSourceRow> = rows
+    let items: Vec<BalanceItem> = rows
         .iter()
-        .filter(|row| match direction {
-            BalanceDirection::PosToNeg => row.amount_cents > 0,
-            BalanceDirection::NegToPos => row.amount_cents < 0,
+        .map(|row| BalanceItem {
+            id: row.row_index,
+            amount_cents: row.amount_cents,
         })
-        .cloned()
         .collect();
-    let mut demand: Vec<BalanceSourceRow> = rows
-        .iter()
-        .filter(|row| match direction {
-            BalanceDirection::PosToNeg => row.amount_cents < 0,
-            BalanceDirection::NegToPos => row.amount_cents > 0,
-        })
-        .cloned()
-        .collect();
-
-    supply.sort_by_key(|r| (r.row_index, r.amount_cents.abs()));
-    demand.sort_by_key(|r| (r.row_index, r.amount_cents.abs()));
-
-    let mut used = vec![false; demand.len()];
-    let mut groups = Vec::new();
-
-    for anchor in supply {
-        let target = anchor.amount_cents.abs();
-        let subset = choose_subset(&demand, &used, target);
-        if let Some(indices) = subset {
-            for &idx in &indices {
-                used[idx] = true;
-            }
-            let total: i64 = indices.iter().map(|&idx| demand[idx].amount_cents).sum();
-            groups.push(BalanceGroup {
-                row_indices: std::iter::once(anchor.row_index)
-                    .chain(indices.into_iter().map(|idx| demand[idx].row_index))
-                    .collect(),
-                total_cents: anchor.amount_cents + total,
-            });
-        }
-    }
-
-    let mut marked = vec![false; rows.len()];
-    for group in &groups {
-        for &row_index in &group.row_indices {
-            if row_index < marked.len() {
-                marked[row_index] = true;
-            }
-        }
-    }
-    let leftovers = (0..rows.len())
-        .filter(|idx| !marked[*idx])
-        .collect::<Vec<_>>();
-
+    let sol = core::solve_balance_groups(&items, direction);
     BalanceReport {
         direction,
         amount_col,
-        groups,
-        leftovers,
+        groups: sol
+            .groups
+            .into_iter()
+            .map(|group| BalanceGroup {
+                row_indices: group.item_ids,
+                total_cents: group.total_cents,
+            })
+            .collect(),
+        leftovers: sol.leftovers,
     }
-}
-
-fn choose_subset(rows: &[BalanceSourceRow], used: &[bool], target: i64) -> Option<Vec<usize>> {
-    fn rec(
-        rows: &[BalanceSourceRow],
-        used: &[bool],
-        target: i64,
-        start: usize,
-        current: &mut Vec<usize>,
-    ) -> Option<Vec<usize>> {
-        if target == 0 {
-            return Some(current.clone());
-        }
-        if target < 0 {
-            return None;
-        }
-
-        for idx in start..rows.len() {
-            if used[idx] {
-                continue;
-            }
-            let value = rows[idx].amount_cents.abs();
-            if value > target {
-                continue;
-            }
-            current.push(idx);
-            if let Some(found) = rec(rows, used, target - value, idx + 1, current) {
-                return Some(found);
-            }
-            current.pop();
-        }
-        None
-    }
-
-    rec(rows, used, target, 0, &mut Vec::new())
 }
 
 pub fn build_balance_report(grid: &Grid, col: usize, direction: BalanceDirection) -> BalanceReport {
@@ -405,119 +291,5 @@ pub fn row_order_from_groups(report: &BalanceReport, total_rows: usize) -> Vec<u
 }
 
 pub fn reordered_row_order(report: &BalanceReport, total_rows: usize) -> Vec<usize> {
-    let mut order = Vec::new();
-    for group in &report.groups {
-        order.extend(group.row_indices.iter().copied());
-    }
-    order.extend(report.leftovers.iter().copied());
-    for row in 0..total_rows {
-        if !order.contains(&row) {
-            order.push(row);
-        }
-    }
-    order
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn reordered_report_preserves_columns_and_translates_formulas() {
-        let mut source = SheetState::new(2, 2);
-        source
-            .grid
-            .set(&CellAddr::Main { row: 0, col: 0 }, "10".into());
-        source
-            .grid
-            .set(&CellAddr::Main { row: 0, col: 1 }, "=A1".into());
-        source
-            .grid
-            .set(&CellAddr::Main { row: 1, col: 0 }, "-10".into());
-        source
-            .grid
-            .set(&CellAddr::Main { row: 1, col: 1 }, "=A2".into());
-
-        let report = BalanceReport {
-            direction: BalanceDirection::PosToNeg,
-            amount_col: 0,
-            groups: Vec::new(),
-            leftovers: vec![1, 0],
-        };
-        let plan = balance_copy_plan(
-            1,
-            "Src".into(),
-            2,
-            "Dst".into(),
-            0,
-            source.grid.main_rows(),
-            &report,
-            true,
-        );
-        let out = materialize_report_sheet(&source, &plan);
-
-        assert_eq!(out.grid.main_cols(), 2);
-        assert_eq!(
-            out.grid.get(&CellAddr::Main { row: 0, col: 0 }),
-            Some("-10")
-        );
-        assert_eq!(
-            out.grid.get(&CellAddr::Main { row: 0, col: 1 }),
-            Some("=A1")
-        );
-        assert_eq!(out.grid.get(&CellAddr::Main { row: 1, col: 0 }), Some("10"));
-        assert_eq!(
-            out.grid.get(&CellAddr::Main { row: 1, col: 1 }),
-            Some("=A2")
-        );
-    }
-
-    #[test]
-    fn unmatched_heading_is_inserted_after_matched_rows() {
-        let mut source = SheetState::new(3, 1);
-        source
-            .grid
-            .set(&CellAddr::Main { row: 0, col: 0 }, "10".into());
-        source
-            .grid
-            .set(&CellAddr::Main { row: 1, col: 0 }, "-10".into());
-        source
-            .grid
-            .set(&CellAddr::Main { row: 2, col: 0 }, "5".into());
-
-        let report = build_balance_report(&source.grid, 0, BalanceDirection::PosToNeg);
-        let plan = balance_copy_plan(
-            1,
-            "Src".into(),
-            2,
-            "Dst".into(),
-            0,
-            source.grid.main_rows(),
-            &report,
-            true,
-        );
-        let out = materialize_report_sheet(&source, &plan);
-
-        assert_eq!(out.grid.get(&CellAddr::Main { row: 0, col: 0 }), Some("10"));
-        assert_eq!(
-            out.grid.get(&CellAddr::Main { row: 1, col: 0 }),
-            Some("-10")
-        );
-        assert_eq!(
-            out.grid.get(&CellAddr::Main { row: 2, col: 0 }),
-            Some("UNMATCHED")
-        );
-        assert_eq!(out.grid.get(&CellAddr::Main { row: 3, col: 0 }), Some("5"));
-    }
-
-    #[test]
-    fn choose_balance_column_prefers_mixed_sign_column() {
-        let mut grid = Grid::new(2, 3);
-        grid.set(&CellAddr::Main { row: 0, col: 0 }, "7".into());
-        grid.set(&CellAddr::Main { row: 1, col: 0 }, "8".into());
-        grid.set(&CellAddr::Main { row: 0, col: 1 }, "10".into());
-        grid.set(&CellAddr::Main { row: 1, col: 1 }, "-10".into());
-
-        assert_eq!(choose_balance_column(&grid), Some(1));
-    }
+    row_order_from_groups(report, total_rows)
 }

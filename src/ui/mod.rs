@@ -481,7 +481,7 @@ const EXPORT_MENU_ITEMS: [MenuItem; 5] = [
     },
     MenuItem {
         shortcut: 'D',
-        label: "ODT",
+        label: "ODS",
         target: MenuTarget::Action(MenuAction::ExportOdt),
     },
 ];
@@ -1006,10 +1006,10 @@ Menus\n\
 - Left goes back one menu level.\n\
  - Enter or the shortcut letter opens the selected item.\n\n\
 File menu\n\
- - Open file loads a .corro, .csv, or .tsv file. Use `link <file> <revision>` to open a log at a revision.\n\
+ - Open file loads a .corro, .csv, .tsv, or .ods file. Use `link <file> <revision>` to open a log at a revision.\n\
  - New sheet adds another sheet to the workbook.\n\
  - Ctrl+PageUp and Ctrl+PageDown switch between workbook tabs.\n\
-- Export opens TSV, CSV, ASCII, full export, or ODT prompts.\n\
+- Export opens TSV, CSV, ASCII, full export, or ODS prompts.\n\
 - Width opens default width and per-column width prompts.\n\
 - Sort view changes the visible order of main rows.\n\
 - Exit opens the quit prompt.\n\n\
@@ -2159,6 +2159,25 @@ impl App {
                         }
                         self.status = format!("Imported TSV {}", p.display());
                     }
+                    "ods" => match crate::ods::import_ods_workbook(p) {
+                        Ok(workbook) => {
+                            self.workbook = workbook;
+                            self.sync_active_sheet_cache();
+                            self.path = Some(p.clone());
+                            self.source_path = None;
+                            self.revision_limit = None;
+                            self.watcher = None;
+                            for c in 0..self.state.grid.main_cols() {
+                                self.state.grid.fit_column_to_content(MARGIN_COLS + c);
+                            }
+                            self.status = format!("Imported ODS {}", p.display());
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            self.status = format!("Failed to import ODS: {e}");
+                            return Ok(());
+                        }
+                    },
                     "csv" => {
                         let data = std::fs::read_to_string(p).map_err(|e| IoError::Io(e))?;
                         crate::io::import_csv(&data, &mut self.state);
@@ -3386,9 +3405,9 @@ impl App {
         String::from_utf8_lossy(&buf).into_owned()
     }
 
-    fn do_export_odt(&mut self) -> Vec<u8> {
+    fn do_export_ods(&mut self) -> Vec<u8> {
         crate::formula::refresh_spills(&mut self.state.grid);
-        export::export_odt_bytes(&self.state.grid).unwrap_or_default()
+        crate::ods::export_ods_bytes(&self.state.grid).unwrap_or_default()
     }
 
     fn save_to_path(&mut self, path: &Path) -> Result<(), RunError> {
@@ -3915,7 +3934,7 @@ impl App {
             ))
             .style(prompt_style),
             Mode::ExportOdt { buffer } => Paragraph::new(input_line(
-                " export ODT: ".to_string(),
+                " export ODS: ".to_string(),
                 buffer,
                 self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
                 prompt_style,
@@ -4293,11 +4312,6 @@ impl App {
                     if footer_agg.is_some() {
                         st = st.add_modifier(Modifier::BOLD);
                     }
-                }
-                let is_tilde_row = r == hr.saturating_sub(1);
-                let is_last_data_row = r == hr + mr - 1;
-                if is_tilde_row || is_last_data_row {
-                    st = st.add_modifier(Modifier::UNDERLINED);
                 }
                 spans.push(Span::styled(disp, st));
                 if c == lm - 1 && lm > 0 && col_ixs.contains(&lm) {
@@ -5222,10 +5236,10 @@ impl App {
                 KeyCode::Enter => {
                     let fname = buffer.clone();
                     if fname.trim().is_empty() {
-                        self.status = "ODT requires a filename".into();
+                        self.status = "ODS requires a filename".into();
                     } else {
-                        match std::fs::write(fname.trim(), self.do_export_odt()) {
-                            Ok(()) => self.status = format!("ODT saved to {}", fname.trim()),
+                        match std::fs::write(fname.trim(), self.do_export_ods()) {
+                            Ok(()) => self.status = format!("ODS saved to {}", fname.trim()),
                             Err(e) => self.status = format!("Write error: {e}"),
                         }
                     }
@@ -5563,7 +5577,7 @@ impl App {
                                 .and_then(|e| e.to_str())
                                 .unwrap_or("")
                                 .to_lowercase();
-                            if matches!(ext.as_str(), "csv" | "tsv") {
+                            if matches!(ext.as_str(), "csv" | "tsv" | "ods") {
                                 self.status = "Link only works for .corro logs".into();
                             } else if let Ok((off, replay)) =
                                 load_revisions_partial(&path, revision, &mut self.state)
