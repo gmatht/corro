@@ -544,14 +544,30 @@ impl Grid {
                 let r = *row as usize;
                 let c = *col as usize;
                 if r < HEADER_ROWS && c < self.total_cols() {
+                    if c >= MARGIN_COLS {
+                        let required_main_cols = c - MARGIN_COLS + 1;
+                        if required_main_cols > self.extent_main_cols as usize {
+                            self.extent_main_cols = required_main_cols as u32;
+                            self.resize_header_footer_width();
+                        }
+                    }
                     self.header[r][c] = value;
+                    self.auto_fit_column(c);
                 }
             }
             CellAddr::Footer { row, col } => {
                 let r = *row as usize;
                 let c = *col as usize;
                 if r < FOOTER_ROWS && c < self.total_cols() {
+                    if c >= MARGIN_COLS {
+                        let required_main_cols = c - MARGIN_COLS + 1;
+                        if required_main_cols > self.extent_main_cols as usize {
+                            self.extent_main_cols = required_main_cols as u32;
+                            self.resize_header_footer_width();
+                        }
+                    }
                     self.footer[r][c] = value;
+                    self.auto_fit_column(c);
                 }
             }
             CellAddr::Main { row, col } => {

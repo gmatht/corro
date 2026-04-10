@@ -7698,6 +7698,51 @@ mod tests {
     }
 
     #[test]
+    fn header_only_b_column_stays_visible_as_b() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 2);
+        app.state.grid.set(
+            &CellAddr::Header {
+                row: 25,
+                col: MARGIN_COLS as u32 + 1,
+            },
+            "HDR-B".into(),
+        );
+        app.state.grid.set(
+            &CellAddr::Footer {
+                row: 0,
+                col: MARGIN_COLS as u32 + 1,
+            },
+            "FTR-B".into(),
+        );
+
+        let backend = TestBackend::new(80, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = |y: u16| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+
+        let header_line = (0..buffer.area.height)
+            .map(row)
+            .find(|line| line.contains("HDR-B"))
+            .unwrap_or_default();
+        let footer_line = (0..buffer.area.height)
+            .map(row)
+            .find(|line| line.contains("FTR-B"))
+            .unwrap_or_default();
+
+        assert!(header_line.contains("B") || footer_line.contains("B"));
+        assert!(!header_line.contains("]A") || header_line.contains("B"));
+    }
+
+    #[test]
     fn escape_cancels_edit_without_committing() {
         let mut app = App::new(None);
         app.state
@@ -8479,9 +8524,9 @@ mod tests {
         };
         let formula_line = row(1);
 
-        assert!(formula_line.contains("B1"), "row1={formula_line}");
-        assert!(formula_line.contains("TAX TAX"), "row1={formula_line}");
-        assert!(!formula_line.contains("]A."), "row1={formula_line}");
+        assert!(formula_line.contains("B1"));
+        assert!(formula_line.contains("TAX TAX"));
+        assert!(!formula_line.contains("]A."));
         assert_eq!(
             app.state.grid.get(&CellAddr::Main { row: 0, col: 1 }),
             Some("=A*0.1 -- TAX TAX")
