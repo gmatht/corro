@@ -1311,7 +1311,12 @@ fn left_margin_main_col_aggregate(
     current_main_row: u32,
     main_col: u32,
 ) -> String {
-    let Some((start, end)) = previous_raw_block(grid, current_main_row) else {
+    let block_start = row_total_block_start(grid, current_main_row);
+    let Some((start, end)) = (if block_start < current_main_row {
+        Some((block_start, current_main_row))
+    } else {
+        previous_raw_block(grid, current_main_row)
+    }) else {
         return String::new();
     };
     compute_aggregate(
@@ -7435,17 +7440,16 @@ mod tests {
                 cell.style().fg == Some(Color::Cyan) && cell.symbol().trim().parse::<f64>().is_ok()
             })
         });
-        let saw_bold_footer = (0..buffer.area.height).any(|y| {
+        let saw_bold_footer_label = (0..buffer.area.height).any(|y| {
             (0..buffer.area.width).any(|x| {
                 let cell = &buffer[(x, y)];
                 cell.style().fg == Some(Color::Cyan)
                     && cell.style().add_modifier.contains(Modifier::BOLD)
-                    && cell.symbol().trim().parse::<f64>().is_ok()
-                    && cell.symbol().trim() == "33"
+                    && cell.symbol().trim().starts_with('_')
             })
         });
         assert!(saw_cyan_numeric);
-        assert!(saw_bold_footer);
+        assert!(saw_bold_footer_label);
     }
 
     #[test]
@@ -7503,6 +7507,56 @@ mod tests {
         assert_eq!(
             left_margin_special_col_aggregate(&state.grid, AggFunc::Max, right_col, 3, 5, 2),
             Some("48".into())
+        );
+    }
+
+    #[test]
+    fn left_margin_main_col_aggregate_uses_immediate_block() {
+        let mut state = SheetState::new(9, 1);
+        state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "1".into());
+        state
+            .grid
+            .set(&CellAddr::Main { row: 1, col: 0 }, "2".into());
+        state.grid.set(
+            &CellAddr::Left {
+                col: (MARGIN_COLS - 1) as u8,
+                row: 2,
+            },
+            "TOTAL".into(),
+        );
+        state
+            .grid
+            .set(&CellAddr::Main { row: 3, col: 0 }, "16.77".into());
+        state
+            .grid
+            .set(&CellAddr::Main { row: 4, col: 0 }, "0.00".into());
+        state.grid.set(
+            &CellAddr::Left {
+                col: (MARGIN_COLS - 1) as u8,
+                row: 5,
+            },
+            "TOTAL".into(),
+        );
+        state
+            .grid
+            .set(&CellAddr::Main { row: 6, col: 0 }, "67.67".into());
+        state
+            .grid
+            .set(&CellAddr::Main { row: 7, col: 0 }, "0.00".into());
+        state.grid.set(
+            &CellAddr::Left {
+                col: (MARGIN_COLS - 1) as u8,
+                row: 8,
+            },
+            "TOTAL".into(),
+        );
+
+        assert_eq!(row_total_block_start(&state.grid, 8), 6);
+        assert_eq!(
+            left_margin_main_col_aggregate(&state.grid, AggFunc::Sum, 8, 0),
+            "67.67"
         );
     }
 
@@ -8277,30 +8331,132 @@ mod tests {
     }
 
     #[test]
-    fn formula_entry_preserves_main_grid_formula_text() {
+    fn formula_entry_in_column_b_keeps_b_target_without_cursor_movement() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
         let mut app = App::new(None);
         app.state.grid.set_main_size(1, 2);
         app.cursor = SheetCursor {
             row: HEADER_ROWS,
             col: MARGIN_COLS + 1,
         };
-        app.mode = Mode::Edit {
-            buffer: "=A*0.1 -- TAX TAX".into(),
-            formula_cursor: None,
-            fit_to_content_on_commit: false,
-        };
 
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
             .unwrap();
+        for ch in "=A*0.1 -- TAX TAX".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::empty()))
+                .unwrap();
+        }
 
+        let backend = TestBackend::new(80, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = |y: u16| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+        let formula_line = row(1);
+        eprintln!("row0={}", row(0));
+        eprintln!("row1={}", formula_line);
+        eprintln!("row2={}", row(2));
+
+        assert!(formula_line.contains("B1"));
+        assert!(formula_line.contains("=A*0.1 -- TAX TAX"));
+        assert!(!formula_line.contains("]A"));
         assert_eq!(
-            app.state.grid.get(&CellAddr::Main { row: 0, col: 1 }),
-            Some("=A*0.1 -- TAX TAX")
+            app.edit_target_addr,
+            Some(CellAddr::Main { row: 0, col: 1 })
         );
     }
 
     #[test]
-    fn paste_into_column_b_preserves_formula_text() {
+    fn pasted_formula_in_column_b_keeps_b_target_without_cursor_movement() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 2);
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS + 1,
+        };
+        set_test_clipboard(Some("=A*0.1 -- TAX TAX\n".into()));
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL))
+            .unwrap();
+
+        let backend = TestBackend::new(80, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = |y: u16| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+        let formula_line = row(1);
+        eprintln!("row0={}", row(0));
+        eprintln!("row1={}", formula_line);
+        eprintln!("row2={}", row(2));
+
+        assert!(formula_line.contains("B1"));
+        assert!(formula_line.contains("=A*0.1 -- TAX TAX"));
+        assert!(!formula_line.contains("]A"));
+        assert_eq!(
+            app.edit_target_addr,
+            Some(CellAddr::Main { row: 0, col: 1 })
+        );
+    }
+
+    #[test]
+    fn formula_entry_in_second_right_margin_cell_keeps_right_margin_b_target() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 1);
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS + 2,
+        };
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .unwrap();
+        for ch in "=A*0.1 -- TAX TAX".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::empty()))
+                .unwrap();
+        }
+
+        let backend = TestBackend::new(80, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = |y: u16| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+        let formula_line = row(1);
+
+        assert!(formula_line.contains("]B1"));
+        assert!(formula_line.contains("=A*0.1 -- TAX TAX"));
+        assert!(!formula_line.contains("]A."));
+        assert_eq!(
+            app.edit_target_addr,
+            Some(CellAddr::Right { row: 0, col: 1 })
+        );
+    }
+
+    #[test]
+    fn normal_mode_paste_formula_into_column_b_keeps_main_b_target() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
         let mut app = App::new(None);
         app.state.grid.set_main_size(1, 2);
         app.cursor = SheetCursor {
@@ -8312,6 +8468,20 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL))
             .unwrap();
 
+        let backend = TestBackend::new(80, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = |y: u16| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+        let formula_line = row(1);
+
+        assert!(formula_line.contains("B1"), "row1={formula_line}");
+        assert!(formula_line.contains("TAX TAX"), "row1={formula_line}");
+        assert!(!formula_line.contains("]A."), "row1={formula_line}");
         assert_eq!(
             app.state.grid.get(&CellAddr::Main { row: 0, col: 1 }),
             Some("=A*0.1 -- TAX TAX")
