@@ -76,21 +76,21 @@ mod tests {
 
     #[test]
     fn parses_revision_limit() {
-        let args = parse_args_from(["corro", "--revision", "2", "test5.corro"]);
+        let args = parse_args_from(["corro", "--revision", "2", "docs/test/main.corro"]);
         assert!(matches!(args.revision, Some(RevisionMode::Limit(2))));
         assert_eq!(
             args.file.as_deref(),
-            Some(std::path::Path::new("test5.corro"))
+            Some(std::path::Path::new("docs/test/main.corro"))
         );
     }
 
     #[test]
     fn parses_browse_mode() {
-        let args = parse_args_from(["corro", "-r", "test5.corro"]);
+        let args = parse_args_from(["corro", "-r", "docs/test/main.corro"]);
         assert!(matches!(args.revision, Some(RevisionMode::Browse)));
         assert_eq!(
             args.file.as_deref(),
-            Some(std::path::Path::new("test5.corro"))
+            Some(std::path::Path::new("docs/test/main.corro"))
         );
     }
 

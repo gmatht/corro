@@ -6317,6 +6317,13 @@ impl App {
 mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::path::PathBuf;
+
+    fn docs_test_path(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("docs/test")
+            .join(name)
+    }
 
     #[test]
     fn undo_restores_previous_cell_value() {
@@ -7801,10 +7808,11 @@ mod tests {
 
     #[test]
     fn open_path_parses_link_revision() {
-        let parsed = parse_open_path_request("link test5.corro 2").unwrap();
+        let fixture = docs_test_path("main.corro");
+        let parsed = parse_open_path_request(&format!("link {} 2", fixture.display())).unwrap();
         match parsed {
             OpenPathRequest::Revision { path, revision } => {
-                assert_eq!(path, PathBuf::from("test5.corro"));
+                assert_eq!(path, fixture);
                 assert_eq!(revision, 2);
             }
             other => panic!("unexpected parse: {other:?}"),
@@ -7813,9 +7821,10 @@ mod tests {
 
     #[test]
     fn linked_revision_uses_source_path_and_detaches_on_save() {
-        let mut app = App::new_with_revision_limit(Some(PathBuf::from("test5.corro")), Some(2));
+        let fixture = docs_test_path("main.corro");
+        let mut app = App::new_with_revision_limit(Some(fixture.clone()), Some(2));
         assert!(app.path.is_none());
-        assert_eq!(app.source_path, Some(PathBuf::from("test5.corro")));
+        assert_eq!(app.source_path, Some(fixture));
         assert_eq!(app.revision_limit, Some(2));
 
         let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -7828,7 +7837,8 @@ mod tests {
 
     #[test]
     fn save_clears_revision_limit() {
-        let mut app = App::new_with_revision_limit(Some(PathBuf::from("test5.corro")), Some(2));
+        let fixture = docs_test_path("main.corro");
+        let mut app = App::new_with_revision_limit(Some(fixture), Some(2));
         app.revision_limit = Some(2);
         let path = tempfile::NamedTempFile::new().unwrap();
 
@@ -7866,7 +7876,7 @@ mod tests {
 
     #[test]
     fn zerosum_right_from_a_in_edit_mode_moves_to_b() {
-        let mut app = App::new(Some(PathBuf::from("docs/test/zerosum.corro")));
+        let mut app = App::new(Some(docs_test_path("zerosum.corro")));
         app.load_initial().unwrap();
 
         assert_eq!(
@@ -8932,7 +8942,7 @@ mod tests {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
-        let mut app = App::new(Some(PathBuf::from("test5.corro")));
+        let mut app = App::new(Some(docs_test_path("main.corro")));
         app.load_initial().unwrap();
 
         let backend = TestBackend::new(140, 24);
@@ -8982,7 +8992,7 @@ mod tests {
 
     #[test]
     fn load_initial_handles_legacy_test5_workbook() {
-        let mut app = App::new(Some(PathBuf::from("test5.corro")));
+        let mut app = App::new(Some(docs_test_path("main.corro")));
         app.load_initial().unwrap();
 
         assert_eq!(app.workbook.sheet_count(), 4);
@@ -9214,7 +9224,7 @@ mod tests {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
-        let mut app = App::new(Some(PathBuf::from("test5.corro")));
+        let mut app = App::new(Some(docs_test_path("main.corro")));
         app.load_initial().unwrap();
 
         let backend = TestBackend::new(140, 24);
@@ -9239,7 +9249,7 @@ mod tests {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
-        let mut app = App::new(Some(PathBuf::from("test5.corro")));
+        let mut app = App::new(Some(docs_test_path("main.corro")));
         app.load_initial().unwrap();
 
         let backend = TestBackend::new(140, 24);

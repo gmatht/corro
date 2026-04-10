@@ -606,6 +606,13 @@ impl LogWatcher {
 mod tests {
     use super::*;
     use crate::grid::CellAddr;
+    use std::path::PathBuf;
+
+    fn docs_test_path(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("docs/test")
+            .join(name)
+    }
     use crate::ops::{Op, SheetRecord, SheetState, WorkbookSnapshot};
     use tempfile::NamedTempFile;
 
@@ -657,7 +664,7 @@ mod tests {
     #[test]
     fn load_legacy_test5_corro() {
         let mut state = SheetState::new(1, 1);
-        let (off, n) = load_revisions(Path::new("test5.corro"), 2, &mut state).unwrap();
+        let (off, n) = load_revisions(&docs_test_path("main.corro"), 2, &mut state).unwrap();
 
         assert!(off > 0);
         assert_eq!(n, 2);
@@ -678,7 +685,7 @@ mod tests {
     #[test]
     fn load_revisions_zero_loads_nothing() {
         let mut state = SheetState::new(1, 1);
-        let (off, n) = load_revisions(Path::new("test5.corro"), 0, &mut state).unwrap();
+        let (off, n) = load_revisions(&docs_test_path("main.corro"), 0, &mut state).unwrap();
 
         assert!(off > 0);
         assert_eq!(n, 0);
@@ -688,7 +695,7 @@ mod tests {
     #[test]
     fn load_revisions_limits_replay() {
         let mut state = SheetState::new(1, 1);
-        let (off, n) = load_revisions(Path::new("test5.corro"), 2, &mut state).unwrap();
+        let (off, n) = load_revisions(&docs_test_path("main.corro"), 2, &mut state).unwrap();
 
         assert!(off > 0);
         assert_eq!(n, 2);
@@ -766,7 +773,7 @@ mod tests {
 
     #[test]
     fn workbook_replay_test5_corro_reports_first_failing_line() {
-        let data = fs::read_to_string(Path::new("test5.corro")).unwrap();
+        let data = fs::read_to_string(docs_test_path("main.corro")).unwrap();
         let mut workbook = WorkbookState::new();
         let mut active_sheet = workbook.sheet_id(workbook.active_sheet);
         for (idx, line) in data.lines().enumerate() {
