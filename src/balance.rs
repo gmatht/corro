@@ -176,6 +176,7 @@ pub fn apply_balance_copy(source: &SheetState, target: &mut SheetState, plan: &B
         source_sheet_id: plan.source_sheet_id,
         target_sheet_id: plan.target_sheet_id,
         row_map: row_map.clone(),
+        main_cols: source.grid.main_cols(),
     };
 
     let copy_cell =

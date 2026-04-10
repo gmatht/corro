@@ -1,7 +1,7 @@
 //! `=...` cell formulas: parse, evaluate, display.
 
 use crate::addr::{
-    excel_column_name, parse_cell_ref_at, parse_main_range_at, parse_sheet_qualified_cell_ref_at,
+    excel_column_name, parse_cell_ref_at, parse_main_range_at, parse_sheet_id_prefix_at,
 };
 use crate::grid::{CellAddr, Grid, MainRange, HEADER_ROWS, MARGIN_COLS};
 use crate::ops::WorkbookState;
@@ -18,6 +18,7 @@ pub struct FormulaCopyContext {
     pub source_sheet_id: u32,
     pub target_sheet_id: u32,
     pub row_map: Vec<u32>,
+    pub main_cols: usize,
 }
 
 pub struct EvalContextGuard;
@@ -135,31 +136,7 @@ fn split_labeled_formula(raw: &str) -> Option<(&str, &str)> {
 }
 
 fn render_addr(addr: &CellAddr) -> String {
-    match addr {
-        CellAddr::Header { row, col } => format!(
-            "~{}{}",
-            HEADER_ROWS - *row as usize,
-            crate::addr::ui_column_fragment(*col as usize, 0)
-        ),
-        CellAddr::Footer { row, col } => {
-            format!(
-                "_{}{}",
-                *row as usize + 1,
-                crate::addr::ui_column_fragment(*col as usize, 0)
-            )
-        }
-        CellAddr::Main { row, col } => format!("{}{}", excel_column_name(*col as usize), row + 1),
-        CellAddr::Left { col, row } => format!(
-            "[{}{}",
-            crate::addr::mirror_margin_column_name(*col as usize, true),
-            row + 1
-        ),
-        CellAddr::Right { col, row } => format!(
-            "]{}{}",
-            crate::addr::mirror_margin_column_name(*col as usize, false),
-            row + 1
-        ),
-    }
+    crate::addr::cell_ref_text(addr, 0)
 }
 
 fn render_ast(ast: &Ast) -> String {
@@ -248,6 +225,7 @@ pub fn translate_formula_text_by_offset(
     let mut parser = Parser {
         s: &expr[1..],
         i: 0,
+        main_cols: 0,
     };
     let ast = parser.parse_expr().ok()?;
     parser.skip_ws();
@@ -419,6 +397,7 @@ pub fn translate_formula_text(raw: &str, ctx: &FormulaCopyContext) -> Option<Str
     let mut parser = Parser {
         s: &expr[1..],
         i: 0,
+        main_cols: ctx.main_cols,
     };
     let ast = parser.parse_expr().ok()?;
     parser.skip_ws();
@@ -655,6 +634,7 @@ fn eval_expr_str(
     let mut p = Parser {
         s: expr.trim(),
         i: 0,
+        main_cols: grid.main_cols(),
     };
     let ast = match p.parse_expr() {
         Ok(a) => a,
@@ -694,6 +674,7 @@ enum Ast {
 struct Parser<'a> {
     s: &'a str,
     i: usize,
+    main_cols: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -842,7 +823,9 @@ impl<'a> Parser<'a> {
         }
 
         if rest.starts_with('$') {
-            if let Some((sheet_id, addr, len)) = parse_sheet_qualified_cell_ref_at(rest) {
+            if let Some((sheet_id, addr, len)) =
+                parse_sheet_qualified_cell_ref_at_for_workbook(rest)
+            {
                 self.i += len;
                 return Ok(Ast::SheetRef { sheet_id, addr });
             }
@@ -854,8 +837,8 @@ impl<'a> Parser<'a> {
             if j > 1 && j < bytes.len() && bytes[j] == b':' {
                 let sheet = &rest[1..j];
                 let after = &rest[j + 1..];
-                if let Some((sheet_id, _grid)) = workbook_lookup_sheet_ref(sheet) {
-                    let (addr, len) = parse_cell_ref_at(after).ok_or(())?;
+                if let Some((sheet_id, grid)) = workbook_lookup_sheet_ref(sheet) {
+                    let (addr, len) = parse_cell_ref_at(after, grid.main_cols()).ok_or(())?;
                     self.i += j + 1 + len;
                     return Ok(Ast::SheetRef { sheet_id, addr });
                 }
@@ -863,13 +846,8 @@ impl<'a> Parser<'a> {
             return Err(());
         }
 
-        // Region-style refs
-        if rest.starts_with('~')
-            || rest.starts_with('_')
-            || rest.starts_with('<')
-            || rest.starts_with('>')
-        {
-            let (addr, len) = parse_cell_ref_at(rest).ok_or(())?;
+        if rest.starts_with('[') || rest.starts_with(']') {
+            let (addr, len) = parse_cell_ref_at(rest, 0).ok_or(())?;
             self.i += len;
             return Ok(Ast::Ref(addr));
         }
@@ -903,7 +881,11 @@ impl<'a> Parser<'a> {
                 };
                 let mut arg_asts = Vec::with_capacity(args.len());
                 for a in args {
-                    let mut sub = Parser { s: a.trim(), i: 0 };
+                    let mut sub = Parser {
+                        s: a.trim(),
+                        i: 0,
+                        main_cols: self.main_cols,
+                    };
                     arg_asts.push(sub.parse_expr()?);
                     sub.skip_ws();
                     if sub.i != sub.s.len() {
@@ -915,7 +897,7 @@ impl<'a> Parser<'a> {
                     args: arg_asts,
                 });
             }
-            if let Some((addr, len)) = parse_cell_ref_at(rest) {
+            if let Some((addr, len)) = parse_cell_ref_at(rest, self.main_cols) {
                 self.i = start + len;
                 return Ok(Ast::Ref(addr));
             }
@@ -968,16 +950,26 @@ impl<'a> Parser<'a> {
 }
 
 fn parse_sheet_qualified_ref(s: &str) -> Option<(u32, CellAddr, usize)> {
+    let (sheet_id, prefix_len) = parse_sheet_id_prefix_at(s)?;
+    let rest = s.get(prefix_len..)?;
+    let rest = rest.strip_prefix('!')?;
+    let grid = workbook_lookup(sheet_id)?;
+    let (addr, len) = parse_cell_ref_at(rest, grid.main_cols())?;
+    Some((sheet_id, addr, prefix_len + 1 + len))
+}
+
+fn parse_sheet_qualified_cell_ref_at_for_workbook(s: &str) -> Option<(u32, CellAddr, usize)> {
     let bytes = s.as_bytes();
     let mut i = 1usize;
     while i < bytes.len() && bytes[i].is_ascii_digit() {
         i += 1;
     }
-    if i == 1 || i >= bytes.len() || bytes[i] != b'!' {
+    if i == 1 || i >= bytes.len() || bytes[i] != b':' {
         return None;
     }
     let sheet_id = std::str::from_utf8(&bytes[1..i]).ok()?.parse().ok()?;
-    let (addr, len) = parse_cell_ref_at(&s[i + 1..])?;
+    let grid = workbook_lookup(sheet_id)?;
+    let (addr, len) = parse_cell_ref_at(&s[i + 1..], grid.main_cols())?;
     Some((sheet_id, addr, i + 1 + len))
 }
 
@@ -1528,7 +1520,11 @@ mod tests {
 
     #[test]
     fn bare_name_is_parse_error_outside_let() {
-        let mut p = Parser { s: "x", i: 0 };
+        let mut p = Parser {
+            s: "x",
+            i: 0,
+            main_cols: 0,
+        };
         assert!(p.parse_expr().is_ok());
         let mut g = Grid::new(1, 1);
         g.set(&CellAddr::Main { row: 0, col: 0 }, "=x".into());
@@ -2213,7 +2209,11 @@ mod tests {
 
     #[test]
     fn sheet_ref_syntax_parses() {
-        let mut p = Parser { s: "#2!A1", i: 0 };
+        let mut p = Parser {
+            s: "#2!A1",
+            i: 0,
+            main_cols: 0,
+        };
         match p.parse_expr().unwrap() {
             Ast::SheetRef { sheet_id, addr } => {
                 assert_eq!(sheet_id, 2);
@@ -2231,6 +2231,7 @@ mod tests {
         let mut p = Parser {
             s: "$Sheet2:A1",
             i: 0,
+            main_cols: 0,
         };
         match p.parse_expr().unwrap() {
             Ast::SheetRef { sheet_id, addr } => {
@@ -2249,6 +2250,7 @@ mod tests {
         let mut p = Parser {
             s: "$Budget:A1",
             i: 0,
+            main_cols: 0,
         };
         match p.parse_expr().unwrap() {
             Ast::SheetRef { sheet_id, addr } => {

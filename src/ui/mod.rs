@@ -28,7 +28,7 @@ use std::io::{self, stdout};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
-/// Width of the row-label gutter (`~1`, ` 1 `, `_1`).
+/// Width of the row-label gutter (`]A~1`, `A1`, `A_1`).
 const ROW_LABEL_CHARS: usize = 5;
 /// Fixed cell display width in terminal columns.
 const CELL_W: usize = 12;
@@ -1018,12 +1018,12 @@ Help menu\n\
 - Row ops and Col ops show quick move tips.\n\
 - Full help opens this page.\n\n\
 Address syntax\n\
- - Main cell: A1\n\
- - Header cell: ~1A\n\
-- Footer cell: _1A\n\
-- Left margin: [A1\n\
-- Right margin: ]A1\n\
- - Cross-sheet refs use numeric IDs like #2!A1.\n\
+  - Main cell: A1\n\
+  - Header cell: A~1\n\
+  - Footer cell: A_1\n\
+  - Left margin: [A1\n\
+  - Right margin: ]A1\n\
+  - Cross-sheet refs use numeric IDs like #2!A1 or $2:A1.\n\
 - Logs and saved files use this syntax only.\n\n\
 Quit\n\
 - q opens the quit prompt.\n\
@@ -1533,14 +1533,14 @@ fn footer_special_col_aggregate(
 // ── Cell-address shorthand ───────────────────────────────────────────────────
 
 /// Parse `ADDR: VALUE` shorthand. Returns `(target_addr, value)` or `None`.
-fn parse_cell_shorthand(buf: &str) -> Option<(CellAddr, String)> {
+fn parse_cell_shorthand(buf: &str, main_cols: usize) -> Option<(CellAddr, String)> {
     let colon = buf.find(':')?;
     let addr_part = buf[..colon].trim();
     let value_part = buf[colon + 1..].trim_start().to_string();
     if addr_part.is_empty() {
         return None;
     }
-    let (addr, n) = parse_cell_ref_at(addr_part)?;
+    let (addr, n) = parse_cell_ref_at(addr_part, main_cols)?;
     if n != addr_part.len() {
         return None;
     }
@@ -2863,16 +2863,17 @@ impl App {
 
     fn commit_edit_buffer(&mut self, buffer: &str) -> Result<(), RunError> {
         self.edit_special_palette = false;
-        let (addr, value) = if let Some((a, v)) = parse_cell_shorthand(buffer) {
-            (a, v)
-        } else {
-            (
-                self.edit_target_addr
-                    .clone()
-                    .unwrap_or_else(|| self.cursor.to_addr(&self.state.grid)),
-                buffer.to_string(),
-            )
-        };
+        let (addr, value) =
+            if let Some((a, v)) = parse_cell_shorthand(buffer, self.state.grid.main_cols()) {
+                (a, v)
+            } else {
+                (
+                    self.edit_target_addr
+                        .clone()
+                        .unwrap_or_else(|| self.cursor.to_addr(&self.state.grid)),
+                    buffer.to_string(),
+                )
+            };
         if self.state.grid.get(&addr).unwrap_or("") == value {
             self.pending_fit_to_content_on_commit = false;
             return Ok(());
@@ -3341,31 +3342,7 @@ impl App {
     }
 
     fn formula_ref_for_addr(&self, addr: &CellAddr) -> String {
-        match addr {
-            CellAddr::Header { row, col } => format!(
-                "~{}{}",
-                HEADER_ROWS - *row as usize,
-                col_header_label(*col as usize, self.state.grid.main_cols())
-            ),
-            CellAddr::Footer { row, col } => format!(
-                "_{}{}",
-                *row as usize + 1,
-                col_header_label(*col as usize, self.state.grid.main_cols())
-            ),
-            CellAddr::Main { row, col } => {
-                format!("{}{}", addr::excel_column_name(*col as usize), row + 1)
-            }
-            CellAddr::Left { col, row } => format!(
-                "[{}{}",
-                addr::mirror_margin_column_name(*col as usize, true),
-                row + 1
-            ),
-            CellAddr::Right { col, row } => format!(
-                "]{}{}",
-                addr::mirror_margin_column_name(*col as usize, false),
-                row + 1
-            ),
-        }
+        crate::addr::cell_ref_text(addr, self.state.grid.main_cols())
     }
 
     fn do_export(&mut self, csv: bool) -> String {
@@ -9439,35 +9416,7 @@ mod tests {
 // ── Display helpers ───────────────────────────────────────────────────────────
 
 fn addr_label(addr: &CellAddr, main_cols: usize) -> String {
-    match addr {
-        CellAddr::Header { row, col } => format!(
-            "~{}:{}",
-            HEADER_ROWS - *row as usize,
-            col_header_label(*col as usize, main_cols)
-        ),
-        CellAddr::Footer { row, col } => format!(
-            "_{}:{}",
-            *row as usize + 1,
-            col_header_label(*col as usize, main_cols)
-        ),
-        CellAddr::Main { row, col } => {
-            format!("{}{}", addr::excel_column_name(*col as usize), row + 1)
-        }
-        CellAddr::Left { col, row } => {
-            format!(
-                "[{}{}",
-                addr::mirror_margin_column_name(*col as usize, true),
-                row + 1
-            )
-        }
-        CellAddr::Right { col, row } => {
-            format!(
-                "]{}{}",
-                addr::mirror_margin_column_name(*col as usize, false),
-                row + 1
-            )
-        }
-    }
+    crate::addr::cell_ref_text(addr, main_cols)
 }
 
 fn input_line(

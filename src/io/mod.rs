@@ -203,33 +203,7 @@ pub fn save_workbook(path: &Path, workbook: &WorkbookSnapshot) -> Result<(), IoE
 }
 
 fn workbook_addr_label(addr: &CellAddr) -> String {
-    match addr {
-        CellAddr::Main { row, col } => format!(
-            "{}{}",
-            crate::addr::excel_column_name(*col as usize),
-            row + 1
-        ),
-        CellAddr::Header { row, col } => format!(
-            "~{}{}",
-            crate::grid::HEADER_ROWS - *row as usize,
-            crate::addr::ui_column_fragment(*col as usize, 0)
-        ),
-        CellAddr::Footer { row, col } => format!(
-            "_{}{}",
-            *row as usize + 1,
-            crate::addr::ui_column_fragment(*col as usize, 0)
-        ),
-        CellAddr::Left { col, row } => format!(
-            "[{}{}",
-            crate::addr::mirror_margin_column_name(*col as usize, true),
-            row + 1
-        ),
-        CellAddr::Right { col, row } => format!(
-            "]{}{}",
-            crate::addr::mirror_margin_column_name(*col as usize, false),
-            row + 1
-        ),
-    }
+    crate::addr::cell_ref_text(addr, 0)
 }
 
 pub fn load_workbook_snapshot(path: &Path) -> Result<WorkbookSnapshot, IoError> {
