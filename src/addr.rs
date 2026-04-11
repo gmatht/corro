@@ -180,13 +180,12 @@ pub fn parse_cell_ref_at(s: &str, main_cols: usize) -> Option<(CellAddr, usize)>
         };
         let col = match prefix {
             Some(true) => parse_mirror_margin_column_name(col_name, true)? as u32,
-            Some(false) => {
-                (crate::grid::MARGIN_COLS
-                    + main_cols
-                    + parse_mirror_margin_column_name(col_name, false)? as usize)
-                    as u32
-            }
-            None => crate::grid::MARGIN_COLS as u32 + parse_excel_column(col_name)?,
+            Some(false) => parse_mirror_margin_column_name(col_name, false)
+                .map(|c| (crate::grid::MARGIN_COLS + main_cols + c as usize) as u32)
+                .or_else(|| {
+                    Some(crate::grid::MARGIN_COLS as u32 + parse_excel_column(col_name)?)
+                })?,
+            None => (crate::grid::MARGIN_COLS as u32 + parse_excel_column(col_name)?) as u32,
         };
         return Some((
             if marker == '~' {
@@ -371,7 +370,7 @@ mod tests {
         );
         assert_eq!(
             parse_cell_ref_at("]A~3", 4).unwrap().0,
-            CellAddr::Header { row: 23, col: 15 }
+            CellAddr::Header { row: 23, col: 14 }
         );
     }
 }

@@ -1,8 +1,6 @@
 //! `=...` cell formulas: parse, evaluate, display.
 
-use crate::addr::{
-    excel_column_name, parse_cell_ref_at, parse_main_range_at, parse_sheet_id_prefix_at,
-};
+use crate::addr::{excel_column_name, parse_cell_ref_at, parse_main_range_at};
 use crate::grid::{CellAddr, Grid, MainRange, HEADER_ROWS, MARGIN_COLS};
 use crate::ops::WorkbookState;
 use std::cell::RefCell;
@@ -950,12 +948,20 @@ impl<'a> Parser<'a> {
 }
 
 fn parse_sheet_qualified_ref(s: &str) -> Option<(u32, CellAddr, usize)> {
-    let (sheet_id, prefix_len) = parse_sheet_id_prefix_at(s)?;
-    let rest = s.get(prefix_len..)?;
-    let rest = rest.strip_prefix('!')?;
-    let grid = workbook_lookup(sheet_id)?;
-    let (addr, len) = parse_cell_ref_at(rest, grid.main_cols())?;
-    Some((sheet_id, addr, prefix_len + 1 + len))
+    let bytes = s.as_bytes();
+    if bytes.first().copied()? != b'#' {
+        return None;
+    }
+    let mut i = 1usize;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == 1 || i >= bytes.len() || bytes[i] != b'!' {
+        return None;
+    }
+    let sheet_id = std::str::from_utf8(&bytes[1..i]).ok()?.parse().ok()?;
+    let (addr, len) = parse_cell_ref_at(&s[i + 1..], 0)?;
+    Some((sheet_id, addr, i + 1 + len))
 }
 
 fn parse_sheet_qualified_cell_ref_at_for_workbook(s: &str) -> Option<(u32, CellAddr, usize)> {
@@ -1468,6 +1474,7 @@ mod tests {
             source_sheet_id: 1,
             target_sheet_id: 2,
             row_map: vec![1, 0],
+            main_cols: 1,
         };
         let out = translate_formula_text("=A1+B2", &ctx).expect("translated formula");
         assert_eq!(out, "=(A2+B1)");

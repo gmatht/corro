@@ -2863,17 +2863,17 @@ impl App {
 
     fn commit_edit_buffer(&mut self, buffer: &str) -> Result<(), RunError> {
         self.edit_special_palette = false;
-        let (addr, value) =
-            if let Some((a, v)) = parse_cell_shorthand(buffer, self.state.grid.main_cols()) {
-                (a, v)
-            } else {
-                (
-                    self.edit_target_addr
-                        .clone()
-                        .unwrap_or_else(|| self.cursor.to_addr(&self.state.grid)),
-                    buffer.to_string(),
-                )
-            };
+        let explicit_addr = parse_cell_shorthand(buffer, self.state.grid.main_cols());
+        let (addr, value) = if let Some((a, v)) = explicit_addr.clone() {
+            (a, v)
+        } else {
+            (
+                self.edit_target_addr
+                    .clone()
+                    .unwrap_or_else(|| self.cursor.to_addr(&self.state.grid)),
+                buffer.to_string(),
+            )
+        };
         if self.state.grid.get(&addr).unwrap_or("") == value {
             self.pending_fit_to_content_on_commit = false;
             return Ok(());
@@ -2902,12 +2902,43 @@ impl App {
             op.apply(&mut self.state);
             self.status = "No file — edit in memory only".into();
         }
+        if let Some((explicit_addr, _)) = explicit_addr {
+            self.cursor = self
+                .sheet_cursor_for_addr(&explicit_addr)
+                .unwrap_or(self.cursor);
+            self.edit_target_addr = Some(explicit_addr);
+        }
         if self.pending_fit_to_content_on_commit {
             self.fit_column_to_content_from_current_cell(addr.clone());
             self.commit_active_sheet_cache();
             self.pending_fit_to_content_on_commit = false;
         }
         Ok(())
+    }
+
+    fn sheet_cursor_for_addr(&self, addr: &CellAddr) -> Option<SheetCursor> {
+        match addr {
+            CellAddr::Header { row, col } => Some(SheetCursor {
+                row: *row as usize,
+                col: *col as usize,
+            }),
+            CellAddr::Footer { row, col } => Some(SheetCursor {
+                row: HEADER_ROWS + self.state.grid.main_rows() + *row as usize,
+                col: *col as usize,
+            }),
+            CellAddr::Main { row, col } => Some(SheetCursor {
+                row: HEADER_ROWS + *row as usize,
+                col: MARGIN_COLS + *col as usize,
+            }),
+            CellAddr::Left { col, row } => Some(SheetCursor {
+                row: HEADER_ROWS + *row as usize,
+                col: *col as usize,
+            }),
+            CellAddr::Right { col, row } => Some(SheetCursor {
+                row: HEADER_ROWS + *row as usize,
+                col: MARGIN_COLS + self.state.grid.main_cols() + *col as usize,
+            }),
+        }
     }
 
     fn commit_edit_and_move_down(&mut self, buffer: &str) -> Result<Mode, RunError> {
@@ -7102,6 +7133,19 @@ mod tests {
             panic!("expected edit mode");
         }
         assert_eq!(app.state.grid.col_width(MARGIN_COLS), 10);
+    }
+
+    #[test]
+    fn explicit_address_edit_moves_cursor_to_target() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 3);
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        };
+        app.commit_edit_buffer("C~1").unwrap();
+        assert_eq!(app.cursor.row, 0);
+        assert_eq!(app.cursor.col, MARGIN_COLS + 2);
     }
 
     #[test]

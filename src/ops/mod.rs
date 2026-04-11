@@ -373,14 +373,14 @@ fn parse_op_text(line: &str) -> Option<Op> {
         "SET" => {
             let addr = parts.next()?;
             let value = parts.collect::<Vec<_>>().join(" ");
-            let (addr, _) = parse_log_addr(addr, 0)?;
+            let (addr, _) = parse_log_addr(addr, 0, false)?;
             Some(Op::SetCell { addr, value })
         }
         "FILL" => {
             let mut cells = Vec::new();
             for token in parts {
                 let (addr, value) = token.split_once('=')?;
-                let (addr, _) = parse_log_addr(addr, 0)?;
+                let (addr, _) = parse_log_addr(addr, 0, false)?;
                 cells.push((addr, decode_log_value(value)?));
             }
             Some(Op::FillRange { cells })
@@ -443,16 +443,16 @@ pub fn parse_op_line(line: &str) -> Option<Op> {
 }
 
 impl Op {
-    pub fn to_log_line(&self) -> String {
+    pub fn to_log_line(&self, main_cols: usize) -> String {
         match self {
-            Op::SetCell { addr, value } => format!("SET {} {}", addr_text(addr, 0), value),
+            Op::SetCell { addr, value } => format!("SET {} {}", addr_text(addr, main_cols), value),
             Op::FillRange { cells } => format!(
                 "FILL {}",
                 cells
                     .iter()
                     .map(|(addr, value)| format!(
                         "{}={}",
-                        addr_text(addr, 0),
+                        addr_text(addr, main_cols),
                         encode_log_value(value)
                     ))
                     .collect::<Vec<_>>()
@@ -534,7 +534,7 @@ impl WorkbookOp {
                 Op::SetCell { addr, value } => {
                     format!("SET ${sheet_id}:{} {value}", addr_text(addr, main_cols))
                 }
-                _ => format!("{}{}", sheet_prefix(*sheet_id), op.to_log_line()),
+                _ => format!("{}{}", sheet_prefix(*sheet_id), op.to_log_line(main_cols)),
             },
         }
     }
@@ -544,12 +544,48 @@ fn parse_sheet_set_addr(addr: &str) -> Option<(u32, CellAddr, usize)> {
     let (sheet_id, prefix_len) = parse_sheet_id_prefix_at(addr)?;
     let rest = addr.get(prefix_len..)?;
     let cell_ref = rest.strip_prefix(':')?;
-    let (cell_addr, cell_len) = parse_log_addr(cell_ref, 0)?;
+    let (cell_addr, cell_len) = parse_log_addr(cell_ref, 0, true)?;
     Some((sheet_id, cell_addr, prefix_len + 1 + cell_len))
 }
 
-fn parse_log_addr(addr: &str, main_cols: usize) -> Option<(CellAddr, usize)> {
-    parse_cell_ref_at(addr, main_cols)
+fn parse_log_addr(
+    addr: &str,
+    main_cols: usize,
+    legacy_footer_right: bool,
+) -> Option<(CellAddr, usize)> {
+    if let Some(parsed) = parse_cell_ref_at(addr, main_cols) {
+        return Some(parsed);
+    }
+    if !legacy_footer_right {
+        return None;
+    }
+    let bytes = addr.as_bytes();
+    if bytes.first().copied()? != b'_' {
+        return None;
+    }
+    let rest = &addr[1..];
+    let row_digits = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+    if row_digits == 0 {
+        return None;
+    }
+    let row_num: usize = rest[..row_digits].parse().ok()?;
+    if row_num == 0 || row_num > crate::grid::FOOTER_ROWS {
+        return None;
+    }
+    let row = (row_num - 1) as u8;
+    let after = &rest[row_digits..];
+    let col_len = after.chars().take_while(|c| c.is_ascii_uppercase()).count();
+    if col_len == 0 {
+        return None;
+    }
+    let col = parse_excel_column(&after[..col_len])?;
+    Some((
+        CellAddr::Footer {
+            row,
+            col: crate::grid::MARGIN_COLS as u32 + col,
+        },
+        1 + row_digits + col_len,
+    ))
 }
 
 pub fn parse_workbook_line(line: &str) -> Result<WorkbookOp, std::io::Error> {
@@ -1019,57 +1055,9 @@ fn apply_any_line(line: &str, state: &mut SheetState) -> Result<(), std::io::Err
 }
 
 /// Append one op as text to `path` (creates file if missing).
-pub fn append_op(path: &Path, op: &Op) -> std::io::Result<()> {
+pub fn append_op(path: &Path, op: &Op, main_cols: usize) -> std::io::Result<()> {
     let mut f = OpenOptions::new().create(true).append(true).open(path)?;
-    let line = match op {
-        Op::SetCell { addr, value } => format!("SET {} {}", addr_text(addr, 0), value),
-        Op::MoveRowRange { from, count, to } => format!("MOVE ROW {from} {count} {to}"),
-        Op::MoveColRange { from, count, to } => format!("MOVE COL {from} {count} {to}"),
-        Op::FillRange { cells } => format!(
-            "FILL {}",
-            cells
-                .iter()
-                .map(|(addr, value)| format!("{}={}", addr_text(addr, 0), encode_log_value(value)))
-                .collect::<Vec<_>>()
-                .join(" ")
-        ),
-        Op::CopyFromTo { source, target } => {
-            format!(
-                "COPY_FROM_TO {} {}",
-                main_range_text(source),
-                main_range_text(target)
-            )
-        }
-        Op::SetMainSize {
-            main_rows,
-            main_cols,
-        } => {
-            format!("SIZE {main_rows} {main_cols}")
-        }
-        Op::SetMaxColWidth { width } => format!("MAX_COL_WIDTH {width}"),
-        Op::SetColWidth { col, width } => {
-            let name = crate::addr::excel_column_name(col.saturating_sub(crate::grid::MARGIN_COLS));
-            match width {
-                Some(w) => format!("COL_WIDTH {name} {w}"),
-                None => format!("COL_WIDTH {name}"),
-            }
-        }
-        Op::SetViewSortCols { cols } => format!(
-            "SORT {}",
-            cols.iter()
-                .map(|spec| {
-                    let name = crate::addr::excel_column_name(spec.col.saturating_sub(MARGIN_COLS));
-                    if spec.desc {
-                        format!("!{name}")
-                    } else {
-                        name
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(" ")
-        ),
-        Op::Undo { target } => format!("UNDO {target}"),
-    };
+    let line = op.to_log_line(main_cols);
     writeln!(f, "{line}")?;
     f.sync_all()?;
     Ok(())
@@ -1157,6 +1145,21 @@ mod tests {
     }
 
     #[test]
+    fn workbook_sheet_set_log_line_uses_absolute_header_footer_refs() {
+        let op = WorkbookOp::SheetOp {
+            sheet_id: 1,
+            op: Op::SetCell {
+                addr: CellAddr::Header {
+                    row: 25,
+                    col: (crate::grid::MARGIN_COLS + 2) as u32,
+                },
+                value: "TOTAL".into(),
+            },
+        };
+        assert_eq!(op.to_log_line(2), "SET $1:]A~1 TOTAL");
+    }
+
+    #[test]
     fn workbook_log_parser_keeps_header_footer_columns_absolute() {
         let header = parse_workbook_line("SET $1:K~1 x").unwrap();
         let footer = parse_workbook_line("SET $1:K_1 y").unwrap();
@@ -1190,7 +1193,7 @@ mod tests {
                 (CellAddr::Main { row: 0, col: 1 }, "2".into()),
             ],
         };
-        let line = op.to_log_line();
+        let line = op.to_log_line(0);
         assert_eq!(line, "FILL A1=1 B1=2");
         assert_eq!(parse_op_line(&line), Some(op));
     }
@@ -1211,7 +1214,7 @@ mod tests {
                 col_end: 3,
             },
         };
-        let line = op.to_log_line();
+        let line = op.to_log_line(0);
         assert_eq!(line, "COPY_FROM_TO A1:B2 B3:C4");
         assert_eq!(parse_op_line(&line), Some(op));
     }

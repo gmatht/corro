@@ -354,7 +354,9 @@ pub fn commit_op(
     state: &mut SheetState,
     op: &Op,
 ) -> Result<(), IoError> {
-    append_op(path, op)?;
+    let mut preview = state.clone();
+    op.apply(&mut preview);
+    append_op(path, op, preview.grid.main_cols())?;
     *offset = tail_apply(path, *offset, state)?;
     Ok(())
 }
@@ -378,10 +380,19 @@ pub fn commit_workbook_op(
     active_sheet: &mut u32,
     op: &WorkbookOp,
 ) -> Result<(), IoError> {
-    append_line(
-        path,
-        &op.to_log_line(workbook.active_sheet().grid.main_cols()),
-    )?;
+    let mut preview = workbook.clone();
+    let mut preview_active_sheet = *active_sheet;
+    crate::ops::apply_workbook_op(&mut preview, &mut preview_active_sheet, op.clone())?;
+    let main_cols = match op {
+        WorkbookOp::SheetOp { sheet_id, .. } => preview
+            .sheets
+            .iter()
+            .find(|s| s.id == *sheet_id)
+            .map(|s| s.state.grid.main_cols())
+            .unwrap_or_else(|| preview.active_sheet().grid.main_cols()),
+        _ => preview.active_sheet().grid.main_cols(),
+    };
+    append_line(path, &op.to_log_line(main_cols))?;
     *offset = tail_apply_workbook(path, *offset, workbook, active_sheet)?;
     Ok(())
 }
@@ -605,6 +616,35 @@ mod tests {
             state.grid.get(&CellAddr::Main { row: 0, col: 0 }),
             Some("42")
         );
+    }
+
+    #[test]
+    fn commit_workbook_op_uses_post_apply_width_for_header_refs() {
+        let path = NamedTempFile::new().unwrap();
+        let mut workbook = WorkbookState::new();
+        let sheet_id = workbook.sheet_id(workbook.active_sheet);
+        workbook.sheets[0].state.grid.set_main_size(1, 1);
+        let mut offset = 0u64;
+        let mut active_sheet = sheet_id;
+        let op = WorkbookOp::SheetOp {
+            sheet_id,
+            op: Op::SetCell {
+                addr: CellAddr::Header { row: 25, col: 12 },
+                value: "x".into(),
+            },
+        };
+
+        commit_workbook_op(
+            path.path(),
+            &mut offset,
+            &mut workbook,
+            &mut active_sheet,
+            &op,
+        )
+        .unwrap();
+
+        let written = fs::read_to_string(path.path()).unwrap();
+        assert!(written.contains("SET $1:]A~1 x"));
     }
 
     #[test]
