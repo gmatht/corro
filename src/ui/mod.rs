@@ -4463,7 +4463,7 @@ impl App {
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD)
                 };
-                let w = grid.col_width(c).max(1);
+                let w = grid.col_width(c).max(1) + 1;
                 spans.push(Span::styled(format!("{:>w$}", name, w = w), style));
                 if c == lm - 1 && lm > 0 && col_ixs.contains(&lm) {
                     spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
@@ -4599,7 +4599,7 @@ impl App {
                 } else {
                     cell_effective_display(grid, &cell_addr)
                 };
-                let cw = grid.col_width(c).max(1);
+                let cw = grid.col_width(c).max(1) + 1;
                 let formatted = format_cell_display(grid, &cell_addr, text);
                 let align = effective_cell_align(grid, &cell_addr, &formatted);
                 let disp = if formatted.chars().count() > cw {
@@ -8111,6 +8111,42 @@ mod tests {
 
         assert!(row4.contains("56"), "rendered row 4: {row4}");
         assert!(row5.contains("112"), "rendered row 5: {row5}");
+    }
+
+    #[test]
+    fn adjacent_cells_keep_a_visible_gap() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 2);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "1".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 1 }, "2".into());
+
+        let backend = TestBackend::new(60, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let row = (0..buffer.area.height)
+            .find(|&y| {
+                let text: String = (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect();
+                text.contains("1") && text.contains("2")
+            })
+            .unwrap();
+
+        let text: String = (0..buffer.area.width)
+            .map(|x| buffer[(x, row)].symbol())
+            .collect();
+        let one = text.find('1').unwrap();
+        let two = text.find('2').unwrap();
+        assert!(two > one + 1, "rendered row: {text}");
     }
 
     #[test]
