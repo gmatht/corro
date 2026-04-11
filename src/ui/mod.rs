@@ -4450,7 +4450,7 @@ impl App {
                 format!("{:>width$}", "", width = ROW_LABEL_CHARS),
                 Style::default().add_modifier(Modifier::BOLD),
             )];
-            for &c in &col_ixs {
+            for (i, &c) in col_ixs.iter().enumerate() {
                 let name = col_header_label(c, grid.main_cols());
                 let active_col = c == self.cursor.col;
                 let style = if active_col {
@@ -4463,12 +4463,14 @@ impl App {
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD)
                 };
-                let w = grid.col_width(c).max(1) + 1;
+                let w = grid.col_width(c).max(1);
                 spans.push(Span::styled(format!("{:>w$}", name, w = w), style));
-                if c == lm - 1 && lm > 0 && col_ixs.contains(&lm) {
+                if i + 1 < col_ixs.len() && c == lm - 1 && lm > 0 && col_ixs.contains(&lm) {
                     spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
+                } else if i + 1 < col_ixs.len() {
+                    spans.push(Span::raw(" "));
                 }
-                if c == lm + mc - 1 && show_right_divider {
+                if i + 1 < col_ixs.len() && c == lm + mc - 1 && show_right_divider {
                     spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
                 }
             }
@@ -4513,7 +4515,7 @@ impl App {
             let left_margin_agg = main_row_idx.and_then(|mri| left_margin_agg_func(grid, mri));
             let left_margin_block_start = main_row_idx.map(|mri| row_total_block_start(grid, mri));
 
-            for &c in &col_ixs {
+            for (i, &c) in col_ixs.iter().enumerate() {
                 let cur = SheetCursor { row: r, col: c };
                 let cell_addr = cur.to_addr(grid);
                 let right_col_agg = right_col_agg_func(grid, c);
@@ -4599,7 +4601,7 @@ impl App {
                 } else {
                     cell_effective_display(grid, &cell_addr)
                 };
-                let cw = grid.col_width(c).max(1) + 1;
+                let cw = grid.col_width(c).max(1);
                 let formatted = format_cell_display(grid, &cell_addr, text);
                 let align = effective_cell_align(grid, &cell_addr, &formatted);
                 let disp = if formatted.chars().count() > cw {
@@ -4660,10 +4662,12 @@ impl App {
                     }
                 }
                 spans.push(Span::styled(disp, st));
-                if c == lm - 1 && lm > 0 && col_ixs.contains(&lm) {
+                if i + 1 < col_ixs.len() && c == lm - 1 && lm > 0 && col_ixs.contains(&lm) {
                     spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
+                } else if i + 1 < col_ixs.len() {
+                    spans.push(Span::raw(" "));
                 }
-                if c == lm + mc - 1 && show_right_divider {
+                if i + 1 < col_ixs.len() && c == lm + mc - 1 && show_right_divider {
                     spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
                 }
             }

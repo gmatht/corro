@@ -315,7 +315,7 @@ impl Op {
                 state.grid.set_max_col_width(*width);
             }
             Op::SetColWidth { col, width } => {
-                state.grid.set_col_width(*col, *width);
+                state.grid.set_col_width(*col, width.map(|w| w.max(4)));
             }
             Op::SetViewSortCols { cols } => {
                 state.grid.set_view_sort_cols(cols.clone());
