@@ -1254,6 +1254,7 @@ Selection and movement\n\
 - Alt+arrows move selected rows or columns by one cell.\n\n\
 Menus\n\
 - Alt+F opens File.\n\
+- Format is available from the menu bar.\n\
 - Alt+I opens Insert.\n\
 - Alt+H opens Help.\n\
 - Ctrl+; inserts the date and Ctrl+Shift+; inserts the time.\n\
@@ -3356,24 +3357,15 @@ impl App {
 
     fn fit_column_to_content_from_current_cell(&mut self, addr: CellAddr) {
         match addr {
-            CellAddr::Main { col, .. } => self.state.grid.set_col_width(
-                MARGIN_COLS + col as usize,
-                self.state
-                    .grid
-                    .content_width_for_column(MARGIN_COLS + col as usize),
-            ),
-            CellAddr::Left { col, .. } => self.state.grid.fit_column_to_content(col as usize),
-            CellAddr::Right { col, .. } => self.state.grid.set_col_width(
+            CellAddr::Main { col, .. } => {
+                self.fit_column_to_rendered_content(MARGIN_COLS + col as usize)
+            }
+            CellAddr::Left { col, .. } => self.fit_column_to_rendered_content(col as usize),
+            CellAddr::Right { col, .. } => self.fit_column_to_rendered_content(
                 MARGIN_COLS + self.state.grid.main_cols() + col as usize,
-                self.state.grid.content_width_for_column(
-                    MARGIN_COLS + self.state.grid.main_cols() + col as usize,
-                ),
             ),
             CellAddr::Header { col, .. } | CellAddr::Footer { col, .. } => {
-                self.state.grid.set_col_width(
-                    col as usize,
-                    self.state.grid.content_width_for_column(col as usize),
-                )
+                self.fit_column_to_rendered_content(col as usize)
             }
         }
     }
@@ -3384,10 +3376,9 @@ impl App {
                 self.fit_column_to_rendered_content(MARGIN_COLS + col as usize)
             }
             CellAddr::Left { col, .. } => self.fit_column_to_rendered_content(col as usize),
-            CellAddr::Right { col, .. } => self
-                .state
-                .grid
-                .fit_column_to_content(MARGIN_COLS + self.state.grid.main_cols() + col as usize),
+            CellAddr::Right { col, .. } => self.fit_column_to_rendered_content(
+                MARGIN_COLS + self.state.grid.main_cols() + col as usize,
+            ),
             CellAddr::Header { col, .. } | CellAddr::Footer { col, .. } => {
                 self.fit_column_to_rendered_content(col as usize)
             }
@@ -4592,7 +4583,9 @@ impl App {
                 let cw = grid.col_width(c).max(1);
                 let formatted = format_cell_display(grid, &cell_addr, text);
                 let disp = if formatted.chars().count() > cw {
-                    truncate_with_ellipsis(&formatted, cw)
+                    shrink_numeric_display(&formatted, cw)
+                        .or_else(|| exponential_numeric_display(&formatted, cw))
+                        .unwrap_or_else(|| truncate_with_ellipsis(&formatted, cw))
                 } else {
                     align_cell_display(formatted, cw, grid.format_for_addr(&cell_addr).align)
                 };
@@ -4842,6 +4835,17 @@ impl App {
         } else {
             " Sheet "
         };
+        let format = if matches!(
+            section,
+            MenuSection::Format
+                | MenuSection::FormatScope
+                | MenuSection::FormatNumber
+                | MenuSection::FormatAlign
+        ) {
+            "[Format]"
+        } else {
+            " Format "
+        };
         let active = if item != usize::MAX {
             format!(
                 "  {}",
@@ -4852,7 +4856,7 @@ impl App {
         } else {
             String::new()
         };
-        format!(" {file}  {edit}  {insert}  {help}  {sheet}{active}")
+        format!(" {file}  {edit}  {format}  {insert}  {help}  {sheet}{active}")
     }
 
     fn balance_dialog_lines(
@@ -9500,6 +9504,26 @@ mod tests {
     }
 
     #[test]
+    fn huge_numbers_render_in_exponential_notation() {
+        let mut grid = Grid::new(1, 1);
+        let addr = CellAddr::Main { row: 0, col: 0 };
+        grid.set(&addr, "1234567890123456789012345".into());
+        grid.set_cell_format(
+            addr.clone(),
+            CellFormat {
+                number: Some(NumberFormat::Fixed { decimals: 2 }),
+                align: Some(TextAlign::Right),
+            },
+        );
+
+        let rendered = format_cell_display(&grid, &addr, cell_effective_display(&grid, &addr));
+        assert!(exponential_numeric_display(&rendered, 10)
+            .map(|s| s.chars().count() <= 10)
+            .unwrap_or(false));
+        assert!(shrink_numeric_display("92.8888", 6).is_some());
+    }
+
+    #[test]
     fn aligned_columns_keep_e_in_same_screen_column() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
@@ -9925,6 +9949,12 @@ mod tests {
     }
 
     #[test]
+    fn menu_bar_shows_format_tab() {
+        let app = App::new(None);
+        assert!(app.menu_bar_line().contains(" Format "));
+    }
+
+    #[test]
     fn save_path_renders_filename_as_typed() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
@@ -10272,6 +10302,49 @@ fn align_cell_display(text: String, width: usize, align: Option<TextAlign>) -> S
 fn truncate_with_ellipsis(text: &str, width: usize) -> String {
     let keep = width.saturating_sub(1);
     format!("{}…", text.chars().take(keep).collect::<String>())
+}
+
+fn shrink_numeric_display(text: &str, width: usize) -> Option<String> {
+    let mut s = text.trim().to_string();
+    if s.parse::<f64>().is_err() || !s.contains('.') {
+        return None;
+    }
+    while s.chars().count() > width {
+        let Some(last) = s.chars().last() else {
+            break;
+        };
+        if last == '.' {
+            s.pop();
+            break;
+        }
+        s.pop();
+    }
+    if s.chars().count() <= width {
+        Some(s)
+    } else {
+        None
+    }
+}
+
+fn exponential_numeric_display(text: &str, width: usize) -> Option<String> {
+    let value = text.trim().parse::<f64>().ok()?;
+    if !value.is_finite() {
+        return None;
+    }
+    let target = width.min(10);
+    for decimals in (0..=6).rev() {
+        let s = format!("{value:.decimals$e}");
+        if s.chars().count() <= target {
+            return Some(s);
+        }
+        if s.contains('.') {
+            let trimmed = s.trim_end_matches('0').trim_end_matches('.').to_string();
+            if trimmed.chars().count() <= target {
+                return Some(trimmed);
+            }
+        }
+    }
+    None
 }
 
 fn sheet_row_label(logical_row: usize, main_rows: usize) -> String {
