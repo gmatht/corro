@@ -66,6 +66,33 @@ pub struct SortSpec {
     pub desc: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum NumberFormat {
+    Currency { decimals: usize },
+    Fixed { decimals: usize },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum TextAlign {
+    Left,
+    Center,
+    Right,
+    Default,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CellFormat {
+    pub number: Option<NumberFormat>,
+    pub align: Option<TextAlign>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum FormatScope {
+    All,
+    Data,
+    Special,
+}
+
 /// Full sheet: dense header/footer; sparse main + left/right margins (infinite logical extent).
 #[derive(Clone, Debug)]
 pub struct Grid {
@@ -84,6 +111,14 @@ pub struct Grid {
     pub col_width_overrides: HashMap<usize, usize>,
     /// Optional sorted main-column view order.
     pub view_sort_cols: Vec<SortSpec>,
+    /// Column-wide format for all cells in a global column.
+    pub col_all_formats: HashMap<usize, CellFormat>,
+    /// Column-wide format for main-region cells in a global column.
+    pub col_data_formats: HashMap<usize, CellFormat>,
+    /// Column-wide format for header/footer/margin cells in a global column.
+    pub col_special_formats: HashMap<usize, CellFormat>,
+    /// Exact-cell overrides used for Cell/Selection formatting.
+    pub cell_formats: HashMap<CellAddr, CellFormat>,
     pub header: Vec<Vec<String>>,
     pub footer: Vec<Vec<String>>,
     pub(crate) spill_followers: HashMap<CellAddr, String>,
@@ -108,6 +143,10 @@ impl Grid {
             max_col_width: 20,
             col_width_overrides: HashMap::new(),
             view_sort_cols: Vec::new(),
+            col_all_formats: HashMap::new(),
+            col_data_formats: HashMap::new(),
+            col_special_formats: HashMap::new(),
+            cell_formats: HashMap::new(),
             header: Vec::new(),
             footer: Vec::new(),
             spill_followers: HashMap::new(),
@@ -129,6 +168,7 @@ impl Grid {
         let old_main_cols = self.extent_main_cols as usize;
         let new_main_cols = old_main_cols.saturating_add(1);
         self.remap_main_col_layout_for_resize(old_main_cols, new_main_cols);
+        self.remap_formats_for_resize(old_main_cols, new_main_cols);
         self.extent_main_cols = new_main_cols as u32;
         self.resize_header_footer_width();
     }
@@ -172,6 +212,7 @@ impl Grid {
                 let old_main_cols = self.extent_main_cols as usize;
                 let new_main_cols = mc as usize + 1;
                 self.remap_main_col_layout_for_resize(old_main_cols, new_main_cols);
+                self.remap_formats_for_resize(old_main_cols, new_main_cols);
                 self.extent_main_cols = mc + 1;
                 grown = true;
             }
@@ -265,6 +306,7 @@ impl Grid {
         let old_main_cols = self.extent_main_cols as usize;
         let new_main_cols = main_cols.max(1);
         self.remap_main_col_layout_for_resize(old_main_cols, new_main_cols);
+        self.remap_formats_for_resize(old_main_cols, new_main_cols);
         self.extent_main_rows = main_rows.max(1) as u32;
         self.extent_main_cols = new_main_cols as u32;
         self.main_cells
@@ -455,6 +497,109 @@ impl Grid {
 
     pub fn set_view_sort_cols(&mut self, cols: Vec<SortSpec>) {
         self.view_sort_cols = cols;
+    }
+
+    fn merge_format(base: CellFormat, overlay: CellFormat) -> CellFormat {
+        CellFormat {
+            number: overlay.number.or(base.number),
+            align: overlay.align.or(base.align),
+        }
+    }
+
+    fn set_scoped_column_format(
+        map: &mut HashMap<usize, CellFormat>,
+        col: usize,
+        format: CellFormat,
+    ) {
+        if format == CellFormat::default() {
+            map.remove(&col);
+        } else {
+            map.insert(col, format);
+        }
+    }
+
+    pub fn set_column_format(&mut self, scope: FormatScope, col: usize, format: CellFormat) {
+        match scope {
+            FormatScope::All => {
+                Self::set_scoped_column_format(&mut self.col_all_formats, col, format)
+            }
+            FormatScope::Data => {
+                Self::set_scoped_column_format(&mut self.col_data_formats, col, format)
+            }
+            FormatScope::Special => {
+                Self::set_scoped_column_format(&mut self.col_special_formats, col, format)
+            }
+        }
+    }
+
+    pub fn set_cell_format(&mut self, addr: CellAddr, format: CellFormat) {
+        if format == CellFormat::default() {
+            self.cell_formats.remove(&addr);
+        } else {
+            self.cell_formats.insert(addr, format);
+        }
+    }
+
+    pub fn format_for_addr(&self, addr: &CellAddr) -> CellFormat {
+        let global_col = addr_logical_col(addr, self);
+        let base = *self
+            .col_all_formats
+            .get(&global_col)
+            .unwrap_or(&CellFormat::default());
+        let region = match addr {
+            CellAddr::Main { .. } => self.col_data_formats.get(&global_col).copied(),
+            _ => self.col_special_formats.get(&global_col).copied(),
+        }
+        .unwrap_or_default();
+        let exact = self.cell_formats.get(addr).copied().unwrap_or_default();
+        Self::merge_format(Self::merge_format(base, region), exact)
+    }
+
+    pub fn format_for_global_col(&self, scope: FormatScope, col: usize) -> CellFormat {
+        match scope {
+            FormatScope::All => self.col_all_formats.get(&col).copied().unwrap_or_default(),
+            FormatScope::Data => self.col_data_formats.get(&col).copied().unwrap_or_default(),
+            FormatScope::Special => self
+                .col_special_formats
+                .get(&col)
+                .copied()
+                .unwrap_or_default(),
+        }
+    }
+
+    pub fn remap_formats_for_resize(&mut self, old_main_cols: usize, new_main_cols: usize) {
+        fn remap_map(
+            map: &mut HashMap<usize, CellFormat>,
+            old_main_cols: usize,
+            new_main_cols: usize,
+        ) {
+            let old_total = MARGIN_COLS + old_main_cols + MARGIN_COLS;
+            let new_total = MARGIN_COLS + new_main_cols + MARGIN_COLS;
+            let old_right_start = MARGIN_COLS + old_main_cols;
+            let new_right_start = MARGIN_COLS + new_main_cols;
+            let mut remapped = HashMap::new();
+            for (col, fmt) in map.drain() {
+                let new_col = if col < MARGIN_COLS {
+                    Some(col)
+                } else if col < old_right_start {
+                    let main_idx = col - MARGIN_COLS;
+                    (main_idx < new_main_cols).then_some(MARGIN_COLS + main_idx)
+                } else {
+                    let right_idx = col - old_right_start;
+                    Some(new_right_start + right_idx)
+                };
+                if let Some(new_col) = new_col {
+                    if new_col < new_total && col < old_total {
+                        remapped.insert(new_col, fmt);
+                    }
+                }
+            }
+            *map = remapped;
+        }
+
+        remap_map(&mut self.col_all_formats, old_main_cols, new_main_cols);
+        remap_map(&mut self.col_data_formats, old_main_cols, new_main_cols);
+        remap_map(&mut self.col_special_formats, old_main_cols, new_main_cols);
     }
 
     /// Logical main-row order for the current view sort.
@@ -799,9 +944,8 @@ pub fn addr_logical_row(addr: &CellAddr, grid: &Grid) -> usize {
 /// Global column index for addressing.
 pub fn addr_logical_col(addr: &CellAddr, grid: &Grid) -> usize {
     match addr {
-        CellAddr::Header { col, .. }
-        | CellAddr::Footer { col, .. }
-        | CellAddr::Main { col, .. } => *col as usize,
+        CellAddr::Header { col, .. } | CellAddr::Footer { col, .. } => *col as usize,
+        CellAddr::Main { col, .. } => MARGIN_COLS + *col as usize,
         CellAddr::Left { col, .. } => *col as usize,
         CellAddr::Right { col, .. } => MARGIN_COLS + grid.extent_main_cols as usize + *col as usize,
     }
@@ -886,5 +1030,37 @@ mod tests {
 
         assert_eq!(g.col_width(MARGIN_COLS + 1), 20);
         assert_eq!(g.col_width(MARGIN_COLS + 2), 24);
+    }
+
+    #[test]
+    fn format_scope_merges_by_region() {
+        let mut g = Grid::new(1, 1);
+        g.set_column_format(
+            FormatScope::All,
+            MARGIN_COLS,
+            CellFormat {
+                number: Some(NumberFormat::Fixed { decimals: 2 }),
+                align: None,
+            },
+        );
+        g.set_column_format(
+            FormatScope::Data,
+            MARGIN_COLS,
+            CellFormat {
+                number: None,
+                align: Some(TextAlign::Right),
+            },
+        );
+        g.set_cell_format(
+            CellAddr::Main { row: 0, col: 0 },
+            CellFormat {
+                number: None,
+                align: Some(TextAlign::Center),
+            },
+        );
+
+        let fmt = g.format_for_addr(&CellAddr::Main { row: 0, col: 0 });
+        assert_eq!(fmt.number, Some(NumberFormat::Fixed { decimals: 2 }));
+        assert_eq!(fmt.align, Some(TextAlign::Center));
     }
 }

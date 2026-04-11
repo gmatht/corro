@@ -3,7 +3,7 @@
 use crate::addr::{
     parse_cell_ref_at, parse_excel_column, parse_main_range_at, parse_sheet_id_prefix_at,
 };
-use crate::grid::{CellAddr, Grid, MainRange, SortSpec, MARGIN_COLS};
+use crate::grid::{CellAddr, CellFormat, FormatScope, Grid, MainRange, SortSpec, MARGIN_COLS};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
@@ -177,6 +177,15 @@ pub enum Op {
     SetViewSortCols {
         cols: Vec<SortSpec>,
     },
+    SetColumnFormat {
+        scope: FormatScope,
+        col: usize,
+        format: CellFormat,
+    },
+    SetCellFormat {
+        addr: CellAddr,
+        format: CellFormat,
+    },
     Undo {
         target: String,
     },
@@ -311,6 +320,12 @@ impl Op {
             Op::SetViewSortCols { cols } => {
                 state.grid.set_view_sort_cols(cols.clone());
             }
+            Op::SetColumnFormat { scope, col, format } => {
+                state.grid.set_column_format(*scope, *col, *format);
+            }
+            Op::SetCellFormat { addr, format } => {
+                state.grid.set_cell_format(addr.clone(), *format);
+            }
             Op::Undo { .. } => {}
         }
     }
@@ -434,6 +449,31 @@ fn parse_op_text(line: &str) -> Option<Op> {
                 .collect::<Vec<_>>();
             Some(Op::SetViewSortCols { cols })
         }
+        "FORMAT" => {
+            let kind = parts.next()?;
+            match kind {
+                "COL" => {
+                    let scope = match parts.next()? {
+                        "ALL" => FormatScope::All,
+                        "DATA" => FormatScope::Data,
+                        "SPECIAL" => FormatScope::Special,
+                        _ => return None,
+                    };
+                    let col = parts.next()?.parse::<usize>().ok()?;
+                    let text = parts.collect::<Vec<_>>().join(" ");
+                    let format = parse_format_text(&text).ok()?;
+                    Some(Op::SetColumnFormat { scope, col, format })
+                }
+                "CELL" => {
+                    let addr = parts.next()?;
+                    let (addr, _) = parse_log_addr(addr, 0, true)?;
+                    let text = parts.collect::<Vec<_>>().join(" ");
+                    let format = parse_format_text(&text).ok()?;
+                    Some(Op::SetCellFormat { addr, format })
+                }
+                _ => None,
+            }
+        }
         _ => None,
     }
 }
@@ -495,9 +535,48 @@ impl Op {
                     .collect::<Vec<_>>()
                     .join(" ")
             ),
+            Op::SetColumnFormat { scope, col, format } => {
+                let scope = match scope {
+                    FormatScope::All => "ALL",
+                    FormatScope::Data => "DATA",
+                    FormatScope::Special => "SPECIAL",
+                };
+                format!("FORMAT COL {scope} {col} {}", format_text(format))
+            }
+            Op::SetCellFormat { addr, format } => {
+                format!(
+                    "FORMAT CELL {} {}",
+                    addr_text(addr, main_cols),
+                    format_text(format)
+                )
+            }
             Op::Undo { target } => format!("UNDO {target}"),
         }
     }
+}
+
+fn format_text(format: &CellFormat) -> String {
+    let mut parts = Vec::new();
+    if let Some(number) = format.number {
+        match number {
+            crate::grid::NumberFormat::Currency { decimals } => {
+                parts.push(format!("currency:{decimals}"));
+            }
+            crate::grid::NumberFormat::Fixed { decimals } => {
+                parts.push(format!("fixed:{decimals}"));
+            }
+        }
+    }
+    if let Some(align) = format.align {
+        let text = match align {
+            crate::grid::TextAlign::Left => "left",
+            crate::grid::TextAlign::Center => "center",
+            crate::grid::TextAlign::Right => "right",
+            crate::grid::TextAlign::Default => "default",
+        };
+        parts.push(format!("align:{text}"));
+    }
+    parts.join(",")
 }
 
 impl WorkbookOp {
@@ -689,6 +768,34 @@ pub fn parse_workbook_line(line: &str) -> Result<WorkbookOp, std::io::Error> {
                 row_order,
                 preserve_formulas,
             })
+        }
+        "FORMAT" => {
+            let kind = parts.next().ok_or_else(|| bad("bad format line"))?;
+            let op = match kind {
+                "COL" => {
+                    let scope = match parts.next().ok_or_else(|| bad("bad format line"))? {
+                        "ALL" => FormatScope::All,
+                        "DATA" => FormatScope::Data,
+                        "SPECIAL" => FormatScope::Special,
+                        _ => return Err(bad("bad format line")),
+                    };
+                    let col = parts
+                        .next()
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .ok_or_else(|| bad("bad format line"))?;
+                    let format = parse_format_text(&parts.collect::<Vec<_>>().join(" "))?;
+                    Op::SetColumnFormat { scope, col, format }
+                }
+                "CELL" => {
+                    let addr = parts.next().ok_or_else(|| bad("bad format line"))?;
+                    let (addr, _) =
+                        parse_log_addr(addr, 0, true).ok_or_else(|| bad("bad format line"))?;
+                    let format = parse_format_text(&parts.collect::<Vec<_>>().join(" "))?;
+                    Op::SetCellFormat { addr, format }
+                }
+                _ => return Err(bad("bad format line")),
+            };
+            Ok(WorkbookOp::SheetOp { sheet_id, op })
         }
         _ => {
             let op = parse_op_line(rest).ok_or_else(|| bad("bad sheet op line"))?;
@@ -893,6 +1000,15 @@ impl SheetState {
                 width: self.grid.col_width_overrides.get(col).copied(),
             }),
             Op::SetViewSortCols { .. } => None,
+            Op::SetColumnFormat { scope, col, .. } => Some(Op::SetColumnFormat {
+                scope: *scope,
+                col: *col,
+                format: self.grid.format_for_global_col(*scope, *col),
+            }),
+            Op::SetCellFormat { addr, .. } => Some(Op::SetCellFormat {
+                addr: addr.clone(),
+                format: self.grid.format_for_addr(addr),
+            }),
             Op::Undo { .. } => None,
         }
     }
@@ -1035,6 +1151,35 @@ fn apply_any_line(line: &str, state: &mut SheetState) -> Result<(), std::io::Err
             state.grid.set_view_sort_cols(cols);
             Ok(())
         }
+        "FORMAT" => {
+            let kind = parts.next().ok_or_else(|| bad("bad FORMAT line"))?;
+            match kind {
+                "COL" => {
+                    let scope = match parts.next().ok_or_else(|| bad("bad FORMAT line"))? {
+                        "ALL" => FormatScope::All,
+                        "DATA" => FormatScope::Data,
+                        "SPECIAL" => FormatScope::Special,
+                        _ => return Err(bad("bad FORMAT line")),
+                    };
+                    let col = parts
+                        .next()
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .ok_or_else(|| bad("bad FORMAT line"))?;
+                    let format = parse_format_text(&parts.collect::<Vec<_>>().join(" "))?;
+                    state.grid.set_column_format(scope, col, format);
+                    Ok(())
+                }
+                "CELL" => {
+                    let addr = parts.next().ok_or_else(|| bad("bad FORMAT line"))?;
+                    let (addr, _) = parse_log_addr(addr, state.grid.main_cols(), true)
+                        .ok_or_else(|| bad("bad FORMAT line"))?;
+                    let format = parse_format_text(&parts.collect::<Vec<_>>().join(" "))?;
+                    state.grid.set_cell_format(addr, format);
+                    Ok(())
+                }
+                _ => Err(bad("bad FORMAT line")),
+            }
+        }
         "SIZE" => {
             let rows = parts
                 .next()
@@ -1052,6 +1197,40 @@ fn apply_any_line(line: &str, state: &mut SheetState) -> Result<(), std::io::Err
         }
         _ => Err(bad("unrecognized log line")),
     }
+}
+
+fn parse_format_text(text: &str) -> Result<CellFormat, std::io::Error> {
+    let bad = |msg: &'static str| std::io::Error::new(std::io::ErrorKind::InvalidData, msg);
+    let mut format = CellFormat::default();
+    if text.trim().is_empty() {
+        return Ok(format);
+    }
+    for part in text.split(',') {
+        let Some((k, v)) = part.split_once(':') else {
+            return Err(bad("bad FORMAT line"));
+        };
+        match k {
+            "currency" => {
+                let decimals = v.parse::<usize>().map_err(|_| bad("bad FORMAT line"))?;
+                format.number = Some(crate::grid::NumberFormat::Currency { decimals });
+            }
+            "fixed" => {
+                let decimals = v.parse::<usize>().map_err(|_| bad("bad FORMAT line"))?;
+                format.number = Some(crate::grid::NumberFormat::Fixed { decimals });
+            }
+            "align" => {
+                format.align = Some(match v {
+                    "left" => crate::grid::TextAlign::Left,
+                    "center" => crate::grid::TextAlign::Center,
+                    "right" => crate::grid::TextAlign::Right,
+                    "default" => crate::grid::TextAlign::Default,
+                    _ => return Err(bad("bad FORMAT line")),
+                });
+            }
+            _ => return Err(bad("bad FORMAT line")),
+        }
+    }
+    Ok(format)
 }
 
 /// Append one op as text to `path` (creates file if missing).
@@ -1217,6 +1396,52 @@ mod tests {
         let line = op.to_log_line(0);
         assert_eq!(line, "COPY_FROM_TO A1:B2 B3:C4");
         assert_eq!(parse_op_line(&line), Some(op));
+    }
+
+    #[test]
+    fn format_column_round_trips_through_log_line() {
+        let op = Op::SetColumnFormat {
+            scope: FormatScope::Data,
+            col: MARGIN_COLS + 2,
+            format: CellFormat {
+                number: Some(crate::grid::NumberFormat::Currency { decimals: 2 }),
+                align: Some(crate::grid::TextAlign::Right),
+            },
+        };
+        let line = op.to_log_line(3);
+        assert_eq!(
+            parse_op_line(&line),
+            Some(Op::SetColumnFormat {
+                scope: FormatScope::Data,
+                col: MARGIN_COLS + 2,
+                format: CellFormat {
+                    number: Some(crate::grid::NumberFormat::Currency { decimals: 2 }),
+                    align: Some(crate::grid::TextAlign::Right),
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn format_cell_round_trips_through_log_line() {
+        let op = Op::SetCellFormat {
+            addr: CellAddr::Header { row: 0, col: 1 },
+            format: CellFormat {
+                number: Some(crate::grid::NumberFormat::Fixed { decimals: 1 }),
+                align: Some(crate::grid::TextAlign::Center),
+            },
+        };
+        let line = op.to_log_line(2);
+        assert_eq!(
+            parse_op_line(&line),
+            Some(Op::SetCellFormat {
+                addr: CellAddr::Header { row: 0, col: 1 },
+                format: CellFormat {
+                    number: Some(crate::grid::NumberFormat::Fixed { decimals: 1 }),
+                    align: Some(crate::grid::TextAlign::Center),
+                },
+            })
+        );
     }
 
     #[test]

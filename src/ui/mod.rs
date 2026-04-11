@@ -6,8 +6,10 @@ use crate::balance::{self, BalanceDirection};
 use crate::export;
 use crate::formula::translate_formula_text_by_offset;
 use crate::formula::{cell_effective_display, is_formula};
-use crate::grid::MainRange;
-use crate::grid::{CellAddr, Grid, SortSpec, FOOTER_ROWS, HEADER_ROWS, MARGIN_COLS};
+use crate::grid::{
+    CellAddr, CellFormat, FormatScope, Grid, MainRange, NumberFormat, SortSpec, TextAlign,
+    FOOTER_ROWS, HEADER_ROWS, MARGIN_COLS,
+};
 use crate::io::{
     commit_line, commit_workbook_op, load_full, load_full_partial, load_revisions,
     load_revisions_partial, load_workbook_revisions, load_workbook_revisions_partial, IoError,
@@ -236,6 +238,10 @@ enum Mode {
         buffer: String,
         persist: bool,
     },
+    FormatDecimals {
+        buffer: String,
+        decimals_for: FormatDecimalsFor,
+    },
     BalanceBooks {
         buffer: String,
         direction: BalanceDirection,
@@ -263,11 +269,30 @@ const SPECIAL_VALUE_CHOICES: [&str; 10] = ["∞", "Σ", "Ω", "π", "μ", "Δ", 
 enum MenuSection {
     Edit,
     File,
+    Format,
+    FormatScope,
+    FormatNumber,
+    FormatAlign,
     Sheet,
     Export,
     Width,
     Insert,
     Help,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FormatTarget {
+    All,
+    Data,
+    Special,
+    Cell,
+    Selection,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FormatDecimalsFor {
+    Currency,
+    Fixed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -303,6 +328,21 @@ enum MenuAction {
     ExportOdt,
     SetMaxColWidth,
     SetColWidth,
+    FormatApplyAll,
+    FormatApplyData,
+    FormatApplySpecial,
+    FormatApplyCell,
+    FormatApplySelection,
+    FormatCurrency,
+    FormatFixed0,
+    FormatFixed1,
+    FormatFixed2,
+    FormatFixedCustom,
+    FormatAlignLeft,
+    FormatAlignCenter,
+    FormatAlignRight,
+    FormatAlignDefault,
+    FormatReset,
     InsertRows,
     InsertCols,
     InsertSpecialChars,
@@ -394,6 +434,57 @@ const FILE_MENU_ITEMS: [MenuItem; 8] = [
         shortcut: 'R',
         label: "Replay",
         target: MenuTarget::Action(MenuAction::Replay),
+    },
+];
+
+const FORMAT_MENU_ITEMS: [MenuItem; 4] = [
+    MenuItem {
+        shortcut: 'S',
+        label: "Scope",
+        target: MenuTarget::Submenu(MenuSection::FormatScope),
+    },
+    MenuItem {
+        shortcut: 'N',
+        label: "Number",
+        target: MenuTarget::Submenu(MenuSection::FormatNumber),
+    },
+    MenuItem {
+        shortcut: 'A',
+        label: "Align",
+        target: MenuTarget::Submenu(MenuSection::FormatAlign),
+    },
+    MenuItem {
+        shortcut: 'R',
+        label: "Reset",
+        target: MenuTarget::Action(MenuAction::FormatReset),
+    },
+];
+
+const FORMAT_SCOPE_MENU_ITEMS: [MenuItem; 5] = [
+    MenuItem {
+        shortcut: 'A',
+        label: "All",
+        target: MenuTarget::Action(MenuAction::FormatApplyAll),
+    },
+    MenuItem {
+        shortcut: 'D',
+        label: "Data",
+        target: MenuTarget::Action(MenuAction::FormatApplyData),
+    },
+    MenuItem {
+        shortcut: 'S',
+        label: "Special",
+        target: MenuTarget::Action(MenuAction::FormatApplySpecial),
+    },
+    MenuItem {
+        shortcut: 'C',
+        label: "Cell",
+        target: MenuTarget::Action(MenuAction::FormatApplyCell),
+    },
+    MenuItem {
+        shortcut: 'L',
+        label: "Selection",
+        target: MenuTarget::Action(MenuAction::FormatApplySelection),
     },
 ];
 
@@ -496,6 +587,57 @@ const WIDTH_MENU_ITEMS: [MenuItem; 2] = [
         shortcut: 'C',
         label: "Column width",
         target: MenuTarget::Action(MenuAction::SetColWidth),
+    },
+];
+
+const FORMAT_NUMBER_MENU_ITEMS: [MenuItem; 5] = [
+    MenuItem {
+        shortcut: '$',
+        label: "Currency ($)",
+        target: MenuTarget::Action(MenuAction::FormatCurrency),
+    },
+    MenuItem {
+        shortcut: '0',
+        label: "Fixed 0",
+        target: MenuTarget::Action(MenuAction::FormatFixed0),
+    },
+    MenuItem {
+        shortcut: '1',
+        label: "Fixed 1",
+        target: MenuTarget::Action(MenuAction::FormatFixed1),
+    },
+    MenuItem {
+        shortcut: '2',
+        label: "Fixed 2",
+        target: MenuTarget::Action(MenuAction::FormatFixed2),
+    },
+    MenuItem {
+        shortcut: 'N',
+        label: "Fixed n",
+        target: MenuTarget::Action(MenuAction::FormatFixedCustom),
+    },
+];
+
+const FORMAT_ALIGN_MENU_ITEMS: [MenuItem; 4] = [
+    MenuItem {
+        shortcut: 'L',
+        label: "Left",
+        target: MenuTarget::Action(MenuAction::FormatAlignLeft),
+    },
+    MenuItem {
+        shortcut: 'C',
+        label: "Center",
+        target: MenuTarget::Action(MenuAction::FormatAlignCenter),
+    },
+    MenuItem {
+        shortcut: 'R',
+        label: "Right",
+        target: MenuTarget::Action(MenuAction::FormatAlignRight),
+    },
+    MenuItem {
+        shortcut: 'D',
+        label: "Default",
+        target: MenuTarget::Action(MenuAction::FormatAlignDefault),
     },
 ];
 
@@ -620,6 +762,10 @@ fn menu_items(section: MenuSection) -> &'static [MenuItem] {
     match section {
         MenuSection::Edit => &EDIT_MENU_ITEMS,
         MenuSection::File => &FILE_MENU_ITEMS,
+        MenuSection::Format => &FORMAT_MENU_ITEMS,
+        MenuSection::FormatScope => &FORMAT_SCOPE_MENU_ITEMS,
+        MenuSection::FormatNumber => &FORMAT_NUMBER_MENU_ITEMS,
+        MenuSection::FormatAlign => &FORMAT_ALIGN_MENU_ITEMS,
         MenuSection::Sheet => &SHEET_MENU_ITEMS,
         MenuSection::Insert => &INSERT_ROOT_MENU_ITEMS,
         MenuSection::Export => &EXPORT_MENU_ITEMS,
@@ -632,6 +778,10 @@ fn menu_title(section: MenuSection) -> &'static str {
     match section {
         MenuSection::Edit => "Edit",
         MenuSection::File => "File",
+        MenuSection::Format => "Format",
+        MenuSection::FormatScope => "Format Scope",
+        MenuSection::FormatNumber => "Format Number",
+        MenuSection::FormatAlign => "Format Align",
         MenuSection::Sheet => "Sheet",
         MenuSection::Export => "Export",
         MenuSection::Width => "Width",
@@ -650,18 +800,20 @@ fn menu_next_root_section(section: MenuSection) -> MenuSection {
         MenuSection::Edit => MenuSection::Insert,
         MenuSection::Insert => MenuSection::Help,
         MenuSection::Help => MenuSection::Sheet,
-        MenuSection::Sheet => MenuSection::File,
+        MenuSection::Sheet => MenuSection::Format,
+        MenuSection::Format => MenuSection::File,
         _ => MenuSection::File,
     }
 }
 
 fn menu_prev_root_section(section: MenuSection) -> MenuSection {
     match section {
-        MenuSection::File => MenuSection::Sheet,
+        MenuSection::File => MenuSection::Format,
         MenuSection::Edit => MenuSection::File,
         MenuSection::Insert => MenuSection::Edit,
         MenuSection::Help => MenuSection::Insert,
         MenuSection::Sheet => MenuSection::Help,
+        MenuSection::Format => MenuSection::Sheet,
         _ => MenuSection::File,
     }
 }
@@ -671,6 +823,10 @@ fn menu_popup_area(area: Rect, section: MenuSection, parent: Option<(Rect, usize
     let width = match section {
         MenuSection::Edit => 18,
         MenuSection::File => 22,
+        MenuSection::Format => 18,
+        MenuSection::FormatScope => 18,
+        MenuSection::FormatNumber => 18,
+        MenuSection::FormatAlign => 18,
         MenuSection::Sheet => 20,
         MenuSection::Export => 18,
         MenuSection::Width => 20,
@@ -688,6 +844,10 @@ fn menu_popup_area(area: Rect, section: MenuSection, parent: Option<(Rect, usize
                 MenuSection::Insert => 17,
                 MenuSection::Help => 27,
                 MenuSection::Sheet => 36,
+                MenuSection::Format => 45,
+                MenuSection::FormatScope => 45,
+                MenuSection::FormatNumber => 45,
+                MenuSection::FormatAlign => 45,
                 _ => 1,
             };
             (area.x.saturating_add(x), area.y.saturating_add(1))
@@ -709,6 +869,16 @@ impl App {
     fn open_menu(&mut self, section: MenuSection) {
         self.mode = Mode::Menu {
             stack: vec![MenuLevel { section, item: 0 }],
+        };
+    }
+
+    fn clear_pending_format_target(&mut self) {
+        self.pending_format_target = None;
+    }
+
+    fn open_menu_item(&mut self, section: MenuSection, item: usize) {
+        self.mode = Mode::Menu {
+            stack: vec![MenuLevel { section, item }],
         };
     }
 
@@ -931,6 +1101,91 @@ impl App {
             MenuAction::HelpFull => {
                 self.help_scroll = 0;
                 Mode::Help
+            }
+            MenuAction::FormatApplyAll => {
+                self.pending_format_target = Some(FormatTarget::All);
+                Mode::Menu {
+                    stack: vec![MenuLevel {
+                        section: MenuSection::Format,
+                        item: 0,
+                    }],
+                }
+            }
+            MenuAction::FormatApplyData => {
+                self.pending_format_target = Some(FormatTarget::Data);
+                Mode::Menu {
+                    stack: vec![MenuLevel {
+                        section: MenuSection::Format,
+                        item: 0,
+                    }],
+                }
+            }
+            MenuAction::FormatApplySpecial => {
+                self.pending_format_target = Some(FormatTarget::Special);
+                Mode::Menu {
+                    stack: vec![MenuLevel {
+                        section: MenuSection::Format,
+                        item: 0,
+                    }],
+                }
+            }
+            MenuAction::FormatApplyCell => {
+                self.pending_format_target = Some(FormatTarget::Cell);
+                Mode::Menu {
+                    stack: vec![MenuLevel {
+                        section: MenuSection::Format,
+                        item: 0,
+                    }],
+                }
+            }
+            MenuAction::FormatApplySelection => {
+                self.pending_format_target = Some(FormatTarget::Selection);
+                Mode::Menu {
+                    stack: vec![MenuLevel {
+                        section: MenuSection::Format,
+                        item: 0,
+                    }],
+                }
+            }
+            MenuAction::FormatCurrency => Mode::FormatDecimals {
+                buffer: self.start_input_mode(String::new()),
+                decimals_for: FormatDecimalsFor::Currency,
+            },
+            MenuAction::FormatFixed0 => {
+                self.apply_format_number(0, false);
+                Mode::Normal
+            }
+            MenuAction::FormatFixed1 => {
+                self.apply_format_number(1, false);
+                Mode::Normal
+            }
+            MenuAction::FormatFixed2 => {
+                self.apply_format_number(2, false);
+                Mode::Normal
+            }
+            MenuAction::FormatFixedCustom => Mode::FormatDecimals {
+                buffer: self.start_input_mode(String::new()),
+                decimals_for: FormatDecimalsFor::Fixed,
+            },
+            MenuAction::FormatAlignLeft => {
+                self.apply_format_align(TextAlign::Left);
+                Mode::Normal
+            }
+            MenuAction::FormatAlignCenter => {
+                self.apply_format_align(TextAlign::Center);
+                Mode::Normal
+            }
+            MenuAction::FormatAlignRight => {
+                self.apply_format_align(TextAlign::Right);
+                Mode::Normal
+            }
+            MenuAction::FormatAlignDefault => {
+                self.apply_format_align(TextAlign::Default);
+                Mode::Normal
+            }
+            MenuAction::FormatReset => {
+                self.apply_format_reset();
+                Mode::Normal
             }
         }
     }
@@ -1725,6 +1980,7 @@ pub struct App {
     edit_cursor: Option<usize>,
     input_cursor: Option<usize>,
     special_picker: Option<usize>,
+    pending_format_target: Option<FormatTarget>,
     view_sheet_id: u32,
     edit_target_addr: Option<CellAddr>,
     pending_fit_to_content_on_commit: bool,
@@ -1782,6 +2038,7 @@ impl App {
             edit_cursor: None,
             input_cursor: None,
             special_picker: None,
+            pending_format_target: None,
             view_sheet_id: 1,
             edit_target_addr: None,
             pending_fit_to_content_on_commit: false,
@@ -1970,6 +2227,133 @@ impl App {
         buffer
     }
 
+    fn open_format_scope_picker(&mut self, target: FormatTarget) {
+        self.pending_format_target = Some(target);
+        self.open_menu(MenuSection::Format);
+        self.status = match target {
+            FormatTarget::All => "Formatting scope: All".into(),
+            FormatTarget::Data => "Formatting scope: Data".into(),
+            FormatTarget::Special => "Formatting scope: Special".into(),
+            FormatTarget::Cell => "Formatting scope: Cell".into(),
+            FormatTarget::Selection => "Formatting scope: Selection".into(),
+        };
+        self.selection_kind = match target {
+            FormatTarget::Selection => SelectionKind::Cells,
+            _ => self.selection_kind,
+        };
+    }
+
+    fn open_format_decimals_picker(&mut self, decimals_for: FormatDecimalsFor) {
+        self.mode = Mode::FormatDecimals {
+            buffer: self.start_input_mode(String::new()),
+            decimals_for,
+        };
+    }
+
+    fn selected_format_target(&self) -> FormatTarget {
+        self.pending_format_target.unwrap_or(FormatTarget::Cell)
+    }
+
+    fn apply_format_to_target(&mut self, target: FormatTarget, format: CellFormat) {
+        let mut ops = Vec::new();
+        match target {
+            FormatTarget::All => {
+                for col in 0..self.state.grid.total_cols() {
+                    ops.push(Op::SetColumnFormat {
+                        scope: FormatScope::All,
+                        col,
+                        format,
+                    });
+                }
+            }
+            FormatTarget::Data => {
+                for col in MARGIN_COLS..MARGIN_COLS + self.state.grid.main_cols() {
+                    ops.push(Op::SetColumnFormat {
+                        scope: FormatScope::Data,
+                        col,
+                        format,
+                    });
+                }
+            }
+            FormatTarget::Special => {
+                for col in 0..self.state.grid.total_cols() {
+                    if col < MARGIN_COLS || col >= MARGIN_COLS + self.state.grid.main_cols() {
+                        ops.push(Op::SetColumnFormat {
+                            scope: FormatScope::Special,
+                            col,
+                            format,
+                        });
+                    }
+                }
+            }
+            FormatTarget::Cell => {
+                ops.push(Op::SetCellFormat {
+                    addr: self.cursor.to_addr(&self.state.grid),
+                    format,
+                });
+            }
+            FormatTarget::Selection => {
+                if let Some((rows, cols)) = self.current_selection_range() {
+                    for row in rows {
+                        for col in &cols {
+                            ops.push(Op::SetCellFormat {
+                                addr: SheetCursor { row, col: *col }.to_addr(&self.state.grid),
+                                format,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        for op in ops {
+            let _ = self.apply_single_op(op);
+        }
+    }
+
+    fn apply_format_number(&mut self, decimals: usize, currency: bool) {
+        let format = if currency {
+            CellFormat {
+                number: Some(NumberFormat::Currency { decimals }),
+                align: None,
+            }
+        } else {
+            CellFormat {
+                number: Some(NumberFormat::Fixed { decimals }),
+                align: None,
+            }
+        };
+        self.apply_format_to_target(self.selected_format_target(), format);
+        self.clear_pending_format_target();
+        self.status = if currency {
+            format!("Currency format set to {decimals} decimals")
+        } else {
+            format!("Fixed format set to {decimals} decimals")
+        };
+    }
+
+    fn apply_format_align(&mut self, align: TextAlign) {
+        self.apply_format_to_target(
+            self.selected_format_target(),
+            CellFormat {
+                number: None,
+                align: Some(align),
+            },
+        );
+        self.clear_pending_format_target();
+        self.status = match align {
+            TextAlign::Left => "Text aligned left".into(),
+            TextAlign::Center => "Text aligned center".into(),
+            TextAlign::Right => "Text aligned right".into(),
+            TextAlign::Default => "Text alignment reset".into(),
+        };
+    }
+
+    fn apply_format_reset(&mut self) {
+        self.apply_format_to_target(self.selected_format_target(), CellFormat::default());
+        self.clear_pending_format_target();
+        self.status = "Format cleared".into();
+    }
+
     fn state(&self) -> &SheetState {
         &self.state
     }
@@ -2023,7 +2407,7 @@ impl App {
         self.view_sheet_id = active_sheet;
         self.sync_active_sheet_cache();
         for c in 0..self.state.grid.main_cols() {
-            self.state.grid.auto_fit_column(MARGIN_COLS + c);
+            self.fit_column_to_rendered_content(MARGIN_COLS + c);
         }
         self.offset = off;
         self.ops_applied = n;
@@ -2135,7 +2519,7 @@ impl App {
                         self.view_sheet_id = active_sheet;
                         self.sync_active_sheet_cache();
                         for c in 0..self.state.grid.main_cols() {
-                            self.state.grid.fit_column_to_content(MARGIN_COLS + c);
+                            self.fit_column_to_rendered_content(MARGIN_COLS + c);
                         }
                         self.offset = data.len() as u64;
                         self.ops_applied = replay.op_count;
@@ -2155,7 +2539,7 @@ impl App {
                         self.revision_limit = None;
                         self.watcher = None;
                         for c in 0..self.state.grid.main_cols() {
-                            self.state.grid.auto_fit_column(MARGIN_COLS + c);
+                            self.fit_column_to_rendered_content(MARGIN_COLS + c);
                         }
                         self.status = format!("Imported TSV {}", p.display());
                     }
@@ -2205,7 +2589,7 @@ impl App {
                             self.view_sheet_id = active_sheet;
                             self.sync_active_sheet_cache();
                             for c in 0..self.state.grid.main_cols() {
-                                self.state.grid.fit_column_to_content(MARGIN_COLS + c);
+                                self.fit_column_to_rendered_content(MARGIN_COLS + c);
                             }
                             self.offset = off;
                             self.ops_applied = replay.op_count;
@@ -2221,7 +2605,7 @@ impl App {
                             None => load_full(p, &mut self.state)?,
                         };
                         for c in 0..self.state.grid.main_cols() {
-                            self.state.grid.auto_fit_column(MARGIN_COLS + c);
+                            self.fit_column_to_rendered_content(MARGIN_COLS + c);
                         }
                         self.offset = off;
                         self.ops_applied = n;
@@ -2976,26 +3360,19 @@ impl App {
                 MARGIN_COLS + col as usize,
                 self.state
                     .grid
-                    .content_width_for_column(MARGIN_COLS + col as usize)
-                    .map(|w| w.saturating_sub(1)),
+                    .content_width_for_column(MARGIN_COLS + col as usize),
             ),
             CellAddr::Left { col, .. } => self.state.grid.fit_column_to_content(col as usize),
             CellAddr::Right { col, .. } => self.state.grid.set_col_width(
                 MARGIN_COLS + self.state.grid.main_cols() + col as usize,
-                self.state
-                    .grid
-                    .content_width_for_column(
-                        MARGIN_COLS + self.state.grid.main_cols() + col as usize,
-                    )
-                    .map(|w| w.saturating_sub(1)),
+                self.state.grid.content_width_for_column(
+                    MARGIN_COLS + self.state.grid.main_cols() + col as usize,
+                ),
             ),
             CellAddr::Header { col, .. } | CellAddr::Footer { col, .. } => {
                 self.state.grid.set_col_width(
                     col as usize,
-                    self.state
-                        .grid
-                        .content_width_for_column(col as usize)
-                        .map(|w| w.saturating_sub(1)),
+                    self.state.grid.content_width_for_column(col as usize),
                 )
             }
         }
@@ -3004,17 +3381,89 @@ impl App {
     fn autofit_column_from_current_cell(&mut self, addr: CellAddr) {
         match addr {
             CellAddr::Main { col, .. } => {
-                self.state.grid.auto_fit_column(MARGIN_COLS + col as usize)
+                self.fit_column_to_rendered_content(MARGIN_COLS + col as usize)
             }
-            CellAddr::Left { col, .. } => self.state.grid.auto_fit_column(col as usize),
+            CellAddr::Left { col, .. } => self.fit_column_to_rendered_content(col as usize),
             CellAddr::Right { col, .. } => self
                 .state
                 .grid
-                .auto_fit_column(MARGIN_COLS + self.state.grid.main_cols() + col as usize),
+                .fit_column_to_content(MARGIN_COLS + self.state.grid.main_cols() + col as usize),
             CellAddr::Header { col, .. } | CellAddr::Footer { col, .. } => {
-                self.state.grid.auto_fit_column(col as usize)
+                self.fit_column_to_rendered_content(col as usize)
             }
         }
+    }
+
+    fn fit_column_to_rendered_content(&mut self, global_col: usize) {
+        let Some(maxw) = self.rendered_width_for_column(global_col) else {
+            self.state.grid.set_col_width(global_col, None);
+            return;
+        };
+        self.state.grid.set_col_width(global_col, Some(maxw));
+    }
+
+    fn rendered_width_for_column(&self, global_col: usize) -> Option<usize> {
+        let mut maxw = 0usize;
+        let mut saw_content = false;
+        let main_cols = self.state.grid.main_cols();
+
+        for r in 0..HEADER_ROWS {
+            let addr = CellAddr::Header {
+                row: r as u8,
+                col: global_col as u32,
+            };
+            let val = cell_effective_display(&self.state.grid, &addr);
+            if !val.is_empty() {
+                saw_content = true;
+                maxw = maxw.max(val.chars().count() + 1);
+            }
+        }
+        for r in 0..FOOTER_ROWS {
+            let addr = CellAddr::Footer {
+                row: r as u8,
+                col: global_col as u32,
+            };
+            let val = cell_effective_display(&self.state.grid, &addr);
+            if !val.is_empty() {
+                saw_content = true;
+                maxw = maxw.max(val.chars().count() + 1);
+            }
+        }
+        for r in 0..self.state.grid.main_rows() {
+            if global_col < MARGIN_COLS {
+                let addr = CellAddr::Left {
+                    col: global_col as u8,
+                    row: r as u32,
+                };
+                let val = cell_effective_display(&self.state.grid, &addr);
+                if !val.is_empty() {
+                    saw_content = true;
+                    maxw = maxw.max(val.chars().count() + 1);
+                }
+            } else if global_col < MARGIN_COLS + main_cols {
+                let addr = CellAddr::Main {
+                    row: r as u32,
+                    col: (global_col - MARGIN_COLS) as u32,
+                };
+                let val = cell_effective_display(&self.state.grid, &addr);
+                if !val.is_empty() {
+                    saw_content = true;
+                    maxw = maxw.max(val.chars().count() + 1);
+                }
+            } else {
+                let addr = CellAddr::Right {
+                    col: (global_col - MARGIN_COLS - main_cols) as u8,
+                    row: r as u32,
+                };
+                let val = cell_effective_display(&self.state.grid, &addr);
+                if !val.is_empty() {
+                    saw_content = true;
+                    maxw = maxw.max(val.chars().count() + 1);
+                }
+            }
+        }
+
+        saw_content.then_some(maxw.max(4))
     }
 
     fn move_selected_rows_by_one(&mut self, down: bool) -> Result<bool, RunError> {
@@ -3495,6 +3944,61 @@ impl App {
                         sheet_id: sheet.id,
                         op: Op::SetViewSortCols {
                             cols: sheet.state.grid.view_sort_cols.clone(),
+                        },
+                    }
+                    .to_log_line(sheet.state.grid.main_cols()),
+                );
+                buf.push('\n');
+            }
+            for (col, format) in &sheet.state.grid.col_all_formats {
+                buf.push_str(
+                    &crate::ops::WorkbookOp::SheetOp {
+                        sheet_id: sheet.id,
+                        op: Op::SetColumnFormat {
+                            scope: FormatScope::All,
+                            col: *col,
+                            format: *format,
+                        },
+                    }
+                    .to_log_line(sheet.state.grid.main_cols()),
+                );
+                buf.push('\n');
+            }
+            for (col, format) in &sheet.state.grid.col_data_formats {
+                buf.push_str(
+                    &crate::ops::WorkbookOp::SheetOp {
+                        sheet_id: sheet.id,
+                        op: Op::SetColumnFormat {
+                            scope: FormatScope::Data,
+                            col: *col,
+                            format: *format,
+                        },
+                    }
+                    .to_log_line(sheet.state.grid.main_cols()),
+                );
+                buf.push('\n');
+            }
+            for (col, format) in &sheet.state.grid.col_special_formats {
+                buf.push_str(
+                    &crate::ops::WorkbookOp::SheetOp {
+                        sheet_id: sheet.id,
+                        op: Op::SetColumnFormat {
+                            scope: FormatScope::Special,
+                            col: *col,
+                            format: *format,
+                        },
+                    }
+                    .to_log_line(sheet.state.grid.main_cols()),
+                );
+                buf.push('\n');
+            }
+            for (addr, format) in &sheet.state.grid.cell_formats {
+                buf.push_str(
+                    &crate::ops::WorkbookOp::SheetOp {
+                        sheet_id: sheet.id,
+                        op: Op::SetCellFormat {
+                            addr: addr.clone(),
+                            format: *format,
                         },
                     }
                     .to_log_line(sheet.state.grid.main_cols()),
@@ -4086,12 +4590,11 @@ impl App {
                     cell_effective_display(grid, &cell_addr)
                 };
                 let cw = grid.col_width(c).max(1);
-                let disp = if text.chars().count() > cw {
-                    truncate_with_ellipsis(&text, cw)
-                } else if text.trim().parse::<f64>().is_ok() {
-                    format!("{:>w$}", text, w = cw)
+                let formatted = format_cell_display(grid, &cell_addr, text);
+                let disp = if formatted.chars().count() > cw {
+                    truncate_with_ellipsis(&formatted, cw)
                 } else {
-                    format!("{:<w$}", text, w = cw)
+                    align_cell_display(formatted, cw, grid.format_for_addr(&cell_addr).align)
                 };
                 let sel = self.anchor.is_some_and(|a| match self.selection_kind {
                     SelectionKind::Cells => {
@@ -4292,6 +4795,7 @@ impl App {
             Mode::BalanceBooks { .. } => {
                 "  Tab/Shift+Tab·move focus   Enter/Space·select   Esc·cancel".into()
             }
+            Mode::FormatDecimals { .. } => "  type decimals   Enter·apply   Esc·cancel".into(),
             Mode::QuitPrompt => "  Q·quit   B·back   Esc·cancel".into(),
             Mode::Help => "  up/down·scroll   Esc·close   ?·help   A·about".into(),
             Mode::About => "  up/down·scroll   Esc·close   ?·help   A·about".into(),
@@ -5326,6 +5830,28 @@ impl App {
                     ) => {}
                 _ => {}
             },
+            Mode::FormatDecimals {
+                buffer,
+                decimals_for,
+            } => match key.code {
+                KeyCode::Enter => {
+                    if let Ok(decimals) = buffer.trim().parse::<usize>() {
+                        match decimals_for {
+                            FormatDecimalsFor::Currency => self.apply_format_number(decimals, true),
+                            FormatDecimalsFor::Fixed => self.apply_format_number(decimals, false),
+                        }
+                        mode = Mode::Normal;
+                    }
+                    self.input_cursor = None;
+                }
+                KeyCode::Esc => mode = Mode::Normal,
+                _ if Self::handle_plain_text_input_key(
+                    buffer,
+                    &mut self.input_cursor,
+                    key.code,
+                ) => {}
+                _ => {}
+            },
             Mode::QuitPrompt => match key.code {
                 KeyCode::Char('q') | KeyCode::Char('Q') => {
                     self.mode = mode;
@@ -6258,6 +6784,21 @@ impl App {
             ))
             .style(prompt_style),
             Mode::BalanceBooks { .. } => Paragraph::new(" ").style(prompt_style),
+            Mode::FormatDecimals {
+                buffer,
+                decimals_for,
+            } => Paragraph::new(input_line(
+                match decimals_for {
+                    FormatDecimalsFor::Currency => " currency decimals: ",
+                    FormatDecimalsFor::Fixed => " fixed decimals: ",
+                }
+                .to_string(),
+                buffer,
+                self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
+                prompt_style,
+                caret_style,
+            ))
+            .style(prompt_style),
             Mode::QuitPrompt => Paragraph::new(" Quit Corro? (Q)uit, (B)ack ")
                 .style(Style::default().fg(Color::White).bg(Color::Red)),
             Mode::Help => Paragraph::new(" Help - Up/Down scroll, Esc closes ")
@@ -8959,6 +9500,36 @@ mod tests {
     }
 
     #[test]
+    fn aligned_columns_keep_e_in_same_screen_column() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let align_path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs/tests/align.corro");
+        let mut app = App::new(Some(align_path));
+        app.load_initial().unwrap();
+
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .filter(|row| row.contains('E') && row.contains('a') && row.contains('│'))
+            .collect();
+
+        let positions: Vec<usize> = rows.iter().map(|row| row.find('E').unwrap()).collect();
+
+        assert!(!positions.is_empty());
+        assert!(positions.windows(2).all(|w| w[0] == w[1]));
+    }
+
+    #[test]
     fn aggregate_rows_draw_dividers_instead_of_underlines() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
@@ -9394,6 +9965,129 @@ mod tests {
     }
 
     #[test]
+    fn format_menu_actions_apply_cell_format() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 1);
+        app.apply_format_to_target(
+            FormatTarget::Cell,
+            CellFormat {
+                number: Some(NumberFormat::Fixed { decimals: 1 }),
+                align: Some(TextAlign::Right),
+            },
+        );
+
+        assert_eq!(
+            app.state
+                .grid
+                .format_for_addr(&CellAddr::Main { row: 0, col: 0 }),
+            CellFormat {
+                number: Some(NumberFormat::Fixed { decimals: 1 }),
+                align: Some(TextAlign::Right),
+            }
+        );
+    }
+
+    #[test]
+    fn formatted_cell_display_uses_number_and_alignment() {
+        let mut grid = Grid::new(1, 1);
+        let addr = CellAddr::Main { row: 0, col: 0 };
+        grid.set(&addr, "12.5".into());
+        grid.set_cell_format(
+            addr.clone(),
+            CellFormat {
+                number: Some(NumberFormat::Fixed { decimals: 1 }),
+                align: Some(TextAlign::Right),
+            },
+        );
+
+        let formatted = format_cell_display(&grid, &addr, cell_effective_display(&grid, &addr));
+        assert_eq!(formatted, "12.5");
+    }
+
+    #[test]
+    fn aligned_columns_keep_separate_widths() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(10, 2);
+        for (i, value) in [
+            "a",
+            "aa",
+            "aaa",
+            "aaaa",
+            "aaaa",
+            "aaaaa",
+            "aaaaaa",
+            "aaaaaaa",
+            "aaaaaaaaaaaaaaaa",
+        ]
+        .iter()
+        .enumerate()
+        {
+            app.state.grid.set(
+                &CellAddr::Left {
+                    row: i as u32,
+                    col: 0,
+                },
+                value.to_string(),
+            );
+            app.state.grid.set(
+                &CellAddr::Main {
+                    row: i as u32,
+                    col: 0,
+                },
+                "E".into(),
+            );
+        }
+        let backend = TestBackend::new(40, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let rendered = buffer_to_string(terminal.backend().buffer());
+        assert!(rendered.contains("a│E"));
+        assert!(rendered.contains("aaaaaaa│E"));
+        assert!(rendered.contains("aaaaaaaaaaaaaaaa│E"));
+    }
+
+    #[test]
+    fn save_and_reload_preserve_format_ops() {
+        let tmp = tempfile::Builder::new()
+            .suffix(".corro")
+            .tempfile()
+            .unwrap();
+        let mut app = App::new(Some(tmp.path().to_path_buf()));
+        app.state.grid.set_main_size(1, 1);
+        app.apply_format_to_target(
+            FormatTarget::Cell,
+            CellFormat {
+                number: Some(NumberFormat::Currency { decimals: 2 }),
+                align: Some(TextAlign::Center),
+            },
+        );
+        app.save_to_path(tmp.path()).unwrap();
+
+        let mut reloaded = App::new(Some(tmp.path().to_path_buf()));
+        reloaded.load_initial().unwrap();
+
+        assert_eq!(
+            reloaded
+                .state
+                .grid
+                .format_for_addr(&CellAddr::Main { row: 0, col: 0 })
+                .number,
+            Some(NumberFormat::Currency { decimals: 2 })
+        );
+        assert_eq!(
+            reloaded
+                .state
+                .grid
+                .format_for_addr(&CellAddr::Main { row: 0, col: 0 })
+                .align,
+            Some(TextAlign::Center)
+        );
+    }
+
+    #[test]
     fn save_path_left_and_right_move_caret() {
         let mut app = App::new(None);
         app.mode = Mode::SavePath {
@@ -9540,6 +10234,39 @@ fn formula_bar_value(grid: &Grid, addr: &CellAddr) -> String {
         return cell_effective_display(grid, addr);
     }
     raw
+}
+
+fn format_cell_display(grid: &Grid, addr: &CellAddr, raw: String) -> String {
+    let fmt = grid.format_for_addr(addr);
+    let Some(number) = fmt.number else {
+        return raw;
+    };
+    let Some(value) = raw.trim().parse::<f64>().ok() else {
+        return raw;
+    };
+    match number {
+        NumberFormat::Currency { decimals } => format!("${value:.decimals$}"),
+        NumberFormat::Fixed { decimals } => format!("{value:.decimals$}"),
+    }
+}
+
+fn align_cell_display(text: String, width: usize, align: Option<TextAlign>) -> String {
+    let width = width.max(1);
+    let len = text.chars().count();
+    if len >= width {
+        return text;
+    }
+    let pad = width - len;
+    match align.unwrap_or(TextAlign::Default) {
+        TextAlign::Left => format!("{text:<width$}"),
+        TextAlign::Center => {
+            let left = pad / 2;
+            let right = pad - left;
+            format!("{}{}{}", " ".repeat(left), text, " ".repeat(right))
+        }
+        TextAlign::Right => format!("{text:>width$}"),
+        TextAlign::Default => format!("{text:<width$}"),
+    }
 }
 
 fn truncate_with_ellipsis(text: &str, width: usize) -> String {

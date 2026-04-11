@@ -1292,7 +1292,7 @@ fn eval_result_to_string(result: &EvalResult) -> String {
             if n.is_nan() {
                 "#NUM!".to_string()
             } else {
-                format!("{n}")
+                format_significant_10(*n)
             }
         }
         EvalResult::Text(s) => s.clone(),
@@ -1327,7 +1327,7 @@ pub fn cell_effective_display(grid: &Grid, addr: &CellAddr) -> String {
             if n.is_nan() {
                 "#NUM!".to_string()
             } else {
-                format!("{n}")
+                format_significant_10(n)
             }
         }
         EvalResult::Text(s) => s,
@@ -1337,6 +1337,28 @@ pub fn cell_effective_display(grid: &Grid, addr: &CellAddr) -> String {
             .and_then(|row| row.first())
             .map(eval_result_to_string)
             .unwrap_or_else(|| "#CALC".to_string()),
+    }
+}
+
+fn format_significant_10(n: f64) -> String {
+    if !n.is_finite() {
+        return n.to_string();
+    }
+    if n == 0.0 {
+        return "0".into();
+    }
+    let abs = n.abs();
+    if (1e-4..1e10).contains(&abs) {
+        let exp = abs.log10().floor() as i32;
+        let decimals = (9 - exp).max(0) as usize;
+        let s = format!("{n:.decimals$}");
+        if s.contains('.') {
+            s.trim_end_matches('0').trim_end_matches('.').to_string()
+        } else {
+            s
+        }
+    } else {
+        format!("{n:.9e}")
     }
 }
 
@@ -1374,6 +1396,12 @@ mod tests {
             EvalResult::Number(n) => assert!((n - 2.0).abs() < 1e-9),
             e => panic!("expected 2 {:?}", e),
         }
+    }
+
+    #[test]
+    fn numeric_display_trims_fractional_trailing_zeroes() {
+        assert_eq!(format_significant_10(0.4040000), "0.404");
+        assert_eq!(format_significant_10(100.0), "100");
     }
 
     #[test]
