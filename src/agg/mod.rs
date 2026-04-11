@@ -4,6 +4,18 @@ use crate::formula;
 use crate::grid::{CellAddr, Grid, MainRange};
 use crate::ops::{AggFunc, AggregateDef};
 
+fn format_aggregate_value(value: f64) -> String {
+    if !value.is_finite() {
+        return value.to_string();
+    }
+    let s = format!("{value:.10}");
+    if s.contains('.') {
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
+    } else {
+        s
+    }
+}
+
 fn collect_numbers(grid: &Grid, range: &MainRange) -> Vec<f64> {
     let mut v = Vec::new();
     if range.is_empty() {
@@ -44,7 +56,7 @@ pub fn compute_aggregate(grid: &Grid, def: &AggregateDef) -> String {
                 String::new()
             } else {
                 let s: f64 = xs.iter().sum();
-                format!("{s}")
+                format_aggregate_value(s)
             }
         }
         AggFunc::Mean => {
@@ -52,7 +64,7 @@ pub fn compute_aggregate(grid: &Grid, def: &AggregateDef) -> String {
                 String::new()
             } else {
                 let s: f64 = xs.iter().sum::<f64>() / xs.len() as f64;
-                format!("{s}")
+                format_aggregate_value(s)
             }
         }
         AggFunc::Median => {
@@ -60,18 +72,18 @@ pub fn compute_aggregate(grid: &Grid, def: &AggregateDef) -> String {
                 String::new()
             } else {
                 let m = median(xs);
-                format!("{m}")
+                format_aggregate_value(m)
             }
         }
         AggFunc::Min => xs
             .into_iter()
             .min_by(|a, b| a.partial_cmp(b).unwrap())
-            .map(|m| format!("{m}"))
+            .map(format_aggregate_value)
             .unwrap_or_default(),
         AggFunc::Max => xs
             .into_iter()
             .max_by(|a, b| a.partial_cmp(b).unwrap())
-            .map(|m| format!("{m}"))
+            .map(format_aggregate_value)
             .unwrap_or_default(),
         AggFunc::Count => {
             if xs.is_empty() {

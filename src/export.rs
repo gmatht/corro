@@ -26,13 +26,13 @@ pub fn export_ascii_table(grid: &Grid, out: &mut dyn Write) {
 
     for r in row_start..row_end {
         for c in col_start..col_end {
-            let val = cell_value_at(grid, r, c);
+            let val = rendered_value_at(grid, r, c);
             let content_w = if val.is_empty() {
                 0
             } else {
                 val.chars().count() + 1
             };
-            col_widths[c] = col_widths[c].max(content_w.min(grid.col_width(c)));
+            col_widths[c] = col_widths[c].max(content_w);
         }
     }
 
@@ -64,7 +64,7 @@ pub fn export_ascii_table(grid: &Grid, out: &mut dyn Write) {
             width = row_label.chars().count().max(4)
         );
         for c in col_start..col_end {
-            let val = cell_value_at(grid, r, c);
+            let val = rendered_value_at(grid, r, c);
             let w = col_widths[c];
             data_line.push_str(&format!(" {:>width$} |", val, width = w));
         }
@@ -196,6 +196,55 @@ fn cell_value_at(grid: &Grid, logical_row: usize, global_col: usize) -> String {
         })
         .unwrap_or("")
         .to_string()
+    }
+}
+
+fn rendered_value_at(grid: &Grid, logical_row: usize, global_col: usize) -> String {
+    let addr = match cell_addr_at(grid, logical_row, global_col) {
+        Some(addr) => addr,
+        None => return String::new(),
+    };
+    crate::ui::format_cell_display(
+        grid,
+        &addr,
+        crate::formula::cell_effective_display(grid, &addr),
+    )
+}
+
+fn cell_addr_at(grid: &Grid, logical_row: usize, global_col: usize) -> Option<CellAddr> {
+    let hr = HEADER_ROWS;
+    let mr = grid.main_rows();
+    let lm = MARGIN_COLS;
+    let mc = grid.main_cols();
+
+    if logical_row < hr {
+        Some(CellAddr::Header {
+            row: logical_row as u8,
+            col: global_col as u32,
+        })
+    } else if logical_row < hr + mr {
+        let mri = logical_row - hr;
+        if global_col < lm {
+            Some(CellAddr::Left {
+                col: (lm - 1 - global_col) as u8,
+                row: mri as u32,
+            })
+        } else if global_col < lm + mc {
+            Some(CellAddr::Main {
+                row: mri as u32,
+                col: (global_col - lm) as u32,
+            })
+        } else {
+            Some(CellAddr::Right {
+                col: (global_col - lm - mc) as u8,
+                row: mri as u32,
+            })
+        }
+    } else {
+        Some(CellAddr::Footer {
+            row: (logical_row - hr - mr) as u8,
+            col: global_col as u32,
+        })
     }
 }
 
@@ -448,5 +497,33 @@ mod tests {
 
         assert_eq!(sheet.grid.col_width(crate::grid::MARGIN_COLS), 4);
         assert_eq!(sheet.grid.col_width(crate::grid::MARGIN_COLS + 1), 20);
+    }
+
+    #[test]
+    fn ascii_export_uses_rendered_widths() {
+        use std::path::Path;
+
+        let data = std::fs::read_to_string(Path::new("subtotal.corro")).unwrap();
+        let mut workbook = crate::ops::WorkbookState::new();
+        let mut active_sheet = workbook.sheet_id(workbook.active_sheet);
+        for line in data.lines() {
+            let t = line.trim();
+            if t.is_empty() {
+                continue;
+            }
+            crate::ops::apply_log_line_to_workbook(t, &mut workbook, &mut active_sheet).unwrap();
+        }
+        let sheet = workbook.sheet_mut_by_id(active_sheet).unwrap();
+        for c in 0..sheet.grid.main_cols() {
+            sheet.grid.set_col_width(crate::grid::MARGIN_COLS + c, None);
+        }
+        let mut out = Vec::new();
+        export_ascii_table(&sheet.grid, &mut out);
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("TOTAL"));
+        assert!(s
+            .lines()
+            .any(|line| line.starts_with("|") && line.contains("|")));
+        assert!(!s.contains("…"));
     }
 }

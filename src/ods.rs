@@ -1,7 +1,7 @@
 //! ODS import/export for workbook data.
 
 use crate::addr::excel_column_name;
-use crate::formula::is_formula;
+use crate::formula::{cell_effective_display, is_formula};
 use crate::grid::{CellAddr, Grid, FOOTER_ROWS, HEADER_ROWS, MARGIN_COLS};
 use crate::ops::{SheetRecord, SheetState, WorkbookSnapshot, WorkbookState};
 use quick_xml::events::Event;
@@ -113,6 +113,9 @@ fn ods_cell_xml(grid: &Grid, logical_row: usize, global_col: usize) -> String {
     let mr = grid.main_rows();
     let lm = MARGIN_COLS;
     let mc = grid.main_cols();
+    let addr = ods_cell_addr(grid, logical_row, global_col);
+    let raw = grid.get(&addr).unwrap_or("").to_string();
+    let display = cell_effective_display(grid, &addr);
 
     let value = if logical_row < hr {
         header_formula_or_value(grid, logical_row, global_col, mc)
@@ -122,19 +125,77 @@ fn ods_cell_xml(grid: &Grid, logical_row: usize, global_col: usize) -> String {
         footer_formula_or_value(grid, logical_row - hr - mr, global_col, mc)
     };
 
-    if value.is_empty() {
+    if value.is_empty() && raw.is_empty() {
         "<table:table-cell/>".into()
-    } else if value.starts_with('=') {
+    } else if value.starts_with('=') || is_formula(&raw) {
+        let formula = if value.starts_with('=') { value } else { raw };
+        let formula = ods_formula_expr(&formula).unwrap_or(formula);
+        let value_attrs = match display.trim().parse::<f64>() {
+            Ok(n) => format!(r#" office:value-type="float" office:value="{n}""#),
+            Err(_) => r#" office:value-type="string""#.to_string(),
+        };
         format!(
-            r#"<table:table-cell office:value-type="string" table:formula="of:{}"><text:p>{}</text:p></table:table-cell>"#,
-            ods_escape(&value),
-            ods_escape(&value)
+            r#"<table:table-cell{} table:formula="of:{}"><text:p>{}</text:p></table:table-cell>"#,
+            value_attrs,
+            ods_escape(&formula),
+            ods_escape(&display)
         )
     } else {
         format!(
             r#"<table:table-cell office:value-type="string"><text:p>{}</text:p></table:table-cell>"#,
-            ods_escape(&value)
+            ods_escape(if display.is_empty() { &value } else { &display })
         )
+    }
+}
+
+fn ods_cell_addr(grid: &Grid, logical_row: usize, global_col: usize) -> CellAddr {
+    let hr = HEADER_ROWS;
+    let mr = grid.main_rows();
+    let lm = MARGIN_COLS;
+    let mc = grid.main_cols();
+
+    if logical_row < hr {
+        CellAddr::Header {
+            row: logical_row as u8,
+            col: global_col as u32,
+        }
+    } else if logical_row < hr + mr {
+        let main_row = (logical_row - hr) as u32;
+        if global_col < lm {
+            CellAddr::Left {
+                col: (lm - 1 - global_col) as u8,
+                row: main_row,
+            }
+        } else if global_col < lm + mc {
+            CellAddr::Main {
+                row: main_row,
+                col: (global_col - lm) as u32,
+            }
+        } else {
+            CellAddr::Right {
+                col: (global_col - lm - mc) as u8,
+                row: main_row,
+            }
+        }
+    } else {
+        CellAddr::Footer {
+            row: (logical_row - hr - mr) as u8,
+            col: global_col as u32,
+        }
+    }
+}
+
+fn ods_formula_expr(raw: &str) -> Option<String> {
+    let t = raw.trim();
+    let expr = t.strip_prefix('=')?;
+    let expr = expr
+        .split_once(" -- ")
+        .map_or(expr, |(expr, _)| expr)
+        .trim();
+    if expr.is_empty() {
+        None
+    } else {
+        Some(format!("={expr}"))
     }
 }
 
@@ -149,9 +210,9 @@ fn header_formula_or_value(grid: &Grid, row: usize, global_col: usize, main_cols
     if global_col < MARGIN_COLS || global_col >= MARGIN_COLS + main_cols {
         return base;
     }
-    if base.trim().eq_ignore_ascii_case("TOTAL") {
+    if let Some(code) = subtotal_code_for_label(&base) {
         let col = excel_column_name(global_col - MARGIN_COLS);
-        return format!("=SUBTOTAL(9;{col}1:{col}{})", grid.main_rows());
+        return format!("=SUBTOTAL({code};{col}1:{col}{})", grid.main_rows());
     }
     base
 }
@@ -173,10 +234,10 @@ fn main_formula_or_value(
             })
             .unwrap_or("")
             .to_string();
-        if raw.trim().eq_ignore_ascii_case("TOTAL") {
+        if let Some(code) = subtotal_code_for_label(&raw) {
             let start = row_total_block_start(grid, main_row as u32);
             let col = excel_column_name(0);
-            return format!("=SUBTOTAL(9;{col}{}:{col}{})", start + 1, main_row + 1);
+            return format!("=SUBTOTAL({code};{col}{}:{col}{})", start + 1, main_row + 1);
         }
         return raw;
     }
@@ -202,9 +263,9 @@ fn main_formula_or_value(
             })
             .unwrap_or("")
             .to_string();
-        if raw.trim().eq_ignore_ascii_case("TOTAL") {
+        if let Some(code) = subtotal_code_for_label(&raw) {
             return format!(
-                "=SUBTOTAL(9;{}1:{}{})",
+                "=SUBTOTAL({code};{}1:{}{})",
                 excel_column_name(0),
                 excel_column_name(main_cols - 1),
                 mr
@@ -227,15 +288,26 @@ fn footer_formula_or_value(
         })
         .unwrap_or("")
         .to_string();
-    if raw.trim().eq_ignore_ascii_case("TOTAL") {
+    if let Some(code) = subtotal_code_for_label(&raw) {
         return format!(
-            "=SUBTOTAL(9;{}1:{}{})",
+            "=SUBTOTAL({code};{}1:{}{})",
             excel_column_name(0),
             excel_column_name(main_cols - 1),
             grid.main_rows()
         );
     }
     raw
+}
+
+fn subtotal_code_for_label(raw: &str) -> Option<u8> {
+    match raw.trim().to_ascii_uppercase().as_str() {
+        "TOTAL" | "SUM" => Some(9),
+        "MEAN" | "AVERAGE" | "AVG" => Some(1),
+        "COUNT" => Some(2),
+        "MAX" | "MAXIMUM" => Some(4),
+        "MIN" | "MINIMUM" => Some(5),
+        _ => None,
+    }
 }
 
 fn row_total_block_start(grid: &Grid, current_main_row: u32) -> u32 {
@@ -471,6 +543,24 @@ mod tests {
         );
         let content = exported_content_xml(&grid);
         assert!(content.contains(r#"table:formula="of:=SUBTOTAL(9;A1:A1)""#));
+    }
+
+    #[test]
+    fn export_translates_other_aggregate_labels() {
+        let mut grid = Grid::new(1, 1);
+        grid.set(
+            &CellAddr::Footer {
+                row: 0,
+                col: (MARGIN_COLS + 0) as u32,
+            },
+            "MAX".into(),
+        );
+        let content = exported_content_xml(&grid);
+        assert!(
+            content.contains(r#"table:formula="of:=SUBTOTAL(4;A1:A1)""#),
+            "{}",
+            content
+        );
     }
 
     fn exported_content_xml(grid: &Grid) -> String {

@@ -1520,7 +1520,7 @@ fn data_main_col_count(grid: &Grid) -> usize {
     let mc = grid.main_cols();
     for c in 0..mc {
         if right_col_agg_func(grid, MARGIN_COLS + c).is_some() {
-            return c;
+            return c + 1;
         }
     }
     mc
@@ -1663,19 +1663,24 @@ fn footer_row_agg_func(grid: &Grid, footer_row_idx: usize) -> Option<AggFunc> {
 }
 
 fn right_col_agg_func(grid: &Grid, global_col: usize) -> Option<AggFunc> {
-    let val = grid.get(&CellAddr::Header {
-        row: (HEADER_ROWS - 1) as u8,
-        col: global_col as u32,
-    })?;
-    match val.trim().to_uppercase().as_str() {
-        "TOTAL" | "SUM" => Some(AggFunc::Sum),
-        "MEAN" | "AVERAGE" | "AVG" => Some(AggFunc::Mean),
-        "MEDIAN" => Some(AggFunc::Median),
-        "MIN" | "MINIMUM" => Some(AggFunc::Min),
-        "MAX" | "MAXIMUM" => Some(AggFunc::Max),
-        "COUNT" => Some(AggFunc::Count),
-        _ => None,
+    for row in 0..HEADER_ROWS {
+        let Some(val) = grid.get(&CellAddr::Header {
+            row: row as u8,
+            col: global_col as u32,
+        }) else {
+            continue;
+        };
+        match val.trim().to_uppercase().as_str() {
+            "TOTAL" | "SUM" => return Some(AggFunc::Sum),
+            "MEAN" | "AVERAGE" | "AVG" => return Some(AggFunc::Mean),
+            "MEDIAN" => return Some(AggFunc::Median),
+            "MIN" | "MINIMUM" => return Some(AggFunc::Min),
+            "MAX" | "MAXIMUM" => return Some(AggFunc::Max),
+            "COUNT" => return Some(AggFunc::Count),
+            _ => {}
+        }
     }
+    None
 }
 
 fn parse_num(s: &str) -> Option<f64> {
@@ -1745,6 +1750,7 @@ fn footer_special_col_aggregate(
     main_cols: usize,
 ) -> Option<String> {
     let row_func = right_col_agg_func(grid, global_col);
+    let data_cols = data_main_col_count(grid);
     let mut samples: Vec<f64> = Vec::new();
     for r in 0..main_rows {
         let row_val = if let Some(func) = row_func {
@@ -1756,7 +1762,7 @@ fn footer_special_col_aggregate(
                         row_start: r as u32,
                         row_end: r as u32 + 1,
                         col_start: 0,
-                        col_end: main_cols as u32,
+                        col_end: data_cols as u32,
                     },
                 },
             )
@@ -4541,8 +4547,24 @@ impl App {
                 {
                     if c >= lm && c < lm + mc {
                         is_agg_cell = true;
-                        let main_col = (c - lm) as u32;
-                        left_margin_main_col_aggregate(grid, func, main_row, main_col)
+                        if right_col_agg.is_some() {
+                            let subtotal_col = (c - lm) as u32;
+                            compute_aggregate(
+                                grid,
+                                &AggregateDef {
+                                    func,
+                                    source: MainRange {
+                                        row_start: block_start,
+                                        row_end: main_row,
+                                        col_start: 0,
+                                        col_end: subtotal_col,
+                                    },
+                                },
+                            )
+                        } else {
+                            let main_col = (c - lm) as u32;
+                            left_margin_main_col_aggregate(grid, func, main_row, main_col)
+                        }
                     } else if right_col_agg.is_some() {
                         is_agg_cell = true;
                         left_margin_special_col_aggregate(
@@ -7999,6 +8021,125 @@ mod tests {
     }
 
     #[test]
+    fn right_margin_aggregate_detects_top_header_marker() {
+        let mut state = SheetState::new(4, 3);
+        state.grid.set(
+            &CellAddr::Header {
+                row: 0,
+                col: (MARGIN_COLS + 2) as u32,
+            },
+            "TOTAL".into(),
+        );
+        state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 2 }, "1".into());
+        state
+            .grid
+            .set(&CellAddr::Main { row: 1, col: 2 }, "2".into());
+        state
+            .grid
+            .set(&CellAddr::Main { row: 2, col: 2 }, "3".into());
+
+        assert_eq!(
+            right_col_agg_func(&state.grid, MARGIN_COLS + 2),
+            Some(AggFunc::Sum)
+        );
+        assert_eq!(
+            footer_special_col_aggregate(&state.grid, AggFunc::Sum, MARGIN_COLS + 2, 4, 3),
+            Some("6".into())
+        );
+    }
+
+    #[test]
+    fn footer_special_col_aggregate_uses_data_region_width() {
+        let mut state = SheetState::new(3, 5);
+        state.grid.set(
+            &CellAddr::Header {
+                row: 0,
+                col: (MARGIN_COLS + 2) as u32,
+            },
+            "TOTAL".into(),
+        );
+        state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "1".into());
+        state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 1 }, "2".into());
+        state
+            .grid
+            .set(&CellAddr::Main { row: 1, col: 0 }, "3".into());
+        state
+            .grid
+            .set(&CellAddr::Main { row: 1, col: 1 }, "4".into());
+
+        assert_eq!(
+            footer_special_col_aggregate(&state.grid, AggFunc::Sum, MARGIN_COLS + 2, 2, 5),
+            Some("10".into())
+        );
+    }
+
+    #[test]
+    fn subtotal_tiny_shows_c3_total() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let path = std::path::PathBuf::from("docs/test/subtotal-tiny.corro");
+        let mut app = App::new(Some(path));
+        app.load_initial().unwrap();
+
+        let backend = TestBackend::new(120, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = |y: u16| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+
+        let line = (0..buffer.area.height)
+            .map(row)
+            .find(|line| line.contains("  3 "))
+            .unwrap_or_default();
+
+        assert!(line.contains("112"), "rendered line: {line}");
+    }
+
+    #[test]
+    fn right_margin_aggregate_uses_top_or_bottom_header_marker() {
+        let mut state = SheetState::new(3, 3);
+        state.grid.set(
+            &CellAddr::Header {
+                row: 0,
+                col: (MARGIN_COLS + 2) as u32,
+            },
+            "TOTAL".into(),
+        );
+        state.grid.set(
+            &CellAddr::Header {
+                row: (HEADER_ROWS - 1) as u8,
+                col: (MARGIN_COLS + 2) as u32,
+            },
+            "".into(),
+        );
+        state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "1".into());
+        state
+            .grid
+            .set(&CellAddr::Main { row: 1, col: 0 }, "2".into());
+        state
+            .grid
+            .set(&CellAddr::Main { row: 2, col: 0 }, "3".into());
+
+        assert_eq!(
+            right_col_agg_func(&state.grid, MARGIN_COLS + 2),
+            Some(AggFunc::Sum)
+        );
+    }
+
+    #[test]
     fn aggregate_columns_render_in_cyan() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
@@ -10266,7 +10407,7 @@ fn formula_bar_value(grid: &Grid, addr: &CellAddr) -> String {
     raw
 }
 
-fn format_cell_display(grid: &Grid, addr: &CellAddr, raw: String) -> String {
+pub(crate) fn format_cell_display(grid: &Grid, addr: &CellAddr, raw: String) -> String {
     let fmt = grid.format_for_addr(addr);
     let Some(number) = fmt.number else {
         return raw;
