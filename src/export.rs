@@ -12,11 +12,16 @@ pub fn export_csv(grid: &Grid, out: &mut dyn Write) {
     export_delimited(grid, out, ',', false, false);
 }
 
-pub fn export_ascii_table(grid: &Grid, out: &mut dyn Write) {
+pub fn export_ascii_table(grid: &Grid, out: &mut dyn Write, row_dividers: bool) {
     let mc = grid.main_cols();
     let tc = grid.total_cols();
     let (row_start, row_end) = ascii_row_bounds(grid);
     let (col_start, col_end) = ascii_col_bounds(grid);
+    let row_label_w = (row_start..row_end)
+        .map(|r| sheet_row_label(r, grid.main_rows()).chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(4);
 
     let mut col_widths: Vec<usize> = vec![0; tc];
     for c in col_start..col_end {
@@ -36,9 +41,14 @@ pub fn export_ascii_table(grid: &Grid, out: &mut dyn Write) {
         }
     }
 
-    let _total_width: usize =
-        col_widths[col_start..col_end].iter().sum::<usize>() + (col_end - col_start) + 1;
+    let _total_width: usize = row_label_w
+        + 1
+        + col_widths[col_start..col_end].iter().sum::<usize>()
+        + (col_end - col_start)
+        + 1;
     let border: String = "+".to_string()
+        + &"-".repeat(row_label_w)
+        + "+"
         + &col_widths[col_start..col_end]
             .iter()
             .map(|w| "-".repeat(*w))
@@ -47,7 +57,7 @@ pub fn export_ascii_table(grid: &Grid, out: &mut dyn Write) {
         + "+";
 
     let _ = writeln!(out, "{}", border);
-    let mut header_line = String::from("|");
+    let mut header_line = format!("| {:>width$} |", "", width = row_label_w);
     for c in col_start..col_end {
         let label = col_header_label(c, mc);
         let w = col_widths[c];
@@ -58,19 +68,18 @@ pub fn export_ascii_table(grid: &Grid, out: &mut dyn Write) {
 
     for r in row_start..row_end {
         let row_label = sheet_row_label(r, grid.main_rows());
-        let mut data_line = format!(
-            "{:width$}|",
-            row_label,
-            width = row_label.chars().count().max(4)
-        );
+        let mut data_line = format!("| {:>width$} |", row_label, width = row_label_w);
         for c in col_start..col_end {
             let val = rendered_value_at(grid, r, c);
             let w = col_widths[c];
             data_line.push_str(&format!(" {:>width$} |", val, width = w));
         }
         let _ = writeln!(out, "{}", data_line);
-        let _ = writeln!(out, "{}", border);
+        if row_dividers {
+            let _ = writeln!(out, "{}", border);
+        }
     }
+    let _ = writeln!(out, "{}", border);
 }
 
 pub fn export_all(grid: &Grid, out: &mut dyn Write) {
@@ -466,7 +475,7 @@ mod tests {
         g.set(&CellAddr::Main { row: 0, col: 0 }, "Aasdf".into());
         g.set(&CellAddr::Main { row: 2, col: 0 }, "adsf".into());
         let mut out = Vec::new();
-        export_ascii_table(&g, &mut out);
+        export_ascii_table(&g, &mut out, false);
         let s = String::from_utf8(out).unwrap();
         assert!(!s.contains("<9"));
         assert!(!s.contains(">9"));
@@ -518,12 +527,12 @@ mod tests {
             sheet.grid.set_col_width(crate::grid::MARGIN_COLS + c, None);
         }
         let mut out = Vec::new();
-        export_ascii_table(&sheet.grid, &mut out);
+        export_ascii_table(&sheet.grid, &mut out, false);
         let s = String::from_utf8(out).unwrap();
         assert!(s.contains("TOTAL"));
-        assert!(s
-            .lines()
-            .any(|line| line.starts_with("|") && line.contains("|")));
+        assert!(s.lines().next().unwrap().starts_with("+"));
+        assert!(s.lines().nth(1).unwrap().starts_with("|"));
+        assert!(s.lines().last().unwrap().starts_with("+"));
         assert!(!s.contains("…"));
     }
 }

@@ -102,16 +102,75 @@ fn ods_row_end(grid: &Grid) -> usize {
 
 fn ods_col_end(grid: &Grid) -> usize {
     let mut end = grid.total_cols();
-    while end > 0 && !grid.logical_col_has_content(end - 1) {
+    while end > 0 && !ods_logical_col_has_content(grid, end - 1) {
         end -= 1;
     }
     end.max(1)
 }
 
+fn ods_logical_col_has_content(grid: &Grid, col: usize) -> bool {
+    if col >= grid.total_cols() {
+        return false;
+    }
+    for row in 0..HEADER_ROWS {
+        if grid
+            .get(&CellAddr::Header {
+                row: row as u8,
+                col: col as u32,
+            })
+            .is_some_and(|s| !s.is_empty())
+        {
+            return true;
+        }
+    }
+    for row in 0..grid.main_rows() {
+        if col < MARGIN_COLS {
+            if grid
+                .get(&CellAddr::Left {
+                    col: col as u8,
+                    row: row as u32,
+                })
+                .is_some_and(|s| !s.is_empty())
+            {
+                return true;
+            }
+        } else if col < MARGIN_COLS + grid.main_cols() {
+            if grid
+                .get(&CellAddr::Main {
+                    row: row as u32,
+                    col: (col - MARGIN_COLS) as u32,
+                })
+                .is_some_and(|s| !s.is_empty())
+            {
+                return true;
+            }
+        } else if grid
+            .get(&CellAddr::Right {
+                col: (col - MARGIN_COLS - grid.main_cols()) as u8,
+                row: row as u32,
+            })
+            .is_some_and(|s| !s.is_empty())
+        {
+            return true;
+        }
+    }
+    for row in 0..FOOTER_ROWS {
+        if grid
+            .get(&CellAddr::Footer {
+                row: row as u8,
+                col: col as u32,
+            })
+            .is_some_and(|s| !s.is_empty())
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn ods_cell_xml(grid: &Grid, logical_row: usize, global_col: usize) -> String {
     let hr = HEADER_ROWS;
     let mr = grid.main_rows();
-    let lm = MARGIN_COLS;
     let mc = grid.main_cols();
     let addr = ods_cell_addr(grid, logical_row, global_col);
     let raw = grid.get(&addr).unwrap_or("").to_string();

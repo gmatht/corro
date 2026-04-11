@@ -3848,7 +3848,7 @@ impl App {
     fn do_export_ascii(&mut self) -> String {
         crate::formula::refresh_spills(&mut self.state.grid);
         let mut buf = Vec::new();
-        export::export_ascii_table(&self.state.grid, &mut buf);
+        export::export_ascii_table(&self.state.grid, &mut buf, false);
         String::from_utf8_lossy(&buf).into_owned()
     }
 
@@ -4548,19 +4548,16 @@ impl App {
                     if c >= lm && c < lm + mc {
                         is_agg_cell = true;
                         if right_col_agg.is_some() {
-                            let subtotal_col = (c - lm) as u32;
-                            compute_aggregate(
-                                grid,
-                                &AggregateDef {
-                                    func,
-                                    source: MainRange {
-                                        row_start: block_start,
-                                        row_end: main_row,
-                                        col_start: 0,
-                                        col_end: subtotal_col,
-                                    },
-                                },
+                            let data_cols = data_main_col_count(grid);
+                            let (row_start, row_end) = if block_start < main_row {
+                                (block_start, main_row)
+                            } else {
+                                previous_raw_block(grid, main_row).unwrap_or((0, main_row))
+                            };
+                            left_margin_special_col_aggregate(
+                                grid, func, c, row_start, row_end, data_cols,
                             )
+                            .unwrap_or_else(|| cell_effective_display(grid, &cell_addr))
                         } else {
                             let main_col = (c - lm) as u32;
                             left_margin_main_col_aggregate(grid, func, main_row, main_col)
@@ -4604,13 +4601,15 @@ impl App {
                 };
                 let cw = grid.col_width(c).max(1);
                 let formatted = format_cell_display(grid, &cell_addr, text);
+                let align = effective_cell_align(grid, &cell_addr, &formatted);
                 let disp = if formatted.chars().count() > cw {
                     shrink_numeric_display(&formatted, cw)
                         .or_else(|| exponential_numeric_display(&formatted, cw))
                         .unwrap_or_else(|| truncate_with_ellipsis(&formatted, cw))
                 } else {
-                    align_cell_display(formatted, cw, grid.format_for_addr(&cell_addr).align)
+                    formatted
                 };
+                let disp = align_cell_display(disp, cw, align);
                 let sel = self.anchor.is_some_and(|a| match self.selection_kind {
                     SelectionKind::Cells => {
                         let r0 = a.row.min(self.cursor.row);
@@ -8080,11 +8079,11 @@ mod tests {
     }
 
     #[test]
-    fn subtotal_tiny_shows_c3_total() {
+    fn subtotal_tiny_shows_c4_and_c5_totals() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
-        let path = std::path::PathBuf::from("docs/test/subtotal-tiny.corro");
+        let path = std::path::PathBuf::from("docs/tests/subtotal-tiny.corro");
         let mut app = App::new(Some(path));
         app.load_initial().unwrap();
 
@@ -8098,12 +8097,20 @@ mod tests {
                 .collect::<String>()
         };
 
-        let line = (0..buffer.area.height)
-            .map(row)
-            .find(|line| line.contains("  3 "))
+        let lines: Vec<String> = (0..buffer.area.height).map(row).collect();
+        let row4 = lines
+            .iter()
+            .find(|line| line.starts_with("│   4 "))
+            .cloned()
+            .unwrap_or_default();
+        let row5 = lines
+            .iter()
+            .find(|line| line.starts_with("│   5 "))
+            .cloned()
             .unwrap_or_default();
 
-        assert!(line.contains("112"), "rendered line: {line}");
+        assert!(row4.contains("56"), "rendered row 4: {row4}");
+        assert!(row5.contains("112"), "rendered row 5: {row5}");
     }
 
     #[test]
@@ -10437,6 +10444,18 @@ fn align_cell_display(text: String, width: usize, align: Option<TextAlign>) -> S
         }
         TextAlign::Right => format!("{text:>width$}"),
         TextAlign::Default => format!("{text:<width$}"),
+    }
+}
+
+fn effective_cell_align(grid: &Grid, addr: &CellAddr, formatted: &str) -> Option<TextAlign> {
+    let fmt = grid.format_for_addr(addr);
+    if fmt.align.is_some() {
+        return fmt.align;
+    }
+    if fmt.number.is_some() || formatted.trim().parse::<f64>().is_ok() {
+        Some(TextAlign::Right)
+    } else {
+        None
     }
 }
 
