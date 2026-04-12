@@ -1,0 +1,10 @@
+0.5.0 All features intended for 1.0.0 at least partially work
+      - Export functions are still largely work
+      - Balance Books function implemented 
+      - Agregate rows/cols, working, with cyan "bolding"
+      - Most important hotkeys should now work.
+      - There are no planned format changes between now an 1.0.0 (or promises to avoid format changes)
+      
+0.1.0 Initial prototype, demonstrating log based file format and concurrent editing.
+      
+
