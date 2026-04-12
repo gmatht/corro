@@ -182,10 +182,8 @@ pub fn parse_cell_ref_at(s: &str, main_cols: usize) -> Option<(CellAddr, usize)>
             Some(true) => parse_mirror_margin_column_name(col_name, true)? as u32,
             Some(false) => parse_mirror_margin_column_name(col_name, false)
                 .map(|c| (crate::grid::MARGIN_COLS + main_cols + c as usize) as u32)
-                .or_else(|| {
-                    Some(crate::grid::MARGIN_COLS as u32 + parse_excel_column(col_name)?)
-                })?,
-            None => (crate::grid::MARGIN_COLS as u32 + parse_excel_column(col_name)?) as u32,
+                .or_else(|| Some(parse_excel_column(col_name)?))?,
+            None => parse_excel_column(col_name)?,
         };
         return Some((
             if marker == '~' {

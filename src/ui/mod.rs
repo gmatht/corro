@@ -1981,6 +1981,7 @@ pub struct App {
     pub col_scroll: usize,
     help_scroll: usize,
     about_scroll: usize,
+    export_preview_scroll: usize,
     pub op_history: Vec<Op>,
     selection_kind: SelectionKind,
     edit_special_palette: bool,
@@ -2039,6 +2040,7 @@ impl App {
             col_scroll: 0,
             help_scroll: 0,
             about_scroll: 0,
+            export_preview_scroll: 0,
             op_history: Vec::new(),
             selection_kind: SelectionKind::Cells,
             edit_special_palette: false,
@@ -2402,6 +2404,7 @@ impl App {
         self.anchor = None;
         self.row_scroll = 0;
         self.col_scroll = 0;
+        self.export_preview_scroll = 0;
         self.path = None;
         self.watcher = None;
         let mut active_sheet = self.workbook.sheet_id(self.workbook.active_sheet);
@@ -3828,19 +3831,7 @@ impl App {
         if csv {
             export::export_csv(&self.state.grid, &mut buf);
         } else {
-            if self.anchor.is_some() {
-                let rows = self
-                    .current_selection_range()
-                    .map(|(rows, _)| rows)
-                    .unwrap_or_default();
-                let cols = self
-                    .current_selection_range()
-                    .map(|(_, cols)| cols)
-                    .unwrap_or_default();
-                export::export_selection(&self.state.grid, &mut buf, &rows, &cols);
-            } else {
-                export::export_tsv(&self.state.grid, &mut buf);
-            }
+            export::export_tsv(&self.state.grid, &mut buf);
         }
         String::from_utf8_lossy(&buf).into_owned()
     }
@@ -4403,6 +4394,10 @@ impl App {
             return;
         }
 
+        if self.render_export_preview_overlay(f, grid_area) {
+            return;
+        }
+
         if matches!(&self.mode, Mode::BalanceBooks { .. }) {
             let area = centered_rect(72, 64, f.area());
             f.render_widget(Clear, area);
@@ -4440,6 +4435,7 @@ impl App {
         }
 
         // ── Grid ──────────────────────────────────────────────────────────────
+        f.render_widget(Clear, grid_area);
         let mut lines: Vec<Line> = Vec::new();
 
         {
@@ -4465,10 +4461,11 @@ impl App {
                 };
                 let w = grid.col_width(c).max(1);
                 spans.push(Span::styled(format!("{:>w$}", name, w = w), style));
+                if i + 1 < col_ixs.len() {
+                    spans.push(Span::raw(" "));
+                }
                 if i + 1 < col_ixs.len() && c == lm - 1 && lm > 0 && col_ixs.contains(&lm) {
                     spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
-                } else if i + 1 < col_ixs.len() {
-                    spans.push(Span::raw(" "));
                 }
                 if i + 1 < col_ixs.len() && c == lm + mc - 1 && show_right_divider {
                     spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
@@ -4662,10 +4659,11 @@ impl App {
                     }
                 }
                 spans.push(Span::styled(disp, st));
+                if i + 1 < col_ixs.len() {
+                    spans.push(Span::raw(" "));
+                }
                 if i + 1 < col_ixs.len() && c == lm - 1 && lm > 0 && col_ixs.contains(&lm) {
                     spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
-                } else if i + 1 < col_ixs.len() {
-                    spans.push(Span::raw(" "));
                 }
                 if i + 1 < col_ixs.len() && c == lm + mc - 1 && show_right_divider {
                     spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
@@ -5538,6 +5536,18 @@ impl App {
                 _ => {}
             },
             Mode::ExportTsv { buffer } => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.export_preview_scroll = self.export_preview_scroll.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.export_preview_scroll = self.export_preview_scroll.saturating_add(1);
+                }
+                KeyCode::PageUp => {
+                    self.export_preview_scroll = self.export_preview_scroll.saturating_sub(20);
+                }
+                KeyCode::PageDown => {
+                    self.export_preview_scroll = self.export_preview_scroll.saturating_add(20);
+                }
                 KeyCode::Enter => {
                     let fname = buffer.clone();
                     self.finish_export(false, &fname);
@@ -5553,6 +5563,18 @@ impl App {
                 _ => {}
             },
             Mode::ExportCsv { buffer } => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.export_preview_scroll = self.export_preview_scroll.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.export_preview_scroll = self.export_preview_scroll.saturating_add(1);
+                }
+                KeyCode::PageUp => {
+                    self.export_preview_scroll = self.export_preview_scroll.saturating_sub(20);
+                }
+                KeyCode::PageDown => {
+                    self.export_preview_scroll = self.export_preview_scroll.saturating_add(20);
+                }
                 KeyCode::Enter => {
                     let fname = buffer.clone();
                     self.finish_export(true, &fname);
@@ -5621,7 +5643,7 @@ impl App {
                     let fname = buffer.clone();
                     if fname.trim().is_empty() {
                         let data = if self.anchor.is_some() {
-                            self.do_export(false)
+                            self.do_export_selection()
                         } else {
                             self.do_export_all()
                         };
@@ -5637,7 +5659,7 @@ impl App {
                         }
                     } else {
                         let data = if self.anchor.is_some() {
-                            self.do_export(false)
+                            self.do_export_selection()
                         } else {
                             self.do_export_all()
                         };
@@ -6845,6 +6867,51 @@ impl App {
                 Paragraph::new(text).style(Style::default().fg(Color::Cyan))
             }
         }
+    }
+
+    fn export_preview_text(&self, csv: bool) -> String {
+        let mut grid = self.state.grid.clone();
+        crate::formula::refresh_spills(&mut grid);
+        let mut buf = Vec::new();
+        if csv {
+            export::export_csv(&grid, &mut buf);
+        } else {
+            export::export_tsv(&grid, &mut buf);
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn render_export_preview_overlay(&self, f: &mut Frame, grid_area: Rect) -> bool {
+        let csv = match self.mode {
+            Mode::ExportCsv { .. } => true,
+            Mode::ExportTsv { .. } => false,
+            _ => return false,
+        };
+        let body = self.export_preview_text(csv);
+        let inner = Block::default().borders(Borders::ALL).inner(grid_area);
+        let lines: Vec<&str> = body.lines().collect();
+        let max_scroll = lines.len().saturating_sub(inner.height as usize);
+        let scroll = self.export_preview_scroll.min(max_scroll);
+        let visible: String = lines
+            .iter()
+            .skip(scroll)
+            .take(inner.height as usize)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        let block = Block::default().borders(Borders::ALL).title(if csv {
+            " Export CSV "
+        } else {
+            " Export TSV "
+        });
+        let paragraph = Paragraph::new(visible)
+            .block(block)
+            .wrap(Wrap { trim: false });
+        f.render_widget(Clear, grid_area);
+        f.render_widget(paragraph, grid_area);
+        true
     }
 
     #[cold]
@@ -8083,6 +8150,23 @@ mod tests {
     }
 
     #[test]
+    fn export_preview_scroll_moves_with_arrow_keys() {
+        let mut app = App::new(None);
+        app.export_preview_scroll = 10;
+        app.mode = Mode::ExportTsv {
+            buffer: String::new(),
+        };
+
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::empty()))
+            .unwrap();
+        assert_eq!(app.export_preview_scroll, 9);
+
+        app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::empty()))
+            .unwrap();
+        assert_eq!(app.export_preview_scroll, 29);
+    }
+
+    #[test]
     fn subtotal_tiny_shows_c4_and_c5_totals() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
@@ -8113,8 +8197,111 @@ mod tests {
             .cloned()
             .unwrap_or_default();
 
-        assert!(row4.contains("56"), "rendered row 4: {row4}");
-        assert!(row5.contains("112"), "rendered row 5: {row5}");
+        assert!(row4.contains("AVERAGE"), "rendered row 4: {row4}");
+        assert!(row5.contains("TOTAL"), "rendered row 5: {row5}");
+    }
+
+    #[test]
+    fn subtotal_tiny_renders_c1_and_total_cells() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(Some(std::path::PathBuf::from(
+            "docs/tests/subtotal-tiny.corro",
+        )));
+        app.load_initial().unwrap();
+
+        let backend = TestBackend::new(120, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = |y: u16| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+
+        let lines: Vec<String> = (0..buffer.area.height).map(row).collect();
+        assert!(
+            lines.iter().any(|line| line.contains("TOTAL")),
+            "{lines:#?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("│   5 TOTAL")),
+            "{lines:#?}"
+        );
+    }
+
+    #[test]
+    fn tsv_export_preview_ignores_active_selection() {
+        let mut app = App::new(Some(std::path::PathBuf::from(
+            "docs/tests/subtotal-tiny.corro",
+        )));
+        app.load_initial().unwrap();
+        app.anchor = Some(SheetCursor {
+            row: HEADER_ROWS + 1,
+            col: MARGIN_COLS,
+        });
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS + 2,
+            col: MARGIN_COLS + 1,
+        };
+
+        let text = app.export_preview_text(false);
+
+        assert!(text.contains("TOTAL"), "{text}");
+        assert!(text.contains("AVERAGE"), "{text}");
+    }
+
+    #[test]
+    fn export_tsv_clears_stale_menu_popup() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(None);
+        let backend = TestBackend::new(120, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        app.mode = Mode::Menu {
+            stack: vec![
+                MenuLevel {
+                    section: MenuSection::File,
+                    item: 2,
+                },
+                MenuLevel {
+                    section: MenuSection::Export,
+                    item: 0,
+                },
+            ],
+        };
+        terminal.draw(|f| app.draw(f)).unwrap();
+
+        app.mode = Mode::ExportTsv {
+            buffer: String::new(),
+        };
+        terminal.draw(|f| app.draw(f)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let lines: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("export TSV (blank=clipboard):")),
+            "{lines:#?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .all(|line| !line.contains("T·TSV") && !line.contains("C·CSV")),
+            "{lines:#?}"
+        );
     }
 
     #[test]

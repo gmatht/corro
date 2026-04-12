@@ -53,6 +53,16 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install LibreOffice (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libreoffice-core libreoffice-calc
+
+      - name: Run ODS smoke tests
+        if: runner.os == 'Linux'
+        run: cargo test -q ods::tests::subtotal_fixture_opens_in_libreoffice_if_available
+
       - name: Build release binary
         run: cargo build --release
 

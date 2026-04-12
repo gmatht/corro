@@ -5,11 +5,11 @@ use std::io::Write;
 use zip::write::FileOptions;
 
 pub fn export_tsv(grid: &Grid, out: &mut dyn Write) {
-    export_delimited(grid, out, '\t', false, false);
+    export_delimited(grid, out, '\t', true, true);
 }
 
 pub fn export_csv(grid: &Grid, out: &mut dyn Write) {
-    export_delimited(grid, out, ',', false, false);
+    export_delimited(grid, out, ',', true, true);
 }
 
 pub fn export_ascii_table(grid: &Grid, out: &mut dyn Write, row_dividers: bool) {
@@ -281,7 +281,7 @@ fn export_delimited(
     let fr = FOOTER_ROWS;
     let total_rows = hr + mr + fr;
 
-    let col_start = if include_margins { 0 } else { lm };
+    let col_start = if include_margins { 0 } else { MARGIN_COLS };
     let col_end = if include_margins { tc } else { lm + mc };
 
     if include_headers {
@@ -295,14 +295,18 @@ fn export_delimited(
         let _ = writeln!(out);
     }
 
-    for r in row_order(grid, total_rows) {
+    let rows: Vec<usize> = row_order(grid, total_rows)
+        .into_iter()
+        .filter(|&r| grid.logical_row_has_content(r))
+        .collect();
+    for r in rows {
         let mut first = true;
         for c in col_start..col_end {
             if !first {
                 let _ = write!(out, "{delim}");
             }
             first = false;
-            let val = cell_value_at(grid, r, c);
+            let val = rendered_value_at(grid, r, c);
             if delim == ',' && needs_csv_quoting(&val, delim) {
                 let _ = write!(out, "{}", csv_quote(&val));
             } else {
@@ -468,6 +472,72 @@ pub fn export_sorted_tsv(grid: &Grid, out: &mut dyn Write, sort_cols: &[usize]) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::{Path, PathBuf};
+
+    fn load_fixture(path: &Path) -> crate::ops::WorkbookState {
+        let data = std::fs::read_to_string(path).unwrap();
+        let mut workbook = crate::ops::WorkbookState::new();
+        let mut active_sheet = workbook.sheet_id(workbook.active_sheet);
+        for (idx, line) in data.lines().enumerate() {
+            let t = line.trim();
+            if t.is_empty() {
+                continue;
+            }
+            if t == "SET $1:_6]A :q" {
+                continue;
+            }
+            crate::ops::apply_log_line_to_workbook(t, &mut workbook, &mut active_sheet)
+                .unwrap_or_else(|e| panic!("{}:{}: {} => {e}", path.display(), idx + 1, t));
+        }
+        workbook
+    }
+
+    fn parse_delimited(data: &str, delim: char) -> Vec<Vec<String>> {
+        data.lines()
+            .map(|line| parse_delimited_line(line, delim))
+            .collect()
+    }
+
+    fn parse_delimited_line(line: &str, delim: char) -> Vec<String> {
+        let mut fields = Vec::new();
+        let mut current = String::new();
+        let mut in_quotes = false;
+        let mut chars = line.chars().peekable();
+
+        while let Some(ch) = chars.next() {
+            if in_quotes {
+                if ch == '"' {
+                    if chars.peek() == Some(&'"') {
+                        current.push('"');
+                        chars.next();
+                    } else {
+                        in_quotes = false;
+                    }
+                } else {
+                    current.push(ch);
+                }
+            } else if ch == '"' {
+                in_quotes = true;
+            } else if ch == delim {
+                fields.push(current.clone());
+                current.clear();
+            } else {
+                current.push(ch);
+            }
+        }
+        fields.push(current);
+        fields
+    }
+
+    fn export_delimited_text(grid: &Grid, csv: bool) -> String {
+        let mut out = Vec::new();
+        if csv {
+            export_csv(grid, &mut out);
+        } else {
+            export_tsv(grid, &mut out);
+        }
+        String::from_utf8(out).unwrap()
+    }
 
     #[test]
     fn ascii_table_trims_empty_margin_columns() {
@@ -534,5 +604,50 @@ mod tests {
         assert!(s.lines().nth(1).unwrap().starts_with("|"));
         assert!(s.lines().last().unwrap().starts_with("+"));
         assert!(!s.contains("…"));
+    }
+
+    #[test]
+    fn tsv_export_keeps_left_margin_columns() {
+        let mut grid = Grid::new(2, 2);
+        grid.set(&CellAddr::Header { row: 0, col: 0 }, "HDR".into());
+        grid.set(&CellAddr::Left { row: 0, col: 0 }, "L0".into());
+        grid.set(&CellAddr::Main { row: 0, col: 0 }, "A0".into());
+        grid.set(&CellAddr::Main { row: 0, col: 1 }, "B0".into());
+        grid.set(&CellAddr::Right { row: 0, col: 0 }, "R0".into());
+        grid.set(&CellAddr::Footer { row: 0, col: 0 }, "FTR".into());
+        let mut out = Vec::new();
+        export_tsv(&grid, &mut out);
+        let tsv = String::from_utf8(out).unwrap();
+        assert!(tsv.contains("HDR"));
+        assert!(tsv.contains("L0"));
+        assert!(tsv.contains("A0\tB0"));
+        assert!(tsv.contains("R0"));
+        assert!(tsv.contains("FTR"));
+    }
+
+    #[test]
+    fn csv_and_tsv_exports_match_for_docs_fixtures() {
+        let fixtures_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs/tests");
+        let mut fixtures: Vec<PathBuf> = std::fs::read_dir(&fixtures_dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .filter(|path| path.extension().and_then(|s| s.to_str()) == Some("corro"))
+            .collect();
+        fixtures.sort();
+
+        for fixture in fixtures {
+            let workbook = load_fixture(&fixture);
+            let grid = &workbook.active_sheet().grid;
+            let csv = export_delimited_text(grid, true);
+            let tsv = export_delimited_text(grid, false);
+            let csv_rows = parse_delimited(&csv, ',');
+            let tsv_rows = parse_delimited(&tsv, '\t');
+            assert_eq!(
+                csv_rows,
+                tsv_rows,
+                "export mismatch for {}",
+                fixture.display()
+            );
+        }
     }
 }

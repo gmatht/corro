@@ -68,13 +68,19 @@ fn ods_manifest_xml() -> String {
 fn ods_content_xml(grid: &Grid) -> String {
     let tc = ods_col_end(grid);
     let row_end = ods_row_end(grid);
+    let column_styles = ods_column_styles_xml(grid, tc);
     let mut s = String::from(
         r#"<?xml version="1.0" encoding="UTF-8"?>
-<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:of="urn:oasis:names:tc:opendocument:xmlns:of:1.2" office:version="1.2"><office:body><office:spreadsheet><table:table>"#,
+<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:of="urn:oasis:names:tc:opendocument:xmlns:of:1.2" office:version="1.2"><office:automatic-styles>"#,
     );
 
-    for _ in 0..tc {
-        s.push_str("<table:table-column table:number-columns-repeated=\"1\"/>");
+    s.push_str(&column_styles);
+    s.push_str("</office:automatic-styles><office:body><office:spreadsheet><table:table>");
+
+    for c in 0..tc {
+        s.push_str(&format!(
+            r#"<table:table-column table:style-name="co{c}"/>"#
+        ));
     }
 
     for r in 0..row_end {
@@ -90,6 +96,22 @@ fn ods_content_xml(grid: &Grid) -> String {
     }
     s.push_str("</table:table></office:spreadsheet></office:body></office:document-content>");
     s
+}
+
+fn ods_column_styles_xml(grid: &Grid, tc: usize) -> String {
+    let mut s = String::new();
+    for c in 0..tc {
+        let width_cm = ods_column_width_cm(grid.col_width(c));
+        s.push_str(&format!(
+            r#"<style:style style:name="co{c}" style:family="table-column"><style:table-column-properties style:column-width="{width_cm:.2}cm"/></style:style>"#
+        ));
+    }
+    s
+}
+
+fn ods_column_width_cm(char_width: usize) -> f32 {
+    let chars = char_width.max(1) as f32;
+    (chars * 0.20 + 0.20).max(0.45)
 }
 
 fn ods_row_end(grid: &Grid) -> usize {
@@ -554,6 +576,9 @@ fn attr_value(e: &quick_xml::events::BytesStart<'_>, key: &[u8]) -> Option<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
+    use std::process::Command;
+    use tempfile::tempdir;
     use tempfile::NamedTempFile;
 
     #[test]
@@ -620,6 +645,133 @@ mod tests {
             "{}",
             content
         );
+    }
+
+    #[test]
+    fn export_emits_column_styles() {
+        let mut grid = Grid::new(2, 2);
+        grid.set(&CellAddr::Main { row: 0, col: 0 }, "42".into());
+        grid.set(&CellAddr::Left { row: 0, col: 0 }, "X".into());
+        let content = exported_content_xml(&grid);
+        assert!(content.contains(r#"style:style style:name="co0" style:family="table-column""#));
+        assert!(content.contains(r#"style:column-width=""#));
+        assert!(content.contains(r#"table:style-name="co0""#));
+    }
+
+    #[test]
+    fn subtotal_fixture_roundtrips_through_ods() {
+        let workbook = workbook_from_fixture("subtotal.corro");
+        let grid = &workbook.active_sheet().grid;
+        let content = exported_content_xml(grid);
+        assert!(content.contains(r#"table:formula="of:=SUBTOTAL("#));
+
+        let bytes = export_ods_bytes(grid).unwrap();
+        let tmp = NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), bytes).unwrap();
+        let reimported = import_ods_workbook(tmp.path()).unwrap();
+
+        let sheet = reimported.active_sheet();
+        let mut saw_formula = false;
+        let mut saw_subtotal = false;
+        scan_grid(&sheet.grid, |value| {
+            if value.starts_with('=') {
+                saw_formula = true;
+            }
+            if value.contains("SUBTOTAL") {
+                saw_subtotal = true;
+            }
+        });
+        assert!(
+            saw_formula,
+            "expected at least one formula cell to survive roundtrip"
+        );
+        assert!(saw_subtotal, "expected subtotal formulas to be preserved");
+    }
+
+    #[test]
+    fn subtotal_fixture_opens_in_libreoffice_if_available() {
+        let Some(soffice) = libreoffice_binary() else {
+            return;
+        };
+
+        let workbook = workbook_from_fixture("subtotal.corro");
+        let grid = &workbook.active_sheet().grid;
+        let dir = tempdir().unwrap();
+        let ods_path = dir.path().join("subtotal.ods");
+        std::fs::write(&ods_path, export_ods_bytes(grid).unwrap()).unwrap();
+        let out_dir = dir.path().join("out");
+        std::fs::create_dir(&out_dir).unwrap();
+
+        let status = Command::new(soffice)
+            .args([
+                "--headless",
+                "--nologo",
+                "--nolockcheck",
+                "--nodefault",
+                "--convert-to",
+                "xlsx",
+                "--outdir",
+                out_dir.to_str().unwrap(),
+                ods_path.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success(), "LibreOffice conversion failed");
+
+        let xlsx = out_dir.join("subtotal.xlsx");
+        assert!(xlsx.exists(), "LibreOffice did not write xlsx output");
+        let mut archive =
+            zip::ZipArchive::new(std::io::Cursor::new(std::fs::read(&xlsx).unwrap())).unwrap();
+        let mut sheet_xml = String::new();
+        archive
+            .by_name("xl/worksheets/sheet1.xml")
+            .unwrap()
+            .read_to_string(&mut sheet_xml)
+            .unwrap();
+        assert!(sheet_xml.contains("SUBTOTAL"));
+        assert!(sheet_xml.contains("<f"));
+    }
+
+    fn workbook_from_fixture(name: &str) -> WorkbookState {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(name);
+        let data = std::fs::read_to_string(path).unwrap();
+        let mut workbook = WorkbookState::new();
+        let mut active_sheet = workbook.sheet_id(workbook.active_sheet);
+        for line in data.lines() {
+            let t = line.trim();
+            if t.is_empty() {
+                continue;
+            }
+            crate::ops::apply_log_line_to_workbook(t, &mut workbook, &mut active_sheet).unwrap();
+        }
+        workbook
+    }
+
+    fn scan_grid<F: FnMut(&str)>(grid: &Grid, mut f: F) {
+        let rows = HEADER_ROWS + grid.main_rows() + FOOTER_ROWS;
+        let cols = grid.total_cols();
+        for r in 0..rows {
+            for c in 0..cols {
+                let addr = ods_cell_addr(grid, r, c);
+                if let Some(value) = grid.get(&addr) {
+                    if !value.is_empty() {
+                        f(value);
+                    }
+                }
+            }
+        }
+    }
+
+    fn libreoffice_binary() -> Option<String> {
+        for name in ["soffice", "libreoffice"] {
+            let Ok(output) = Command::new(name).arg("--version").output() else {
+                continue;
+            };
+            if output.status.success() {
+                return Some(name.to_string());
+            }
+        }
+        None
     }
 
     fn exported_content_xml(grid: &Grid) -> String {
