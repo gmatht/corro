@@ -4280,6 +4280,7 @@ impl App {
     fn draw(&mut self, f: &mut Frame) {
         let _ctx = crate::formula::set_eval_context(&self.workbook);
         crate::formula::refresh_spills(&mut self.state.grid);
+        f.render_widget(Clear, f.area());
         let special_picker = self.special_picker;
         let has_tabs = self.workbook.sheet_count() > 1;
         let constraints = vec![
@@ -8300,6 +8301,49 @@ mod tests {
             lines
                 .iter()
                 .all(|line| !line.contains("T·TSV") && !line.contains("C·CSV")),
+            "{lines:#?}"
+        );
+    }
+
+    #[test]
+    fn export_tsv_drops_persist_sort_from_previous_menu_frame() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(None);
+        let backend = TestBackend::new(120, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        app.mode = Mode::Menu {
+            stack: vec![MenuLevel {
+                section: MenuSection::File,
+                item: 5,
+            }],
+        };
+        terminal.draw(|f| app.draw(f)).unwrap();
+
+        app.mode = Mode::ExportTsv {
+            buffer: String::new(),
+        };
+        terminal.draw(|f| app.draw(f)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let lines: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("export TSV (blank=clipboard):")),
+            "{lines:#?}"
+        );
+        assert!(
+            lines.iter().all(|line| !line.contains("Persist sort")),
             "{lines:#?}"
         );
     }
