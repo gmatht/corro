@@ -798,22 +798,22 @@ fn menu_next_root_section(section: MenuSection) -> MenuSection {
     match section {
         MenuSection::File => MenuSection::Edit,
         MenuSection::Edit => MenuSection::Insert,
-        MenuSection::Insert => MenuSection::Help,
-        MenuSection::Help => MenuSection::Sheet,
-        MenuSection::Sheet => MenuSection::Format,
-        MenuSection::Format => MenuSection::File,
+        MenuSection::Insert => MenuSection::Format,
+        MenuSection::Format => MenuSection::Sheet,
+        MenuSection::Sheet => MenuSection::Help,
+        MenuSection::Help => MenuSection::File,
         _ => MenuSection::File,
     }
 }
 
 fn menu_prev_root_section(section: MenuSection) -> MenuSection {
     match section {
-        MenuSection::File => MenuSection::Format,
+        MenuSection::File => MenuSection::Help,
         MenuSection::Edit => MenuSection::File,
         MenuSection::Insert => MenuSection::Edit,
-        MenuSection::Help => MenuSection::Insert,
-        MenuSection::Sheet => MenuSection::Help,
-        MenuSection::Format => MenuSection::Sheet,
+        MenuSection::Format => MenuSection::Insert,
+        MenuSection::Sheet => MenuSection::Format,
+        MenuSection::Help => MenuSection::Sheet,
         _ => MenuSection::File,
     }
 }
@@ -842,12 +842,12 @@ fn menu_popup_area(area: Rect, section: MenuSection, parent: Option<(Rect, usize
                 MenuSection::File => 1,
                 MenuSection::Edit => 9,
                 MenuSection::Insert => 17,
-                MenuSection::Help => 27,
+                MenuSection::Format => 27,
+                MenuSection::FormatScope => 27,
+                MenuSection::FormatNumber => 27,
+                MenuSection::FormatAlign => 27,
                 MenuSection::Sheet => 36,
-                MenuSection::Format => 45,
-                MenuSection::FormatScope => 45,
-                MenuSection::FormatNumber => 45,
-                MenuSection::FormatAlign => 45,
+                MenuSection::Help => 45,
                 _ => 1,
             };
             (area.x.saturating_add(x), area.y.saturating_add(1))
@@ -4844,21 +4844,6 @@ impl App {
         } else {
             " Edit "
         };
-        let insert = if section == MenuSection::Insert {
-            "[Insert]"
-        } else {
-            " Insert "
-        };
-        let help = if section == MenuSection::Help {
-            "[Help]"
-        } else {
-            " Help "
-        };
-        let sheet = if section == MenuSection::Sheet {
-            "[Sheet]"
-        } else {
-            " Sheet "
-        };
         let format = if matches!(
             section,
             MenuSection::Format
@@ -4870,6 +4855,21 @@ impl App {
         } else {
             " Format "
         };
+        let insert = if section == MenuSection::Insert {
+            "[Insert]"
+        } else {
+            " Insert "
+        };
+        let sheet = if section == MenuSection::Sheet {
+            "[Sheet]"
+        } else {
+            " Sheet "
+        };
+        let help = if section == MenuSection::Help {
+            "[Help]"
+        } else {
+            " Help "
+        };
         let active = if item != usize::MAX {
             format!(
                 "  {}",
@@ -4880,7 +4880,7 @@ impl App {
         } else {
             String::new()
         };
-        format!(" {file}  {edit}  {format}  {insert}  {help}  {sheet}{active}")
+        format!(" {file}  {edit}  {insert}  {format}  {sheet}  {help}{active}")
     }
 
     fn balance_dialog_lines(
@@ -8306,7 +8306,7 @@ mod tests {
     }
 
     #[test]
-    fn export_tsv_drops_persist_sort_from_previous_menu_frame() {
+    fn export_tsv_clears_persist_sort_from_previous_menu_frame() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
@@ -8317,7 +8317,7 @@ mod tests {
         app.mode = Mode::Menu {
             stack: vec![MenuLevel {
                 section: MenuSection::File,
-                item: 5,
+                item: 6,
             }],
         };
         terminal.draw(|f| app.draw(f)).unwrap();
@@ -8342,10 +8342,12 @@ mod tests {
                 .any(|line| line.contains("export TSV (blank=clipboard):")),
             "{lines:#?}"
         );
-        assert!(
-            lines.iter().all(|line| !line.contains("Persist sort")),
-            "{lines:#?}"
-        );
+        let leaked_row = lines
+            .iter()
+            .find(|line| line.contains("Persist sort"))
+            .cloned()
+            .unwrap_or_default();
+        assert!(leaked_row.is_empty(), "{lines:#?}");
     }
 
     #[test]
@@ -10371,6 +10373,59 @@ mod tests {
     fn menu_bar_shows_format_tab() {
         let app = App::new(None);
         assert!(app.menu_bar_line().contains(" Format "));
+    }
+
+    #[test]
+    fn menu_bar_orders_root_sections_as_requested() {
+        let mut app = App::new(None);
+        app.mode = Mode::Menu {
+            stack: vec![MenuLevel {
+                section: MenuSection::File,
+                item: 0,
+            }],
+        };
+
+        let line = app.menu_bar_line();
+        let file = line.find("[File]").unwrap();
+        let edit = line.find(" Edit ").unwrap();
+        let insert = line.find(" Insert ").unwrap();
+        let format = line.find(" Format ").unwrap();
+        let sheet = line.find(" Sheet ").unwrap();
+        let help = line.find(" Help ").unwrap();
+
+        assert!(file < edit && edit < insert && insert < format && format < sheet && sheet < help);
+    }
+
+    #[test]
+    fn root_menu_cycling_follows_new_order() {
+        let mut app = App::new(None);
+        app.mode = Mode::Menu {
+            stack: vec![MenuLevel {
+                section: MenuSection::File,
+                item: 0,
+            }],
+        };
+
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::empty()))
+            .unwrap();
+        match app.mode {
+            Mode::Menu { ref stack } => assert_eq!(stack[0].section, MenuSection::Edit),
+            other => panic!("unexpected mode: {other:?}"),
+        }
+
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::empty()))
+            .unwrap();
+        match app.mode {
+            Mode::Menu { ref stack } => assert_eq!(stack[0].section, MenuSection::Insert),
+            other => panic!("unexpected mode: {other:?}"),
+        }
+
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::empty()))
+            .unwrap();
+        match app.mode {
+            Mode::Menu { ref stack } => assert_eq!(stack[0].section, MenuSection::Format),
+            other => panic!("unexpected mode: {other:?}"),
+        }
     }
 
     #[test]

@@ -4,6 +4,7 @@
       - Agregate rows/cols, working, with cyan "bolding"
       - Most important hotkeys should now work.
       - There are no planned format changes between now an 1.0.0 (or promises to avoid format changes)
+      - Multiple sheets per workbook.
       
 0.1.0 Initial prototype, demonstrating log based file format and concurrent editing.
       
