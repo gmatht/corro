@@ -623,7 +623,25 @@ fn parse_sheet_set_addr(addr: &str) -> Option<(u32, CellAddr, usize)> {
     let (sheet_id, prefix_len) = parse_sheet_id_prefix_at(addr)?;
     let rest = addr.get(prefix_len..)?;
     let cell_ref = rest.strip_prefix(':')?;
-    let (cell_addr, cell_len) = parse_log_addr(cell_ref, 0, true)?;
+    // Parse the cell ref without context (legacy behavior).
+    let (mut cell_addr, cell_len) = parse_log_addr(cell_ref, 0, true)?;
+
+    // If this parsed reference refers to a header/footer cell using an
+    // unprefixed Excel column name (e.g. `C~1`) and that parsed column index
+    // falls within the left-margin range, treat it as a main-region column
+    // reference and shift it into the global column namespace by adding the
+    // left margin offset. This preserves existing absolute forms like `K~1`
+    // while interpreting author-written `A..J~N` as likely meant for the
+    // main region (so `C~1` targets the main-column C).
+    match &mut cell_addr {
+        CellAddr::Header { col, .. } | CellAddr::Footer { col, .. } => {
+            if (*col as usize) < crate::grid::MARGIN_COLS {
+                *col = crate::grid::MARGIN_COLS as u32 + *col;
+            }
+        }
+        _ => {}
+    }
+
     Some((sheet_id, cell_addr, prefix_len + 1 + cell_len))
 }
 

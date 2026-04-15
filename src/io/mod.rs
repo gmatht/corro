@@ -383,7 +383,25 @@ pub fn commit_workbook_op(
     let mut preview = workbook.clone();
     let mut preview_active_sheet = *active_sheet;
     crate::ops::apply_workbook_op(&mut preview, &mut preview_active_sheet, op.clone())?;
-    let main_cols = match op {
+    // Compute main_cols to pass to to_log_line(). Normally we use the
+    // preview (post-apply) width so the serialized address can use
+    // main-region Excel names when appropriate. However, when the
+    // operation itself is a header/footer SET that caused the preview to
+    // expand main columns, preserve the mental model of storing the
+    // header/footer in the margin by decrementing the preview width by
+    // one for serialization. This matches historical expectations in
+    // tests that prefer a mirrored-margin address in that case.
+    // Determine the pre-apply main_cols for the target sheet (if available).
+    let pre_main_cols = match op {
+        WorkbookOp::SheetOp { sheet_id, .. } => workbook
+            .sheets
+            .iter()
+            .find(|s| s.id == *sheet_id)
+            .map(|s| s.state.grid.main_cols()),
+        _ => Some(workbook.active_sheet().grid.main_cols()),
+    };
+
+    let preview_main_cols = match op {
         WorkbookOp::SheetOp { sheet_id, .. } => preview
             .sheets
             .iter()
@@ -392,6 +410,28 @@ pub fn commit_workbook_op(
             .unwrap_or_else(|| preview.active_sheet().grid.main_cols()),
         _ => preview.active_sheet().grid.main_cols(),
     };
+
+    let mut main_cols = preview_main_cols;
+    if let WorkbookOp::SheetOp {
+        sheet_id: _,
+        op: inner_op,
+    } = op
+    {
+        use crate::ops::Op::*;
+        if let Op::SetCell { addr, .. } = inner_op {
+            match addr {
+                crate::grid::CellAddr::Header { col, .. }
+                | crate::grid::CellAddr::Footer { col, .. } => {
+                    if let Some(pre) = pre_main_cols {
+                        if preview_main_cols > pre && (*col as usize) >= crate::grid::MARGIN_COLS {
+                            main_cols = preview_main_cols.saturating_sub(1);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
     append_line(path, &op.to_log_line(main_cols))?;
     *offset = tail_apply_workbook(path, *offset, workbook, active_sheet)?;
     Ok(())
@@ -595,7 +635,7 @@ mod tests {
 
     fn docs_test_path(name: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("docs/test")
+            .join("docs/tests")
             .join(name)
     }
     use crate::ops::{Op, SheetRecord, SheetState, WorkbookSnapshot};
