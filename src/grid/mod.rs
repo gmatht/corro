@@ -45,6 +45,62 @@ fn header_label(row: u8) -> char {
     (b'A' + row.min(25)) as char
 }
 
+// Abstraction trait for Grid implementations.
+// Methods return owned Strings where necessary to keep the trait object-safe.
+pub trait GridImpl {
+    fn main_rows(&self) -> usize;
+    fn main_cols(&self) -> usize;
+    fn total_cols(&self) -> usize;
+    fn get_owned(&self, addr: &CellAddr) -> Option<String>;
+    fn set_owned(&mut self, addr: &CellAddr, value: String);
+    fn set_main_size(&mut self, main_rows: usize, main_cols: usize);
+    fn bump_volatile_seed(&mut self);
+    fn iter_nonempty(&self) -> Box<dyn Iterator<Item = (CellAddr, String)> + '_>;
+}
+
+/// A boxed handle to an abstract Grid implementation.
+pub struct GridBox {
+    pub inner: Box<dyn GridImpl>,
+}
+
+impl GridBox {
+    pub fn new<G: GridImpl + 'static>(g: G) -> Self {
+        Self { inner: Box::new(g) }
+    }
+
+    pub fn main_rows(&self) -> usize {
+        self.inner.main_rows()
+    }
+
+    pub fn main_cols(&self) -> usize {
+        self.inner.main_cols()
+    }
+
+    pub fn total_cols(&self) -> usize {
+        self.inner.total_cols()
+    }
+
+    pub fn get_owned(&self, addr: &CellAddr) -> Option<String> {
+        self.inner.get_owned(addr)
+    }
+
+    pub fn set_owned(&mut self, addr: &CellAddr, value: String) {
+        self.inner.set_owned(addr, value)
+    }
+
+    pub fn set_main_size(&mut self, r: usize, c: usize) {
+        self.inner.set_main_size(r, c)
+    }
+
+    pub fn bump_volatile_seed(&mut self) {
+        self.inner.bump_volatile_seed()
+    }
+
+    pub fn iter_nonempty(&self) -> Box<dyn Iterator<Item = (CellAddr, String)> + '_> {
+        self.inner.iter_nonempty()
+    }
+}
+
 /// Inclusive-exclusive range in the **main** region (for aggregates).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MainRange {
@@ -869,6 +925,84 @@ impl Grid {
         self.remap_main_col_width_overrides_for_order(&order);
 
         self.extent_main_cols = order.len() as u32;
+    }
+}
+
+// Implement GridImpl for the existing Grid so we can use Grid via GridBox.
+impl GridImpl for Grid {
+    fn main_rows(&self) -> usize {
+        self.main_rows()
+    }
+
+    fn main_cols(&self) -> usize {
+        self.main_cols()
+    }
+
+    fn total_cols(&self) -> usize {
+        self.total_cols()
+    }
+
+    fn get_owned(&self, addr: &CellAddr) -> Option<String> {
+        self.get(addr).map(|s| s.to_string())
+    }
+
+    fn set_owned(&mut self, addr: &CellAddr, value: String) {
+        self.set(addr, value)
+    }
+
+    fn set_main_size(&mut self, main_rows: usize, main_cols: usize) {
+        self.set_main_size(main_rows, main_cols)
+    }
+
+    fn bump_volatile_seed(&mut self) {
+        self.bump_volatile_seed()
+    }
+
+    fn iter_nonempty(&self) -> Box<dyn Iterator<Item = (CellAddr, String)> + '_> {
+        // Build a vec of non-empty cells across regions and return an iterator.
+        let mut v: Vec<(CellAddr, String)> = Vec::new();
+        for (r, row) in self.header.iter().enumerate() {
+            for (c, vcell) in row.iter().enumerate() {
+                if !vcell.is_empty() {
+                    v.push((
+                        CellAddr::Header {
+                            row: r as u8,
+                            col: c as u32,
+                        },
+                        vcell.clone(),
+                    ));
+                }
+            }
+        }
+        for (r, row) in self.footer.iter().enumerate() {
+            for (c, vcell) in row.iter().enumerate() {
+                if !vcell.is_empty() {
+                    v.push((
+                        CellAddr::Footer {
+                            row: r as u8,
+                            col: c as u32,
+                        },
+                        vcell.clone(),
+                    ));
+                }
+            }
+        }
+        for (&(r, c), val) in &self.main_cells {
+            v.push((CellAddr::Main { row: r, col: c }, val.clone()));
+        }
+        for (&(r, mc), val) in &self.left {
+            v.push((CellAddr::Left { col: mc, row: r }, val.clone()));
+        }
+        for (&(r, mc), val) in &self.right {
+            v.push((CellAddr::Right { col: mc, row: r }, val.clone()));
+        }
+        Box::new(v.into_iter())
+    }
+}
+
+impl From<Grid> for GridBox {
+    fn from(g: Grid) -> Self {
+        GridBox::new(g)
     }
 }
 

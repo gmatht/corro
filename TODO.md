@@ -9,9 +9,9 @@ Principles
 - Preserve current behavior and tests during the migration.
 
 Milestones
-1. Introduce Grid trait
+1. Introduce Grid trait (completed)
   - Create a trait (GridImpl) describing required operations used across the codebase: get, set, remove, main_rows/main_cols sizing, iterate non-empty cells in ranges, volatile_seed accessor, and any allocation/growth operations (set_main_size, ensure_main_size, clear_range, etc.).
-  - Add a thin wrapper type (Grid) currently implemented by the existing in-memory HashMap-backed struct (call it HashGrid or GridMap). Keep the current Grid struct name if it already exists, but make it delegate to a boxed GridImpl so most call sites use Grid methods rather than the underlying map.
+  - Add a thin wrapper type (GridBox) currently implemented by the existing in-memory HashMap-backed struct. Completed: GridImpl trait, GridBox wrapper, and Grid now implements GridImpl.
 
 2. Convert internal consumers to use Grid API
   - Search for direct hashmap accessors (e.g., grid.map or grid.inner) and replace them with Grid methods.
