@@ -35,6 +35,12 @@ impl SheetState {
             grid: Grid::new(main_rows as u32, main_cols as u32),
         }
     }
+
+    /// Construct a SheetState from an existing GridBox-backed implementation.
+    /// This is a convenience for gradually moving to the boxed abstraction.
+    pub fn from_grid(grid: Grid) -> Self {
+        SheetState { grid }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
