@@ -183,15 +183,10 @@ pub fn parse_cell_ref_at(s: &str, main_cols: usize) -> Option<(CellAddr, usize)>
             Some(false) => parse_mirror_margin_column_name(col_name, false)
                 .map(|c| (crate::grid::MARGIN_COLS + main_cols + c as usize) as u32)
                 .or_else(|| Some(parse_excel_column(col_name)?))?,
-            // When parsing legacy/unprefixed header/footer refs we need to interpret
-            // the column name in the context of a caller-provided `main_cols`.
-            // If `main_cols` is nonzero we assume the unprefixed Excel column
-            // name refers to a main-region column and therefore add the left
-            // margin offset so the resulting `col` is a global column index.
-            // If `main_cols` is zero (caller didn't provide context) fall back
-            // to the legacy behaviour of treating the name as an absolute
-            // global column index.
-            None => parse_excel_column(col_name)?,
+            // Unprefixed Excel letters always refer to the main/data region
+            // column. Map to a global column index by adding the left-margin
+            // offset.
+            None => crate::grid::MARGIN_COLS as u32 + parse_excel_column(col_name)?,
         };
         return Some((
             if marker == '~' {
@@ -222,6 +217,7 @@ pub fn parse_cell_ref_at(s: &str, main_cols: usize) -> Option<(CellAddr, usize)>
         },
         None => CellAddr::Main {
             row: row_num - 1,
+            // Always map unprefixed Excel letters to main/data columns.
             col: parse_excel_column(col_name)?,
         },
     };
@@ -368,7 +364,10 @@ mod tests {
     fn parses_corners_and_footers() {
         assert_eq!(
             parse_cell_ref_at("A_3", 4).unwrap().0,
-            CellAddr::Footer { row: 2, col: 0 }
+            CellAddr::Footer {
+                row: 2,
+                col: crate::grid::MARGIN_COLS as u32
+            }
         );
         assert_eq!(
             parse_cell_ref_at("[A_3", 4).unwrap().0,
@@ -376,7 +375,10 @@ mod tests {
         );
         assert_eq!(
             parse_cell_ref_at("]A~3", 4).unwrap().0,
-            CellAddr::Header { row: 23, col: 14 }
+            CellAddr::Header {
+                row: 23,
+                col: (crate::grid::MARGIN_COLS + 4) as u32
+            }
         );
     }
 }

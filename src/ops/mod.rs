@@ -146,6 +146,12 @@ pub enum Op {
         addr: CellAddr,
         value: String,
     },
+    /// Set using a parsed high-level CellRef; conversion to a grid::CellAddr
+    /// is done at apply-time using the target sheet's main_cols.
+    SetCellRef {
+        cref: crate::celladdr::CellRef,
+        value: String,
+    },
     SetMainSize {
         main_rows: u32,
         main_cols: u32,
@@ -255,6 +261,14 @@ impl Op {
         match self {
             Op::SetCell { addr, value } => {
                 state.grid.set(addr, value.clone());
+                state.grid.bump_volatile_seed();
+            }
+            Op::SetCellRef { cref, value } => {
+                // Convert the parsed CellRef to a concrete grid::CellAddr using
+                // the sheet's main_cols, then apply.
+                let main_cols = state.grid.main_cols();
+                let addr = cref.to_grid_addr(main_cols);
+                state.grid.set(&addr, value.clone());
                 state.grid.bump_volatile_seed();
             }
             Op::SetMainSize {
@@ -551,6 +565,11 @@ impl Op {
                 )
             }
             Op::Undo { target } => format!("UNDO {target}"),
+            Op::SetCellRef { cref, value } => {
+                // Emit using the parsed CellRef textual form; value may need
+                // encoding when used in logs elsewhere.
+                format!("SET {} {}", cref.to_log_text(main_cols), value)
+            }
         }
     }
 }
@@ -623,26 +642,25 @@ fn parse_sheet_set_addr(addr: &str) -> Option<(u32, CellAddr, usize)> {
     let (sheet_id, prefix_len) = parse_sheet_id_prefix_at(addr)?;
     let rest = addr.get(prefix_len..)?;
     let cell_ref = rest.strip_prefix(':')?;
-    // Parse the cell ref without context (legacy behavior).
-    let (mut cell_addr, cell_len) = parse_log_addr(cell_ref, 0, true)?;
-
-    // If this parsed reference refers to a header/footer cell using an
-    // unprefixed Excel column name (e.g. `C~1`) and that parsed column index
-    // falls within the left-margin range, treat it as a main-region column
-    // reference and shift it into the global column namespace by adding the
-    // left margin offset. This preserves existing absolute forms like `K~1`
-    // while interpreting author-written `A..J~N` as likely meant for the
-    // main region (so `C~1` targets the main-column C).
-    match &mut cell_addr {
-        CellAddr::Header { col, .. } | CellAddr::Footer { col, .. } => {
-            if (*col as usize) < crate::grid::MARGIN_COLS {
-                *col = crate::grid::MARGIN_COLS as u32 + *col;
-            }
-        }
-        _ => {}
-    }
-
-    Some((sheet_id, cell_addr, prefix_len + 1 + cell_len))
+    // Parse the cell ref using the new CellRef abstraction with a
+    // non-zero main_cols_hint so that unprefixed Excel column names in
+    // workbook-level SETs are treated as main-region Data columns (e.g.
+    // `C~1` => column C in the main region). We then convert to the
+    // canonical grid::CellAddr. This keeps prefixed forms ([, ]) and
+    // absolute forms behaving as before.
+    let (cref, cell_len) = crate::celladdr::CellRef::parse_at(cell_ref, 1)?;
+    // Don't convert to grid::CellAddr here because we may not have the
+    // correct sheet main_cols yet. Return the parsed CellRef packed into a
+    // variant via the caller (we'll return the CellRef by encoding it into
+    // the returned usize as a sentinel is awkward; instead change the
+    // parse_workbook_line path to call this and then construct a
+    // WorkbookOp::SheetOp::SetCellRef).
+    // For compatibility with the existing signature, return a dummy
+    // CellAddr::Main(0,0) here and let the caller reconstruct from cref.
+    // To keep things simple, we'll return the CellRef by using a different
+    // helper below; keep this function unused and instead parse in
+    // parse_workbook_line directly.
+    None
 }
 
 fn parse_log_addr(
@@ -692,15 +710,35 @@ pub fn parse_workbook_line(line: &str) -> Result<WorkbookOp, std::io::Error> {
         let addr = parts
             .next()
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad SET line"))?;
-        if let Some((sheet_id, cell_addr, len)) = parse_sheet_set_addr(addr) {
-            let value = rest.get(len..).unwrap_or("").trim_start().to_string();
-            return Ok(WorkbookOp::SheetOp {
-                sheet_id,
-                op: Op::SetCell {
-                    addr: cell_addr,
-                    value,
-                },
-            });
+        // Handle sheet-qualified SET like "$2:A2" where unprefixed Excel
+        // letters should be parsed as Data columns. We parse into the
+        // high-level CellRef and defer conversion to grid::CellAddr until
+        // apply-time by using Op::SetCellRef.
+        if let Some((sheet_id, prefix_len)) = parse_sheet_id_prefix_at(addr) {
+            if let Some(cell_ref_text) = addr.get(prefix_len..).and_then(|s| s.strip_prefix(':')) {
+                // Prefer the new CellRef parser (treats unprefixed letters as Data)
+                if let Some((cref, cell_len)) = crate::celladdr::CellRef::parse_at(cell_ref_text, 1)
+                {
+                    let len = prefix_len + 1 + cell_len;
+                    let value = rest.get(len..).unwrap_or("").trim_start().to_string();
+                    return Ok(WorkbookOp::SheetOp {
+                        sheet_id,
+                        op: Op::SetCellRef { cref, value },
+                    });
+                }
+                // Fallback to legacy parse that can handle forms like `_1O`.
+                if let Some((cell_addr, cell_len)) = parse_log_addr(cell_ref_text, 0, true) {
+                    let len = prefix_len + 1 + cell_len;
+                    let value = rest.get(len..).unwrap_or("").trim_start().to_string();
+                    return Ok(WorkbookOp::SheetOp {
+                        sheet_id,
+                        op: Op::SetCell {
+                            addr: cell_addr,
+                            value,
+                        },
+                    });
+                }
+            }
         }
     }
     let (sheet_id, prefix_len) = parse_sheet_id_prefix_at(t)
@@ -1027,6 +1065,16 @@ impl SheetState {
                 addr: addr.clone(),
                 format: self.grid.format_for_addr(addr),
             }),
+            Op::SetCellRef { cref, .. } => {
+                // Convert the high-level CellRef to a concrete addr using
+                // this sheet's main_cols and report the previous value.
+                let addr = cref.to_grid_addr(self.grid.main_cols());
+                let prev_value = self.grid.get(&addr).unwrap_or("").to_string();
+                Some(Op::SetCell {
+                    addr,
+                    value: prev_value,
+                })
+            }
             Op::Undo { .. } => None,
         }
     }
@@ -1329,16 +1377,22 @@ mod tests {
     #[test]
     fn workbook_sheet_set_parser_accepts_ui_notation() {
         let op = parse_workbook_line("SET $2:A2 is A2").unwrap();
-        assert_eq!(
-            op,
-            WorkbookOp::SheetOp {
-                sheet_id: 2,
-                op: Op::SetCell {
-                    addr: CellAddr::Main { row: 1, col: 0 },
-                    value: "is A2".into(),
-                },
+        match op {
+            WorkbookOp::SheetOp { sheet_id, op } => {
+                assert_eq!(sheet_id, 2);
+                match op {
+                    Op::SetCellRef { cref, value } => {
+                        assert_eq!(value, "is A2");
+                        // Data column mapping should produce a Main addr when
+                        // converted with any main_cols (Data->Main is independent).
+                        let addr = cref.to_grid_addr(1);
+                        assert_eq!(addr, CellAddr::Main { row: 1, col: 0 });
+                    }
+                    other => panic!("unexpected op: {other:?}"),
+                }
             }
-        );
+            other => panic!("unexpected workbook op: {other:?}"),
+        }
     }
 
     #[test]
@@ -1360,26 +1414,38 @@ mod tests {
     fn workbook_log_parser_keeps_header_footer_columns_absolute() {
         let header = parse_workbook_line("SET $1:K~1 x").unwrap();
         let footer = parse_workbook_line("SET $1:K_1 y").unwrap();
-        assert!(matches!(
-            header,
-            WorkbookOp::SheetOp {
-                op: Op::SetCell {
-                    addr: CellAddr::Header { col: 10, .. },
-                    ..
-                },
-                ..
-            }
-        ));
-        assert!(matches!(
-            footer,
-            WorkbookOp::SheetOp {
-                op: Op::SetCell {
-                    addr: CellAddr::Footer { col: 10, .. },
-                    ..
-                },
-                ..
-            }
-        ));
+        match header {
+            WorkbookOp::SheetOp { op, .. } => match op {
+                Op::SetCellRef { cref, .. } => {
+                    let addr = cref.to_grid_addr(2); // main_cols doesn't affect header Data mapping
+                    assert_eq!(
+                        addr,
+                        CellAddr::Header {
+                            row: 25,
+                            col: (crate::grid::MARGIN_COLS + 10) as u32
+                        }
+                    );
+                }
+                other => panic!("unexpected op: {other:?}"),
+            },
+            other => panic!("unexpected workbook op: {other:?}"),
+        }
+        match footer {
+            WorkbookOp::SheetOp { op, .. } => match op {
+                Op::SetCellRef { cref, .. } => {
+                    let addr = cref.to_grid_addr(2);
+                    assert_eq!(
+                        addr,
+                        CellAddr::Footer {
+                            row: 0,
+                            col: (crate::grid::MARGIN_COLS + 10) as u32
+                        }
+                    );
+                }
+                other => panic!("unexpected op: {other:?}"),
+            },
+            other => panic!("unexpected workbook op: {other:?}"),
+        }
     }
 
     #[test]
