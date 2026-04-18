@@ -26,20 +26,25 @@ pub struct AggregateDef {
 
 #[derive(Clone, Debug, Default)]
 pub struct SheetState {
-    pub grid: Grid,
+    pub grid: crate::grid::GridBox,
 }
 
 impl SheetState {
     pub fn new(main_rows: usize, main_cols: usize) -> Self {
         SheetState {
-            grid: Grid::new(main_rows as u32, main_cols as u32),
+            grid: crate::grid::GridBox::new(crate::grid::Grid::new(
+                main_rows as u32,
+                main_cols as u32,
+            )),
         }
     }
 
     /// Construct a SheetState from an existing GridBox-backed implementation.
     /// This is a convenience for gradually moving to the boxed abstraction.
     pub fn from_grid(grid: Grid) -> Self {
-        SheetState { grid }
+        SheetState {
+            grid: crate::grid::GridBox::from(grid),
+        }
     }
 }
 
@@ -257,7 +262,7 @@ impl WorkbookSnapshot {
             next_sheet_id: workbook.next_sheet_id,
             active_sheet_id: workbook.sheet_id(workbook.active_sheet),
             sheets: workbook.sheets.clone(),
-            volatile_seed: workbook.active_sheet().grid.volatile_seed,
+            volatile_seed: workbook.active_sheet().grid.volatile_seed(),
         }
     }
 }
@@ -323,7 +328,7 @@ impl Op {
                             row: target.row_start + r,
                             col: target.col_start + c,
                         };
-                        cells.push((dst, state.grid.get(&src).unwrap_or("").to_string()));
+                        cells.push((dst, state.grid.get(&src).to_string()));
                     }
                 }
                 for (addr, value) in cells {
@@ -644,30 +649,7 @@ impl WorkbookOp {
     }
 }
 
-fn parse_sheet_set_addr(addr: &str) -> Option<(u32, CellAddr, usize)> {
-    let (sheet_id, prefix_len) = parse_sheet_id_prefix_at(addr)?;
-    let rest = addr.get(prefix_len..)?;
-    let cell_ref = rest.strip_prefix(':')?;
-    // Parse the cell ref using the new CellRef abstraction with a
-    // non-zero main_cols_hint so that unprefixed Excel column names in
-    // workbook-level SETs are treated as main-region Data columns (e.g.
-    // `C~1` => column C in the main region). We then convert to the
-    // canonical grid::CellAddr. This keeps prefixed forms ([, ]) and
-    // absolute forms behaving as before.
-    let (cref, cell_len) = crate::celladdr::CellRef::parse_at(cell_ref, 1)?;
-    // Don't convert to grid::CellAddr here because we may not have the
-    // correct sheet main_cols yet. Return the parsed CellRef packed into a
-    // variant via the caller (we'll return the CellRef by encoding it into
-    // the returned usize as a sentinel is awkward; instead change the
-    // parse_workbook_line path to call this and then construct a
-    // WorkbookOp::SheetOp::SetCellRef).
-    // For compatibility with the existing signature, return a dummy
-    // CellAddr::Main(0,0) here and let the caller reconstruct from cref.
-    // To keep things simple, we'll return the CellRef by using a different
-    // helper below; keep this function unused and instead parse in
-    // parse_workbook_line directly.
-    None
-}
+// parse_sheet_set_addr removed: parsing is handled inline in parse_workbook_line
 
 fn parse_log_addr(
     addr: &str,
@@ -723,10 +705,14 @@ pub fn parse_workbook_line(line: &str) -> Result<WorkbookOp, std::io::Error> {
         if let Some((sheet_id, prefix_len)) = parse_sheet_id_prefix_at(addr) {
             if let Some(cell_ref_text) = addr.get(prefix_len..).and_then(|s| s.strip_prefix(':')) {
                 // Prefer the new CellRef parser (treats unprefixed letters as Data)
-                if let Some((cref, cell_len)) = crate::celladdr::CellRef::parse_at(cell_ref_text, 1)
+                if let Some((cref, cell_len)) = crate::celladdr::CellRef::parse_at(cell_ref_text)
                 {
                     let len = prefix_len + 1 + cell_len;
-                    let value = rest.get(len..).unwrap_or("").trim_start().to_string();
+                    let value = rest
+                        .get(len..)
+                        .unwrap_or("\n+                    ")
+                        .trim_start()
+                        .to_string();
                     return Ok(WorkbookOp::SheetOp {
                         sheet_id,
                         op: Op::SetCellRef { cref, value },
@@ -1008,7 +994,7 @@ impl SheetState {
     pub fn reverse_op(&self, op: &Op) -> Option<Op> {
         match op {
             Op::SetCell { addr, .. } => {
-                let prev_value = self.grid.get(addr).unwrap_or("").to_string();
+                let prev_value = self.grid.text(addr);
                 Some(Op::SetCell {
                     addr: addr.clone(),
                     value: prev_value,
@@ -1034,7 +1020,7 @@ impl SheetState {
                 cells: cells
                     .iter()
                     .map(|(addr, _)| {
-                        let prev_value = self.grid.get(addr).unwrap_or("").to_string();
+                        let prev_value = self.grid.text(addr);
                         (addr.clone(), prev_value)
                     })
                     .collect(),
@@ -1044,7 +1030,7 @@ impl SheetState {
                 for r in target.row_start..target.row_end {
                     for c in target.col_start..target.col_end {
                         let addr = CellAddr::Main { row: r, col: c };
-                        let prev_value = self.grid.get(&addr).unwrap_or("").to_string();
+                        let prev_value = self.grid.text(&addr);
                         cells.push((addr, prev_value));
                     }
                 }
@@ -1055,11 +1041,11 @@ impl SheetState {
                 main_cols: self.grid.main_cols() as u32,
             }),
             Op::SetMaxColWidth { .. } => Some(Op::SetMaxColWidth {
-                width: self.grid.max_col_width,
+                width: self.grid.max_col_width(),
             }),
             Op::SetColWidth { col, .. } => Some(Op::SetColWidth {
                 col: *col,
-                width: self.grid.col_width_overrides.get(col).copied(),
+                width: self.grid.get_col_width_override(*col),
             }),
             Op::SetViewSortCols { .. } => None,
             Op::SetColumnFormat { scope, col, .. } => Some(Op::SetColumnFormat {
@@ -1075,7 +1061,7 @@ impl SheetState {
                 // Convert the high-level CellRef to a concrete addr using
                 // this sheet's main_cols and report the previous value.
                 let addr = cref.to_grid_addr(self.grid.main_cols());
-                let prev_value = self.grid.get(&addr).unwrap_or("").to_string();
+                let prev_value = self.grid.text(&addr);
                 Some(Op::SetCell {
                     addr,
                     value: prev_value,
@@ -1332,7 +1318,7 @@ mod tests {
         let mut s = SheetState::new(1, 3);
         apply_line("MAX_COL_WIDTH 17", &mut s).unwrap();
         apply_line("COL_WIDTH B 9", &mut s).unwrap();
-        assert_eq!(s.grid.max_col_width, 17);
+        assert_eq!(s.grid.max_col_width(), 17);
         assert_eq!(s.grid.col_width(crate::grid::MARGIN_COLS + 1), 9);
     }
 
@@ -1355,10 +1341,7 @@ mod tests {
             ">>>>>>> other\n"
         );
         replay_lines(log, &mut s).unwrap();
-        assert_eq!(
-            s.grid.get(&CellAddr::Main { row: 0, col: 0 }),
-            Some("right")
-        );
+        assert_eq!(s.grid.get(&CellAddr::Main { row: 0, col: 0 }), "right");
     }
 
     #[test]
@@ -1575,14 +1558,14 @@ mod tests {
                 .state
                 .grid
                 .get(&CellAddr::Main { row: 0, col: 1 }),
-            Some("=A1")
+            "=A1"
         );
         assert_eq!(
             workbook.sheets[dst]
                 .state
                 .grid
                 .get(&CellAddr::Main { row: 1, col: 1 }),
-            Some("=A2")
+            "=A2"
         );
     }
 
@@ -1613,7 +1596,7 @@ mod tests {
                 .state
                 .grid
                 .get(&CellAddr::Main { row: 0, col: 0 }),
-            Some("src")
+            "src"
         );
     }
 
