@@ -7,7 +7,7 @@ use crate::export;
 use crate::formula::translate_formula_text_by_offset;
 use crate::formula::{cell_effective_display, is_formula};
 use crate::grid::{
-    CellAddr, CellFormat, FormatScope, Grid, MainRange, NumberFormat, SortSpec, TextAlign,
+    CellAddr, CellFormat, FormatScope, GridBox as Grid, MainRange, NumberFormat, SortSpec, TextAlign,
     FOOTER_ROWS, HEADER_ROWS, MARGIN_COLS,
 };
 use crate::io::{
@@ -1514,11 +1514,11 @@ fn trailing_blank_main_cols(state: &SheetState) -> usize {
 }
 
 fn header_template_applies(grid: &Grid, main_col: usize) -> bool {
-    grid.get(&CellAddr::Header {
+    let raw = grid.get(&CellAddr::Header {
         row: (HEADER_ROWS - 1) as u8,
         col: (MARGIN_COLS as u32) + main_col as u32,
-    })
-    .is_some_and(is_formula)
+    });
+    raw.as_deref().is_some_and(is_formula)
 }
 
 fn data_main_col_count(grid: &Grid) -> usize {
@@ -1641,11 +1641,11 @@ fn left_margin_special_col_aggregate(
 }
 
 fn left_margin_template_applies(grid: &Grid, main_row: usize) -> bool {
-    grid.get(&CellAddr::Left {
+    let raw = grid.get(&CellAddr::Left {
         col: (MARGIN_COLS - 1) as u8,
         row: main_row as u32,
-    })
-    .is_some_and(is_formula)
+    });
+    raw.as_deref().is_some_and(is_formula)
 }
 
 // ── Display-time aggregate helpers ───────────────────────────────────────────
@@ -2798,12 +2798,7 @@ impl App {
         let start_col = (cols[0] - MARGIN_COLS) as u32;
         let end_col = (*cols.last()? - MARGIN_COLS) as u32;
         let seed: Vec<String> = (start_col..=end_col)
-            .map(|col| {
-                self.state
-                    .grid
-                    .get(&CellAddr::Main { row: main_row, col })
-                    .map(str::to_string)
-            })
+            .map(|col| self.state.grid.get(&CellAddr::Main { row: main_row, col }))
             .collect::<Option<Vec<_>>>()?;
         let mut cells = Vec::new();
         for col in (end_col + 1)..self.state.grid.main_cols() as u32 {
@@ -2837,12 +2832,7 @@ impl App {
         let start_row = (rows[0] - HEADER_ROWS) as u32;
         let end_row = (*rows.last()? - HEADER_ROWS) as u32;
         let seed: Vec<String> = (start_row..=end_row)
-            .map(|row| {
-                self.state
-                    .grid
-                    .get(&CellAddr::Main { row, col: main_col })
-                    .map(str::to_string)
-            })
+            .map(|row| self.state.grid.get(&CellAddr::Main { row, col: main_col }))
             .collect::<Option<Vec<_>>>()?;
         let mut cells = Vec::new();
         for row in (end_row + 1)..self.state.grid.main_rows() as u32 {
@@ -3138,7 +3128,7 @@ impl App {
     }
 
     fn move_cursor_row_through_view(&mut self, down: bool) -> bool {
-        if self.state.grid.view_sort_cols.is_empty() {
+        if self.state.grid.view_sort_cols().is_empty() {
             return false;
         }
 
@@ -3292,7 +3282,8 @@ impl App {
         // want to move the cursor to the target even if the grid cell is
         // already empty. Detect explicit addresses and handle that
         // specially: set the cursor and return early.
-        if self.state.grid.get(&addr).unwrap_or("") == value {
+        let raw = self.state.grid.get(&addr);
+        if raw.as_deref().unwrap_or("") == value.as_str() {
             self.pending_fit_to_content_on_commit = false;
             if explicit_addr.is_some() {
                 self.cursor = self.sheet_cursor_for_addr(&addr).unwrap_or(self.cursor);
@@ -3767,7 +3758,8 @@ impl App {
 
     fn menu_insert_special_seed(&self) -> String {
         let addr = self.cursor.to_addr(&self.state.grid);
-        let current = self.state.grid.get(&addr).unwrap_or("").trim();
+        let raw = self.state.grid.get(&addr);
+        let current = raw.as_deref().unwrap_or("").trim();
         if special_value_choices(&addr)
             .iter()
             .any(|choice| choice.eq_ignore_ascii_case(current))
@@ -3780,7 +3772,8 @@ impl App {
 
     fn menu_insert_hyperlink_seed(&self) -> String {
         let addr = self.cursor.to_addr(&self.state.grid);
-        let current = self.state.grid.get(&addr).unwrap_or("").trim();
+        let raw = self.state.grid.get(&addr);
+        let current = raw.as_deref().unwrap_or("").trim();
         if current.starts_with("http://") || current.starts_with("https://") {
             current.to_string()
         } else {
@@ -3929,92 +3922,92 @@ impl App {
                 .to_log_line(sheet.state.grid.main_cols()),
             );
             buf.push('\n');
-            if sheet.state.grid.max_col_width != 20 {
+            if sheet.state.grid.max_col_width() != 20 {
                 buf.push_str(
                     &crate::ops::WorkbookOp::SheetOp {
                         sheet_id: sheet.id,
                         op: Op::SetMaxColWidth {
-                            width: sheet.state.grid.max_col_width,
+                            width: sheet.state.grid.max_col_width(),
                         },
                     }
                     .to_log_line(sheet.state.grid.main_cols()),
                 );
                 buf.push('\n');
             }
-            for (col, width) in &sheet.state.grid.col_width_overrides {
+            for (col, width) in sheet.state.grid.col_width_overrides() {
                 buf.push_str(
                     &crate::ops::WorkbookOp::SheetOp {
                         sheet_id: sheet.id,
                         op: Op::SetColWidth {
-                            col: *col,
-                            width: Some(*width),
+                            col,
+                            width: Some(width),
                         },
                     }
                     .to_log_line(sheet.state.grid.main_cols()),
                 );
                 buf.push('\n');
             }
-            if !sheet.state.grid.view_sort_cols.is_empty() {
+            if !sheet.state.grid.view_sort_cols().is_empty() {
                 buf.push_str(
                     &crate::ops::WorkbookOp::SheetOp {
                         sheet_id: sheet.id,
                         op: Op::SetViewSortCols {
-                            cols: sheet.state.grid.view_sort_cols.clone(),
+                            cols: sheet.state.grid.view_sort_cols(),
                         },
                     }
                     .to_log_line(sheet.state.grid.main_cols()),
                 );
                 buf.push('\n');
             }
-            for (col, format) in &sheet.state.grid.col_all_formats {
+            for (col, format) in sheet.state.grid.col_all_formats() {
                 buf.push_str(
                     &crate::ops::WorkbookOp::SheetOp {
                         sheet_id: sheet.id,
                         op: Op::SetColumnFormat {
                             scope: FormatScope::All,
-                            col: *col,
-                            format: *format,
+                            col: col,
+                            format: format,
                         },
                     }
                     .to_log_line(sheet.state.grid.main_cols()),
                 );
                 buf.push('\n');
             }
-            for (col, format) in &sheet.state.grid.col_data_formats {
+            for (col, format) in sheet.state.grid.col_data_formats() {
                 buf.push_str(
                     &crate::ops::WorkbookOp::SheetOp {
                         sheet_id: sheet.id,
                         op: Op::SetColumnFormat {
                             scope: FormatScope::Data,
-                            col: *col,
-                            format: *format,
+                            col: col,
+                            format: format,
                         },
                     }
                     .to_log_line(sheet.state.grid.main_cols()),
                 );
                 buf.push('\n');
             }
-            for (col, format) in &sheet.state.grid.col_special_formats {
+            for (col, format) in sheet.state.grid.col_special_formats() {
                 buf.push_str(
                     &crate::ops::WorkbookOp::SheetOp {
                         sheet_id: sheet.id,
                         op: Op::SetColumnFormat {
                             scope: FormatScope::Special,
-                            col: *col,
-                            format: *format,
+                            col: col,
+                            format: format,
                         },
                     }
                     .to_log_line(sheet.state.grid.main_cols()),
                 );
                 buf.push('\n');
             }
-            for (addr, format) in &sheet.state.grid.cell_formats {
+            for (addr, format) in sheet.state.grid.cell_formats() {
                 buf.push_str(
                     &crate::ops::WorkbookOp::SheetOp {
                         sheet_id: sheet.id,
                         op: Op::SetCellFormat {
-                            addr: addr.clone(),
-                            format: *format,
+                            addr: addr,
+                            format: format,
                         },
                     }
                     .to_log_line(sheet.state.grid.main_cols()),
@@ -4053,7 +4046,8 @@ impl App {
                     out.push('\t');
                 }
                 if let Some(addr) = self.addr_at(*row, *col) {
-                    out.push_str(self.state.grid.get(&addr).unwrap_or(""));
+                    let raw = self.state.grid.get(&addr);
+                    out.push_str(raw.as_deref().unwrap_or(""));
                 }
             }
         }
@@ -4205,7 +4199,8 @@ impl App {
                     out.push('\t');
                 }
                 if let Some(addr) = self.addr_at(*row, *col) {
-                    out.push_str(self.state.grid.get(&addr).unwrap_or(""));
+                    let raw = self.state.grid.get(&addr);
+                    out.push_str(raw.as_deref().unwrap_or(""));
                 }
             }
         }
@@ -6644,7 +6639,8 @@ impl App {
                     KeyCode::Backspace => {
                         if !self.delete_selection() {
                             if let Some(addr) = self.addr_at(self.cursor.row, self.cursor.col) {
-                                if self.state.grid.get(&addr).unwrap_or("").is_empty() {
+                                let raw = self.state.grid.get(&addr);
+                                if raw.as_deref().unwrap_or("").is_empty() {
                                     self.status = "Cell already blank".into();
                                     self.mode = mode;
                                     return Ok(false);
@@ -7037,7 +7033,7 @@ mod tests {
         undo_op.apply(&mut app.state);
 
         assert_eq!(
-            app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }),
+            app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }).as_deref(),
             Some("old")
         );
     }
@@ -7197,7 +7193,7 @@ mod tests {
         assert_eq!(app.cursor.row, HEADER_ROWS + 1);
         assert_eq!(app.state.grid.get(&CellAddr::Main { row: 1, col: 0 }), None);
         assert_eq!(
-            app.state.grid.get(&CellAddr::Main { row: 2, col: 0 }),
+            app.state.grid.get(&CellAddr::Main { row: 2, col: 0 }).as_deref(),
             Some("bottom")
         );
     }
@@ -7238,7 +7234,7 @@ mod tests {
         assert_eq!(app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }), None);
         assert_eq!(app.state.grid.get(&CellAddr::Main { row: 1, col: 0 }), None);
         assert_eq!(
-            app.state.grid.get(&CellAddr::Main { row: 2, col: 0 }),
+            app.state.grid.get(&CellAddr::Main { row: 2, col: 0 }).as_deref(),
             Some("a")
         );
     }
@@ -7273,11 +7269,11 @@ mod tests {
         assert_eq!(app.state.grid.main_rows(), 3);
         assert_eq!(app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }), None);
         assert_eq!(
-            app.state.grid.get(&CellAddr::Main { row: 1, col: 0 }),
+            app.state.grid.get(&CellAddr::Main { row: 1, col: 0 }).as_deref(),
             Some("top")
         );
         assert_eq!(
-            app.state.grid.get(&CellAddr::Main { row: 2, col: 0 }),
+            app.state.grid.get(&CellAddr::Main { row: 2, col: 0 }).as_deref(),
             Some("bottom")
         );
     }
@@ -7307,11 +7303,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            app.state.grid.get(&CellAddr::Main { row: 0, col: 2 }),
+            app.state.grid.get(&CellAddr::Main { row: 0, col: 2 }).as_deref(),
             Some("3")
         );
         assert_eq!(
-            app.state.grid.get(&CellAddr::Main { row: 0, col: 3 }),
+            app.state.grid.get(&CellAddr::Main { row: 0, col: 3 }).as_deref(),
             Some("4")
         );
     }
@@ -7341,11 +7337,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            app.state.grid.get(&CellAddr::Main { row: 2, col: 0 }),
+            app.state.grid.get(&CellAddr::Main { row: 2, col: 0 }).as_deref(),
             Some("WED")
         );
         assert_eq!(
-            app.state.grid.get(&CellAddr::Main { row: 3, col: 0 }),
+            app.state.grid.get(&CellAddr::Main { row: 3, col: 0 }).as_deref(),
             Some("THU")
         );
     }
@@ -7562,12 +7558,12 @@ mod tests {
 
         assert_eq!(app.state.grid.main_cols(), 3);
         assert_eq!(
-            app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }),
+            app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }).as_deref(),
             Some("left")
         );
         assert_eq!(app.state.grid.get(&CellAddr::Main { row: 0, col: 1 }), None);
         assert_eq!(
-            app.state.grid.get(&CellAddr::Main { row: 0, col: 2 }),
+            app.state.grid.get(&CellAddr::Main { row: 0, col: 2 }).as_deref(),
             Some("right")
         );
     }
@@ -8840,7 +8836,7 @@ mod tests {
 
         assert!(matches!(app.mode, Mode::Normal));
         assert_eq!(
-            app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }),
+            app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }).as_deref(),
             Some("orig")
         );
     }
@@ -9094,19 +9090,19 @@ mod tests {
         assert_eq!(app.state.grid.main_rows(), 2);
         assert_eq!(app.state.grid.main_cols(), 2);
         assert_eq!(
-            app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }),
+            app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }).as_deref(),
             Some("x")
         );
         assert_eq!(
-            app.state.grid.get(&CellAddr::Main { row: 0, col: 1 }),
+            app.state.grid.get(&CellAddr::Main { row: 0, col: 1 }).as_deref(),
             Some("y")
         );
         assert_eq!(
-            app.state.grid.get(&CellAddr::Main { row: 1, col: 0 }),
+            app.state.grid.get(&CellAddr::Main { row: 1, col: 0 }).as_deref(),
             Some("1")
         );
         assert_eq!(
-            app.state.grid.get(&CellAddr::Main { row: 1, col: 1 }),
+            app.state.grid.get(&CellAddr::Main { row: 1, col: 1 }).as_deref(),
             Some("2")
         );
     }
@@ -9154,19 +9150,19 @@ mod tests {
         assert_eq!(app.state.grid.main_rows(), 2);
         assert_eq!(app.state.grid.main_cols(), 2);
         assert_eq!(
-            app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }),
+            app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }).as_deref(),
             Some("x")
         );
         assert_eq!(
-            app.state.grid.get(&CellAddr::Main { row: 0, col: 1 }),
+            app.state.grid.get(&CellAddr::Main { row: 0, col: 1 }).as_deref(),
             Some("y")
         );
         assert_eq!(
-            app.state.grid.get(&CellAddr::Main { row: 1, col: 0 }),
+            app.state.grid.get(&CellAddr::Main { row: 1, col: 0 }).as_deref(),
             Some("1")
         );
         assert_eq!(
-            app.state.grid.get(&CellAddr::Main { row: 1, col: 1 }),
+            app.state.grid.get(&CellAddr::Main { row: 1, col: 1 }).as_deref(),
             Some("2")
         );
     }
@@ -9187,10 +9183,10 @@ mod tests {
         ))
         .unwrap();
 
-        assert_eq!(
-            app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }),
-            Some("A1")
-        );
+    assert_eq!(
+        app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }).as_deref(),
+        Some("A1")
+    );
     }
 
     #[test]
@@ -9315,19 +9311,19 @@ mod tests {
         assert_eq!(app.state.grid.main_rows(), 2);
         assert_eq!(app.state.grid.main_cols(), 2);
         assert_eq!(
-            app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }),
+            app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }).as_deref(),
             Some("x")
         );
         assert_eq!(
-            app.state.grid.get(&CellAddr::Main { row: 0, col: 1 }),
+            app.state.grid.get(&CellAddr::Main { row: 0, col: 1 }).as_deref(),
             Some("y")
         );
         assert_eq!(
-            app.state.grid.get(&CellAddr::Main { row: 1, col: 0 }),
+            app.state.grid.get(&CellAddr::Main { row: 1, col: 0 }).as_deref(),
             Some("1")
         );
         assert_eq!(
-            app.state.grid.get(&CellAddr::Main { row: 1, col: 1 }),
+            app.state.grid.get(&CellAddr::Main { row: 1, col: 1 }).as_deref(),
             Some("2")
         );
     }
@@ -9356,11 +9352,12 @@ mod tests {
                 .sheets
                 .iter()
                 .find(|sheet| sheet.id == 2)
-                .and_then(|sheet| sheet.state.grid.get(&CellAddr::Main { row: 0, col: 0 })),
+                .and_then(|sheet| sheet.state.grid.get(&CellAddr::Main { row: 0, col: 0 }))
+                .as_deref(),
             Some("Sheet2 value")
         );
         assert_eq!(
-            app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }),
+            app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }).as_deref(),
             Some("Sheet2 value")
         );
     }
@@ -9385,7 +9382,7 @@ mod tests {
         assert!(matches!(app.mode, Mode::Edit { .. }));
         assert_eq!(app.cursor.row, HEADER_ROWS + 1);
         assert_eq!(
-            app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }),
+            app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }).as_deref(),
             Some("first")
         );
     }
@@ -9460,7 +9457,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }),
+            app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }).as_deref(),
             Some("=$Sheet1:A1")
         );
     }
@@ -9614,7 +9611,7 @@ mod tests {
         assert!(formula_line.contains("TAX TAX"));
         assert!(!formula_line.contains("]A."));
         assert_eq!(
-            app.state.grid.get(&CellAddr::Main { row: 0, col: 1 }),
+            app.state.grid.get(&CellAddr::Main { row: 0, col: 1 }).as_deref(),
             Some("=A*0.1 -- TAX TAX")
         );
     }
@@ -9671,7 +9668,7 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
             .unwrap();
         assert_eq!(
-            app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }),
+            app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }).as_deref(),
             Some("hello")
         );
     }
@@ -9707,7 +9704,7 @@ mod tests {
             Some(CellAddr::Main { row: 0, col: 0 })
         );
         assert_eq!(
-            app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }),
+            app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }).as_deref(),
             Some("=A*0.1 -- TAX TAX")
         );
     }
@@ -9749,7 +9746,7 @@ mod tests {
         assert_eq!(app.state.grid.main_rows(), 3);
         assert_eq!(app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }), None);
         assert_eq!(
-            app.state.grid.get(&CellAddr::Main { row: 1, col: 0 }),
+            app.state.grid.get(&CellAddr::Main { row: 1, col: 0 }).as_deref(),
             Some("top")
         );
     }
@@ -9985,7 +9982,7 @@ mod tests {
 
     #[test]
     fn huge_numbers_render_in_exponential_notation() {
-        let mut grid = Grid::new(1, 1);
+        let mut grid = crate::grid::GridBox::from(crate::grid::Grid::new(1, 1));
         let addr = CellAddr::Main { row: 0, col: 0 };
         grid.set(&addr, "1234567890123456789012345".into());
         grid.set_cell_format(
@@ -10165,11 +10162,11 @@ mod tests {
         ));
 
         assert_eq!(
-            app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }),
+            app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }).as_deref(),
             Some("10")
         );
         assert_eq!(
-            app.state.grid.get(&CellAddr::Main { row: 1, col: 0 }),
+            app.state.grid.get(&CellAddr::Main { row: 1, col: 0 }).as_deref(),
             Some("-10")
         );
     }
@@ -10309,7 +10306,7 @@ mod tests {
 
         assert!(matches!(app.mode, Mode::Normal));
         assert_eq!(
-            app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }),
+            app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }).as_deref(),
             Some("10")
         );
     }
@@ -10567,7 +10564,7 @@ mod tests {
 
     #[test]
     fn formatted_cell_display_uses_number_and_alignment() {
-        let mut grid = Grid::new(1, 1);
+        let mut grid = crate::grid::GridBox::from(crate::grid::Grid::new(1, 1));
         let addr = CellAddr::Main { row: 0, col: 0 };
         grid.set(&addr, "12.5".into());
         grid.set_cell_format(
