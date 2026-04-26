@@ -225,6 +225,22 @@ pub fn export_ascii_table_with_options(
     let last_main_r = (row_start..row_end)
         .rfind(|&r| (hr..hr + mr).contains(&r));
 
+    let generic_rebase = if cell_content == ExportContent::Generic {
+        let (dr, dc) = ascii_generic_rebase(
+            col_start,
+            col_end,
+            row_start,
+            row_end,
+            first_main_r,
+            last_main_r,
+            frame_active,
+            options,
+        );
+        Some((dr, dc))
+    } else {
+        None
+    };
+
     let row_label_w = if options.include_row_label_column {
         (row_start..row_end)
             .map(|r| sheet_row_label(r, grid.main_rows()).chars().count())
@@ -244,7 +260,7 @@ pub fn export_ascii_table_with_options(
 
     for r in row_start..row_end {
         for c in col_start..col_end {
-            let val = export_cell_text(grid, r, c, cell_content);
+            let val = export_cell_text(grid, r, c, cell_content, generic_rebase);
             let content_w = val.chars().count();
             col_widths[c] = col_widths[c].max(content_w);
         }
@@ -330,7 +346,7 @@ pub fn export_ascii_table_with_options(
                     data_line.push('+');
                 }
             }
-            let val = export_cell_text(grid, r, c, cell_content);
+            let val = export_cell_text(grid, r, c, cell_content, generic_rebase);
             let w = col_widths[c];
             ascii_push_cell(&mut data_line, pre, pad, &val, w);
             if frame_active
@@ -410,6 +426,12 @@ pub fn export_selection(
 
     let include_header_row = options.include_header_row;
     let content = options.content;
+    let generic_rebase = if content == ExportContent::Generic {
+        let (dr, dc) = selection_generic_rebase(cols, include_header_row, rows);
+        Some((dr, dc))
+    } else {
+        None
+    };
 
     if include_header_row {
         for (ci, &c) in cols.iter().enumerate() {
@@ -427,48 +449,38 @@ pub fn export_selection(
             if ci > 0 {
                 let _ = write!(out, "\t");
             }
-            let val = export_cell_text(grid, r, c, content);
+            let val = export_cell_text(grid, r, c, content, generic_rebase);
             let _ = write!(out, "{}", val);
         }
         let _ = writeln!(out);
     }
 }
 
-/// TSV/CSV main-only / selection header token: `<`/`>` margins or `A`/`B` or generic `TAX`.
+/// TSV/CSV main-only / selection header token: `<`/`>` margins or `A`/`B` (column letters).
+/// Generic mode shows `TAX` etc. on the bottom control header row, not in this synthetic label line.
 fn col_header_label_for_export(
-    grid: &Grid,
+    _grid: &Grid,
     global_col: usize,
     main_cols: usize,
-    content: ExportContent,
+    _content: ExportContent,
 ) -> String {
     let m = MARGIN_COLS;
     if global_col < m {
         format!("<{}", m - 1 - global_col)
     } else if global_col < m + main_cols {
-        if content == ExportContent::Generic {
-            if let Some(label) = formula::main_column_label_from_header(grid, global_col - m) {
-                return label;
-            }
-        }
         crate::addr::excel_column_name(global_col - m)
     } else {
         format!(">{}", global_col - m - main_cols)
     }
 }
 
-/// With margins: [A / B / ]C unless Generic replaces the main `B` with a label.
+/// With margins: [A / B / ]C (same in Generic; labeled-column titles appear on the `~1` control row).
 fn delimited_marginal_header_token(
-    grid: &Grid,
+    _grid: &Grid,
     global_col: usize,
     main_cols: usize,
-    content: ExportContent,
+    _content: ExportContent,
 ) -> String {
-    let m = MARGIN_COLS;
-    if content == ExportContent::Generic && (m..(m + main_cols)).contains(&global_col) {
-        if let Some(label) = formula::main_column_label_from_header(grid, global_col - m) {
-            return label;
-        }
-    }
     crate::addr::ui_column_fragment(global_col, main_cols)
 }
 
@@ -488,7 +500,125 @@ fn interop_excel_list_separators(s: &str) -> String {
     s.replace(';', ",")
 }
 
-fn generic_interop_text(grid: &Grid, logical_row: usize, global_col: usize) -> Option<String> {
+fn finish_generic_interop(s: String, rebase: Option<(i32, i32)>) -> String {
+    let Some((d_row, d_col)) = rebase else {
+        return s;
+    };
+    if s.trim_start().starts_with('=') {
+        formula::rebase_interop_formula_row_col(&s, d_row, d_col)
+    } else {
+        s
+    }
+}
+
+/// Deltas for [`formula::rebase_interop_formula_row_col`]: the exported TSV/CSV/ASCII file’s
+/// top-left cell (line 0, field 0) is treated as Excel A1, so all `=…` refs shift by these.
+fn delimited_generic_rebase(
+    col_start: usize,
+    col_end: usize,
+    include_header_row: bool,
+    include_row_label_column: bool,
+    main_rows: &[usize],
+) -> (i32, i32) {
+    // Row labels (~1, 1, 2, …) are a field *before* the col loop: count them in d_col.
+    // Left margin `<…` / `[A` style cols are the first c in (col_start..MARGIN_COLS) in the loop;
+    // `position(== MARGIN_COLS)` is exactly that many.
+    let d_col = (if include_row_label_column { 1 } else { 0 })
+        + (col_start..col_end)
+            .position(|c| c == MARGIN_COLS)
+            .map(|i| i as i32)
+            .unwrap_or(0);
+    let base = if include_header_row { 1 } else { 0 };
+    let d_row = main_rows
+        .iter()
+        .position(|&r| r == HEADER_ROWS)
+        .map(|j| base + j as i32)
+        .unwrap_or(0);
+    (d_row, d_col)
+}
+
+fn selection_generic_rebase(
+    cols: &[usize],
+    include_header_row: bool,
+    rows: &[usize],
+) -> (i32, i32) {
+    let d_col = cols
+        .iter()
+        .position(|&c| c == MARGIN_COLS)
+        .map(|i| i as i32)
+        .unwrap_or(0);
+    let base = if include_header_row { 1 } else { 0 };
+    let d_row = rows
+        .iter()
+        .position(|&r| r == HEADER_ROWS)
+        .map(|j| base + j as i32)
+        .unwrap_or(0);
+    (d_row, d_col)
+}
+
+/// Same row/col semantics as delimited, matching [`export_ascii_table_with_options`]'s `writeln!` order.
+fn ascii_generic_rebase(
+    col_start: usize,
+    col_end: usize,
+    row_start: usize,
+    row_end: usize,
+    first_main_r: Option<usize>,
+    last_main_r: Option<usize>,
+    frame_active: bool,
+    options: &AsciiTableOptions,
+) -> (i32, i32) {
+    let d_col = (if options.include_row_label_column { 1 } else { 0 })
+        + (col_start..col_end)
+            .position(|c| c == MARGIN_COLS)
+            .map(|i| i as i32)
+            .unwrap_or(0);
+    if !(row_start..row_end).contains(&HEADER_ROWS) {
+        return (0, d_col);
+    }
+    let hr = HEADER_ROWS;
+    let mut d_row: i32 = 0;
+    d_row = d_row.saturating_add(1);
+    if options.include_column_label_row {
+        d_row = d_row.saturating_add(1);
+        if matches!(
+            options.header_data_separator,
+            AsciiHeaderDataSeparator::FullBorder
+        ) {
+            d_row = d_row.saturating_add(1);
+        }
+    }
+    for r in row_start..hr {
+        if frame_active && first_main_r == Some(r) {
+            d_row = d_row.saturating_add(1);
+        }
+        d_row = d_row.saturating_add(1);
+        if options.row_dividers {
+            d_row = d_row.saturating_add(1);
+        }
+        if frame_active && last_main_r == Some(r) {
+            d_row = d_row.saturating_add(1);
+        }
+    }
+    if frame_active && first_main_r == Some(hr) {
+        d_row = d_row.saturating_add(1);
+    }
+    (d_row, d_col)
+}
+
+fn generic_interop_text(
+    grid: &Grid,
+    logical_row: usize,
+    global_col: usize,
+    rebase: Option<(i32, i32)>,
+) -> Option<String> {
+    if logical_row + 1 == HEADER_ROWS
+        && (MARGIN_COLS..(MARGIN_COLS + grid.main_cols())).contains(&global_col)
+    {
+        let main_c = global_col - MARGIN_COLS;
+        if let Some(lab) = formula::main_column_label_from_header(grid, main_c) {
+            return Some(lab);
+        }
+    }
     use crate::ui::SheetCursor;
     let cur = SheetCursor {
         row: logical_row,
@@ -497,21 +627,28 @@ fn generic_interop_text(grid: &Grid, logical_row: usize, global_col: usize) -> O
     let addr = cur.to_addr(grid);
 
     if let Some(tf) = formula::export_templated_formula(grid, &addr) {
-        return Some(interop_excel_list_separators(
+        let s = interop_excel_list_separators(
             &crate::ods::ods_labeled_prefix_strip_to_formula(&tf).unwrap_or(tf),
-        ));
+        );
+        return Some(finish_generic_interop(s, rebase));
     }
 
     let v = crate::ods::cell_export_value_string(grid, logical_row, global_col);
     if !v.is_empty() {
         if let Some(st) = crate::ods::ods_labeled_prefix_strip_to_formula(&v) {
-            return Some(interop_excel_list_separators(&st));
+            return Some(finish_generic_interop(
+                interop_excel_list_separators(&st),
+                rebase,
+            ));
         }
     }
     if let Some(raw) = grid.get(&addr) {
         if formula::is_formula(&raw) {
             if let Some(st) = crate::ods::ods_labeled_prefix_strip_to_formula(&raw) {
-                return Some(interop_excel_list_separators(&st));
+                return Some(finish_generic_interop(
+                    interop_excel_list_separators(&st),
+                    rebase,
+                ));
             }
         }
     }
@@ -590,12 +727,15 @@ fn export_cell_text(
     logical_row: usize,
     global_col: usize,
     content: ExportContent,
+    generic_rebase: Option<(i32, i32)>,
 ) -> String {
     match content {
         ExportContent::Values => rendered_value_at(grid, logical_row, global_col),
         ExportContent::Formulas => cell_value_at(grid, logical_row, global_col),
-        ExportContent::Generic => generic_interop_text(grid, logical_row, global_col)
-            .unwrap_or_else(|| rendered_value_at(grid, logical_row, global_col)),
+        ExportContent::Generic => {
+            generic_interop_text(grid, logical_row, global_col, generic_rebase)
+                .unwrap_or_else(|| rendered_value_at(grid, logical_row, global_col))
+        }
     }
 }
 
@@ -701,6 +841,18 @@ fn export_delimited(
             false
         })
         .collect();
+    let generic_rebase = if content == ExportContent::Generic {
+        let (dr, dc) = delimited_generic_rebase(
+            col_start,
+            col_end,
+            include_headers,
+            row_key_col,
+            &rows,
+        );
+        Some((dr, dc))
+    } else {
+        None
+    };
     for r in rows {
         if row_key_col {
             let _ = write!(out, "{}", sheet_row_label(r, mr));
@@ -712,7 +864,7 @@ fn export_delimited(
                 let _ = write!(out, "{delim}");
             }
             first = false;
-            let val = export_cell_text(grid, r, c, content);
+            let val = export_cell_text(grid, r, c, content, generic_rebase);
             if delim == ',' && needs_csv_quoting(&val, delim) {
                 let _ = write!(out, "{}", csv_quote(&val));
             } else {
@@ -1162,16 +1314,25 @@ mod tests {
         export_tsv_with_options(&gb, &mut out, &opts);
         let tsv = String::from_utf8(out).unwrap();
         let lines: Vec<_> = tsv.lines().collect();
-        assert_eq!(lines[0], "A\tTAX", "header: letter + label");
+        assert_eq!(lines[0], "A\tB", "synthetic A/B; labeled header text is on the ~1 control row");
         // `row_order` lists non-empty header rows before the main block, so the control-strip row
         // appears as an extra data line before the first main data row.
+        assert!(
+            lines
+                .iter()
+                .any(|l| *l == "\tTAX" || l.ends_with("\tTAX")),
+            "TAX replaces =A*0.1 on the control row, got {lines:?}"
+        );
         let main_row = lines
             .iter()
             .find(|l| l.starts_with("100\t"))
             .expect("main data row with 100 in column A");
+        // d_row=2, d_col=0: two body lines (control strip + main) before the first data row, no
+        // left columns in this main-only export, so =A1*0.1 => =A3*0.1 (file A1 = top-left).
         assert!(
-            main_row.contains("=A1*0.1") && main_row.ends_with("=A1*0.1"),
-            "TAX column: =A1*0.1, got {main_row:?}"
+            (main_row.contains("A3*0.1") && main_row.contains('='))
+                || main_row.contains("(A3*0.1)"),
+            "TAX column rebased, got {main_row:?}"
         );
     }
 

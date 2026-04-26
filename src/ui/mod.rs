@@ -1367,7 +1367,7 @@ File menu\n\
  - Open file loads a .corro, .csv, .tsv, or .ods file. Use `link <file> <revision>` to open a log at a revision.\n\
  - New sheet adds another sheet to the workbook.\n\
  - Ctrl+PageUp and Ctrl+PageDown switch between workbook tabs.\n\
-- Export opens TSV, CSV, ASCII, full export, or ODS prompts; Alt+F / Alt+V / Alt+G choose formulas, values, or generic interop for that export.\n\
+- Export opens TSV, CSV, ASCII, full export, or ODS prompts; Alt+F / Alt+V / Alt+G choose formulas, values, or generic interop; Alt+X copies the current export to the clipboard (TSV, CSV, ASCII, or full/selection TSV, not ODS).\n\
 - Width opens default width and per-column width prompts.\n\
 - Sort view changes the visible order of main rows.\n\
 - Exit opens the quit prompt.\n\n\
@@ -5745,7 +5745,7 @@ impl App {
                 };
                 format!(
                     "  Alt+F·formulas   Alt+V·values   Alt+G·generic   ·{vf}   Alt+H·header {h}   Alt+M·margins {m}   \
-Alt+R·left row# {r}   ↑/↓/k/j·scroll   PgUp/PgDn·page   path or empty+Enter=clipboard   Esc"
+Alt+R·left row# {r}   Alt+X·clipboard   ↑/↓/k/j·scroll   PgUp/PgDn·page   path or empty+Enter=clipboard   Esc"
                 )
             }
             Mode::ExportAscii { .. } => {
@@ -5791,7 +5791,7 @@ Alt+R·left row# {r}   ↑/↓/k/j·scroll   PgUp/PgDn·page   path or empty+Ent
                 format!(
                     "  Alt+F·formulas   Alt+V·values   Alt+G·generic   ·{vf}   Alt+H·top A/B label row {a}   Alt+R·left row# column {r}   Alt+M·margins {m}   \
 Alt+O·data frame {f}   Alt+D·row rules {d}   Alt+E·padding {pad_letter} ({pad_desc})   \
-Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard   Esc"
+Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard   Esc"
                 )
             }
             Mode::ExportOdt { .. } => {
@@ -6672,6 +6672,18 @@ Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard 
                                 self.export_delimited_options.content = export::ExportContent::Generic;
                                 self.status = "Export: generic (labels + =interop)".into();
                             }
+                            'x' | 'X' => {
+                                match copy_to_clipboard(&self.do_export(false)) {
+                                    Ok(()) => {
+                                        self.status = "TSV export copied to clipboard".into();
+                                    }
+                                    Err(e) => {
+                                        self.status = format!("Clipboard error: {e}");
+                                    }
+                                }
+                                self.input_cursor = None;
+                                mode = Mode::Normal;
+                            }
                             _ => {}
                         }
                     }
@@ -6749,6 +6761,18 @@ Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard 
                             'g' | 'G' => {
                                 self.export_delimited_options.content = export::ExportContent::Generic;
                                 self.status = "Export: generic (labels + =interop)".into();
+                            }
+                            'x' | 'X' => {
+                                match copy_to_clipboard(&self.do_export(true)) {
+                                    Ok(()) => {
+                                        self.status = "CSV export copied to clipboard".into();
+                                    }
+                                    Err(e) => {
+                                        self.status = format!("Clipboard error: {e}");
+                                    }
+                                }
+                                self.input_cursor = None;
+                                mode = Mode::Normal;
                             }
                             _ => {}
                         }
@@ -6876,6 +6900,18 @@ Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard 
                             'g' | 'G' => {
                                 self.export_ascii_options.content = export::ExportContent::Generic;
                                 self.status = "Export: generic (labels + =interop)".into();
+                            }
+                            'x' | 'X' => {
+                                match copy_to_clipboard(&self.do_export_ascii()) {
+                                    Ok(()) => {
+                                        self.status = "ASCII table copied to clipboard".into();
+                                    }
+                                    Err(e) => {
+                                        self.status = format!("Clipboard error: {e}");
+                                    }
+                                }
+                                self.input_cursor = None;
+                                mode = Mode::Normal;
                             }
                             _ => {}
                         }
@@ -7023,6 +7059,27 @@ Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard 
                             'g' | 'G' => {
                                 self.export_delimited_options.content = export::ExportContent::Generic;
                                 self.status = "Export: generic (labels + =interop)".into();
+                            }
+                            'x' | 'X' => {
+                                let data = if self.anchor.is_some() {
+                                    self.do_export_selection()
+                                } else {
+                                    self.do_export_all()
+                                };
+                                match copy_to_clipboard(&data) {
+                                    Ok(()) => {
+                                        self.status = if self.anchor.is_some() {
+                                            "Selection copied to clipboard".into()
+                                        } else {
+                                            "Full export copied to clipboard".into()
+                                        }
+                                    }
+                                    Err(e) => {
+                                        self.status = format!("Clipboard error: {e}");
+                                    }
+                                }
+                                self.input_cursor = None;
+                                mode = Mode::Normal;
                             }
                             _ => {}
                         }

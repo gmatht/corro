@@ -206,6 +206,15 @@ fn translate_range(range: &MainRange, ctx: &FormulaCopyContext) -> Option<MainRa
     })
 }
 
+/// Shift A1 cell references in an interop `=…` string by `(row_delta, col_delta)` (main-cell units).
+/// Used for generic export so the pasted file’s top-left is Excel A1. On parse failure, returns `s`.
+pub fn rebase_interop_formula_row_col(s: &str, row_delta: i32, col_delta: i32) -> String {
+    if row_delta == 0 && col_delta == 0 {
+        return s.to_string();
+    }
+    translate_formula_text_by_offset(s, row_delta, col_delta).unwrap_or_else(|| s.to_string())
+}
+
 pub fn translate_formula_text_by_offset(
     raw: &str,
     row_delta: i32,
