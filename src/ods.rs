@@ -539,7 +539,7 @@ fn attr_value(e: &quick_xml::events::BytesStart<'_>, key: &[u8]) -> Option<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read;
+    use std::io::{ErrorKind, Read};
     use std::process::Command;
     use tempfile::tempdir;
     use tempfile::NamedTempFile;
@@ -679,7 +679,7 @@ mod tests {
         let out_dir = dir.path().join("out");
         std::fs::create_dir(&out_dir).unwrap();
 
-        let status = Command::new(soffice)
+        let status = match Command::new(&soffice)
             .args([
                 "--headless",
                 "--nologo",
@@ -692,7 +692,14 @@ mod tests {
                 ods_path.to_str().unwrap(),
             ])
             .status()
-            .unwrap();
+        {
+            Ok(status) => status,
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                eprintln!("LibreOffice not found; skipping ODS smoke test");
+                return;
+            }
+            Err(err) => panic!("failed to run LibreOffice: {err}"),
+        };
         assert!(status.success(), "LibreOffice conversion failed");
 
         let xlsx = out_dir.join("subtotal.xlsx");

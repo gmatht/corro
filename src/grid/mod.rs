@@ -588,11 +588,14 @@ impl Grid {
     }
 
     pub fn col_width(&self, global_col: usize) -> usize {
-        self.col_width_overrides
-            .get(&global_col)
-            .copied()
-            .unwrap_or(self.max_col_width)
-            .max(1)
+        if let Some(width) = self.col_width_overrides.get(&global_col).copied() {
+            return width.max(1);
+        }
+        if self.logical_col_has_content(global_col) {
+            self.max_col_width.max(1)
+        } else {
+            4
+        }
     }
 
     pub fn set_max_col_width(&mut self, width: usize) {
@@ -1543,13 +1546,27 @@ mod tests {
     }
 
     #[test]
+    fn empty_columns_use_compact_display_width() {
+        let mut g = Grid::new(1, 2);
+
+        assert_eq!(g.col_width(MARGIN_COLS), 4);
+
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "x".into());
+        assert_eq!(g.col_width(MARGIN_COLS), 20);
+        assert_eq!(g.col_width(MARGIN_COLS + 1), 4);
+
+        g.set_col_width(MARGIN_COLS + 1, Some(12));
+        assert_eq!(g.col_width(MARGIN_COLS + 1), 12);
+    }
+
+    #[test]
     fn widths_shift_when_main_cols_grow() {
         let mut g = Grid::new(1, 1);
         g.set_col_width(MARGIN_COLS + 1, Some(24));
 
         g.grow_main_col_at_right();
 
-        assert_eq!(g.col_width(MARGIN_COLS + 1), 20);
+        assert_eq!(g.col_width(MARGIN_COLS + 1), 4);
         assert_eq!(g.col_width(MARGIN_COLS + 2), 24);
     }
 
@@ -1560,7 +1577,7 @@ mod tests {
 
         g.move_main_cols(1, 1, 3);
 
-        assert_eq!(g.col_width(MARGIN_COLS + 1), 20);
+        assert_eq!(g.col_width(MARGIN_COLS + 1), 4);
         assert_eq!(g.col_width(MARGIN_COLS + 2), 24);
     }
 

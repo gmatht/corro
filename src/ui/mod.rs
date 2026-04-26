@@ -1362,6 +1362,7 @@ fn visible_row_indices(
     } else if cursor.row >= hr + mr {
         footer_rows.push(cursor.row);
     }
+    footer_rows.extend((0..NAV_BLANK_ROWS).map(|r| hr + mr + r));
     header_rows.sort_unstable();
     header_rows.dedup();
     footer_rows.sort_unstable();
@@ -3189,11 +3190,31 @@ impl App {
         let g = &self.state.grid;
         let hr = HEADER_ROWS;
         let mr = g.main_rows();
-        let fr = FOOTER_ROWS;
-        let mut rows = Vec::with_capacity(hr + mr + fr);
-        rows.extend(0..hr);
+        let first_footer = hr + mr;
+        let mut header_rows = Vec::new();
+        let mut footer_rows = Vec::new();
+        for (addr, _) in g.iter_nonempty() {
+            match addr {
+                CellAddr::Header { row, .. } => header_rows.push(row as usize),
+                CellAddr::Footer { row, .. } => footer_rows.push(first_footer + row as usize),
+                _ => {}
+            }
+        }
+        if self.cursor.row < hr {
+            header_rows.push(self.cursor.row);
+        } else if self.cursor.row >= first_footer {
+            footer_rows.push(self.cursor.row);
+        }
+        footer_rows.extend((0..NAV_BLANK_ROWS).map(|r| first_footer + r));
+        header_rows.sort_unstable();
+        header_rows.dedup();
+        footer_rows.sort_unstable();
+        footer_rows.dedup();
+
+        let mut rows = Vec::with_capacity(header_rows.len() + mr + footer_rows.len());
+        rows.extend(header_rows);
         rows.extend(g.sorted_main_rows().into_iter().map(|r| hr + r));
-        rows.extend((0..fr).map(|r| hr + mr + r));
+        rows.extend(footer_rows);
         rows
     }
 
