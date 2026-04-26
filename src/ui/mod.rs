@@ -5343,13 +5343,19 @@ impl App {
             Mode::GoToCell { .. } => "  type cell address   Enter·go   Esc·cancel".into(),
             Mode::SavePath { .. } => "  type file path   Enter·save as   Esc·cancel".into(),
             Mode::ExportTsv { .. } | Mode::ExportCsv { .. } | Mode::ExportAll { .. } => {
-                let a = if self.export_delimited_options.include_header_row {
+                let h = if self.export_delimited_options.include_header_row {
+                    "on"
+                } else {
+                    "off"
+                };
+                let m = if self.export_delimited_options.include_margins {
                     "on"
                 } else {
                     "off"
                 };
                 format!(
-                    "  Alt+h·column header {a}   up/down·scroll   path / blank=clipboard   Enter   Esc"
+                    "  Alt+H·column header row {h}   Alt+M·margin row/col labels {m}   \
+↑/↓/k/j·scroll   PgUp/PgDn·page   path or empty+Enter=clipboard   Esc"
                 )
             }
             Mode::ExportAscii { .. } => {
@@ -5369,11 +5375,13 @@ impl App {
                     AsciiInterCellSpace::Space => "sp",
                 };
                 let b = match self.export_ascii_options.header_data_separator {
-                    AsciiHeaderDataSeparator::FullBorder => "rule",
+                    AsciiHeaderDataSeparator::FullBorder => "border",
                     AsciiHeaderDataSeparator::None => "none",
                 };
                 format!(
-                    "  Alt+h·col labels {a}   Alt+d·between rows {d}   Alt+e·pad {e}   Alt+b·hdr|body {b}   scroll   Enter   Esc"
+                    "  Alt+H·column label row {a}   Alt+D·row dividers {d}   \
+Alt+E·cell padding {e}   Alt+B·label/body line {b}   \
+↑/↓/k/j·scroll   PgUp/PgDn·page   path or empty+Enter=clipboard   Esc"
                 )
             }
             Mode::ExportOdt { .. } => {
@@ -6150,14 +6158,26 @@ impl App {
             Mode::ExportTsv { buffer } => {
                 if key.modifiers.contains(KeyModifiers::ALT) {
                     if let KeyCode::Char(ch) = key.code {
-                        if matches!(ch, 'h' | 'H') {
-                            self.export_delimited_options.include_header_row =
-                                !self.export_delimited_options.include_header_row;
-                            self.status = if self.export_delimited_options.include_header_row {
-                                "Column header row: on".into()
-                            } else {
-                                "Column header row: off".into()
-                            };
+                        match ch {
+                            'h' | 'H' => {
+                                self.export_delimited_options.include_header_row =
+                                    !self.export_delimited_options.include_header_row;
+                                self.status = if self.export_delimited_options.include_header_row {
+                                    "Column header row: on".into()
+                                } else {
+                                    "Column header row: off".into()
+                                };
+                            }
+                            'm' | 'M' => {
+                                self.export_delimited_options.include_margins =
+                                    !self.export_delimited_options.include_margins;
+                                self.status = if self.export_delimited_options.include_margins {
+                                    "Row/column margin labels: on".into()
+                                } else {
+                                    "Row/column margin labels: off".into()
+                                };
+                            }
+                            _ => {}
                         }
                     }
                 } else {
@@ -6193,14 +6213,26 @@ impl App {
             Mode::ExportCsv { buffer } => {
                 if key.modifiers.contains(KeyModifiers::ALT) {
                     if let KeyCode::Char(ch) = key.code {
-                        if matches!(ch, 'h' | 'H') {
-                            self.export_delimited_options.include_header_row =
-                                !self.export_delimited_options.include_header_row;
-                            self.status = if self.export_delimited_options.include_header_row {
-                                "Column header row: on".into()
-                            } else {
-                                "Column header row: off".into()
-                            };
+                        match ch {
+                            'h' | 'H' => {
+                                self.export_delimited_options.include_header_row =
+                                    !self.export_delimited_options.include_header_row;
+                                self.status = if self.export_delimited_options.include_header_row {
+                                    "Column header row: on".into()
+                                } else {
+                                    "Column header row: off".into()
+                                };
+                            }
+                            'm' | 'M' => {
+                                self.export_delimited_options.include_margins =
+                                    !self.export_delimited_options.include_margins;
+                                self.status = if self.export_delimited_options.include_margins {
+                                    "Row/column margin labels: on".into()
+                                } else {
+                                    "Row/column margin labels: off".into()
+                                };
+                            }
+                            _ => {}
                         }
                     }
                 } else {
@@ -6371,14 +6403,26 @@ impl App {
             Mode::ExportAll { buffer } => {
                 if key.modifiers.contains(KeyModifiers::ALT) {
                     if let KeyCode::Char(ch) = key.code {
-                        if matches!(ch, 'h' | 'H') {
-                            self.export_delimited_options.include_header_row =
-                                !self.export_delimited_options.include_header_row;
-                            self.status = if self.export_delimited_options.include_header_row {
-                                "Column header row: on".into()
-                            } else {
-                                "Column header row: off".into()
-                            };
+                        match ch {
+                            'h' | 'H' => {
+                                self.export_delimited_options.include_header_row =
+                                    !self.export_delimited_options.include_header_row;
+                                self.status = if self.export_delimited_options.include_header_row {
+                                    "Column header row: on".into()
+                                } else {
+                                    "Column header row: off".into()
+                                };
+                            }
+                            'm' | 'M' => {
+                                self.export_delimited_options.include_margins =
+                                    !self.export_delimited_options.include_margins;
+                                self.status = if self.export_delimited_options.include_margins {
+                                    "Row/column margin labels: on".into()
+                                } else {
+                                    "Row/column margin labels: off".into()
+                                };
+                            }
+                            _ => {}
                         }
                     }
                 } else {
