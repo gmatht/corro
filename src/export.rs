@@ -658,6 +658,11 @@ pub fn generic_interop_cell_text(
         return Some(after_rebase(&s1, excel_list_arg_comma));
     }
 
+    if let Some(agg) = right_margin_row_aggregate_formula(grid, logical_row, global_col) {
+        let s1 = finish_generic_interop(agg, rebase);
+        return Some(after_rebase(&s1, excel_list_arg_comma));
+    }
+
     let v = crate::ods::cell_export_value_string(grid, logical_row, global_col);
     if !v.is_empty() {
         if let Some(st) = crate::ods::ods_labeled_prefix_strip_to_formula(&v) {
@@ -674,6 +679,49 @@ pub fn generic_interop_cell_text(
         }
     }
     None
+}
+
+fn aggregate_formula_name(raw: &str) -> Option<&'static str> {
+    match raw.trim().to_ascii_uppercase().as_str() {
+        "TOTAL" | "SUM" => Some("SUM"),
+        "MEAN" | "AVERAGE" | "AVG" => Some("AVERAGE"),
+        "COUNT" => Some("COUNT"),
+        "MAX" | "MAXIMUM" => Some("MAX"),
+        "MIN" | "MINIMUM" => Some("MIN"),
+        _ => None,
+    }
+}
+
+fn right_margin_aggregate_formula_name(grid: &Grid, global_col: usize) -> Option<&'static str> {
+    let mut labels: Vec<(u32, String)> = grid
+        .iter_nonempty()
+        .filter_map(|(addr, val)| match addr {
+            CellAddr::Header { row, col } if col as usize == global_col => Some((row, val)),
+            _ => None,
+        })
+        .collect();
+    labels.sort_unstable_by_key(|(row, _)| *row);
+    labels
+        .into_iter()
+        .find_map(|(_, val)| aggregate_formula_name(&val))
+}
+
+fn right_margin_row_aggregate_formula(
+    grid: &Grid,
+    logical_row: usize,
+    global_col: usize,
+) -> Option<String> {
+    let main_cols = grid.main_cols();
+    if logical_row < HEADER_ROWS || logical_row >= HEADER_ROWS + grid.main_rows() {
+        return None;
+    }
+    if global_col < MARGIN_COLS + main_cols {
+        return None;
+    }
+    let func = right_margin_aggregate_formula_name(grid, global_col)?;
+    let row = logical_row - HEADER_ROWS + 1;
+    let last_col = crate::addr::excel_column_name(main_cols.saturating_sub(1));
+    Some(format!("={func}(A{row}:{last_col}{row})"))
 }
 
 fn sheet_row_label(logical_row: usize, main_rows: usize) -> String {
@@ -1668,6 +1716,221 @@ mod tests {
         export_tsv_with_options(&gb, &mut out, &opts);
         let tsv = String::from_utf8(out).unwrap();
         assert!(tsv.contains("=SUBTOTAL(4,"), "expect Excel comma, got {tsv}");
+    }
+
+    /// "Target" is the **Generic** formula TSV ([`ExportContent::Generic`]), interpreted as its own
+    /// spreadsheet: row 0 is the synthetic `A/B/...` header and formulas are already rebased to that
+    /// file layout. After a **data** change on the source grid, apply the *identical* field change to a
+    /// snapshot of the Generic target. The edited target must equal a full re-export, and its computed
+    /// Values must match the edited source for every exported main data cell (including formulas whose
+    /// values changed because of the edit).
+    #[test]
+    fn generic_tsv_target_parallel_data_edit_values_match_source() {
+        fn target_grid_from_matrix(m: &[Vec<String>]) -> crate::grid::GridBox {
+            let rows = m.len().max(1);
+            let cols = m.iter().map(|r| r.len()).max().unwrap_or(1).max(1);
+            let mut g = crate::grid::Grid::new(rows as u32, cols as u32);
+            for (r, row) in m.iter().enumerate() {
+                for (c, val) in row.iter().enumerate() {
+                    if !val.is_empty() {
+                        g.set(
+                            &CellAddr::Main {
+                                row: r as u32,
+                                col: c as u32,
+                            },
+                            val.clone(),
+                        );
+                    }
+                }
+            }
+            crate::grid::GridBox::from(g)
+        }
+
+        let mut g = crate::grid::Grid::new(2, 5);
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "5".into());
+        g.set(&CellAddr::Main { row: 0, col: 1 }, "3".into());
+        g.set(&CellAddr::Main { row: 0, col: 2 }, "=A1+B1".into());
+        g.set(&CellAddr::Main { row: 0, col: 3 }, "=C1*2".into());
+        g.set(&CellAddr::Main { row: 0, col: 4 }, "=D1-A1".into());
+        g.set(&CellAddr::Main { row: 1, col: 0 }, "10".into());
+        g.set(&CellAddr::Main { row: 1, col: 1 }, "4".into());
+        g.set(&CellAddr::Main { row: 1, col: 2 }, "=A2+B2".into());
+        g.set(&CellAddr::Main { row: 1, col: 3 }, "=C2+A1".into());
+        g.set(&CellAddr::Main { row: 1, col: 4 }, "=D2-C1".into());
+        let opts = DelimitedExportOptions {
+            content: ExportContent::Generic,
+            include_margins: false,
+            include_header_row: true,
+            include_row_label_column: false,
+            ..Default::default()
+        };
+        let (matrix0, _c0, _c1, _rows) =
+            delimited_export_matrix(&crate::grid::GridBox::from(g.clone()), &opts);
+        let old_target = target_grid_from_matrix(&matrix0);
+        let h = 1usize; // A | B | C | D | E
+        assert!(matrix0.len() > h, "header + at least one data line");
+        assert!(
+            matrix0[h][2].contains("A2+B2"),
+            "formula should be rebased into target file layout, got {:?}",
+            matrix0[h][2]
+        );
+
+        let before_formula_value = export_cell_text(
+            &old_target,
+            crate::grid::HEADER_ROWS + h,
+            MARGIN_COLS + 2,
+            ExportContent::Values,
+            None,
+        );
+
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "6".into());
+        let gb_after = crate::grid::GridBox::from(g.clone());
+        let (matrix_fresh, ..) = delimited_export_matrix(&gb_after, &opts);
+
+        let mut m_parallel = matrix0.clone();
+        m_parallel[h][0] = "6".into();
+        assert_eq!(
+            m_parallel, matrix_fresh,
+            "the Generic-export 'target' with the same one-cell edit as the source must match a full re-export"
+        );
+
+        let edited_target = target_grid_from_matrix(&m_parallel);
+        let after_formula_value = export_cell_text(
+            &edited_target,
+            crate::grid::HEADER_ROWS + h,
+            MARGIN_COLS + 2,
+            ExportContent::Values,
+            None,
+        );
+        assert_ne!(
+            before_formula_value, after_formula_value,
+            "formula value should change after the parallel data edit, proving the test exercises computation"
+        );
+
+        let lr = crate::grid::HEADER_ROWS;
+        for source_row in 0..2 {
+            for source_col in 0..5 {
+                let source_gc = MARGIN_COLS + source_col;
+                let target_lr = lr + h + source_row;
+                let target_gc = MARGIN_COLS + source_col;
+                let v_src = export_cell_text(
+                    &gb_after,
+                    lr + source_row,
+                    source_gc,
+                    ExportContent::Values,
+                    None,
+                );
+                let v_target = export_cell_text(
+                    &edited_target,
+                    target_lr,
+                    target_gc,
+                    ExportContent::Values,
+                    None,
+                );
+                assert_eq!(
+                    v_src, v_target,
+                    "Values mismatch after same edit: source main row {source_row} col {source_col} vs Generic target row {} col {}",
+                    h + source_row,
+                    source_col
+                );
+            }
+        }
+    }
+
+    /// Catches the obvious Generic-export failure:
+    /// `2  Hammers  5  =(C4*0.1)  5.5`
+    /// where the right-margin `TOTAL` cell is a static value. If only the source data cell and the
+    /// corresponding exported target field change, the target's total must still recompute.
+    #[test]
+    fn generic_tsv_target_right_margin_total_recomputes_after_parallel_data_edit() {
+        fn target_grid_from_matrix(m: &[Vec<String>]) -> crate::grid::GridBox {
+            let rows = m.len().max(1);
+            let cols = m.iter().map(|r| r.len()).max().unwrap_or(1).max(1);
+            let mut g = crate::grid::Grid::new(rows as u32, cols as u32);
+            for (r, row) in m.iter().enumerate() {
+                for (c, val) in row.iter().enumerate() {
+                    if !val.is_empty() {
+                        g.set(
+                            &CellAddr::Main {
+                                row: r as u32,
+                                col: c as u32,
+                            },
+                            val.clone(),
+                        );
+                    }
+                }
+            }
+            crate::grid::GridBox::from(g)
+        }
+
+        let mut g = crate::grid::Grid::new(1, 2);
+        g.set(
+            &CellAddr::Header {
+                row: (HEADER_ROWS - 1) as u32,
+                col: (MARGIN_COLS + 1) as u32,
+            },
+            "=A*0.1 -- TAX".into(),
+        );
+        g.set(
+            &CellAddr::Header {
+                row: (HEADER_ROWS - 1) as u32,
+                col: (MARGIN_COLS + 2) as u32,
+            },
+            "TOTAL".into(),
+        );
+        g.set(&CellAddr::Left { col: MARGIN_COLS - 1, row: 0 }, "Hammers".into());
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "5".into());
+
+        let opts = DelimitedExportOptions {
+            content: ExportContent::Generic,
+            include_margins: true,
+            include_header_row: true,
+            include_row_label_column: true,
+            ..Default::default()
+        };
+        let (matrix0, col_start, _col_end, rows) =
+            delimited_export_matrix(&crate::grid::GridBox::from(g.clone()), &opts);
+        let h = 1usize;
+        let data_row = h + rows.iter().position(|&r| r == HEADER_ROWS).unwrap();
+        let amount_field = 1 + (MARGIN_COLS - col_start);
+        let total_field = 1 + (MARGIN_COLS + 2 - col_start);
+        assert_eq!(matrix0[data_row][amount_field], "5");
+        assert!(
+            matrix0[data_row][total_field].starts_with('='),
+            "right-margin TOTAL must be a formula in the Generic target, not a static value like 5.5; got {:?}",
+            matrix0[data_row][total_field]
+        );
+        assert!(
+            matrix0[data_row][total_field].contains("C3:D3"),
+            "right-margin TOTAL formula should reference the target row's amount/tax fields; got {:?}",
+            matrix0[data_row][total_field]
+        );
+
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "6".into());
+        let source_after = crate::grid::GridBox::from(g);
+
+        let mut edited_target_matrix = matrix0.clone();
+        edited_target_matrix[data_row][amount_field] = "6".into();
+        let edited_target = target_grid_from_matrix(&edited_target_matrix);
+
+        let source_total = export_cell_text(
+            &source_after,
+            HEADER_ROWS,
+            MARGIN_COLS + 2,
+            ExportContent::Values,
+            None,
+        );
+        let target_total = export_cell_text(
+            &edited_target,
+            HEADER_ROWS + data_row,
+            MARGIN_COLS + total_field,
+            ExportContent::Values,
+            None,
+        );
+        assert_eq!(
+            source_total, target_total,
+            "Generic target right-margin TOTAL must update after the same source data edit"
+        );
     }
 
     /// TSV/ODS generic strings match after `,` / `;` in function-argument positions (Subtotal).

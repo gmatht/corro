@@ -289,7 +289,7 @@ fn translate_cell_addr_by_offset(
 fn translate_range_by_offset(
     range: &MainRange,
     row_delta: i32,
-    _col_delta: i32,
+    col_delta: i32,
 ) -> Option<MainRange> {
     let shift_u32 = |v: u32, delta: i32| -> Option<u32> {
         if delta >= 0 {
@@ -301,8 +301,8 @@ fn translate_range_by_offset(
     Some(MainRange {
         row_start: shift_u32(range.row_start, row_delta)?,
         row_end: shift_u32(range.row_end, row_delta)?,
-        col_start: range.col_start,
-        col_end: range.col_end,
+        col_start: shift_u32(range.col_start, col_delta)?,
+        col_end: shift_u32(range.col_end, col_delta)?,
     })
 }
 
