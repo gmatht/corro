@@ -347,6 +347,7 @@ enum MenuAction {
     FormatAlignDefault,
     FormatReset,
     InsertRows,
+    InsertMitosisRow,
     InsertCols,
     InsertSpecialChars,
     InsertDate,
@@ -524,11 +525,16 @@ const SHEET_MENU_ITEMS: [MenuItem; 6] = [
     },
 ];
 
-const INSERT_ROOT_MENU_ITEMS: [MenuItem; 6] = [
+const INSERT_ROOT_MENU_ITEMS: [MenuItem; 7] = [
     MenuItem {
         shortcut: 'R',
         label: "Rows",
         target: MenuTarget::Action(MenuAction::InsertRows),
+    },
+    MenuItem {
+        shortcut: 'M',
+        label: "Mitosis (Row)",
+        target: MenuTarget::Action(MenuAction::InsertMitosisRow),
     },
     MenuItem {
         shortcut: 'C',
@@ -1050,6 +1056,10 @@ impl App {
             },
             MenuAction::InsertRows => {
                 let _ = self.insert_rows_above_cursor(1);
+                Mode::Normal
+            }
+            MenuAction::InsertMitosisRow => {
+                let _ = self.insert_mitosis_row_after_cursor();
                 Mode::Normal
             }
             MenuAction::InsertCols => {
@@ -3278,14 +3288,19 @@ impl App {
 
         let hr = HEADER_ROWS;
         let mr = self.state.grid.main_rows();
-        let last_main = hr + mr.saturating_sub(1);
+        let last_display_main = self
+            .state
+            .grid
+            .sorted_main_rows()
+            .last()
+            .map(|row| hr + *row);
         let first_footer = hr + mr;
         let rows = self.view_row_order();
         let Some(pos) = rows.iter().position(|&r| r == self.cursor.row) else {
             return false;
         };
         let next_pos = if down {
-            if self.cursor.row == last_main
+            if last_display_main == Some(self.cursor.row)
                 && trailing_blank_main_rows(&self.state) < NAV_BLANK_ROWS
             {
                 self.state.grid.grow_main_row_at_bottom();
@@ -3611,16 +3626,20 @@ impl App {
         self.edit_cursor = None;
         self.commit_edit_buffer(buffer)?;
 
-        let hr = HEADER_ROWS;
-        let last_main = hr + self.state.grid.main_rows().saturating_sub(1);
-        if self.cursor.row == last_main && trailing_blank_main_rows(&self.state) < NAV_BLANK_ROWS {
-            self.state.grid.grow_main_row_at_bottom();
+        if !self.move_cursor_row_through_view(true) {
+            let hr = HEADER_ROWS;
+            let last_main = hr + self.state.grid.main_rows().saturating_sub(1);
+            if self.cursor.row == last_main
+                && trailing_blank_main_rows(&self.state) < NAV_BLANK_ROWS
+            {
+                self.state.grid.grow_main_row_at_bottom();
+            }
+            self.cursor.row = self.cursor.row.saturating_add(1);
+            self.cursor.clamp(&self.state.grid);
+            self.state
+                .grid
+                .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
         }
-        self.cursor.row = self.cursor.row.saturating_add(1);
-        self.cursor.clamp(&self.state.grid);
-        self.state
-            .grid
-            .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
 
         let addr = self.cursor.to_addr(&self.state.grid);
         let cur = cell_display(&self.state.grid, &addr);
@@ -3926,6 +3945,73 @@ impl App {
         } else {
             format!("Inserted {count} rows above row {row}")
         };
+        Ok(true)
+    }
+
+    fn insert_mitosis_row_after_cursor(&mut self) -> Result<bool, RunError> {
+        let hr = HEADER_ROWS;
+        let original_main_rows = self.state.grid.main_rows() as u32;
+        if self.cursor.row < hr || self.cursor.row >= hr + original_main_rows as usize {
+            return Ok(false);
+        }
+
+        let source_row = (self.cursor.row - hr) as u32;
+        let dest_row = source_row + 1;
+        let mut copied_cells = Vec::new();
+        for col in 0..self.state.grid.main_cols() as u32 {
+            let src = CellAddr::Main {
+                row: source_row,
+                col,
+            };
+            if let Some(value) = self.state.grid.get(&src) {
+                copied_cells.push((CellAddr::Main { row: dest_row, col }, value.to_string()));
+            }
+        }
+        for col in 0..MARGIN_COLS {
+            let src = CellAddr::Left {
+                col,
+                row: source_row,
+            };
+            if let Some(value) = self.state.grid.get(&src) {
+                copied_cells.push((CellAddr::Left { col, row: dest_row }, value.to_string()));
+            }
+            let src = CellAddr::Right {
+                col,
+                row: source_row,
+            };
+            if let Some(value) = self.state.grid.get(&src) {
+                copied_cells.push((CellAddr::Right { col, row: dest_row }, value.to_string()));
+            }
+        }
+
+        self.apply_single_op(Op::SetMainSize {
+            main_rows: original_main_rows + 1,
+            main_cols: self.state.grid.main_cols() as u32,
+        })?;
+
+        let rows_below = original_main_rows.saturating_sub(dest_row);
+        if rows_below > 0 {
+            self.apply_single_op(Op::MoveRowRange {
+                from: dest_row,
+                count: rows_below,
+                to: original_main_rows + 1,
+            })?;
+        }
+
+        if !copied_cells.is_empty() {
+            self.apply_single_op(Op::FillRange {
+                cells: copied_cells,
+            })?;
+        }
+
+        self.cursor = SheetCursor {
+            row: hr + dest_row as usize,
+            col: self.cursor.col,
+        };
+        self.cursor.clamp(&self.state.grid);
+        self.anchor = None;
+        self.selection_kind = SelectionKind::Cells;
+        self.status = format!("Inserted mitosis row after row {}", source_row + 1);
         Ok(true)
     }
 
@@ -6494,13 +6580,13 @@ impl App {
                     self.edit_cursor = None;
                     let raw = buffer.clone();
                     self.commit_edit_buffer(&raw)?;
-                    if self.cursor.row > 0 {
+                    if !self.move_cursor_row_through_view(false) && self.cursor.row > 0 {
                         self.cursor.row = self.cursor.row.saturating_sub(1);
+                        self.cursor.clamp(&self.state.grid);
+                        self.state
+                            .grid
+                            .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
                     }
-                    self.cursor.clamp(&self.state.grid);
-                    self.state
-                        .grid
-                        .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
                     let addr = self.cursor.to_addr(&self.state.grid);
                     let cur = cell_display(&self.state.grid, &addr);
                     mode = self.start_edit_mode(
@@ -6756,19 +6842,23 @@ impl App {
                             if self.anchor.is_none() {
                                 self.anchor = Some(self.cursor);
                             }
-                            self.cursor.row = self.cursor.row.saturating_sub(1);
-                            self.cursor.clamp(&self.state.grid);
+                            if !self.move_cursor_row_through_view(false) {
+                                self.cursor.row = self.cursor.row.saturating_sub(1);
+                                self.cursor.clamp(&self.state.grid);
+                            }
                         }
                     }
                     KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
                         if self.anchor.is_none() {
                             self.anchor = Some(self.cursor);
                         }
-                        self.cursor.row = self.cursor.row.saturating_add(1);
-                        self.cursor.clamp(&self.state.grid);
-                        self.state
-                            .grid
-                            .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
+                        if !self.move_cursor_row_through_view(true) {
+                            self.cursor.row = self.cursor.row.saturating_add(1);
+                            self.cursor.clamp(&self.state.grid);
+                            self.state
+                                .grid
+                                .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
+                        }
                     }
                     KeyCode::Char('o') => {
                         self.edit_special_palette = false;
@@ -7434,6 +7524,101 @@ mod tests {
 
         assert_eq!(app.cursor.row, HEADER_ROWS);
         assert_eq!(app.state.grid.sorted_main_rows(), vec![1, 0, 2]);
+    }
+
+    #[test]
+    fn sorted_view_up_moves_through_visible_order() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(3, 1);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "2".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 1, col: 0 }, "apple".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 2, col: 0 }, "10".into());
+        app.state.grid.set_view_sort_cols(vec![SortSpec {
+            col: MARGIN_COLS,
+            desc: false,
+        }]);
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        };
+        app.mode = Mode::Normal;
+
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::empty()))
+            .unwrap();
+
+        assert_eq!(app.cursor.row, HEADER_ROWS + 1);
+        assert_eq!(app.state.grid.sorted_main_rows(), vec![1, 0, 2]);
+    }
+
+    #[test]
+    fn sorted_view_down_from_physical_last_uses_view_order_without_growing() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(3, 1);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "a".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 1, col: 0 }, "b".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 2, col: 0 }, "c".into());
+        app.state.grid.set_view_sort_cols(vec![SortSpec {
+            col: MARGIN_COLS,
+            desc: true,
+        }]);
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS + 2,
+            col: MARGIN_COLS,
+        };
+        app.mode = Mode::Normal;
+
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()))
+            .unwrap();
+
+        assert_eq!(app.cursor.row, HEADER_ROWS + 1);
+        assert_eq!(app.state.grid.main_rows(), 3);
+        assert_eq!(app.state.grid.sorted_main_rows(), vec![2, 1, 0]);
+    }
+
+    #[test]
+    fn sorted_view_edit_up_moves_through_visible_order() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(3, 1);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "2".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 1, col: 0 }, "apple".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 2, col: 0 }, "10".into());
+        app.state.grid.set_view_sort_cols(vec![SortSpec {
+            col: MARGIN_COLS,
+            desc: false,
+        }]);
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        };
+        app.mode = Mode::Edit {
+            buffer: "2".into(),
+            formula_cursor: None,
+            fit_to_content_on_commit: false,
+        };
+
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::empty()))
+            .unwrap();
+
+        assert_eq!(app.cursor.row, HEADER_ROWS + 1);
+        assert!(matches!(app.mode, Mode::Edit { .. }));
     }
 
     #[test]
@@ -10671,6 +10856,97 @@ mod tests {
         assert_eq!(app.selection_kind, SelectionKind::Cells);
         assert!(app.anchor.is_none());
         assert_eq!(app.cursor.row, HEADER_ROWS);
+    }
+
+    #[test]
+    fn mitosis_row_copies_current_row_after_it() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(3, 2);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "before".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 1, col: 0 }, "copy-me".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 1, col: 1 }, "=A2*2".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 2, col: 0 }, "after".into());
+        app.state.grid.set(
+            &CellAddr::Left {
+                col: MARGIN_COLS - 1,
+                row: 1,
+            },
+            "label".into(),
+        );
+        app.state
+            .grid
+            .set(&CellAddr::Right { col: 0, row: 1 }, "note".into());
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS + 1,
+            col: MARGIN_COLS,
+        };
+
+        app.insert_mitosis_row_after_cursor().unwrap();
+
+        assert_eq!(app.state.grid.main_rows(), 4);
+        assert_eq!(app.cursor.row, HEADER_ROWS + 2);
+        assert_eq!(
+            app.state
+                .grid
+                .get(&CellAddr::Main { row: 1, col: 0 })
+                .as_deref(),
+            Some("copy-me")
+        );
+        assert_eq!(
+            app.state
+                .grid
+                .get(&CellAddr::Main { row: 2, col: 0 })
+                .as_deref(),
+            Some("copy-me")
+        );
+        assert_eq!(
+            app.state
+                .grid
+                .get(&CellAddr::Main { row: 2, col: 1 })
+                .as_deref(),
+            Some("=A2*2")
+        );
+        assert_eq!(
+            app.state
+                .grid
+                .get(&CellAddr::Main { row: 3, col: 0 })
+                .as_deref(),
+            Some("after")
+        );
+        assert_eq!(
+            app.state
+                .grid
+                .get(&CellAddr::Left {
+                    col: MARGIN_COLS - 1,
+                    row: 2
+                })
+                .as_deref(),
+            Some("label")
+        );
+        assert_eq!(
+            app.state
+                .grid
+                .get(&CellAddr::Right { col: 0, row: 2 })
+                .as_deref(),
+            Some("note")
+        );
+    }
+
+    #[test]
+    fn insert_menu_contains_mitosis_row() {
+        assert!(INSERT_ROOT_MENU_ITEMS.iter().any(|item| {
+            item.shortcut == 'M'
+                && item.label == "Mitosis (Row)"
+                && item.target == MenuTarget::Action(MenuAction::InsertMitosisRow)
+        }));
     }
 
     #[test]
