@@ -28,6 +28,8 @@ use std::collections::HashMap;
 use std::io::{self, stdout};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
+use unicode_truncate::{Alignment as UTruncAlign, UnicodeTruncateStr};
+use unicode_width::UnicodeWidthStr;
 
 /// Width of the row-label gutter (`]A~1`, `A1`, `A_1`).
 const ROW_LABEL_CHARS: usize = 5;
@@ -1260,13 +1262,38 @@ impl App {
         }
     }
 
-    fn menu_target_mode(&mut self, path: &[MenuLevel], target: MenuTarget) -> Mode {
+    /// TSV/ODS import with no `.corro` path: no unsaved edits when the undo stack is at the
+    /// session baseline (including after the user undoes back to the imported state).
+    fn is_ods_tsv_import_unchanged(&self) -> bool {
+        if self.path.is_some() {
+            return false;
+        }
+        let Some(src) = self.import_source.as_ref() else {
+            return false;
+        };
+        let ext = src
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        if ext != "tsv" && ext != "ods" {
+            return false;
+        }
+        self.op_history.is_empty()
+    }
+
+    fn menu_target_mode(&mut self, path: &[MenuLevel], target: MenuTarget) -> Result<Mode, ()> {
         match target {
-            MenuTarget::Action(action) => self.menu_action_mode(action),
+            MenuTarget::Action(action) => {
+                if matches!(action, MenuAction::Exit) && self.is_ods_tsv_import_unchanged() {
+                    return Err(());
+                }
+                Ok(self.menu_action_mode(action))
+            }
             MenuTarget::Submenu(section) => {
                 let mut stack = path.to_vec();
                 stack.push(MenuLevel { section, item: 0 });
-                Mode::Menu { stack }
+                Ok(Mode::Menu { stack })
             }
         }
     }
@@ -4139,7 +4166,7 @@ impl App {
                         normalize_inline_text(&cell_effective_display(&self.state.grid, &addr));
                     if !val.is_empty() {
                         saw_content = true;
-                        maxw = maxw.max(val.chars().count() + 1);
+                        maxw = maxw.max(val.width() + 1);
                     }
                 }
                 _ => {}
@@ -4154,7 +4181,7 @@ impl App {
                 let val = normalize_inline_text(&cell_effective_display(&self.state.grid, &addr));
                 if !val.is_empty() {
                     saw_content = true;
-                    maxw = maxw.max(val.chars().count() + 1);
+                    maxw = maxw.max(val.width() + 1);
                 }
             } else if global_col < MARGIN_COLS + main_cols {
                 let addr = CellAddr::Main {
@@ -4164,7 +4191,7 @@ impl App {
                 let val = normalize_inline_text(&cell_effective_display(&self.state.grid, &addr));
                 if !val.is_empty() {
                     saw_content = true;
-                    maxw = maxw.max(val.chars().count() + 1);
+                    maxw = maxw.max(val.width() + 1);
                 }
             } else {
                 let addr = CellAddr::Right {
@@ -4174,7 +4201,7 @@ impl App {
                 let val = normalize_inline_text(&cell_effective_display(&self.state.grid, &addr));
                 if !val.is_empty() {
                     saw_content = true;
-                    maxw = maxw.max(val.chars().count() + 1);
+                    maxw = maxw.max(val.width() + 1);
                 }
             }
         }
@@ -5299,7 +5326,10 @@ impl App {
                         .add_modifier(Modifier::BOLD)
                 };
                 let w = grid.col_width(c).max(1);
-                spans.push(Span::styled(format!("{:>w$}", name, w = w), style));
+                let p = name
+                    .unicode_pad(w, UTruncAlign::Right, true)
+                    .into_owned();
+                spans.push(Span::styled(p, style));
                 if i + 1 < col_ixs.len() {
                     if c == lm - 1 && lm > 0 && col_ixs.contains(&lm) {
                         // Put the vertical divider immediately after the cell
@@ -5451,7 +5481,7 @@ impl App {
                 let cw = grid.col_width(c).max(1);
                 let formatted = format_cell_display(grid, &cell_addr, text);
                 let align = effective_cell_align(grid, &cell_addr, &formatted);
-                let disp = if formatted.chars().count() > cw {
+                let disp = if formatted.width() > cw {
                     shrink_numeric_display(&formatted, cw)
                         .or_else(|| exponential_numeric_display(&formatted, cw))
                         .unwrap_or_else(|| truncate_with_ellipsis(&formatted, cw))
@@ -6286,7 +6316,13 @@ Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard 
                 KeyCode::Enter => {
                     if let Some(level) = stack.last() {
                         if let Some(menu_item) = menu_action_item(level.section, level.item) {
-                            mode = self.menu_target_mode(stack.as_slice(), menu_item.target);
+                            match self.menu_target_mode(stack.as_slice(), menu_item.target) {
+                                Ok(m) => mode = m,
+                                Err(()) => {
+                                    self.mode = mode;
+                                    return Ok(true);
+                                }
+                            }
                         }
                     }
                 }
@@ -6299,7 +6335,13 @@ Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard 
                             .find(|(_, mi)| mi.shortcut == upper)
                         {
                             level.item = idx;
-                            mode = self.menu_target_mode(stack.as_slice(), menu_item.target);
+                            match self.menu_target_mode(stack.as_slice(), menu_item.target) {
+                                Ok(m) => mode = m,
+                                Err(()) => {
+                                    self.mode = mode;
+                                    return Ok(true);
+                                }
+                            }
                         }
                     }
                 }
@@ -7781,6 +7823,9 @@ Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard 
                         if self.anchor.is_some() {
                             self.anchor = None;
                             self.selection_kind = SelectionKind::Cells;
+                        } else if self.is_ods_tsv_import_unchanged() {
+                            self.mode = mode;
+                            return Ok(true);
                         } else {
                             mode = if self.path.is_none() {
                                 Mode::QuitImportPrompt
@@ -9553,6 +9598,8 @@ mod tests {
     fn long_grid_values_truncate_one_char_shorter() {
         assert_eq!(truncate_with_ellipsis("abcdef", 4), "abc…");
         assert_eq!(truncate_with_ellipsis("abcdef", 1), "…");
+        // display width, not char count: fullwidth letters are width 2 each
+        assert_eq!(truncate_with_ellipsis("ＡＢＣＤＥＦ", 4), "Ａ…");
     }
 
     #[test]
@@ -11770,6 +11817,57 @@ mod tests {
     }
 
     #[test]
+    fn esc_quits_immediately_on_unchanged_tsv_import() {
+        use std::path::PathBuf;
+
+        let tsv = tempfile::Builder::new().suffix(".tsv").tempfile().unwrap();
+        std::fs::write(tsv.path(), "a\tb\n").unwrap();
+        let path: PathBuf = tsv.path().to_path_buf();
+
+        let mut app = App::new(None);
+        app.mode = Mode::OpenPath {
+            buffer: path.display().to_string(),
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .unwrap();
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(app.path.is_none());
+
+        let quit = app
+            .handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()))
+            .unwrap();
+        assert!(quit);
+    }
+
+    #[test]
+    fn esc_shows_quit_import_prompt_after_tsv_edit_tracked() {
+        use std::path::PathBuf;
+        use crate::grid::CellAddr;
+        use crate::ops::Op;
+
+        let tsv = tempfile::Builder::new().suffix(".tsv").tempfile().unwrap();
+        std::fs::write(tsv.path(), "a\tb\n").unwrap();
+        let path: PathBuf = tsv.path().to_path_buf();
+
+        let mut app = App::new(None);
+        app.mode = Mode::OpenPath {
+            buffer: path.display().to_string(),
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .unwrap();
+        app.op_history.push(Op::SetCell {
+            addr: CellAddr::Main { row: 0, col: 0 },
+            value: "x".into(),
+        });
+
+        let quit = app
+            .handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()))
+            .unwrap();
+        assert!(!quit);
+        assert!(matches!(app.mode, Mode::QuitImportPrompt));
+    }
+
+    #[test]
     fn ctrl_shift_plus_works_while_editing() {
         let mut app = App::new(None);
         app.state.grid.set_main_size(2, 1);
@@ -13125,23 +13223,18 @@ pub(crate) fn format_cell_display(grid: &Grid, addr: &CellAddr, raw: String) -> 
     }
 }
 
+fn text_align_to_utrunc(a: TextAlign) -> UTruncAlign {
+    match a {
+        TextAlign::Left | TextAlign::Default => UTruncAlign::Left,
+        TextAlign::Right => UTruncAlign::Right,
+        TextAlign::Center => UTruncAlign::Center,
+    }
+}
+
 fn align_cell_display(text: String, width: usize, align: Option<TextAlign>) -> String {
     let width = width.max(1);
-    let len = text.chars().count();
-    if len >= width {
-        return text;
-    }
-    let pad = width - len;
-    match align.unwrap_or(TextAlign::Default) {
-        TextAlign::Left => format!("{text:<width$}"),
-        TextAlign::Center => {
-            let left = pad / 2;
-            let right = pad - left;
-            format!("{}{}{}", " ".repeat(left), text, " ".repeat(right))
-        }
-        TextAlign::Right => format!("{text:>width$}"),
-        TextAlign::Default => format!("{text:<width$}"),
-    }
+    let ual = text_align_to_utrunc(align.unwrap_or(TextAlign::Default));
+    text.unicode_pad(width, ual, true).into_owned()
 }
 
 fn effective_cell_align(grid: &Grid, addr: &CellAddr, formatted: &str) -> Option<TextAlign> {
@@ -13157,8 +13250,18 @@ fn effective_cell_align(grid: &Grid, addr: &CellAddr, formatted: &str) -> Option
 }
 
 fn truncate_with_ellipsis(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if text.width() <= width {
+        return text.to_string();
+    }
     let keep = width.saturating_sub(1);
-    format!("{}…", text.chars().take(keep).collect::<String>())
+    if keep == 0 {
+        return "…".to_string();
+    }
+    let (prefix, _) = text.unicode_truncate(keep);
+    format!("{prefix}…")
 }
 
 fn shrink_numeric_display(text: &str, width: usize) -> Option<String> {

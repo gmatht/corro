@@ -9,6 +9,8 @@ default-run = "corro"
 
 [dependencies]
 ratatui = "0.29"
+unicode-width = "0.2.0"
+unicode-truncate = "1"
 crossterm = "0.28"
 serde = { version = "1", features = ["derive"] }
 notify = "7"

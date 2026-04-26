@@ -138,6 +138,8 @@ dependencies = [
  "serde",
  "tempfile",
  "thiserror",
+ "unicode-truncate",
+ "unicode-width 0.2.0",
  "zip",
 ]
 
