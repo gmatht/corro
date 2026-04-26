@@ -1388,7 +1388,7 @@ File menu\n\
  - Open file loads a .corro, .csv, .tsv, or .ods file. Use `link <file> <revision>` to open a log at a revision.\n\
  - New sheet adds another sheet to the workbook.\n\
  - Ctrl+PageUp and Ctrl+PageDown switch between workbook tabs.\n\
-- Export opens TSV, CSV, ASCII, full export, or ODS prompts; Alt+F / Alt+V / Alt+G choose formulas, values, or generic interop; Alt+X copies the current export to the clipboard (TSV, CSV, ASCII, or full/selection TSV, not ODS).\n\
+- Export opens TSV, CSV, ASCII, full export, or ODS prompts; ODS includes every sheet as a separate table (Calc tab) by default. Alt+F / Alt+V / Alt+G choose formulas, values, or generic interop; Alt+X copies the current export to the clipboard (TSV, CSV, ASCII, or full/selection TSV, not ODS).\n\
 - Width opens default width and per-column width prompts.\n\
 - Sort view changes the visible order of main rows.\n\
 - Exit opens the quit prompt.\n\n\
@@ -4838,10 +4838,13 @@ impl App {
     }
 
     fn do_export_ods(&mut self) -> Vec<u8> {
-        crate::formula::refresh_spills(&mut self.state.grid);
+        self.commit_active_sheet_cache();
+        for s in &mut self.workbook.sheets {
+            crate::formula::refresh_spills(&mut s.state.grid);
+        }
         let mut o = self.export_delimited_options;
         o.content = self.export_ods_content;
-        crate::ods::export_ods_bytes_with_options(&self.state.grid, &o)
+        crate::ods::export_ods_bytes_workbook_with_options(&self.workbook, &o)
             .unwrap_or_default()
     }
 
