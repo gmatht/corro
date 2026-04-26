@@ -1061,20 +1061,35 @@ impl App {
                 buffer: self.start_input_mode(String::new()),
             },
             MenuAction::Exit => Mode::QuitPrompt,
-            MenuAction::ExportTsv => Mode::ExportTsv {
-                buffer: self.start_input_mode(String::new()),
+            MenuAction::ExportTsv => {
+                self.export_preview_scroll = 0;
+                Mode::ExportTsv {
+                    buffer: self.start_input_mode(String::new()),
+                }
             },
-            MenuAction::ExportCsv => Mode::ExportCsv {
-                buffer: self.start_input_mode(String::new()),
+            MenuAction::ExportCsv => {
+                self.export_preview_scroll = 0;
+                Mode::ExportCsv {
+                    buffer: self.start_input_mode(String::new()),
+                }
             },
-            MenuAction::ExportAscii => Mode::ExportAscii {
-                buffer: self.start_input_mode(String::new()),
+            MenuAction::ExportAscii => {
+                self.export_preview_scroll = 0;
+                Mode::ExportAscii {
+                    buffer: self.start_input_mode(String::new()),
+                }
             },
-            MenuAction::ExportAll => Mode::ExportAll {
-                buffer: self.start_input_mode(String::new()),
+            MenuAction::ExportAll => {
+                self.export_preview_scroll = 0;
+                Mode::ExportAll {
+                    buffer: self.start_input_mode(String::new()),
+                }
             },
-            MenuAction::ExportOdt => Mode::ExportOdt {
-                buffer: self.start_input_mode(String::new()),
+            MenuAction::ExportOdt => {
+                self.export_preview_scroll = 0;
+                Mode::ExportOdt {
+                    buffer: self.start_input_mode(String::new()),
+                }
             },
             MenuAction::SetMaxColWidth => Mode::SetMaxColWidth {
                 buffer: self.start_input_mode(String::new()),
@@ -5309,11 +5324,18 @@ impl App {
             Mode::ExportTsv { .. }
             | Mode::ExportCsv { .. }
             | Mode::ExportAscii { .. }
-            | Mode::ExportAll { .. }
-            | Mode::ExportOdt { .. }
-            | Mode::SetMaxColWidth { .. }
-            | Mode::SetColWidth { .. } => {
-                "  type filename (blank=clipboard)   Enter·export   Esc·cancel".into()
+            | Mode::ExportAll { .. } => {
+                "  up/down·scroll preview   type filename (blank=clipboard)   Enter·export   Esc·cancel"
+                    .into()
+            }
+            Mode::ExportOdt { .. } => {
+                "  up/down·scroll   type .ods file path   Enter·save   Esc·cancel".into()
+            }
+            Mode::SetMaxColWidth { .. } => {
+                "  type default column width   Enter·apply   Esc·cancel".into()
+            }
+            Mode::SetColWidth { .. } => {
+                "  type col=width or col to clear   Enter   Esc·cancel".into()
             }
             Mode::SortView { .. } => {
                 "  type sort columns like A,B,C   Enter·apply   Esc·cancel".into()
@@ -6132,6 +6154,18 @@ impl App {
                 _ => {}
             },
             Mode::ExportAscii { buffer } => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.export_preview_scroll = self.export_preview_scroll.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.export_preview_scroll = self.export_preview_scroll.saturating_add(1);
+                }
+                KeyCode::PageUp => {
+                    self.export_preview_scroll = self.export_preview_scroll.saturating_sub(20);
+                }
+                KeyCode::PageDown => {
+                    self.export_preview_scroll = self.export_preview_scroll.saturating_add(20);
+                }
                 KeyCode::Enter => {
                     let fname = buffer.clone();
                     if fname.trim().is_empty() {
@@ -6159,6 +6193,18 @@ impl App {
                 _ => {}
             },
             Mode::ExportOdt { buffer } => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.export_preview_scroll = self.export_preview_scroll.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.export_preview_scroll = self.export_preview_scroll.saturating_add(1);
+                }
+                KeyCode::PageUp => {
+                    self.export_preview_scroll = self.export_preview_scroll.saturating_sub(20);
+                }
+                KeyCode::PageDown => {
+                    self.export_preview_scroll = self.export_preview_scroll.saturating_add(20);
+                }
                 KeyCode::Enter => {
                     let fname = buffer.clone();
                     if fname.trim().is_empty() {
@@ -6181,6 +6227,18 @@ impl App {
                 _ => {}
             },
             Mode::ExportAll { buffer } => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.export_preview_scroll = self.export_preview_scroll.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.export_preview_scroll = self.export_preview_scroll.saturating_add(1);
+                }
+                KeyCode::PageUp => {
+                    self.export_preview_scroll = self.export_preview_scroll.saturating_sub(20);
+                }
+                KeyCode::PageDown => {
+                    self.export_preview_scroll = self.export_preview_scroll.saturating_add(20);
+                }
                 KeyCode::Enter => {
                     let fname = buffer.clone();
                     if fname.trim().is_empty() {
@@ -7103,6 +7161,7 @@ impl App {
                         self.selection_kind = SelectionKind::Cells;
                     }
                     KeyCode::Char('t') => {
+                        self.export_preview_scroll = 0;
                         mode = Mode::ExportTsv {
                             buffer: self.start_input_mode(String::new()),
                         }
@@ -7152,6 +7211,7 @@ impl App {
                                 self.status = "Selection expanded to columns".into();
                             }
                         } else {
+                            self.export_preview_scroll = 0;
                             mode = Mode::ExportCsv {
                                 buffer: self.start_input_mode(String::new()),
                             };
@@ -7520,29 +7580,79 @@ impl App {
         String::from_utf8_lossy(&buf).into_owned()
     }
 
+    /// Full-grid export preview: `sanitize_tabs` means replace `\t` in the *preview* only
+    /// (terminal tab stops corrupt the TUI; real exports are unchanged).
+    fn export_preview_overlay_content(&self) -> Option<(String, &'static str, bool)> {
+        let mut grid = self.state.grid.clone();
+        crate::formula::refresh_spills(&mut grid);
+        match &self.mode {
+            Mode::ExportTsv { .. } => {
+                let mut buf = Vec::new();
+                export::export_tsv(&grid, &mut buf);
+                Some((
+                    String::from_utf8_lossy(&buf).into_owned(),
+                    " Export TSV ",
+                    true,
+                ))
+            }
+            Mode::ExportCsv { .. } => {
+                let mut buf = Vec::new();
+                export::export_csv(&grid, &mut buf);
+                Some((
+                    String::from_utf8_lossy(&buf).into_owned(),
+                    " Export CSV ",
+                    false,
+                ))
+            }
+            Mode::ExportAscii { .. } => {
+                let mut buf = Vec::new();
+                export::export_ascii_table(&grid, &mut buf, false);
+                Some((
+                    String::from_utf8_lossy(&buf).into_owned(),
+                    " Export ASCII table ",
+                    false,
+                ))
+            }
+            Mode::ExportAll { .. } => {
+                if self.anchor.is_some() {
+                    Some((
+                        self.selection_tsv_text(),
+                        " Export selection (TSV) ",
+                        true,
+                    ))
+                } else {
+                    let mut buf = Vec::new();
+                    export::export_all(&grid, &mut buf);
+                    Some((
+                        String::from_utf8_lossy(&buf).into_owned(),
+                        " Export full (TSV) ",
+                        true,
+                    ))
+                }
+            }
+            Mode::ExportOdt { .. } => Some((
+                "OpenDocument (.ods) is a binary ZIP package.\n\nThere is no text preview. Type a file path and press Enter to save."
+                    .to_string(),
+                " Export ODS ",
+                false,
+            )),
+            _ => None,
+        }
+    }
+
     #[cold]
     #[inline(never)]
     fn render_export_preview_overlay(&self, f: &mut Frame, grid_area: Rect) -> bool {
-        let csv = match self.mode {
-            Mode::ExportCsv { .. } => true,
-            Mode::ExportTsv { .. } => false,
-            _ => return false,
+        let Some((body, title, sanitize_tabs)) = self.export_preview_overlay_content() else {
+            return false;
         };
-        let body = self.export_preview_text(csv);
-        // TSV field separators are U+0009. If we pass them to ratatui/Paragraph, the terminal
-        // applies tab stops to the *screen* buffer, so one logical line can paint across wrong
-        // columns and look like a mix of TSV, menu, and frame — even after a full `Clear` of
-        // this widget's area. Only the on-screen preview is changed; `do_export` stays raw TSV.
-        let body = if csv {
-            body
-        } else {
+        let body = if sanitize_tabs {
+            // See `export_preview_overlay_content` (tab stops in the TUI).
             body.replace('\t', "  ")
-        };
-        let block = Block::default().borders(Borders::ALL).title(if csv {
-            " Export CSV "
         } else {
-            " Export TSV "
-        });
+            body
+        };
+        let block = Block::default().borders(Borders::ALL).title(title);
         let inner = block.inner(grid_area);
         let lines: Vec<&str> = body.lines().collect();
         let max_scroll = lines.len().saturating_sub(inner.height as usize);
@@ -7554,8 +7664,7 @@ impl App {
             .cloned()
             .collect::<Vec<_>>()
             .join("\n");
-        // No wrap: long TSV/CSV lines must not expand to extra terminal rows (would overflow
-        // the grid and corrupt surrounding chrome).
+        // No wrap: long lines must not expand to extra terminal rows (overflows the grid).
         let paragraph = Paragraph::new(visible).block(block);
         f.render_widget(Clear, grid_area);
         f.render_widget(paragraph, grid_area);
