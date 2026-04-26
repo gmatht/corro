@@ -1,6 +1,7 @@
 //! ODS import/export for workbook data.
 
 use crate::addr::excel_column_name;
+use crate::export::ExportContent;
 use crate::formula::{cell_effective_display, is_formula};
 use crate::grid::{CellAddr, GridBox as Grid, HEADER_ROWS, MARGIN_COLS};
 use crate::ops::{SheetRecord, SheetState, WorkbookSnapshot, WorkbookState};
@@ -111,11 +112,27 @@ fn parse_corro_ods_layout_str(buf: &str) -> OdsTableLayout {
 }
 
 pub fn export_ods_bytes(grid: &Grid) -> Result<Vec<u8>, OdsError> {
+    export_ods_bytes_with_options(grid, ExportContent::Formulas)
+}
+
+/// `ExportContent::Formulas` preserves `table:formula` where applicable; `Values` writes static cells
+/// from computed display (no formulas in the ODF file).
+pub fn export_ods_bytes_with_options(
+    grid: &Grid,
+    content: ExportContent,
+) -> Result<Vec<u8>, OdsError> {
     let tc = ods_col_end(grid);
     let rows = ods_row_order(grid);
     let max_rebase_run = ods_max_rebase_blank_run(&rows);
     let use_compact = max_rebase_run >= LIBREOFFICE_MAX_SHEET_ROWS;
-    let content = ods_content_xml_with_rows_and_mode(grid, tc, rows.clone(), use_compact, max_rebase_run);
+    let content_xml = ods_content_xml_with_rows_and_mode(
+        grid,
+        tc,
+        rows.clone(),
+        use_compact,
+        max_rebase_run,
+        content,
+    );
     let min_r = *rows
         .first()
         .expect("ods_row_order is never empty");
@@ -129,7 +146,7 @@ pub fn export_ods_bytes(grid: &Grid) -> Result<Vec<u8>, OdsError> {
     zip.write_all(b"application/vnd.oasis.opendocument.spreadsheet")?;
 
     zip.start_file("content.xml", FileOptions::default())?;
-    zip.write_all(content.as_bytes())?;
+    zip.write_all(content_xml.as_bytes())?;
 
     zip.start_file(CORRO_ODS_LAYOUT_PATH, FileOptions::default())?;
     zip.write_all(sidecar.as_bytes())?;
@@ -256,6 +273,7 @@ fn ods_content_xml_with_rows_and_mode(
     rows: Vec<usize>,
     use_compact: bool,
     _max_rebase_run: usize,
+    export_content: ExportContent,
 ) -> String {
     let column_styles = ods_column_styles_xml(grid, tc);
     let mut s = String::from(
@@ -277,7 +295,7 @@ fn ods_content_xml_with_rows_and_mode(
             s.push_str("<table:table-row>");
             let mut c = 0usize;
             while c < tc {
-                s.push_str(&ods_cell_xml(grid, *r, c));
+                s.push_str(&ods_cell_xml(grid, *r, c, export_content));
                 c += 1;
             }
             s.push_str("</table:table-row>");
@@ -298,7 +316,7 @@ fn ods_content_xml_with_rows_and_mode(
             s.push_str("<table:table-row>");
             let mut c = 0usize;
             while c < tc {
-                s.push_str(&ods_cell_xml(grid, r, c));
+                s.push_str(&ods_cell_xml(grid, r, c, export_content));
                 c += 1;
             }
             s.push_str("</table:table-row>");
@@ -309,7 +327,12 @@ fn ods_content_xml_with_rows_and_mode(
     s
 }
 
-fn ods_cell_xml(grid: &Grid, logical_row: usize, global_col: usize) -> String {
+fn ods_cell_xml(
+    grid: &Grid,
+    logical_row: usize,
+    global_col: usize,
+    export_content: ExportContent,
+) -> String {
     let hr = HEADER_ROWS;
     let mr = grid.main_rows();
     let mc = grid.main_cols();
@@ -326,8 +349,12 @@ fn ods_cell_xml(grid: &Grid, logical_row: usize, global_col: usize) -> String {
     };
 
     if value.is_empty() && raw.is_empty() {
-        "<table:table-cell/>".into()
-    } else if value.starts_with('=') || is_formula(&raw) {
+        return "<table:table-cell/>".into();
+    }
+    if export_content == ExportContent::Values {
+        return ods_cell_xml_values_only(&display, &value, &raw);
+    }
+    if value.starts_with('=') || is_formula(&raw) {
         let formula = if value.starts_with('=') { value } else { raw };
         let formula = ods_formula_expr(&formula).unwrap_or(formula);
         let value_attrs = match display.trim().parse::<f64>() {
@@ -346,6 +373,30 @@ fn ods_cell_xml(grid: &Grid, logical_row: usize, global_col: usize) -> String {
             ods_escape(if display.is_empty() { &value } else { &display })
         )
     }
+}
+
+/// Static ODF cell: `display` is preferred (evaluated for formulas), then `value` / `raw`.
+fn ods_cell_xml_values_only(display: &str, value: &str, raw: &str) -> String {
+    let show = if !display.is_empty() {
+        display
+    } else if !value.is_empty() {
+        value
+    } else {
+        raw
+    };
+    if show.trim().is_empty() {
+        return "<table:table-cell/>".into();
+    }
+    if let Ok(n) = show.trim().parse::<f64>() {
+        return format!(
+            r#"<table:table-cell office:value-type="float" office:value="{n}"><text:p>{}</text:p></table:table-cell>"#,
+            ods_escape(show)
+        );
+    }
+    format!(
+        r#"<table:table-cell office:value-type="string"><text:p>{}</text:p></table:table-cell>"#,
+        ods_escape(show)
+    )
 }
 
 fn ods_cell_addr(grid: &Grid, logical_row: usize, global_col: usize) -> CellAddr {

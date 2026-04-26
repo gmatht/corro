@@ -5,6 +5,16 @@ use std::collections::HashSet;
 use std::io::Write;
 use zip::write::FileOptions;
 
+/// Whether delimited/ASCII/selection export emits computed display text or stored cell text (`=…`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
+pub enum ExportContent {
+    /// Evaluated + formatted (matches the main grid / TSV golden files).
+    #[default]
+    Values,
+    /// Raw storage: formula text where present, labels as stored.
+    Formulas,
+}
+
 /// Options for tab/comma (and "export all") delimited text.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DelimitedExportOptions {
@@ -19,6 +29,8 @@ pub struct DelimitedExportOptions {
     /// can still show row `1`/`2` in the first field). Same idea as
     /// `AsciiTableOptions::include_row_label_column`.
     pub include_row_label_column: bool,
+    /// Computed display vs stored `=…` text; see [ExportContent].
+    pub content: ExportContent,
 }
 
 impl Default for DelimitedExportOptions {
@@ -27,6 +39,7 @@ impl Default for DelimitedExportOptions {
             include_header_row: true,
             include_margins: true,
             include_row_label_column: true,
+            content: ExportContent::default(),
         }
     }
 }
@@ -106,6 +119,8 @@ pub struct AsciiTableOptions {
     pub row_dividers: bool,
     pub inter_cell_space: AsciiInterCellSpace,
     pub header_data_separator: AsciiHeaderDataSeparator,
+    /// Same meaning as [DelimitedExportOptions::content].
+    pub content: ExportContent,
 }
 
 impl Default for AsciiTableOptions {
@@ -118,6 +133,7 @@ impl Default for AsciiTableOptions {
             row_dividers: false,
             inter_cell_space: AsciiInterCellSpace::Space,
             header_data_separator: AsciiHeaderDataSeparator::FullBorder,
+            content: ExportContent::default(),
         }
     }
 }
@@ -195,6 +211,8 @@ pub fn export_ascii_table_with_options(
         row_end = hr + mr;
     }
 
+    let cell_content = options.content;
+
     let main_c0 = m.max(col_start);
     let main_c1 = (m + mc).min(col_end);
     let frame_active = options.data_frame && main_c0 < main_c1;
@@ -223,7 +241,7 @@ pub fn export_ascii_table_with_options(
 
     for r in row_start..row_end {
         for c in col_start..col_end {
-            let val = rendered_value_at(grid, r, c);
+            let val = export_cell_text(grid, r, c, cell_content);
             let content_w = val.chars().count();
             col_widths[c] = col_widths[c].max(content_w);
         }
@@ -309,7 +327,7 @@ pub fn export_ascii_table_with_options(
                     data_line.push('+');
                 }
             }
-            let val = rendered_value_at(grid, r, c);
+            let val = export_cell_text(grid, r, c, cell_content);
             let w = col_widths[c];
             ascii_push_cell(&mut data_line, pre, pad, &val, w);
             if frame_active
@@ -381,11 +399,14 @@ pub fn export_selection(
     out: &mut dyn Write,
     rows: &[usize],
     cols: &[usize],
-    include_header_row: bool,
+    options: &DelimitedExportOptions,
 ) {
     if rows.is_empty() || cols.is_empty() {
         return;
     }
+
+    let include_header_row = options.include_header_row;
+    let content = options.content;
 
     if include_header_row {
         for (ci, &c) in cols.iter().enumerate() {
@@ -403,7 +424,7 @@ pub fn export_selection(
             if ci > 0 {
                 let _ = write!(out, "\t");
             }
-            let val = cell_value_at(grid, r, c);
+            let val = export_cell_text(grid, r, c, content);
             let _ = write!(out, "{}", val);
         }
         let _ = writeln!(out);
@@ -488,6 +509,18 @@ fn rendered_value_at(grid: &Grid, logical_row: usize, global_col: usize) -> Stri
     crate::ui::format_cell_display(grid, &addr, text)
 }
 
+fn export_cell_text(
+    grid: &Grid,
+    logical_row: usize,
+    global_col: usize,
+    content: ExportContent,
+) -> String {
+    match content {
+        ExportContent::Values => rendered_value_at(grid, logical_row, global_col),
+        ExportContent::Formulas => cell_value_at(grid, logical_row, global_col),
+    }
+}
+
 fn needs_csv_quoting(s: &str, delim: char) -> bool {
     s.contains(delim) || s.contains('"') || s.contains('\n') || s.contains('\r')
 }
@@ -505,6 +538,7 @@ fn export_delimited(
     let include_headers = options.include_header_row;
     let include_margins = options.include_margins;
     let row_key_col = options.include_row_label_column;
+    let content = options.content;
     let mr = grid.main_rows();
     let mc = grid.main_cols();
     let hr = HEADER_ROWS;
@@ -600,7 +634,7 @@ fn export_delimited(
                 let _ = write!(out, "{delim}");
             }
             first = false;
-            let val = rendered_value_at(grid, r, c);
+            let val = export_cell_text(grid, r, c, content);
             if delim == ',' && needs_csv_quoting(&val, delim) {
                 let _ = write!(out, "{}", csv_quote(&val));
             } else {
@@ -1039,7 +1073,10 @@ mod tests {
             &mut out,
             &[HEADER_ROWS],
             &[m, m + 1],
-            false,
+            &DelimitedExportOptions {
+                include_header_row: false,
+                ..Default::default()
+            },
         );
         let s = String::from_utf8(out).unwrap();
         let first = s.lines().next().expect("at least one line");
@@ -1051,7 +1088,10 @@ mod tests {
             &mut out2,
             &[HEADER_ROWS],
             &[m, m + 1],
-            true,
+            &DelimitedExportOptions {
+                include_header_row: true,
+                ..Default::default()
+            },
         );
         let s2 = String::from_utf8(out2).unwrap();
         let first2 = s2.lines().next().expect("at least one line");

@@ -1069,30 +1069,35 @@ impl App {
             }
             MenuAction::ExportTsv => {
                 self.export_preview_scroll = 0;
+                self.export_delimited_options.content = export::ExportContent::Values;
                 Mode::ExportTsv {
                     buffer: self.start_input_mode(self.suggested_export_save_path("tsv")),
                 }
             },
             MenuAction::ExportCsv => {
                 self.export_preview_scroll = 0;
+                self.export_delimited_options.content = export::ExportContent::Values;
                 Mode::ExportCsv {
                     buffer: self.start_input_mode(self.suggested_export_save_path("csv")),
                 }
             },
             MenuAction::ExportAscii => {
                 self.export_preview_scroll = 0;
+                self.export_ascii_options.content = export::ExportContent::Values;
                 Mode::ExportAscii {
                     buffer: self.start_input_mode(self.suggested_export_save_path("txt")),
                 }
             },
             MenuAction::ExportAll => {
                 self.export_preview_scroll = 0;
+                self.export_delimited_options.content = export::ExportContent::Values;
                 Mode::ExportAll {
                     buffer: self.start_input_mode(self.suggested_export_save_path("tsv")),
                 }
             },
             MenuAction::ExportOdt => {
                 self.export_preview_scroll = 0;
+                self.export_ods_content = export::ExportContent::Formulas;
                 Mode::ExportOdt {
                     buffer: self.start_input_mode(self.suggested_export_save_path("ods")),
                 }
@@ -1362,7 +1367,7 @@ File menu\n\
  - Open file loads a .corro, .csv, .tsv, or .ods file. Use `link <file> <revision>` to open a log at a revision.\n\
  - New sheet adds another sheet to the workbook.\n\
  - Ctrl+PageUp and Ctrl+PageDown switch between workbook tabs.\n\
-- Export opens TSV, CSV, ASCII, full export, or ODS prompts.\n\
+- Export opens TSV, CSV, ASCII, full export, or ODS prompts; Alt+F vs Alt+V choose formulas (stored =…) or values (calculated) for that export.\n\
 - Width opens default width and per-column width prompts.\n\
 - Sort view changes the visible order of main rows.\n\
 - Exit opens the quit prompt.\n\n\
@@ -2182,6 +2187,8 @@ pub struct App {
     export_delimited_options: export::DelimitedExportOptions,
     /// Session-only. Applies to "ASCII table" export and its preview.
     export_ascii_options: export::AsciiTableOptions,
+    /// ODS only: [export::ExportContent::Formulas] matches legacy export (keeps ODF formulas).
+    export_ods_content: export::ExportContent,
     pub op_history: Vec<Op>,
     redo_history: Vec<Op>,
     selection_kind: SelectionKind,
@@ -2250,6 +2257,7 @@ impl App {
             export_preview_scroll: 0,
             export_delimited_options: export::DelimitedExportOptions::default(),
             export_ascii_options: export::AsciiTableOptions::default(),
+            export_ods_content: export::ExportContent::Formulas,
             op_history: Vec::new(),
             redo_history: Vec::new(),
             selection_kind: SelectionKind::Cells,
@@ -4673,7 +4681,8 @@ impl App {
 
     fn do_export_ods(&mut self) -> Vec<u8> {
         crate::formula::refresh_spills(&mut self.state.grid);
-        crate::ods::export_ods_bytes(&self.state.grid).unwrap_or_default()
+        crate::ods::export_ods_bytes_with_options(&self.state.grid, self.export_ods_content)
+            .unwrap_or_default()
     }
 
     fn save_to_path(&mut self, path: &Path) -> Result<(), RunError> {
@@ -4857,13 +4866,7 @@ impl App {
             return String::new();
         }
         let mut buf = Vec::new();
-        export::export_selection(
-            &self.state.grid,
-            &mut buf,
-            &rows,
-            &cols,
-            self.export_delimited_options.include_header_row,
-        );
+        export::export_selection(&self.state.grid, &mut buf, &rows, &cols, &self.export_delimited_options);
         String::from_utf8_lossy(&buf).into_owned()
     }
 
@@ -5735,9 +5738,13 @@ impl App {
                 } else {
                     "off"
                 };
+                let vf = match self.export_delimited_options.content {
+                    export::ExportContent::Values => "values",
+                    export::ExportContent::Formulas => "formulas",
+                };
                 format!(
-                    "  Alt+H·column header row {h}   Alt+M·margins {m}   Alt+R·left row# {r}   \
-↑/↓/k/j·scroll   PgUp/PgDn·page   path or empty+Enter=clipboard   Esc"
+                    "  Alt+F·formulas   Alt+V·values   ·{vf}   Alt+H·header {h}   Alt+M·margins {m}   \
+Alt+R·left row# {r}   ↑/↓/k/j·scroll   PgUp/PgDn·page   path or empty+Enter=clipboard   Esc"
                 )
             }
             Mode::ExportAscii { .. } => {
@@ -5775,14 +5782,24 @@ impl App {
                     AsciiHeaderDataSeparator::FullBorder => "border",
                     AsciiHeaderDataSeparator::None => "none",
                 };
+                let vf = match self.export_ascii_options.content {
+                    export::ExportContent::Values => "values",
+                    export::ExportContent::Formulas => "formulas",
+                };
                 format!(
-                    "  Alt+H·top A/B label row {a}   Alt+R·left row# column {r}   Alt+M·margins {m}   \
+                    "  Alt+F·formulas   Alt+V·values   ·{vf}   Alt+H·top A/B label row {a}   Alt+R·left row# column {r}   Alt+M·margins {m}   \
 Alt+O·data frame {f}   Alt+D·row rules {d}   Alt+E·padding {pad_letter} ({pad_desc})   \
 Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard   Esc"
                 )
             }
             Mode::ExportOdt { .. } => {
-                "  up/down·scroll   type .ods file path   Enter·save   Esc·cancel".into()
+                let vf = match self.export_ods_content {
+                    export::ExportContent::Values => "values",
+                    export::ExportContent::Formulas => "formulas",
+                };
+                format!(
+                    "  Alt+F·formulas   Alt+V·values   ·{vf}   up/down·scroll   type .ods path   Enter·save   Esc"
+                )
             }
             Mode::SetMaxColWidth { .. } => {
                 "  type default column width   Enter·apply   Esc·cancel".into()
@@ -6640,6 +6657,14 @@ Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard 
                                     "Left row# column: off".into()
                                 };
                             }
+                            'f' | 'F' => {
+                                self.export_delimited_options.content = export::ExportContent::Formulas;
+                                self.status = "Export: formulas (stored text)".into();
+                            }
+                            'v' | 'V' => {
+                                self.export_delimited_options.content = export::ExportContent::Values;
+                                self.status = "Export: values (calculated)".into();
+                            }
                             _ => {}
                         }
                     }
@@ -6705,6 +6730,14 @@ Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard 
                                 } else {
                                     "Left row# column: off".into()
                                 };
+                            }
+                            'f' | 'F' => {
+                                self.export_delimited_options.content = export::ExportContent::Formulas;
+                                self.status = "Export: formulas (stored text)".into();
+                            }
+                            'v' | 'V' => {
+                                self.export_delimited_options.content = export::ExportContent::Values;
+                                self.status = "Export: values (calculated)".into();
                             }
                             _ => {}
                         }
@@ -6821,6 +6854,14 @@ Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard 
                                     "ASCII: data frame: off".into()
                                 };
                             }
+                            'f' | 'F' => {
+                                self.export_ascii_options.content = export::ExportContent::Formulas;
+                                self.status = "Export: formulas (stored text)".into();
+                            }
+                            'v' | 'V' => {
+                                self.export_ascii_options.content = export::ExportContent::Values;
+                                self.status = "Export: values (calculated)".into();
+                            }
                             _ => {}
                         }
                     }
@@ -6867,40 +6908,58 @@ Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard 
                     }
                 }
             }
-            Mode::ExportOdt { buffer } => match key.code {
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.export_preview_scroll = self.export_preview_scroll.saturating_sub(1);
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    self.export_preview_scroll = self.export_preview_scroll.saturating_add(1);
-                }
-                KeyCode::PageUp => {
-                    self.export_preview_scroll = self.export_preview_scroll.saturating_sub(20);
-                }
-                KeyCode::PageDown => {
-                    self.export_preview_scroll = self.export_preview_scroll.saturating_add(20);
-                }
-                KeyCode::Enter => {
-                    let fname = buffer.clone();
-                    if fname.trim().is_empty() {
-                        self.status = "ODS requires a filename".into();
-                    } else {
-                        match std::fs::write(fname.trim(), self.do_export_ods()) {
-                            Ok(()) => self.status = format!("ODS saved to {}", fname.trim()),
-                            Err(e) => self.status = format!("Write error: {e}"),
+            Mode::ExportOdt { buffer } => {
+                if key.modifiers.contains(KeyModifiers::ALT) {
+                    if let KeyCode::Char(ch) = key.code {
+                        match ch {
+                            'f' | 'F' => {
+                                self.export_ods_content = export::ExportContent::Formulas;
+                                self.status = "ODS: formulas (ODF with table:formula)".into();
+                            }
+                            'v' | 'V' => {
+                                self.export_ods_content = export::ExportContent::Values;
+                                self.status = "ODS: values only (static cells)".into();
+                            }
+                            _ => {}
                         }
                     }
-                    self.input_cursor = None;
-                    mode = Mode::Normal;
+                } else {
+                    match key.code {
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            self.export_preview_scroll = self.export_preview_scroll.saturating_sub(1);
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            self.export_preview_scroll = self.export_preview_scroll.saturating_add(1);
+                        }
+                        KeyCode::PageUp => {
+                            self.export_preview_scroll = self.export_preview_scroll.saturating_sub(20);
+                        }
+                        KeyCode::PageDown => {
+                            self.export_preview_scroll = self.export_preview_scroll.saturating_add(20);
+                        }
+                        KeyCode::Enter => {
+                            let fname = buffer.clone();
+                            if fname.trim().is_empty() {
+                                self.status = "ODS requires a filename".into();
+                            } else {
+                                match std::fs::write(fname.trim(), self.do_export_ods()) {
+                                    Ok(()) => self.status = format!("ODS saved to {}", fname.trim()),
+                                    Err(e) => self.status = format!("Write error: {e}"),
+                                }
+                            }
+                            self.input_cursor = None;
+                            mode = Mode::Normal;
+                        }
+                        KeyCode::Esc => mode = Mode::Normal,
+                        _ if Self::handle_plain_text_input_key(
+                            buffer,
+                            &mut self.input_cursor,
+                            key.code,
+                        ) => {}
+                        _ => {}
+                    }
                 }
-                KeyCode::Esc => mode = Mode::Normal,
-                _ if Self::handle_plain_text_input_key(
-                    buffer,
-                    &mut self.input_cursor,
-                    key.code,
-                ) => {}
-                _ => {}
-            },
+            }
             Mode::ExportAll { buffer } => {
                 if key.modifiers.contains(KeyModifiers::ALT) {
                     if let KeyCode::Char(ch) = key.code {
@@ -6933,6 +6992,14 @@ Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard 
                                 } else {
                                     "Left row# column: off".into()
                                 };
+                            }
+                            'f' | 'F' => {
+                                self.export_delimited_options.content = export::ExportContent::Formulas;
+                                self.status = "Export: formulas (stored text)".into();
+                            }
+                            'v' | 'V' => {
+                                self.export_delimited_options.content = export::ExportContent::Values;
+                                self.status = "Export: values (calculated)".into();
                             }
                             _ => {}
                         }
@@ -7950,6 +8017,7 @@ Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard 
                     }
                     KeyCode::Char('t') => {
                         self.export_preview_scroll = 0;
+                        self.export_delimited_options.content = export::ExportContent::Values;
                         mode = Mode::ExportTsv {
                             buffer: self
                                 .start_input_mode(self.suggested_export_save_path("tsv")),
@@ -8001,6 +8069,7 @@ Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard 
                             }
                         } else {
                             self.export_preview_scroll = 0;
+                            self.export_delimited_options.content = export::ExportContent::Values;
                             mode = Mode::ExportCsv {
                                 buffer: self
                                     .start_input_mode(self.suggested_export_save_path("csv")),
@@ -8417,7 +8486,7 @@ Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard 
                         &mut buf,
                         &rows,
                         &cols,
-                        self.export_delimited_options.include_header_row,
+                        &self.export_delimited_options,
                     );
                     Some((
                         String::from_utf8_lossy(&buf).into_owned(),
@@ -8434,12 +8503,19 @@ Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard 
                     ))
                 }
             }
-            Mode::ExportOdt { .. } => Some((
-                "OpenDocument (.ods) is a binary ZIP package.\n\nThere is no text preview. Type a file path and press Enter to save."
-                    .to_string(),
-                " Export ODS ",
-                false,
-            )),
+            Mode::ExportOdt { .. } => {
+                let mode = match self.export_ods_content {
+                    export::ExportContent::Values => "values only (static)",
+                    export::ExportContent::Formulas => "formulas (with ODF formula attributes)",
+                };
+                Some((
+                    format!(
+                        "OpenDocument (.ods) is a binary ZIP package.\n\nExport: {mode}. There is no text preview. Type a file path and press Enter to save."
+                    ),
+                    " Export ODS ",
+                    false,
+                ))
+            }
             _ => None,
         }
     }
