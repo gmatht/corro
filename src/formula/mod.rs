@@ -1,7 +1,7 @@
 //! `=...` cell formulas: parse, evaluate, display.
 
 use crate::addr::{excel_column_name, parse_cell_ref_at, parse_main_range_at};
-use crate::grid::{CellAddr, Grid, MainRange, HEADER_ROWS, MARGIN_COLS};
+use crate::grid::{CellAddr, GridBox as Grid, MainRange, HEADER_ROWS, MARGIN_COLS};
 use crate::ops::WorkbookState;
 use std::cell::RefCell;
 
@@ -265,11 +265,13 @@ fn translate_cell_addr_by_offset(
             col: shift_u32(*col, col_delta)?,
         }),
         CellAddr::Left { col, row } => Some(CellAddr::Left {
-            col: shift_u32(*col as u32, col_delta)? as u8,
+            // Margin indices are now usize (MarginIndex). Shift via u32 and cast
+            // back to usize to preserve range while using existing shift helper.
+            col: shift_u32(*col as u32, col_delta)? as usize,
             row: shift_u32(*row, row_delta)?,
         }),
         CellAddr::Right { col, row } => Some(CellAddr::Right {
-            col: shift_u32(*col as u32, col_delta)? as u8,
+            col: shift_u32(*col as u32, col_delta)? as usize,
             row: shift_u32(*row, row_delta)?,
         }),
     }
@@ -460,13 +462,15 @@ fn rewrite_row_template(expr: &str, col: usize) -> String {
 }
 
 fn control_formula_expr(grid: &Grid, addr: &CellAddr) -> Option<String> {
-    let raw = grid.get(addr)?;
+    let raw_owned = grid.get(addr);
+    let raw = raw_owned.as_deref()?;
     let (expr, _label) = split_labeled_formula(raw)?;
     Some(expr.to_string())
 }
 
 fn control_formula_label(grid: &Grid, addr: &CellAddr) -> Option<String> {
-    let raw = grid.get(addr)?;
+    let raw_owned = grid.get(addr);
+    let raw = raw_owned.as_deref()?;
     let (_expr, label) = split_labeled_formula(raw)?;
     Some(label.to_string())
 }
@@ -485,7 +489,7 @@ fn templated_formula(grid: &Grid, addr: &CellAddr) -> Option<String> {
     }
 
     let left_addr = CellAddr::Left {
-        col: (MARGIN_COLS - 1) as u8,
+        col: MARGIN_COLS - 1,
         row: *row,
     };
     if let Some(expr) = control_formula_expr(grid, &left_addr) {
@@ -507,7 +511,8 @@ pub fn effective_numeric(
     visiting: &mut Vec<CellAddr>,
     budget: &mut usize,
 ) -> Option<f64> {
-    let raw = grid.get(addr).unwrap_or("");
+    let raw_owned = grid.get(addr);
+    let raw = raw_owned.as_deref().unwrap_or("");
     if templated_formula(grid, addr).is_none() && !is_formula(raw) {
         return functions::parse_numeric_or_date_literal(raw);
     }
@@ -541,7 +546,8 @@ fn eval_cell_with_sheet(
     if *budget == 0 {
         return EvalResult::Error("LIMIT");
     }
-    let raw = grid.get(addr).unwrap_or("");
+    let raw_owned = grid.get(addr);
+    let raw = raw_owned.as_deref().unwrap_or("");
     let t = raw.trim();
     if t.is_empty() {
         return EvalResult::Number(0.0);
@@ -594,7 +600,8 @@ fn eval_cell_inner(
         }
     }
 
-    let raw = grid.get(addr).unwrap_or("");
+    let raw_owned = grid.get(addr);
+    let raw = raw_owned.as_deref().unwrap_or("");
     let t = raw.trim();
     if t.is_empty() {
         return EvalResult::Number(0.0);
@@ -1231,23 +1238,11 @@ fn sum_main_range(
 }
 
 pub fn refresh_spills(grid: &mut Grid) {
-    let mut prev_followers = grid.spill_followers.clone();
-    let mut prev_errors = grid.spill_errors.clone();
+    let mut prev_followers: Vec<(CellAddr, String)> = grid.spill_followers().into_iter().collect();
+    let mut prev_errors: Vec<(CellAddr, &'static str)> = grid.spill_errors().into_iter().collect();
     for _ in 0..8 {
         grid.clear_spills();
-        let mut anchors: Vec<(CellAddr, String)> = grid
-            .main_cells
-            .iter()
-            .map(|((row, col), value)| {
-                (
-                    CellAddr::Main {
-                        row: *row,
-                        col: *col,
-                    },
-                    value.clone(),
-                )
-            })
-            .collect();
+        let mut anchors: Vec<(CellAddr, String)> = grid.iter_nonempty().collect();
         anchors.sort_by_key(|(addr, _)| match addr {
             CellAddr::Main { row, col } => (*row, *col),
             _ => (u32::MAX, u32::MAX),
@@ -1278,11 +1273,11 @@ pub fn refresh_spills(grid: &mut Grid) {
                 }
             }
         }
-        if grid.spill_followers == prev_followers && grid.spill_errors == prev_errors {
+        if grid.spill_followers() == prev_followers && grid.spill_errors() == prev_errors {
             break;
         }
-        prev_followers = grid.spill_followers.clone();
-        prev_errors = grid.spill_errors.clone();
+        prev_followers = grid.spill_followers();
+        prev_errors = grid.spill_errors();
     }
 }
 
@@ -1313,10 +1308,11 @@ pub fn cell_effective_display(grid: &Grid, addr: &CellAddr) -> String {
     if let Some(err) = grid.spill_error(addr) {
         return format!("#{err}");
     }
-    if let Some(v) = grid.spill_followers.get(addr) {
-        return v.clone();
+    if let Some(v) = grid.spill_followers().into_iter().find(|(a, _)| a == addr).map(|(_, v)| v) {
+        return v;
     }
-    let raw = grid.get(addr).unwrap_or("");
+    let raw_owned = grid.get(addr);
+    let raw = raw_owned.as_deref().unwrap_or("");
     if templated_formula(grid, addr).is_none() && !is_formula(raw) {
         return raw.to_string();
     }
@@ -1369,7 +1365,7 @@ mod tests {
 
     #[test]
     fn formula_add() {
-        let mut g = Grid::new(2, 2);
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(2, 2));
         g.set(&CellAddr::Main { row: 0, col: 0 }, "=1+2*3".into());
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
@@ -1381,7 +1377,7 @@ mod tests {
 
     #[test]
     fn formula_pow() {
-        let mut g = Grid::new(1, 1);
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(1, 1));
         g.set(&CellAddr::Main { row: 0, col: 0 }, "=2^3".into());
         g.set(&CellAddr::Main { row: 0, col: 1 }, "=4^0.5".into());
         let mut v = Vec::new();
@@ -1406,7 +1402,7 @@ mod tests {
 
     #[test]
     fn power_is_right_associative() {
-        let mut g = Grid::new(1, 1);
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(1, 1));
         g.set(&CellAddr::Main { row: 0, col: 0 }, "=2^3^2".into());
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
@@ -1418,7 +1414,7 @@ mod tests {
 
     #[test]
     fn unary_minus_binds_weaker_than_power() {
-        let mut g = Grid::new(1, 1);
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(1, 1));
         g.set(&CellAddr::Main { row: 0, col: 0 }, "=-2^2".into());
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
@@ -1430,7 +1426,7 @@ mod tests {
 
     #[test]
     fn sum_range_with_formula_cells() {
-        let mut g = Grid::new(2, 2);
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(2, 2));
         g.set(&CellAddr::Main { row: 0, col: 0 }, "2".into());
         g.set(&CellAddr::Main { row: 0, col: 1 }, "=A1+3".into());
         g.set(&CellAddr::Main { row: 1, col: 0 }, "=sum(A1:B1)".into());
@@ -1444,7 +1440,7 @@ mod tests {
 
     #[test]
     fn quoted_text_literal_parses() {
-        let mut g = Grid::new(1, 1);
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(1, 1));
         g.set(&CellAddr::Main { row: 0, col: 0 }, "=\"hi\"".into());
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
@@ -1456,7 +1452,7 @@ mod tests {
 
     #[test]
     fn quoted_text_escape_parses() {
-        let mut g = Grid::new(1, 1);
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(1, 1));
         g.set(&CellAddr::Main { row: 0, col: 0 }, "=\"a\"\"b\"".into());
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
@@ -1468,7 +1464,7 @@ mod tests {
 
     #[test]
     fn let_binds_names() {
-        let mut g = Grid::new(1, 1);
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(1, 1));
         g.set(
             &CellAddr::Main { row: 0, col: 0 },
             "=LET(x, 2, y, x + 3, x + y)".into(),
@@ -1483,7 +1479,7 @@ mod tests {
 
     #[test]
     fn let_supports_shadowing() {
-        let mut g = Grid::new(1, 1);
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(1, 1));
         g.set(
             &CellAddr::Main { row: 0, col: 0 },
             "=LET(x, 1, x, x + 2, x)".into(),
@@ -1510,7 +1506,7 @@ mod tests {
 
     #[test]
     fn math_constants_evaluate() {
-        let mut g = Grid::new(1, 3);
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(1, 3));
         g.set(&CellAddr::Main { row: 0, col: 0 }, "=sin(π)".into());
         g.set(&CellAddr::Main { row: 0, col: 1 }, "=e".into());
         g.set(&CellAddr::Main { row: 0, col: 2 }, "=c".into());
@@ -1539,7 +1535,7 @@ mod tests {
 
     #[test]
     fn let_can_shadow_pi_constant() {
-        let mut g = Grid::new(1, 1);
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(1, 1));
         g.set(
             &CellAddr::Main { row: 0, col: 0 },
             "=LET(π, 2, π + 1)".into(),
@@ -1561,7 +1557,7 @@ mod tests {
             main_cols: 0,
         };
         assert!(p.parse_expr().is_ok());
-        let mut g = Grid::new(1, 1);
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(1, 1));
         g.set(&CellAddr::Main { row: 0, col: 0 }, "=x".into());
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
@@ -1573,7 +1569,7 @@ mod tests {
 
     #[test]
     fn countif_quoted_text_criteria() {
-        let mut g = Grid::new(1, 3);
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(1, 3));
         g.set(&CellAddr::Main { row: 0, col: 0 }, "a".into());
         g.set(&CellAddr::Main { row: 0, col: 1 }, "b".into());
         g.set(
@@ -1590,7 +1586,7 @@ mod tests {
 
     #[test]
     fn xlookup_exact_match() {
-        let mut g = Grid::new(1, 5);
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(1, 5));
         g.set(&CellAddr::Main { row: 0, col: 0 }, "b".into());
         g.set(&CellAddr::Main { row: 0, col: 1 }, "a".into());
         g.set(&CellAddr::Main { row: 0, col: 2 }, "20".into());
@@ -1609,7 +1605,7 @@ mod tests {
 
     #[test]
     fn xlookup_if_not_found() {
-        let mut g = Grid::new(1, 4);
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(1, 4));
         g.set(&CellAddr::Main { row: 0, col: 0 }, "a".into());
         g.set(&CellAddr::Main { row: 0, col: 1 }, "10".into());
         g.set(&CellAddr::Main { row: 0, col: 2 }, "30".into());
@@ -1627,7 +1623,7 @@ mod tests {
 
     #[test]
     fn sequence_spills() {
-        let mut g = Grid::new(1, 1);
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(1, 1));
         g.set(
             &CellAddr::Main { row: 0, col: 0 },
             "=SEQUENCE(2,2,1,1)".into(),
@@ -1653,7 +1649,7 @@ mod tests {
 
     #[test]
     fn unique_deduplicates() {
-        let mut g = Grid::new(1, 4);
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(1, 4));
         g.set(&CellAddr::Main { row: 0, col: 0 }, "a".into());
         g.set(&CellAddr::Main { row: 0, col: 1 }, "a".into());
         g.set(&CellAddr::Main { row: 0, col: 2 }, "b".into());
@@ -1671,7 +1667,7 @@ mod tests {
 
     #[test]
     fn filter_applies_mask() {
-        let mut g = Grid::new(1, 4);
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(1, 4));
         g.set(&CellAddr::Main { row: 0, col: 0 }, "a".into());
         g.set(&CellAddr::Main { row: 0, col: 1 }, "b".into());
         g.set(&CellAddr::Main { row: 0, col: 2 }, "1".into());
@@ -1688,7 +1684,7 @@ mod tests {
 
     #[test]
     fn iferror_and_ifna() {
-        let mut g = Grid::new(1, 4);
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(1, 4));
         g.set(&CellAddr::Main { row: 0, col: 0 }, "1".into());
         g.set(&CellAddr::Main { row: 0, col: 1 }, "2".into());
         g.set(
@@ -1715,7 +1711,7 @@ mod tests {
 
     #[test]
     fn index_and_match_work() {
-        let mut g = Grid::new(2, 4);
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(2, 4));
         g.set(&CellAddr::Main { row: 0, col: 0 }, "a".into());
         g.set(&CellAddr::Main { row: 0, col: 1 }, "b".into());
         g.set(&CellAddr::Main { row: 1, col: 0 }, "c".into());
@@ -1744,7 +1740,7 @@ mod tests {
 
     #[test]
     fn countifs_sumifs_averageifs_work() {
-        let mut g = Grid::new(2, 4);
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(2, 4));
         g.set(&CellAddr::Main { row: 0, col: 0 }, "a".into());
         g.set(&CellAddr::Main { row: 0, col: 1 }, "1".into());
         g.set(&CellAddr::Main { row: 1, col: 0 }, "a".into());
@@ -1783,7 +1779,7 @@ mod tests {
 
     #[test]
     fn sort_take_drop_choose_work() {
-        let mut g = Grid::new(4, 9);
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(4, 9));
         g.set(&CellAddr::Main { row: 0, col: 0 }, "3".into());
         g.set(&CellAddr::Main { row: 1, col: 0 }, "1".into());
         g.set(&CellAddr::Main { row: 2, col: 0 }, "2".into());
@@ -1849,7 +1845,7 @@ mod tests {
 
     #[test]
     fn text_functions_work() {
-        let mut g = Grid::new(1, 5);
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(1, 5));
         g.set(&CellAddr::Main { row: 0, col: 0 }, "=LEN(\"abc\")".into());
         g.set(
             &CellAddr::Main { row: 0, col: 1 },
@@ -1901,7 +1897,7 @@ mod tests {
 
     #[test]
     fn text_casing_and_replace_work() {
-        let mut g = Grid::new(1, 7);
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(1, 7));
         g.set(&CellAddr::Main { row: 0, col: 0 }, "=UPPER(\"Abc\")".into());
         g.set(&CellAddr::Main { row: 0, col: 1 }, "=LOWER(\"AbC\")".into());
         g.set(
@@ -1970,7 +1966,7 @@ mod tests {
 
     #[test]
     fn text_formatting_works() {
-        let mut g = Grid::new(1, 1);
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(1, 1));
         g.set(
             &CellAddr::Main { row: 0, col: 0 },
             "=TEXT(12.345,\"0.00\")".into(),
@@ -1985,7 +1981,7 @@ mod tests {
 
     #[test]
     fn date_time_functions_work() {
-        let mut g = Grid::new(1, 7);
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(1, 7));
         g.set(&CellAddr::Main { row: 0, col: 0 }, "2024-01-02".into());
         g.set(&CellAddr::Main { row: 0, col: 1 }, "=A1+1".into());
         g.set(&CellAddr::Main { row: 0, col: 2 }, "=YEAR(A1)".into());
@@ -2033,7 +2029,7 @@ mod tests {
 
     #[test]
     fn rand_is_deterministic_per_seed() {
-        let mut g = Grid::new(1, 2);
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(1, 2));
         g.set(&CellAddr::Main { row: 0, col: 0 }, "=RAND()".into());
         g.set(
             &CellAddr::Main { row: 0, col: 1 },
@@ -2071,7 +2067,7 @@ mod tests {
 
     #[test]
     fn practical_batch_functions_work() {
-        let mut g = Grid::new(3, 8);
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(3, 8));
         g.set(&CellAddr::Main { row: 0, col: 0 }, "a".into());
         g.set(&CellAddr::Main { row: 0, col: 1 }, "".into());
         g.set(&CellAddr::Main { row: 1, col: 0 }, "1".into());
@@ -2141,7 +2137,7 @@ mod tests {
 
     #[test]
     fn sortby_spills_sorted_rows() {
-        let mut g = Grid::new(3, 6);
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(3, 6));
         g.set(&CellAddr::Main { row: 0, col: 0 }, "b".into());
         g.set(&CellAddr::Main { row: 1, col: 0 }, "a".into());
         g.set(&CellAddr::Main { row: 2, col: 0 }, "c".into());
@@ -2169,7 +2165,7 @@ mod tests {
 
     #[test]
     fn sumproduct_works() {
-        let mut g = Grid::new(2, 3);
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(2, 3));
         g.set(&CellAddr::Main { row: 0, col: 0 }, "1".into());
         g.set(&CellAddr::Main { row: 0, col: 1 }, "2".into());
         g.set(&CellAddr::Main { row: 1, col: 0 }, "3".into());
@@ -2188,7 +2184,7 @@ mod tests {
 
     #[test]
     fn ifs_works() {
-        let mut g = Grid::new(1, 1);
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(1, 1));
         g.set(&CellAddr::Main { row: 0, col: 0 }, "=IFS(0,1,1,2)".into());
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
@@ -2200,7 +2196,7 @@ mod tests {
 
     #[test]
     fn xmatch_works() {
-        let mut g = Grid::new(1, 4);
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(1, 4));
         g.set(&CellAddr::Main { row: 0, col: 0 }, "a".into());
         g.set(&CellAddr::Main { row: 0, col: 1 }, "b".into());
         g.set(&CellAddr::Main { row: 0, col: 2 }, "c".into());
@@ -2218,7 +2214,7 @@ mod tests {
 
     #[test]
     fn boolean_functions_work() {
-        let mut g = Grid::new(1, 3);
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(1, 3));
         g.set(&CellAddr::Main { row: 0, col: 0 }, "=AND(1,2,3)".into());
         g.set(&CellAddr::Main { row: 0, col: 1 }, "=OR(0,0,1)".into());
         g.set(&CellAddr::Main { row: 0, col: 2 }, "=NOT(0)".into());
@@ -2298,7 +2294,7 @@ mod tests {
 
     #[test]
     fn circular_ref() {
-        let mut g = Grid::new(1, 2);
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(1, 2));
         g.set(&CellAddr::Main { row: 0, col: 0 }, "=B1".into());
         g.set(&CellAddr::Main { row: 0, col: 1 }, "=A1".into());
         let mut v = Vec::new();
@@ -2311,7 +2307,7 @@ mod tests {
 
     #[test]
     fn if_func() {
-        let mut g = Grid::new(1, 3);
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(1, 3));
         g.set(&CellAddr::Main { row: 0, col: 0 }, "0".into());
         g.set(&CellAddr::Main { row: 0, col: 2 }, "=IF(A1,1,2)".into());
         let mut v = Vec::new();
@@ -2324,7 +2320,7 @@ mod tests {
 
     #[test]
     fn header_template_label_is_display_only() {
-        let mut g = Grid::new(2, 2);
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(2, 2));
         g.set(
             &CellAddr::Header {
                 row: 25,
@@ -2357,7 +2353,7 @@ mod tests {
 
     #[test]
     fn left_margin_template_can_label_rows() {
-        let mut g = Grid::new(2, 2);
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(2, 2));
         g.set(&CellAddr::Left { col: 9, row: 0 }, "=:1*0.1 -- TAX".into());
         g.set(&CellAddr::Main { row: 0, col: 0 }, "10".into());
         let mut v = Vec::new();

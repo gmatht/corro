@@ -1,7 +1,7 @@
 //! Book balancing by row reordering.
 
 use crate::formula::{cell_effective_display, translate_formula_text, FormulaCopyContext};
-use crate::grid::{CellAddr, Grid};
+use crate::grid::{CellAddr, GridBox as Grid};
 use crate::ops::SheetState;
 use balance_core as core;
 
@@ -58,10 +58,12 @@ pub fn choose_balance_column(grid: &Grid) -> Option<usize> {
                 row: row as u32,
                 col: col as u32,
             };
-            if let Some(amount) = parse_amount_cents(grid.get(&addr).unwrap_or("")) {
-                first_numeric.get_or_insert(col);
-                saw_pos |= amount > 0;
-                saw_neg |= amount < 0;
+            if let Some(raw) = grid.get(&addr) {
+                if let Some(amount) = parse_amount_cents(&raw) {
+                    first_numeric.get_or_insert(col);
+                    saw_pos |= amount > 0;
+                    saw_neg |= amount < 0;
+                }
             }
             if saw_pos && saw_neg {
                 return Some(col);
@@ -78,7 +80,7 @@ pub fn source_rows_from_grid(grid: &Grid, col: usize) -> Vec<BalanceSourceRow> {
             row: row as u32,
             col: col as u32,
         };
-        let amount = parse_amount_cents(grid.get(&amount_addr).unwrap_or("")).unwrap_or(0);
+        let amount = grid.get(&amount_addr).and_then(|s| parse_amount_cents(&s)).unwrap_or(0);
         rows.push(BalanceSourceRow {
             row_index: row,
             amount_cents: amount,
@@ -156,11 +158,10 @@ pub fn apply_balance_copy(source: &SheetState, target: &mut SheetState, plan: &B
     target
         .grid
         .set_main_size(mr.saturating_add(extra_row).max(1), mc.max(1));
-    target.grid.main_cells.clear();
-    target.grid.left.clear();
-    target.grid.right.clear();
+    // Clear cell storage and spills on the target (use GridBox API).
+    target.grid.clear_cells();
     target.grid.clear_spills();
-    target.grid.view_sort_cols.clear();
+    target.grid.set_view_sort_cols(Vec::new());
 
     let mut row_map = vec![0u32; mr];
     for (new_row, &old_row) in plan.row_order.iter().enumerate() {
@@ -181,13 +182,14 @@ pub fn apply_balance_copy(source: &SheetState, target: &mut SheetState, plan: &B
 
     let copy_cell =
         |src: &SheetState, dst: &mut SheetState, src_addr: CellAddr, dst_addr: CellAddr| {
-            if let Some(raw) = src.grid.get(&src_addr) {
-                let value = if plan.preserve_formulas && raw.trim_start().starts_with('=') {
-                    translate_formula_text(raw, &ctx)
-                        .unwrap_or_else(|| cell_effective_display(&src.grid, &src_addr))
-                } else {
-                    raw.to_string()
-                };
+                if let Some(raw) = src.grid.get(&src_addr) {
+                    let value = if plan.preserve_formulas && raw.trim_start().starts_with('=') {
+                        // translate_formula_text expects &str; borrow the owned String
+                        translate_formula_text(&raw, &ctx)
+                            .unwrap_or_else(|| cell_effective_display(&src.grid, &src_addr))
+                    } else {
+                        raw.to_string()
+                    };
                 if !value.is_empty() {
                     dst.grid.set(&dst_addr, value);
                 }
@@ -220,24 +222,12 @@ pub fn apply_balance_copy(source: &SheetState, target: &mut SheetState, plan: &B
             copy_cell(source, target, src_addr, dst_addr);
         }
         for col in 0..crate::grid::MARGIN_COLS {
-            let src_left = CellAddr::Left {
-                col: col as u8,
-                row: src_row as u32,
-            };
-            let dst_left = CellAddr::Left {
-                col: col as u8,
-                row: dst_row,
-            };
+            let src_left = CellAddr::Left { col, row: src_row as u32 };
+            let dst_left = CellAddr::Left { col, row: dst_row };
             copy_cell(source, target, src_left, dst_left);
 
-            let src_right = CellAddr::Right {
-                col: col as u8,
-                row: src_row as u32,
-            };
-            let dst_right = CellAddr::Right {
-                col: col as u8,
-                row: dst_row,
-            };
+            let src_right = CellAddr::Right { col, row: src_row as u32 };
+            let dst_right = CellAddr::Right { col, row: dst_row };
             copy_cell(source, target, src_right, dst_right);
         }
     }
@@ -266,9 +256,13 @@ pub fn apply_balance_copy(source: &SheetState, target: &mut SheetState, plan: &B
         }
     }
 
-    target.grid.max_col_width = source.grid.max_col_width;
-    target.grid.col_width_overrides = source.grid.col_width_overrides.clone();
-    target.grid.volatile_seed = 0;
+    target
+        .grid
+        .set_max_col_width(source.grid.max_col_width());
+    target
+        .grid
+        .set_col_width_overrides(source.grid.col_width_overrides());
+    target.grid.set_volatile_seed(0);
 }
 
 pub fn materialize_report_sheet(source: &SheetState, plan: &BalanceCopyPlan) -> SheetState {

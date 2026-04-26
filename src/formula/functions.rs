@@ -1,7 +1,7 @@
 use super::{
     eval_ast, eval_binary, eval_cell_inner, eval_sum, parse_number_literal, Ast, EvalResult,
 };
-use crate::grid::{CellAddr, Grid, MainRange};
+use crate::grid::{CellAddr, GridBox as Grid, MainRange};
 use chrono::{Datelike, Local, NaiveDate, NaiveDateTime, Timelike};
 use std::hash::{Hash, Hasher};
 
@@ -1179,7 +1179,7 @@ fn current_addr_hash(visiting: &[CellAddr]) -> Option<u64> {
 
 fn deterministic_rand(grid: &Grid, c: Option<u64>, a: Option<u64>, b: Option<u64>) -> f64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    Hash::hash(&grid.volatile_seed, &mut hasher);
+    Hash::hash(&grid.volatile_seed(), &mut hasher);
     Hash::hash(&c, &mut hasher);
     Hash::hash(&a, &mut hasher);
     Hash::hash(&b, &mut hasher);

@@ -9,7 +9,7 @@
 //! `crate::grid::CellAddr` so we can migrate incrementally without changing
 //! Grid's storage layout.
 
-use crate::grid::{CellAddr, HEADER_ROWS, MARGIN_COLS};
+use crate::grid::{CellAddr, HEADER_ROWS, MARGIN_COLS, MarginIndex};
 use std::fmt;
 
 /// Row region with 1-based textual index.
@@ -21,12 +21,12 @@ pub enum RowRegion {
 }
 
 /// Column region with 1-based indices for ``Data`` and ``Global`` using
-/// human/textual numbers; left/right margins are small indices (0..9).
+/// human/textual numbers; left/right margins are MarginIndex (usize).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ColRegion {
-    Left(u8),    // <0.. <9 mirror index
+    Left(MarginIndex),    // < margin index (usize)
     Data(u32),   // A=1, B=2, ... (1-based main-column index)
-    Right(u8),   // >0..>9 mirror index
+    Right(MarginIndex),   // > margin index (usize)
     Global(u32), // absolute global column index
 }
 
@@ -58,12 +58,12 @@ impl fmt::Display for ColRegion {
             ColRegion::Left(i) => write!(
                 f,
                 "[{}",
-                super::addr::mirror_margin_column_name(*i as usize, true)
+                super::addr::mirror_margin_column_name(*i, true)
             ),
             ColRegion::Right(i) => write!(
                 f,
                 "]{}",
-                super::addr::mirror_margin_column_name(*i as usize, false)
+                super::addr::mirror_margin_column_name(*i, false)
             ),
             ColRegion::Data(n) => write!(f, "{}", super::addr::excel_column_name(*n as usize - 1)),
             ColRegion::Global(g) => write!(f, "{}", super::addr::excel_column_name(*g as usize)),
@@ -79,11 +79,11 @@ impl CellRef {
         let col_text = match &self.col {
             ColRegion::Left(i) => format!(
                 "[{}",
-                super::addr::mirror_margin_column_name(*i as usize, true)
+                super::addr::mirror_margin_column_name(*i, true)
             ),
             ColRegion::Right(i) => format!(
                 "]{}",
-                super::addr::mirror_margin_column_name(*i as usize, false)
+                super::addr::mirror_margin_column_name(*i, false)
             ),
             ColRegion::Data(n) => super::addr::excel_column_name(*n as usize - 1),
             ColRegion::Global(g) => super::addr::excel_column_name(*g as usize),
@@ -134,11 +134,11 @@ impl CellRef {
             },
 
             (RowRegion::Data(rr), ColRegion::Left(i)) => CellAddr::Left {
-                col: *i as u8,
+                col: *i,
                 row: (*rr as u32 - 1),
             },
             (RowRegion::Data(rr), ColRegion::Right(i)) => CellAddr::Right {
-                col: *i as u8,
+                col: *i,
                 row: (*rr as u32 - 1),
             },
             (RowRegion::Data(rr), ColRegion::Data(n)) => CellAddr::Main {
@@ -150,7 +150,7 @@ impl CellRef {
                 let gc = *g as usize;
                 if gc < MARGIN_COLS {
                     CellAddr::Left {
-                        col: gc as u8,
+                        col: gc,
                         row: (*rr as u32 - 1),
                     }
                 } else if gc < MARGIN_COLS + main_cols {
@@ -160,7 +160,7 @@ impl CellRef {
                     }
                 } else {
                     CellAddr::Right {
-                        col: (gc - MARGIN_COLS - main_cols) as u8,
+                        col: (gc - MARGIN_COLS - main_cols),
                         row: (*rr as u32 - 1),
                     }
                 }
@@ -176,7 +176,7 @@ impl CellRef {
                 if c < MARGIN_COLS {
                     CellRef {
                         row: RowRegion::Header((HEADER_ROWS - *row as usize) as u32),
-                        col: ColRegion::Left(*col as u8),
+                        col: ColRegion::Left(*col as usize),
                         raw_col_fragment: Some(super::addr::mirror_margin_column_name(
                             *col as usize,
                             true,
@@ -193,7 +193,7 @@ impl CellRef {
                 } else {
                     CellRef {
                         row: RowRegion::Header((HEADER_ROWS - *row as usize) as u32),
-                        col: ColRegion::Right((c - MARGIN_COLS - main_cols) as u8),
+                        col: ColRegion::Right((c - MARGIN_COLS - main_cols) as usize),
                         raw_col_fragment: Some(super::addr::mirror_margin_column_name(
                             c - MARGIN_COLS - main_cols,
                             false,
@@ -207,7 +207,7 @@ impl CellRef {
                 if c < MARGIN_COLS {
                     CellRef {
                         row: RowRegion::Footer(*row as u32 + 1),
-                        col: ColRegion::Left(*col as u8),
+                        col: ColRegion::Left(*col as usize),
                         raw_col_fragment: Some(super::addr::mirror_margin_column_name(
                             *col as usize,
                             true,
@@ -224,7 +224,7 @@ impl CellRef {
                 } else {
                     CellRef {
                         row: RowRegion::Footer(*row as u32 + 1),
-                        col: ColRegion::Right((c - MARGIN_COLS - main_cols) as u8),
+                        col: ColRegion::Right((c - MARGIN_COLS - main_cols) as usize),
                         raw_col_fragment: Some(super::addr::mirror_margin_column_name(
                             c - MARGIN_COLS - main_cols,
                             false,
@@ -274,13 +274,11 @@ impl CellRef {
             _ => (None, s, 0usize),
         };
 
-        let col_len = if prefix.is_some() {
-            let len = rest.chars().take_while(|c| c.is_ascii_uppercase()).count();
-            if len != 1 {
-                return None;
-            }
-            len
-        } else {
+        // Accept one-or-more uppercase letters for the column fragment
+        // regardless of whether a bracket prefix was present. The older
+        // implementation required exactly one letter when a bracket was
+        // used; that prevented multi-letter mirror margin names like "AA".
+        let col_len = {
             let len = rest.chars().take_while(|c| c.is_ascii_uppercase()).count();
             if len == 0 {
                 return None;

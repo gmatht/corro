@@ -28,9 +28,15 @@ pub fn excel_column_name(main_col_index: usize) -> String {
 
 /// 10-column margin label (`A` nearest the main grid, `J` farthest).
 pub fn mirror_margin_column_name(margin_col_index: usize, left_side: bool) -> String {
-    let idx = margin_col_index.min(9);
-    let idx = if left_side { 9 - idx } else { idx };
-    ((b'A' + idx as u8) as char).to_string()
+    // Map the margin_col_index (0..MARGIN_COLS-1) into a letter sequence.
+    // If left_side is true, mirror the index (so 0 -> last, as in previous
+    // behavior for small margins).
+    let max = crate::grid::MARGIN_COLS;
+    let idx = margin_col_index.min(max.saturating_sub(1));
+    let mapped = if left_side { max.saturating_sub(1).saturating_sub(idx) } else { idx };
+    // Use excel-style column naming for the mapped index (0 -> A, 25 -> Z,
+    // 26 -> AA, ...). Reuse excel_column_name which is 0-based.
+    excel_column_name(mapped)
 }
 
 /// UI-style column fragment for display and formulas.
@@ -111,21 +117,22 @@ pub fn parse_sheet_qualified_cell_ref_at(
     Some((sheet_id, addr, prefix_len + 1 + addr_len))
 }
 
-pub(crate) fn parse_mirror_margin_column_name(name: &str, left_side: bool) -> Option<u8> {
-    let mut chars = name.chars();
-    let ch = chars.next()?;
-    if chars.next().is_some() || !ch.is_ascii_uppercase() {
+pub(crate) fn parse_mirror_margin_column_name(name: &str, left_side: bool) -> Option<usize> {
+    // Accept multi-letter uppercase sequences and parse them like Excel
+    // columns, then map according to left_side mirroring.
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_uppercase()) {
         return None;
     }
-    let idx = (ch as u8 - b'A') as usize;
-    if idx > 9 {
+    let parsed = parse_excel_column(name)? as usize; // 0-based
+    if parsed >= crate::grid::MARGIN_COLS {
         return None;
     }
-    Some(if left_side {
-        (9 - idx) as u8
+    let mapped = if left_side {
+        crate::grid::MARGIN_COLS - 1 - parsed
     } else {
-        idx as u8
-    })
+        parsed
+    };
+    Some(mapped)
 }
 
 /// Parse one cell reference at the start of `s` (no leading whitespace).

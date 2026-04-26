@@ -2,7 +2,7 @@
 
 use crate::addr::excel_column_name;
 use crate::formula::{cell_effective_display, is_formula};
-use crate::grid::{CellAddr, Grid, FOOTER_ROWS, HEADER_ROWS, MARGIN_COLS};
+use crate::grid::{CellAddr, GridBox as Grid, FOOTER_ROWS, HEADER_ROWS, MARGIN_COLS};
 use crate::ops::{SheetRecord, SheetState, WorkbookSnapshot, WorkbookState};
 use quick_xml::events::Event;
 use quick_xml::Reader;
@@ -146,10 +146,10 @@ fn ods_logical_col_has_content(grid: &Grid, col: usize) -> bool {
         }
     }
     for row in 0..grid.main_rows() {
-        if col < MARGIN_COLS {
+            if col < MARGIN_COLS {
             if grid
                 .get(&CellAddr::Left {
-                    col: col as u8,
+                    col: col,
                     row: row as u32,
                 })
                 .is_some_and(|s| !s.is_empty())
@@ -168,7 +168,7 @@ fn ods_logical_col_has_content(grid: &Grid, col: usize) -> bool {
             }
         } else if grid
             .get(&CellAddr::Right {
-                col: (col - MARGIN_COLS - grid.main_cols()) as u8,
+                col: col - MARGIN_COLS - grid.main_cols(),
                 row: row as u32,
             })
             .is_some_and(|s| !s.is_empty())
@@ -195,7 +195,7 @@ fn ods_cell_xml(grid: &Grid, logical_row: usize, global_col: usize) -> String {
     let mr = grid.main_rows();
     let mc = grid.main_cols();
     let addr = ods_cell_addr(grid, logical_row, global_col);
-    let raw = grid.get(&addr).unwrap_or("").to_string();
+    let raw = grid.text(&addr);
     let display = cell_effective_display(grid, &addr);
 
     let value = if logical_row < hr {
@@ -244,7 +244,7 @@ fn ods_cell_addr(grid: &Grid, logical_row: usize, global_col: usize) -> CellAddr
         let main_row = (logical_row - hr) as u32;
         if global_col < lm {
             CellAddr::Left {
-                col: (lm - 1 - global_col) as u8,
+                col: lm - 1 - global_col,
                 row: main_row,
             }
         } else if global_col < lm + mc {
@@ -254,7 +254,7 @@ fn ods_cell_addr(grid: &Grid, logical_row: usize, global_col: usize) -> CellAddr
             }
         } else {
             CellAddr::Right {
-                col: (global_col - lm - mc) as u8,
+                col: global_col - lm - mc,
                 row: main_row,
             }
         }
@@ -281,13 +281,10 @@ fn ods_formula_expr(raw: &str) -> Option<String> {
 }
 
 fn header_formula_or_value(grid: &Grid, row: usize, global_col: usize, main_cols: usize) -> String {
-    let base = grid
-        .get(&CellAddr::Header {
-            row: row as u8,
-            col: global_col as u32,
-        })
-        .unwrap_or("")
-        .to_string();
+    let base = grid.text(&CellAddr::Header {
+        row: row as u8,
+        col: global_col as u32,
+    });
     if global_col < MARGIN_COLS || global_col >= MARGIN_COLS + main_cols {
         return base;
     }
@@ -307,14 +304,11 @@ fn main_formula_or_value(
     let lm = MARGIN_COLS;
     let mr = grid.main_rows();
     if global_col < lm {
-        let c = (lm - 1 - global_col) as u8;
-        let raw = grid
-            .get(&CellAddr::Left {
-                col: c,
-                row: main_row as u32,
-            })
-            .unwrap_or("")
-            .to_string();
+        let c = lm - 1 - global_col;
+        let raw = grid.text(&CellAddr::Left {
+            col: c,
+            row: main_row as u32,
+        });
         if let Some(code) = subtotal_code_for_label(&raw) {
             let start = row_total_block_start(grid, main_row as u32);
             let col = excel_column_name(0);
@@ -323,27 +317,18 @@ fn main_formula_or_value(
         return raw;
     }
     if global_col < lm + main_cols {
-        let raw = grid
-            .get(&CellAddr::Main {
-                row: main_row as u32,
-                col: (global_col - lm) as u32,
-            })
-            .unwrap_or("")
-            .to_string();
+        let raw = grid.text(&CellAddr::Main {
+            row: main_row as u32,
+            col: (global_col - lm) as u32,
+        });
         if is_formula(&raw) {
             raw
         } else {
             raw
         }
     } else {
-        let rc = (global_col - lm - main_cols) as u8;
-        let raw = grid
-            .get(&CellAddr::Right {
-                col: rc,
-                row: main_row as u32,
-            })
-            .unwrap_or("")
-            .to_string();
+        let rc = global_col - lm - main_cols;
+        let raw = grid.text(&CellAddr::Right { col: rc, row: main_row as u32 });
         if let Some(code) = subtotal_code_for_label(&raw) {
             return format!(
                 "=SUBTOTAL({code};{}1:{}{})",
@@ -362,13 +347,10 @@ fn footer_formula_or_value(
     global_col: usize,
     main_cols: usize,
 ) -> String {
-    let raw = grid
-        .get(&CellAddr::Footer {
-            row: footer_row as u8,
-            col: global_col as u32,
-        })
-        .unwrap_or("")
-        .to_string();
+    let raw = grid.text(&CellAddr::Footer {
+        row: footer_row as u8,
+        col: global_col as u32,
+    });
     if let Some(code) = subtotal_code_for_label(&raw) {
         return format!(
             "=SUBTOTAL({code};{}1:{}{})",
@@ -395,7 +377,7 @@ fn row_total_block_start(grid: &Grid, current_main_row: u32) -> u32 {
     for candidate in (0..current_main_row).rev() {
         if grid
             .get(&CellAddr::Left {
-                col: (MARGIN_COLS - 1) as u8,
+                col: MARGIN_COLS - 1,
                 row: candidate,
             })
             .is_some()
@@ -527,7 +509,7 @@ fn set_ods_cell(
         let mr = row - HEADER_ROWS;
         if col < MARGIN_COLS {
             CellAddr::Left {
-                col: (MARGIN_COLS - 1 - col) as u8,
+                col: MARGIN_COLS - 1 - col,
                 row: mr as u32,
             }
         } else if col < MARGIN_COLS + state.grid.main_cols() {
@@ -537,7 +519,7 @@ fn set_ods_cell(
             }
         } else {
             CellAddr::Right {
-                col: (col - MARGIN_COLS - state.grid.main_cols()) as u8,
+                col: col - MARGIN_COLS - state.grid.main_cols(),
                 row: mr as u32,
             }
         }
@@ -583,17 +565,19 @@ mod tests {
 
     #[test]
     fn export_writes_ods_zip() {
-        let mut grid = Grid::new(2, 2);
+        let mut grid = crate::grid::Grid::new(2, 2);
         grid.set(&CellAddr::Main { row: 0, col: 0 }, "1".into());
-        let bytes = export_ods_bytes(&grid).unwrap();
+        let gb = crate::grid::GridBox::from(grid);
+        let bytes = export_ods_bytes(&gb).unwrap();
         assert!(bytes.starts_with(b"PK"));
     }
 
     #[test]
     fn import_ods_roundtrip_basic_sheet() {
-        let mut grid = Grid::new(2, 2);
+        let mut grid = crate::grid::Grid::new(2, 2);
         grid.set(&CellAddr::Main { row: 0, col: 0 }, "42".into());
-        let bytes = export_ods_bytes(&grid).unwrap();
+        let gb = crate::grid::GridBox::from(grid);
+        let bytes = export_ods_bytes(&gb).unwrap();
         let tmp = NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), bytes).unwrap();
         let workbook = import_ods_workbook(tmp.path()).unwrap();
@@ -601,23 +585,25 @@ mod tests {
             workbook
                 .active_sheet()
                 .grid
-                .get(&CellAddr::Main { row: 0, col: 0 }),
+                .get(&CellAddr::Main { row: 0, col: 0 })
+                .as_deref(),
             Some("42")
         );
     }
 
     #[test]
     fn export_trims_trailing_blank_rows_and_columns() {
-        let mut grid = Grid::new(2, 2);
+        let mut grid = crate::grid::Grid::new(2, 2);
         grid.set(&CellAddr::Main { row: 0, col: 0 }, "42".into());
-        let content = exported_content_xml(&grid);
+        let gb = crate::grid::GridBox::from(grid);
+        let content = exported_content_xml(&gb);
         assert_eq!(content.matches("<table:table-row>").count(), 27);
         assert_eq!(content.matches("<table:table-column").count(), 11);
     }
 
     #[test]
     fn export_converts_total_to_subtotal_formula() {
-        let mut grid = Grid::new(1, 1);
+        let mut grid = crate::grid::Grid::new(1, 1);
         grid.set(
             &CellAddr::Header {
                 row: 0,
@@ -625,13 +611,14 @@ mod tests {
             },
             "TOTAL".into(),
         );
-        let content = exported_content_xml(&grid);
+        let gb = crate::grid::GridBox::from(grid);
+        let content = exported_content_xml(&gb);
         assert!(content.contains(r#"table:formula="of:=SUBTOTAL(9;A1:A1)""#));
     }
 
     #[test]
     fn export_translates_other_aggregate_labels() {
-        let mut grid = Grid::new(1, 1);
+        let mut grid = crate::grid::Grid::new(1, 1);
         grid.set(
             &CellAddr::Footer {
                 row: 0,
@@ -639,7 +626,8 @@ mod tests {
             },
             "MAX".into(),
         );
-        let content = exported_content_xml(&grid);
+        let gb = crate::grid::GridBox::from(grid);
+        let content = exported_content_xml(&gb);
         assert!(
             content.contains(r#"table:formula="of:=SUBTOTAL(4;A1:A1)""#),
             "{}",
@@ -649,10 +637,11 @@ mod tests {
 
     #[test]
     fn export_emits_column_styles() {
-        let mut grid = Grid::new(2, 2);
+        let mut grid = crate::grid::Grid::new(2, 2);
         grid.set(&CellAddr::Main { row: 0, col: 0 }, "42".into());
         grid.set(&CellAddr::Left { row: 0, col: 0 }, "X".into());
-        let content = exported_content_xml(&grid);
+        let gb = crate::grid::GridBox::from(grid);
+        let content = exported_content_xml(&gb);
         assert!(content.contains(r#"style:style style:name="co0" style:family="table-column""#));
         assert!(content.contains(r#"style:column-width=""#));
         assert!(content.contains(r#"table:style-name="co0""#));
@@ -755,7 +744,7 @@ mod tests {
                 let addr = ods_cell_addr(grid, r, c);
                 if let Some(value) = grid.get(&addr) {
                     if !value.is_empty() {
-                        f(value);
+                        f(&value);
                     }
                 }
             }

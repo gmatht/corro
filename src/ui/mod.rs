@@ -8,7 +8,7 @@ use crate::formula::translate_formula_text_by_offset;
 use crate::formula::{cell_effective_display, is_formula};
 use crate::grid::{
     CellAddr, CellFormat, FormatScope, GridBox as Grid, MainRange, NumberFormat, SortSpec, TextAlign,
-    FOOTER_ROWS, HEADER_ROWS, MARGIN_COLS,
+    FOOTER_ROWS, HEADER_ROWS, MARGIN_COLS, MarginIndex,
 };
 use crate::io::{
     commit_line, commit_workbook_op, load_full, load_full_partial, load_revisions,
@@ -155,7 +155,7 @@ impl SheetCursor {
             let mcc = self.col;
             if mcc < MARGIN_COLS {
                 CellAddr::Left {
-                    col: mcc as u8,
+                    col: mcc,
                     row: mri as u32,
                 }
             } else if mcc < MARGIN_COLS + mc {
@@ -165,7 +165,7 @@ impl SheetCursor {
                 }
             } else {
                 CellAddr::Right {
-                    col: (mcc - MARGIN_COLS - mc) as u8,
+                    col: (mcc - MARGIN_COLS - mc),
                     row: mri as u32,
                 }
             }
@@ -197,6 +197,9 @@ enum Mode {
     SheetCopy {
         buffer: String,
         source_id: u32,
+    },
+    GoToCell {
+        buffer: String,
     },
     SavePath {
         buffer: String,
@@ -320,6 +323,7 @@ enum MenuAction {
     RenameSheet,
     CopySheet,
     MoveSheet,
+    GoToCell,
     Exit,
     ExportTsv,
     ExportCsv,
@@ -488,7 +492,7 @@ const FORMAT_SCOPE_MENU_ITEMS: [MenuItem; 5] = [
     },
 ];
 
-const SHEET_MENU_ITEMS: [MenuItem; 5] = [
+const SHEET_MENU_ITEMS: [MenuItem; 6] = [
     MenuItem {
         shortcut: 'N',
         label: "New sheet",
@@ -508,6 +512,11 @@ const SHEET_MENU_ITEMS: [MenuItem; 5] = [
         shortcut: 'M',
         label: "Move sheet",
         target: MenuTarget::Action(MenuAction::MoveSheet),
+    },
+    MenuItem {
+        shortcut: 'G',
+        label: "Go",
+        target: MenuTarget::Action(MenuAction::GoToCell),
     },
     MenuItem {
         shortcut: 'B',
@@ -1015,6 +1024,9 @@ impl App {
                 let _ = self.move_current_sheet_to_end();
                 Mode::Normal
             }
+            MenuAction::GoToCell => Mode::GoToCell {
+                buffer: self.start_input_mode(String::new()),
+            },
             MenuAction::Exit => Mode::QuitPrompt,
             MenuAction::ExportTsv => Mode::ExportTsv {
                 buffer: self.start_input_mode(String::new()),
@@ -1376,7 +1388,7 @@ fn visible_row_indices(
     (display_rows[start..start + dim].to_vec(), start)
 }
 
-/// Column viewport with pinned totals and minimal-scroll movement.
+/// Column viewport with pinned left context and minimal-scroll movement.
 fn visible_col_indices(
     state: &SheetState,
     cursor: SheetCursor,
@@ -1433,8 +1445,7 @@ fn visible_col_indices(
         return (stable_band, 0);
     }
 
-    let mut reserved: Vec<usize> = right_band;
-    reserved.extend(left_band.iter().copied());
+    let mut reserved: Vec<usize> = left_band;
     if lm > 0 && dim > reserved.len() {
         reserved.push(lm - 1);
     }
@@ -1642,7 +1653,7 @@ fn left_margin_special_col_aggregate(
 
 fn left_margin_template_applies(grid: &Grid, main_row: usize) -> bool {
     let raw = grid.get(&CellAddr::Left {
-        col: (MARGIN_COLS - 1) as u8,
+        col: (MARGIN_COLS - 1),
         row: main_row as u32,
     });
     raw.as_deref().is_some_and(is_formula)
@@ -1697,11 +1708,8 @@ fn parse_num(s: &str) -> Option<f64> {
 }
 
 fn left_margin_agg_func(grid: &Grid, main_row: u32) -> Option<AggFunc> {
-    let key_col = (MARGIN_COLS - 1) as u8;
-    let val = grid.get(&CellAddr::Left {
-        col: key_col,
-        row: main_row,
-    })?;
+    let key_col: MarginIndex = MARGIN_COLS - 1;
+    let val = grid.get(&CellAddr::Left { col: key_col, row: main_row })?;
     match val.trim().to_uppercase().as_str() {
         "TOTAL" | "SUM" => Some(AggFunc::Sum),
         "MEAN" | "AVERAGE" | "AVG" => Some(AggFunc::Mean),
@@ -1785,7 +1793,7 @@ fn footer_special_col_aggregate(
             cell_effective_display(
                 grid,
                 &CellAddr::Right {
-                    col: (global_col - MARGIN_COLS - main_cols) as u8,
+                    col: (global_col - MARGIN_COLS - main_cols),
                     row: r as u32,
                 },
             )
@@ -2969,10 +2977,7 @@ impl App {
         } else if row < hr + mr {
             let mri = row - hr;
             if col < MARGIN_COLS {
-                Some(CellAddr::Left {
-                    col: col as u8,
-                    row: mri as u32,
-                })
+                Some(CellAddr::Left { col: col, row: mri as u32 })
             } else if col < MARGIN_COLS + mc {
                 Some(CellAddr::Main {
                     row: mri as u32,
@@ -2980,7 +2985,7 @@ impl App {
                 })
             } else if col < MARGIN_COLS + mc + MARGIN_COLS {
                 Some(CellAddr::Right {
-                    col: (col - MARGIN_COLS - mc) as u8,
+                    col: (col - MARGIN_COLS - mc),
                     row: mri as u32,
                 })
             } else {
@@ -3354,6 +3359,61 @@ impl App {
         }
     }
 
+    fn go_to_cell(&mut self, raw: &str) -> bool {
+        let text = raw.trim();
+        if text.is_empty() {
+            self.status = "Cell address required".into();
+            return false;
+        }
+
+        let text = text.to_ascii_uppercase();
+        let Some((cref, len)) = crate::celladdr::CellRef::parse_at(&text) else {
+            self.status = "Bad cell address".into();
+            return false;
+        };
+        if len != text.len() || !Self::cell_ref_is_in_supported_bounds(&cref) {
+            self.status = "Bad cell address".into();
+            return false;
+        }
+
+        let mut rows = self.state.grid.main_rows();
+        let mut cols = self.state.grid.main_cols();
+        if let crate::celladdr::RowRegion::Data(row) = cref.row {
+            rows = rows.max(row as usize);
+        }
+        if let crate::celladdr::ColRegion::Data(col) = cref.col {
+            cols = cols.max(col as usize);
+        }
+        if rows != self.state.grid.main_rows() || cols != self.state.grid.main_cols() {
+            self.state.grid.set_main_size(rows, cols);
+        }
+
+        let addr = cref.to_grid_addr(self.state.grid.main_cols());
+        if let Some(cursor) = self.sheet_cursor_for_addr(&addr) {
+            self.cursor = cursor;
+            self.cursor.clamp(&self.state.grid);
+            self.anchor = None;
+            self.edit_target_addr = None;
+            self.status = format!("Went to {}", addr_label(&addr, self.state.grid.main_cols()));
+            true
+        } else {
+            self.status = "Bad cell address".into();
+            false
+        }
+    }
+
+    fn cell_ref_is_in_supported_bounds(cref: &crate::celladdr::CellRef) -> bool {
+        match cref.row {
+            crate::celladdr::RowRegion::Header(row) => {
+                row > 0 && (row as usize) <= HEADER_ROWS
+            }
+            crate::celladdr::RowRegion::Data(row) => row > 0,
+            crate::celladdr::RowRegion::Footer(row) => {
+                row > 0 && (row as usize) <= FOOTER_ROWS
+            }
+        }
+    }
+
     fn commit_edit_and_move_down(&mut self, buffer: &str) -> Result<Mode, RunError> {
         self.edit_cursor = None;
         self.commit_edit_buffer(buffer)?;
@@ -3450,10 +3510,7 @@ impl App {
         }
         for r in 0..self.state.grid.main_rows() {
             if global_col < MARGIN_COLS {
-                let addr = CellAddr::Left {
-                    col: global_col as u8,
-                    row: r as u32,
-                };
+                let addr = CellAddr::Left { col: global_col, row: r as u32 };
                 let val = cell_effective_display(&self.state.grid, &addr);
                 if !val.is_empty() {
                     saw_content = true;
@@ -3471,7 +3528,7 @@ impl App {
                 }
             } else {
                 let addr = CellAddr::Right {
-                    col: (global_col - MARGIN_COLS - main_cols) as u8,
+                    col: (global_col - MARGIN_COLS - main_cols),
                     row: r as u32,
                 };
                 let val = cell_effective_display(&self.state.grid, &addr);
@@ -4836,6 +4893,7 @@ impl App {
             Mode::RevisionBrowse => "  left/right·step revisions   Enter·close   Esc·close".into(),
             Mode::SheetRename { .. } => "  type sheet title   Enter·rename   Esc·cancel".into(),
             Mode::SheetCopy { .. } => "  type sheet title   Enter·copy   Esc·cancel".into(),
+            Mode::GoToCell { .. } => "  type cell address   Enter·go   Esc·cancel".into(),
             Mode::SavePath { .. } => "  type file path   Enter·save as   Esc·cancel".into(),
             Mode::ExportTsv { .. }
             | Mode::ExportCsv { .. }
@@ -5568,6 +5626,20 @@ impl App {
                 KeyCode::Enter => {
                     self.input_cursor = None;
                     self.copy_current_sheet(buffer.clone())?;
+                    mode = Mode::Normal;
+                }
+                KeyCode::Esc => mode = Mode::Normal,
+                _ if Self::handle_plain_text_input_key(
+                    buffer,
+                    &mut self.input_cursor,
+                    key.code,
+                ) => {}
+                _ => {}
+            },
+            Mode::GoToCell { buffer } => match key.code {
+                KeyCode::Enter => {
+                    self.input_cursor = None;
+                    self.go_to_cell(buffer);
                     mode = Mode::Normal;
                 }
                 KeyCode::Esc => mode = Mode::Normal,
@@ -6781,6 +6853,14 @@ impl App {
             .style(prompt_style),
             Mode::SheetCopy { buffer, .. } => Paragraph::new(input_line(
                 " copy sheet as: ".to_string(),
+                buffer,
+                self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
+                prompt_style,
+                caret_style,
+            ))
+            .style(prompt_style),
+            Mode::GoToCell { buffer } => Paragraph::new(input_line(
+                " go to: ".to_string(),
                 buffer,
                 self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
                 prompt_style,
@@ -8052,11 +8132,9 @@ mod tests {
         app.state
             .grid
             .set(&CellAddr::Main { row: 1, col: 1 }, "55".into());
+        let key_col: MarginIndex = MARGIN_COLS - 1;
         app.state.grid.set(
-            &CellAddr::Left {
-                col: (MARGIN_COLS - 1) as u8,
-                row: 2,
-            },
+            &CellAddr::Left { col: key_col, row: 2 },
             "TOTAL".into(),
         );
 
@@ -8094,13 +8172,7 @@ mod tests {
         state
             .grid
             .set(&CellAddr::Main { row: 1, col: 1 }, "2".into());
-        state.grid.set(
-            &CellAddr::Left {
-                col: (MARGIN_COLS - 1) as u8,
-                row: 2,
-            },
-            "TOTAL".into(),
-        );
+        state.grid.set(&CellAddr::Left { col: (MARGIN_COLS - 1), row: 2 }, "TOTAL".into());
         state
             .grid
             .set(&CellAddr::Main { row: 3, col: 0 }, "33".into());
@@ -8115,7 +8187,7 @@ mod tests {
             .set(&CellAddr::Main { row: 4, col: 1 }, "4".into());
         state.grid.set(
             &CellAddr::Left {
-                col: (MARGIN_COLS - 1) as u8,
+                col: (MARGIN_COLS - 1),
                 row: 5,
             },
             "TOTAL".into(),
@@ -8488,7 +8560,7 @@ mod tests {
             .set(&CellAddr::Main { row: 1, col: 1 }, "2".into());
         app.state.grid.set(
             &CellAddr::Left {
-                col: (MARGIN_COLS - 1) as u8,
+                col: (MARGIN_COLS - 1),
                 row: 2,
             },
             "TOTAL".into(),
@@ -8544,13 +8616,7 @@ mod tests {
         state
             .grid
             .set(&CellAddr::Main { row: 1, col: 1 }, "2".into());
-        state.grid.set(
-            &CellAddr::Left {
-                col: (MARGIN_COLS - 1) as u8,
-                row: 2,
-            },
-            "TOTAL".into(),
-        );
+        state.grid.set(&CellAddr::Left { col: (MARGIN_COLS - 1), row: 2 }, "TOTAL".into());
         state
             .grid
             .set(&CellAddr::Main { row: 3, col: 0 }, "33".into());
@@ -8565,7 +8631,7 @@ mod tests {
             .set(&CellAddr::Main { row: 4, col: 1 }, "4".into());
         state.grid.set(
             &CellAddr::Left {
-                col: (MARGIN_COLS - 1) as u8,
+                col: (MARGIN_COLS - 1),
                 row: 5,
             },
             "MAX".into(),
@@ -8598,7 +8664,7 @@ mod tests {
             .set(&CellAddr::Main { row: 1, col: 0 }, "2".into());
         state.grid.set(
             &CellAddr::Left {
-                col: (MARGIN_COLS - 1) as u8,
+                col: (MARGIN_COLS - 1),
                 row: 2,
             },
             "TOTAL".into(),
@@ -8609,13 +8675,7 @@ mod tests {
         state
             .grid
             .set(&CellAddr::Main { row: 4, col: 0 }, "0.00".into());
-        state.grid.set(
-            &CellAddr::Left {
-                col: (MARGIN_COLS - 1) as u8,
-                row: 5,
-            },
-            "TOTAL".into(),
-        );
+        state.grid.set(&CellAddr::Left { col: (MARGIN_COLS - 1), row: 5 }, "TOTAL".into());
         state
             .grid
             .set(&CellAddr::Main { row: 6, col: 0 }, "67.67".into());
@@ -8624,7 +8684,7 @@ mod tests {
             .set(&CellAddr::Main { row: 7, col: 0 }, "0.00".into());
         state.grid.set(
             &CellAddr::Left {
-                col: (MARGIN_COLS - 1) as u8,
+                col: (MARGIN_COLS - 1),
                 row: 8,
             },
             "TOTAL".into(),
@@ -8658,14 +8718,14 @@ mod tests {
             .set(&CellAddr::Main { row: 1, col: 1 }, "2".into());
         app.state.grid.set(
             &CellAddr::Left {
-                col: (MARGIN_COLS - 1) as u8,
+                col: (MARGIN_COLS - 1),
                 row: 2,
             },
             "TOTAL".into(),
         );
         app.state.grid.set(
             &CellAddr::Left {
-                col: (MARGIN_COLS - 1) as u8,
+                col: (MARGIN_COLS - 1),
                 row: 3,
             },
             "MAX".into(),
@@ -8772,6 +8832,64 @@ mod tests {
         assert!(initial.contains("]A"));
         assert!(moved.contains("]B"));
         assert!((0..buffer.area.height).any(|y| row2(y).contains("TOTAL")));
+    }
+
+    #[test]
+    fn right_margin_columns_scroll_to_keep_cursor_visible() {
+        let mut state = SheetState::new(1, 2);
+        let right_start = MARGIN_COLS + state.grid.main_cols();
+        for i in 0..6 {
+            state.grid.set(
+                &CellAddr::Header {
+                    row: (HEADER_ROWS - 1) as u8,
+                    col: (right_start + i) as u32,
+                },
+                "TOTAL".into(),
+            );
+        }
+
+        let cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: right_start + 5,
+        };
+        let (cols, _) = visible_col_indices(&state, cursor, 3, 0);
+
+        assert!(cols.contains(&cursor.col), "{cols:?}");
+        assert!(!cols.contains(&right_start), "{cols:?}");
+    }
+
+    #[test]
+    fn sheet_go_jumps_to_main_cell_and_grows_extent() {
+        let mut app = App::new(None);
+
+        assert!(app.go_to_cell("c12"));
+
+        assert_eq!(
+            app.cursor,
+            SheetCursor {
+                row: HEADER_ROWS + 11,
+                col: MARGIN_COLS + 2,
+            }
+        );
+        assert_eq!(app.state.grid.main_rows(), 12);
+        assert_eq!(app.state.grid.main_cols(), 3);
+    }
+
+    #[test]
+    fn sheet_go_jumps_to_right_margin_header_without_expanding_main_cols() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 2);
+
+        assert!(app.go_to_cell("]A~1"));
+
+        assert_eq!(
+            app.cursor,
+            SheetCursor {
+                row: HEADER_ROWS - 1,
+                col: MARGIN_COLS + 2,
+            }
+        );
+        assert_eq!(app.state.grid.main_cols(), 2);
     }
 
     #[test]

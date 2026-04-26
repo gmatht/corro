@@ -47,9 +47,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for r in 0..corro::grid::HEADER_ROWS {
         for c in 0..total {
             let addr = corro::grid::CellAddr::Header { row: r as u8, col: c as u32 };
-            let v = sheet.grid.get(&addr);
-            if !v.is_empty() {
-                println!("  {} => {}", corro::addr::cell_ref_text(&addr, main_cols), v);
+            let raw = sheet.grid.get(&addr);
+            let short = raw.as_deref().unwrap_or("");
+            if !short.is_empty() {
+                println!("  {} => {}", corro::addr::cell_ref_text(&addr, main_cols), short);
             }
         }
     }
@@ -58,9 +59,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for r in 0..corro::grid::FOOTER_ROWS {
         for c in 0..total {
             let addr = corro::grid::CellAddr::Footer { row: r as u8, col: c as u32 };
-            let v = sheet.grid.get(&addr);
-            if !v.is_empty() {
-                println!("  {} => {}", corro::addr::cell_ref_text(&addr, main_cols), v);
+            let raw = sheet.grid.get(&addr);
+            let short = raw.as_deref().unwrap_or("");
+            if !short.is_empty() {
+                println!("  {} => {}", corro::addr::cell_ref_text(&addr, main_cols), short);
             }
         }
     }

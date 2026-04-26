@@ -1,6 +1,6 @@
 //! TSV and CSV export for the main data region.
 
-use crate::grid::{CellAddr, Grid, FOOTER_ROWS, HEADER_ROWS, MARGIN_COLS};
+use crate::grid::{CellAddr, GridBox as Grid, FOOTER_ROWS, HEADER_ROWS, MARGIN_COLS};
 use std::io::Write;
 use zip::write::FileOptions;
 
@@ -163,50 +163,40 @@ fn cell_value_at(grid: &Grid, logical_row: usize, global_col: usize) -> String {
 
     if logical_row < hr {
         let r = logical_row as u8;
-        grid.get(&CellAddr::Header {
+        grid.text(&CellAddr::Header {
             row: r,
             col: global_col as u32,
         })
-        .unwrap_or("")
-        .to_string()
     } else if logical_row < hr + mr {
         let mri = logical_row - hr;
-        if global_col < lm {
-            let c = (lm - 1 - global_col) as u8;
-            grid.get(&CellAddr::Left {
-                col: c,
-                row: mri as u32,
-            })
-            .unwrap_or("")
-            .to_string()
-        } else if global_col < lm + mc {
-            let mc_idx = global_col - lm;
-            grid.get(&CellAddr::Main {
-                row: mri as u32,
-                col: mc_idx as u32,
-            })
-            .unwrap_or("")
-            .to_string()
+            if global_col < lm {
+                let c = lm - 1 - global_col; // margin index (usize)
+                grid.text(&CellAddr::Left {
+                    col: c,
+                    row: mri as u32,
+                })
+            } else if global_col < lm + mc {
+                let mc_idx = global_col - lm;
+                grid.text(&CellAddr::Main {
+                    row: mri as u32,
+                    col: mc_idx as u32,
+                })
+            } else {
+                let rc = global_col - lm - mc; // margin index (usize)
+                grid.text(&CellAddr::Right {
+                    col: rc,
+                    row: mri as u32,
+                })
+            }
         } else {
-            let rc = (global_col - lm - mc) as u8;
-            grid.get(&CellAddr::Right {
-                col: rc,
-                row: mri as u32,
+            let fr_idx = logical_row - hr - mr;
+            let r = fr_idx as u8;
+            grid.text(&CellAddr::Footer {
+                row: r,
+                col: global_col as u32,
             })
-            .unwrap_or("")
-            .to_string()
         }
-    } else {
-        let fr_idx = logical_row - hr - mr;
-        let r = fr_idx as u8;
-        grid.get(&CellAddr::Footer {
-            row: r,
-            col: global_col as u32,
-        })
-        .unwrap_or("")
-        .to_string()
     }
-}
 
 fn rendered_value_at(grid: &Grid, logical_row: usize, global_col: usize) -> String {
     let addr = match cell_addr_at(grid, logical_row, global_col) {
@@ -235,7 +225,7 @@ fn cell_addr_at(grid: &Grid, logical_row: usize, global_col: usize) -> Option<Ce
         let mri = logical_row - hr;
         if global_col < lm {
             Some(CellAddr::Left {
-                col: (lm - 1 - global_col) as u8,
+                col: lm - 1 - global_col,
                 row: mri as u32,
             })
         } else if global_col < lm + mc {
@@ -245,7 +235,7 @@ fn cell_addr_at(grid: &Grid, logical_row: usize, global_col: usize) -> Option<Ce
             })
         } else {
             Some(CellAddr::Right {
-                col: (global_col - lm - mc) as u8,
+                col: global_col - lm - mc,
                 row: mri as u32,
             })
         }
@@ -424,19 +414,9 @@ pub fn export_sorted_tsv(grid: &Grid, out: &mut dyn Write, sort_cols: &[usize]) 
     let mut rows: Vec<usize> = (0..mr).collect();
     rows.sort_by(|&a, &b| {
         for &c in sort_cols {
-            let va = grid
-                .get(&CellAddr::Main {
-                    row: a as u32,
-                    col: c as u32,
-                })
-                .unwrap_or("");
-            let vb = grid
-                .get(&CellAddr::Main {
-                    row: b as u32,
-                    col: c as u32,
-                })
-                .unwrap_or("");
-            let ord = va.cmp(vb);
+            let va = grid.text(&CellAddr::Main { row: a as u32, col: c as u32 });
+            let vb = grid.text(&CellAddr::Main { row: b as u32, col: c as u32 });
+            let ord = va.cmp(&vb);
             if ord != std::cmp::Ordering::Equal {
                 return ord;
             }
@@ -462,7 +442,7 @@ pub fn export_sorted_tsv(grid: &Grid, out: &mut dyn Write, sort_cols: &[usize]) 
                     row: r as u32,
                     col: c as u32,
                 })
-                .unwrap_or("");
+                .unwrap_or("".to_string());
             let _ = write!(out, "{}", val);
         }
         let _ = writeln!(out);
@@ -541,11 +521,12 @@ mod tests {
 
     #[test]
     fn ascii_table_trims_empty_margin_columns() {
-        let mut g = Grid::new(3, 1);
+        let mut g = crate::grid::Grid::new(3, 1);
         g.set(&CellAddr::Main { row: 0, col: 0 }, "Aasdf".into());
         g.set(&CellAddr::Main { row: 2, col: 0 }, "adsf".into());
+        let gb = crate::grid::GridBox::from(g);
         let mut out = Vec::new();
-        export_ascii_table(&g, &mut out, false);
+        export_ascii_table(&gb, &mut out, false);
         let s = String::from_utf8(out).unwrap();
         assert!(!s.contains("<9"));
         assert!(!s.contains(">9"));
@@ -597,6 +578,7 @@ mod tests {
             sheet.grid.set_col_width(crate::grid::MARGIN_COLS + c, None);
         }
         let mut out = Vec::new();
+        // sheet.grid is already a GridBox
         export_ascii_table(&sheet.grid, &mut out, false);
         let s = String::from_utf8(out).unwrap();
         assert!(s.contains("TOTAL"));
@@ -608,15 +590,16 @@ mod tests {
 
     #[test]
     fn tsv_export_keeps_left_margin_columns() {
-        let mut grid = Grid::new(2, 2);
+        let mut grid = crate::grid::Grid::new(2, 2);
         grid.set(&CellAddr::Header { row: 0, col: 0 }, "HDR".into());
         grid.set(&CellAddr::Left { row: 0, col: 0 }, "L0".into());
         grid.set(&CellAddr::Main { row: 0, col: 0 }, "A0".into());
         grid.set(&CellAddr::Main { row: 0, col: 1 }, "B0".into());
         grid.set(&CellAddr::Right { row: 0, col: 0 }, "R0".into());
         grid.set(&CellAddr::Footer { row: 0, col: 0 }, "FTR".into());
+        let gb = crate::grid::GridBox::from(grid);
         let mut out = Vec::new();
-        export_tsv(&grid, &mut out);
+        export_tsv(&gb, &mut out);
         let tsv = String::from_utf8(out).unwrap();
         assert!(tsv.contains("HDR"));
         assert!(tsv.contains("L0"));

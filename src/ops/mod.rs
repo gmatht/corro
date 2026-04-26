@@ -3,7 +3,7 @@
 use crate::addr::{
     parse_cell_ref_at, parse_excel_column, parse_main_range_at, parse_sheet_id_prefix_at,
 };
-use crate::grid::{CellAddr, CellFormat, FormatScope, Grid, MainRange, SortSpec, MARGIN_COLS};
+use crate::grid::{CellAddr, CellFormat, FormatScope, GridBox, MainRange, SortSpec, MARGIN_COLS};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
@@ -32,7 +32,7 @@ pub struct SheetState {
 impl SheetState {
     pub fn new(main_rows: usize, main_cols: usize) -> Self {
         SheetState {
-            grid: crate::grid::GridBox::new(crate::grid::Grid::new(
+            grid: crate::grid::GridBox::from(crate::grid::Grid::new(
                 main_rows as u32,
                 main_cols as u32,
             )),
@@ -41,7 +41,7 @@ impl SheetState {
 
     /// Construct a SheetState from an existing GridBox-backed implementation.
     /// This is a convenience for gradually moving to the boxed abstraction.
-    pub fn from_grid(grid: Grid) -> Self {
+    pub fn from_grid(grid: crate::grid::Grid) -> Self {
         SheetState {
             grid: crate::grid::GridBox::from(grid),
         }
@@ -275,10 +275,21 @@ impl Op {
                 state.grid.bump_volatile_seed();
             }
             Op::SetCellRef { cref, value } => {
-                // Convert the parsed CellRef to a concrete grid::CellAddr using
-                // the sheet's main_cols, then apply.
-                let main_cols = state.grid.main_cols();
-                let addr = cref.to_grid_addr(main_cols);
+                // Header/footer Data refs (e.g. K~1) should be able to grow
+                // main width, but right-margin refs (e.g. ]A~1) must not.
+                if matches!(
+                    cref.row,
+                    crate::celladdr::RowRegion::Header(_) | crate::celladdr::RowRegion::Footer(_)
+                ) && matches!(cref.col, crate::celladdr::ColRegion::Data(_))
+                {
+                    if let crate::celladdr::ColRegion::Data(col) = cref.col {
+                        let target_cols = col as usize;
+                        if target_cols > state.grid.main_cols() {
+                            state.grid.set_main_size(state.grid.main_rows(), target_cols);
+                        }
+                    }
+                }
+                let addr = cref.to_grid_addr(state.grid.main_cols());
                 state.grid.set(&addr, value.clone());
                 state.grid.bump_volatile_seed();
             }
@@ -328,7 +339,8 @@ impl Op {
                             row: target.row_start + r,
                             col: target.col_start + c,
                         };
-                        cells.push((dst, state.grid.get(&src).to_string()));
+                // get returns Option<String>; map to owned string (empty if None)
+                cells.push((dst, state.grid.get(&src).unwrap_or_else(|| "".to_string())));
                     }
                 }
                 for (addr, value) in cells {
@@ -1341,7 +1353,7 @@ mod tests {
             ">>>>>>> other\n"
         );
         replay_lines(log, &mut s).unwrap();
-        assert_eq!(s.grid.get(&CellAddr::Main { row: 0, col: 0 }), "right");
+        assert_eq!(s.grid.get(&CellAddr::Main { row: 0, col: 0 }).as_deref(), Some("right"));
     }
 
     #[test]
@@ -1435,6 +1447,41 @@ mod tests {
             },
             other => panic!("unexpected workbook op: {other:?}"),
         }
+    }
+
+    #[test]
+    fn right_margin_header_ref_does_not_expand_main_cols() {
+        let mut wb = WorkbookState::new();
+        let mut active = wb.sheet_id(wb.active_sheet);
+        let op = parse_workbook_line("SET $1:]A~1 TOTAL").unwrap();
+        apply_workbook_op(&mut wb, &mut active, op).unwrap();
+
+        let sheet = wb.sheet_mut_by_id(1).unwrap();
+        assert_eq!(sheet.grid.main_cols(), 1);
+
+        let addr = CellAddr::Header {
+            row: (crate::grid::HEADER_ROWS - 1) as u8,
+            col: (crate::grid::MARGIN_COLS + 1) as u32,
+        };
+        assert_eq!(sheet.grid.get(&addr).as_deref(), Some("TOTAL"));
+        assert_eq!(crate::addr::cell_ref_text(&addr, sheet.grid.main_cols()), "]A~1");
+    }
+
+    #[test]
+    fn header_data_ref_can_expand_main_cols_when_needed() {
+        let mut wb = WorkbookState::new();
+        let mut active = wb.sheet_id(wb.active_sheet);
+        let op = parse_workbook_line("SET $1:K~1 TOTAL").unwrap();
+        apply_workbook_op(&mut wb, &mut active, op).unwrap();
+
+        let sheet = wb.sheet_mut_by_id(1).unwrap();
+        assert_eq!(sheet.grid.main_cols(), 11);
+        let addr = CellAddr::Header {
+            row: (crate::grid::HEADER_ROWS - 1) as u8,
+            col: (crate::grid::MARGIN_COLS + 10) as u32,
+        };
+        assert_eq!(sheet.grid.get(&addr).as_deref(), Some("TOTAL"));
+        assert_eq!(crate::addr::cell_ref_text(&addr, sheet.grid.main_cols()), "K~1");
     }
 
     #[test]
@@ -1557,15 +1604,17 @@ mod tests {
             workbook.sheets[dst]
                 .state
                 .grid
-                .get(&CellAddr::Main { row: 0, col: 1 }),
-            "=A1"
+                .get(&CellAddr::Main { row: 0, col: 1 })
+                .as_deref(),
+            Some("=A1")
         );
         assert_eq!(
             workbook.sheets[dst]
                 .state
                 .grid
-                .get(&CellAddr::Main { row: 1, col: 1 }),
-            "=A2"
+                .get(&CellAddr::Main { row: 1, col: 1 })
+                .as_deref(),
+            Some("=A2")
         );
     }
 
@@ -1595,8 +1644,9 @@ mod tests {
             workbook.sheets[1]
                 .state
                 .grid
-                .get(&CellAddr::Main { row: 0, col: 0 }),
-            "src"
+                .get(&CellAddr::Main { row: 0, col: 0 })
+                .as_deref(),
+            Some("src")
         );
     }
 

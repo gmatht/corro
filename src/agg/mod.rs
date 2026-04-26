@@ -1,7 +1,7 @@
 //! Aggregate functions over main-region numeric samples.
 
 use crate::formula;
-use crate::grid::{CellAddr, Grid, MainRange};
+use crate::grid::{CellAddr, GridBox as Grid, MainRange};
 use crate::ops::{AggFunc, AggregateDef};
 
 fn format_aggregate_value(value: f64) -> String {
@@ -97,13 +97,15 @@ pub fn compute_aggregate(grid: &Grid, def: &AggregateDef) -> String {
 
 /// Raw cell value for display.
 pub fn cell_display(grid: &Grid, addr: &CellAddr) -> String {
-    grid.get(addr).unwrap_or("").to_string()
+    // GridBox provides `text` which returns an owned String for the addr.
+    grid.text(addr)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::grid::Grid;
+    use crate::grid::GridBox;
 
     #[test]
     fn sum_mean() {
@@ -119,7 +121,8 @@ mod tests {
                 col_end: 2,
             },
         };
-        assert_eq!(compute_aggregate(&g, &def), "5");
+        let gb = GridBox::from(g);
+        assert_eq!(compute_aggregate(&gb, &def), "5");
     }
 
     #[test]
@@ -136,6 +139,7 @@ mod tests {
                 col_end: 2,
             },
         };
-        assert_eq!(compute_aggregate(&g, &def), "5");
+        let gb = GridBox::from(g);
+        assert_eq!(compute_aggregate(&gb, &def), "5");
     }
 }
