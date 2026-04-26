@@ -3666,6 +3666,92 @@ impl App {
         }
     }
 
+    /// Parse `old|new` (first `|` only; `a|b|c` → find `a`, replace `b|c`).
+    fn parse_replace_spec(raw: &str) -> Option<(&str, &str)> {
+        let t = raw.trim();
+        t.split_once('|')
+            .map(|(a, b)| (a.trim(), b.trim()))
+    }
+
+    /// Find the next main cell (row-major, starting after the cursor, wrapping) whose
+    /// displayed text contains `needle`. Moves the active cell when a match is found.
+    fn find_next_substring(&mut self, needle: &str) {
+        let needle = needle.trim();
+        if needle.is_empty() {
+            self.status = "Enter text to find".into();
+            return;
+        }
+        let grid = &self.state.grid;
+        let mr = grid.main_rows();
+        let mc = grid.main_cols();
+        if mr == 0 || mc == 0 {
+            self.status = "Nothing to search".into();
+            return;
+        }
+
+        let (cur_r, cur_c) = match self.cursor.to_addr(grid) {
+            CellAddr::Main { row, col } => (row as usize, col as usize),
+            _ => (0usize, 0usize),
+        };
+
+        let flat_index = |r: usize, c: usize| r * mc + c;
+        let total = mr * mc;
+        let start = flat_index(cur_r, cur_c);
+
+        for k in 1..=total {
+            let idx = (start + k) % total;
+            let r = idx / mc;
+            let c = idx % mc;
+            let addr = CellAddr::Main {
+                row: r as u32,
+                col: c as u32,
+            };
+            let text = cell_display(grid, &addr);
+            if text.contains(needle) {
+                if let Some(cur) = self.sheet_cursor_for_addr(&addr) {
+                    self.cursor = cur;
+                }
+                self.anchor = None;
+                let label = addr_label(&addr, grid.main_cols());
+                self.status = format!("Found: {label}");
+                return;
+            }
+        }
+        self.status = "Not found".into();
+    }
+
+    /// Replace all occurrences of `find` with `replace_with` in each main cell's raw value.
+    fn replace_all_substrings_in_main(
+        &mut self,
+        find: &str,
+        replace_with: &str,
+    ) -> Result<usize, RunError> {
+        let mut changed = 0usize;
+        let mr = self.state.grid.main_rows();
+        let mc = self.state.grid.main_cols();
+        for r in 0..mr {
+            for c in 0..mc {
+                let addr = CellAddr::Main {
+                    row: r as u32,
+                    col: c as u32,
+                };
+                let raw = self.state.grid.get(&addr).unwrap_or_default();
+                if !raw.contains(find) {
+                    continue;
+                }
+                let new_val = raw.replace(find, replace_with);
+                if new_val != raw {
+                    changed += 1;
+                    self.apply_single_op(Op::SetCell {
+                        addr,
+                        value: new_val,
+                    })?;
+                }
+            }
+        }
+        Ok(changed)
+    }
+
     fn go_to_cell(&mut self, raw: &str) -> bool {
         let text = raw.trim();
         if text.is_empty() {
@@ -5500,8 +5586,9 @@ Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard 
             Mode::SortView { .. } => {
                 "  type sort columns like A,B,C   Enter·apply   Esc·cancel".into()
             }
-            Mode::Find { .. } => "  type search text   Enter·find next   Esc·cancel".into(),
-            Mode::Replace { .. } => "  type search/replace text   Enter·apply   Esc·cancel".into(),
+            Mode::Find { .. } => "  type text   Enter·find next (wrap)   Esc·close".into(),
+            Mode::Replace { .. } => "  type old|new   Enter·replace in all main cells   Esc·cancel"
+                .into(),
             Mode::BalanceBooks { .. } => {
                 "  Tab/Shift+Tab·move focus   Enter/Space·select   Esc·cancel".into()
             }
@@ -6231,8 +6318,22 @@ Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard 
             Mode::Menu { .. } => {}
             Mode::Replace { buffer } => match key.code {
                 KeyCode::Enter => {
-                    self.status = format!("Replace queued: {}", buffer);
                     self.input_cursor = None;
+                    if let Some((find, repl)) = Self::parse_replace_spec(buffer) {
+                        if find.is_empty() {
+                            self.status = "Replace: text before | is required (example: old|new)".into();
+                        } else {
+                            let n = self.replace_all_substrings_in_main(find, repl)?;
+                            self.status = if n == 0 {
+                                "No matching cells".into()
+                            } else {
+                                format!("Replaced in {n} cell(s)")
+                            };
+                        }
+                    } else {
+                        self.status =
+                            "Replace: use old|new (example: search|replace)".into();
+                    }
                     mode = Mode::Normal;
                 }
                 KeyCode::Esc => mode = Mode::Normal,
@@ -7146,15 +7247,12 @@ Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard 
             },
             Mode::Find { buffer } => match key.code {
                 KeyCode::Enter => {
-                    self.status = if buffer.trim().is_empty() {
-                        "Find cancelled".into()
-                    } else {
-                        format!("Find: {}", buffer.trim())
-                    };
+                    self.find_next_substring(buffer);
+                }
+                KeyCode::Esc => {
                     self.input_cursor = None;
                     mode = Mode::Normal;
                 }
-                KeyCode::Esc => mode = Mode::Normal,
                 _ if Self::handle_plain_text_input_key(
                     buffer,
                     &mut self.input_cursor,
@@ -7946,7 +8044,7 @@ Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard 
             ))
             .style(prompt_style),
             Mode::Replace { buffer } => Paragraph::new(input_line(
-                " replace text: ".to_string(),
+                " replace (old|new): ".to_string(),
                 buffer,
                 self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
                 prompt_style,
@@ -10978,6 +11076,63 @@ mod tests {
             Mode::Replace { buffer } => assert!(buffer.is_empty()),
             other => panic!("unexpected mode: {other:?}"),
         }
+    }
+
+    #[test]
+    fn find_next_moves_cursor_to_matching_cell() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(2, 2);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "a".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 1, col: 1 }, "findme".into());
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        };
+        app.mode = Mode::Find {
+            buffer: "findme".into(),
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .unwrap();
+        assert_eq!(app.cursor.row, HEADER_ROWS + 1);
+        assert_eq!(app.cursor.col, MARGIN_COLS + 1);
+        assert!(matches!(app.mode, Mode::Find { .. }));
+        assert!(app.status.contains("Found"));
+    }
+
+    #[test]
+    fn replace_all_updates_matching_cells() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 2);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "foo".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 1 }, "barfoo".into());
+        app.mode = Mode::Replace {
+            buffer: "foo|x".into(),
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .unwrap();
+        assert_eq!(
+            app.state
+                .grid
+                .get(&CellAddr::Main { row: 0, col: 0 })
+                .as_deref(),
+            Some("x")
+        );
+        assert_eq!(
+            app.state
+                .grid
+                .get(&CellAddr::Main { row: 0, col: 1 })
+                .as_deref(),
+            Some("barx")
+        );
+        assert!(matches!(app.mode, Mode::Normal));
     }
 
     #[test]
