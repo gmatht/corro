@@ -1070,31 +1070,31 @@ impl App {
             MenuAction::ExportTsv => {
                 self.export_preview_scroll = 0;
                 Mode::ExportTsv {
-                    buffer: self.start_input_mode(String::new()),
+                    buffer: self.start_input_mode(self.suggested_export_save_path("tsv")),
                 }
             },
             MenuAction::ExportCsv => {
                 self.export_preview_scroll = 0;
                 Mode::ExportCsv {
-                    buffer: self.start_input_mode(String::new()),
+                    buffer: self.start_input_mode(self.suggested_export_save_path("csv")),
                 }
             },
             MenuAction::ExportAscii => {
                 self.export_preview_scroll = 0;
                 Mode::ExportAscii {
-                    buffer: self.start_input_mode(String::new()),
+                    buffer: self.start_input_mode(self.suggested_export_save_path("txt")),
                 }
             },
             MenuAction::ExportAll => {
                 self.export_preview_scroll = 0;
                 Mode::ExportAll {
-                    buffer: self.start_input_mode(String::new()),
+                    buffer: self.start_input_mode(self.suggested_export_save_path("tsv")),
                 }
             },
             MenuAction::ExportOdt => {
                 self.export_preview_scroll = 0;
                 Mode::ExportOdt {
-                    buffer: self.start_input_mode(String::new()),
+                    buffer: self.start_input_mode(self.suggested_export_save_path("ods")),
                 }
             },
             MenuAction::SetMaxColWidth => Mode::SetMaxColWidth {
@@ -2306,6 +2306,14 @@ impl App {
         }
         if let Some(p) = &self.import_source {
             return Self::to_corro_path(p).to_string_lossy().into_owned();
+        }
+        String::new()
+    }
+
+    /// Default filename for export: same basename as `path` or `import_source` with the target extension (`file.corro` → `file.ods`). Empty when there is no path (blank still means clipboard where the prompt says so).
+    fn suggested_export_save_path(&self, extension: &str) -> String {
+        if let Some(p) = self.path.as_ref().or(self.import_source.as_ref()) {
+            return p.with_extension(extension).to_string_lossy().into_owned();
         }
         String::new()
     }
@@ -7943,7 +7951,8 @@ Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard 
                     KeyCode::Char('t') => {
                         self.export_preview_scroll = 0;
                         mode = Mode::ExportTsv {
-                            buffer: self.start_input_mode(String::new()),
+                            buffer: self
+                                .start_input_mode(self.suggested_export_save_path("tsv")),
                         }
                     }
                     KeyCode::Char('c') => {
@@ -7993,7 +8002,8 @@ Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard 
                         } else {
                             self.export_preview_scroll = 0;
                             mode = Mode::ExportCsv {
-                                buffer: self.start_input_mode(String::new()),
+                                buffer: self
+                                    .start_input_mode(self.suggested_export_save_path("csv")),
                             };
                         }
                     }

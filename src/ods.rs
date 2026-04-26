@@ -21,12 +21,106 @@ pub enum OdsError {
     Zip(#[from] zip::result::ZipError),
 }
 
-/// Corro ODS export starts with a long `table:number-rows-repeated` fill so content rows use
-/// global logical indices; LibreOffice/Calc does not. If the first row in a table uses a repeat
-/// count below this, we map ODF 0-based table cells into the main area (`HEADER_ROWS` / `MARGIN_COLS` offset).
+/// Corro re-import: if the first `table:table-row` uses a `number-rows-repeated` this large,
+/// ODF table rows are treated as full logical (header + margins + main + footer). Otherwise, ODF
+/// rows are mapped directly onto the main grid (interop, including compact export).
 const ODS_GLOBAL_LAYOUT_MIN_FIRST_ROW_REPEAT: u64 = 1_000_000;
+/// A single ODF `table:number-rows-repeated` must not make the sheet length exceed what Calc allows.
+const LIBREOFFICE_MAX_SHEET_ROWS: usize = 1_048_576;
+const CORRO_ODS_LAYOUT_PATH: &str = "corro-ods-layout";
+
+/// How to interpret 0-based ODF table `row_idx` when writing into the Corro grid. Corro exports
+/// include a `corro-ods-layout` sidecar; files without it use the first row's
+/// [ODS_GLOBAL_LAYOUT_MIN_FIRST_ROW_REPEAT] as before (LibreOffice / interop ODS).
+enum OdsTableLayout {
+    Odf,
+    Rebase { min: usize },
+    Compact { physical_to_logical: Vec<usize> },
+}
+
+impl OdsTableLayout {
+    /// Use full logical (header + margins + main + footer) mapping; see [set_ods_cell].
+    fn use_global_ods_addr(&self, odf_inferred: bool) -> bool {
+        match self {
+            OdsTableLayout::Odf => odf_inferred,
+            OdsTableLayout::Rebase { .. } | OdsTableLayout::Compact { .. } => true,
+        }
+    }
+
+    fn odf_to_logical(&self, odf_table_row: usize) -> usize {
+        match self {
+            OdsTableLayout::Odf => odf_table_row,
+            OdsTableLayout::Rebase { min } => min.saturating_add(odf_table_row),
+            OdsTableLayout::Compact {
+                physical_to_logical,
+            } => physical_to_logical
+                .get(odf_table_row)
+                .copied()
+                .unwrap_or(odf_table_row),
+        }
+    }
+}
+
+fn corro_ods_layout_file_bytes(
+    use_compact: bool,
+    min_r: usize,
+    ordered_logical_rows: &[usize],
+) -> String {
+    if use_compact {
+        let mut s = String::from("v1\ncompact\n");
+        for r in ordered_logical_rows {
+            use std::fmt::Write;
+            let _ = writeln!(s, "{}", r);
+        }
+        s
+    } else {
+        format!("v1\nrebase\n{}\n", min_r)
+    }
+}
+
+fn parse_corro_ods_layout_str(buf: &str) -> OdsTableLayout {
+    let lines: Vec<&str> = buf.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    if lines.first().copied() != Some("v1") {
+        return OdsTableLayout::Odf;
+    }
+    match lines.get(1).copied() {
+        Some("rebase") => {
+            if let Some(n) = lines.get(2).and_then(|s| s.parse().ok()) {
+                OdsTableLayout::Rebase { min: n }
+            } else {
+                OdsTableLayout::Odf
+            }
+        }
+        Some("compact") => {
+            let rows: Vec<usize> = lines
+                .get(2..)
+                .unwrap_or(&[])
+                .iter()
+                .filter_map(|l| l.parse().ok())
+                .collect();
+            if rows.is_empty() {
+                OdsTableLayout::Odf
+            } else {
+                OdsTableLayout::Compact {
+                    physical_to_logical: rows,
+                }
+            }
+        }
+        _ => OdsTableLayout::Odf,
+    }
+}
 
 pub fn export_ods_bytes(grid: &Grid) -> Result<Vec<u8>, OdsError> {
+    let tc = ods_col_end(grid);
+    let rows = ods_row_order(grid);
+    let max_rebase_run = ods_max_rebase_blank_run(&rows);
+    let use_compact = max_rebase_run >= LIBREOFFICE_MAX_SHEET_ROWS;
+    let content = ods_content_xml_with_rows_and_mode(grid, tc, rows.clone(), use_compact, max_rebase_run);
+    let min_r = *rows
+        .first()
+        .expect("ods_row_order is never empty");
+    let sidecar = corro_ods_layout_file_bytes(use_compact, min_r, &rows);
+
     let cursor = std::io::Cursor::new(Vec::new());
     let mut zip = zip::ZipWriter::new(cursor);
     let opt = FileOptions::default().compression_method(zip::CompressionMethod::Stored);
@@ -35,10 +129,13 @@ pub fn export_ods_bytes(grid: &Grid) -> Result<Vec<u8>, OdsError> {
     zip.write_all(b"application/vnd.oasis.opendocument.spreadsheet")?;
 
     zip.start_file("content.xml", FileOptions::default())?;
-    zip.write_all(ods_content_xml(grid).as_bytes())?;
+    zip.write_all(content.as_bytes())?;
+
+    zip.start_file(CORRO_ODS_LAYOUT_PATH, FileOptions::default())?;
+    zip.write_all(sidecar.as_bytes())?;
 
     zip.start_file("META-INF/manifest.xml", FileOptions::default())?;
-    zip.write_all(ods_manifest_xml().as_bytes())?;
+    zip.write_all(ods_manifest_with_corro_layout().as_bytes())?;
 
     Ok(zip.finish()?.into_inner())
 }
@@ -50,7 +147,17 @@ pub fn import_ods_workbook(path: &Path) -> Result<WorkbookState, OdsError> {
     archive
         .by_name("content.xml")?
         .read_to_string(&mut content)?;
-    parse_ods_content(&content)
+    let mut sidecar = String::new();
+    let layout = if let Ok(mut f) = archive.by_name(CORRO_ODS_LAYOUT_PATH) {
+        if f.read_to_string(&mut sidecar).is_ok() {
+            parse_corro_ods_layout_str(&sidecar)
+        } else {
+            OdsTableLayout::Odf
+        }
+    } else {
+        OdsTableLayout::Odf
+    };
+    parse_ods_content_with_layout(&content, layout)
 }
 
 fn ods_escape(s: &str) -> String {
@@ -60,55 +167,17 @@ fn ods_escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
-fn ods_manifest_xml() -> String {
-    String::from(
+fn ods_manifest_with_corro_layout() -> String {
+    String::from(concat!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <manifest:manifest xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0" manifest:version="1.2">
 <manifest:file-entry manifest:full-path="/" manifest:media-type="application/vnd.oasis.opendocument.spreadsheet"/>
-<manifest:file-entry manifest:full-path="content.xml" manifest:media-type="text/xml"/>
-</manifest:manifest>"#,
-    )
-}
-
-fn ods_content_xml(grid: &Grid) -> String {
-    let tc = ods_col_end(grid);
-    let rows = ods_row_order(grid);
-    let column_styles = ods_column_styles_xml(grid, tc);
-    let mut s = String::from(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:of="urn:oasis:names:tc:opendocument:xmlns:of:1.2" office:version="1.2"><office:automatic-styles>"#,
-    );
-
-    s.push_str(&column_styles);
-    s.push_str("</office:automatic-styles><office:body><office:spreadsheet><table:table>");
-
-    for c in 0..tc {
-        s.push_str(&format!(
-            r#"<table:table-column table:style-name="co{c}"/>"#
-        ));
-    }
-
-    let mut next_row = 0usize;
-    for r in rows {
-        if r > next_row {
-            let repeated = r - next_row;
-            s.push_str(&format!(
-                r#"<table:table-row table:number-rows-repeated="{repeated}"><table:table-cell table:number-columns-repeated="{tc}"/></table:table-row>"#
-            ));
-        }
-        s.push_str("<table:table-row>");
-        let mut c = 0usize;
-        while c < tc {
-            let global_col = c;
-            let cell = ods_cell_xml(grid, r, global_col);
-            s.push_str(&cell);
-            c += 1;
-        }
-        s.push_str("</table:table-row>");
-        next_row = r + 1;
-    }
-    s.push_str("</table:table></office:spreadsheet></office:body></office:document-content>");
-    s
+<manifest:file-entry manifest:full-path="content.xml" manifest:media-type="text/xml"/>"#,
+        r#"
+<manifest:file-entry manifest:full-path="corro-ods-layout" manifest:media-type="text/plain"/>"#,
+        r#"
+</manifest:manifest>"#
+    ))
 }
 
 fn ods_column_styles_xml(grid: &Grid, tc: usize) -> String {
@@ -159,6 +228,85 @@ fn ods_row_order(grid: &Grid) -> Vec<usize> {
         rows.push(0);
     }
     rows
+}
+
+/// Max single `table:number-rows-repeated` in the rebase-anchored (min-row) ODF run we would emit
+/// (leading gap + any gap between used logical rows). If that exceeds [LIBREOFFICE_MAX_SHEET_ROWS],
+/// we use compact ODF: one ODF table row per used logical row (no large blank run).
+fn ods_max_rebase_blank_run(rows: &[usize]) -> usize {
+    if rows.is_empty() {
+        return 0;
+    }
+    let min_r = rows[0];
+    let mut next_rel = 0usize;
+    let mut max_run = 0usize;
+    for &r in rows {
+        let rel = r.saturating_sub(min_r);
+        if rel > next_rel {
+            max_run = max_run.max(rel - next_rel);
+        }
+        next_rel = rel.saturating_add(1);
+    }
+    max_run
+}
+
+fn ods_content_xml_with_rows_and_mode(
+    grid: &Grid,
+    tc: usize,
+    rows: Vec<usize>,
+    use_compact: bool,
+    _max_rebase_run: usize,
+) -> String {
+    let column_styles = ods_column_styles_xml(grid, tc);
+    let mut s = String::from(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:of="urn:oasis:names:tc:opendocument:xmlns:of:1.2" office:version="1.2"><office:automatic-styles>"#,
+    );
+
+    s.push_str(&column_styles);
+    s.push_str("</office:automatic-styles><office:body><office:spreadsheet><table:table>");
+
+    for c in 0..tc {
+        s.push_str(&format!(
+            r#"<table:table-column table:style-name="co{c}"/>"#
+        ));
+    }
+
+    if use_compact {
+        for r in &rows {
+            s.push_str("<table:table-row>");
+            let mut c = 0usize;
+            while c < tc {
+                s.push_str(&ods_cell_xml(grid, *r, c));
+                c += 1;
+            }
+            s.push_str("</table:table-row>");
+        }
+    } else {
+        let min_r = *rows
+            .first()
+            .expect("ods_row_order is never empty");
+        let mut next_row = 0usize;
+        for r in rows {
+            let rel = r.saturating_sub(min_r);
+            if rel > next_row {
+                let repeated = rel - next_row;
+                s.push_str(&format!(
+                    r#"<table:table-row table:number-rows-repeated="{repeated}"><table:table-cell table:number-columns-repeated="{tc}"/></table:table-row>"#
+                ));
+            }
+            s.push_str("<table:table-row>");
+            let mut c = 0usize;
+            while c < tc {
+                s.push_str(&ods_cell_xml(grid, r, c));
+                c += 1;
+            }
+            s.push_str("</table:table-row>");
+            next_row = rel + 1;
+        }
+    }
+    s.push_str("</table:table></office:spreadsheet></office:body></office:document-content>");
+    s
 }
 
 fn ods_cell_xml(grid: &Grid, logical_row: usize, global_col: usize) -> String {
@@ -362,7 +510,10 @@ fn row_total_block_start(grid: &Grid, current_main_row: u32) -> u32 {
     0
 }
 
-fn parse_ods_content(xml: &str) -> Result<WorkbookState, OdsError> {
+fn parse_ods_content_with_layout(
+    xml: &str,
+    table_layout: OdsTableLayout,
+) -> Result<WorkbookState, OdsError> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
     let mut buf = Vec::new();
@@ -428,11 +579,13 @@ fn parse_ods_content(xml: &str) -> Result<WorkbookState, OdsError> {
                         .unwrap_or(1)
                         .max(1);
                     if let Some(sheet) = current_sheet.as_mut() {
-                        let g = odf_uses_global_logical == Some(true);
+                        let g = table_layout
+                            .use_global_ods_addr(odf_uses_global_logical == Some(true));
+                        let logical = table_layout.odf_to_logical(row_idx);
                         for c_off in 0..n {
                             set_ods_cell(
                                 &mut sheet.state,
-                                row_idx,
+                                logical,
                                 col_idx + c_off,
                                 None,
                                 "",
@@ -456,11 +609,13 @@ fn parse_ods_content(xml: &str) -> Result<WorkbookState, OdsError> {
                 b"table:table-cell" => {
                     if let Some(sheet) = current_sheet.as_mut() {
                         let n = table_cell_num_cols;
-                        let g = odf_uses_global_logical == Some(true);
+                        let g = table_layout
+                            .use_global_ods_addr(odf_uses_global_logical == Some(true));
+                        let logical = table_layout.odf_to_logical(row_idx);
                         for c_off in 0..n {
                             set_ods_cell(
                                 &mut sheet.state,
-                                row_idx,
+                                logical,
                                 col_idx + c_off,
                                 pending_formula.as_deref(),
                                 &pending_value,
@@ -656,7 +811,7 @@ mod tests {
 </office:spreadsheet></office:body>
 </office:document-content>
 "#;
-        let workbook = parse_ods_content(xml).unwrap();
+        let workbook = parse_ods_content_with_layout(xml, OdsTableLayout::Odf).unwrap();
         assert_eq!(
             workbook
                 .active_sheet()
@@ -680,7 +835,7 @@ mod tests {
 </office:spreadsheet></office:body>
 </office:document-content>
 "#;
-        let workbook = parse_ods_content(xml).unwrap();
+        let workbook = parse_ods_content_with_layout(xml, OdsTableLayout::Odf).unwrap();
         let s = workbook.active_sheet();
         assert_eq!(
             s.grid.get(&CellAddr::Main { row: 1, col: 1 }).as_deref(),
@@ -697,10 +852,22 @@ mod tests {
         let gb = crate::grid::GridBox::from(grid);
         let content = exported_content_xml(&gb);
         assert_eq!(content.matches("<table:table-row>").count(), 1);
-        assert!(content.contains(&format!(
-            r#"<table:table-row table:number-rows-repeated="{}">"#,
-            HEADER_ROWS
-        )));
+        assert!(
+            !content.contains(&format!(
+                r#"<table:table-row table:number-rows-repeated="{}">"#,
+                HEADER_ROWS
+            )),
+            "a single ~1e9 blank run exceeds Calc row limits; export should rebase"
+        );
+        let bytes = export_ods_bytes(&gb).unwrap();
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let mut sidecar = String::new();
+        archive
+            .by_name(CORRO_ODS_LAYOUT_PATH)
+            .unwrap()
+            .read_to_string(&mut sidecar)
+            .unwrap();
+        assert!(sidecar.contains("rebase"));
         assert_eq!(
             content.matches("<table:table-column").count(),
             MARGIN_COLS + 1

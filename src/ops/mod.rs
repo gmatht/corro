@@ -816,31 +816,6 @@ pub fn parse_workbook_line(line: &str) -> Result<WorkbookOp, std::io::Error> {
                 });
             }
         }
-        // #region agent log
-        {
-            use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("debug-53234c.log")
-            {
-                let esc = t
-                    .replace('\\', "\\\\")
-                    .replace('"', "\\\"")
-                    .replace('\n', "\\n");
-                let ts = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis())
-                    .unwrap_or(0);
-                let _ = writeln!(
-                    f,
-                    r#"{{"sessionId":"53234c","location":"ops/mod.rs:parse_workbook_line","message":"set_parse_miss","data":{{"line":"{esc}"}},"hypothesisId":"H1","timestamp":{ts}}}"#,
-                    esc = esc,
-                    ts = ts
-                );
-            }
-        }
-        // #endregion
     }
     let Some((sheet_id, prefix_len)) = parse_sheet_id_prefix_at(t) else {
         let op = parse_op_line(t).ok_or_else(|| {
