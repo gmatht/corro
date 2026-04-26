@@ -36,34 +36,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Inspect sheet 1
     let sheet_id = 1u32;
-    let sheet = wb
-        .sheet_mut_by_id(sheet_id)
-        .ok_or("missing sheet 1")?;
+    let sheet = wb.sheet_mut_by_id(sheet_id).ok_or("missing sheet 1")?;
     let main_cols = sheet.grid.main_cols();
     println!("After replay: main_cols = {}", main_cols);
 
-    let total = sheet.grid.total_cols();
     println!("Non-empty header cells:");
-    for r in 0..corro::grid::HEADER_ROWS {
-        for c in 0..total {
-            let addr = corro::grid::CellAddr::Header { row: r as u8, col: c as u32 };
-            let raw = sheet.grid.get(&addr);
-            let short = raw.as_deref().unwrap_or("");
-            if !short.is_empty() {
-                println!("  {} => {}", corro::addr::cell_ref_text(&addr, main_cols), short);
-            }
+    for (addr, raw) in sheet.grid.iter_nonempty() {
+        if matches!(addr, corro::grid::CellAddr::Header { .. }) {
+            println!(
+                "  {} => {}",
+                corro::addr::cell_ref_text(&addr, main_cols),
+                raw
+            );
         }
     }
 
     println!("Non-empty footer cells:");
-    for r in 0..corro::grid::FOOTER_ROWS {
-        for c in 0..total {
-            let addr = corro::grid::CellAddr::Footer { row: r as u8, col: c as u32 };
-            let raw = sheet.grid.get(&addr);
-            let short = raw.as_deref().unwrap_or("");
-            if !short.is_empty() {
-                println!("  {} => {}", corro::addr::cell_ref_text(&addr, main_cols), short);
-            }
+    for (addr, raw) in sheet.grid.iter_nonempty() {
+        if matches!(addr, corro::grid::CellAddr::Footer { .. }) {
+            println!(
+                "  {} => {}",
+                corro::addr::cell_ref_text(&addr, main_cols),
+                raw
+            );
         }
     }
 

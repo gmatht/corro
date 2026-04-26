@@ -180,9 +180,9 @@ pub fn save_workbook(path: &Path, workbook: &WorkbookSnapshot) -> Result<(), IoE
     for sheet in &workbook.sheets {
         out.push_str(&format!("SHEET {} {}\n", sheet.id, sheet.title));
         out.push_str(&format!(
-        "VOLATILE_SEED {}\n",
-        sheet.state.grid.volatile_seed()
-    ));
+            "VOLATILE_SEED {}\n",
+            sheet.state.grid.volatile_seed()
+        ));
         for row in 0..sheet.state.grid.main_rows() {
             for col in 0..sheet.state.grid.main_cols() {
                 let addr = CellAddr::Main {
@@ -528,7 +528,7 @@ fn import_delimited(data: &str, state: &mut SheetState, delim: char) {
 
     if let Some(hdr) = header_row {
         use crate::grid::HEADER_ROWS;
-        let header_idx = (HEADER_ROWS - 1) as u8;
+        let header_idx = (HEADER_ROWS - 1) as u32;
         for (ci, val) in hdr.iter().enumerate() {
             if !val.is_empty() {
                 let global_col = crate::grid::MARGIN_COLS as u32 + ci as u32;
@@ -653,7 +653,10 @@ mod tests {
         commit_op(path.path(), &mut offset, &mut state, &op).unwrap();
         assert_eq!(offset, fs::metadata(path.path()).unwrap().len());
         assert_eq!(
-            state.grid.get(&CellAddr::Main { row: 0, col: 0 }).as_deref(),
+            state
+                .grid
+                .get(&CellAddr::Main { row: 0, col: 0 })
+                .as_deref(),
             Some("42")
         );
     }
@@ -669,7 +672,10 @@ mod tests {
         let op = WorkbookOp::SheetOp {
             sheet_id,
             op: Op::SetCell {
-                addr: CellAddr::Header { row: 25, col: 12 },
+                addr: CellAddr::Header {
+                    row: (crate::grid::HEADER_ROWS - 1) as u32,
+                    col: (crate::grid::MARGIN_COLS + 1) as u32,
+                },
                 value: "x".into(),
             },
         };
@@ -706,11 +712,17 @@ mod tests {
         assert!(off > 0);
         assert!(n > 0);
         assert_eq!(
-            reloaded.grid.get(&CellAddr::Main { row: 0, col: 0 }).as_deref(),
+            reloaded
+                .grid
+                .get(&CellAddr::Main { row: 0, col: 0 })
+                .as_deref(),
             Some("a")
         );
         assert_eq!(
-            reloaded.grid.get(&CellAddr::Main { row: 1, col: 0 }).as_deref(),
+            reloaded
+                .grid
+                .get(&CellAddr::Main { row: 1, col: 0 })
+                .as_deref(),
             Some("b")
         );
     }
@@ -723,16 +735,28 @@ mod tests {
         assert!(off > 0);
         assert_eq!(n, 2);
         assert_eq!(
-            state.grid.get(&CellAddr::Main { row: 0, col: 0 }).as_deref(),
+            state
+                .grid
+                .get(&CellAddr::Main { row: 0, col: 0 })
+                .as_deref(),
             Some("1")
         );
         assert_eq!(
-            state.grid.get(&CellAddr::Main { row: 1, col: 0 }).as_deref(),
+            state
+                .grid
+                .get(&CellAddr::Main { row: 1, col: 0 })
+                .as_deref(),
             Some("7")
         );
         assert_eq!(
-            state.grid.get(&CellAddr::Header { row: 25, col: 10 }).as_deref(),
-            Some("")
+            state
+                .grid
+                .get(&CellAddr::Header {
+                    row: (crate::grid::HEADER_ROWS - 1) as u32,
+                    col: 10,
+                })
+                .as_deref(),
+            None
         );
     }
 
@@ -754,11 +778,17 @@ mod tests {
         assert!(off > 0);
         assert_eq!(n, 2);
         assert_eq!(
-            state.grid.get(&CellAddr::Main { row: 0, col: 0 }).as_deref(),
+            state
+                .grid
+                .get(&CellAddr::Main { row: 0, col: 0 })
+                .as_deref(),
             Some("1")
         );
         assert_eq!(
-            state.grid.get(&CellAddr::Main { row: 1, col: 0 }).as_deref(),
+            state
+                .grid
+                .get(&CellAddr::Main { row: 1, col: 0 })
+                .as_deref(),
             Some("7")
         );
         assert_eq!(state.grid.get(&CellAddr::Main { row: 2, col: 0 }), None);
@@ -779,7 +809,10 @@ mod tests {
             .unwrap_or_default()
             .contains("unrecognized"));
         assert_eq!(
-            state.grid.get(&CellAddr::Main { row: 0, col: 0 }).as_deref(),
+            state
+                .grid
+                .get(&CellAddr::Main { row: 0, col: 0 })
+                .as_deref(),
             Some("1")
         );
     }
@@ -848,11 +881,17 @@ mod tests {
         assert_eq!(state.grid.main_rows(), 2);
         assert_eq!(state.grid.main_cols(), 2);
         assert_eq!(
-            state.grid.get(&CellAddr::Main { row: 0, col: 0 }).as_deref(),
+            state
+                .grid
+                .get(&CellAddr::Main { row: 0, col: 0 })
+                .as_deref(),
             Some("Alice")
         );
         assert_eq!(
-            state.grid.get(&CellAddr::Main { row: 1, col: 1 }).as_deref(),
+            state
+                .grid
+                .get(&CellAddr::Main { row: 1, col: 1 })
+                .as_deref(),
             Some("25")
         );
     }
@@ -864,7 +903,10 @@ mod tests {
         assert_eq!(state.grid.main_rows(), 1);
         assert_eq!(state.grid.main_cols(), 3);
         assert_eq!(
-            state.grid.get(&CellAddr::Main { row: 0, col: 1 }).as_deref(),
+            state
+                .grid
+                .get(&CellAddr::Main { row: 0, col: 1 })
+                .as_deref(),
             Some("2")
         );
     }

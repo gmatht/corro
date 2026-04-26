@@ -9,7 +9,7 @@
 //! `crate::grid::CellAddr` so we can migrate incrementally without changing
 //! Grid's storage layout.
 
-use crate::grid::{CellAddr, HEADER_ROWS, MARGIN_COLS, MarginIndex};
+use crate::grid::{CellAddr, MarginIndex, HEADER_ROWS, MARGIN_COLS};
 use std::fmt;
 
 /// Row region with 1-based textual index.
@@ -24,10 +24,10 @@ pub enum RowRegion {
 /// human/textual numbers; left/right margins are MarginIndex (usize).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ColRegion {
-    Left(MarginIndex),    // < margin index (usize)
-    Data(u32),   // A=1, B=2, ... (1-based main-column index)
-    Right(MarginIndex),   // > margin index (usize)
-    Global(u32), // absolute global column index
+    Left(MarginIndex),  // < margin index (usize)
+    Data(u32),          // A=1, B=2, ... (1-based main-column index)
+    Right(MarginIndex), // > margin index (usize)
+    Global(u32),        // absolute global column index
 }
 
 /// Rich cell reference (parsed form). `raw` contains the original column
@@ -55,16 +55,12 @@ impl fmt::Display for RowRegion {
 impl fmt::Display for ColRegion {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ColRegion::Left(i) => write!(
-                f,
-                "[{}",
-                super::addr::mirror_margin_column_name(*i, true)
-            ),
-            ColRegion::Right(i) => write!(
-                f,
-                "]{}",
-                super::addr::mirror_margin_column_name(*i, false)
-            ),
+            ColRegion::Left(i) => {
+                write!(f, "[{}", super::addr::mirror_margin_column_name(*i, true))
+            }
+            ColRegion::Right(i) => {
+                write!(f, "]{}", super::addr::mirror_margin_column_name(*i, false))
+            }
             ColRegion::Data(n) => write!(f, "{}", super::addr::excel_column_name(*n as usize - 1)),
             ColRegion::Global(g) => write!(f, "{}", super::addr::excel_column_name(*g as usize)),
         }
@@ -77,14 +73,10 @@ impl CellRef {
     /// the main region vs. the right margin when formatting global forms.
     pub fn to_log_text(&self, _main_cols: usize) -> String {
         let col_text = match &self.col {
-            ColRegion::Left(i) => format!(
-                "[{}",
-                super::addr::mirror_margin_column_name(*i, true)
-            ),
-            ColRegion::Right(i) => format!(
-                "]{}",
-                super::addr::mirror_margin_column_name(*i, false)
-            ),
+            ColRegion::Left(i) => format!("[{}", super::addr::mirror_margin_column_name(*i, true)),
+            ColRegion::Right(i) => {
+                format!("]{}", super::addr::mirror_margin_column_name(*i, false))
+            }
             ColRegion::Data(n) => super::addr::excel_column_name(*n as usize - 1),
             ColRegion::Global(g) => super::addr::excel_column_name(*g as usize),
         };
@@ -100,36 +92,36 @@ impl CellRef {
     pub fn to_grid_addr(&self, main_cols: usize) -> CellAddr {
         match (&self.row, &self.col) {
             (RowRegion::Header(r), ColRegion::Left(i)) => CellAddr::Header {
-                row: ((*r as usize).saturating_sub(1) as u8).saturating_sub(0),
+                row: (HEADER_ROWS - (*r as usize)) as u32,
                 col: *i as u32,
             },
             (RowRegion::Header(r), ColRegion::Right(i)) => CellAddr::Header {
-                row: (HEADER_ROWS - (*r as usize)) as u8,
+                row: (HEADER_ROWS - (*r as usize)) as u32,
                 col: (MARGIN_COLS + main_cols + *i as usize) as u32,
             },
             (RowRegion::Header(r), ColRegion::Data(n)) => CellAddr::Header {
-                row: (HEADER_ROWS - (*r as usize)) as u8,
+                row: (HEADER_ROWS - (*r as usize)) as u32,
                 col: (MARGIN_COLS + (*n as usize - 1)) as u32,
             },
             (RowRegion::Header(r), ColRegion::Global(g)) => CellAddr::Header {
-                row: (HEADER_ROWS - (*r as usize)) as u8,
+                row: (HEADER_ROWS - (*r as usize)) as u32,
                 col: *g as u32,
             },
 
             (RowRegion::Footer(r), ColRegion::Left(i)) => CellAddr::Footer {
-                row: (*r as u8 - 1),
+                row: *r - 1,
                 col: *i as u32,
             },
             (RowRegion::Footer(r), ColRegion::Right(i)) => CellAddr::Footer {
-                row: (*r as u8 - 1),
+                row: *r - 1,
                 col: (MARGIN_COLS + main_cols + *i as usize) as u32,
             },
             (RowRegion::Footer(r), ColRegion::Data(n)) => CellAddr::Footer {
-                row: (*r as u8 - 1),
+                row: *r - 1,
                 col: (MARGIN_COLS + (*n as usize - 1)) as u32,
             },
             (RowRegion::Footer(r), ColRegion::Global(g)) => CellAddr::Footer {
-                row: (*r as u8 - 1),
+                row: *r - 1,
                 col: *g as u32,
             },
 
@@ -299,9 +291,15 @@ impl CellRef {
             }
             let row_num: usize = after[1..1 + row_digits].parse().ok()?;
             let row_region = if marker == '~' {
+                if row_num == 0 || row_num > HEADER_ROWS {
+                    return None;
+                }
                 // Header: keep textual 1-based row number
                 RowRegion::Header(row_num as u32)
             } else {
+                if row_num == 0 || row_num > crate::grid::FOOTER_ROWS {
+                    return None;
+                }
                 RowRegion::Footer(row_num as u32)
             };
 
@@ -413,10 +411,15 @@ mod tests {
     #[test]
     fn roundtrip_header_cell() {
         let mut g = Grid::new(1, 1);
-        g.set(&CellAddr::Header { row: 25, col: 12 }, "TOTAL".into());
-        let cref = CellRef::from_grid(&CellAddr::Header { row: 25, col: 12 }, g.main_cols());
+        g.set_main_size(1, 3);
+        let addr = CellAddr::Header {
+            row: (crate::grid::HEADER_ROWS - 1) as u32,
+            col: (MARGIN_COLS + 2) as u32,
+        };
+        g.set(&addr, "TOTAL".into());
+        let cref = CellRef::from_grid(&addr, g.main_cols());
         assert!(matches!(cref.col, ColRegion::Data(_)));
         let back = cref.to_grid_addr(g.main_cols());
-        assert_eq!(back, CellAddr::Header { row: 25, col: 12 });
+        assert_eq!(back, addr);
     }
 }

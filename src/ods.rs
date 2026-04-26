@@ -2,7 +2,7 @@
 
 use crate::addr::excel_column_name;
 use crate::formula::{cell_effective_display, is_formula};
-use crate::grid::{CellAddr, GridBox as Grid, FOOTER_ROWS, HEADER_ROWS, MARGIN_COLS};
+use crate::grid::{CellAddr, GridBox as Grid, HEADER_ROWS, MARGIN_COLS};
 use crate::ops::{SheetRecord, SheetState, WorkbookSnapshot, WorkbookState};
 use quick_xml::events::Event;
 use quick_xml::Reader;
@@ -67,7 +67,7 @@ fn ods_manifest_xml() -> String {
 
 fn ods_content_xml(grid: &Grid) -> String {
     let tc = ods_col_end(grid);
-    let row_end = ods_row_end(grid);
+    let rows = ods_row_order(grid);
     let column_styles = ods_column_styles_xml(grid, tc);
     let mut s = String::from(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -83,7 +83,14 @@ fn ods_content_xml(grid: &Grid) -> String {
         ));
     }
 
-    for r in 0..row_end {
+    let mut next_row = 0usize;
+    for r in rows {
+        if r > next_row {
+            let repeated = r - next_row;
+            s.push_str(&format!(
+                r#"<table:table-row table:number-rows-repeated="{repeated}"><table:table-cell table:number-columns-repeated="{tc}"/></table:table-row>"#
+            ));
+        }
         s.push_str("<table:table-row>");
         let mut c = 0usize;
         while c < tc {
@@ -93,6 +100,7 @@ fn ods_content_xml(grid: &Grid) -> String {
             c += 1;
         }
         s.push_str("</table:table-row>");
+        next_row = r + 1;
     }
     s.push_str("</table:table></office:spreadsheet></office:body></office:document-content>");
     s
@@ -114,14 +122,6 @@ fn ods_column_width_cm(char_width: usize) -> f32 {
     (chars * 0.20 + 0.20).max(0.45)
 }
 
-fn ods_row_end(grid: &Grid) -> usize {
-    let mut end = HEADER_ROWS + grid.main_rows() + FOOTER_ROWS;
-    while end > 0 && !grid.logical_row_has_content(end - 1) {
-        end -= 1;
-    }
-    end.max(1)
-}
-
 fn ods_col_end(grid: &Grid) -> usize {
     let mut end = grid.total_cols();
     while end > 0 && !ods_logical_col_has_content(grid, end - 1) {
@@ -131,63 +131,29 @@ fn ods_col_end(grid: &Grid) -> usize {
 }
 
 fn ods_logical_col_has_content(grid: &Grid, col: usize) -> bool {
-    if col >= grid.total_cols() {
-        return false;
+    grid.logical_col_has_content(col)
+}
+
+fn ods_row_order(grid: &Grid) -> Vec<usize> {
+    let hr = HEADER_ROWS;
+    let mr = grid.main_rows();
+    let mut rows = Vec::new();
+    for (addr, _) in grid.iter_nonempty() {
+        let logical_row = match addr {
+            CellAddr::Header { row, .. } => row as usize,
+            CellAddr::Footer { row, .. } => hr + mr + row as usize,
+            CellAddr::Main { row, .. }
+            | CellAddr::Left { row, .. }
+            | CellAddr::Right { row, .. } => hr + row as usize,
+        };
+        rows.push(logical_row);
     }
-    for row in 0..HEADER_ROWS {
-        if grid
-            .get(&CellAddr::Header {
-                row: row as u8,
-                col: col as u32,
-            })
-            .is_some_and(|s| !s.is_empty())
-        {
-            return true;
-        }
+    rows.sort_unstable();
+    rows.dedup();
+    if rows.is_empty() {
+        rows.push(0);
     }
-    for row in 0..grid.main_rows() {
-            if col < MARGIN_COLS {
-            if grid
-                .get(&CellAddr::Left {
-                    col: col,
-                    row: row as u32,
-                })
-                .is_some_and(|s| !s.is_empty())
-            {
-                return true;
-            }
-        } else if col < MARGIN_COLS + grid.main_cols() {
-            if grid
-                .get(&CellAddr::Main {
-                    row: row as u32,
-                    col: (col - MARGIN_COLS) as u32,
-                })
-                .is_some_and(|s| !s.is_empty())
-            {
-                return true;
-            }
-        } else if grid
-            .get(&CellAddr::Right {
-                col: col - MARGIN_COLS - grid.main_cols(),
-                row: row as u32,
-            })
-            .is_some_and(|s| !s.is_empty())
-        {
-            return true;
-        }
-    }
-    for row in 0..FOOTER_ROWS {
-        if grid
-            .get(&CellAddr::Footer {
-                row: row as u8,
-                col: col as u32,
-            })
-            .is_some_and(|s| !s.is_empty())
-        {
-            return true;
-        }
-    }
-    false
+    rows
 }
 
 fn ods_cell_xml(grid: &Grid, logical_row: usize, global_col: usize) -> String {
@@ -237,7 +203,7 @@ fn ods_cell_addr(grid: &Grid, logical_row: usize, global_col: usize) -> CellAddr
 
     if logical_row < hr {
         CellAddr::Header {
-            row: logical_row as u8,
+            row: logical_row as u32,
             col: global_col as u32,
         }
     } else if logical_row < hr + mr {
@@ -260,7 +226,7 @@ fn ods_cell_addr(grid: &Grid, logical_row: usize, global_col: usize) -> CellAddr
         }
     } else {
         CellAddr::Footer {
-            row: (logical_row - hr - mr) as u8,
+            row: (logical_row - hr - mr) as u32,
             col: global_col as u32,
         }
     }
@@ -282,7 +248,7 @@ fn ods_formula_expr(raw: &str) -> Option<String> {
 
 fn header_formula_or_value(grid: &Grid, row: usize, global_col: usize, main_cols: usize) -> String {
     let base = grid.text(&CellAddr::Header {
-        row: row as u8,
+        row: row as u32,
         col: global_col as u32,
     });
     if global_col < MARGIN_COLS || global_col >= MARGIN_COLS + main_cols {
@@ -328,7 +294,10 @@ fn main_formula_or_value(
         }
     } else {
         let rc = global_col - lm - main_cols;
-        let raw = grid.text(&CellAddr::Right { col: rc, row: main_row as u32 });
+        let raw = grid.text(&CellAddr::Right {
+            col: rc,
+            row: main_row as u32,
+        });
         if let Some(code) = subtotal_code_for_label(&raw) {
             return format!(
                 "=SUBTOTAL({code};{}1:{}{})",
@@ -348,7 +317,7 @@ fn footer_formula_or_value(
     main_cols: usize,
 ) -> String {
     let raw = grid.text(&CellAddr::Footer {
-        row: footer_row as u8,
+        row: footer_row as u32,
         col: global_col as u32,
     });
     if let Some(code) = subtotal_code_for_label(&raw) {
@@ -401,6 +370,7 @@ fn parse_ods_content(xml: &str) -> Result<WorkbookState, OdsError> {
     let mut pending_formula: Option<String> = None;
     let mut in_p = false;
     let mut in_cell = false;
+    let mut current_row_repeat = 1usize;
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -417,6 +387,9 @@ fn parse_ods_content(xml: &str) -> Result<WorkbookState, OdsError> {
                 }
                 b"table:table-row" => {
                     col_idx = 0;
+                    current_row_repeat = attr_value(&e, b"table:number-rows-repeated")
+                        .and_then(|n| n.parse().ok())
+                        .unwrap_or(1);
                 }
                 b"text:p" => {
                     in_p = true;
@@ -458,7 +431,7 @@ fn parse_ods_content(xml: &str) -> Result<WorkbookState, OdsError> {
                     in_cell = false;
                     col_idx += 1;
                 }
-                b"table:table-row" => row_idx += 1,
+                b"table:table-row" => row_idx += current_row_repeat,
                 b"table:table" => {
                     if let Some(sheet) = current_sheet.take() {
                         workbook.sheets.push(sheet);
@@ -502,7 +475,7 @@ fn set_ods_cell(
     }
     let target = if row < HEADER_ROWS {
         CellAddr::Header {
-            row: row as u8,
+            row: row as u32,
             col: col as u32,
         }
     } else if row < HEADER_ROWS + state.grid.main_rows() {
@@ -526,7 +499,7 @@ fn set_ods_cell(
     } else {
         let fr = row - HEADER_ROWS - state.grid.main_rows();
         CellAddr::Footer {
-            row: fr as u8,
+            row: fr as u32,
             col: col as u32,
         }
     };
@@ -539,7 +512,15 @@ fn set_ods_cell(
 }
 
 fn ods_row_end_for_sheet(grid: &Grid) -> usize {
-    HEADER_ROWS + grid.main_rows() + FOOTER_ROWS
+    grid.iter_nonempty()
+        .filter_map(|(addr, _)| match addr {
+            CellAddr::Main { row, .. }
+            | CellAddr::Left { row, .. }
+            | CellAddr::Right { row, .. } => Some(row as usize + 1),
+            _ => None,
+        })
+        .max()
+        .unwrap_or_else(|| grid.main_rows())
 }
 
 fn ods_col_end_for_sheet(grid: &Grid) -> usize {
@@ -597,8 +578,15 @@ mod tests {
         grid.set(&CellAddr::Main { row: 0, col: 0 }, "42".into());
         let gb = crate::grid::GridBox::from(grid);
         let content = exported_content_xml(&gb);
-        assert_eq!(content.matches("<table:table-row>").count(), 27);
-        assert_eq!(content.matches("<table:table-column").count(), 11);
+        assert_eq!(content.matches("<table:table-row>").count(), 1);
+        assert!(content.contains(&format!(
+            r#"<table:table-row table:number-rows-repeated="{}">"#,
+            HEADER_ROWS
+        )));
+        assert_eq!(
+            content.matches("<table:table-column").count(),
+            MARGIN_COLS + 1
+        );
     }
 
     #[test]
@@ -737,16 +725,9 @@ mod tests {
     }
 
     fn scan_grid<F: FnMut(&str)>(grid: &Grid, mut f: F) {
-        let rows = HEADER_ROWS + grid.main_rows() + FOOTER_ROWS;
-        let cols = grid.total_cols();
-        for r in 0..rows {
-            for c in 0..cols {
-                let addr = ods_cell_addr(grid, r, c);
-                if let Some(value) = grid.get(&addr) {
-                    if !value.is_empty() {
-                        f(&value);
-                    }
-                }
+        for (_, value) in grid.iter_nonempty() {
+            if !value.is_empty() {
+                f(&value);
             }
         }
     }

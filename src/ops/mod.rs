@@ -285,7 +285,9 @@ impl Op {
                     if let crate::celladdr::ColRegion::Data(col) = cref.col {
                         let target_cols = col as usize;
                         if target_cols > state.grid.main_cols() {
-                            state.grid.set_main_size(state.grid.main_rows(), target_cols);
+                            state
+                                .grid
+                                .set_main_size(state.grid.main_rows(), target_cols);
                         }
                     }
                 }
@@ -339,8 +341,8 @@ impl Op {
                             row: target.row_start + r,
                             col: target.col_start + c,
                         };
-                // get returns Option<String>; map to owned string (empty if None)
-                cells.push((dst, state.grid.get(&src).unwrap_or_else(|| "".to_string())));
+                        // get returns Option<String>; map to owned string (empty if None)
+                        cells.push((dst, state.grid.get(&src).unwrap_or_else(|| "".to_string())));
                     }
                 }
                 for (addr, value) in cells {
@@ -687,7 +689,7 @@ fn parse_log_addr(
     if row_num == 0 || row_num > crate::grid::FOOTER_ROWS {
         return None;
     }
-    let row = (row_num - 1) as u8;
+    let row = (row_num - 1) as u32;
     let after = &rest[row_digits..];
     let col_len = after.chars().take_while(|c| c.is_ascii_uppercase()).count();
     if col_len == 0 {
@@ -717,8 +719,7 @@ pub fn parse_workbook_line(line: &str) -> Result<WorkbookOp, std::io::Error> {
         if let Some((sheet_id, prefix_len)) = parse_sheet_id_prefix_at(addr) {
             if let Some(cell_ref_text) = addr.get(prefix_len..).and_then(|s| s.strip_prefix(':')) {
                 // Prefer the new CellRef parser (treats unprefixed letters as Data)
-                if let Some((cref, cell_len)) = crate::celladdr::CellRef::parse_at(cell_ref_text)
-                {
+                if let Some((cref, cell_len)) = crate::celladdr::CellRef::parse_at(cell_ref_text) {
                     let len = prefix_len + 1 + cell_len;
                     let value = rest
                         .get(len..)
@@ -1353,7 +1354,10 @@ mod tests {
             ">>>>>>> other\n"
         );
         replay_lines(log, &mut s).unwrap();
-        assert_eq!(s.grid.get(&CellAddr::Main { row: 0, col: 0 }).as_deref(), Some("right"));
+        assert_eq!(
+            s.grid.get(&CellAddr::Main { row: 0, col: 0 }).as_deref(),
+            Some("right")
+        );
     }
 
     #[test]
@@ -1402,7 +1406,7 @@ mod tests {
             sheet_id: 1,
             op: Op::SetCell {
                 addr: CellAddr::Header {
-                    row: 25,
+                    row: (crate::grid::HEADER_ROWS - 1) as u32,
                     col: (crate::grid::MARGIN_COLS + 2) as u32,
                 },
                 value: "TOTAL".into(),
@@ -1422,7 +1426,7 @@ mod tests {
                     assert_eq!(
                         addr,
                         CellAddr::Header {
-                            row: 25,
+                            row: (crate::grid::HEADER_ROWS - 1) as u32,
                             col: (crate::grid::MARGIN_COLS + 10) as u32
                         }
                     );
@@ -1460,11 +1464,14 @@ mod tests {
         assert_eq!(sheet.grid.main_cols(), 1);
 
         let addr = CellAddr::Header {
-            row: (crate::grid::HEADER_ROWS - 1) as u8,
+            row: (crate::grid::HEADER_ROWS - 1) as u32,
             col: (crate::grid::MARGIN_COLS + 1) as u32,
         };
         assert_eq!(sheet.grid.get(&addr).as_deref(), Some("TOTAL"));
-        assert_eq!(crate::addr::cell_ref_text(&addr, sheet.grid.main_cols()), "]A~1");
+        assert_eq!(
+            crate::addr::cell_ref_text(&addr, sheet.grid.main_cols()),
+            "]A~1"
+        );
     }
 
     #[test]
@@ -1477,11 +1484,14 @@ mod tests {
         let sheet = wb.sheet_mut_by_id(1).unwrap();
         assert_eq!(sheet.grid.main_cols(), 11);
         let addr = CellAddr::Header {
-            row: (crate::grid::HEADER_ROWS - 1) as u8,
+            row: (crate::grid::HEADER_ROWS - 1) as u32,
             col: (crate::grid::MARGIN_COLS + 10) as u32,
         };
         assert_eq!(sheet.grid.get(&addr).as_deref(), Some("TOTAL"));
-        assert_eq!(crate::addr::cell_ref_text(&addr, sheet.grid.main_cols()), "K~1");
+        assert_eq!(
+            crate::addr::cell_ref_text(&addr, sheet.grid.main_cols()),
+            "K~1"
+        );
     }
 
     #[test]

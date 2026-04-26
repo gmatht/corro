@@ -26,14 +26,18 @@ pub fn excel_column_name(main_col_index: usize) -> String {
     s.chars().rev().collect()
 }
 
-/// 10-column margin label (`A` nearest the main grid, `J` farthest).
+/// Margin label (`A` nearest the main grid/right edge, up to `ZZ`).
 pub fn mirror_margin_column_name(margin_col_index: usize, left_side: bool) -> String {
     // Map the margin_col_index (0..MARGIN_COLS-1) into a letter sequence.
     // If left_side is true, mirror the index (so 0 -> last, as in previous
     // behavior for small margins).
     let max = crate::grid::MARGIN_COLS;
     let idx = margin_col_index.min(max.saturating_sub(1));
-    let mapped = if left_side { max.saturating_sub(1).saturating_sub(idx) } else { idx };
+    let mapped = if left_side {
+        max.saturating_sub(1).saturating_sub(idx)
+    } else {
+        idx
+    };
     // Use excel-style column naming for the mapped index (0 -> A, 25 -> Z,
     // 26 -> AA, ...). Reuse excel_column_name which is 0-based.
     excel_column_name(mapped)
@@ -58,7 +62,7 @@ pub fn ui_column_fragment(global_col: usize, main_cols: usize) -> String {
 pub fn parse_ui_column_fragment(s: &str, main_cols: usize) -> Option<(u32, usize)> {
     if let Some(rest) = s.strip_prefix('[') {
         let col_len = rest.chars().take_while(|c| c.is_ascii_uppercase()).count();
-        if col_len != 1 {
+        if col_len == 0 {
             return None;
         }
         let col = parse_mirror_margin_column_name(&rest[..col_len], true)?;
@@ -66,7 +70,7 @@ pub fn parse_ui_column_fragment(s: &str, main_cols: usize) -> Option<(u32, usize
     }
     if let Some(rest) = s.strip_prefix(']') {
         let col_len = rest.chars().take_while(|c| c.is_ascii_uppercase()).count();
-        if col_len != 1 {
+        if col_len == 0 {
             return None;
         }
         let col = parse_mirror_margin_column_name(&rest[..col_len], false)?;
@@ -149,13 +153,7 @@ pub fn parse_cell_ref_at(s: &str, main_cols: usize) -> Option<(CellAddr, usize)>
         _ => (None, s, 0usize),
     };
 
-    let col_len = if prefix.is_some() {
-        let len = rest.chars().take_while(|c| c.is_ascii_uppercase()).count();
-        if len != 1 {
-            return None;
-        }
-        len
-    } else {
+    let col_len = {
         let len = rest.chars().take_while(|c| c.is_ascii_uppercase()).count();
         if len == 0 {
             return None;
@@ -178,12 +176,12 @@ pub fn parse_cell_ref_at(s: &str, main_cols: usize) -> Option<(CellAddr, usize)>
             if row_num == 0 || row_num > crate::grid::HEADER_ROWS {
                 return None;
             }
-            (crate::grid::HEADER_ROWS - row_num) as u8
+            (crate::grid::HEADER_ROWS - row_num) as u32
         } else {
             if row_num == 0 || row_num > crate::grid::FOOTER_ROWS {
                 return None;
             }
-            (row_num - 1) as u8
+            (row_num - 1) as u32
         };
         let col = match prefix {
             Some(true) => parse_mirror_margin_column_name(col_name, true)? as u32,
@@ -351,11 +349,17 @@ mod tests {
 
     #[test]
     fn left_margin_is_mirrored_from_the_main_grid() {
-        assert_eq!(mirror_margin_column_name(0, true), "J");
-        assert_eq!(mirror_margin_column_name(9, true), "A");
+        assert_eq!(mirror_margin_column_name(0, true), "ZZ");
+        assert_eq!(
+            mirror_margin_column_name(crate::grid::MARGIN_COLS - 1, true),
+            "A"
+        );
         assert_eq!(
             parse_cell_ref_at("[A1", 1).unwrap().0,
-            CellAddr::Left { col: 9, row: 0 }
+            CellAddr::Left {
+                col: crate::grid::MARGIN_COLS - 1,
+                row: 0
+            }
         );
     }
 
@@ -378,14 +382,37 @@ mod tests {
         );
         assert_eq!(
             parse_cell_ref_at("[A_3", 4).unwrap().0,
-            CellAddr::Footer { row: 2, col: 9 }
+            CellAddr::Footer {
+                row: 2,
+                col: (crate::grid::MARGIN_COLS - 1) as u32
+            }
         );
         assert_eq!(
             parse_cell_ref_at("]A~3", 4).unwrap().0,
             CellAddr::Header {
-                row: 23,
+                row: (crate::grid::HEADER_ROWS - 3) as u32,
                 col: (crate::grid::MARGIN_COLS + 4) as u32
             }
         );
+    }
+
+    #[test]
+    fn parses_boundary_header_footer_rows() {
+        assert_eq!(
+            parse_cell_ref_at("A~999999999", 1).unwrap().0,
+            CellAddr::Header {
+                row: 0,
+                col: crate::grid::MARGIN_COLS as u32
+            }
+        );
+        assert_eq!(
+            parse_cell_ref_at("A_999999999", 1).unwrap().0,
+            CellAddr::Footer {
+                row: 999_999_998,
+                col: crate::grid::MARGIN_COLS as u32
+            }
+        );
+        assert!(parse_cell_ref_at("A~1000000000", 1).is_none());
+        assert!(parse_cell_ref_at("A_1000000000", 1).is_none());
     }
 }

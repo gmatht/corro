@@ -253,11 +253,11 @@ fn translate_cell_addr_by_offset(
     };
     match addr {
         CellAddr::Header { row, col } => Some(CellAddr::Header {
-            row: shift_u32(*row as u32, row_delta)? as u8,
+            row: shift_u32(*row, row_delta)?,
             col: shift_u32(*col, col_delta)?,
         }),
         CellAddr::Footer { row, col } => Some(CellAddr::Footer {
-            row: shift_u32(*row as u32, row_delta)? as u8,
+            row: shift_u32(*row, row_delta)?,
             col: shift_u32(*col, col_delta)?,
         }),
         CellAddr::Main { row, col } => Some(CellAddr::Main {
@@ -481,7 +481,7 @@ fn templated_formula(grid: &Grid, addr: &CellAddr) -> Option<String> {
     };
 
     let header_addr = CellAddr::Header {
-        row: (HEADER_ROWS - 1) as u8,
+        row: (HEADER_ROWS - 1) as u32,
         col: (MARGIN_COLS as u32) + *col,
     };
     if let Some(expr) = control_formula_expr(grid, &header_addr) {
@@ -1308,7 +1308,12 @@ pub fn cell_effective_display(grid: &Grid, addr: &CellAddr) -> String {
     if let Some(err) = grid.spill_error(addr) {
         return format!("#{err}");
     }
-    if let Some(v) = grid.spill_followers().into_iter().find(|(a, _)| a == addr).map(|(_, v)| v) {
+    if let Some(v) = grid
+        .spill_followers()
+        .into_iter()
+        .find(|(a, _)| a == addr)
+        .map(|(_, v)| v)
+    {
         return v;
     }
     let raw_owned = grid.get(addr);
@@ -2323,7 +2328,7 @@ mod tests {
         let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(2, 2));
         g.set(
             &CellAddr::Header {
-                row: 25,
+                row: (HEADER_ROWS - 1) as u32,
                 col: MARGIN_COLS as u32 + 1,
             },
             "=A*2 -- POW2".into(),
@@ -2343,7 +2348,7 @@ mod tests {
             cell_effective_display(
                 &g,
                 &CellAddr::Header {
-                    row: 25,
+                    row: (HEADER_ROWS - 1) as u32,
                     col: MARGIN_COLS as u32 + 1,
                 },
             ),
@@ -2354,7 +2359,13 @@ mod tests {
     #[test]
     fn left_margin_template_can_label_rows() {
         let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(2, 2));
-        g.set(&CellAddr::Left { col: 9, row: 0 }, "=:1*0.1 -- TAX".into());
+        g.set(
+            &CellAddr::Left {
+                col: MARGIN_COLS - 1,
+                row: 0,
+            },
+            "=:1*0.1 -- TAX".into(),
+        );
         g.set(&CellAddr::Main { row: 0, col: 0 }, "10".into());
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
@@ -2363,7 +2374,13 @@ mod tests {
             e => panic!("expected 1 {:?}", e),
         }
         assert_eq!(
-            cell_effective_display(&g, &CellAddr::Left { col: 9, row: 0 }),
+            cell_effective_display(
+                &g,
+                &CellAddr::Left {
+                    col: MARGIN_COLS - 1,
+                    row: 0
+                }
+            ),
             "TAX"
         );
     }

@@ -24,8 +24,8 @@ Non-goals (currently):
 
 The sheet is conceptually split into **five regions**:
 
-- **Header**: 26 fixed rows indexed `0…25` internally. Header references use `~`; display/reference text numbers them from `~26` at the top to `~1` nearest the main region.
-- **Footer**: 26 fixed rows indexed `0…25` internally. Footer references use `_`; display/reference text numbers them from `_1` nearest the main region to `_26` at the bottom.
+- **Header**: up to `999999999` fixed logical rows indexed `0…999999998` internally. Header references use `~`; display/reference text numbers them from `~999999999` at the top to `~1` nearest the main region.
+- **Footer**: up to `999999999` fixed logical rows indexed `0…999999998` internally. Footer references use `_`; display/reference text numbers them from `_1` nearest the main region to `_999999999` at the bottom.
 - **Left margin**: `MARGIN_COLS` fixed columns on the left of the main region. `MARGIN_COLS` is currently `26 * 26` (676). Margin references use `[` plus mirrored Excel-style names, so the column nearest the main region is `[A`, then `[B`, etc. outward.
 - **Right margin**: another 676 fixed columns on the right of the main region. Right-margin references use `]A`, `]B`, etc. from the main region outward.
 - **Main**: the spreadsheet body, addressed by `(row, col)` with Excel-like column letters `A`, `B`, ..., and 1-based row numbers in user-facing references.
@@ -46,12 +46,12 @@ Addresses are represented by `CellAddr` in `src/grid/mod.rs`:
 
 ## Storage: current sparse hybrid
 
-The current concrete `Grid` is a sparse/dense hybrid:
+The current concrete `Grid` is sparse across editable cell regions:
 
 - **Main cells**: `HashMap<(u32, u32), String>`, keyed by main row and main column. Absent keys are empty cells.
 - **Left margin cells**: `HashMap<(u32, MarginIndex), String>`, keyed by main row and left-margin column.
 - **Right margin cells**: `HashMap<(u32, MarginIndex), String>`, keyed by main row and right-margin column.
-- **Header/footer cells**: dense `Vec<Vec<String>>`, always resized to `HEADER_ROWS`/`FOOTER_ROWS` by `total_cols()`.
+- **Header/footer cells**: sparse `HashMap<(u32, u32), String>` maps keyed by special-row index and global column. Absent keys are empty cells.
 - **Column widths**: default `max_col_width` plus sparse per-global-column overrides in `HashMap<usize, usize>`.
 - **View sort**: `Vec<SortSpec>` containing global main-column indices and descending flags.
 - **Formatting**: sparse maps for all-column, data-column, special-column, and exact-cell overrides.
@@ -79,14 +79,14 @@ Pros:
 
 - Sparse main and margin storage keeps mostly-empty sheets cheap.
 - `HashMap` gives simple expected O(1) lookup and update for random cell edits.
-- Dense header/footer rows make global-column rendering straightforward because each special row has the same width as the visible sheet.
+- Sparse header/footer rows allow very large logical header/footer limits without allocating empty rows.
 - `GridImpl`/`GridBox` leaves room to experiment with alternate storage without rewriting every caller.
 
 Cons:
 
-- Header/footer memory scales with `HEADER_ROWS + FOOTER_ROWS` times `total_cols()`, so widening `extent_main_cols` also allocates empty header/footer strings.
+- Header/footer logical row positions can be very far apart, so export paths must preserve sparse row positions without scanning every blank row.
 - Row and column moves rebuild maps by scanning logical extents, which is wasteful for large sparse sheets.
-- Row/column content checks scan maps or dense rows instead of using maintained indexes.
+- Row/column content checks scan sparse maps instead of using maintained indexes.
 - Global-column metadata needs careful remapping whenever main columns grow, shrink, or move.
 - `HashMap` iteration order is nondeterministic, so callers that need stable output must sort or otherwise normalize.
 

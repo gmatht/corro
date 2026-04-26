@@ -1,6 +1,7 @@
 //! TSV and CSV export for the main data region.
 
 use crate::grid::{CellAddr, GridBox as Grid, FOOTER_ROWS, HEADER_ROWS, MARGIN_COLS};
+use std::collections::HashSet;
 use std::io::Write;
 use zip::write::FileOptions;
 
@@ -145,12 +146,12 @@ fn col_header_label(global_col: usize, main_cols: usize) -> String {
 fn sheet_row_label(logical_row: usize, main_rows: usize) -> String {
     let hr = HEADER_ROWS;
     if logical_row < hr {
-        format!("~{}", (b'Z' - logical_row as u8) as char)
+        format!("~{}", HEADER_ROWS - logical_row)
     } else if logical_row < hr + main_rows {
         format!("{}", logical_row - hr + 1)
     } else {
         let fr = logical_row - hr - main_rows;
-        format!("_{}", (b'A' + fr as u8) as char)
+        format!("_{}", fr + 1)
     }
 }
 
@@ -162,41 +163,41 @@ fn cell_value_at(grid: &Grid, logical_row: usize, global_col: usize) -> String {
     let _fr = FOOTER_ROWS;
 
     if logical_row < hr {
-        let r = logical_row as u8;
+        let r = logical_row as u32;
         grid.text(&CellAddr::Header {
             row: r,
             col: global_col as u32,
         })
     } else if logical_row < hr + mr {
         let mri = logical_row - hr;
-            if global_col < lm {
-                let c = lm - 1 - global_col; // margin index (usize)
-                grid.text(&CellAddr::Left {
-                    col: c,
-                    row: mri as u32,
-                })
-            } else if global_col < lm + mc {
-                let mc_idx = global_col - lm;
-                grid.text(&CellAddr::Main {
-                    row: mri as u32,
-                    col: mc_idx as u32,
-                })
-            } else {
-                let rc = global_col - lm - mc; // margin index (usize)
-                grid.text(&CellAddr::Right {
-                    col: rc,
-                    row: mri as u32,
-                })
-            }
+        if global_col < lm {
+            let c = lm - 1 - global_col; // margin index (usize)
+            grid.text(&CellAddr::Left {
+                col: c,
+                row: mri as u32,
+            })
+        } else if global_col < lm + mc {
+            let mc_idx = global_col - lm;
+            grid.text(&CellAddr::Main {
+                row: mri as u32,
+                col: mc_idx as u32,
+            })
         } else {
-            let fr_idx = logical_row - hr - mr;
-            let r = fr_idx as u8;
-            grid.text(&CellAddr::Footer {
-                row: r,
-                col: global_col as u32,
+            let rc = global_col - lm - mc; // margin index (usize)
+            grid.text(&CellAddr::Right {
+                col: rc,
+                row: mri as u32,
             })
         }
+    } else {
+        let fr_idx = logical_row - hr - mr;
+        let r = fr_idx as u32;
+        grid.text(&CellAddr::Footer {
+            row: r,
+            col: global_col as u32,
+        })
     }
+}
 
 fn rendered_value_at(grid: &Grid, logical_row: usize, global_col: usize) -> String {
     let addr = match cell_addr_at(grid, logical_row, global_col) {
@@ -218,7 +219,7 @@ fn cell_addr_at(grid: &Grid, logical_row: usize, global_col: usize) -> Option<Ce
 
     if logical_row < hr {
         Some(CellAddr::Header {
-            row: logical_row as u8,
+            row: logical_row as u32,
             col: global_col as u32,
         })
     } else if logical_row < hr + mr {
@@ -241,7 +242,7 @@ fn cell_addr_at(grid: &Grid, logical_row: usize, global_col: usize) -> Option<Ce
         }
     } else {
         Some(CellAddr::Footer {
-            row: (logical_row - hr - mr) as u8,
+            row: (logical_row - hr - mr) as u32,
             col: global_col as u32,
         })
     }
@@ -356,15 +357,11 @@ fn ascii_row_bounds(grid: &Grid) -> (usize, usize) {
     let hr = HEADER_ROWS;
     let mr = grid.main_rows();
     let fr = FOOTER_ROWS;
-    let mut start = 0;
-    while start < hr + mr + fr && !grid.logical_row_has_content(start) {
-        start += 1;
+    let rows = row_order(grid, hr + mr + fr);
+    match (rows.first().copied(), rows.last().copied()) {
+        (Some(start), Some(end)) => (start, end + 1),
+        _ => (hr, hr + 1),
     }
-    let mut end = hr + mr + fr;
-    while end > start && !grid.logical_row_has_content(end - 1) {
-        end -= 1;
-    }
-    (start, end.max(start + 1))
 }
 
 fn ascii_col_bounds(grid: &Grid) -> (usize, usize) {
@@ -390,16 +387,38 @@ fn odt_manifest_xml() -> String {
     )
 }
 
-fn row_order(grid: &Grid, total_rows: usize) -> Vec<usize> {
+fn row_order(grid: &Grid, _total_rows: usize) -> Vec<usize> {
     let hr = HEADER_ROWS;
     let mr = grid.main_rows();
-    let fr = FOOTER_ROWS;
-    let mut rows: Vec<usize> = Vec::with_capacity(total_rows);
-    rows.extend(0..hr);
+    let mut header_rows = Vec::new();
+    let mut main_rows = HashSet::new();
+    let mut footer_rows = Vec::new();
 
-    rows.extend(grid.sorted_main_rows().into_iter().map(|r| hr + r));
+    for (addr, _) in grid.iter_nonempty() {
+        match addr {
+            CellAddr::Header { row, .. } => header_rows.push(row as usize),
+            CellAddr::Footer { row, .. } => footer_rows.push(hr + mr + row as usize),
+            CellAddr::Main { row, .. }
+            | CellAddr::Left { row, .. }
+            | CellAddr::Right { row, .. } => {
+                main_rows.insert(row as usize);
+            }
+        }
+    }
 
-    rows.extend((0..fr).map(|r| hr + mr + r));
+    header_rows.sort_unstable();
+    header_rows.dedup();
+    footer_rows.sort_unstable();
+    footer_rows.dedup();
+
+    let mut rows = header_rows;
+    rows.extend(
+        grid.sorted_main_rows()
+            .into_iter()
+            .filter(|r| main_rows.contains(r))
+            .map(|r| hr + r),
+    );
+    rows.extend(footer_rows);
     rows
 }
 
@@ -414,8 +433,14 @@ pub fn export_sorted_tsv(grid: &Grid, out: &mut dyn Write, sort_cols: &[usize]) 
     let mut rows: Vec<usize> = (0..mr).collect();
     rows.sort_by(|&a, &b| {
         for &c in sort_cols {
-            let va = grid.text(&CellAddr::Main { row: a as u32, col: c as u32 });
-            let vb = grid.text(&CellAddr::Main { row: b as u32, col: c as u32 });
+            let va = grid.text(&CellAddr::Main {
+                row: a as u32,
+                col: c as u32,
+            });
+            let vb = grid.text(&CellAddr::Main {
+                row: b as u32,
+                col: c as u32,
+            });
             let ord = va.cmp(&vb);
             if ord != std::cmp::Ordering::Equal {
                 return ord;

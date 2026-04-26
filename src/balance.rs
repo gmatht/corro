@@ -80,7 +80,10 @@ pub fn source_rows_from_grid(grid: &Grid, col: usize) -> Vec<BalanceSourceRow> {
             row: row as u32,
             col: col as u32,
         };
-        let amount = grid.get(&amount_addr).and_then(|s| parse_amount_cents(&s)).unwrap_or(0);
+        let amount = grid
+            .get(&amount_addr)
+            .and_then(|s| parse_amount_cents(&s))
+            .unwrap_or(0);
         rows.push(BalanceSourceRow {
             row_index: row,
             amount_cents: amount,
@@ -182,27 +185,22 @@ pub fn apply_balance_copy(source: &SheetState, target: &mut SheetState, plan: &B
 
     let copy_cell =
         |src: &SheetState, dst: &mut SheetState, src_addr: CellAddr, dst_addr: CellAddr| {
-                if let Some(raw) = src.grid.get(&src_addr) {
-                    let value = if plan.preserve_formulas && raw.trim_start().starts_with('=') {
-                        // translate_formula_text expects &str; borrow the owned String
-                        translate_formula_text(&raw, &ctx)
-                            .unwrap_or_else(|| cell_effective_display(&src.grid, &src_addr))
-                    } else {
-                        raw.to_string()
-                    };
+            if let Some(raw) = src.grid.get(&src_addr) {
+                let value = if plan.preserve_formulas && raw.trim_start().starts_with('=') {
+                    // translate_formula_text expects &str; borrow the owned String
+                    translate_formula_text(&raw, &ctx)
+                        .unwrap_or_else(|| cell_effective_display(&src.grid, &src_addr))
+                } else {
+                    raw.to_string()
+                };
                 if !value.is_empty() {
                     dst.grid.set(&dst_addr, value);
                 }
             }
         };
 
-    let total_cols = source.grid.total_cols();
-    for row in 0..crate::grid::HEADER_ROWS {
-        for col in 0..total_cols {
-            let src_addr = CellAddr::Header {
-                row: row as u8,
-                col: col as u32,
-            };
+    for (src_addr, _) in source.grid.iter_nonempty() {
+        if matches!(src_addr, CellAddr::Header { .. }) {
             let dst_addr = src_addr.clone();
             copy_cell(source, target, src_addr, dst_addr);
         }
@@ -222,11 +220,17 @@ pub fn apply_balance_copy(source: &SheetState, target: &mut SheetState, plan: &B
             copy_cell(source, target, src_addr, dst_addr);
         }
         for col in 0..crate::grid::MARGIN_COLS {
-            let src_left = CellAddr::Left { col, row: src_row as u32 };
+            let src_left = CellAddr::Left {
+                col,
+                row: src_row as u32,
+            };
             let dst_left = CellAddr::Left { col, row: dst_row };
             copy_cell(source, target, src_left, dst_left);
 
-            let src_right = CellAddr::Right { col, row: src_row as u32 };
+            let src_right = CellAddr::Right {
+                col,
+                row: src_row as u32,
+            };
             let dst_right = CellAddr::Right { col, row: dst_row };
             copy_cell(source, target, src_right, dst_right);
         }
@@ -245,20 +249,14 @@ pub fn apply_balance_copy(source: &SheetState, target: &mut SheetState, plan: &B
         }
     }
 
-    for row in 0..crate::grid::FOOTER_ROWS {
-        for col in 0..total_cols {
-            let src_addr = CellAddr::Footer {
-                row: row as u8,
-                col: col as u32,
-            };
+    for (src_addr, _) in source.grid.iter_nonempty() {
+        if matches!(src_addr, CellAddr::Footer { .. }) {
             let dst_addr = src_addr.clone();
             copy_cell(source, target, src_addr, dst_addr);
         }
     }
 
-    target
-        .grid
-        .set_max_col_width(source.grid.max_col_width());
+    target.grid.set_max_col_width(source.grid.max_col_width());
     target
         .grid
         .set_col_width_overrides(source.grid.col_width_overrides());
