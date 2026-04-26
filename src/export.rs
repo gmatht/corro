@@ -605,12 +605,29 @@ fn ascii_generic_rebase(
     (d_row, d_col)
 }
 
-fn generic_interop_text(
+/// Generic interop text for a cell. When `excel_list_arg_comma` is true, function-argument
+/// `;` becomes `,` (TSV/CSV/Excel). When false, grid/ODF-style `;` is kept in the result string.
+///
+/// ODS “generic” export uses `excel_list_arg_comma: true` via [`export_cell_text`] so
+/// `table:formula` / `<text:p>` match default TSV generic.
+///
+/// The list-separator pass runs **after** [`finish_generic_interop`] (rebase), so
+/// `formula::rebase_interop_formula_row_col` always sees the same `;` tokenization as the grid.
+pub fn generic_interop_cell_text(
     grid: &Grid,
     logical_row: usize,
     global_col: usize,
     rebase: Option<(i32, i32)>,
+    excel_list_arg_comma: bool,
 ) -> Option<String> {
+    fn after_rebase(s: &str, excel: bool) -> String {
+        if excel {
+            interop_excel_list_separators(s)
+        } else {
+            s.to_string()
+        }
+    }
+
     if logical_row + 1 == HEADER_ROWS
         && (MARGIN_COLS..(MARGIN_COLS + grid.main_cols())).contains(&global_col)
     {
@@ -627,28 +644,23 @@ fn generic_interop_text(
     let addr = cur.to_addr(grid);
 
     if let Some(tf) = formula::export_templated_formula(grid, &addr) {
-        let s = interop_excel_list_separators(
-            &crate::ods::ods_labeled_prefix_strip_to_formula(&tf).unwrap_or(tf),
-        );
-        return Some(finish_generic_interop(s, rebase));
+        let s0 = crate::ods::ods_labeled_prefix_strip_to_formula(&tf).unwrap_or(tf);
+        let s1 = finish_generic_interop(s0, rebase);
+        return Some(after_rebase(&s1, excel_list_arg_comma));
     }
 
     let v = crate::ods::cell_export_value_string(grid, logical_row, global_col);
     if !v.is_empty() {
         if let Some(st) = crate::ods::ods_labeled_prefix_strip_to_formula(&v) {
-            return Some(finish_generic_interop(
-                interop_excel_list_separators(&st),
-                rebase,
-            ));
+            let s1 = finish_generic_interop(st, rebase);
+            return Some(after_rebase(&s1, excel_list_arg_comma));
         }
     }
     if let Some(raw) = grid.get(&addr) {
         if formula::is_formula(&raw) {
             if let Some(st) = crate::ods::ods_labeled_prefix_strip_to_formula(&raw) {
-                return Some(finish_generic_interop(
-                    interop_excel_list_separators(&st),
-                    rebase,
-                ));
+                let s1 = finish_generic_interop(st, rebase);
+                return Some(after_rebase(&s1, excel_list_arg_comma));
             }
         }
     }
@@ -722,7 +734,9 @@ fn rendered_value_at(grid: &Grid, logical_row: usize, global_col: usize) -> Stri
     crate::ui::format_cell_display(grid, &addr, text)
 }
 
-fn export_cell_text(
+/// What one cell would be in TSV/CSV/ASCII for the given [ExportContent] and (for Generic) the
+/// same `generic_rebase` that [`export_delimited`] / [`export_tsv_with_options`] use.
+pub fn export_cell_text(
     grid: &Grid,
     logical_row: usize,
     global_col: usize,
@@ -733,7 +747,7 @@ fn export_cell_text(
         ExportContent::Values => rendered_value_at(grid, logical_row, global_col),
         ExportContent::Formulas => cell_value_at(grid, logical_row, global_col),
         ExportContent::Generic => {
-            generic_interop_text(grid, logical_row, global_col, generic_rebase)
+            generic_interop_cell_text(grid, logical_row, global_col, generic_rebase, true)
                 .unwrap_or_else(|| rendered_value_at(grid, logical_row, global_col))
         }
     }
@@ -745,6 +759,59 @@ fn needs_csv_quoting(s: &str, delim: char) -> bool {
 
 fn csv_quote(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
+}
+
+/// Column span and row order for TSV/CSV; must match [`export_delimited`].
+fn delimited_table_col_span_and_rows(
+    grid: &Grid,
+    options: &DelimitedExportOptions,
+) -> (usize, usize, Vec<usize>) {
+    let include_margins = options.include_margins;
+    let mr = grid.main_rows();
+    let mc = grid.main_cols();
+    let hr = HEADER_ROWS;
+    let lm = MARGIN_COLS;
+    let fr = FOOTER_ROWS;
+    let total_rows = hr + mr + fr;
+
+    let (col_start, mut col_end) = if include_margins {
+        ascii_col_bounds(grid)
+    } else {
+        (lm, lm + mc)
+    };
+    if include_margins {
+        col_end = col_end.max(lm + mc);
+    }
+    let main_spans = main_row_index_bounds_for_export(grid);
+    let rows: Vec<usize> = row_order(grid, total_rows)
+        .into_iter()
+        .filter(|&r| {
+            if grid.logical_row_has_content(r) {
+                return true;
+            }
+            if let Some((mmin, mmax)) = main_spans {
+                if r >= hr + mmin && r <= hr + mmax {
+                    return true;
+                }
+            }
+            false
+        })
+        .collect();
+    (col_start, col_end, rows)
+}
+
+/// Rebase (Δrow, Δcol) for interop `=…` relative to a default TSV/CSV table (A1 = file top-left
+/// with header row, margins, and row key column; same layout as `DelimitedExportOptions::default`).
+pub fn delimited_default_generic_rebase(grid: &Grid) -> (i32, i32) {
+    let o = DelimitedExportOptions::default();
+    let (c0, c1, ref rows) = delimited_table_col_span_and_rows(grid, &o);
+    delimited_generic_rebase(
+        c0,
+        c1,
+        o.include_header_row,
+        o.include_row_label_column,
+        rows,
+    )
 }
 
 fn export_delimited(
@@ -759,23 +826,12 @@ fn export_delimited(
     let content = options.content;
     let mr = grid.main_rows();
     let mc = grid.main_cols();
-    let hr = HEADER_ROWS;
-    let lm = MARGIN_COLS;
     let _rm = MARGIN_COLS;
-    let fr = FOOTER_ROWS;
-    let total_rows = hr + mr + fr;
 
     // Trim leading/trailing all-empty margin columns (same span as `export_ascii_table`),
     // but always include the full main block: the last main column can hold fill/spill
     // output without a `main_cells` key, so `logical_col_has_content` may be false.
-    let (col_start, mut col_end) = if include_margins {
-        ascii_col_bounds(grid)
-    } else {
-        (lm, lm + mc)
-    };
-    if include_margins {
-        col_end = col_end.max(lm + mc);
-    }
+    let (col_start, col_end, rows) = delimited_table_col_span_and_rows(grid, options);
 
     if include_headers {
         if include_margins {
@@ -826,21 +882,6 @@ fn export_delimited(
         let _ = writeln!(out);
     }
 
-    let main_spans = main_row_index_bounds_for_export(grid);
-    let rows: Vec<usize> = row_order(grid, total_rows)
-        .into_iter()
-        .filter(|&r| {
-            if grid.logical_row_has_content(r) {
-                return true;
-            }
-            if let Some((mmin, mmax)) = main_spans {
-                if r >= hr + mmin && r <= hr + mmax {
-                    return true;
-                }
-            }
-            false
-        })
-        .collect();
     let generic_rebase = if content == ExportContent::Generic {
         let (dr, dc) = delimited_generic_rebase(
             col_start,
@@ -873,6 +914,71 @@ fn export_delimited(
         }
         let _ = writeln!(out);
     }
+}
+
+/// Matrix of the same text [`export_tsv_with_options`] / [`export_delimited`] would write (one
+/// row per `Vec`, fields tab-separated in the original output). For ODS, this matches LibreOffice
+/// A1/row 1+ layout when a header row and row-key column are used.
+pub fn delimited_export_matrix(
+    grid: &Grid,
+    options: &DelimitedExportOptions,
+) -> (Vec<Vec<String>>, usize, usize, Vec<usize>) {
+    let include_headers = options.include_header_row;
+    let include_margins = options.include_margins;
+    let row_key_col = options.include_row_label_column;
+    let content = options.content;
+    let mr = grid.main_rows();
+    let mc = grid.main_cols();
+    let (col_start, col_end, rows) = delimited_table_col_span_and_rows(grid, options);
+    let generic_rebase = if content == ExportContent::Generic {
+        let (dr, dc) = delimited_generic_rebase(
+            col_start,
+            col_end,
+            include_headers,
+            row_key_col,
+            &rows,
+        );
+        Some((dr, dc))
+    } else {
+        None
+    };
+    let mut out: Vec<Vec<String>> = Vec::new();
+    if include_headers {
+        let mut line = Vec::new();
+        if include_margins {
+            if row_key_col {
+                line.push(String::new());
+            }
+            for c in col_start..col_end {
+                line.push(delimited_marginal_header_token(grid, c, mc, content));
+            }
+        } else {
+            if row_key_col {
+                line.push(String::new());
+            }
+            for c in col_start..col_end {
+                line.push(col_header_label_for_export(grid, c, mc, content));
+            }
+        }
+        out.push(line);
+    }
+    for r in &rows {
+        let mut line = Vec::new();
+        if row_key_col {
+            line.push(sheet_row_label(*r, mr));
+        }
+        for c in col_start..col_end {
+            line.push(export_cell_text(
+                grid,
+                *r,
+                c,
+                content,
+                generic_rebase,
+            ));
+        }
+        out.push(line);
+    }
+    (out, col_start, col_end, rows)
 }
 
 fn odt_escape(s: &str) -> String {
@@ -1362,6 +1468,32 @@ mod tests {
         export_tsv_with_options(&gb, &mut out, &opts);
         let tsv = String::from_utf8(out).unwrap();
         assert!(tsv.contains("=SUBTOTAL(4,"), "expect comma, got {tsv}");
+    }
+
+    /// `generic_interop_cell_text(..., true)` is the TSV generic string; `false` is the same with
+    /// ODF/Excel list separators. They differ by [`interop_excel_list_separators`].
+    #[test]
+    fn generic_ods_reuses_tsv_interop_excel_list_swap() {
+        use crate::grid::HEADER_ROWS;
+
+        let m = MARGIN_COLS;
+        let mut grid = crate::grid::Grid::new(1, 2);
+        grid.set(
+            &CellAddr::Header {
+                row: (HEADER_ROWS - 1) as u32,
+                col: MARGIN_COLS as u32 + 1,
+            },
+            "MAX".into(),
+        );
+        grid.set(&CellAddr::Main { row: 0, col: 0 }, "3".into());
+        grid.set(&CellAddr::Right { col: 0, row: 0 }, "MAX".into());
+        let gb = crate::grid::GridBox::from(grid);
+        let re = delimited_default_generic_rebase(&gb);
+        let lr = HEADER_ROWS;
+        let gc = m + 2;
+        let tsv_s = generic_interop_cell_text(&gb, lr, gc, Some(re), true).expect("tsv interop");
+        let ods_s = generic_interop_cell_text(&gb, lr, gc, Some(re), false).expect("ods interop");
+        assert_eq!(tsv_s, super::interop_excel_list_separators(&ods_s));
     }
 
     #[test]

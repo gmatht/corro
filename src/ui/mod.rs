@@ -11,7 +11,8 @@ use crate::grid::{
     SortSpec, TextAlign, FOOTER_ROWS, HEADER_ROWS, MARGIN_COLS,
 };
 use crate::io::{
-    commit_workbook_op, load_workbook_revisions_partial, IoError, LogWatcher, PartialReplay,
+    commit_workbook_op, commit_workbook_set_column_format_batch, load_workbook_revisions_partial,
+    IoError, LogWatcher, PartialReplay,
 };
 use crate::ops::{AggFunc, AggregateDef, Op, SheetState, WorkbookState};
 use crossterm::cursor::{Hide, Show};
@@ -2567,8 +2568,45 @@ impl App {
                 }
             }
         }
-        for op in ops {
-            let _ = self.apply_single_op(op);
+        if ops.is_empty() {
+            return;
+        }
+        let all_set_col = ops
+            .iter()
+            .all(|o| matches!(o, Op::SetColumnFormat { .. }));
+        if all_set_col {
+            if let Some(ref p) = self.path.clone() {
+                for op in &ops {
+                    self.push_inverse_op(op);
+                    op.apply(&mut self.state);
+                    self.state.grid.bump_volatile_seed();
+                }
+                let mut active_sheet = self.view_sheet_id;
+                if let Err(e) = commit_workbook_set_column_format_batch(
+                    p,
+                    &mut self.offset,
+                    &mut self.workbook,
+                    &mut active_sheet,
+                    self.view_sheet_id,
+                    &ops,
+                ) {
+                    self.status = format!("I/O: {e}");
+                } else {
+                    self.ops_applied = self.ops_applied.saturating_add(ops.len());
+                    self.sync_active_sheet_cache();
+                    let _ = self.start_log_watcher_if_needed();
+                }
+            } else {
+                for op in &ops {
+                    self.push_inverse_op(op);
+                    op.apply(&mut self.state);
+                    self.state.grid.bump_volatile_seed();
+                }
+            }
+        } else {
+            for op in ops {
+                let _ = self.apply_single_op(op);
+            }
         }
     }
 
@@ -6973,7 +7011,7 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                             }
                             'g' | 'G' => {
                                 self.export_ods_content = export::ExportContent::Generic;
-                                self.status = "ODS: generic (same as formulas; ODF `;` args)".into();
+                                self.status = "ODS: generic (same strings as TSV generic)".into();
                             }
                             _ => {}
                         }
@@ -8587,7 +8625,7 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                 let mode = match self.export_ods_content {
                     export::ExportContent::Values => "values only (static)",
                     export::ExportContent::Formulas => "formulas (with ODF formula attributes)",
-                    export::ExportContent::Generic => "generic (interop formulas; ODF `;` separators)",
+                    export::ExportContent::Generic => "generic (same as TSV generic; comma arg lists in of:)",
                 };
                 Some((
                     format!(

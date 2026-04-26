@@ -2,8 +2,8 @@
 
 use crate::grid::CellAddr;
 use crate::ops::{
-    append_line, apply_line, apply_log_line_to_workbook, Op, SheetState, WorkbookOp,
-    WorkbookSnapshot, WorkbookState, LOG_HEADER_PREFIX, LOG_VERSION,
+    append_line, apply_line, apply_log_line_to_workbook, apply_workbook_op, Op, SheetState,
+    WorkbookOp, WorkbookSnapshot, WorkbookState, LOG_HEADER_PREFIX, LOG_VERSION,
 };
 use notify::{RecursiveMode, Watcher};
 use std::fs;
@@ -358,6 +358,63 @@ pub fn commit_workbook_op(
     let omit_sheet1_prefix = workbook.sheet_count() == 1;
     for line in op.to_log_lines_with_policy(main_cols, omit_sheet1_prefix) {
         append_line(path, &line)?;
+    }
+    *offset = tail_apply_workbook(path, *offset, workbook, active_sheet)?;
+    Ok(())
+}
+
+/// Commit many [`Op::SetColumnFormat`] changes with a single full-workbook validation pass and one
+/// `tail_apply_workbook`. Calling [`commit_workbook_op`] once per column runs `workbook.clone()`
+/// and a full append/tail-apply round trip each time, which freezes the UI (e.g. Format → Scope
+/// "All" → Align) on large sheets.
+pub fn commit_workbook_set_column_format_batch(
+    path: &Path,
+    offset: &mut u64,
+    workbook: &mut WorkbookState,
+    active_sheet: &mut u32,
+    sheet_id: u32,
+    ops: &[Op],
+) -> Result<(), IoError> {
+    if ops.is_empty() {
+        return Ok(());
+    }
+    for op in ops {
+        if !matches!(op, Op::SetColumnFormat { .. }) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "commit_workbook_set_column_format_batch requires only SetColumnFormat ops",
+            )
+            .into());
+        }
+    }
+    ensure_log_header(path)?;
+    let mut preview = workbook.clone();
+    let mut preview_active = *active_sheet;
+    for op in ops {
+        apply_workbook_op(
+            &mut preview,
+            &mut preview_active,
+            WorkbookOp::SheetOp {
+                sheet_id,
+                op: op.clone(),
+            },
+        )?;
+    }
+    let omit = workbook.sheet_count() == 1;
+    let main_cols = workbook
+        .sheets
+        .iter()
+        .find(|s| s.id == sheet_id)
+        .map(|s| s.state.grid.main_cols())
+        .unwrap_or(0);
+    for op in ops {
+        let wbo = WorkbookOp::SheetOp {
+            sheet_id,
+            op: op.clone(),
+        };
+        for line in wbo.to_log_lines_with_policy(main_cols, omit) {
+            append_line(path, &line)?;
+        }
     }
     *offset = tail_apply_workbook(path, *offset, workbook, active_sheet)?;
     Ok(())

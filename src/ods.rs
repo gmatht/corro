@@ -1,7 +1,7 @@
 //! ODS import/export for workbook data.
 
 use crate::addr::excel_column_name;
-use crate::export::ExportContent;
+use crate::export::{self, DelimitedExportOptions, ExportContent};
 use crate::formula::{cell_effective_display, is_formula};
 use crate::grid::{CellAddr, GridBox as Grid, HEADER_ROWS, MARGIN_COLS};
 use crate::ops::{SheetRecord, SheetState, WorkbookSnapshot, WorkbookState};
@@ -26,8 +26,6 @@ pub enum OdsError {
 /// ODF table rows are treated as full logical (header + margins + main + footer). Otherwise, ODF
 /// rows are mapped directly onto the main grid (interop, including compact export).
 const ODS_GLOBAL_LAYOUT_MIN_FIRST_ROW_REPEAT: u64 = 1_000_000;
-/// A single ODF `table:number-rows-repeated` must not make the sheet length exceed what Calc allows.
-const LIBREOFFICE_MAX_SHEET_ROWS: usize = 1_048_576;
 const CORRO_ODS_LAYOUT_PATH: &str = "corro-ods-layout";
 
 /// How to interpret 0-based ODF table `row_idx` when writing into the Corro grid. Corro exports
@@ -37,46 +35,87 @@ enum OdsTableLayout {
     Odf,
     Rebase { min: usize },
     Compact { physical_to_logical: Vec<usize> },
+    /// ODF table matches default TSV shape: optional synthetic header row, row-key column, then
+    /// `data_logical_rows.len()` data rows. Cell (`odf_r`,`odf_c`) maps to
+    /// `(data_logical_rows[odf_r - header_ods], col_start + odf_c - row_key)`.
+    TsvParity {
+        col_start: usize,
+        data_logical_rows: Vec<usize>,
+        header_ods_rows: usize,
+        row_key_cols: usize,
+    },
 }
 
 impl OdsTableLayout {
-    /// Use full logical (header + margins + main + footer) mapping; see [set_ods_cell].
-    fn use_global_ods_addr(&self, odf_inferred: bool) -> bool {
+    /// Map 0-based ODF table (row, col) to Corro `set_ods_cell` coordinates. `None` = synthetic
+    /// (TSV header / row key) or out of range: do not write the grid.
+    fn map_ods_table_cell(
+        &self,
+        odf_table_row: usize,
+        odf_table_col: usize,
+        odf_uses_full_logical: bool,
+    ) -> Option<(usize, usize, bool)> {
         match self {
-            OdsTableLayout::Odf => odf_inferred,
-            OdsTableLayout::Rebase { .. } | OdsTableLayout::Compact { .. } => true,
-        }
-    }
-
-    fn odf_to_logical(&self, odf_table_row: usize) -> usize {
-        match self {
-            OdsTableLayout::Odf => odf_table_row,
-            OdsTableLayout::Rebase { min } => min.saturating_add(odf_table_row),
+            OdsTableLayout::TsvParity {
+                col_start,
+                data_logical_rows,
+                header_ods_rows,
+                row_key_cols,
+            } => {
+                if odf_table_row < *header_ods_rows {
+                    return None;
+                }
+                if *row_key_cols > 0 && odf_table_col < *row_key_cols {
+                    return None;
+                }
+                let i = odf_table_row - header_ods_rows;
+                if i >= data_logical_rows.len() {
+                    return None;
+                }
+                let lr = data_logical_rows[i];
+                let gc = col_start + (odf_table_col - row_key_cols);
+                Some((lr, gc, true))
+            }
+            OdsTableLayout::Odf => {
+                let g = odf_uses_full_logical;
+                Some((odf_table_row, odf_table_col, g))
+            }
+            OdsTableLayout::Rebase { min } => Some((
+                min.saturating_add(odf_table_row),
+                odf_table_col,
+                true,
+            )),
             OdsTableLayout::Compact {
                 physical_to_logical,
-            } => physical_to_logical
-                .get(odf_table_row)
-                .copied()
-                .unwrap_or(odf_table_row),
+            } => {
+                let lr = physical_to_logical
+                    .get(odf_table_row)
+                    .copied()
+                    .unwrap_or(odf_table_row);
+                Some((lr, odf_table_col, true))
+            }
         }
     }
 }
 
-fn corro_ods_layout_file_bytes(
-    use_compact: bool,
-    min_r: usize,
-    ordered_logical_rows: &[usize],
+fn corro_ods_layout_tsv_parity(
+    col_start: usize,
+    _col_end: usize,
+    header_ods_rows: usize,
+    row_key_cols: usize,
+    data_logical_rows: &[usize],
 ) -> String {
-    if use_compact {
-        let mut s = String::from("v1\ncompact\n");
-        for r in ordered_logical_rows {
-            use std::fmt::Write;
-            let _ = writeln!(s, "{}", r);
-        }
-        s
-    } else {
-        format!("v1\nrebase\n{}\n", min_r)
+    use std::fmt::Write;
+    let mut s = String::from("v1\ntsv\n");
+    let _ = writeln!(&mut s, "{}", col_start);
+    let _ = writeln!(&mut s, "{}", _col_end);
+    let _ = writeln!(&mut s, "{}", header_ods_rows);
+    let _ = writeln!(&mut s, "{}", row_key_cols);
+    let _ = writeln!(&mut s, "{}", data_logical_rows.len());
+    for r in data_logical_rows {
+        let _ = writeln!(s, "{}", r);
     }
+    s
 }
 
 fn parse_corro_ods_layout_str(buf: &str) -> OdsTableLayout {
@@ -107,6 +146,48 @@ fn parse_corro_ods_layout_str(buf: &str) -> OdsTableLayout {
                 }
             }
         }
+        Some("tsv") => {
+            let c0 = lines
+                .get(2)
+                .and_then(|l| l.parse::<usize>().ok());
+            let c1 = lines
+                .get(3)
+                .and_then(|l| l.parse::<usize>().ok());
+            let hr = lines
+                .get(4)
+                .and_then(|l| l.parse::<usize>().ok());
+            let rk = lines
+                .get(5)
+                .and_then(|l| l.parse::<usize>().ok());
+            let n = lines
+                .get(6)
+                .and_then(|l| l.parse::<usize>().ok());
+            if let (Some(col_start), Some(_), Some(header_ods_rows), Some(row_key_cols), Some(n)) =
+                (c0, c1, hr, rk, n)
+            {
+                let need = 7 + n;
+                if lines.len() < need {
+                    return OdsTableLayout::Odf;
+                }
+                let data: Vec<usize> = lines
+                    .get(7..7 + n)
+                    .unwrap_or(&[])
+                    .iter()
+                    .filter_map(|l| l.parse().ok())
+                    .collect();
+                if data.len() != n {
+                    return OdsTableLayout::Odf;
+                }
+                OdsTableLayout::TsvParity {
+                    col_start,
+                    data_logical_rows: data,
+                    header_ods_rows,
+                    row_key_cols,
+                }
+            } else {
+                OdsTableLayout::Odf
+            }
+        }
         _ => OdsTableLayout::Odf,
     }
 }
@@ -121,22 +202,51 @@ pub fn export_ods_bytes_with_options(
     grid: &Grid,
     content: ExportContent,
 ) -> Result<Vec<u8>, OdsError> {
-    let tc = ods_col_end(grid);
-    let rows = ods_row_order(grid);
-    let max_rebase_run = ods_max_rebase_blank_run(&rows);
-    let use_compact = max_rebase_run >= LIBREOFFICE_MAX_SHEET_ROWS;
-    let content_xml = ods_content_xml_with_rows_and_mode(
-        grid,
-        tc,
-        rows.clone(),
-        use_compact,
-        max_rebase_run,
+    let options = DelimitedExportOptions {
         content,
+        ..Default::default()
+    };
+    let (matrix, col_start, col_end, data_rows) = export::delimited_export_matrix(grid, &options);
+    // #region agent log
+    {
+        use std::io::Write;
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("debug-211195.log")
+        {
+            let nrows = matrix.len();
+            let tc0 = matrix.first().map(|r| r.len()).unwrap_or(0);
+            let drc = data_rows.len();
+            let _ = writeln!(
+                f,
+                "{{\"sessionId\":\"211195\",\"hypothesisId\":\"H1\",\"location\":\"ods.rs:export_ods_bytes_with_options\",\"message\":\"tsv_shaped_matrix\",\"data\":{{\"nrows\":{0},\"tc\":{1},\"col_start\":{2},\"col_end\":{3},\"data_row_count\":{4}}},\"timestamp\":{5}}}",
+                nrows, tc0, col_start, col_end, drc, ts
+            );
+        }
+    }
+    // #endregion
+    let content_xml = ods_content_xml_tsv_shaped(
+        grid,
+        &matrix,
+        &options,
+        col_start,
+        col_end,
+        &data_rows,
     );
-    let min_r = *rows
-        .first()
-        .expect("ods_row_order is never empty");
-    let sidecar = corro_ods_layout_file_bytes(use_compact, min_r, &rows);
+    let header_ods_rows = if options.include_header_row { 1 } else { 0 };
+    let row_key_cols = if options.include_row_label_column { 1 } else { 0 };
+    let sidecar = corro_ods_layout_tsv_parity(
+        col_start,
+        col_end,
+        header_ods_rows,
+        row_key_cols,
+        &data_rows,
+    );
 
     let cursor = std::io::Cursor::new(Vec::new());
     let mut zip = zip::ZipWriter::new(cursor);
@@ -197,10 +307,30 @@ fn ods_manifest_with_corro_layout() -> String {
     ))
 }
 
-fn ods_column_styles_xml(grid: &Grid, tc: usize) -> String {
+fn ods_column_width_cm(char_width: usize) -> f32 {
+    let chars = char_width.max(1) as f32;
+    (chars * 0.20 + 0.20).max(0.45)
+}
+
+fn ods_column_styles_tsv(
+    grid: &Grid,
+    tc: usize,
+    col_start: usize,
+    has_row_key: bool,
+) -> String {
     let mut s = String::new();
     for c in 0..tc {
-        let width_cm = ods_column_width_cm(grid.col_width(c));
+        let width_chars = if has_row_key && c == 0 {
+            8
+        } else {
+            let gc = if has_row_key {
+                col_start + c.saturating_sub(1)
+            } else {
+                col_start + c
+            };
+            grid.col_width(gc)
+        };
+        let width_cm = ods_column_width_cm(width_chars);
         s.push_str(&format!(
             r#"<style:style style:name="co{c}" style:family="table-column"><style:table-column-properties style:column-width="{width_cm:.2}cm"/></style:style>"#
         ));
@@ -208,79 +338,33 @@ fn ods_column_styles_xml(grid: &Grid, tc: usize) -> String {
     s
 }
 
-fn ods_column_width_cm(char_width: usize) -> f32 {
-    let chars = char_width.max(1) as f32;
-    (chars * 0.20 + 0.20).max(0.45)
-}
-
-fn ods_col_end(grid: &Grid) -> usize {
-    let mut end = grid.total_cols();
-    while end > 0 && !ods_logical_col_has_content(grid, end - 1) {
-        end -= 1;
-    }
-    end.max(1)
-}
-
-fn ods_logical_col_has_content(grid: &Grid, col: usize) -> bool {
-    grid.logical_col_has_content(col)
-}
-
-fn ods_row_order(grid: &Grid) -> Vec<usize> {
-    let hr = HEADER_ROWS;
-    let mr = grid.main_rows();
-    let mut rows = Vec::new();
-    for (addr, _) in grid.iter_nonempty() {
-        let logical_row = match addr {
-            CellAddr::Header { row, .. } => row as usize,
-            CellAddr::Footer { row, .. } => hr + mr + row as usize,
-            CellAddr::Main { row, .. }
-            | CellAddr::Left { row, .. }
-            | CellAddr::Right { row, .. } => hr + row as usize,
-        };
-        rows.push(logical_row);
-    }
-    rows.sort_unstable();
-    rows.dedup();
-    if rows.is_empty() {
-        rows.push(0);
-    }
-    rows
-}
-
-/// Max single `table:number-rows-repeated` in the rebase-anchored (min-row) ODF run we would emit
-/// (leading gap + any gap between used logical rows). If that exceeds [LIBREOFFICE_MAX_SHEET_ROWS],
-/// we use compact ODF: one ODF table row per used logical row (no large blank run).
-fn ods_max_rebase_blank_run(rows: &[usize]) -> usize {
-    if rows.is_empty() {
-        return 0;
-    }
-    let min_r = rows[0];
-    let mut next_rel = 0usize;
-    let mut max_run = 0usize;
-    for &r in rows {
-        let rel = r.saturating_sub(min_r);
-        if rel > next_rel {
-            max_run = max_run.max(rel - next_rel);
-        }
-        next_rel = rel.saturating_add(1);
-    }
-    max_run
-}
-
-fn ods_content_xml_with_rows_and_mode(
+/// TSV/CSV default layout: one ODF table row per matrix row, same column count as
+/// [export::delimited_export_matrix] (synthetic header + row key + grid columns).
+fn ods_content_xml_tsv_shaped(
     grid: &Grid,
-    tc: usize,
-    rows: Vec<usize>,
-    use_compact: bool,
-    _max_rebase_run: usize,
-    export_content: ExportContent,
+    matrix: &[Vec<String>],
+    options: &DelimitedExportOptions,
+    col_start: usize,
+    _col_end: usize,
+    data_rows: &[usize],
 ) -> String {
-    let column_styles = ods_column_styles_xml(grid, tc);
+    let export_content = options.content;
+    let generic_tsv_rebase = if export_content == ExportContent::Generic {
+        Some(export::delimited_default_generic_rebase(grid))
+    } else {
+        None
+    };
+    let tc = matrix
+        .iter()
+        .map(|r| r.len())
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let column_styles = ods_column_styles_tsv(grid, tc, col_start, options.include_row_label_column);
     let mut s = String::from(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:of="urn:oasis:names:tc:opendocument:xmlns:of:1.2" office:version="1.2"><office:automatic-styles>"#,
     );
-
     s.push_str(&column_styles);
     s.push_str("</office:automatic-styles><office:body><office:spreadsheet><table:table>");
 
@@ -290,41 +374,74 @@ fn ods_content_xml_with_rows_and_mode(
         ));
     }
 
-    if use_compact {
-        for r in &rows {
-            s.push_str("<table:table-row>");
-            let mut c = 0usize;
-            while c < tc {
-                s.push_str(&ods_cell_xml(grid, *r, c, export_content));
-                c += 1;
-            }
-            s.push_str("</table:table-row>");
-        }
-    } else {
-        let min_r = *rows
-            .first()
-            .expect("ods_row_order is never empty");
-        let mut next_row = 0usize;
-        for r in rows {
-            let rel = r.saturating_sub(min_r);
-            if rel > next_row {
-                let repeated = rel - next_row;
-                s.push_str(&format!(
-                    r#"<table:table-row table:number-rows-repeated="{repeated}"><table:table-cell table:number-columns-repeated="{tc}"/></table:table-row>"#
+    let rk: usize = if options.include_row_label_column { 1 } else { 0 };
+    for (i, row) in matrix.iter().enumerate() {
+        s.push_str("<table:table-row>");
+        for j in 0..tc {
+            let cell_str = row.get(j).map(|s| s.as_str()).unwrap_or("");
+            if options.include_header_row && i == 0 {
+                s.push_str(&ods_cell_from_export_matrix_string(cell_str, export_content));
+            } else if options.include_row_label_column && j < rk {
+                s.push_str(&ods_cell_from_export_matrix_string(cell_str, export_content));
+            } else {
+                let data_i = if options.include_header_row { i - 1 } else { i };
+                let logical = data_rows.get(data_i).copied().unwrap_or(HEADER_ROWS);
+                let global = col_start + j.saturating_sub(rk);
+                s.push_str(&ods_cell_xml(
+                    grid,
+                    logical,
+                    global,
+                    export_content,
+                    generic_tsv_rebase,
                 ));
             }
-            s.push_str("<table:table-row>");
-            let mut c = 0usize;
-            while c < tc {
-                s.push_str(&ods_cell_xml(grid, r, c, export_content));
-                c += 1;
-            }
-            s.push_str("</table:table-row>");
-            next_row = rel + 1;
         }
+        s.push_str("</table:table-row>");
     }
     s.push_str("</table:table></office:spreadsheet></office:body></office:document-content>");
     s
+}
+
+fn ods_cell_from_export_matrix_string(s: &str, export_content: ExportContent) -> String {
+    if s.trim().is_empty() {
+        return "<table:table-cell/>".into();
+    }
+    match export_content {
+        ExportContent::Values => ods_cell_xml_values_only(s, s, s),
+        ExportContent::Formulas => {
+            if s.trim().starts_with('=') || is_formula(s) {
+                let formula = ods_formula_expr(s).unwrap_or_else(|| s.to_string());
+                let value_attrs = match s.trim().parse::<f64>() {
+                    Ok(n) => format!(r#" office:value-type="float" office:value="{n}""#),
+                    Err(_) => r#" office:value-type="string""#.to_string(),
+                };
+                return format!(
+                    r#"<table:table-cell{} table:formula="of:{}"><text:p>{}</text:p></table:table-cell>"#,
+                    value_attrs,
+                    ods_escape(&formula),
+                    ods_escape(s)
+                );
+            }
+            ods_cell_xml_values_only(s, s, s)
+        }
+        ExportContent::Generic => {
+            let tsv = s;
+            if tsv.trim_start().starts_with('=') {
+                let formula = ods_formula_expr(&tsv).unwrap_or_else(|| tsv.to_string());
+                let value_attrs = match tsv.trim().parse::<f64>() {
+                    Ok(n) => format!(r#" office:value-type="float" office:value="{n}""#),
+                    Err(_) => r#" office:value-type="string""#.to_string(),
+                };
+                return format!(
+                    r#"<table:table-cell{} table:formula="of:{}"><text:p>{}</text:p></table:table-cell>"#,
+                    value_attrs,
+                    ods_escape(&formula),
+                    ods_escape(&tsv)
+                );
+            }
+            ods_cell_xml_values_only(&tsv, &tsv, &tsv)
+        }
+    }
 }
 
 fn ods_cell_xml(
@@ -332,6 +449,7 @@ fn ods_cell_xml(
     logical_row: usize,
     global_col: usize,
     export_content: ExportContent,
+    generic_tsv_rebase: Option<(i32, i32)>,
 ) -> String {
     let hr = HEADER_ROWS;
     let mr = grid.main_rows();
@@ -348,11 +466,42 @@ fn ods_cell_xml(
         footer_formula_or_value(grid, logical_row - hr - mr, global_col, mc)
     };
 
+    if export_content == ExportContent::Values {
+        if value.is_empty() && raw.is_empty() {
+            return "<table:table-cell/>".into();
+        }
+        return ods_cell_xml_values_only(&display, &value, &raw);
+    }
+    // Generic: same string as default TSV “generic” (interop `=…`, commas in arg lists) — not
+    // [cell_effective_display] in <text:p> (that matches Values, not the TSV generic column).
+    if export_content == ExportContent::Generic {
+        let tsv = export::export_cell_text(
+            grid,
+            logical_row,
+            global_col,
+            ExportContent::Generic,
+            generic_tsv_rebase,
+        );
+        if tsv.trim().is_empty() {
+            return "<table:table-cell/>".into();
+        }
+        if tsv.trim_start().starts_with('=') {
+            let formula = ods_formula_expr(&tsv).unwrap_or_else(|| tsv.clone());
+            let value_attrs = match display.trim().parse::<f64>() {
+                Ok(n) => format!(r#" office:value-type="float" office:value="{n}""#),
+                Err(_) => r#" office:value-type="string""#.to_string(),
+            };
+            return format!(
+                r#"<table:table-cell{} table:formula="of:{}"><text:p>{}</text:p></table:table-cell>"#,
+                value_attrs,
+                ods_escape(&formula),
+                ods_escape(&tsv)
+            );
+        }
+        return ods_cell_xml_values_only(&tsv, &tsv, &tsv);
+    }
     if value.is_empty() && raw.is_empty() {
         return "<table:table-cell/>".into();
-    }
-    if export_content == ExportContent::Values {
-        return ods_cell_xml_values_only(&display, &value, &raw);
     }
     if value.starts_with('=') || is_formula(&raw) {
         let formula = if value.starts_with('=') { value } else { raw };
@@ -653,18 +802,21 @@ fn parse_ods_content_with_layout(
                         .unwrap_or(1)
                         .max(1);
                     if let Some(sheet) = current_sheet.as_mut() {
-                        let g = table_layout
-                            .use_global_ods_addr(odf_uses_global_logical == Some(true));
-                        let logical = table_layout.odf_to_logical(row_idx);
+                        let odf_full = odf_uses_global_logical == Some(true);
                         for c_off in 0..n {
-                            set_ods_cell(
-                                &mut sheet.state,
-                                logical,
-                                col_idx + c_off,
-                                None,
-                                "",
-                                g,
-                            );
+                            let c = col_idx + c_off;
+                            if let Some((lr, gc, g)) =
+                                table_layout.map_ods_table_cell(row_idx, c, odf_full)
+                            {
+                                set_ods_cell(
+                                    &mut sheet.state,
+                                    lr,
+                                    gc,
+                                    None,
+                                    "",
+                                    g,
+                                );
+                            }
                         }
                         col_idx += n;
                     } else {
@@ -683,18 +835,21 @@ fn parse_ods_content_with_layout(
                 b"table:table-cell" => {
                     if let Some(sheet) = current_sheet.as_mut() {
                         let n = table_cell_num_cols;
-                        let g = table_layout
-                            .use_global_ods_addr(odf_uses_global_logical == Some(true));
-                        let logical = table_layout.odf_to_logical(row_idx);
+                        let odf_full = odf_uses_global_logical == Some(true);
                         for c_off in 0..n {
-                            set_ods_cell(
-                                &mut sheet.state,
-                                logical,
-                                col_idx + c_off,
-                                pending_formula.as_deref(),
-                                &pending_value,
-                                g,
-                            );
+                            let c = col_idx + c_off;
+                            if let Some((lr, gc, g)) =
+                                table_layout.map_ods_table_cell(row_idx, c, odf_full)
+                            {
+                                set_ods_cell(
+                                    &mut sheet.state,
+                                    lr,
+                                    gc,
+                                    pending_formula.as_deref(),
+                                    &pending_value,
+                                    g,
+                                );
+                            }
                         }
                         col_idx += n;
                     } else {
@@ -837,6 +992,7 @@ fn attr_value(e: &quick_xml::events::BytesStart<'_>, key: &[u8]) -> Option<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::export;
     use std::io::{ErrorKind, Read};
     use std::process::Command;
     use tempfile::tempdir;
@@ -849,6 +1005,42 @@ mod tests {
         let gb = crate::grid::GridBox::from(grid);
         let bytes = export_ods_bytes(&gb).unwrap();
         assert!(bytes.starts_with(b"PK"));
+    }
+
+    /// ODS “generic” must use the same per-cell string as TSV generic (not evaluated display in
+    /// &lt;text:p&gt;).
+    #[test]
+    fn ods_generic_text_p_matches_tsv_cell_text() {
+        let mut grid = crate::grid::Grid::new(2, 2);
+        grid.set(&CellAddr::Main { row: 0, col: 0 }, "=2+2".into());
+        let gb = crate::grid::GridBox::from(grid);
+        let rebase = export::delimited_default_generic_rebase(&gb);
+        let expected = export::export_cell_text(
+            &gb,
+            HEADER_ROWS,
+            MARGIN_COLS,
+            ExportContent::Generic,
+            Some(rebase),
+        );
+        assert!(
+            expected.contains("2+2") || expected.trim_start().starts_with('='),
+            "unexpected generic cell {expected:?}"
+        );
+        let content_xml = {
+            let bytes = export_ods_bytes_with_options(&gb, ExportContent::Generic).unwrap();
+            let mut a = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+            let mut s = String::new();
+            a.by_name("content.xml")
+                .unwrap()
+                .read_to_string(&mut s)
+                .unwrap();
+            s
+        };
+        assert!(
+            content_xml.contains(&format!("<text:p>{}</text:p>", ods_escape(&expected))),
+            "ODS <text:p> should equal TSV generic for that cell; want {:?}\n",
+            expected
+        );
     }
 
     #[test]
@@ -924,14 +1116,16 @@ mod tests {
         let mut grid = crate::grid::Grid::new(2, 2);
         grid.set(&CellAddr::Main { row: 0, col: 0 }, "42".into());
         let gb = crate::grid::GridBox::from(grid);
+        let opts = export::DelimitedExportOptions::default();
+        let (matrix, _cs, _ce, _dr) = export::delimited_export_matrix(&gb, &opts);
         let content = exported_content_xml(&gb);
-        assert_eq!(content.matches("<table:table-row>").count(), 1);
+        assert_eq!(content.matches("<table:table-row>").count(), matrix.len());
         assert!(
             !content.contains(&format!(
                 r#"<table:table-row table:number-rows-repeated="{}">"#,
                 HEADER_ROWS
             )),
-            "a single ~1e9 blank run exceeds Calc row limits; export should rebase"
+            "TSV-shaped ODF does not use a gap filler row; huge logical gaps are not in the table"
         );
         let bytes = export_ods_bytes(&gb).unwrap();
         let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
@@ -941,10 +1135,58 @@ mod tests {
             .unwrap()
             .read_to_string(&mut sidecar)
             .unwrap();
-        assert!(sidecar.contains("rebase"));
-        assert_eq!(
-            content.matches("<table:table-column").count(),
-            MARGIN_COLS + 1
+        assert!(sidecar.contains("tsv"));
+        let tc = matrix.first().map(|r| r.len()).unwrap_or(0);
+        assert_eq!(content.matches("<table:table-column").count(), tc);
+    }
+
+    /// Generic ODS `table:formula` uses the same `of:…` expression as [export::export_cell_text]
+    /// for [ExportContent::Generic] (TSV/Excel-style `,` in function arg lists; see
+    /// [export::generic_interop_cell_text] with `excel_list_arg_comma: true`).
+    #[test]
+    fn export_generic_ods_formula_attribute_matches_tsv_generic_interop() {
+        use crate::grid::HEADER_ROWS;
+
+        let m = MARGIN_COLS;
+        let mut grid = crate::grid::Grid::new(1, 2);
+        grid.set(
+            &CellAddr::Header {
+                row: (HEADER_ROWS - 1) as u32,
+                col: MARGIN_COLS as u32 + 1,
+            },
+            "MAX".into(),
+        );
+        grid.set(&CellAddr::Main { row: 0, col: 0 }, "3".into());
+        grid.set(&CellAddr::Right { col: 0, row: 0 }, "MAX".into());
+        let gb = crate::grid::GridBox::from(grid);
+        let re = export::delimited_default_generic_rebase(&gb);
+        let tsv = export::export_cell_text(
+            &gb,
+            HEADER_ROWS,
+            m + 2,
+            ExportContent::Generic,
+            Some(re),
+        );
+        let formula = ods_formula_expr(&tsv).expect("formula");
+        assert!(tsv.trim_start().starts_with('='), "{tsv}");
+        let bytes = export_ods_bytes_with_options(&gb, ExportContent::Generic).unwrap();
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let mut content = String::new();
+        archive
+            .by_name("content.xml")
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
+        let expected_in_xml = format!(r#"table:formula="of:{}"#, ods_escape(&formula));
+        assert!(
+            content.contains(&expected_in_xml),
+            "expected {} in ODS, got (fragment): {}",
+            expected_in_xml,
+            if content.contains("table:formula") {
+                "has table:formula not matching"
+            } else {
+                "no table:formula"
+            }
         );
     }
 
