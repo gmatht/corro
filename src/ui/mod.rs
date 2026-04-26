@@ -1,6 +1,6 @@
 //! Ratatui front-end: sheet viewport, editing, export, move, file sync.
 
-use crate::addr::{self, parse_cell_ref_at};
+use crate::addr::{self, parse_cell_ref_at, parse_sheet_id_prefix_at};
 use crate::agg::{cell_display, compute_aggregate};
 use crate::balance::{self, BalanceDirection};
 use crate::export;
@@ -3979,11 +3979,111 @@ impl App {
         Ok(changed)
     }
 
+    fn main_cols_for_sheet_id(&self, sheet_id: u32) -> usize {
+        self.workbook
+            .sheet_index_by_id(sheet_id)
+            .map(|i| self.workbook.sheets[i].state.grid.main_cols())
+            .unwrap_or(0)
+    }
+
+    /// `Sheet>Go` targets like `$1`, `$Sheet1`, `$Budget:B2` (see formula sheet-ref syntax). Must run
+    /// before the go-to string is uppercased, so sheet titles stay matchable.
+    fn go_to_dollar_qualified(&mut self, text: &str) -> bool {
+        let b = text.as_bytes();
+        if b.len() < 2 {
+            self.status = "Bad cell address".into();
+            return false;
+        }
+        let (sheet_id, addr_opt) = if b[1].is_ascii_digit() {
+            let (sheet_id, plen) = match parse_sheet_id_prefix_at(text) {
+                Some(x) => x,
+                None => {
+                    self.status = "Bad cell address".into();
+                    return false;
+                }
+            };
+            if plen == text.len() {
+                (sheet_id, None)
+            } else if let Some(after) = text.get(plen..).and_then(|r| r.strip_prefix(':')) {
+                let main_cols = self.main_cols_for_sheet_id(sheet_id);
+                let Some((addr, len)) = parse_cell_ref_at(after, main_cols) else {
+                    self.status = "Bad cell address".into();
+                    return false;
+                };
+                if plen + 1 + len != text.len() {
+                    self.status = "Bad cell address".into();
+                    return false;
+                }
+                (sheet_id, Some(addr))
+            } else {
+                self.status = "Bad cell address".into();
+                return false;
+            }
+        } else {
+            let mut j = 1usize;
+            while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+                j += 1;
+            }
+            if j == 1 {
+                self.status = "Bad cell address".into();
+                return false;
+            }
+            let name = &text[1..j];
+            let Some(sheet_id) = self.workbook.resolve_dollar_sheet_name(name) else {
+                self.status = "Unknown sheet".into();
+                return false;
+            };
+            if j == text.len() {
+                (sheet_id, None)
+            } else if let Some(after) = text.get(j..).and_then(|r| r.strip_prefix(':')) {
+                let main_cols = self.main_cols_for_sheet_id(sheet_id);
+                let Some((addr, len)) = parse_cell_ref_at(after, main_cols) else {
+                    self.status = "Bad cell address".into();
+                    return false;
+                };
+                if j + 1 + len != text.len() {
+                    self.status = "Bad cell address".into();
+                    return false;
+                }
+                (sheet_id, Some(addr))
+            } else {
+                self.status = "Bad cell address".into();
+                return false;
+            }
+        };
+
+        if self.workbook.sheet_index_by_id(sheet_id).is_none() {
+            self.status = "Unknown sheet".into();
+            return false;
+        }
+
+        self.commit_active_sheet_cache();
+        self.view_sheet_id = sheet_id;
+        self.sync_active_sheet_cache();
+
+        if let Some(addr) = addr_opt {
+            if let Some(c) = self.sheet_cursor_for_addr(&addr) {
+                return self.set_cursor_from_go(c);
+            }
+            self.status = "Bad cell address".into();
+            return false;
+        }
+
+        self.set_cursor_from_go(SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        })
+    }
+
     fn go_to_cell(&mut self, raw: &str) -> bool {
         let text = raw.trim();
         if text.is_empty() {
             self.status = "Cell address required".into();
             return false;
+        }
+
+        if text.starts_with('$') {
+            return self.go_to_dollar_qualified(text);
         }
 
         let text = text.to_ascii_uppercase();
@@ -10904,6 +11004,43 @@ mod tests {
             ),
             "]ZZ1"
         );
+    }
+
+    #[test]
+    fn sheet_go_dollar_goes_to_sheet_by_name_or_id() {
+        let mut app = App::new(None);
+        app.add_sheet("Sheet2".into());
+        assert_eq!(app.view_sheet_id, 2);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 1, col: 1 }, "here".into());
+
+        assert!(app.go_to_cell("$Sheet1"));
+        assert_eq!(app.view_sheet_id, 1);
+        assert_eq!(
+            app.cursor,
+            SheetCursor {
+                row: HEADER_ROWS,
+                col: MARGIN_COLS,
+            }
+        );
+
+        assert!(app.go_to_cell("$2:B2"));
+        assert_eq!(app.view_sheet_id, 2);
+        assert_eq!(
+            app.cursor,
+            SheetCursor {
+                row: HEADER_ROWS + 1,
+                col: MARGIN_COLS + 1,
+            }
+        );
+        assert_eq!(
+            app.state.grid.get(&CellAddr::Main { row: 1, col: 1 }).as_deref(),
+            Some("here")
+        );
+
+        assert!(app.go_to_cell("$SHEET1"));
+        assert_eq!(app.view_sheet_id, 1);
     }
 
     #[test]

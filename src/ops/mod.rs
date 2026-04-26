@@ -141,6 +141,31 @@ impl WorkbookState {
         self.sheets.iter().position(|s| s.id == id)
     }
 
+    /// Resolve a sheet for formula-style and **Go to**-style `$` prefixes (e.g. `Sheet1` → id, or
+    /// a title such as `Budget`). The `Sheet`+digits form matches a sheet with that **id** (same
+    /// rules as `workbook_lookup_sheet_ref` in `formula`); title match is ASCII case-insensitive.
+    pub fn resolve_dollar_sheet_name(&self, name: &str) -> Option<u32> {
+        if name.is_empty() {
+            return None;
+        }
+        const PREFIX: &str = "Sheet";
+        if name.len() > PREFIX.len() && name[..PREFIX.len()].eq_ignore_ascii_case(PREFIX) {
+            let rest = &name[PREFIX.len()..];
+            if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) {
+                if let Ok(id) = rest.parse::<u32>() {
+                    if let Some(rec) = self.sheets.iter().find(|s| s.id == id) {
+                        return Some(rec.id);
+                    }
+                }
+            }
+        }
+        self
+            .sheets
+            .iter()
+            .find(|s| s.title.eq_ignore_ascii_case(name))
+            .map(|s| s.id)
+    }
+
     pub fn sheet_mut_by_index(&mut self, index: usize) -> Option<&mut SheetState> {
         self.sheets.get_mut(index).map(|sheet| &mut sheet.state)
     }
