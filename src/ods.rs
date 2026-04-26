@@ -21,6 +21,11 @@ pub enum OdsError {
     Zip(#[from] zip::result::ZipError),
 }
 
+/// Corro ODS export starts with a long `table:number-rows-repeated` fill so content rows use
+/// global logical indices; LibreOffice/Calc does not. If the first row in a table uses a repeat
+/// count below this, we map ODF 0-based table cells into the main area (`HEADER_ROWS` / `MARGIN_COLS` offset).
+const ODS_GLOBAL_LAYOUT_MIN_FIRST_ROW_REPEAT: u64 = 1_000_000;
+
 pub fn export_ods_bytes(grid: &Grid) -> Result<Vec<u8>, OdsError> {
     let cursor = std::io::Cursor::new(Vec::new());
     let mut zip = zip::ZipWriter::new(cursor);
@@ -364,6 +369,7 @@ fn parse_ods_content(xml: &str) -> Result<WorkbookState, OdsError> {
     let mut workbook = WorkbookState::new();
     workbook.sheets.clear();
     let mut current_sheet: Option<SheetRecord> = None;
+    let mut odf_uses_global_logical: Option<bool> = None;
     let mut row_idx = 0usize;
     let mut col_idx = 0usize;
     let mut pending_value = String::new();
@@ -371,6 +377,7 @@ fn parse_ods_content(xml: &str) -> Result<WorkbookState, OdsError> {
     let mut in_p = false;
     let mut in_cell = false;
     let mut current_row_repeat = 1usize;
+    let mut table_cell_num_cols = 1usize;
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -384,12 +391,18 @@ fn parse_ods_content(xml: &str) -> Result<WorkbookState, OdsError> {
                     });
                     workbook.next_sheet_id += 1;
                     row_idx = 0;
+                    odf_uses_global_logical = None;
                 }
                 b"table:table-row" => {
                     col_idx = 0;
                     current_row_repeat = attr_value(&e, b"table:number-rows-repeated")
                         .and_then(|n| n.parse().ok())
                         .unwrap_or(1);
+                    if odf_uses_global_logical.is_none() {
+                        odf_uses_global_logical = Some(
+                            (current_row_repeat as u64) >= ODS_GLOBAL_LAYOUT_MIN_FIRST_ROW_REPEAT,
+                        );
+                    }
                 }
                 b"text:p" => {
                     in_p = true;
@@ -399,15 +412,35 @@ fn parse_ods_content(xml: &str) -> Result<WorkbookState, OdsError> {
                     in_cell = true;
                     pending_value.clear();
                     pending_formula = attr_value(&e, b"table:formula");
+                    table_cell_num_cols = attr_value(&e, b"table:number-columns-repeated")
+                        .and_then(|n| n.parse().ok())
+                        .unwrap_or(1)
+                        .max(1);
                 }
                 _ => {}
             },
             Ok(Event::Empty(e)) => match e.name().as_ref() {
                 b"table:table-cell" => {
+                    let n = attr_value(&e, b"table:number-columns-repeated")
+                        .and_then(|n| n.parse().ok())
+                        .unwrap_or(1)
+                        .max(1);
                     if let Some(sheet) = current_sheet.as_mut() {
-                        set_ods_cell(&mut sheet.state, row_idx, col_idx, None, "");
+                        let g = odf_uses_global_logical == Some(true);
+                        for c_off in 0..n {
+                            set_ods_cell(
+                                &mut sheet.state,
+                                row_idx,
+                                col_idx + c_off,
+                                None,
+                                "",
+                                g,
+                            );
+                        }
+                        col_idx += n;
+                    } else {
+                        col_idx += n;
                     }
-                    col_idx += 1;
                 }
                 _ => {}
             },
@@ -420,16 +453,23 @@ fn parse_ods_content(xml: &str) -> Result<WorkbookState, OdsError> {
                 b"text:p" => in_p = false,
                 b"table:table-cell" => {
                     if let Some(sheet) = current_sheet.as_mut() {
-                        set_ods_cell(
-                            &mut sheet.state,
-                            row_idx,
-                            col_idx,
-                            pending_formula.as_deref(),
-                            &pending_value,
-                        );
+                        let n = table_cell_num_cols;
+                        let g = odf_uses_global_logical == Some(true);
+                        for c_off in 0..n {
+                            set_ods_cell(
+                                &mut sheet.state,
+                                row_idx,
+                                col_idx + c_off,
+                                pending_formula.as_deref(),
+                                &pending_value,
+                                g,
+                            );
+                        }
+                        col_idx += n;
+                    } else {
+                        col_idx += table_cell_num_cols;
                     }
                     in_cell = false;
-                    col_idx += 1;
                 }
                 b"table:table-row" => row_idx += current_row_repeat,
                 b"table:table" => {
@@ -465,14 +505,34 @@ fn parse_ods_content(xml: &str) -> Result<WorkbookState, OdsError> {
 
 fn set_ods_cell(
     state: &mut SheetState,
-    row: usize,
-    col: usize,
+    odf_table_row: usize,
+    odf_table_col: usize,
     formula: Option<&str>,
     value: &str,
+    odf_uses_global_logical: bool,
 ) {
     if value.is_empty() && formula.is_none() {
         return;
     }
+    // Interop: ODF/Calc tables are a plain rectangle — map directly to the main grid. (Do not add
+    // HEADER_ROWS / MARGIN_COLS; the old `row < … + main_rows()` check misclassified ODF row 2+
+    // as footer while `main_rows` was still 1.)
+    if !odf_uses_global_logical {
+        let target = CellAddr::Main {
+            row: odf_table_row as u32,
+            col: odf_table_col as u32,
+        };
+        if let Some(f) = formula {
+            let expr = f.strip_prefix("of:").unwrap_or(f);
+            state.grid.set(&target, format!("={}", expr));
+        } else {
+            state.grid.set(&target, value.to_string());
+        }
+        return;
+    }
+
+    // Corro round-trip export: (row, col) are full logical coordinates (huge index rows, etc.)
+    let (row, col) = (odf_table_row, odf_table_col);
     let target = if row < HEADER_ROWS {
         CellAddr::Header {
             row: row as u32,
@@ -523,8 +583,10 @@ fn ods_row_end_for_sheet(grid: &Grid) -> usize {
         .unwrap_or_else(|| grid.main_rows())
 }
 
+/// Used after import to clip main extent — must be **main** width, not `total_cols()` (which
+/// includes both margins) or `set_main_size` will expand the main area by ~1400 columns.
 fn ods_col_end_for_sheet(grid: &Grid) -> usize {
-    grid.total_cols()
+    grid.main_cols()
 }
 
 fn attr_value(e: &quick_xml::events::BytesStart<'_>, key: &[u8]) -> Option<String> {
@@ -570,6 +632,55 @@ mod tests {
                 .as_deref(),
             Some("42")
         );
+    }
+
+    /// LibreOffice/Calc: first `table:table-row` has a small (or no) `number-rows-repeated`; ODF
+    /// 0,0 should become corro main (0,0), not a `~N` header row.
+    #[test]
+    fn import_interop_ods_first_cell_goes_to_main() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" office:version="1.2">
+<office:body><office:spreadsheet>
+<table:table table:name="Sheet1">
+<table:table-row>
+<table:table-cell><text:p>hello</text:p></table:table-cell>
+</table:table-row>
+</table:table>
+</office:spreadsheet></office:body>
+</office:document-content>
+"#;
+        let workbook = parse_ods_content(xml).unwrap();
+        assert_eq!(
+            workbook
+                .active_sheet()
+                .grid
+                .get(&CellAddr::Main { row: 0, col: 0 })
+                .as_deref(),
+            Some("hello")
+        );
+    }
+
+    /// ODF row 1+ must stay in the main grid, and `set_main_size` must not use `total_cols` (margins + main).
+    #[test]
+    fn import_interop_ods_row2_and_few_main_cols() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" office:version="1.2">
+<office:body><office:spreadsheet>
+<table:table table:name="S">
+<table:table-row><table:table-cell><text:p>a1</text:p></table:table-cell><table:table-cell><text:p>b1</text:p></table:table-cell></table:table-row>
+<table:table-row><table:table-cell><text:p>a2</text:p></table:table-cell><table:table-cell><text:p>b2</text:p></table:table-cell></table:table-row>
+</table:table>
+</office:spreadsheet></office:body>
+</office:document-content>
+"#;
+        let workbook = parse_ods_content(xml).unwrap();
+        let s = workbook.active_sheet();
+        assert_eq!(
+            s.grid.get(&CellAddr::Main { row: 1, col: 1 }).as_deref(),
+            Some("b2")
+        );
+        assert_eq!(s.grid.main_cols(), 2);
+        assert!(s.grid.get(&CellAddr::Footer { row: 0, col: 0 }).is_none());
     }
 
     #[test]

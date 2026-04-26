@@ -13,7 +13,7 @@ crossterm = "0.28"
 serde = { version = "1", features = ["derive"] }
 notify = "7"
 thiserror = "2"
-zip = { version = "0.6", default-features = false }
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 quick-xml = "0.37"
 balance-core = { path = "balance-core" }

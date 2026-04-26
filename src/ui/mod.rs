@@ -1303,7 +1303,7 @@ impl App {
         let body = String::from(
             "Corro Help\n\n\
 Basics\n\
-- Arrow keys or hjkl move the cursor.\n\
+- Arrow keys or hjkl move the cursor; PageUp/PageDown move by one screen of rows.\n\
 - Enter or e starts editing the current cell.\n\
 - Header/footer/margin cells use the active address syntax.\n\
 - Any printable key starts editing with that character.\n\
@@ -2134,6 +2134,8 @@ pub struct App {
     pub ops_applied: usize,
     pub row_scroll: usize,
     pub col_scroll: usize,
+    /// Rows visible in the main grid (data area), updated in [`App::draw`]. Used for PageUp/PageDown.
+    pub grid_viewport_data_rows: usize,
     help_scroll: usize,
     about_scroll: usize,
     export_preview_scroll: usize,
@@ -2200,6 +2202,7 @@ impl App {
             ops_applied: 0,
             row_scroll: 0,
             col_scroll: 0,
+            grid_viewport_data_rows: 24,
             help_scroll: 0,
             about_scroll: 0,
             export_preview_scroll: 0,
@@ -3408,6 +3411,40 @@ impl App {
             .grid
             .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
         true
+    }
+
+    /// One vertical step: same semantics as a single `Up` / `Down` in normal mode
+    /// (view sort, header/footer, trailing blanks, grow last row).
+    fn move_cursor_one_row_vertical(&mut self, down: bool) {
+        if down {
+            if !self.move_cursor_row_through_view(true) {
+                let hr = HEADER_ROWS;
+                let last_main = hr + self.state.grid.main_rows().saturating_sub(1);
+                if self.cursor.row == last_main
+                    && trailing_blank_main_rows(&self.state) < NAV_BLANK_ROWS
+                {
+                    self.state.grid.grow_main_row_at_bottom();
+                }
+                self.cursor.row = self.cursor.row.saturating_add(1);
+                self.cursor.clamp(&self.state.grid);
+                self.state
+                    .grid
+                    .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
+            }
+        } else if !self.move_cursor_row_through_view(false) {
+            self.cursor.row = self.cursor.row.saturating_sub(1);
+            self.cursor.clamp(&self.state.grid);
+            self.state
+                .grid
+                .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
+        }
+    }
+
+    fn move_cursor_vertical_steps(&mut self, mut steps: usize, down: bool) {
+        while steps > 0 {
+            self.move_cursor_one_row_vertical(down);
+            steps -= 1;
+        }
     }
 
     fn expand_selection_to_rows(&mut self) {
@@ -4793,6 +4830,7 @@ impl App {
         let inner_w = inner.width as usize;
 
         let data_rows = inner_h.saturating_sub(1).max(1);
+        self.grid_viewport_data_rows = data_rows;
         let data_width = inner_w.saturating_sub(ROW_LABEL_CHARS).max(1);
         let data_cols = data_width.checked_div(2).unwrap_or(1).max(1);
 
@@ -7648,29 +7686,18 @@ Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard 
                             .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
                     }
                     KeyCode::Up | KeyCode::Char('k') => {
-                        if !self.move_cursor_row_through_view(false) {
-                            self.cursor.row = self.cursor.row.saturating_sub(1);
-                            self.cursor.clamp(&self.state.grid);
-                            self.state
-                                .grid
-                                .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
-                        }
+                        self.move_cursor_one_row_vertical(false);
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
-                        if !self.move_cursor_row_through_view(true) {
-                            let hr = HEADER_ROWS;
-                            let last_main = hr + self.state.grid.main_rows().saturating_sub(1);
-                            if self.cursor.row == last_main
-                                && trailing_blank_main_rows(&self.state) < NAV_BLANK_ROWS
-                            {
-                                self.state.grid.grow_main_row_at_bottom();
-                            }
-                            self.cursor.row = self.cursor.row.saturating_add(1);
-                            self.cursor.clamp(&self.state.grid);
-                            self.state
-                                .grid
-                                .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
-                        }
+                        self.move_cursor_one_row_vertical(true);
+                    }
+                    KeyCode::PageUp => {
+                        let steps = self.grid_viewport_data_rows.max(1);
+                        self.move_cursor_vertical_steps(steps, false);
+                    }
+                    KeyCode::PageDown => {
+                        let steps = self.grid_viewport_data_rows.max(1);
+                        self.move_cursor_vertical_steps(steps, true);
                     }
                     KeyCode::Char(c) if !c.is_control() => {
                         self.edit_special_palette = false;
@@ -9490,6 +9517,25 @@ mod tests {
             footer_special_col_aggregate(&state.grid, AggFunc::Sum, MARGIN_COLS + 2, 2, 5),
             Some("10".into())
         );
+    }
+
+    #[test]
+    fn page_up_page_down_step_by_grid_viewport_row_count() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(20, 1);
+        app.grid_viewport_data_rows = 4;
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        };
+
+        app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::empty()))
+            .unwrap();
+        assert_eq!(app.cursor.row, HEADER_ROWS + 4);
+
+        app.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::empty()))
+            .unwrap();
+        assert_eq!(app.cursor.row, HEADER_ROWS);
     }
 
     #[test]
