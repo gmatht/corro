@@ -608,8 +608,8 @@ fn ascii_generic_rebase(
 /// Generic interop text for a cell. When `excel_list_arg_comma` is true, function-argument
 /// `;` becomes `,` (TSV/CSV/Excel). When false, grid/ODF-style `;` is kept in the result string.
 ///
-/// ODS “generic” export uses `excel_list_arg_comma: true` via [`export_cell_text`] so
-/// `table:formula` / `<text:p>` match default TSV generic.
+/// TSV/CSV use `excel_list_arg_comma: true`; ODS generic uses `false` (ODF `;` lists). Same
+/// rebase as default delimited export (see `delimited_default_generic_rebase`).
 ///
 /// The list-separator pass runs **after** [`finish_generic_interop`] (rebase), so
 /// `formula::rebase_interop_formula_row_col` always sees the same `;` tokenization as the grid.
@@ -642,6 +642,15 @@ pub fn generic_interop_cell_text(
         col: global_col,
     };
     let addr = cur.to_addr(grid);
+    // Bare aggregate *labels* (TOTAL, MAX, …), not stored `=…`, must stay that text in Generic.
+    // Otherwise `=SUBTOTAL(4,…)` (etc.) is not the string `MAX` and does not “evaluate to” a label
+    // — Values export the numeric result; Generic must not pretend the interop is the word on sheet.
+    let raw_stored = grid.text(&addr);
+    if !raw_stored.is_empty() && !formula::is_formula(&raw_stored) {
+        if crate::ods::subtotal_code_for_label(&raw_stored).is_some() {
+            return Some(finish_generic_interop(raw_stored, rebase));
+        }
+    }
 
     if let Some(tf) = formula::export_templated_formula(grid, &addr) {
         let s0 = crate::ods::ods_labeled_prefix_strip_to_formula(&tf).unwrap_or(tf);
@@ -1307,6 +1316,192 @@ mod tests {
         assert!(!s.contains("…"));
     }
 
+    /// Default TSV adds a synthetic header row and row-key column before the logical grid. For
+    /// `subtotal.corro`, Values match computed display. Generic keeps bare aggregate **words**
+    /// (TOTAL, MAX, …) as on-sheet text, not `=SUBTOTAL(4,…)` / `=SUBTOTAL(9,…)` — those interop
+    /// strings are formulas whose **Values** are numeric, never the label word `MAX`.
+    #[test]
+    fn subtotal_delimited_values_match_computed_display_and_generic_matches_non_formula() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("subtotal.corro");
+        let workbook = load_fixture(&path);
+        let grid = &workbook.active_sheet().grid;
+
+        let opts_v = DelimitedExportOptions {
+            content: ExportContent::Values,
+            ..Default::default()
+        };
+        let opts_g = DelimitedExportOptions {
+            content: ExportContent::Generic,
+            ..Default::default()
+        };
+        let (m_v, c0, c1, rows) = delimited_export_matrix(grid, &opts_v);
+        let (m_g, c0g, c1g, rows_g) = delimited_export_matrix(grid, &opts_g);
+        assert_eq!(c0, c0g, "col span start");
+        assert_eq!(c1, c1g, "col span end");
+        assert_eq!(rows, rows_g, "logical row order");
+        assert_eq!(m_v.len(), m_g.len(), "matrix row count");
+
+        let h = if opts_v.include_header_row { 1 } else { 0 };
+        let rk = if opts_v.include_row_label_column { 1 } else { 0 };
+
+        fn is_subtotal_following_label_replaced_by_interop(s: &str) -> bool {
+            matches!(
+                s.trim().to_ascii_uppercase().as_str(),
+                "TOTAL" | "SUM" | "MEAN" | "AVERAGE" | "AVG" | "COUNT" | "MAX" | "MAXIMUM" | "MIN"
+                    | "MINIMUM"
+            )
+        }
+
+        for (i, (row_v, row_g)) in m_v.iter().zip(m_g.iter()).enumerate() {
+            assert_eq!(
+                row_v.len(),
+                row_g.len(),
+                "row {i} column count mismatch"
+            );
+            for (j, (v_cell, g_cell)) in row_v.iter().zip(row_g.iter()).enumerate() {
+                if i < h {
+                    assert_eq!(
+                        v_cell, g_cell,
+                        "header line {i} field {j} should match Values vs Generic"
+                    );
+                    continue;
+                }
+                if j < rk {
+                    assert_eq!(
+                        v_cell, g_cell,
+                        "row-label column i={i} j={j} should match"
+                    );
+                    continue;
+                }
+                let data_i = i - h;
+                let lr = rows[data_i];
+                let gc = c0 + (j - rk);
+                let computed =
+                    export_cell_text(grid, lr, gc, ExportContent::Values, None);
+                assert_eq!(
+                    v_cell, &computed,
+                    "Values export at matrix[{i}][{j}] (logical row {lr}, col {gc})"
+                );
+                use crate::ui::SheetCursor;
+                let cur = SheetCursor { row: lr, col: gc };
+                let raw_stored = grid.text(&cur.to_addr(grid));
+                let is_bare_agg_label = !raw_stored.is_empty()
+                    && !formula::is_formula(&raw_stored)
+                    && crate::ods::subtotal_code_for_label(&raw_stored).is_some();
+                let g_norm = g_cell.trim();
+                if is_bare_agg_label {
+                    assert!(
+                        !g_norm.contains("SUBTOTAL"),
+                        "regression: wrong Generic =SUBTOTAL(…) vs on-sheet label {raw_stored:?} \
+                         (e.g. =SUBTOTAL(4,A1:B10) is not the string MAX) at matrix[{i}][{j}] \
+                         (lr={lr} gc={gc}), got {g_cell:?}"
+                    );
+                    assert_eq!(g_norm, raw_stored.trim(), "Generic keeps bare aggregate at [{i}][{j}]");
+                    continue;
+                }
+                let is_subtotal_interop = g_norm
+                    .strip_prefix('=')
+                    .is_some_and(|r| {
+                        r.trim_start()
+                            .to_ascii_lowercase()
+                            .starts_with("subtotal(")
+                    });
+                if g_norm.starts_with('=') {
+                    if is_subtotal_interop
+                        && is_subtotal_following_label_replaced_by_interop(v_cell)
+                    {
+                        panic!(
+                            "Values TSV must show computed subtotal, not label text {v_cell:?}; \
+                             Generic is {g_cell:?} at matrix[{i}][{j}] (lr={lr} gc={gc})"
+                        );
+                    }
+                    // `=SUBTOTAL(4,…,A1:B10)` never “evaluates to” the string `MAX` — it evaluates to
+                    // a *number*; the matrix cannot assert that here without a separate eval, see
+                    // `subtotal4_eval_result_is_not_string_max` below. We only `continue`d before,
+                    // which hid the label-vs-formula mix-up for bare `MAX` until the bare-agg branch
+                    // above and that test existed.
+                    continue;
+                }
+                assert_eq!(
+                    g_cell, &computed,
+                    "Generic non-formula at matrix[{i}][{j}] (logical row {lr}, col {gc})"
+                );
+            }
+        }
+    }
+
+    /// Regresses a bad Generic interop that turned a bare `TOTAL` into `=SUBTOTAL(9,…)` over the
+    /// main block (e.g. `=SUBTOTAL(9,A1:B10)`): the export must keep the word **TOTAL**.
+    #[test]
+    fn generic_bare_total_label_stays_total_not_subtotal_range() {
+        use crate::grid::HEADER_ROWS;
+
+        let mut grid = crate::grid::Grid::new(10, 2);
+        for r in 0..10 {
+            grid.set(
+                &CellAddr::Main {
+                    row: r,
+                    col: 0,
+                },
+                format!("{}", (r + 1) * 10).into(),
+            );
+            grid.set(
+                &CellAddr::Main {
+                    row: r,
+                    col: 1,
+                },
+                format!("{}", (r + 1) * 10).into(),
+            );
+        }
+        grid.set(&CellAddr::Right { col: 0, row: 9 }, "TOTAL".into());
+        let gb = crate::grid::GridBox::from(grid);
+        let re = delimited_default_generic_rebase(&gb);
+        let lr = HEADER_ROWS + 9;
+        let gc = MARGIN_COLS + 2;
+        let g = export_cell_text(
+            &gb,
+            lr,
+            gc,
+            ExportContent::Generic,
+            Some(re),
+        );
+        assert_eq!(g.trim(), "TOTAL");
+        assert!(
+            !g.contains("SUBTOTAL"),
+            "expected bare label, not an interop formula, got {g:?}"
+        );
+    }
+
+    /// A real `=SUBTOTAL(4,…)` evaluates to a **number** (function 4 = MAX in Excel/ODF), never to
+    /// the *word* `MAX` — a fact the delimited matrix test does not see when it `continue`s on
+    /// `=…` Generic cells. This pins that semantic.
+    #[test]
+    fn subtotal4_eval_result_is_not_string_max() {
+        use crate::grid::HEADER_ROWS;
+
+        // One column, three rows, max is 5; one cell with real interop =SUBTOTAL(4,…, range)
+        let mut grid = crate::grid::Grid::new(3, 1);
+        for r in 0..3 {
+            let v = [1, 5, 2][r];
+            grid.set(
+                &CellAddr::Main {
+                    row: r as u32,
+                    col: 0,
+                },
+                v.to_string().into(),
+            );
+        }
+        grid.set(
+            &CellAddr::Right { col: 0, row: 2 },
+            "=SUBTOTAL(4;A1:A3)".into(),
+        );
+        let gb = crate::grid::GridBox::from(grid);
+        let lr = HEADER_ROWS + 2;
+        let gc = MARGIN_COLS + 1;
+        let v = export_cell_text(&gb, lr, gc, ExportContent::Values, None);
+        assert!(!v.trim().eq_ignore_ascii_case("MAX"), "result was {v:?}, want numeric max, not the label word MAX; =SUBTOTAL(4,…) is not a MAX string");
+    }
+
     #[test]
     fn tsv_export_keeps_left_margin_columns() {
         let mut grid = crate::grid::Grid::new(2, 2);
@@ -1442,8 +1637,10 @@ mod tests {
         );
     }
 
+    /// A real `=SUBTOTAL(4;…)` (stored formula) should use `,` in function lists for Excel/TSV.
+    /// Bare `MAX` labels no longer go through that path (see `subtotal_code_for_label`).
     #[test]
-    fn generic_right_margin_uses_excel_list_sep() {
+    fn generic_tsv_subtotal_formula_uses_excel_list_commas() {
         use crate::grid::HEADER_ROWS;
 
         let mut grid = crate::grid::Grid::new(1, 2);
@@ -1455,7 +1652,10 @@ mod tests {
             "MAX".into(),
         );
         grid.set(&CellAddr::Main { row: 0, col: 0 }, "3".into());
-        grid.set(&CellAddr::Right { col: 0, row: 0 }, "MAX".into());
+        grid.set(
+            &CellAddr::Right { col: 0, row: 0 },
+            "=SUBTOTAL(4;A1:B1)".into(),
+        );
         let gb = crate::grid::GridBox::from(grid);
         let opts = DelimitedExportOptions {
             content: ExportContent::Generic,
@@ -1467,11 +1667,10 @@ mod tests {
         let mut out = Vec::new();
         export_tsv_with_options(&gb, &mut out, &opts);
         let tsv = String::from_utf8(out).unwrap();
-        assert!(tsv.contains("=SUBTOTAL(4,"), "expect comma, got {tsv}");
+        assert!(tsv.contains("=SUBTOTAL(4,"), "expect Excel comma, got {tsv}");
     }
 
-    /// `generic_interop_cell_text(..., true)` is the TSV generic string; `false` is the same with
-    /// ODF/Excel list separators. They differ by [`interop_excel_list_separators`].
+    /// TSV/ODS generic strings match after `,` / `;` in function-argument positions (Subtotal).
     #[test]
     fn generic_ods_reuses_tsv_interop_excel_list_swap() {
         use crate::grid::HEADER_ROWS;
@@ -1486,7 +1685,10 @@ mod tests {
             "MAX".into(),
         );
         grid.set(&CellAddr::Main { row: 0, col: 0 }, "3".into());
-        grid.set(&CellAddr::Right { col: 0, row: 0 }, "MAX".into());
+        grid.set(
+            &CellAddr::Right { col: 0, row: 0 },
+            "=SUBTOTAL(4;A1:B1)".into(),
+        );
         let gb = crate::grid::GridBox::from(grid);
         let re = delimited_default_generic_rebase(&gb);
         let lr = HEADER_ROWS;

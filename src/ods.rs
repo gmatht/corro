@@ -207,29 +207,6 @@ pub fn export_ods_bytes_with_options(
         ..Default::default()
     };
     let (matrix, col_start, col_end, data_rows) = export::delimited_export_matrix(grid, &options);
-    // #region agent log
-    {
-        use std::io::Write;
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("debug-211195.log")
-        {
-            let nrows = matrix.len();
-            let tc0 = matrix.first().map(|r| r.len()).unwrap_or(0);
-            let drc = data_rows.len();
-            let _ = writeln!(
-                f,
-                "{{\"sessionId\":\"211195\",\"hypothesisId\":\"H1\",\"location\":\"ods.rs:export_ods_bytes_with_options\",\"message\":\"tsv_shaped_matrix\",\"data\":{{\"nrows\":{0},\"tc\":{1},\"col_start\":{2},\"col_end\":{3},\"data_row_count\":{4}}},\"timestamp\":{5}}}",
-                nrows, tc0, col_start, col_end, drc, ts
-            );
-        }
-    }
-    // #endregion
     let content_xml = ods_content_xml_tsv_shaped(
         grid,
         &matrix,
@@ -707,7 +684,7 @@ fn footer_formula_or_value(
     raw
 }
 
-fn subtotal_code_for_label(raw: &str) -> Option<u8> {
+pub(crate) fn subtotal_code_for_label(raw: &str) -> Option<u8> {
     match raw.trim().to_ascii_uppercase().as_str() {
         "TOTAL" | "SUM" => Some(9),
         "MEAN" | "AVERAGE" | "AVG" => Some(1),
@@ -1140,9 +1117,8 @@ mod tests {
         assert_eq!(content.matches("<table:table-column").count(), tc);
     }
 
-    /// Generic ODS `table:formula` uses the same `of:…` expression as [export::export_cell_text]
-    /// for [ExportContent::Generic] (TSV/Excel-style `,` in function arg lists; see
-    /// [export::generic_interop_cell_text] with `excel_list_arg_comma: true`).
+    /// Generic ODS `of:` matches TSV generic for a *stored* `=SUBTOTAL(4;…)` (bare `MAX` is plain text, no
+    /// `of:` — see [export::generic_interop_cell_text]).
     #[test]
     fn export_generic_ods_formula_attribute_matches_tsv_generic_interop() {
         use crate::grid::HEADER_ROWS;
@@ -1157,7 +1133,10 @@ mod tests {
             "MAX".into(),
         );
         grid.set(&CellAddr::Main { row: 0, col: 0 }, "3".into());
-        grid.set(&CellAddr::Right { col: 0, row: 0 }, "MAX".into());
+        grid.set(
+            &CellAddr::Right { col: 0, row: 0 },
+            "=SUBTOTAL(4;A1:B1)".into(),
+        );
         let gb = crate::grid::GridBox::from(grid);
         let re = export::delimited_default_generic_rebase(&gb);
         let tsv = export::export_cell_text(

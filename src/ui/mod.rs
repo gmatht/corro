@@ -325,6 +325,8 @@ enum MenuAction {
     RenameSheet,
     CopySheet,
     MoveSheet,
+    SheetPrev,
+    SheetNext,
     GoToCell,
     Exit,
     ExportTsv,
@@ -495,7 +497,17 @@ const FORMAT_SCOPE_MENU_ITEMS: [MenuItem; 5] = [
     },
 ];
 
-const SHEET_MENU_ITEMS: [MenuItem; 6] = [
+const SHEET_MENU_ITEMS: [MenuItem; 8] = [
+    MenuItem {
+        shortcut: '[',
+        label: "Prev sheet",
+        target: MenuTarget::Action(MenuAction::SheetPrev),
+    },
+    MenuItem {
+        shortcut: ']',
+        label: "Next sheet",
+        target: MenuTarget::Action(MenuAction::SheetNext),
+    },
     MenuItem {
         shortcut: 'N',
         label: "New sheet",
@@ -1056,6 +1068,14 @@ impl App {
             },
             MenuAction::MoveSheet => {
                 let _ = self.move_current_sheet_to_end();
+                Mode::Normal
+            }
+            MenuAction::SheetPrev => {
+                self.switch_sheet(-1);
+                Mode::Normal
+            }
+            MenuAction::SheetNext => {
+                self.switch_sheet(1);
                 Mode::Normal
             }
             MenuAction::GoToCell => Mode::GoToCell {
@@ -10385,8 +10405,10 @@ mod tests {
 
         let text = app.export_preview_text(false);
 
+        // Header margin still carries the "TOTAL" label; aggregate rows export computed values
+        // in the key column (not the words TOTAL/AVERAGE) so they match =SUBTOTAL semantics.
         assert!(text.contains("TOTAL"), "{text}");
-        assert!(text.contains("AVERAGE"), "{text}");
+        assert!(text.contains("1.5"), "{text}");
     }
 
     /// TSV body from `export_tsv` / export preview; matches `docs/tests/subtotal-tiny-tsv.tsv`.
@@ -13446,6 +13468,61 @@ fn formula_bar_value(grid: &Grid, addr: &CellAddr) -> String {
     raw
 }
 
+/// For **Values** TSV, bare aggregate labels in the key left margin still resolve to the computed
+/// aggregate for the row, not the word `TOTAL` (etc.). (Generic text export keeps bare `TOTAL` /
+/// `SUM` as on-sheet text; other labels such as `MAX` can still use `=SUBTOTAL(…)` interop.)
+fn tsv_left_key_subtotal_computed(
+    grid: &Grid,
+    cell_addr: &CellAddr,
+    func: AggFunc,
+    main_row: u32,
+) -> Option<String> {
+    let CellAddr::Left { col, row } = cell_addr else {
+        return None;
+    };
+    if *row != main_row || *col != MARGIN_COLS - 1 {
+        return None;
+    }
+    let raw = grid.get(cell_addr).unwrap_or_default();
+    if crate::ods::subtotal_code_for_label(&raw).is_none() {
+        return None;
+    }
+    Some(left_margin_main_col_aggregate(grid, func, main_row, 0))
+}
+
+/// Footers: key column (`MARGIN_COLS - 1`) may hold a bare `TOTAL` while [`crate::ods::cell_export_value_string`]
+/// emits `=SUBTOTAL(…)` over the full main block — Values must be that aggregate, not the label.
+fn tsv_footer_key_subtotal_computed(
+    grid: &Grid,
+    cell_addr: &CellAddr,
+    func: AggFunc,
+) -> Option<String> {
+    let CellAddr::Footer { col, .. } = cell_addr else {
+        return None;
+    };
+    if *col as usize != MARGIN_COLS - 1 {
+        return None;
+    }
+    let raw = grid.get(cell_addr).unwrap_or_default();
+    if crate::ods::subtotal_code_for_label(&raw).is_none() {
+        return None;
+    }
+    let mr = grid.main_rows();
+    let mc = grid.main_cols() as u32;
+    Some(compute_aggregate(
+        grid,
+        &AggregateDef {
+            func,
+            source: MainRange {
+                row_start: 0,
+                row_end: mr as u32,
+                col_start: 0,
+                col_end: mc,
+            },
+        },
+    ))
+}
+
 /// Same unformatted value as the main grid’s data cells, used by TSV/CSV export to match
 /// on-screen subtotal/aggregate columns (not just stored formula text).
 pub(crate) fn tsv_effective_unformatted_string(grid: &Grid, r: usize, c: usize) -> String {
@@ -13472,7 +13549,10 @@ pub(crate) fn tsv_effective_unformatted_string(grid: &Grid, r: usize, c: usize) 
     if let Some(func) = footer_agg {
         if right_col_agg.is_some() {
             footer_special_col_aggregate(grid, func, c, mr, mc)
-                .unwrap_or_else(|| cell_effective_display(grid, &cell_addr))
+                .unwrap_or_else(|| {
+                    tsv_footer_key_subtotal_computed(grid, &cell_addr, func)
+                        .unwrap_or_else(|| cell_effective_display(grid, &cell_addr))
+                })
         } else if c >= lm && c < lm + mc {
             let main_col = (c - lm) as u32;
             compute_aggregate(
@@ -13488,7 +13568,8 @@ pub(crate) fn tsv_effective_unformatted_string(grid: &Grid, r: usize, c: usize) 
                 },
             )
         } else {
-            cell_effective_display(grid, &cell_addr)
+            tsv_footer_key_subtotal_computed(grid, &cell_addr, func)
+                .unwrap_or_else(|| cell_effective_display(grid, &cell_addr))
         }
     } else if let (Some(func), Some(block_start), Some(main_row)) =
         (left_margin_agg, left_margin_block_start, main_row_idx)
@@ -13504,7 +13585,10 @@ pub(crate) fn tsv_effective_unformatted_string(grid: &Grid, r: usize, c: usize) 
                 left_margin_special_col_aggregate(
                     grid, func, c, row_start, row_end, data_cols,
                 )
-                .unwrap_or_else(|| cell_effective_display(grid, &cell_addr))
+                .unwrap_or_else(|| {
+                    tsv_left_key_subtotal_computed(grid, &cell_addr, func, main_row)
+                        .unwrap_or_else(|| cell_effective_display(grid, &cell_addr))
+                })
             } else {
                 let main_col = (c - lm) as u32;
                 left_margin_main_col_aggregate(grid, func, main_row, main_col)
@@ -13518,9 +13602,13 @@ pub(crate) fn tsv_effective_unformatted_string(grid: &Grid, r: usize, c: usize) 
                 main_row,
                 data_main_col_count(grid),
             )
-            .unwrap_or_else(|| cell_effective_display(grid, &cell_addr))
+            .unwrap_or_else(|| {
+                tsv_left_key_subtotal_computed(grid, &cell_addr, func, main_row)
+                    .unwrap_or_else(|| cell_effective_display(grid, &cell_addr))
+            })
         } else {
-            cell_effective_display(grid, &cell_addr)
+            tsv_left_key_subtotal_computed(grid, &cell_addr, func, main_row)
+                .unwrap_or_else(|| cell_effective_display(grid, &cell_addr))
         }
     } else if r >= hr && r < hr + mr {
         if let Some(func) = right_col_agg {
