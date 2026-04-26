@@ -7529,7 +7529,21 @@ impl App {
             _ => return false,
         };
         let body = self.export_preview_text(csv);
-        let inner = Block::default().borders(Borders::ALL).inner(grid_area);
+        // TSV field separators are U+0009. If we pass them to ratatui/Paragraph, the terminal
+        // applies tab stops to the *screen* buffer, so one logical line can paint across wrong
+        // columns and look like a mix of TSV, menu, and frame — even after a full `Clear` of
+        // this widget's area. Only the on-screen preview is changed; `do_export` stays raw TSV.
+        let body = if csv {
+            body
+        } else {
+            body.replace('\t', "  ")
+        };
+        let block = Block::default().borders(Borders::ALL).title(if csv {
+            " Export CSV "
+        } else {
+            " Export TSV "
+        });
+        let inner = block.inner(grid_area);
         let lines: Vec<&str> = body.lines().collect();
         let max_scroll = lines.len().saturating_sub(inner.height as usize);
         let scroll = self.export_preview_scroll.min(max_scroll);
@@ -7540,14 +7554,9 @@ impl App {
             .cloned()
             .collect::<Vec<_>>()
             .join("\n");
-        let block = Block::default().borders(Borders::ALL).title(if csv {
-            " Export CSV "
-        } else {
-            " Export TSV "
-        });
-        let paragraph = Paragraph::new(visible)
-            .block(block)
-            .wrap(Wrap { trim: false });
+        // No wrap: long TSV/CSV lines must not expand to extra terminal rows (would overflow
+        // the grid and corrupt surrounding chrome).
+        let paragraph = Paragraph::new(visible).block(block);
         f.render_widget(Clear, grid_area);
         f.render_widget(paragraph, grid_area);
         true
@@ -7565,7 +7574,14 @@ impl App {
             Mode::About => self.about_page_body(),
             _ => String::new(),
         };
-        let inner = Block::default().borders(Borders::ALL).inner(grid_area);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(match self.mode {
+                Mode::Help => " Help ",
+                Mode::About => " About ",
+                _ => "",
+            });
+        let inner = block.inner(grid_area);
         let lines: Vec<&str> = body.lines().collect();
         let scroll = match &self.mode {
             Mode::Help => self.help_scroll,
@@ -7581,13 +7597,6 @@ impl App {
             .cloned()
             .collect::<Vec<_>>()
             .join("\n");
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(match self.mode {
-                Mode::Help => " Help ",
-                Mode::About => " About ",
-                _ => "",
-            });
         let paragraph = Paragraph::new(visible)
             .block(block)
             .wrap(Wrap { trim: false });
