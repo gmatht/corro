@@ -2104,6 +2104,7 @@ pub struct App {
     view_sheet_id: u32,
     persisted_view_sort_cols: HashMap<u32, Vec<SortSpec>>,
     edit_target_addr: Option<CellAddr>,
+    pending_lost_edit: Option<(CellAddr, String)>,
     pending_fit_to_content_on_commit: bool,
     clipboard_snapshot: Option<(MainRange, String)>,
 }
@@ -2164,6 +2165,7 @@ impl App {
             view_sheet_id: 1,
             persisted_view_sort_cols: HashMap::new(),
             edit_target_addr: None,
+            pending_lost_edit: None,
             pending_fit_to_content_on_commit: false,
             clipboard_snapshot: None,
         }
@@ -3425,6 +3427,7 @@ impl App {
 
     fn commit_edit_buffer(&mut self, buffer: &str) -> Result<(), RunError> {
         self.edit_special_palette = false;
+        self.pending_lost_edit = None;
         let explicit_addr = parse_cell_shorthand(buffer, self.state.grid.main_cols());
         let (addr, value) = if let Some((a, v)) = explicit_addr.clone() {
             (a, v)
@@ -3612,6 +3615,28 @@ impl App {
         let addr = self.cursor.to_addr(&self.state.grid);
         self.status = format!("Went to {}", addr_label(&addr, self.state.grid.main_cols()));
         true
+    }
+
+    fn remember_lost_edit(&mut self, buffer: &str) {
+        let Some(addr) = self.edit_target_addr.clone() else {
+            return;
+        };
+        let current = self.state.grid.get(&addr);
+        if buffer.is_empty() || current.as_deref().unwrap_or("") == buffer {
+            self.pending_lost_edit = None;
+            return;
+        }
+        self.pending_lost_edit = Some((addr, buffer.to_string()));
+        self.status = "Edit cancelled. Press Enter to restore lost text.".into();
+    }
+
+    fn restore_lost_edit(&mut self) -> Option<Mode> {
+        let (addr, buffer) = self.pending_lost_edit.take()?;
+        self.cursor = self.sheet_cursor_for_addr(&addr).unwrap_or(self.cursor);
+        self.cursor.clamp(&self.state.grid);
+        self.edit_target_addr = Some(addr);
+        self.status.clear();
+        Some(self.start_edit_mode(buffer, None, false, false))
     }
 
     fn cell_ref_is_in_supported_bounds(cref: &crate::celladdr::CellRef) -> bool {
@@ -6604,8 +6629,10 @@ impl App {
                     mode = self.commit_edit_and_move_down(buffer)?;
                 }
                 KeyCode::Esc => {
+                    self.remember_lost_edit(buffer);
                     self.edit_cursor = None;
                     self.edit_special_palette = false;
+                    self.edit_target_addr = None;
                     *formula_cursor = None;
                     mode = Mode::Normal;
                 }
@@ -6640,11 +6667,18 @@ impl App {
                 _ => {}
             },
             Mode::Normal => {
+                if key.code == KeyCode::Enter {
+                    if let Some(restored) = self.restore_lost_edit() {
+                        self.mode = restored;
+                        return Ok(false);
+                    }
+                }
                 if matches!(key.code, KeyCode::Char(c) if !c.is_control())
                     && key.modifiers.is_empty()
                 {
                     if let KeyCode::Char(c) = key.code {
                         self.edit_special_palette = false;
+                        self.pending_lost_edit = None;
                         let buffer = c.to_string();
                         mode = self.start_edit_mode(
                             buffer.clone(),
@@ -7288,6 +7322,7 @@ impl App {
                 .style(Style::default().fg(Color::White).bg(Color::Blue)),
             Mode::Menu { .. } | Mode::Normal | Mode::RevisionBrowse => {
                 let val = formula_bar_value(grid, addr);
+                let addr_str = addr_label(addr, grid.main_cols());
                 let base = format!(" {addr_str}  {val}");
                 let text = if self.status.is_empty() {
                     base
@@ -8313,6 +8348,51 @@ mod tests {
         };
 
         assert!(row(1).contains("=π"));
+    }
+
+    #[test]
+    fn escaped_edit_does_not_follow_cursor_and_can_be_restored() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 2);
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        };
+        app.mode = app.start_edit_mode("draft".into(), None, false, false);
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()))
+            .unwrap();
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(app.edit_target_addr.is_none());
+        assert!(app.pending_lost_edit.is_some());
+        assert!(app.status.contains("Press Enter"));
+
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::empty()))
+            .unwrap();
+        let backend = TestBackend::new(50, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = |y: u16| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+
+        assert!(row(1).contains("B1"), "{}", row(1));
+        assert!(!row(1).contains("A1  draft"), "{}", row(1));
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .unwrap();
+        assert_eq!(app.cursor.col, MARGIN_COLS);
+        match &app.mode {
+            Mode::Edit { buffer, .. } => assert_eq!(buffer, "draft"),
+            other => panic!("expected restored edit mode, got {other:?}"),
+        }
+        assert!(app.pending_lost_edit.is_none());
     }
 
     #[test]
