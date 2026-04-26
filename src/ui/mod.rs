@@ -4895,6 +4895,7 @@ impl App {
         }
 
         if self.render_export_preview_overlay(f, grid_area) {
+            self.render_export_bottom_hints(f, hints_area, has_tabs);
             return;
         }
 
@@ -5365,23 +5366,33 @@ impl App {
                 } else {
                     "off"
                 };
+                let m = if self.export_ascii_options.include_margins {
+                    "on"
+                } else {
+                    "off"
+                };
+                let f = if self.export_ascii_options.data_frame {
+                    "on"
+                } else {
+                    "off"
+                };
                 let d = if self.export_ascii_options.row_dividers {
                     "on"
                 } else {
                     "off"
                 };
-                let e = match self.export_ascii_options.inter_cell_space {
-                    AsciiInterCellSpace::EmSpace => "em",
-                    AsciiInterCellSpace::Space => "sp",
+                let (pad_letter, pad_desc) = match self.export_ascii_options.inter_cell_space {
+                    AsciiInterCellSpace::EmSpace => ("em", "U+2003 em"),
+                    AsciiInterCellSpace::Space => ("sp", "U+0020 space"),
                 };
                 let b = match self.export_ascii_options.header_data_separator {
                     AsciiHeaderDataSeparator::FullBorder => "border",
                     AsciiHeaderDataSeparator::None => "none",
                 };
                 format!(
-                    "  Alt+H·column label row {a}   Alt+D·row dividers {d}   \
-Alt+E·cell padding {e}   Alt+B·label/body line {b}   \
-↑/↓/k/j·scroll   PgUp/PgDn·page   path or empty+Enter=clipboard   Esc"
+                    "  Alt+H·label row {a}   Alt+M·margins {m}   Alt+O·data frame {f}   \
+Alt+D·row rules {d}   Alt+E·padding {pad_letter} ({pad_desc})   \
+Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard   Esc"
                 )
             }
             Mode::ExportOdt { .. } => {
@@ -5410,6 +5421,31 @@ Alt+E·cell padding {e}   Alt+B·label/body line {b}   \
                     .into()
             }
         }
+    }
+
+    /// Hint line for export/CSV/TSV/ASCII/All: visible on dark-gray background (export preview
+    /// covers the grid and previously skipped drawing hints on early return from [`Self::draw`]).
+    fn render_export_bottom_hints(&self, f: &mut Frame, hints_area: Rect, has_tabs: bool) {
+        let hints = self.hints_line();
+        let area = if has_tabs {
+            Rect {
+                x: hints_area.x,
+                y: hints_area.y.saturating_sub(1),
+                width: hints_area.width,
+                height: 1,
+            }
+        } else {
+            hints_area
+        };
+        f.render_widget(
+            Paragraph::new(hints).style(
+                Style::default()
+                    .fg(Color::White)
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            area,
+        );
     }
 
     fn menu_bar_line(&self) -> String {
@@ -6318,6 +6354,24 @@ Alt+E·cell padding {e}   Alt+B·label/body line {b}   \
                                         self.status = "ASCII: full border under column labels".into();
                                         AsciiHeaderDataSeparator::FullBorder
                                     }
+                                };
+                            }
+                            'm' | 'M' => {
+                                self.export_ascii_options.include_margins =
+                                    !self.export_ascii_options.include_margins;
+                                self.status = if self.export_ascii_options.include_margins {
+                                    "ASCII: margin rows/columns: on".into()
+                                } else {
+                                    "ASCII: main block only: on".into()
+                                };
+                            }
+                            'o' | 'O' => {
+                                self.export_ascii_options.data_frame =
+                                    !self.export_ascii_options.data_frame;
+                                self.status = if self.export_ascii_options.data_frame {
+                                    "ASCII: data frame (rules around main): on".into()
+                                } else {
+                                    "ASCII: data frame: off".into()
                                 };
                             }
                             _ => {}

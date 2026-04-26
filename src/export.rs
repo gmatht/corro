@@ -84,6 +84,13 @@ pub enum AsciiHeaderDataSeparator {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AsciiTableOptions {
+    /// When false, export only the main data block: rows `hr..hr+main_rows`, cols A..Z (main) — no
+    /// margin/header/footer cell columns or rows in the text table.
+    pub include_margins: bool,
+    /// Draw extra rules in the main block: a horizontal line of `=` above and below the main row
+    /// range, and `+` at the left and right of the main block on each main data row to meet those
+    /// lines (in addition to the normal outer `+---+` table border).
+    pub data_frame: bool,
     pub include_column_label_row: bool,
     pub row_dividers: bool,
     pub inter_cell_space: AsciiInterCellSpace,
@@ -93,6 +100,8 @@ pub struct AsciiTableOptions {
 impl Default for AsciiTableOptions {
     fn default() -> Self {
         Self {
+            include_margins: true,
+            data_frame: false,
             include_column_label_row: true,
             row_dividers: false,
             inter_cell_space: AsciiInterCellSpace::Space,
@@ -116,6 +125,39 @@ fn ascii_push_cell(s: &mut String, pre: char, pad: char, text: &str, w: usize) {
     s.push('|');
 }
 
+/// `+---...---+` — row-label run is always `-`. When `use_equals_in_main`, column runs for
+/// `c in main_c0..main_c1` use `=`, which matches the `data_frame` inner horizontals.
+fn ascii_border_line(
+    col_start: usize,
+    col_end: usize,
+    row_label_w: usize,
+    col_widths: &[usize],
+    main_c0: usize,
+    main_c1: usize,
+    use_equals_in_main: bool,
+) -> String {
+    let border_dash_len = |w: usize| w.saturating_add(2);
+    let mut s = String::new();
+    s.push('+');
+    s.push_str(&"-".repeat(border_dash_len(row_label_w)));
+    s.push('+');
+    for c in col_start..col_end {
+        let w = col_widths[c];
+        let dch = if use_equals_in_main && (main_c0..main_c1).contains(&c) {
+            '='
+        } else {
+            '-'
+        };
+        s.push_str(
+            &std::iter::repeat(dch)
+                .take(border_dash_len(w))
+                .collect::<String>(),
+        );
+        s.push('+');
+    }
+    s
+}
+
 pub fn export_ascii_table_with_options(
     grid: &Grid,
     out: &mut dyn Write,
@@ -123,8 +165,30 @@ pub fn export_ascii_table_with_options(
 ) {
     let mc = grid.main_cols();
     let tc = grid.total_cols();
-    let (row_start, row_end) = ascii_row_bounds(grid);
-    let (col_start, col_end) = ascii_col_bounds(grid);
+    let m = MARGIN_COLS;
+    let hr = HEADER_ROWS;
+    let mr = grid.main_rows();
+
+    let (mut row_start, mut row_end) = ascii_row_bounds(grid);
+    let (mut col_start, mut col_end) = ascii_col_bounds(grid);
+
+    if !options.include_margins {
+        col_start = m;
+        col_end = (m + mc).min(grid.total_cols());
+        col_end = col_end.max(col_start.saturating_add(1));
+        row_start = hr;
+        row_end = hr + mr;
+    }
+
+    let main_c0 = m.max(col_start);
+    let main_c1 = (m + mc).min(col_end);
+    let frame_active = options.data_frame && main_c0 < main_c1;
+
+    let first_main_r = (row_start..row_end)
+        .find(|&r| (hr..hr + mr).contains(&r));
+    let last_main_r = (row_start..row_end)
+        .rfind(|&r| (hr..hr + mr).contains(&r));
+
     let row_label_w = (row_start..row_end)
         .map(|r| sheet_row_label(r, grid.main_rows()).chars().count())
         .max()
@@ -148,16 +212,16 @@ pub fn export_ascii_table_with_options(
     // Each cell is rendered as `| {:>w$} |`, so the span between one `|` and the next is
     // always w + 2 characters (space + w-wide field + space before the closing `|`). Top/bottom
     // borders use that same width in `-` so `+` corners line up with `|`.
-    let border_dash_len = |w: usize| w.saturating_add(2);
-    let border: String = "+".to_string()
-        + &"-".repeat(border_dash_len(row_label_w))
-        + "+"
-        + &col_widths[col_start..col_end]
-            .iter()
-            .map(|&w| "-".repeat(border_dash_len(w)))
-            .collect::<Vec<_>>()
-            .join("+")
-        + "+";
+    let border: String = ascii_border_line(
+        col_start, col_end, row_label_w, &col_widths, main_c0, main_c1, false,
+    );
+    let frame_line = if frame_active {
+        Some(ascii_border_line(
+            col_start, col_end, row_label_w, &col_widths, main_c0, main_c1, true,
+        ))
+    } else {
+        None
+    };
 
     let pre = ascii_pre(options);
     let pad = pre;
@@ -180,18 +244,55 @@ pub fn export_ascii_table_with_options(
     }
 
     for r in row_start..row_end {
+        if frame_active && Some(r) == first_main_r {
+            if let Some(ref fl) = frame_line {
+                let _ = writeln!(out, "{}", fl);
+            }
+        }
+
+        let in_main = (hr..hr + mr).contains(&r);
         let row_label = sheet_row_label(r, grid.main_rows());
         let mut data_line = String::new();
         data_line.push('|');
         ascii_push_cell(&mut data_line, pre, pad, &row_label, row_label_w);
         for c in col_start..col_end {
+            if frame_active && in_main && c == main_c0 {
+                if data_line
+                    .as_bytes()
+                    .last()
+                    .is_some_and(|&b| b == b'|')
+                {
+                    data_line.pop();
+                    data_line.push('+');
+                }
+            }
             let val = rendered_value_at(grid, r, c);
             let w = col_widths[c];
             ascii_push_cell(&mut data_line, pre, pad, &val, w);
+            if frame_active
+                && in_main
+                && main_c0 < main_c1
+                && c + 1 == main_c1
+            {
+                if data_line
+                    .as_bytes()
+                    .last()
+                    .is_some_and(|&b| b == b'|')
+                {
+                    data_line.pop();
+                    data_line.push('+');
+                }
+            }
         }
+
         let _ = writeln!(out, "{}", data_line);
         if options.row_dividers {
             let _ = writeln!(out, "{}", border);
+        }
+        if frame_active && Some(r) == last_main_r {
+            if let Some(ref fl) = frame_line {
+                let _ = writeln!(out, "{}", fl);
+            }
         }
     }
     let _ = writeln!(out, "{}", border);
