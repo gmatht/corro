@@ -940,6 +940,88 @@ fn row_total_block_start(grid: &Grid, current_main_row: u32) -> u32 {
     0
 }
 
+/// Convert ODF OpenFormula (string after the `of:` prefix) to Corro/Excel-style syntax: bracket
+/// references `[.A1]`, `[.A1:.B2]` become `A1`, `A1:B2`; list separators `;` become `,`.
+fn odf_openformula_to_corro(expr: &str) -> String {
+    let mut out = String::with_capacity(expr.len());
+    let mut i = 0usize;
+    let b = expr.as_bytes();
+    while i < b.len() {
+        if b[i] == b'[' && b.get(i + 1) == Some(&b'.') {
+            if let Some((end, rep)) = try_replace_odf_bracket_ref(expr, i) {
+                out.push_str(&rep);
+                i = end;
+                continue;
+            }
+        }
+        out.push(b[i] as char);
+        i += 1;
+    }
+    out.replace(';', ",")
+}
+
+/// Parse `[.ColRow]` or `[.C1:.C2:...]` *range* (second part is `:` optionally followed by `.`). Returns
+/// (byte index after closing `]`, A1 or A1:B2 string).
+fn try_replace_odf_bracket_ref(s: &str, start: usize) -> Option<(usize, String)> {
+    let b = s.as_bytes();
+    if b.get(start) != Some(&b'[') || b.get(start + 1) != Some(&b'.') {
+        return None;
+    }
+    let (first, p1) = parse_odf_col_row_tokens(s, start + 2)?;
+    if p1 < b.len() && b[p1] == b':' {
+        let mut p2 = p1 + 1;
+        if b.get(p2) == Some(&b'.') {
+            p2 += 1;
+        }
+        let (second, p3) = parse_odf_col_row_tokens(s, p2)?;
+        if p3 < b.len() && b[p3] == b']' {
+            return Some((p3 + 1, format!("{first}:{second}")));
+        }
+        return None;
+    }
+    if p1 < b.len() && b[p1] == b']' {
+        return Some((p1 + 1, first));
+    }
+    None
+}
+
+/// One ODF A1 token inside a bracket ref (optional `$` before col/row, letters + digits). Returns
+/// `C3` and index after the row digits.
+fn parse_odf_col_row_tokens(s: &str, start: usize) -> Option<(String, usize)> {
+    let b = s.as_bytes();
+    let mut i = start;
+    if b.get(i) == Some(&b'$') {
+        i += 1;
+    }
+    let col0 = i;
+    while i < b.len() && b[i].is_ascii_alphabetic() {
+        i += 1;
+    }
+    if i == col0 {
+        return None;
+    }
+    let col = s[col0..i].to_ascii_uppercase();
+    if b.get(i) == Some(&b'$') {
+        i += 1;
+    }
+    let r0 = i;
+    while i < b.len() && b[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == r0 {
+        return None;
+    }
+    let row = &s[r0..i];
+    Some((format!("{col}{row}"), i))
+}
+
+fn ods_openformula_body_to_cell_text(formula: &str) -> String {
+    // `table:formula` is `of:...`; OpenDocument uses `of:=` when the body includes `=`.
+    let t = formula.strip_prefix("of:").unwrap_or(formula);
+    let t = t.strip_prefix('=').unwrap_or(t);
+    odf_openformula_to_corro(t)
+}
+
 fn ods_layout_for_table_index<'a>(
     layouts: &'a [OdsTableLayout],
     table_index: usize,
@@ -1146,8 +1228,8 @@ fn set_ods_cell(
             col: odf_table_col as u32,
         };
         if let Some(f) = formula {
-            let expr = f.strip_prefix("of:").unwrap_or(f);
-            state.grid.set(&target, format!("={}", expr));
+            let body = ods_openformula_body_to_cell_text(f);
+            state.grid.set(&target, format!("={body}"));
         } else {
             state.grid.set(&target, value.to_string());
         }
@@ -1187,8 +1269,8 @@ fn set_ods_cell(
         }
     };
     if let Some(f) = formula {
-        let expr = f.strip_prefix("of:").unwrap_or(f);
-        state.grid.set(&target, format!("={}", expr));
+        let body = ods_openformula_body_to_cell_text(f);
+        state.grid.set(&target, format!("={body}"));
     } else {
         state.grid.set(&target, value.to_string());
     }
@@ -1288,6 +1370,39 @@ mod tests {
             "ODS <text:p> should equal ODF-style generic for that cell; want {:?}\n",
             expected_ods
         );
+    }
+
+    #[test]
+    fn odf_openformula_to_corro_rewrites_lo_refs_and_semicolons() {
+        assert_eq!(&odf_openformula_to_corro("([.C3]*0.1)"), "(C3*0.1)");
+        assert_eq!(&odf_openformula_to_corro("SUM([.C3:.E3])"), "SUM(C3:E3)");
+        assert_eq!(
+            &odf_openformula_to_corro("MAX([.C3:.C7];[.C9:.C11])"),
+            "MAX(C3:C7,C9:C11)"
+        );
+    }
+
+    #[test]
+    fn ods_openformula_body_strips_of_prefix_and_leading_eq() {
+        assert_eq!(&ods_openformula_body_to_cell_text("of:=([.C3]*0.1)"), "(C3*0.1)");
+        assert_eq!(&ods_openformula_body_to_cell_text("of:SUM([.A1:.B2])"), "SUM(A1:B2)");
+    }
+
+    #[test]
+    fn import_subtotal_lo_ods_succeeds() {
+        use crate::formula::cell_effective_display;
+        use crate::grid::CellAddr;
+
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("subtotal_lo.ods");
+        if !p.is_file() {
+            return;
+        }
+        let w = import_ods_workbook(&p).expect("import subtotal_lo.ods");
+        // First data row, TAX (col D) had `of:=([.C3]*0.1)` in LibreOffice export — should not
+        // #PARSE as Corro/Excel.
+        let g = &w.active_sheet().grid;
+        let disp = cell_effective_display(g, &CellAddr::Main { row: 2, col: 3 });
+        assert!(!disp.contains("PARSE"), "unexpected {disp}");
     }
 
     #[test]

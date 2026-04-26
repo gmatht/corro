@@ -228,14 +228,16 @@ fn eval_numeric_aggregate(
     allow_templates: bool,
     kind: NumericAgg,
 ) -> EvalResult {
-    if args.len() != 1 {
+    if args.is_empty() {
         return EvalResult::Error("ARGS");
     }
-    let nums =
-        match collect_numeric_values(&args[0], grid, visiting, bindings, budget, allow_templates) {
-            Ok(nums) => nums,
+    let mut nums: Vec<f64> = Vec::new();
+    for a in args {
+        match collect_numeric_values(a, grid, visiting, bindings, budget, allow_templates) {
+            Ok(n) => nums.extend(n),
             Err(e) => return EvalResult::Error(e),
-        };
+        }
+    }
     match kind {
         NumericAgg::Average => {
             if nums.is_empty() {

@@ -2324,6 +2324,37 @@ mod tests {
     }
 
     #[test]
+    fn max_min_across_two_comma_separated_ranges() {
+        // LibreOffice ODS uses `;` between ranges; we normalize to `,` — same as Excel / Corro
+        // TSV `MAX(r1,r2)`.
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(4, 2));
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "1".into());
+        g.set(&CellAddr::Main { row: 1, col: 0 }, "2".into());
+        g.set(&CellAddr::Main { row: 2, col: 0 }, "5".into());
+        g.set(&CellAddr::Main { row: 3, col: 0 }, "3".into());
+        g.set(
+            &CellAddr::Main { row: 0, col: 1 },
+            "=MAX(A1:A2,A3:A4)".into(),
+        );
+        g.set(
+            &CellAddr::Main { row: 1, col: 1 },
+            "=MIN(A1:A2,A3:A4)".into(),
+        );
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        assert!(matches!(
+            eval_cell(&g, &CellAddr::Main { row: 0, col: 1 }, &mut v, &mut b),
+            EvalResult::Number(n) if (n - 5.0).abs() < 1e-9
+        ));
+        v.clear();
+        b = DEFAULT_BUDGET;
+        assert!(matches!(
+            eval_cell(&g, &CellAddr::Main { row: 1, col: 1 }, &mut v, &mut b),
+            EvalResult::Number(n) if (n - 1.0).abs() < 1e-9
+        ));
+    }
+
+    #[test]
     fn boolean_functions_work() {
         let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(1, 3));
         g.set(&CellAddr::Main { row: 0, col: 0 }, "=AND(1,2,3)".into());
