@@ -1592,10 +1592,14 @@ fn trim_visible_cols_to_width(grid: &Grid, cols: &mut Vec<usize>, cursor_col: us
     while cols.len() > 1 && visible_cols_render_width(grid, cols) > width {
         let first = cols.first().copied().unwrap_or(cursor_col);
         let last = cols.last().copied().unwrap_or(cursor_col);
-        if first < cursor_col {
-            cols.remove(0);
-        } else if last > cursor_col {
+        // Remove columns to the *right* of the cursor first so we do not
+        // immediately drop a column to the left of the focus (e.g. hiding A
+        // when moving to B) when the overflow is from wide content on the right
+        // or in the right margin.
+        if last > cursor_col {
             cols.pop();
+        } else if first < cursor_col {
+            cols.remove(0);
         } else {
             break;
         }
@@ -3954,6 +3958,29 @@ impl App {
         self.state.grid.set_col_width(global_col, Some(maxw));
     }
 
+    /// Width override for the draw pass: never wider than the share of
+    /// `data_width` so multiple visible columns (and gutters) can stay on
+    /// screen; long text is shown truncated instead of dropping whole columns.
+    fn fit_visible_columns_capped(&mut self, col_ixs: &[usize], data_width: usize) {
+        if col_ixs.is_empty() {
+            return;
+        }
+        let n = col_ixs.len();
+        // One char separator per adjacent pair; matches trim loop roughly.
+        let gaps = n.saturating_sub(1);
+        let budget = data_width.saturating_sub(gaps);
+        let per = (budget / n).max(1);
+        for &c in col_ixs {
+            if let Some(maxw) = self.rendered_width_for_column(c) {
+                self.state
+                    .grid
+                    .set_col_width(c, Some(maxw.min(per)));
+            } else {
+                self.state.grid.set_col_width(c, None);
+            }
+        }
+    }
+
     fn rendered_width_for_column(&self, global_col: usize) -> Option<usize> {
         let mut maxw = 0usize;
         let mut saw_content = false;
@@ -4976,12 +5003,10 @@ impl App {
         self.row_scroll = next_row_scroll;
         self.col_scroll = next_col_scroll;
 
-        // Shrink visible columns to their rendered content before we take an
-        // immutable borrow of grid for rendering.
-        let visible_cols_for_fit = col_ixs.clone();
-        for &c in &visible_cols_for_fit {
-            self.fit_column_to_rendered_content(c);
-        }
+        // Shrink visible columns: cap width so every visible index can share
+        // the row body (avoids unbounded autofill from one long cell, then
+        // trim_visible_cols_to_width eating columns to the left of the cursor).
+        self.fit_visible_columns_capped(&col_ixs, data_width);
         trim_visible_cols_to_width(&self.state.grid, &mut col_ixs, self.cursor.col, data_width);
 
         // Materialize grid after we finish possibly mutating column widths.
