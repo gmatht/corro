@@ -26,6 +26,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::{
     Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
 };
+use std::collections::HashMap;
 use std::io::{self, stdout};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -2091,6 +2092,7 @@ pub struct App {
     special_picker: Option<usize>,
     pending_format_target: Option<FormatTarget>,
     view_sheet_id: u32,
+    persisted_view_sort_cols: HashMap<u32, Vec<SortSpec>>,
     edit_target_addr: Option<CellAddr>,
     pending_fit_to_content_on_commit: bool,
     clipboard_snapshot: Option<(MainRange, String)>,
@@ -2150,6 +2152,7 @@ impl App {
             special_picker: None,
             pending_format_target: None,
             view_sheet_id: 1,
+            persisted_view_sort_cols: HashMap::new(),
             edit_target_addr: None,
             pending_fit_to_content_on_commit: false,
             clipboard_snapshot: None,
@@ -2483,6 +2486,35 @@ impl App {
         }
     }
 
+    fn sync_persisted_sort_cache_from_workbook(&mut self) {
+        self.persisted_view_sort_cols.clear();
+        for sheet in &self.workbook.sheets {
+            let cols = sheet.state.grid.view_sort_cols();
+            if !cols.is_empty() {
+                self.persisted_view_sort_cols.insert(sheet.id, cols);
+            }
+        }
+    }
+
+    fn sync_persisted_sort_cache_from_active_sheet(&mut self) {
+        let cols = self.state.grid.view_sort_cols();
+        if cols.is_empty() {
+            self.persisted_view_sort_cols.remove(&self.view_sheet_id);
+        } else {
+            self.persisted_view_sort_cols
+                .insert(self.view_sheet_id, cols);
+        }
+    }
+
+    fn set_active_sort_persistence(&mut self, cols: &[SortSpec], persisted: bool) {
+        if persisted && !cols.is_empty() {
+            self.persisted_view_sort_cols
+                .insert(self.view_sheet_id, cols.to_vec());
+        } else {
+            self.persisted_view_sort_cols.remove(&self.view_sheet_id);
+        }
+    }
+
     fn replay_status(prefix: &str, path: &Path, replay: &PartialReplay) -> String {
         match (replay.failed_line, replay.error.as_deref()) {
             (Some(line), Some(err)) => {
@@ -2629,6 +2661,7 @@ impl App {
                         self.workbook = workbook;
                         self.view_sheet_id = active_sheet;
                         self.sync_active_sheet_cache();
+                        self.sync_persisted_sort_cache_from_workbook();
                         for c in 0..self.state.grid.main_cols() {
                             self.fit_column_to_rendered_content(MARGIN_COLS + c);
                         }
@@ -2658,6 +2691,7 @@ impl App {
                         Ok(workbook) => {
                             self.workbook = workbook;
                             self.sync_active_sheet_cache();
+                            self.persisted_view_sort_cols.clear();
                             self.path = Some(p.clone());
                             self.source_path = None;
                             self.revision_limit = None;
@@ -2699,6 +2733,7 @@ impl App {
                             )?;
                             self.view_sheet_id = active_sheet;
                             self.sync_active_sheet_cache();
+                            self.sync_persisted_sort_cache_from_workbook();
                             for c in 0..self.state.grid.main_cols() {
                                 self.fit_column_to_rendered_content(MARGIN_COLS + c);
                             }
@@ -2715,6 +2750,7 @@ impl App {
                             Some(limit) => load_revisions(p, limit, &mut self.state)?,
                             None => load_full(p, &mut self.state)?,
                         };
+                        self.sync_persisted_sort_cache_from_active_sheet();
                         for c in 0..self.state.grid.main_cols() {
                             self.fit_column_to_rendered_content(MARGIN_COLS + c);
                         }
@@ -4156,13 +4192,15 @@ impl App {
                 );
                 buf.push('\n');
             }
-            if !sheet.state.grid.view_sort_cols().is_empty() {
+            if let Some(cols) = self
+                .persisted_view_sort_cols
+                .get(&sheet.id)
+                .filter(|cols| !cols.is_empty())
+            {
                 buf.push_str(
                     &crate::ops::WorkbookOp::SheetOp {
                         sheet_id: sheet.id,
-                        op: Op::SetViewSortCols {
-                            cols: sheet.state.grid.view_sort_cols(),
-                        },
+                        op: Op::SetViewSortCols { cols: cols.clone() },
                     }
                     .to_log_line(sheet.state.grid.main_cols()),
                 );
@@ -4728,10 +4766,11 @@ impl App {
         let mc = grid.main_cols();
         let show_right_divider = col_ixs.contains(&(lm + mc));
         let max_data_lines = inner_h.saturating_sub(1);
+        let last_display_main_row = grid.sorted_main_rows().last().map(|row| hr + *row);
         for &r in row_ixs.iter().take(max_data_lines) {
             let active_row = r == self.cursor.row;
             let is_underlined_boundary_row =
-                (hr > 0 && r == hr - 1) || (mr > 0 && r == hr + mr - 1);
+                (hr > 0 && r == hr - 1) || last_display_main_row == Some(r);
             let mut row_label_style = if active_row {
                 Style::default()
                     .fg(Color::Black)
@@ -4887,7 +4926,7 @@ impl App {
                 let is_right_border = c == lm + mc && col_ixs.contains(&(lm + mc));
                 let is_header_border =
                     r == hr - 1 && r >= row_ixs.first().copied().unwrap_or(0) && hr > 0;
-                let is_footer_border = mr > 0 && r == hr + mr - 1;
+                let is_footer_border = last_display_main_row == Some(r);
 
                 let border_color =
                     if is_left_border || is_right_border || is_header_border || is_footer_border {
@@ -6086,10 +6125,12 @@ impl App {
                             self.ops_applied = self.ops_applied.saturating_add(1);
                             self.start_log_watcher_if_needed()?;
                         } else {
-                            self.state.grid.set_view_sort_cols(cols);
+                            self.state.grid.set_view_sort_cols(cols.clone());
                         }
+                        self.set_active_sort_persistence(&cols, true);
                     } else {
-                        self.state.grid.set_view_sort_cols(cols);
+                        self.state.grid.set_view_sort_cols(cols.clone());
+                        self.set_active_sort_persistence(&cols, false);
                     }
                     self.status = if *persist {
                         "View sort saved".into()
@@ -6216,6 +6257,7 @@ impl App {
                         self.source_path = None;
                         self.offset = 0;
                         self.state = SheetState::new(1, 1);
+                        self.persisted_view_sort_cols.clear();
                         self.ops_applied = 0;
                         self.revision_limit = None;
                         if path.exists() {
@@ -6240,6 +6282,7 @@ impl App {
                                     if let Ok((off, n)) = loaded {
                                         self.offset = off;
                                         self.ops_applied = n;
+                                        self.sync_persisted_sort_cache_from_active_sheet();
                                     }
                                 }
                             }
@@ -10512,7 +10555,20 @@ mod tests {
         );
         app.state
             .grid
-            .set(&CellAddr::Main { row: 2, col: 0 }, "last".into());
+            .set(&CellAddr::Main { row: 0, col: 0 }, "b".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 1, col: 0 }, "c".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 1, col: 1 }, "last-sorted".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 2, col: 0 }, "a".into());
+        app.state.grid.set_view_sort_cols(vec![SortSpec {
+            col: MARGIN_COLS,
+            desc: false,
+        }]);
 
         let backend = TestBackend::new(80, 18);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -10529,7 +10585,7 @@ mod tests {
             if line.contains("~1") && line.contains("Hdr") {
                 tilde_row_y = Some(y);
             }
-            if line.contains("3") && line.contains("last") {
+            if line.contains("2") && line.contains("last-sorted") {
                 last_data_row_y = Some(y);
             }
         }
@@ -10550,6 +10606,37 @@ mod tests {
 
         assert!(saw_underlined_tilde_row);
         assert!(saw_underlined_last_data_row);
+    }
+
+    #[test]
+    fn save_only_writes_persisted_view_sort() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sort.corro");
+        let cols = vec![SortSpec {
+            col: MARGIN_COLS,
+            desc: false,
+        }];
+
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(2, 1);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "b".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 1, col: 0 }, "a".into());
+
+        app.state.grid.set_view_sort_cols(cols.clone());
+        app.set_active_sort_persistence(&cols, false);
+        app.save_to_path(&path).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(!saved.contains("SORT A"), "{saved}");
+        assert_eq!(app.state.grid.sorted_main_rows(), vec![1, 0]);
+
+        app.set_active_sort_persistence(&cols, true);
+        app.save_to_path(&path).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("SORT A"), "{saved}");
     }
 
     #[test]
