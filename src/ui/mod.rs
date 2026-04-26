@@ -906,7 +906,9 @@ impl App {
         formula_cursor: Option<SheetCursor>,
         special_palette: bool,
         fit_to_content_on_commit: bool,
+        edit_range_addrs: Option<Vec<CellAddr>>,
     ) -> Mode {
+        self.edit_range_addrs = edit_range_addrs;
         self.edit_target_addr = Some(self.cursor.to_addr(&self.state.grid));
         let cursor = if buffer.trim() == "=" {
             1
@@ -935,6 +937,7 @@ impl App {
             },
             false,
             false,
+            None,
         )
     }
 
@@ -946,7 +949,7 @@ impl App {
     fn commit_special_choice(&mut self, idx: usize) {
         let choice = SPECIAL_VALUE_CHOICES[idx];
         let buffer = choice.to_string();
-        self.mode = self.start_edit_mode(buffer, None, true, false);
+        self.mode = self.start_edit_mode(buffer, None, true, false, None);
     }
 
     fn menu_action_mode(&mut self, action: MenuAction) -> Mode {
@@ -1119,15 +1122,17 @@ impl App {
                 None,
                 false,
                 true,
+                None,
             ),
             MenuAction::InsertTime => self.start_edit_mode(
                 chrono::Local::now().format("%H:%M:%S").to_string(),
                 None,
                 false,
                 true,
+                None,
             ),
             MenuAction::InsertHyperlink => {
-                self.start_edit_mode(self.menu_insert_hyperlink_seed(), None, false, false)
+                self.start_edit_mode(self.menu_insert_hyperlink_seed(), None, false, false, None)
             }
             MenuAction::SortView => Mode::SortView {
                 buffer: self.start_input_mode(String::new()),
@@ -2161,6 +2166,8 @@ pub struct App {
     view_sheet_id: u32,
     persisted_view_sort_cols: HashMap<u32, Vec<SortSpec>>,
     edit_target_addr: Option<CellAddr>,
+    /// When set, edit buffer commits to all listed addresses (same value). Preview uses all addrs in [`App::addr_at`].
+    edit_range_addrs: Option<Vec<CellAddr>>,
     pending_lost_edit: Option<(CellAddr, String)>,
     pending_fit_to_content_on_commit: bool,
     clipboard_snapshot: Option<(MainRange, String)>,
@@ -2227,6 +2234,7 @@ impl App {
             view_sheet_id: 1,
             persisted_view_sort_cols: HashMap::new(),
             edit_target_addr: None,
+            edit_range_addrs: None,
             pending_lost_edit: None,
             pending_fit_to_content_on_commit: false,
             clipboard_snapshot: None,
@@ -3204,11 +3212,85 @@ impl App {
         Some((&s[..i], &s[i..]))
     }
 
+    /// Sheet layout address for a visible `(row, col)` without using edit-mode buffer preview.
+    fn cell_addr_for_position(&self, row: usize, col: usize) -> Option<CellAddr> {
+        let hr = HEADER_ROWS;
+        let mr = self.state.grid.main_rows();
+        let mc = self.state.grid.main_cols();
+        if row < hr {
+            Some(CellAddr::Header {
+                row: row as u32,
+                col: col as u32,
+            })
+        } else if row < hr + mr {
+            let mri = row - hr;
+            if col < MARGIN_COLS {
+                Some(CellAddr::Left {
+                    col,
+                    row: mri as u32,
+                })
+            } else if col < MARGIN_COLS + mc {
+                Some(CellAddr::Main {
+                    row: mri as u32,
+                    col: (col - MARGIN_COLS) as u32,
+                })
+            } else if col < MARGIN_COLS + mc + MARGIN_COLS {
+                Some(CellAddr::Right {
+                    col: (col - MARGIN_COLS - mc),
+                    row: mri as u32,
+                })
+            } else {
+                None
+            }
+        } else if row < hr + mr + FOOTER_ROWS {
+            Some(CellAddr::Footer {
+                row: (row - hr - mr) as u32,
+                col: col as u32,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// All layout addresses in the current anchor/cursor range (if any), row-major.
+    fn selection_cell_addresses(&self) -> Option<Vec<CellAddr>> {
+        let (rows, cols) = self.current_selection_range()?;
+        let mut v = Vec::new();
+        for r in rows {
+            for c in cols.iter().copied() {
+                if let Some(a) = self.cell_addr_for_position(r, c) {
+                    v.push(a);
+                }
+            }
+        }
+        if v.is_empty() {
+            None
+        } else {
+            Some(v)
+        }
+    }
+
+    /// When the user types to replace, fill all of these with the same buffer (more than one cell).
+    fn multi_cell_type_targets(&self) -> Option<Vec<CellAddr>> {
+        let v = self.selection_cell_addresses()?;
+        if v.len() > 1 {
+            Some(v)
+        } else {
+            None
+        }
+    }
+
     fn addr_at(&self, row: usize, col: usize) -> Option<CellAddr> {
         let preview_grid = if let Mode::Edit { buffer, .. } = &self.mode {
             let mut grid = self.state.grid.clone();
-            let addr = self.cursor.to_addr(&self.state.grid);
-            grid.set(&addr, buffer.clone());
+            if let Some(ref addrs) = self.edit_range_addrs {
+                for a in addrs {
+                    grid.set(a, buffer.clone());
+                }
+            } else {
+                let addr = self.cursor.to_addr(&self.state.grid);
+                grid.set(&addr, buffer.clone());
+            }
             Some(grid)
         } else {
             None
@@ -3582,7 +3664,67 @@ impl App {
     fn commit_edit_buffer(&mut self, buffer: &str) -> Result<(), RunError> {
         self.edit_special_palette = false;
         self.pending_lost_edit = None;
+        let range = self.edit_range_addrs.take();
         let explicit_addr = parse_cell_shorthand(buffer, self.state.grid.main_cols());
+
+        if let Some(ref addrs) = range {
+            if addrs.len() > 1 && explicit_addr.is_none() {
+                let value = buffer.to_string();
+                if addrs.iter().all(|a| {
+                    self.state.grid.get(a).as_deref().unwrap_or("") == value.as_str()
+                }) {
+                    self.pending_fit_to_content_on_commit = false;
+                    return Ok(());
+                }
+                let cells: Vec<(CellAddr, String)> = addrs
+                    .iter()
+                    .cloned()
+                    .map(|a| (a, value.clone()))
+                    .collect();
+                let op = Op::FillRange { cells };
+                self.push_inverse_op(&op);
+                if let Some(ref p) = self.path.clone() {
+                    let mut active_sheet = self.view_sheet_id;
+                    commit_workbook_op(
+                        p,
+                        &mut self.offset,
+                        &mut self.workbook,
+                        &mut active_sheet,
+                        &crate::ops::WorkbookOp::SheetOp {
+                            sheet_id: self.view_sheet_id,
+                            op,
+                        },
+                    )?;
+                    self.ops_applied = self.ops_applied.saturating_add(1);
+                    self.sync_active_sheet_cache();
+                    self.start_log_watcher_if_needed()?;
+                } else {
+                    op.apply(&mut self.state);
+                    self.status = "No file — edit in memory only".into();
+                }
+                let cur_addr = self.cursor.to_addr(&self.state.grid);
+                for a in addrs {
+                    if let &CellAddr::Main { col, .. } = a {
+                        self.state
+                            .grid
+                            .auto_fit_column(MARGIN_COLS + col as usize);
+                    }
+                }
+                if self.pending_fit_to_content_on_commit {
+                    if let Some(addr) = addrs
+                        .iter()
+                        .find(|a| *a == &cur_addr)
+                        .or_else(|| addrs.first())
+                    {
+                        self.fit_column_to_content_from_current_cell(addr.clone());
+                    }
+                    self.commit_active_sheet_cache();
+                    self.pending_fit_to_content_on_commit = false;
+                }
+                return Ok(());
+            }
+        }
+
         let (addr, value) = if let Some((a, v)) = explicit_addr.clone() {
             (a, v)
         } else {
@@ -3852,6 +3994,7 @@ impl App {
         self.cursor.clamp(&self.state.grid);
         self.anchor = None;
         self.edit_target_addr = None;
+        self.edit_range_addrs = None;
         let addr = self.cursor.to_addr(&self.state.grid);
         self.status = format!("Went to {}", addr_label(&addr, self.state.grid.main_cols()));
         true
@@ -3876,7 +4019,7 @@ impl App {
         self.cursor.clamp(&self.state.grid);
         self.edit_target_addr = Some(addr);
         self.status.clear();
-        Some(self.start_edit_mode(buffer, None, false, false))
+        Some(self.start_edit_mode(buffer, None, false, false, None))
     }
 
     fn cell_ref_is_in_supported_bounds(cref: &crate::celladdr::CellRef) -> bool {
@@ -3917,6 +4060,7 @@ impl App {
             },
             false,
             false,
+            None,
         ))
     }
 
@@ -6246,17 +6390,17 @@ Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard 
                 match ch {
                     ';' if key.modifiers.contains(KeyModifiers::SHIFT) => {
                         let buffer = chrono::Local::now().format("%H:%M:%S").to_string();
-                        self.mode = self.start_edit_mode(buffer, None, false, false);
+                        self.mode = self.start_edit_mode(buffer, None, false, false, None);
                         return Ok(false);
                     }
                     ':' => {
                         let buffer = chrono::Local::now().format("%H:%M:%S").to_string();
-                        self.mode = self.start_edit_mode(buffer, None, false, false);
+                        self.mode = self.start_edit_mode(buffer, None, false, false, None);
                         return Ok(false);
                     }
                     ';' => {
                         let buffer = chrono::Local::now().format("%Y-%m-%d").to_string();
-                        self.mode = self.start_edit_mode(buffer, None, false, true);
+                        self.mode = self.start_edit_mode(buffer, None, false, true, None);
                         return Ok(false);
                     }
                     _ => {}
@@ -6282,6 +6426,7 @@ Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard 
                             },
                             false,
                             false,
+                            None,
                         );
                     }
                     self.mode = mode;
@@ -6301,6 +6446,7 @@ Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard 
                             },
                             false,
                             false,
+                            None,
                         );
                     }
                     self.mode = mode;
@@ -7413,6 +7559,7 @@ Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard 
                         },
                         false,
                         false,
+                        None,
                     );
                 }
                 KeyCode::Down => {
@@ -7423,6 +7570,7 @@ Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard 
                     self.edit_cursor = None;
                     self.edit_special_palette = false;
                     self.edit_target_addr = None;
+                    self.edit_range_addrs = None;
                     *formula_cursor = None;
                     mode = Mode::Normal;
                 }
@@ -7470,6 +7618,7 @@ Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard 
                         self.edit_special_palette = false;
                         self.pending_lost_edit = None;
                         let buffer = c.to_string();
+                        let type_targets = self.multi_cell_type_targets();
                         mode = self.start_edit_mode(
                             buffer.clone(),
                             if buffer.trim() == "=" {
@@ -7479,6 +7628,7 @@ Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard 
                             },
                             false,
                             false,
+                            type_targets,
                         );
                     }
                     self.mode = mode;
@@ -7628,8 +7778,10 @@ Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard 
 
                 match key.code {
                     KeyCode::Esc => {
-                        self.anchor = None;
-                        if self.anchor.is_none() {
+                        if self.anchor.is_some() {
+                            self.anchor = None;
+                            self.selection_kind = SelectionKind::Cells;
+                        } else {
                             mode = if self.path.is_none() {
                                 Mode::QuitImportPrompt
                             } else {
@@ -7732,6 +7884,7 @@ Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard 
                             },
                             false,
                             false,
+                            None,
                         );
                     }
                     KeyCode::Char('v') => {
@@ -7938,6 +8091,7 @@ Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard 
                     KeyCode::Char(c) if !c.is_control() => {
                         self.edit_special_palette = false;
                         let buffer = c.to_string();
+                        let type_targets = self.multi_cell_type_targets();
                         mode = self.start_edit_mode(
                             buffer.clone(),
                             if buffer.trim() == "=" {
@@ -7947,6 +8101,7 @@ Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard 
                             },
                             false,
                             false,
+                            type_targets,
                         );
                     }
                     _ => {}
@@ -9259,7 +9414,7 @@ mod tests {
             row: HEADER_ROWS,
             col: MARGIN_COLS,
         };
-        app.mode = app.start_edit_mode("draft".into(), None, false, false);
+        app.mode = app.start_edit_mode("draft".into(), None, false, false, None);
 
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()))
             .unwrap();
@@ -9300,7 +9455,7 @@ mod tests {
             row: HEADER_ROWS,
             col: MARGIN_COLS,
         };
-        app.mode = app.start_edit_mode("2024-01-02".into(), None, false, true);
+        app.mode = app.start_edit_mode("2024-01-02".into(), None, false, true, None);
         if let Mode::Edit { buffer, .. } = &app.mode {
             let raw = buffer.clone();
             app.commit_edit_buffer(&raw).unwrap();
