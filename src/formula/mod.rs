@@ -1300,6 +1300,70 @@ fn eval_result_to_string(result: &EvalResult) -> String {
     }
 }
 
+fn formula_references_all_empty(grid: &Grid, formula: &str) -> bool {
+    let t = formula.trim();
+    let Some(expr) = t.strip_prefix('=') else {
+        return false;
+    };
+    let expr = split_labeled_formula(t).map_or(expr, |(expr, _)| expr);
+    let mut p = Parser {
+        s: expr.trim(),
+        i: 0,
+        main_cols: grid.main_cols(),
+    };
+    let Ok(ast) = p.parse_expr() else {
+        return false;
+    };
+    p.skip_ws();
+    if p.i != p.s.len() {
+        return false;
+    }
+
+    let mut saw_ref = false;
+    ast_references_all_empty(&ast, grid, &mut saw_ref) && saw_ref
+}
+
+fn ast_references_all_empty(ast: &Ast, grid: &Grid, saw_ref: &mut bool) -> bool {
+    match ast {
+        Ast::Number(_) | Ast::Text(_) | Ast::Name(_) => true,
+        Ast::Ref(addr) => {
+            *saw_ref = true;
+            cell_reference_is_empty(grid, addr)
+        }
+        Ast::SheetRef { sheet_id, addr } => {
+            let Some(sheet_grid) = workbook_lookup(*sheet_id) else {
+                return false;
+            };
+            *saw_ref = true;
+            cell_reference_is_empty(&sheet_grid, addr)
+        }
+        Ast::Range(range) => {
+            let mut all_empty = true;
+            for row in range.row_start..range.row_end {
+                for col in range.col_start..range.col_end {
+                    *saw_ref = true;
+                    let addr = CellAddr::Main { row, col };
+                    all_empty &= cell_reference_is_empty(grid, &addr);
+                }
+            }
+            all_empty
+        }
+        Ast::Neg(a) => ast_references_all_empty(a, grid, saw_ref),
+        Ast::Add(a, b) | Ast::Sub(a, b) | Ast::Mul(a, b) | Ast::Div(a, b) | Ast::Pow(a, b) => {
+            ast_references_all_empty(a, grid, saw_ref) && ast_references_all_empty(b, grid, saw_ref)
+        }
+        Ast::Call { args, .. } => args
+            .iter()
+            .all(|arg| ast_references_all_empty(arg, grid, saw_ref)),
+    }
+}
+
+fn cell_reference_is_empty(grid: &Grid, addr: &CellAddr) -> bool {
+    grid.get(addr)
+        .as_deref()
+        .map_or(true, |value| value.trim().is_empty())
+}
+
 /// Display string for a cell: evaluated formula result, or raw text.
 pub fn cell_effective_display(grid: &Grid, addr: &CellAddr) -> String {
     if let Some(label) = control_formula_label(grid, addr) {
@@ -1318,7 +1382,8 @@ pub fn cell_effective_display(grid: &Grid, addr: &CellAddr) -> String {
     }
     let raw_owned = grid.get(addr);
     let raw = raw_owned.as_deref().unwrap_or("");
-    if templated_formula(grid, addr).is_none() && !is_formula(raw) {
+    let template_formula = templated_formula(grid, addr);
+    if template_formula.is_none() && !is_formula(raw) {
         return raw.to_string();
     }
     let mut visiting = Vec::new();
@@ -1327,6 +1392,12 @@ pub fn cell_effective_display(grid: &Grid, addr: &CellAddr) -> String {
         EvalResult::Number(n) => {
             if n.is_nan() {
                 "#NUM!".to_string()
+            } else if n == 0.0
+                && template_formula
+                    .as_deref()
+                    .is_some_and(|formula| formula_references_all_empty(grid, formula))
+            {
+                String::new()
             } else {
                 format_significant_10(n)
             }
@@ -2353,6 +2424,29 @@ mod tests {
                 },
             ),
             "POW2"
+        );
+    }
+
+    #[test]
+    fn header_template_zero_from_blank_references_displays_blank() {
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(2, 2));
+        g.set(
+            &CellAddr::Header {
+                row: (HEADER_ROWS - 1) as u32,
+                col: MARGIN_COLS as u32 + 1,
+            },
+            "=A*0.1 -- TAX".into(),
+        );
+
+        assert_eq!(
+            cell_effective_display(&g, &CellAddr::Main { row: 0, col: 1 }),
+            ""
+        );
+
+        g.set(&CellAddr::Main { row: 1, col: 0 }, "0".into());
+        assert_eq!(
+            cell_effective_display(&g, &CellAddr::Main { row: 1, col: 1 }),
+            "0"
         );
     }
 
