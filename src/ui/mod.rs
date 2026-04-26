@@ -1761,6 +1761,23 @@ fn parse_num(s: &str) -> Option<f64> {
     t.parse::<f64>().ok()
 }
 
+fn boundary_gap_style(underlined: bool) -> Style {
+    if underlined {
+        Style::default().add_modifier(Modifier::UNDERLINED)
+    } else {
+        Style::default()
+    }
+}
+
+fn boundary_separator_style(underlined: bool) -> Style {
+    let style = Style::default().fg(Color::DarkGray);
+    if underlined {
+        style.add_modifier(Modifier::UNDERLINED)
+    } else {
+        style
+    }
+}
+
 fn left_margin_agg_func(grid: &Grid, main_row: u32) -> Option<AggFunc> {
     let key_col: MarginIndex = MARGIN_COLS - 1;
     let val = grid.get(&CellAddr::Left {
@@ -4713,7 +4730,9 @@ impl App {
         let max_data_lines = inner_h.saturating_sub(1);
         for &r in row_ixs.iter().take(max_data_lines) {
             let active_row = r == self.cursor.row;
-            let row_label_style = if active_row {
+            let is_underlined_boundary_row =
+                (hr > 0 && r == hr - 1) || (mr > 0 && r == hr + mr - 1);
+            let mut row_label_style = if active_row {
                 Style::default()
                     .fg(Color::Black)
                     .bg(Color::Yellow)
@@ -4725,6 +4744,9 @@ impl App {
             } else {
                 Style::default().fg(Color::Yellow)
             };
+            if is_underlined_boundary_row {
+                row_label_style = row_label_style.add_modifier(Modifier::UNDERLINED);
+            }
             let mut spans: Vec<Span> = vec![Span::styled(
                 format!("{:>4} ", sheet_row_label(r, grid.main_rows())),
                 row_label_style,
@@ -4865,7 +4887,7 @@ impl App {
                 let is_right_border = c == lm + mc && col_ixs.contains(&(lm + mc));
                 let is_header_border =
                     r == hr - 1 && r >= row_ixs.first().copied().unwrap_or(0) && hr > 0;
-                let is_footer_border = r == hr + mr && row_ixs.contains(&(hr + mr));
+                let is_footer_border = mr > 0 && r == hr + mr - 1;
 
                 let border_color =
                     if is_left_border || is_right_border || is_header_border || is_footer_border {
@@ -4889,16 +4911,34 @@ impl App {
                         st = st.add_modifier(Modifier::BOLD);
                     }
                 }
+                if is_underlined_boundary_row {
+                    st = st.add_modifier(Modifier::UNDERLINED);
+                }
                 spans.push(Span::styled(disp, st));
                 if i + 1 < col_ixs.len() {
                     if c == lm - 1 && lm > 0 && col_ixs.contains(&lm) {
-                        spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
-                        spans.push(Span::raw(" "));
+                        spans.push(Span::styled(
+                            "│",
+                            boundary_separator_style(is_underlined_boundary_row),
+                        ));
+                        spans.push(Span::styled(
+                            " ",
+                            boundary_gap_style(is_underlined_boundary_row),
+                        ));
                     } else if c == lm + mc - 1 && show_right_divider {
-                        spans.push(Span::styled("│", Style::default().fg(Color::DarkGray)));
-                        spans.push(Span::raw(" "));
+                        spans.push(Span::styled(
+                            "│",
+                            boundary_separator_style(is_underlined_boundary_row),
+                        ));
+                        spans.push(Span::styled(
+                            " ",
+                            boundary_gap_style(is_underlined_boundary_row),
+                        ));
                     } else {
-                        spans.push(Span::raw(" "));
+                        spans.push(Span::styled(
+                            " ",
+                            boundary_gap_style(is_underlined_boundary_row),
+                        ));
                     }
                 }
             }
@@ -10457,43 +10497,45 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_rows_draw_dividers_instead_of_underlines() {
+    fn grid_draws_underlines_below_header_and_data_regions() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
-        let fixture = docs_test_path("main.corro");
-        if !fixture.exists() {
-            // Fixture not available in this environment (local dev); skip the
-            // test rather than failing. CI has the fixture and will exercise
-            // the full behavior.
-            eprintln!("Skipping load_initial_handles_legacy_test5_workbook: fixture missing");
-            return;
-        }
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(3, 2);
+        app.state.grid.set(
+            &CellAddr::Header {
+                row: (HEADER_ROWS - 1) as u32,
+                col: MARGIN_COLS as u32,
+            },
+            "Hdr".into(),
+        );
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 2, col: 0 }, "last".into());
 
-        let mut app = App::new(Some(fixture));
-        app.load_initial().unwrap();
-
-        let backend = TestBackend::new(140, 24);
+        let backend = TestBackend::new(80, 18);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| app.draw(f)).unwrap();
         let buffer = terminal.backend().buffer();
         let mut saw_underlined_tilde_row = false;
         let mut saw_underlined_last_data_row = false;
-        let mut saw_left_divider = false;
-        let mut saw_right_divider = false;
         let mut tilde_row_y: Option<u16> = None;
         let mut last_data_row_y: Option<u16> = None;
         for y in 0..buffer.area.height {
             let line = (0..buffer.area.width)
                 .map(|x| buffer[(x, y)].symbol())
                 .collect::<String>();
-            if line.contains("│  ~1") && line.contains("POW2") {
+            if line.contains("~1") && line.contains("Hdr") {
                 tilde_row_y = Some(y);
             }
-            if line.contains("│  13") && line.contains("#NAME") {
+            if line.contains("3") && line.contains("last") {
                 last_data_row_y = Some(y);
             }
         }
+        assert!(tilde_row_y.is_some(), "expected rendered ~1 row");
+        assert!(last_data_row_y.is_some(), "expected rendered last data row");
+
         for y in 0..buffer.area.height {
             for x in 0..buffer.area.width {
                 let cell = &buffer[(x, y)];
@@ -10503,19 +10545,11 @@ mod tests {
                 if last_data_row_y == Some(y) && cell.modifier.contains(Modifier::UNDERLINED) {
                     saw_underlined_last_data_row = true;
                 }
-                if cell.symbol() == "│" && x < 8 {
-                    saw_left_divider = true;
-                }
-                if cell.symbol() == "│" && x > 25 {
-                    saw_right_divider = true;
-                }
             }
         }
 
-        assert!(!saw_underlined_tilde_row);
-        assert!(!saw_underlined_last_data_row);
-        assert!(saw_left_divider);
-        assert!(saw_right_divider);
+        assert!(saw_underlined_tilde_row);
+        assert!(saw_underlined_last_data_row);
     }
 
     #[test]
