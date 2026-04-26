@@ -9283,6 +9283,21 @@ mod tests {
         assert_eq!(norm(&tsv), norm(expected), "subtotal-tiny TSV export");
     }
 
+    /// ASCII table from `export_ascii_table` / `do_export_ascii`; matches
+    /// `docs/tests/subtotal-tiny-ascii.txt`.
+    #[test]
+    fn subtotal_tiny_ascii_export_matches_golden() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("docs/tests/subtotal-tiny.corro");
+        let mut app = App::new(Some(path));
+        app.load_initial().unwrap();
+
+        let ascii = app.do_export_ascii();
+        let expected = include_str!("../../docs/tests/subtotal-tiny-ascii.txt");
+        let norm = |s: &str| s.replace("\r\n", "\n");
+        assert_eq!(norm(&ascii), norm(expected), "subtotal-tiny ASCII table export");
+    }
+
     #[test]
     fn export_tsv_clears_stale_menu_popup() {
         use ratatui::backend::TestBackend;

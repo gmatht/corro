@@ -33,26 +33,21 @@ pub fn export_ascii_table(grid: &Grid, out: &mut dyn Write, row_dividers: bool) 
     for r in row_start..row_end {
         for c in col_start..col_end {
             let val = rendered_value_at(grid, r, c);
-            let content_w = if val.is_empty() {
-                0
-            } else {
-                val.chars().count() + 1
-            };
+            let content_w = val.chars().count();
             col_widths[c] = col_widths[c].max(content_w);
         }
     }
 
-    let _total_width: usize = row_label_w
-        + 1
-        + col_widths[col_start..col_end].iter().sum::<usize>()
-        + (col_end - col_start)
-        + 1;
+    // Each cell is rendered as `| {:>w$} |`, so the span between one `|` and the next is
+    // always w + 2 characters (space + w-wide field + space before the closing `|`). Top/bottom
+    // borders use that same width in `-` so `+` corners line up with `|`.
+    let border_dash_len = |w: usize| w.saturating_add(2);
     let border: String = "+".to_string()
-        + &"-".repeat(row_label_w)
+        + &"-".repeat(border_dash_len(row_label_w))
         + "+"
         + &col_widths[col_start..col_end]
             .iter()
-            .map(|w| "-".repeat(*w))
+            .map(|&w| "-".repeat(border_dash_len(w)))
             .collect::<Vec<_>>()
             .join("+")
         + "+";
