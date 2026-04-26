@@ -104,8 +104,8 @@ pub fn cell_display(grid: &Grid, addr: &CellAddr) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::grid::Grid;
     use crate::grid::GridBox;
+    use crate::grid::{Grid, HEADER_ROWS, MARGIN_COLS};
 
     #[test]
     fn sum_mean() {
@@ -141,5 +141,53 @@ mod tests {
         };
         let gb = GridBox::from(g);
         assert_eq!(compute_aggregate(&gb, &def), "5");
+    }
+
+    #[test]
+    fn aggregate_ignores_template_zero_from_blank_references() {
+        let mut g = GridBox::from(Grid::new(2, 2));
+        g.set(
+            &CellAddr::Header {
+                row: (HEADER_ROWS - 1) as u32,
+                col: MARGIN_COLS as u32 + 1,
+            },
+            "=A*0.1 -- TAX".into(),
+        );
+
+        let def = AggregateDef {
+            func: AggFunc::Sum,
+            source: MainRange {
+                row_start: 0,
+                row_end: 2,
+                col_start: 1,
+                col_end: 2,
+            },
+        };
+        assert_eq!(compute_aggregate(&g, &def), "");
+
+        let def = AggregateDef {
+            func: AggFunc::Min,
+            source: MainRange {
+                row_start: 0,
+                row_end: 2,
+                col_start: 1,
+                col_end: 2,
+            },
+        };
+        assert_eq!(compute_aggregate(&g, &def), "");
+
+        let def = AggregateDef {
+            func: AggFunc::Mean,
+            source: MainRange {
+                row_start: 0,
+                row_end: 2,
+                col_start: 1,
+                col_end: 2,
+            },
+        };
+        assert_eq!(compute_aggregate(&g, &def), "");
+
+        g.set(&CellAddr::Main { row: 1, col: 0 }, "0".into());
+        assert_eq!(compute_aggregate(&g, &def), "0");
     }
 }

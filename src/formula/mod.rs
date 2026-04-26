@@ -513,11 +513,22 @@ pub fn effective_numeric(
 ) -> Option<f64> {
     let raw_owned = grid.get(addr);
     let raw = raw_owned.as_deref().unwrap_or("");
-    if templated_formula(grid, addr).is_none() && !is_formula(raw) {
+    let template_formula = templated_formula(grid, addr);
+    if template_formula.is_none() && !is_formula(raw) {
         return functions::parse_numeric_or_date_literal(raw);
     }
     match eval_cell(grid, addr, visiting, budget) {
-        EvalResult::Number(n) if !n.is_nan() => Some(n),
+        EvalResult::Number(n) if !n.is_nan() => {
+            if n == 0.0
+                && template_formula
+                    .as_deref()
+                    .is_some_and(|formula| formula_references_all_empty(grid, formula))
+            {
+                None
+            } else {
+                Some(n)
+            }
+        }
         EvalResult::Text(s) => functions::parse_numeric_or_date_literal(&s),
         _ => None,
     }
