@@ -11,8 +11,7 @@ use crate::grid::{
     SortSpec, TextAlign, FOOTER_ROWS, HEADER_ROWS, MARGIN_COLS,
 };
 use crate::io::{
-    commit_line, commit_workbook_op, load_full, load_revisions, load_revisions_partial,
-    load_workbook_revisions_partial, IoError, LogWatcher, PartialReplay,
+    commit_workbook_op, load_workbook_revisions_partial, IoError, LogWatcher, PartialReplay,
 };
 use crate::ops::{AggFunc, AggregateDef, Op, SheetState, WorkbookState};
 use crossterm::cursor::{Hide, Show};
@@ -2796,26 +2795,37 @@ impl App {
                             self.cursor.clamp(&self.state.grid);
                             return Ok(());
                         }
-                        let (off, n) = match linked_revision {
-                            Some(limit) => load_revisions(p, limit, &mut self.state)?,
-                            None => load_full(p, &mut self.state)?,
-                        };
-                        self.sync_persisted_sort_cache_from_active_sheet();
+                        self.workbook = WorkbookState::new();
+                        self.state = SheetState::new(1, 1);
+                        let mut active_sheet = self.workbook.sheet_id(self.workbook.active_sheet);
+                        let (off, replay) = load_workbook_revisions_partial(
+                            p,
+                            linked_revision.unwrap_or(usize::MAX),
+                            &mut self.workbook,
+                            &mut active_sheet,
+                        )?;
+                        self.view_sheet_id = active_sheet;
+                        self.sync_active_sheet_cache();
+                        self.sync_persisted_sort_cache_from_workbook();
                         for c in 0..self.state.grid.main_cols() {
                             self.fit_column_to_rendered_content(MARGIN_COLS + c);
                         }
                         self.offset = off;
-                        self.ops_applied = n;
+                        self.ops_applied = replay.op_count;
                         if let Some(limit) = linked_revision {
                             self.source_path = Some(p.clone());
                             self.path = None;
                             self.watcher = None;
-                            self.status = format!("Linked {} @ revision {}", p.display(), limit);
+                            self.status = format!(
+                                "Linked {} @ revision {}",
+                                p.display(),
+                                replay.op_count.min(limit)
+                            );
                         } else {
                             self.source_path = None;
                             self.path = Some(p.clone());
                             self.watcher = Some(LogWatcher::new(p.clone())?);
-                            self.status = format!("Loaded {}", p.display());
+                            self.status = Self::replay_status("Loaded", p, &replay);
                         }
                     }
                 }
@@ -3767,7 +3777,8 @@ impl App {
                 CellAddr::Header { col, .. } | CellAddr::Footer { col, .. }
                     if col as usize == global_col =>
                 {
-                    let val = cell_effective_display(&self.state.grid, &addr);
+                    let val =
+                        normalize_inline_text(&cell_effective_display(&self.state.grid, &addr));
                     if !val.is_empty() {
                         saw_content = true;
                         maxw = maxw.max(val.chars().count() + 1);
@@ -3782,7 +3793,7 @@ impl App {
                     col: global_col,
                     row: r as u32,
                 };
-                let val = cell_effective_display(&self.state.grid, &addr);
+                let val = normalize_inline_text(&cell_effective_display(&self.state.grid, &addr));
                 if !val.is_empty() {
                     saw_content = true;
                     maxw = maxw.max(val.chars().count() + 1);
@@ -3792,7 +3803,7 @@ impl App {
                     row: r as u32,
                     col: (global_col - MARGIN_COLS) as u32,
                 };
-                let val = cell_effective_display(&self.state.grid, &addr);
+                let val = normalize_inline_text(&cell_effective_display(&self.state.grid, &addr));
                 if !val.is_empty() {
                     saw_content = true;
                     maxw = maxw.max(val.chars().count() + 1);
@@ -3802,7 +3813,7 @@ impl App {
                     col: (global_col - MARGIN_COLS - main_cols),
                     row: r as u32,
                 };
-                let val = cell_effective_display(&self.state.grid, &addr);
+                let val = normalize_inline_text(&cell_effective_display(&self.state.grid, &addr));
                 if !val.is_empty() {
                     saw_content = true;
                     maxw = maxw.max(val.chars().count() + 1);
@@ -4274,15 +4285,22 @@ impl App {
     fn save_to_path(&mut self, path: &Path) -> Result<(), RunError> {
         self.commit_active_sheet_cache();
         let mut buf = String::new();
+        buf.push_str(&format!(
+            "{} {}\n",
+            crate::ops::LOG_HEADER_PREFIX,
+            crate::ops::LOG_VERSION
+        ));
+        let omit_sheet1_prefix = self.workbook.sheet_count() == 1;
         for sheet in &self.workbook.sheets {
-            buf.push_str(
-                &crate::ops::WorkbookOp::NewSheet {
-                    id: sheet.id,
-                    title: sheet.title.clone(),
-                }
-                .to_log_line(sheet.state.grid.main_cols()),
-            );
-            buf.push('\n');
+            for line in (crate::ops::WorkbookOp::NewSheet {
+                id: sheet.id,
+                title: sheet.title.clone(),
+            })
+            .to_log_lines_with_policy(sheet.state.grid.main_cols(), omit_sheet1_prefix)
+            {
+                buf.push_str(&line);
+                buf.push('\n');
+            }
             for row in 0..sheet.state.grid.main_rows() {
                 for col in 0..sheet.state.grid.main_cols() {
                     let addr = CellAddr::Main {
@@ -4291,125 +4309,136 @@ impl App {
                     };
                     if let Some(value) = sheet.state.grid.get(&addr) {
                         if !value.is_empty() {
-                            buf.push_str(
-                                &crate::ops::WorkbookOp::SheetOp {
-                                    sheet_id: sheet.id,
-                                    op: Op::SetCell {
-                                        addr: addr.clone(),
-                                        value: value.to_string(),
-                                    },
-                                }
-                                .to_log_line(sheet.state.grid.main_cols()),
-                            );
-                            buf.push('\n');
+                            for line in (crate::ops::WorkbookOp::SheetOp {
+                                sheet_id: sheet.id,
+                                op: Op::SetCell {
+                                    addr: addr.clone(),
+                                    value: value.to_string(),
+                                },
+                            })
+                            .to_log_lines_with_policy(
+                                sheet.state.grid.main_cols(),
+                                omit_sheet1_prefix,
+                            ) {
+                                buf.push_str(&line);
+                                buf.push('\n');
+                            }
                         }
                     }
                 }
             }
-            buf.push_str(
-                &crate::ops::WorkbookOp::SheetOp {
-                    sheet_id: sheet.id,
-                    op: Op::SetMainSize {
-                        main_rows: sheet.state.grid.main_rows() as u32,
-                        main_cols: sheet.state.grid.main_cols() as u32,
-                    },
-                }
-                .to_log_line(sheet.state.grid.main_cols()),
-            );
-            buf.push('\n');
-            if sheet.state.grid.max_col_width() != 20 {
-                buf.push_str(
-                    &crate::ops::WorkbookOp::SheetOp {
-                        sheet_id: sheet.id,
-                        op: Op::SetMaxColWidth {
-                            width: sheet.state.grid.max_col_width(),
-                        },
-                    }
-                    .to_log_line(sheet.state.grid.main_cols()),
-                );
+            for line in (crate::ops::WorkbookOp::SheetOp {
+                sheet_id: sheet.id,
+                op: Op::SetMainSize {
+                    main_rows: sheet.state.grid.main_rows() as u32,
+                    main_cols: sheet.state.grid.main_cols() as u32,
+                },
+            })
+            .to_log_lines_with_policy(sheet.state.grid.main_cols(), omit_sheet1_prefix)
+            {
+                buf.push_str(&line);
                 buf.push('\n');
             }
+            if sheet.state.grid.max_col_width() != 20 {
+                for line in (crate::ops::WorkbookOp::SheetOp {
+                    sheet_id: sheet.id,
+                    op: Op::SetMaxColWidth {
+                        width: sheet.state.grid.max_col_width(),
+                    },
+                })
+                .to_log_lines_with_policy(sheet.state.grid.main_cols(), omit_sheet1_prefix)
+                {
+                    buf.push_str(&line);
+                    buf.push('\n');
+                }
+            }
             for (col, width) in sheet.state.grid.col_width_overrides() {
-                buf.push_str(
-                    &crate::ops::WorkbookOp::SheetOp {
-                        sheet_id: sheet.id,
-                        op: Op::SetColWidth {
-                            col,
-                            width: Some(width),
-                        },
-                    }
-                    .to_log_line(sheet.state.grid.main_cols()),
-                );
-                buf.push('\n');
+                for line in (crate::ops::WorkbookOp::SheetOp {
+                    sheet_id: sheet.id,
+                    op: Op::SetColWidth {
+                        col,
+                        width: Some(width),
+                    },
+                })
+                .to_log_lines_with_policy(sheet.state.grid.main_cols(), omit_sheet1_prefix)
+                {
+                    buf.push_str(&line);
+                    buf.push('\n');
+                }
             }
             if let Some(cols) = self
                 .persisted_view_sort_cols
                 .get(&sheet.id)
                 .filter(|cols| !cols.is_empty())
             {
-                buf.push_str(
-                    &crate::ops::WorkbookOp::SheetOp {
-                        sheet_id: sheet.id,
-                        op: Op::SetViewSortCols { cols: cols.clone() },
-                    }
-                    .to_log_line(sheet.state.grid.main_cols()),
-                );
-                buf.push('\n');
+                for line in (crate::ops::WorkbookOp::SheetOp {
+                    sheet_id: sheet.id,
+                    op: Op::SetViewSortCols { cols: cols.clone() },
+                })
+                .to_log_lines_with_policy(sheet.state.grid.main_cols(), omit_sheet1_prefix)
+                {
+                    buf.push_str(&line);
+                    buf.push('\n');
+                }
             }
             for (col, format) in sheet.state.grid.col_all_formats() {
-                buf.push_str(
-                    &crate::ops::WorkbookOp::SheetOp {
-                        sheet_id: sheet.id,
-                        op: Op::SetColumnFormat {
-                            scope: FormatScope::All,
-                            col: col,
-                            format: format,
-                        },
-                    }
-                    .to_log_line(sheet.state.grid.main_cols()),
-                );
-                buf.push('\n');
+                for line in (crate::ops::WorkbookOp::SheetOp {
+                    sheet_id: sheet.id,
+                    op: Op::SetColumnFormat {
+                        scope: FormatScope::All,
+                        col: col,
+                        format: format,
+                    },
+                })
+                .to_log_lines_with_policy(sheet.state.grid.main_cols(), omit_sheet1_prefix)
+                {
+                    buf.push_str(&line);
+                    buf.push('\n');
+                }
             }
             for (col, format) in sheet.state.grid.col_data_formats() {
-                buf.push_str(
-                    &crate::ops::WorkbookOp::SheetOp {
-                        sheet_id: sheet.id,
-                        op: Op::SetColumnFormat {
-                            scope: FormatScope::Data,
-                            col: col,
-                            format: format,
-                        },
-                    }
-                    .to_log_line(sheet.state.grid.main_cols()),
-                );
-                buf.push('\n');
+                for line in (crate::ops::WorkbookOp::SheetOp {
+                    sheet_id: sheet.id,
+                    op: Op::SetColumnFormat {
+                        scope: FormatScope::Data,
+                        col: col,
+                        format: format,
+                    },
+                })
+                .to_log_lines_with_policy(sheet.state.grid.main_cols(), omit_sheet1_prefix)
+                {
+                    buf.push_str(&line);
+                    buf.push('\n');
+                }
             }
             for (col, format) in sheet.state.grid.col_special_formats() {
-                buf.push_str(
-                    &crate::ops::WorkbookOp::SheetOp {
-                        sheet_id: sheet.id,
-                        op: Op::SetColumnFormat {
-                            scope: FormatScope::Special,
-                            col: col,
-                            format: format,
-                        },
-                    }
-                    .to_log_line(sheet.state.grid.main_cols()),
-                );
-                buf.push('\n');
+                for line in (crate::ops::WorkbookOp::SheetOp {
+                    sheet_id: sheet.id,
+                    op: Op::SetColumnFormat {
+                        scope: FormatScope::Special,
+                        col: col,
+                        format: format,
+                    },
+                })
+                .to_log_lines_with_policy(sheet.state.grid.main_cols(), omit_sheet1_prefix)
+                {
+                    buf.push_str(&line);
+                    buf.push('\n');
+                }
             }
             for (addr, format) in sheet.state.grid.cell_formats() {
-                buf.push_str(
-                    &crate::ops::WorkbookOp::SheetOp {
-                        sheet_id: sheet.id,
-                        op: Op::SetCellFormat {
-                            addr: addr,
-                            format: format,
-                        },
-                    }
-                    .to_log_line(sheet.state.grid.main_cols()),
-                );
-                buf.push('\n');
+                for line in (crate::ops::WorkbookOp::SheetOp {
+                    sheet_id: sheet.id,
+                    op: Op::SetCellFormat {
+                        addr: addr,
+                        format: format,
+                    },
+                })
+                .to_log_lines_with_policy(sheet.state.grid.main_cols(), omit_sheet1_prefix)
+                {
+                    buf.push_str(&line);
+                    buf.push('\n');
+                }
             }
         }
         std::fs::write(path, buf)?;
@@ -6202,12 +6231,18 @@ impl App {
                 KeyCode::Enter => {
                     if let Ok(width) = buffer.trim().parse::<usize>() {
                         if let Some(ref p) = self.path.clone() {
-                            commit_line(
+                            let mut active_sheet = self.view_sheet_id;
+                            commit_workbook_op(
                                 p,
                                 &mut self.offset,
-                                &mut self.state,
-                                &format!("MAX_COL_WIDTH {width}"),
+                                &mut self.workbook,
+                                &mut active_sheet,
+                                &crate::ops::WorkbookOp::SheetOp {
+                                    sheet_id: self.view_sheet_id,
+                                    op: Op::SetMaxColWidth { width },
+                                },
                             )?;
+                            self.sync_active_sheet_cache();
                             self.ops_applied = self.ops_applied.saturating_add(1);
                             self.start_log_watcher_if_needed()?;
                         } else {
@@ -6233,10 +6268,22 @@ impl App {
                         if let (Ok(col), Ok(width)) =
                             (lhs.trim().parse::<usize>(), rhs.trim().parse::<usize>())
                         {
-                            let line =
-                                format!("COL_WIDTH {} {}", addr::excel_column_name(col), width);
                             if let Some(ref p) = self.path.clone() {
-                                commit_line(p, &mut self.offset, &mut self.state, &line)?;
+                                let mut active_sheet = self.view_sheet_id;
+                                commit_workbook_op(
+                                    p,
+                                    &mut self.offset,
+                                    &mut self.workbook,
+                                    &mut active_sheet,
+                                    &crate::ops::WorkbookOp::SheetOp {
+                                        sheet_id: self.view_sheet_id,
+                                        op: Op::SetColWidth {
+                                            col: MARGIN_COLS + col,
+                                            width: Some(width),
+                                        },
+                                    },
+                                )?;
+                                self.sync_active_sheet_cache();
                                 self.ops_applied = self.ops_applied.saturating_add(1);
                                 self.start_log_watcher_if_needed()?;
                             } else {
@@ -6247,9 +6294,22 @@ impl App {
                             self.status = format!("Column {col} width set to {width}");
                         }
                     } else if let Ok(col) = raw.parse::<usize>() {
-                        let line = format!("COL_WIDTH {}", addr::excel_column_name(col));
                         if let Some(ref p) = self.path.clone() {
-                            commit_line(p, &mut self.offset, &mut self.state, &line)?;
+                            let mut active_sheet = self.view_sheet_id;
+                            commit_workbook_op(
+                                p,
+                                &mut self.offset,
+                                &mut self.workbook,
+                                &mut active_sheet,
+                                &crate::ops::WorkbookOp::SheetOp {
+                                    sheet_id: self.view_sheet_id,
+                                    op: Op::SetColWidth {
+                                        col: MARGIN_COLS + col,
+                                        width: None,
+                                    },
+                                },
+                            )?;
+                            self.sync_active_sheet_cache();
                             self.ops_applied = self.ops_applied.saturating_add(1);
                             self.start_log_watcher_if_needed()?;
                         } else {
@@ -6290,24 +6350,19 @@ impl App {
                         })
                         .collect::<Vec<_>>();
                     if *persist {
-                        let line = format!(
-                            "SORT {}",
-                            cols.iter()
-                                .map(|spec| {
-                                    let name = addr::excel_column_name(
-                                        spec.col.saturating_sub(MARGIN_COLS),
-                                    );
-                                    if spec.desc {
-                                        format!("!{name}")
-                                    } else {
-                                        name
-                                    }
-                                })
-                                .collect::<Vec<_>>()
-                                .join(" ")
-                        );
                         if let Some(ref p) = self.path.clone() {
-                            commit_line(p, &mut self.offset, &mut self.state, &line)?;
+                            let mut active_sheet = self.view_sheet_id;
+                            commit_workbook_op(
+                                p,
+                                &mut self.offset,
+                                &mut self.workbook,
+                                &mut active_sheet,
+                                &crate::ops::WorkbookOp::SheetOp {
+                                    sheet_id: self.view_sheet_id,
+                                    op: Op::SetViewSortCols { cols: cols.clone() },
+                                },
+                            )?;
+                            self.sync_active_sheet_cache();
                             self.ops_applied = self.ops_applied.saturating_add(1);
                             self.start_log_watcher_if_needed()?;
                         } else {
@@ -6464,11 +6519,22 @@ impl App {
                                     }
                                 }
                                 _ => {
-                                    let loaded = load_full(&path, &mut self.state);
-                                    if let Ok((off, n)) = loaded {
+                                    self.workbook = WorkbookState::new();
+                                    self.state = SheetState::new(1, 1);
+                                    let mut active_sheet =
+                                        self.workbook.sheet_id(self.workbook.active_sheet);
+                                    let loaded = load_workbook_revisions_partial(
+                                        &path,
+                                        usize::MAX,
+                                        &mut self.workbook,
+                                        &mut active_sheet,
+                                    );
+                                    if let Ok((off, replay)) = loaded {
                                         self.offset = off;
-                                        self.ops_applied = n;
-                                        self.sync_persisted_sort_cache_from_active_sheet();
+                                        self.ops_applied = replay.op_count;
+                                        self.view_sheet_id = active_sheet;
+                                        self.sync_active_sheet_cache();
+                                        self.sync_persisted_sort_cache_from_workbook();
                                     }
                                 }
                             }
@@ -6502,25 +6568,38 @@ impl App {
                                 .to_lowercase();
                             if matches!(ext.as_str(), "csv" | "tsv" | "ods") {
                                 self.status = "Link only works for .corro logs".into();
-                            } else if let Ok((off, replay)) =
-                                load_revisions_partial(&path, revision, &mut self.state)
-                            {
-                                self.path = None;
-                                self.source_path = Some(path.clone());
-                                self.revision_limit = Some(revision);
-                                self.offset = off;
-                                self.ops_applied = replay.op_count;
-                                self.watcher = None;
-                                self.cursor = SheetCursor {
-                                    row: HEADER_ROWS,
-                                    col: MARGIN_COLS,
-                                };
-                                self.row_scroll = 0;
-                                self.col_scroll = 0;
-                                self.status = Self::replay_status("Linked", &path, &replay);
-                                mode = Mode::Normal;
                             } else {
-                                self.status = format!("Load failed: {}", path.display());
+                                self.workbook = WorkbookState::new();
+                                self.state = SheetState::new(1, 1);
+                                let mut active_sheet =
+                                    self.workbook.sheet_id(self.workbook.active_sheet);
+                                let loaded = load_workbook_revisions_partial(
+                                    &path,
+                                    revision,
+                                    &mut self.workbook,
+                                    &mut active_sheet,
+                                );
+                                if let Ok((off, replay)) = loaded {
+                                    self.view_sheet_id = active_sheet;
+                                    self.sync_active_sheet_cache();
+                                    self.sync_persisted_sort_cache_from_workbook();
+                                    self.path = None;
+                                    self.source_path = Some(path.clone());
+                                    self.revision_limit = Some(revision);
+                                    self.offset = off;
+                                    self.ops_applied = replay.op_count;
+                                    self.watcher = None;
+                                    self.cursor = SheetCursor {
+                                        row: HEADER_ROWS,
+                                        col: MARGIN_COLS,
+                                    };
+                                    self.row_scroll = 0;
+                                    self.col_scroll = 0;
+                                    self.status = Self::replay_status("Linked", &path, &replay);
+                                    mode = Mode::Normal;
+                                } else {
+                                    self.status = format!("Load failed: {}", path.display());
+                                }
                             }
                         }
                     }
@@ -11943,18 +12022,23 @@ fn formula_edit_preview(grid: &Grid, addr: &CellAddr, buffer: &str) -> Option<St
 }
 
 fn formula_bar_value(grid: &Grid, addr: &CellAddr) -> String {
-    let raw = cell_display(grid, addr);
+    let raw = normalize_inline_text(&cell_display(grid, addr));
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return String::new();
     }
     if trimmed.starts_with('=') {
-        return cell_effective_display(grid, addr);
+        return normalize_inline_text(&cell_effective_display(grid, addr));
     }
     raw
 }
 
+fn normalize_inline_text(text: &str) -> String {
+    text.replace('\n', "¶")
+}
+
 pub(crate) fn format_cell_display(grid: &Grid, addr: &CellAddr, raw: String) -> String {
+    let raw = normalize_inline_text(&raw);
     let fmt = grid.format_for_addr(addr);
     let Some(number) = fmt.number else {
         return raw;

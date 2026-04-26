@@ -244,6 +244,9 @@ pub enum WorkbookOp {
     },
 }
 
+pub const LOG_VERSION: u32 = 1;
+pub const LOG_HEADER_PREFIX: &str = "CORRO_LOG";
+
 fn sheet_prefix(sheet_id: u32) -> String {
     format!("${sheet_id}:")
 }
@@ -624,6 +627,34 @@ fn format_text(format: &CellFormat) -> String {
 }
 
 impl WorkbookOp {
+    pub fn to_log_lines_with_policy(
+        &self,
+        main_cols: usize,
+        omit_sheet1_prefix: bool,
+    ) -> Vec<String> {
+        match self {
+            WorkbookOp::SheetOp { sheet_id, op } => {
+                let sheet_prefix_text = if omit_sheet1_prefix && *sheet_id == 1 {
+                    String::new()
+                } else {
+                    sheet_prefix(*sheet_id)
+                };
+                match op {
+                    Op::SetCell { addr, value } => {
+                        let addr_text = addr_text(addr, main_cols);
+                        split_multiline_set_lines(sheet_prefix_text, addr_text, value)
+                    }
+                    Op::SetCellRef { cref, value } => {
+                        let addr_text = cref.to_log_text(main_cols);
+                        split_multiline_set_lines(sheet_prefix_text, addr_text, value)
+                    }
+                    _ => vec![format!("{sheet_prefix_text}{}", op.to_log_line(main_cols))],
+                }
+            }
+            _ => vec![self.to_log_line(main_cols)],
+        }
+    }
+
     pub fn to_log_line(&self, main_cols: usize) -> String {
         match self {
             WorkbookOp::NewSheet { id, title } => format!("${id}:NEW_SHEET {title}"),
@@ -657,10 +688,23 @@ impl WorkbookOp {
                 Op::SetCell { addr, value } => {
                     format!("SET ${sheet_id}:{} {value}", addr_text(addr, main_cols))
                 }
+                Op::SetCellRef { cref, value } => {
+                    format!("SET ${sheet_id}:{} {value}", cref.to_log_text(main_cols))
+                }
                 _ => format!("{}{}", sheet_prefix(*sheet_id), op.to_log_line(main_cols)),
             },
         }
     }
+}
+
+fn split_multiline_set_lines(prefix: String, addr_text: String, value: &str) -> Vec<String> {
+    let mut parts = value.split('\n');
+    let first = parts.next().unwrap_or_default();
+    let mut lines = vec![format!("SET {prefix}{addr_text} {first}")];
+    for part in parts {
+        lines.push(format!("CONTINUE_LINE {part}"));
+    }
+    lines
 }
 
 // parse_sheet_set_addr removed: parsing is handled inline in parse_workbook_line
@@ -744,10 +788,44 @@ pub fn parse_workbook_line(line: &str) -> Result<WorkbookOp, std::io::Error> {
                     });
                 }
             }
+        } else {
+            if let Some((cref, cell_len)) = crate::celladdr::CellRef::parse_at(addr) {
+                if cell_len == addr.len() {
+                    let value = rest
+                        .get(addr.len()..)
+                        .unwrap_or("")
+                        .trim_start()
+                        .to_string();
+                    return Ok(WorkbookOp::SheetOp {
+                        sheet_id: 1,
+                        op: Op::SetCellRef { cref, value },
+                    });
+                }
+            }
+            if let Some((cell_addr, cell_len)) = parse_log_addr(addr, 0, true) {
+                if cell_len == addr.len() {
+                    let value = rest
+                        .get(addr.len()..)
+                        .unwrap_or("")
+                        .trim_start()
+                        .to_string();
+                    return Ok(WorkbookOp::SheetOp {
+                        sheet_id: 1,
+                        op: Op::SetCell {
+                            addr: cell_addr,
+                            value,
+                        },
+                    });
+                }
+            }
         }
     }
-    let (sheet_id, prefix_len) = parse_sheet_id_prefix_at(t)
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "missing sheet id"))?;
+    let Some((sheet_id, prefix_len)) = parse_sheet_id_prefix_at(t) else {
+        let op = parse_op_line(t).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "bad sheet op line")
+        })?;
+        return Ok(WorkbookOp::SheetOp { sheet_id: 1, op });
+    };
     let rest = t
         .get(prefix_len..)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad sheet prefix"))?;
@@ -1136,23 +1214,31 @@ pub fn apply_log_line_to_workbook(
     if t.is_empty() {
         return Ok(());
     }
-    if let Ok(op) = parse_workbook_line(t) {
-        return apply_workbook_op(workbook, active_sheet, op);
+    if t.starts_with(LOG_HEADER_PREFIX) {
+        let mut parts = t.split_whitespace();
+        let _ = parts.next();
+        let version = parts
+            .next()
+            .and_then(|v| v.parse::<u32>().ok())
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "bad log header")
+            })?;
+        if version != LOG_VERSION {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unsupported log version {version}"),
+            ));
+        }
+        return Ok(());
     }
-    if let Some(op) = parse_op_line(t) {
-        return apply_workbook_op(
-            workbook,
-            active_sheet,
-            WorkbookOp::SheetOp {
-                sheet_id: *active_sheet,
-                op,
-            },
-        );
+    if t.starts_with("CONTINUE_LINE") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "orphan CONTINUE_LINE",
+        ));
     }
-    let sheet = workbook.sheet_mut_by_id(*active_sheet).ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, "unknown active sheet")
-    })?;
-    apply_any_line(t, sheet)
+    let op = parse_workbook_line(t)?;
+    apply_workbook_op(workbook, active_sheet, op)
 }
 
 fn apply_any_line(line: &str, state: &mut SheetState) -> Result<(), std::io::Error> {

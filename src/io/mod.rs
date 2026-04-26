@@ -2,8 +2,8 @@
 
 use crate::grid::CellAddr;
 use crate::ops::{
-    append_line, append_op, apply_line, apply_log_line_to_workbook, replay_lines,
-    replay_lines_partial, Op, SheetState, WorkbookOp, WorkbookSnapshot, WorkbookState,
+    append_line, apply_line, apply_log_line_to_workbook, Op, SheetState, WorkbookOp,
+    WorkbookSnapshot, WorkbookState, LOG_HEADER_PREFIX, LOG_VERSION,
 };
 use notify::{RecursiveMode, Watcher};
 use std::fs;
@@ -27,74 +27,66 @@ pub struct PartialReplay {
     pub error: Option<String>,
 }
 
-/// Load entire file from disk and replay into `state`. Returns `(byte_len, op_count)`.
-pub fn load_full(path: &Path, state: &mut SheetState) -> Result<(u64, usize), IoError> {
-    let data = fs::read_to_string(path)?;
-    let n = replay_lines(&data, state)?;
-    Ok((data.len() as u64, n))
-}
-
-pub fn load_full_partial(
-    path: &Path,
-    state: &mut SheetState,
-) -> Result<(u64, PartialReplay), IoError> {
-    let data = fs::read_to_string(path)?;
-    let (n, failed_line, error) = replay_lines_partial(&data, state)?;
-    Ok((
-        data.len() as u64,
-        PartialReplay {
-            op_count: n,
-            failed_line,
-            error: error.map(|e| e.to_string()),
-        },
-    ))
-}
-
-pub fn load_revisions_partial(
-    path: &Path,
-    limit: usize,
-    state: &mut SheetState,
-) -> Result<(u64, PartialReplay), IoError> {
-    let data = fs::read_to_string(path)?;
-    if limit == 0 {
-        return Ok((
-            data.len() as u64,
-            PartialReplay {
-                op_count: 0,
-                failed_line: None,
-                error: None,
-            },
-        ));
+fn parse_log_header_version(line: &str) -> Option<Result<u32, std::io::Error>> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with(LOG_HEADER_PREFIX) {
+        return None;
     }
-    let mut n = 0usize;
-    for (idx, line) in data.lines().enumerate() {
-        let t = line.trim();
-        if t.is_empty() {
+    let mut parts = trimmed.split_whitespace();
+    let _prefix = parts.next();
+    let version = parts
+        .next()
+        .and_then(|v| v.parse::<u32>().ok())
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad log header"));
+    Some(version)
+}
+
+fn collect_workbook_log_lines(data: &str) -> Result<Vec<(usize, String)>, std::io::Error> {
+    let mut out: Vec<(usize, String)> = Vec::new();
+    for (idx, raw) in data.lines().enumerate() {
+        let line_no = idx + 1;
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
             continue;
         }
-        if let Err(err) = apply_line(t, state) {
-            return Ok((
-                data.len() as u64,
-                PartialReplay {
-                    op_count: n,
-                    failed_line: Some(idx + 1),
-                    error: Some(err.to_string()),
-                },
-            ));
+        if let Some(version_result) = parse_log_header_version(trimmed) {
+            let version = version_result?;
+            if version != LOG_VERSION {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("unsupported log version {version}"),
+                ));
+            }
+            continue;
         }
-        n += 1;
-        if n >= limit {
-            break;
+        if let Some(rest) = trimmed.strip_prefix("CONTINUE_LINE") {
+            let payload = rest.strip_prefix(' ').unwrap_or(rest);
+            if let Some((_, prev)) = out.last_mut() {
+                prev.push('\n');
+                prev.push_str(payload);
+            } else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("orphan CONTINUE_LINE at line {line_no}"),
+                ));
+            }
+            continue;
         }
+        out.push((line_no, trimmed.to_string()));
     }
-    Ok((
-        data.len() as u64,
-        PartialReplay {
-            op_count: n,
-            failed_line: None,
-            error: None,
-        },
-    ))
+    Ok(out)
+}
+
+fn ensure_log_header(path: &Path) -> Result<(), IoError> {
+    let missing_or_empty = match fs::metadata(path) {
+        Ok(meta) => meta.len() == 0,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+        Err(err) => return Err(err.into()),
+    };
+    if missing_or_empty {
+        fs::write(path, format!("{LOG_HEADER_PREFIX} {LOG_VERSION}\n"))?;
+    }
+    Ok(())
 }
 
 /// Load at most `limit` log entries from disk and replay into a workbook snapshot.
@@ -105,16 +97,13 @@ pub fn load_workbook_revisions(
     active_sheet: &mut u32,
 ) -> Result<(u64, usize), IoError> {
     let data = fs::read_to_string(path)?;
+    let logical_lines = collect_workbook_log_lines(&data)?;
     if limit == 0 {
         return Ok((data.len() as u64, 0));
     }
     let mut n = 0usize;
-    for line in data.lines() {
-        let t = line.trim();
-        if t.is_empty() {
-            continue;
-        }
-        apply_log_line_to_workbook(t, workbook, active_sheet)?;
+    for (_, line) in logical_lines {
+        apply_log_line_to_workbook(&line, workbook, active_sheet)?;
         n += 1;
         if n >= limit {
             break;
@@ -130,6 +119,19 @@ pub fn load_workbook_revisions_partial(
     active_sheet: &mut u32,
 ) -> Result<(u64, PartialReplay), IoError> {
     let data = fs::read_to_string(path)?;
+    let logical_lines = match collect_workbook_log_lines(&data) {
+        Ok(lines) => lines,
+        Err(err) => {
+            return Ok((
+                data.len() as u64,
+                PartialReplay {
+                    op_count: 0,
+                    failed_line: Some(1),
+                    error: Some(err.to_string()),
+                },
+            ));
+        }
+    };
     if limit == 0 {
         return Ok((
             data.len() as u64,
@@ -141,17 +143,13 @@ pub fn load_workbook_revisions_partial(
         ));
     }
     let mut n = 0usize;
-    for (idx, line) in data.lines().enumerate() {
-        let t = line.trim();
-        if t.is_empty() {
-            continue;
-        }
-        if let Err(err) = apply_log_line_to_workbook(t, workbook, active_sheet) {
+    for (line_no, line) in logical_lines {
+        if let Err(err) = apply_log_line_to_workbook(&line, workbook, active_sheet) {
             return Ok((
                 data.len() as u64,
                 PartialReplay {
                     op_count: n,
-                    failed_line: Some(idx + 1),
+                    failed_line: Some(line_no),
                     error: Some(err.to_string()),
                 },
             ));
@@ -298,81 +296,6 @@ pub fn load_workbook_snapshot(path: &Path) -> Result<WorkbookSnapshot, IoError> 
     })
 }
 
-/// Load at most `limit` non-empty log lines from disk and replay into `state`.
-pub fn load_revisions(
-    path: &Path,
-    limit: usize,
-    state: &mut SheetState,
-) -> Result<(u64, usize), IoError> {
-    let data = fs::read_to_string(path)?;
-    if limit == 0 {
-        return Ok((data.len() as u64, 0));
-    }
-    let mut n = 0usize;
-    for line in data.lines() {
-        let t = line.trim();
-        if t.is_empty() {
-            continue;
-        }
-        apply_line(t, state)?;
-        n += 1;
-        if n >= limit {
-            break;
-        }
-    }
-    Ok((data.len() as u64, n))
-}
-
-/// Read new bytes from `path` starting at `byte_offset`, apply appended log lines, return new EOF offset.
-pub fn tail_apply(path: &Path, byte_offset: u64, state: &mut SheetState) -> Result<u64, IoError> {
-    let meta = fs::metadata(path)?;
-    let len = meta.len();
-    if len < byte_offset {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "file shrank; full reload required",
-        )
-        .into());
-    }
-    if len == byte_offset {
-        return Ok(byte_offset);
-    }
-    let mut f = fs::File::open(path)?;
-    f.seek(SeekFrom::Start(byte_offset))?;
-    let mut rest = String::new();
-    f.read_to_string(&mut rest)?;
-    for line in rest.lines() {
-        apply_line(line, state)?;
-    }
-    Ok(len)
-}
-
-/// Append `op` to the log and apply newly written bytes from `offset` (single-writer tail).
-pub fn commit_op(
-    path: &Path,
-    offset: &mut u64,
-    state: &mut SheetState,
-    op: &Op,
-) -> Result<(), IoError> {
-    let mut preview = state.clone();
-    op.apply(&mut preview);
-    append_op(path, op, preview.grid.main_cols())?;
-    *offset = tail_apply(path, *offset, state)?;
-    Ok(())
-}
-
-/// Append a plain-text document-setting line and apply it to the live state.
-pub fn commit_line(
-    path: &Path,
-    offset: &mut u64,
-    state: &mut SheetState,
-    line: &str,
-) -> Result<(), IoError> {
-    append_line(path, line)?;
-    *offset = tail_apply(path, *offset, state)?;
-    Ok(())
-}
-
 pub fn commit_workbook_op(
     path: &Path,
     offset: &mut u64,
@@ -380,6 +303,7 @@ pub fn commit_workbook_op(
     active_sheet: &mut u32,
     op: &WorkbookOp,
 ) -> Result<(), IoError> {
+    ensure_log_header(path)?;
     let mut preview = workbook.clone();
     let mut preview_active_sheet = *active_sheet;
     crate::ops::apply_workbook_op(&mut preview, &mut preview_active_sheet, op.clone())?;
@@ -417,7 +341,6 @@ pub fn commit_workbook_op(
         op: inner_op,
     } = op
     {
-        use crate::ops::Op::*;
         if let Op::SetCell { addr, .. } = inner_op {
             match addr {
                 crate::grid::CellAddr::Header { col, .. }
@@ -432,7 +355,10 @@ pub fn commit_workbook_op(
             }
         }
     }
-    append_line(path, &op.to_log_line(main_cols))?;
+    let omit_sheet1_prefix = workbook.sheet_count() == 1;
+    for line in op.to_log_lines_with_policy(main_cols, omit_sheet1_prefix) {
+        append_line(path, &line)?;
+    }
     *offset = tail_apply_workbook(path, *offset, workbook, active_sheet)?;
     Ok(())
 }
@@ -444,6 +370,7 @@ pub fn commit_sheet_log_line(
     active_sheet: &mut u32,
     line: &str,
 ) -> Result<(), IoError> {
+    ensure_log_header(path)?;
     append_line(path, line)?;
     *offset = tail_apply_workbook(path, *offset, workbook, active_sheet)?;
     Ok(())
@@ -471,8 +398,9 @@ pub fn tail_apply_workbook(
     f.seek(SeekFrom::Start(byte_offset))?;
     let mut rest = String::new();
     f.read_to_string(&mut rest)?;
-    for line in rest.lines() {
-        apply_log_line_to_workbook(line, workbook, active_sheet)?;
+    let logical_lines = collect_workbook_log_lines(&rest)?;
+    for (_, line) in logical_lines {
+        apply_log_line_to_workbook(&line, workbook, active_sheet)?;
     }
     Ok(len)
 }
@@ -642,18 +570,29 @@ mod tests {
     use tempfile::NamedTempFile;
 
     #[test]
-    fn commit_op_roundtrip() {
+    fn commit_workbook_op_roundtrip() {
         let path = NamedTempFile::new().unwrap();
-        let mut state = SheetState::new(2, 2);
+        let mut workbook = WorkbookState::new();
+        workbook.sheets[0].state.grid.set_main_size(2, 2);
         let mut offset = 0u64;
+        let mut active_sheet = workbook.sheet_id(workbook.active_sheet);
         let op = Op::SetCell {
             addr: CellAddr::Main { row: 0, col: 0 },
             value: "42".into(),
         };
-        commit_op(path.path(), &mut offset, &mut state, &op).unwrap();
+        commit_workbook_op(
+            path.path(),
+            &mut offset,
+            &mut workbook,
+            &mut active_sheet,
+            &WorkbookOp::SheetOp { sheet_id: 1, op },
+        )
+        .unwrap();
         assert_eq!(offset, fs::metadata(path.path()).unwrap().len());
         assert_eq!(
-            state
+            workbook
+                .sheet_mut_by_id(1)
+                .unwrap()
                 .grid
                 .get(&CellAddr::Main { row: 0, col: 0 })
                 .as_deref(),
@@ -690,36 +629,40 @@ mod tests {
         .unwrap();
 
         let written = fs::read_to_string(path.path()).unwrap();
-        assert!(written.contains("SET $1:]A~1 x"));
+        assert!(written.contains(&format!("{LOG_HEADER_PREFIX} {LOG_VERSION}")));
+        assert!(
+            written.contains("SET $1:]A~1 x") || written.contains("SET ]A~1 x"),
+            "{written}"
+        );
     }
 
     #[test]
-    fn save_as_snapshot_reloads_as_log() {
+    fn workbook_loader_accepts_unqualified_sheet1_lines() {
         let path = NamedTempFile::new().unwrap();
-        let mut state = SheetState::new(2, 2);
-        state
-            .grid
-            .set(&CellAddr::Main { row: 0, col: 0 }, "a".into());
-        state
-            .grid
-            .set(&CellAddr::Main { row: 1, col: 0 }, "b".into());
-
-        let log = concat!("SET A1 a\n", "SET A2 b\n",);
+        let log = concat!("CORRO_LOG 1\n", "SET A1 a\n", "SET A2 b\n");
         fs::write(path.path(), log).unwrap();
 
-        let mut reloaded = SheetState::new(1, 1);
-        let (off, n) = load_full(path.path(), &mut reloaded).unwrap();
+        let mut workbook = WorkbookState::new();
+        let mut active_sheet = workbook.sheet_id(workbook.active_sheet);
+        let (off, replay) = load_workbook_revisions_partial(
+            path.path(),
+            usize::MAX,
+            &mut workbook,
+            &mut active_sheet,
+        )
+        .unwrap();
         assert!(off > 0);
-        assert!(n > 0);
+        assert_eq!(replay.failed_line, None);
+        let sheet = workbook.sheet_mut_by_id(1).unwrap();
         assert_eq!(
-            reloaded
+            sheet
                 .grid
                 .get(&CellAddr::Main { row: 0, col: 0 })
                 .as_deref(),
             Some("a")
         );
         assert_eq!(
-            reloaded
+            sheet
                 .grid
                 .get(&CellAddr::Main { row: 1, col: 0 })
                 .as_deref(),
@@ -728,93 +671,136 @@ mod tests {
     }
 
     #[test]
-    fn load_legacy_test5_corro() {
-        let mut state = SheetState::new(1, 1);
-        let (off, n) = load_revisions(&docs_test_path("main.corro"), 2, &mut state).unwrap();
+    fn load_workbook_revisions_zero_loads_nothing() {
+        let path = docs_test_path("main.corro");
+        let mut workbook = WorkbookState::new();
+        let mut active_sheet = workbook.sheet_id(workbook.active_sheet);
+        let (off, n) = load_workbook_revisions(&path, 0, &mut workbook, &mut active_sheet).unwrap();
 
         assert!(off > 0);
-        assert_eq!(n, 2);
+        assert_eq!(n, 0);
         assert_eq!(
-            state
+            workbook
+                .sheet_mut_by_id(1)
+                .unwrap()
                 .grid
-                .get(&CellAddr::Main { row: 0, col: 0 })
-                .as_deref(),
-            Some("1")
-        );
-        assert_eq!(
-            state
-                .grid
-                .get(&CellAddr::Main { row: 1, col: 0 })
-                .as_deref(),
-            Some("7")
-        );
-        assert_eq!(
-            state
-                .grid
-                .get(&CellAddr::Header {
-                    row: (crate::grid::HEADER_ROWS - 1) as u32,
-                    col: 10,
-                })
-                .as_deref(),
+                .get(&CellAddr::Main { row: 0, col: 0 }),
             None
         );
     }
 
     #[test]
-    fn load_revisions_zero_loads_nothing() {
-        let mut state = SheetState::new(1, 1);
-        let (off, n) = load_revisions(&docs_test_path("main.corro"), 0, &mut state).unwrap();
-
-        assert!(off > 0);
-        assert_eq!(n, 0);
-        assert_eq!(state.grid.get(&CellAddr::Main { row: 0, col: 0 }), None);
-    }
-
-    #[test]
-    fn load_revisions_limits_replay() {
-        let mut state = SheetState::new(1, 1);
-        let (off, n) = load_revisions(&docs_test_path("main.corro"), 2, &mut state).unwrap();
+    fn load_workbook_revisions_limits_replay() {
+        let path = docs_test_path("main.corro");
+        let mut workbook = WorkbookState::new();
+        let mut active_sheet = workbook.sheet_id(workbook.active_sheet);
+        let (off, n) = load_workbook_revisions(&path, 2, &mut workbook, &mut active_sheet).unwrap();
 
         assert!(off > 0);
         assert_eq!(n, 2);
+        let sheet = workbook.sheet_mut_by_id(1).unwrap();
         assert_eq!(
-            state
+            sheet
                 .grid
                 .get(&CellAddr::Main { row: 0, col: 0 })
                 .as_deref(),
             Some("1")
         );
         assert_eq!(
-            state
+            sheet
                 .grid
                 .get(&CellAddr::Main { row: 1, col: 0 })
                 .as_deref(),
             Some("7")
         );
-        assert_eq!(state.grid.get(&CellAddr::Main { row: 2, col: 0 }), None);
+        assert_eq!(sheet.grid.get(&CellAddr::Main { row: 2, col: 0 }), None);
     }
 
     #[test]
-    fn load_revisions_partial_reports_bad_line() {
+    fn load_workbook_revisions_partial_reports_bad_line() {
         let tmp = NamedTempFile::new().unwrap();
-        std::fs::write(tmp.path(), "SET A1 1\nBAD LINE\nSET A2 2\n").unwrap();
-        let mut state = SheetState::new(1, 1);
-        let (_, replay) = load_revisions_partial(tmp.path(), usize::MAX, &mut state).unwrap();
+        std::fs::write(tmp.path(), "CORRO_LOG 1\nSET A1 1\nBAD LINE\nSET A2 2\n").unwrap();
+        let mut workbook = WorkbookState::new();
+        let mut active_sheet = workbook.sheet_id(workbook.active_sheet);
+        let (_, replay) = load_workbook_revisions_partial(
+            tmp.path(),
+            usize::MAX,
+            &mut workbook,
+            &mut active_sheet,
+        )
+        .unwrap();
 
         assert_eq!(replay.op_count, 1);
-        assert_eq!(replay.failed_line, Some(2));
+        assert_eq!(replay.failed_line, Some(3));
         assert!(replay
             .error
             .as_deref()
             .unwrap_or_default()
-            .contains("unrecognized"));
+            .contains("bad sheet op line"));
         assert_eq!(
-            state
+            workbook
+                .sheet_mut_by_id(1)
+                .unwrap()
                 .grid
                 .get(&CellAddr::Main { row: 0, col: 0 })
                 .as_deref(),
             Some("1")
         );
+    }
+
+    #[test]
+    fn load_workbook_revisions_partial_reconstructs_continue_lines() {
+        let tmp = NamedTempFile::new().unwrap();
+        std::fs::write(
+            tmp.path(),
+            "CORRO_LOG 1\nSET A1 first line\nCONTINUE_LINE second line\n",
+        )
+        .unwrap();
+        let mut workbook = WorkbookState::new();
+        let mut active_sheet = workbook.sheet_id(workbook.active_sheet);
+        let (_, replay) = load_workbook_revisions_partial(
+            tmp.path(),
+            usize::MAX,
+            &mut workbook,
+            &mut active_sheet,
+        )
+        .unwrap();
+        assert_eq!(replay.failed_line, None);
+        assert_eq!(
+            workbook
+                .sheet_mut_by_id(1)
+                .unwrap()
+                .grid
+                .get(&CellAddr::Main { row: 0, col: 0 })
+                .as_deref(),
+            Some("first line\nsecond line")
+        );
+    }
+
+    #[test]
+    fn commit_workbook_op_multiline_set_uses_continue_line() {
+        let path = NamedTempFile::new().unwrap();
+        let mut workbook = WorkbookState::new();
+        let mut active_sheet = workbook.sheet_id(workbook.active_sheet);
+        let mut offset = 0u64;
+        let op = WorkbookOp::SheetOp {
+            sheet_id: 1,
+            op: Op::SetCell {
+                addr: CellAddr::Main { row: 0, col: 0 },
+                value: "first\nsecond".into(),
+            },
+        };
+        commit_workbook_op(
+            path.path(),
+            &mut offset,
+            &mut workbook,
+            &mut active_sheet,
+            &op,
+        )
+        .unwrap();
+        let written = fs::read_to_string(path.path()).unwrap();
+        assert!(written.contains("SET A1 first"), "{written}");
+        assert!(written.contains("CONTINUE_LINE second"), "{written}");
     }
 
     #[test]
