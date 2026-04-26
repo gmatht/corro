@@ -91,6 +91,9 @@ pub struct AsciiTableOptions {
     /// range, and `+` at the left and right of the main block on each main data row to meet those
     /// lines (in addition to the normal outer `+---+` table border).
     pub data_frame: bool,
+    /// First column: sheet row labels (`1`, `2`, `~1`, …). When false, the table starts with
+    /// `| A | B |` (or margin columns) with no left gutter. Distinct from [`Self::include_column_label_row`].
+    pub include_row_label_column: bool,
     pub include_column_label_row: bool,
     pub row_dividers: bool,
     pub inter_cell_space: AsciiInterCellSpace,
@@ -102,6 +105,7 @@ impl Default for AsciiTableOptions {
         Self {
             include_margins: true,
             data_frame: false,
+            include_row_label_column: true,
             include_column_label_row: true,
             row_dividers: false,
             inter_cell_space: AsciiInterCellSpace::Space,
@@ -125,9 +129,10 @@ fn ascii_push_cell(s: &mut String, pre: char, pad: char, text: &str, w: usize) {
     s.push('|');
 }
 
-/// `+---...---+` — row-label run is always `-`. When `use_equals_in_main`, column runs for
-/// `c in main_c0..main_c1` use `=`, which matches the `data_frame` inner horizontals.
+/// `+---...---+` — optional row-label run (first block) is `-`. When `use_equals_in_main`, column
+/// runs for `c in main_c0..main_c1` use `=`, which matches the `data_frame` inner horizontals.
 fn ascii_border_line(
+    with_row_gutter: bool,
     col_start: usize,
     col_end: usize,
     row_label_w: usize,
@@ -139,8 +144,10 @@ fn ascii_border_line(
     let border_dash_len = |w: usize| w.saturating_add(2);
     let mut s = String::new();
     s.push('+');
-    s.push_str(&"-".repeat(border_dash_len(row_label_w)));
-    s.push('+');
+    if with_row_gutter {
+        s.push_str(&"-".repeat(border_dash_len(row_label_w)));
+        s.push('+');
+    }
     for c in col_start..col_end {
         let w = col_widths[c];
         let dch = if use_equals_in_main && (main_c0..main_c1).contains(&c) {
@@ -189,11 +196,16 @@ pub fn export_ascii_table_with_options(
     let last_main_r = (row_start..row_end)
         .rfind(|&r| (hr..hr + mr).contains(&r));
 
-    let row_label_w = (row_start..row_end)
-        .map(|r| sheet_row_label(r, grid.main_rows()).chars().count())
-        .max()
-        .unwrap_or(0)
-        .max(4);
+    let row_label_w = if options.include_row_label_column {
+        (row_start..row_end)
+            .map(|r| sheet_row_label(r, grid.main_rows()).chars().count())
+            .max()
+            .unwrap_or(0)
+            .max(4)
+    } else {
+        0
+    };
+    let with_row_gutter = options.include_row_label_column;
 
     let mut col_widths: Vec<usize> = vec![0; tc];
     for c in col_start..col_end {
@@ -213,11 +225,25 @@ pub fn export_ascii_table_with_options(
     // always w + 2 characters (space + w-wide field + space before the closing `|`). Top/bottom
     // borders use that same width in `-` so `+` corners line up with `|`.
     let border: String = ascii_border_line(
-        col_start, col_end, row_label_w, &col_widths, main_c0, main_c1, false,
+        with_row_gutter,
+        col_start,
+        col_end,
+        row_label_w,
+        &col_widths,
+        main_c0,
+        main_c1,
+        false,
     );
     let frame_line = if frame_active {
         Some(ascii_border_line(
-            col_start, col_end, row_label_w, &col_widths, main_c0, main_c1, true,
+            with_row_gutter,
+            col_start,
+            col_end,
+            row_label_w,
+            &col_widths,
+            main_c0,
+            main_c1,
+            true,
         ))
     } else {
         None
@@ -231,7 +257,9 @@ pub fn export_ascii_table_with_options(
     if options.include_column_label_row {
         let mut header_line = String::new();
         header_line.push('|');
-        ascii_push_cell(&mut header_line, pre, pad, "", row_label_w);
+        if with_row_gutter {
+            ascii_push_cell(&mut header_line, pre, pad, "", row_label_w);
+        }
         for c in col_start..col_end {
             let label = col_header_label(c, mc);
             let w = col_widths[c];
@@ -254,10 +282,17 @@ pub fn export_ascii_table_with_options(
         let row_label = sheet_row_label(r, grid.main_rows());
         let mut data_line = String::new();
         data_line.push('|');
-        ascii_push_cell(&mut data_line, pre, pad, &row_label, row_label_w);
+        if with_row_gutter {
+            ascii_push_cell(&mut data_line, pre, pad, &row_label, row_label_w);
+        }
         for c in col_start..col_end {
             if frame_active && in_main && c == main_c0 {
-                if data_line
+                if !options.include_row_label_column && col_start == main_c0 {
+                    if data_line.starts_with('|') {
+                        data_line.remove(0);
+                        data_line.insert(0, '+');
+                    }
+                } else if data_line
                     .as_bytes()
                     .last()
                     .is_some_and(|&b| b == b'|')
@@ -984,6 +1019,27 @@ mod tests {
         export_ascii_table_with_options(&gb, &mut out, &o);
         let s = String::from_utf8(out).unwrap();
         assert!(s.contains(em), "expected em U+2003 in output");
+    }
+
+    #[test]
+    fn ascii_omit_row_label_column_starts_with_column_not_row_numbers() {
+        let mut g = crate::grid::Grid::new(3, 1);
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "x".into());
+        let gb = crate::grid::GridBox::from(g);
+        let o = AsciiTableOptions {
+            include_row_label_column: false,
+            include_margins: false,
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        export_ascii_table_with_options(&gb, &mut out, &o);
+        let s = String::from_utf8(out).unwrap();
+        let data_line = s.lines().find(|l| l.contains("x")).expect("data row");
+        assert!(
+            !data_line.contains("  1  ") && !data_line.contains("| 1 |"),
+            "no row-number gutter: {data_line}"
+        );
+        assert!(data_line.contains("x"));
     }
 
     #[test]

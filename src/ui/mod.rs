@@ -5366,6 +5366,11 @@ impl App {
                 } else {
                     "off"
                 };
+                let r = if self.export_ascii_options.include_row_label_column {
+                    "on"
+                } else {
+                    "off"
+                };
                 let m = if self.export_ascii_options.include_margins {
                     "on"
                 } else {
@@ -5390,8 +5395,8 @@ impl App {
                     AsciiHeaderDataSeparator::None => "none",
                 };
                 format!(
-                    "  Alt+H·label row {a}   Alt+M·margins {m}   Alt+O·data frame {f}   \
-Alt+D·row rules {d}   Alt+E·padding {pad_letter} ({pad_desc})   \
+                    "  Alt+H·top A/B label row {a}   Alt+R·left row# column {r}   Alt+M·margins {m}   \
+Alt+O·data frame {f}   Alt+D·row rules {d}   Alt+E·padding {pad_letter} ({pad_desc})   \
 Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard   Esc"
                 )
             }
@@ -6310,9 +6315,18 @@ Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard 
                                     !self.export_ascii_options.include_column_label_row;
                                 self.status = if self.export_ascii_options.include_column_label_row
                                 {
-                                    "ASCII: column label row: on".into()
+                                    "ASCII: top column label (A/B) row: on".into()
                                 } else {
-                                    "ASCII: column label row: off".into()
+                                    "ASCII: top column label (A/B) row: off".into()
+                                };
+                            }
+                            'r' | 'R' => {
+                                self.export_ascii_options.include_row_label_column =
+                                    !self.export_ascii_options.include_row_label_column;
+                                self.status = if self.export_ascii_options.include_row_label_column {
+                                    "ASCII: left row-number column: on".into()
+                                } else {
+                                    "ASCII: left row-number column: off".into()
                                 };
                             }
                             'd' | 'D' => {
