@@ -2137,6 +2137,10 @@ pub struct App {
     help_scroll: usize,
     about_scroll: usize,
     export_preview_scroll: usize,
+    /// Session-only. Applies to TSV, CSV, full export, and selection clipboard when using the export flow.
+    export_delimited_options: export::DelimitedExportOptions,
+    /// Session-only. Applies to "ASCII table" export and its preview.
+    export_ascii_options: export::AsciiTableOptions,
     pub op_history: Vec<Op>,
     redo_history: Vec<Op>,
     selection_kind: SelectionKind,
@@ -2199,6 +2203,8 @@ impl App {
             help_scroll: 0,
             about_scroll: 0,
             export_preview_scroll: 0,
+            export_delimited_options: export::DelimitedExportOptions::default(),
+            export_ascii_options: export::AsciiTableOptions::default(),
             op_history: Vec::new(),
             redo_history: Vec::new(),
             selection_kind: SelectionKind::Cells,
@@ -4270,10 +4276,11 @@ impl App {
     fn do_export(&mut self, csv: bool) -> String {
         crate::formula::refresh_spills(&mut self.state.grid);
         let mut buf = Vec::new();
+        let o = &self.export_delimited_options;
         if csv {
-            export::export_csv(&self.state.grid, &mut buf);
+            export::export_csv_with_options(&self.state.grid, &mut buf, o);
         } else {
-            export::export_tsv(&self.state.grid, &mut buf);
+            export::export_tsv_with_options(&self.state.grid, &mut buf, o);
         }
         String::from_utf8_lossy(&buf).into_owned()
     }
@@ -4281,14 +4288,14 @@ impl App {
     fn do_export_ascii(&mut self) -> String {
         crate::formula::refresh_spills(&mut self.state.grid);
         let mut buf = Vec::new();
-        export::export_ascii_table(&self.state.grid, &mut buf, false);
+        export::export_ascii_table_with_options(&self.state.grid, &mut buf, &self.export_ascii_options);
         String::from_utf8_lossy(&buf).into_owned()
     }
 
     fn do_export_all(&mut self) -> String {
         crate::formula::refresh_spills(&mut self.state.grid);
         let mut buf = Vec::new();
-        export::export_all(&self.state.grid, &mut buf);
+        export::export_all_with_options(&self.state.grid, &mut buf, &self.export_delimited_options);
         String::from_utf8_lossy(&buf).into_owned()
     }
 
@@ -4467,9 +4474,23 @@ impl App {
         Ok(())
     }
 
-    #[allow(dead_code)]
     fn do_export_selection(&mut self) -> String {
-        self.selection_tsv_text()
+        crate::formula::refresh_spills(&mut self.state.grid);
+        let (rows, cols) = self
+            .current_selection_range()
+            .unwrap_or_else(|| (vec![self.cursor.row], vec![self.cursor.col]));
+        if rows.is_empty() || cols.is_empty() {
+            return String::new();
+        }
+        let mut buf = Vec::new();
+        export::export_selection(
+            &self.state.grid,
+            &mut buf,
+            &rows,
+            &cols,
+            self.export_delimited_options.include_header_row,
+        );
+        String::from_utf8_lossy(&buf).into_owned()
     }
 
     fn selection_tsv_text(&self) -> String {
@@ -5321,12 +5342,39 @@ impl App {
             Mode::SheetCopy { .. } => "  type sheet title   Enter·copy   Esc·cancel".into(),
             Mode::GoToCell { .. } => "  type cell address   Enter·go   Esc·cancel".into(),
             Mode::SavePath { .. } => "  type file path   Enter·save as   Esc·cancel".into(),
-            Mode::ExportTsv { .. }
-            | Mode::ExportCsv { .. }
-            | Mode::ExportAscii { .. }
-            | Mode::ExportAll { .. } => {
-                "  up/down·scroll preview   type filename (blank=clipboard)   Enter·export   Esc·cancel"
-                    .into()
+            Mode::ExportTsv { .. } | Mode::ExportCsv { .. } | Mode::ExportAll { .. } => {
+                let a = if self.export_delimited_options.include_header_row {
+                    "on"
+                } else {
+                    "off"
+                };
+                format!(
+                    "  Alt+h·column header {a}   up/down·scroll   path / blank=clipboard   Enter   Esc"
+                )
+            }
+            Mode::ExportAscii { .. } => {
+                use export::{AsciiHeaderDataSeparator, AsciiInterCellSpace};
+                let a = if self.export_ascii_options.include_column_label_row {
+                    "on"
+                } else {
+                    "off"
+                };
+                let d = if self.export_ascii_options.row_dividers {
+                    "on"
+                } else {
+                    "off"
+                };
+                let e = match self.export_ascii_options.inter_cell_space {
+                    AsciiInterCellSpace::EmSpace => "em",
+                    AsciiInterCellSpace::Space => "sp",
+                };
+                let b = match self.export_ascii_options.header_data_separator {
+                    AsciiHeaderDataSeparator::FullBorder => "rule",
+                    AsciiHeaderDataSeparator::None => "none",
+                };
+                format!(
+                    "  Alt+h·col labels {a}   Alt+d·between rows {d}   Alt+e·pad {e}   Alt+b·hdr|body {b}   scroll   Enter   Esc"
+                )
             }
             Mode::ExportOdt { .. } => {
                 "  up/down·scroll   type .ods file path   Enter·save   Esc·cancel".into()
@@ -6099,99 +6147,193 @@ impl App {
                 ) => {}
                 _ => {}
             },
-            Mode::ExportTsv { buffer } => match key.code {
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.export_preview_scroll = self.export_preview_scroll.saturating_sub(1);
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    self.export_preview_scroll = self.export_preview_scroll.saturating_add(1);
-                }
-                KeyCode::PageUp => {
-                    self.export_preview_scroll = self.export_preview_scroll.saturating_sub(20);
-                }
-                KeyCode::PageDown => {
-                    self.export_preview_scroll = self.export_preview_scroll.saturating_add(20);
-                }
-                KeyCode::Enter => {
-                    let fname = buffer.clone();
-                    self.finish_export(false, &fname);
-                    self.input_cursor = None;
-                    mode = Mode::Normal;
-                }
-                KeyCode::Esc => mode = Mode::Normal,
-                _ if Self::handle_plain_text_input_key(
-                    buffer,
-                    &mut self.input_cursor,
-                    key.code,
-                ) => {}
-                _ => {}
-            },
-            Mode::ExportCsv { buffer } => match key.code {
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.export_preview_scroll = self.export_preview_scroll.saturating_sub(1);
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    self.export_preview_scroll = self.export_preview_scroll.saturating_add(1);
-                }
-                KeyCode::PageUp => {
-                    self.export_preview_scroll = self.export_preview_scroll.saturating_sub(20);
-                }
-                KeyCode::PageDown => {
-                    self.export_preview_scroll = self.export_preview_scroll.saturating_add(20);
-                }
-                KeyCode::Enter => {
-                    let fname = buffer.clone();
-                    self.finish_export(true, &fname);
-                    self.input_cursor = None;
-                    mode = Mode::Normal;
-                }
-                KeyCode::Esc => mode = Mode::Normal,
-                _ if Self::handle_plain_text_input_key(
-                    buffer,
-                    &mut self.input_cursor,
-                    key.code,
-                ) => {}
-                _ => {}
-            },
-            Mode::ExportAscii { buffer } => match key.code {
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.export_preview_scroll = self.export_preview_scroll.saturating_sub(1);
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    self.export_preview_scroll = self.export_preview_scroll.saturating_add(1);
-                }
-                KeyCode::PageUp => {
-                    self.export_preview_scroll = self.export_preview_scroll.saturating_sub(20);
-                }
-                KeyCode::PageDown => {
-                    self.export_preview_scroll = self.export_preview_scroll.saturating_add(20);
-                }
-                KeyCode::Enter => {
-                    let fname = buffer.clone();
-                    if fname.trim().is_empty() {
-                        match copy_to_clipboard(&self.do_export_ascii()) {
-                            Ok(()) => self.status = "ASCII table copied to clipboard".into(),
-                            Err(e) => self.status = format!("Clipboard error: {e}"),
-                        }
-                    } else {
-                        match std::fs::write(fname.trim(), self.do_export_ascii()) {
-                            Ok(()) => {
-                                self.status = format!("ASCII table exported to {}", fname.trim())
-                            }
-                            Err(e) => self.status = format!("Write error: {e}"),
+            Mode::ExportTsv { buffer } => {
+                if key.modifiers.contains(KeyModifiers::ALT) {
+                    if let KeyCode::Char(ch) = key.code {
+                        if matches!(ch, 'h' | 'H') {
+                            self.export_delimited_options.include_header_row =
+                                !self.export_delimited_options.include_header_row;
+                            self.status = if self.export_delimited_options.include_header_row {
+                                "Column header row: on".into()
+                            } else {
+                                "Column header row: off".into()
+                            };
                         }
                     }
-                    self.input_cursor = None;
-                    mode = Mode::Normal;
+                } else {
+                    match key.code {
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            self.export_preview_scroll = self.export_preview_scroll.saturating_sub(1);
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            self.export_preview_scroll = self.export_preview_scroll.saturating_add(1);
+                        }
+                        KeyCode::PageUp => {
+                            self.export_preview_scroll = self.export_preview_scroll.saturating_sub(20);
+                        }
+                        KeyCode::PageDown => {
+                            self.export_preview_scroll = self.export_preview_scroll.saturating_add(20);
+                        }
+                        KeyCode::Enter => {
+                            let fname = buffer.clone();
+                            self.finish_export(false, &fname);
+                            self.input_cursor = None;
+                            mode = Mode::Normal;
+                        }
+                        KeyCode::Esc => mode = Mode::Normal,
+                        _ if Self::handle_plain_text_input_key(
+                            buffer,
+                            &mut self.input_cursor,
+                            key.code,
+                        ) => {}
+                        _ => {}
+                    }
                 }
-                KeyCode::Esc => mode = Mode::Normal,
-                _ if Self::handle_plain_text_input_key(
-                    buffer,
-                    &mut self.input_cursor,
-                    key.code,
-                ) => {}
-                _ => {}
-            },
+            }
+            Mode::ExportCsv { buffer } => {
+                if key.modifiers.contains(KeyModifiers::ALT) {
+                    if let KeyCode::Char(ch) = key.code {
+                        if matches!(ch, 'h' | 'H') {
+                            self.export_delimited_options.include_header_row =
+                                !self.export_delimited_options.include_header_row;
+                            self.status = if self.export_delimited_options.include_header_row {
+                                "Column header row: on".into()
+                            } else {
+                                "Column header row: off".into()
+                            };
+                        }
+                    }
+                } else {
+                    match key.code {
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            self.export_preview_scroll = self.export_preview_scroll.saturating_sub(1);
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            self.export_preview_scroll = self.export_preview_scroll.saturating_add(1);
+                        }
+                        KeyCode::PageUp => {
+                            self.export_preview_scroll = self.export_preview_scroll.saturating_sub(20);
+                        }
+                        KeyCode::PageDown => {
+                            self.export_preview_scroll = self.export_preview_scroll.saturating_add(20);
+                        }
+                        KeyCode::Enter => {
+                            let fname = buffer.clone();
+                            self.finish_export(true, &fname);
+                            self.input_cursor = None;
+                            mode = Mode::Normal;
+                        }
+                        KeyCode::Esc => mode = Mode::Normal,
+                        _ if Self::handle_plain_text_input_key(
+                            buffer,
+                            &mut self.input_cursor,
+                            key.code,
+                        ) => {}
+                        _ => {}
+                    }
+                }
+            }
+            Mode::ExportAscii { buffer } => {
+                if key.modifiers.contains(KeyModifiers::ALT) {
+                    if let KeyCode::Char(ch) = key.code {
+                        match ch {
+                            'h' | 'H' => {
+                                self.export_ascii_options.include_column_label_row =
+                                    !self.export_ascii_options.include_column_label_row;
+                                self.status = if self.export_ascii_options.include_column_label_row
+                                {
+                                    "ASCII: column label row: on".into()
+                                } else {
+                                    "ASCII: column label row: off".into()
+                                };
+                            }
+                            'd' | 'D' => {
+                                self.export_ascii_options.row_dividers =
+                                    !self.export_ascii_options.row_dividers;
+                                self.status = if self.export_ascii_options.row_dividers {
+                                    "ASCII: row dividers: on".into()
+                                } else {
+                                    "ASCII: row dividers: off".into()
+                                };
+                            }
+                            'e' | 'E' => {
+                                use export::AsciiInterCellSpace;
+                                self.export_ascii_options.inter_cell_space = match self
+                                    .export_ascii_options
+                                    .inter_cell_space
+                                {
+                                    AsciiInterCellSpace::Space => {
+                                        self.status = "ASCII: pad: em space".into();
+                                        AsciiInterCellSpace::EmSpace
+                                    }
+                                    AsciiInterCellSpace::EmSpace => {
+                                        self.status = "ASCII: pad: U+0020 space".into();
+                                        AsciiInterCellSpace::Space
+                                    }
+                                };
+                            }
+                            'b' | 'B' => {
+                                use export::AsciiHeaderDataSeparator;
+                                self.export_ascii_options.header_data_separator = match self
+                                    .export_ascii_options
+                                    .header_data_separator
+                                {
+                                    AsciiHeaderDataSeparator::FullBorder => {
+                                        self.status = "ASCII: no border under column labels".into();
+                                        AsciiHeaderDataSeparator::None
+                                    }
+                                    AsciiHeaderDataSeparator::None => {
+                                        self.status = "ASCII: full border under column labels".into();
+                                        AsciiHeaderDataSeparator::FullBorder
+                                    }
+                                };
+                            }
+                            _ => {}
+                        }
+                    }
+                } else {
+                    match key.code {
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            self.export_preview_scroll = self.export_preview_scroll.saturating_sub(1);
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            self.export_preview_scroll = self.export_preview_scroll.saturating_add(1);
+                        }
+                        KeyCode::PageUp => {
+                            self.export_preview_scroll = self.export_preview_scroll.saturating_sub(20);
+                        }
+                        KeyCode::PageDown => {
+                            self.export_preview_scroll = self.export_preview_scroll.saturating_add(20);
+                        }
+                        KeyCode::Enter => {
+                            let fname = buffer.clone();
+                            if fname.trim().is_empty() {
+                                match copy_to_clipboard(&self.do_export_ascii()) {
+                                    Ok(()) => self.status = "ASCII table copied to clipboard".into(),
+                                    Err(e) => self.status = format!("Clipboard error: {e}"),
+                                }
+                            } else {
+                                match std::fs::write(fname.trim(), self.do_export_ascii()) {
+                                    Ok(()) => {
+                                        self.status =
+                                            format!("ASCII table exported to {}", fname.trim())
+                                    }
+                                    Err(e) => self.status = format!("Write error: {e}"),
+                                }
+                            }
+                            self.input_cursor = None;
+                            mode = Mode::Normal;
+                        }
+                        KeyCode::Esc => mode = Mode::Normal,
+                        _ if Self::handle_plain_text_input_key(
+                            buffer,
+                            &mut self.input_cursor,
+                            key.code,
+                        ) => {}
+                        _ => {}
+                    }
+                }
+            }
             Mode::ExportOdt { buffer } => match key.code {
                 KeyCode::Up | KeyCode::Char('k') => {
                     self.export_preview_scroll = self.export_preview_scroll.saturating_sub(1);
@@ -6226,65 +6368,81 @@ impl App {
                 ) => {}
                 _ => {}
             },
-            Mode::ExportAll { buffer } => match key.code {
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.export_preview_scroll = self.export_preview_scroll.saturating_sub(1);
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    self.export_preview_scroll = self.export_preview_scroll.saturating_add(1);
-                }
-                KeyCode::PageUp => {
-                    self.export_preview_scroll = self.export_preview_scroll.saturating_sub(20);
-                }
-                KeyCode::PageDown => {
-                    self.export_preview_scroll = self.export_preview_scroll.saturating_add(20);
-                }
-                KeyCode::Enter => {
-                    let fname = buffer.clone();
-                    if fname.trim().is_empty() {
-                        let data = if self.anchor.is_some() {
-                            self.do_export_selection()
-                        } else {
-                            self.do_export_all()
-                        };
-                        match copy_to_clipboard(&data) {
-                            Ok(()) => {
-                                self.status = if self.anchor.is_some() {
-                                    "Selection copied to clipboard".into()
-                                } else {
-                                    "Full export copied to clipboard".into()
-                                }
-                            }
-                            Err(e) => self.status = format!("Clipboard error: {e}"),
-                        }
-                    } else {
-                        let data = if self.anchor.is_some() {
-                            self.do_export_selection()
-                        } else {
-                            self.do_export_all()
-                        };
-                        match std::fs::write(fname.trim(), data) {
-                            Ok(()) => {
-                                self.status = if self.anchor.is_some() {
-                                    format!("Selection saved to {}", fname.trim())
-                                } else {
-                                    format!("Full export saved to {}", fname.trim())
-                                }
-                            }
-                            Err(e) => self.status = format!("Write error: {e}"),
+            Mode::ExportAll { buffer } => {
+                if key.modifiers.contains(KeyModifiers::ALT) {
+                    if let KeyCode::Char(ch) = key.code {
+                        if matches!(ch, 'h' | 'H') {
+                            self.export_delimited_options.include_header_row =
+                                !self.export_delimited_options.include_header_row;
+                            self.status = if self.export_delimited_options.include_header_row {
+                                "Column header row: on".into()
+                            } else {
+                                "Column header row: off".into()
+                            };
                         }
                     }
-                    self.input_cursor = None;
-                    mode = Mode::Normal;
+                } else {
+                    match key.code {
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            self.export_preview_scroll = self.export_preview_scroll.saturating_sub(1);
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            self.export_preview_scroll = self.export_preview_scroll.saturating_add(1);
+                        }
+                        KeyCode::PageUp => {
+                            self.export_preview_scroll = self.export_preview_scroll.saturating_sub(20);
+                        }
+                        KeyCode::PageDown => {
+                            self.export_preview_scroll = self.export_preview_scroll.saturating_add(20);
+                        }
+                        KeyCode::Enter => {
+                            let fname = buffer.clone();
+                            if fname.trim().is_empty() {
+                                let data = if self.anchor.is_some() {
+                                    self.do_export_selection()
+                                } else {
+                                    self.do_export_all()
+                                };
+                                match copy_to_clipboard(&data) {
+                                    Ok(()) => {
+                                        self.status = if self.anchor.is_some() {
+                                            "Selection copied to clipboard".into()
+                                        } else {
+                                            "Full export copied to clipboard".into()
+                                        }
+                                    }
+                                    Err(e) => self.status = format!("Clipboard error: {e}"),
+                                }
+                            } else {
+                                let data = if self.anchor.is_some() {
+                                    self.do_export_selection()
+                                } else {
+                                    self.do_export_all()
+                                };
+                                match std::fs::write(fname.trim(), data) {
+                                    Ok(()) => {
+                                        self.status = if self.anchor.is_some() {
+                                            format!("Selection saved to {}", fname.trim())
+                                        } else {
+                                            format!("Full export saved to {}", fname.trim())
+                                        }
+                                    }
+                                    Err(e) => self.status = format!("Write error: {e}"),
+                                }
+                            }
+                            self.input_cursor = None;
+                            mode = Mode::Normal;
+                        }
+                        KeyCode::Esc => mode = Mode::Normal,
+                        _ if Self::handle_plain_text_input_key(
+                            buffer,
+                            &mut self.input_cursor,
+                            key.code,
+                        ) => {}
+                        _ => {}
+                    }
                 }
-                KeyCode::Esc => mode = Mode::Normal,
-                _ if Self::handle_plain_text_input_key(
-                    buffer,
-                    &mut self.input_cursor,
-                    key.code,
-                ) => {}
-                _ => {}
-            },
+            }
             Mode::SetMaxColWidth { buffer } => match key.code {
                 KeyCode::Enter => {
                     if let Ok(width) = buffer.trim().parse::<usize>() {
@@ -7572,10 +7730,11 @@ impl App {
         let mut grid = self.state.grid.clone();
         crate::formula::refresh_spills(&mut grid);
         let mut buf = Vec::new();
+        let o = &self.export_delimited_options;
         if csv {
-            export::export_csv(&grid, &mut buf);
+            export::export_csv_with_options(&grid, &mut buf, o);
         } else {
-            export::export_tsv(&grid, &mut buf);
+            export::export_tsv_with_options(&grid, &mut buf, o);
         }
         String::from_utf8_lossy(&buf).into_owned()
     }
@@ -7588,7 +7747,7 @@ impl App {
         match &self.mode {
             Mode::ExportTsv { .. } => {
                 let mut buf = Vec::new();
-                export::export_tsv(&grid, &mut buf);
+                export::export_tsv_with_options(&grid, &mut buf, &self.export_delimited_options);
                 Some((
                     String::from_utf8_lossy(&buf).into_owned(),
                     " Export TSV ",
@@ -7597,7 +7756,7 @@ impl App {
             }
             Mode::ExportCsv { .. } => {
                 let mut buf = Vec::new();
-                export::export_csv(&grid, &mut buf);
+                export::export_csv_with_options(&grid, &mut buf, &self.export_delimited_options);
                 Some((
                     String::from_utf8_lossy(&buf).into_owned(),
                     " Export CSV ",
@@ -7606,7 +7765,7 @@ impl App {
             }
             Mode::ExportAscii { .. } => {
                 let mut buf = Vec::new();
-                export::export_ascii_table(&grid, &mut buf, false);
+                export::export_ascii_table_with_options(&grid, &mut buf, &self.export_ascii_options);
                 Some((
                     String::from_utf8_lossy(&buf).into_owned(),
                     " Export ASCII table ",
@@ -7615,14 +7774,32 @@ impl App {
             }
             Mode::ExportAll { .. } => {
                 if self.anchor.is_some() {
+                    let (rows, cols) = self
+                        .current_selection_range()
+                        .unwrap_or_else(|| (vec![self.cursor.row], vec![self.cursor.col]));
+                    if rows.is_empty() || cols.is_empty() {
+                        return Some((
+                            String::new(),
+                            " Export selection (TSV) ",
+                            true,
+                        ));
+                    }
+                    let mut buf = Vec::new();
+                    export::export_selection(
+                        &grid,
+                        &mut buf,
+                        &rows,
+                        &cols,
+                        self.export_delimited_options.include_header_row,
+                    );
                     Some((
-                        self.selection_tsv_text(),
+                        String::from_utf8_lossy(&buf).into_owned(),
                         " Export selection (TSV) ",
                         true,
                     ))
                 } else {
                     let mut buf = Vec::new();
-                    export::export_all(&grid, &mut buf);
+                    export::export_all_with_options(&grid, &mut buf, &self.export_delimited_options);
                     Some((
                         String::from_utf8_lossy(&buf).into_owned(),
                         " Export full (TSV) ",

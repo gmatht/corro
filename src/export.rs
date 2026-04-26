@@ -5,15 +5,122 @@ use std::collections::HashSet;
 use std::io::Write;
 use zip::write::FileOptions;
 
+/// Options for tab/comma (and "export all") delimited text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DelimitedExportOptions {
+    /// If true, emit a first line of column names (`A` / `[A` / `]B` with margins, etc.).
+    pub include_header_row: bool,
+    /// If true, include the row-label column and margin columns; if false, main block only.
+    pub include_margins: bool,
+}
+
+impl Default for DelimitedExportOptions {
+    fn default() -> Self {
+        Self {
+            include_header_row: true,
+            include_margins: true,
+        }
+    }
+}
+
 pub fn export_tsv(grid: &Grid, out: &mut dyn Write) {
-    export_delimited(grid, out, '\t', true, true);
+    export_tsv_with_options(grid, out, &DelimitedExportOptions::default());
+}
+
+pub fn export_tsv_with_options(
+    grid: &Grid,
+    out: &mut dyn Write,
+    options: &DelimitedExportOptions,
+) {
+    export_delimited(grid, out, '\t', options);
 }
 
 pub fn export_csv(grid: &Grid, out: &mut dyn Write) {
-    export_delimited(grid, out, ',', true, true);
+    export_csv_with_options(grid, out, &DelimitedExportOptions::default());
 }
 
-pub fn export_ascii_table(grid: &Grid, out: &mut dyn Write, row_dividers: bool) {
+pub fn export_csv_with_options(
+    grid: &Grid,
+    out: &mut dyn Write,
+    options: &DelimitedExportOptions,
+) {
+    export_delimited(grid, out, ',', options);
+}
+
+/// Pad/truncate to `width` by Unicode scalar values; right-align (pads on the left) with `pad`.
+fn ascii_field(s: &str, width: usize, pad: char) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let w = s.chars().count();
+    if w > width {
+        s.chars().rev().take(width).collect::<String>().chars().rev().collect()
+    } else {
+        let n = width - w;
+        std::iter::repeat(pad)
+            .take(n)
+            .chain(s.chars())
+            .collect()
+    }
+}
+
+/// Space (U+0020) vs em space (U+2003) for padding between ASCII table pipes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
+pub enum AsciiInterCellSpace {
+    #[default]
+    Space,
+    EmSpace,
+}
+
+/// Rule for the line between the column-label row and the first data row.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
+pub enum AsciiHeaderDataSeparator {
+    /// A full `+---+` line under the column labels (default when a label row is present).
+    #[default]
+    FullBorder,
+    /// No border between label row and data; data follows the label line immediately.
+    None,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AsciiTableOptions {
+    pub include_column_label_row: bool,
+    pub row_dividers: bool,
+    pub inter_cell_space: AsciiInterCellSpace,
+    pub header_data_separator: AsciiHeaderDataSeparator,
+}
+
+impl Default for AsciiTableOptions {
+    fn default() -> Self {
+        Self {
+            include_column_label_row: true,
+            row_dividers: false,
+            inter_cell_space: AsciiInterCellSpace::Space,
+            header_data_separator: AsciiHeaderDataSeparator::FullBorder,
+        }
+    }
+}
+
+fn ascii_pre(opts: &AsciiTableOptions) -> char {
+    match opts.inter_cell_space {
+        AsciiInterCellSpace::Space => ' ',
+        AsciiInterCellSpace::EmSpace => '\u{2003}',
+    }
+}
+
+/// Append one cell: `pre` + right-aligned `text` in `w` (pad) + pre + `|`.
+fn ascii_push_cell(s: &mut String, pre: char, pad: char, text: &str, w: usize) {
+    s.push(pre);
+    s.push_str(&ascii_field(text, w, pad));
+    s.push(pre);
+    s.push('|');
+}
+
+pub fn export_ascii_table_with_options(
+    grid: &Grid,
+    out: &mut dyn Write,
+    options: &AsciiTableOptions,
+) {
     let mc = grid.main_cols();
     let tc = grid.total_cols();
     let (row_start, row_end) = ascii_row_bounds(grid);
@@ -52,34 +159,58 @@ pub fn export_ascii_table(grid: &Grid, out: &mut dyn Write, row_dividers: bool) 
             .join("+")
         + "+";
 
+    let pre = ascii_pre(options);
+    let pad = pre;
+
     let _ = writeln!(out, "{}", border);
-    let mut header_line = format!("| {:>width$} |", "", width = row_label_w);
-    for c in col_start..col_end {
-        let label = col_header_label(c, mc);
-        let w = col_widths[c];
-        header_line.push_str(&format!(" {:>width$} |", label, width = w));
+
+    if options.include_column_label_row {
+        let mut header_line = String::new();
+        header_line.push('|');
+        ascii_push_cell(&mut header_line, pre, pad, "", row_label_w);
+        for c in col_start..col_end {
+            let label = col_header_label(c, mc);
+            let w = col_widths[c];
+            ascii_push_cell(&mut header_line, pre, pad, &label, w);
+        }
+        let _ = writeln!(out, "{}", header_line);
+        if matches!(options.header_data_separator, AsciiHeaderDataSeparator::FullBorder) {
+            let _ = writeln!(out, "{}", border);
+        }
     }
-    let _ = writeln!(out, "{}", header_line);
-    let _ = writeln!(out, "{}", border);
 
     for r in row_start..row_end {
         let row_label = sheet_row_label(r, grid.main_rows());
-        let mut data_line = format!("| {:>width$} |", row_label, width = row_label_w);
+        let mut data_line = String::new();
+        data_line.push('|');
+        ascii_push_cell(&mut data_line, pre, pad, &row_label, row_label_w);
         for c in col_start..col_end {
             let val = rendered_value_at(grid, r, c);
             let w = col_widths[c];
-            data_line.push_str(&format!(" {:>width$} |", val, width = w));
+            ascii_push_cell(&mut data_line, pre, pad, &val, w);
         }
         let _ = writeln!(out, "{}", data_line);
-        if row_dividers {
+        if options.row_dividers {
             let _ = writeln!(out, "{}", border);
         }
     }
     let _ = writeln!(out, "{}", border);
 }
 
+/// Renders a text table. For backward compatibility, [`export_ascii_table`] fixes `row_dividers`
+/// only; use [`export_ascii_table_with_options`] for full control.
+pub fn export_ascii_table(grid: &Grid, out: &mut dyn Write, row_dividers: bool) {
+    let mut o = AsciiTableOptions::default();
+    o.row_dividers = row_dividers;
+    export_ascii_table_with_options(grid, out, &o);
+}
+
 pub fn export_all(grid: &Grid, out: &mut dyn Write) {
-    export_delimited(grid, out, '\t', true, true);
+    export_all_with_options(grid, out, &DelimitedExportOptions::default());
+}
+
+pub fn export_all_with_options(grid: &Grid, out: &mut dyn Write, options: &DelimitedExportOptions) {
+    export_delimited(grid, out, '\t', options);
 }
 
 pub fn export_odt_bytes(grid: &Grid) -> Result<Vec<u8>, std::io::Error> {
@@ -101,19 +232,27 @@ pub fn export_odt_bytes(grid: &Grid) -> Result<Vec<u8>, std::io::Error> {
     Ok(cursor.into_inner())
 }
 
-pub fn export_selection(grid: &Grid, out: &mut dyn Write, rows: &[usize], cols: &[usize]) {
+pub fn export_selection(
+    grid: &Grid,
+    out: &mut dyn Write,
+    rows: &[usize],
+    cols: &[usize],
+    include_header_row: bool,
+) {
     if rows.is_empty() || cols.is_empty() {
         return;
     }
 
-    for (ci, &c) in cols.iter().enumerate() {
-        if ci > 0 {
-            let _ = write!(out, "\t");
+    if include_header_row {
+        for (ci, &c) in cols.iter().enumerate() {
+            if ci > 0 {
+                let _ = write!(out, "\t");
+            }
+            let label = col_header_label(c, grid.main_cols());
+            let _ = write!(out, "{}", label);
         }
-        let label = col_header_label(c, grid.main_cols());
-        let _ = write!(out, "{}", label);
+        let _ = writeln!(out);
     }
-    let _ = writeln!(out);
 
     for &r in rows {
         for (ci, &c) in cols.iter().enumerate() {
@@ -217,9 +356,10 @@ fn export_delimited(
     grid: &Grid,
     out: &mut dyn Write,
     delim: char,
-    include_headers: bool,
-    include_margins: bool,
+    options: &DelimitedExportOptions,
 ) {
+    let include_headers = options.include_header_row;
+    let include_margins = options.include_margins;
     let mr = grid.main_rows();
     let mc = grid.main_cols();
     let hr = HEADER_ROWS;
@@ -677,5 +817,120 @@ mod tests {
                 fixture.display()
             );
         }
+    }
+
+    #[test]
+    fn delimited_omit_header_row_starts_with_data() {
+        let mut grid = crate::grid::Grid::new(2, 2);
+        grid.set(&CellAddr::Main { row: 0, col: 0 }, "V1".into());
+        grid.set(&CellAddr::Main { row: 0, col: 1 }, "V2".into());
+        let gb = crate::grid::GridBox::from(grid);
+        let opts = DelimitedExportOptions {
+            include_header_row: false,
+            include_margins: false,
+        };
+        let mut out = Vec::new();
+        export_tsv_with_options(&gb, &mut out, &opts);
+        let tsv = String::from_utf8(out).unwrap();
+        let first = tsv.lines().next().expect("at least one line");
+        assert_eq!(first, "V1\tV2", "first line should be data, not A/B");
+    }
+
+    #[test]
+    fn selection_omit_header_row_is_data_first() {
+        use crate::grid::HEADER_ROWS;
+
+        let mut grid = crate::grid::Grid::new(2, 2);
+        grid.set(&CellAddr::Main { row: 0, col: 0 }, "a".into());
+        let gb = crate::grid::GridBox::from(grid);
+        let m = MARGIN_COLS;
+        let mut out = Vec::new();
+        export_selection(
+            &gb,
+            &mut out,
+            &[HEADER_ROWS],
+            &[m, m + 1],
+            false,
+        );
+        let s = String::from_utf8(out).unwrap();
+        let first = s.lines().next().expect("at least one line");
+        assert_eq!(first, "a\t", "first line is data, not column labels");
+
+        let mut out2 = Vec::new();
+        export_selection(
+            &gb,
+            &mut out2,
+            &[HEADER_ROWS],
+            &[m, m + 1],
+            true,
+        );
+        let s2 = String::from_utf8(out2).unwrap();
+        let first2 = s2.lines().next().expect("at least one line");
+        assert_eq!(first2, "A\tB", "with header, first line is A/B for two main columns");
+    }
+
+    #[test]
+    fn ascii_ems_space_in_cell_glue() {
+        let mut g = crate::grid::Grid::new(3, 1);
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "x".into());
+        let gb = crate::grid::GridBox::from(g);
+        let em = '\u{2003}';
+        let o = AsciiTableOptions {
+            inter_cell_space: AsciiInterCellSpace::EmSpace,
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        export_ascii_table_with_options(&gb, &mut out, &o);
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains(em), "expected em U+2003 in output");
+    }
+
+    #[test]
+    fn ascii_omit_column_label_row_goes_straight_to_data() {
+        let mut g = crate::grid::Grid::new(3, 1);
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "val".into());
+        let gb = crate::grid::GridBox::from(g);
+        let o = AsciiTableOptions {
+            include_column_label_row: false,
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        export_ascii_table_with_options(&gb, &mut out, &o);
+        let s = String::from_utf8(out).unwrap();
+        let lines: Vec<_> = s.lines().collect();
+        assert!(lines.len() >= 2);
+        // After top border, first line is a data row (row label + cell), not a column-letter row.
+        assert!(
+            lines[1].contains("val"),
+            "line after top border should be data, got: {:?}",
+            lines[1]
+        );
+    }
+
+    #[test]
+    fn ascii_header_data_separator_none_drops_line_between_label_and_data() {
+        let mut g = crate::grid::Grid::new(3, 1);
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "z".into());
+        let gb = crate::grid::GridBox::from(g);
+        let o_full = AsciiTableOptions {
+            header_data_separator: AsciiHeaderDataSeparator::FullBorder,
+            ..Default::default()
+        };
+        let o_none = AsciiTableOptions {
+            header_data_separator: AsciiHeaderDataSeparator::None,
+            ..Default::default()
+        };
+        let mut out_full = Vec::new();
+        let mut out_none = Vec::new();
+        export_ascii_table_with_options(&gb, &mut out_full, &o_full);
+        export_ascii_table_with_options(&gb, &mut out_none, &o_none);
+        let full = String::from_utf8(out_full).unwrap();
+        let none = String::from_utf8(out_none).unwrap();
+        assert!(
+            full.lines().count() > none.lines().count(),
+            "FullBorder should add a line under labels: full={} none={}",
+            full.lines().count(),
+            none.lines().count()
+        );
     }
 }
