@@ -138,7 +138,7 @@ impl SheetCursor {
         }
     }
 
-    fn to_addr(self, grid: &Grid) -> CellAddr {
+    pub(crate) fn to_addr(self, grid: &Grid) -> CellAddr {
         let hr = HEADER_ROWS;
         let mr = grid.main_rows();
         let mc = grid.main_cols();
@@ -9151,6 +9151,20 @@ mod tests {
         assert!(text.contains("AVERAGE"), "{text}");
     }
 
+    /// TSV body from `export_tsv` / export preview; matches `docs/tests/subtotal-tiny-tsv.tsv`.
+    #[test]
+    fn subtotal_tiny_tsv_export_matches_golden() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("docs/tests/subtotal-tiny.corro");
+        let mut app = App::new(Some(path));
+        app.load_initial().unwrap();
+
+        let tsv = app.do_export(false);
+        let expected = include_str!("../../docs/tests/subtotal-tiny-tsv.tsv");
+        let norm = |s: &str| s.replace("\r\n", "\n");
+        assert_eq!(norm(&tsv), norm(expected), "subtotal-tiny TSV export");
+    }
+
     #[test]
     fn export_tsv_clears_stale_menu_popup() {
         use ratatui::backend::TestBackend;
@@ -12031,6 +12045,106 @@ fn formula_bar_value(grid: &Grid, addr: &CellAddr) -> String {
         return normalize_inline_text(&cell_effective_display(grid, addr));
     }
     raw
+}
+
+/// Same unformatted value as the main grid’s data cells, used by TSV/CSV export to match
+/// on-screen subtotal/aggregate columns (not just stored formula text).
+pub(crate) fn tsv_effective_unformatted_string(grid: &Grid, r: usize, c: usize) -> String {
+    let cur = SheetCursor { row: r, col: c };
+    let cell_addr = cur.to_addr(grid);
+    let hr = HEADER_ROWS;
+    let mr = grid.main_rows();
+    let lm = MARGIN_COLS;
+    let mc = grid.main_cols();
+    let right_col_agg = right_col_agg_func(grid, c);
+    let footer_agg = if r >= hr + mr {
+        footer_row_agg_func(grid, r - hr - mr)
+    } else {
+        None
+    };
+    let main_row_idx = if r >= hr && r < hr + mr {
+        Some((r - hr) as u32)
+    } else {
+        None
+    };
+    let left_margin_agg = main_row_idx.and_then(|mri| left_margin_agg_func(grid, mri));
+    let left_margin_block_start = main_row_idx.map(|mri| row_total_block_start(grid, mri));
+
+    if let Some(func) = footer_agg {
+        if right_col_agg.is_some() {
+            footer_special_col_aggregate(grid, func, c, mr, mc)
+                .unwrap_or_else(|| cell_effective_display(grid, &cell_addr))
+        } else if c >= lm && c < lm + mc {
+            let main_col = (c - lm) as u32;
+            compute_aggregate(
+                grid,
+                &AggregateDef {
+                    func,
+                    source: MainRange {
+                        row_start: 0,
+                        row_end: mr as u32,
+                        col_start: main_col,
+                        col_end: main_col + 1,
+                    },
+                },
+            )
+        } else {
+            cell_effective_display(grid, &cell_addr)
+        }
+    } else if let (Some(func), Some(block_start), Some(main_row)) =
+        (left_margin_agg, left_margin_block_start, main_row_idx)
+    {
+        if c >= lm && c < lm + mc {
+            if right_col_agg.is_some() {
+                let data_cols = data_main_col_count(grid);
+                let (row_start, row_end) = if block_start < main_row {
+                    (block_start, main_row)
+                } else {
+                    previous_raw_block(grid, main_row).unwrap_or((0, main_row))
+                };
+                left_margin_special_col_aggregate(
+                    grid, func, c, row_start, row_end, data_cols,
+                )
+                .unwrap_or_else(|| cell_effective_display(grid, &cell_addr))
+            } else {
+                let main_col = (c - lm) as u32;
+                left_margin_main_col_aggregate(grid, func, main_row, main_col)
+            }
+        } else if right_col_agg.is_some() {
+            left_margin_special_col_aggregate(
+                grid,
+                func,
+                c,
+                block_start,
+                main_row,
+                data_main_col_count(grid),
+            )
+            .unwrap_or_else(|| cell_effective_display(grid, &cell_addr))
+        } else {
+            cell_effective_display(grid, &cell_addr)
+        }
+    } else if r >= hr && r < hr + mr {
+        if let Some(func) = right_col_agg {
+            let main_row = (r - hr) as u32;
+            let data_cols = data_main_col_count(grid);
+            compute_aggregate(
+                grid,
+                &AggregateDef {
+                    func,
+                    source: MainRange {
+                        row_start: main_row,
+                        row_end: main_row + 1,
+                        col_start: 0,
+                        col_end: data_cols as u32,
+                    },
+                },
+            )
+        } else {
+            cell_effective_display(grid, &cell_addr)
+        }
+    } else {
+        cell_effective_display(grid, &cell_addr)
+    }
 }
 
 fn normalize_inline_text(text: &str) -> String {

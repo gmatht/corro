@@ -171,9 +171,9 @@ fn cell_value_at(grid: &Grid, logical_row: usize, global_col: usize) -> String {
     } else if logical_row < hr + mr {
         let mri = logical_row - hr;
         if global_col < lm {
-            let c = lm - 1 - global_col; // margin index (usize)
+            // Match `SheetCursor::to_addr`: Left `col` is the global margin column (0..lm).
             grid.text(&CellAddr::Left {
-                col: c,
+                col: global_col,
                 row: mri as u32,
             })
         } else if global_col < lm + mc {
@@ -200,52 +200,14 @@ fn cell_value_at(grid: &Grid, logical_row: usize, global_col: usize) -> String {
 }
 
 fn rendered_value_at(grid: &Grid, logical_row: usize, global_col: usize) -> String {
-    let addr = match cell_addr_at(grid, logical_row, global_col) {
-        Some(addr) => addr,
-        None => return String::new(),
+    use crate::ui::SheetCursor;
+    let cur = SheetCursor {
+        row: logical_row,
+        col: global_col,
     };
-    crate::ui::format_cell_display(
-        grid,
-        &addr,
-        crate::formula::cell_effective_display(grid, &addr),
-    )
-}
-
-fn cell_addr_at(grid: &Grid, logical_row: usize, global_col: usize) -> Option<CellAddr> {
-    let hr = HEADER_ROWS;
-    let mr = grid.main_rows();
-    let lm = MARGIN_COLS;
-    let mc = grid.main_cols();
-
-    if logical_row < hr {
-        Some(CellAddr::Header {
-            row: logical_row as u32,
-            col: global_col as u32,
-        })
-    } else if logical_row < hr + mr {
-        let mri = logical_row - hr;
-        if global_col < lm {
-            Some(CellAddr::Left {
-                col: lm - 1 - global_col,
-                row: mri as u32,
-            })
-        } else if global_col < lm + mc {
-            Some(CellAddr::Main {
-                row: mri as u32,
-                col: (global_col - lm) as u32,
-            })
-        } else {
-            Some(CellAddr::Right {
-                col: global_col - lm - mc,
-                row: mri as u32,
-            })
-        }
-    } else {
-        Some(CellAddr::Footer {
-            row: (logical_row - hr - mr) as u32,
-            col: global_col as u32,
-        })
-    }
+    let addr = cur.to_addr(grid);
+    let text = crate::ui::tsv_effective_unformatted_string(grid, logical_row, global_col);
+    crate::ui::format_cell_display(grid, &addr, text)
 }
 
 fn needs_csv_quoting(s: &str, delim: char) -> bool {
@@ -265,32 +227,74 @@ fn export_delimited(
 ) {
     let mr = grid.main_rows();
     let mc = grid.main_cols();
-    let tc = grid.total_cols();
     let hr = HEADER_ROWS;
     let lm = MARGIN_COLS;
     let _rm = MARGIN_COLS;
     let fr = FOOTER_ROWS;
     let total_rows = hr + mr + fr;
 
-    let col_start = if include_margins { 0 } else { MARGIN_COLS };
-    let col_end = if include_margins { tc } else { lm + mc };
+    // Trim leading/trailing all-empty margin columns (same span as `export_ascii_table`),
+    // but always include the full main block: the last main column can hold fill/spill
+    // output without a `main_cells` key, so `logical_col_has_content` may be false.
+    let (col_start, mut col_end) = if include_margins {
+        ascii_col_bounds(grid)
+    } else {
+        (lm, lm + mc)
+    };
+    if include_margins {
+        col_end = col_end.max(lm + mc);
+    }
 
     if include_headers {
-        for c in col_start..col_end {
-            if c > col_start {
-                let _ = write!(out, "{delim}");
+        if include_margins {
+            // Match UI: leading row-label column; header cell is blank. First field is empty, so
+            // the line starts with the delimiter (tab for TSV, comma for CSV).
+            let _ = write!(
+                out,
+                "{}{}",
+                delim,
+                crate::addr::ui_column_fragment(col_start, mc)
+            );
+            for c in (col_start + 1)..col_end {
+                let _ = write!(
+                    out,
+                    "{}{}",
+                    delim,
+                    crate::addr::ui_column_fragment(c, mc)
+                );
             }
-            let label = col_header_label(c, mc);
-            let _ = write!(out, "{}", label);
+        } else {
+            for c in col_start..col_end {
+                if c > col_start {
+                    let _ = write!(out, "{delim}");
+                }
+                let label = col_header_label(c, mc);
+                let _ = write!(out, "{}", label);
+            }
         }
         let _ = writeln!(out);
     }
 
+    let main_spans = main_row_index_bounds_for_export(grid);
     let rows: Vec<usize> = row_order(grid, total_rows)
         .into_iter()
-        .filter(|&r| grid.logical_row_has_content(r))
+        .filter(|&r| {
+            if grid.logical_row_has_content(r) {
+                return true;
+            }
+            if let Some((mmin, mmax)) = main_spans {
+                if r >= hr + mmin && r <= hr + mmax {
+                    return true;
+                }
+            }
+            false
+        })
         .collect();
     for r in rows {
+        if include_margins {
+            let _ = write!(out, "{}", sheet_row_label(r, mr));
+            let _ = write!(out, "{delim}");
+        }
         let mut first = true;
         for c in col_start..col_end {
             if !first {
@@ -387,6 +391,26 @@ fn odt_manifest_xml() -> String {
     )
 }
 
+/// Min/max main **row** indices (0-based) with any main/margin content.
+fn main_row_index_bounds_for_export(grid: &Grid) -> Option<(usize, usize)> {
+    let mut set = HashSet::new();
+    for (addr, _) in grid.iter_nonempty() {
+        match addr {
+            CellAddr::Main { row, .. }
+            | CellAddr::Left { row, .. }
+            | CellAddr::Right { row, .. } => {
+                set.insert(row as usize);
+            }
+            _ => {}
+        }
+    }
+    if set.is_empty() {
+        None
+    } else {
+        Some((*set.iter().min().unwrap(), *set.iter().max().unwrap()))
+    }
+}
+
 fn row_order(grid: &Grid, _total_rows: usize) -> Vec<usize> {
     let hr = HEADER_ROWS;
     let mr = grid.main_rows();
@@ -412,12 +436,13 @@ fn row_order(grid: &Grid, _total_rows: usize) -> Vec<usize> {
     footer_rows.dedup();
 
     let mut rows = header_rows;
-    rows.extend(
-        grid.sorted_main_rows()
-            .into_iter()
-            .filter(|r| main_rows.contains(r))
-            .map(|r| hr + r),
-    );
+    // Contiguous main row indices: include "gap" main rows (no cells yet) so export matches
+    // a sheet that shows row numbers through empty interstitial rows.
+    if !main_rows.is_empty() {
+        let mmin = *main_rows.iter().min().unwrap();
+        let mmax = *main_rows.iter().max().unwrap();
+        rows.extend((mmin..=mmax).map(|r| hr + r));
+    }
     rows.extend(footer_rows);
     rows
 }
