@@ -5354,8 +5354,13 @@ impl App {
                 } else {
                     "off"
                 };
+                let r = if self.export_delimited_options.include_row_label_column {
+                    "on"
+                } else {
+                    "off"
+                };
                 format!(
-                    "  Alt+H·column header row {h}   Alt+M·margin row/col labels {m}   \
+                    "  Alt+H·column header row {h}   Alt+M·margins {m}   Alt+R·left row# {r}   \
 ↑/↓/k/j·scroll   PgUp/PgDn·page   path or empty+Enter=clipboard   Esc"
                 )
             }
@@ -6218,6 +6223,17 @@ Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard 
                                     "Row/column margin labels: off".into()
                                 };
                             }
+                            'r' | 'R' => {
+                                self.export_delimited_options.include_row_label_column =
+                                    !self.export_delimited_options.include_row_label_column;
+                                self.status = if self.export_delimited_options
+                                    .include_row_label_column
+                                {
+                                    "Left row# column: on".into()
+                                } else {
+                                    "Left row# column: off".into()
+                                };
+                            }
                             _ => {}
                         }
                     }
@@ -6273,6 +6289,17 @@ Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard 
                                     "Row/column margin labels: off".into()
                                 };
                             }
+                            'r' | 'R' => {
+                                self.export_delimited_options.include_row_label_column =
+                                    !self.export_delimited_options.include_row_label_column;
+                                self.status = if self.export_delimited_options
+                                    .include_row_label_column
+                                {
+                                    "Left row# column: on".into()
+                                } else {
+                                    "Left row# column: off".into()
+                                };
+                            }
                             _ => {}
                         }
                     }
@@ -6324,9 +6351,9 @@ Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard 
                                 self.export_ascii_options.include_row_label_column =
                                     !self.export_ascii_options.include_row_label_column;
                                 self.status = if self.export_ascii_options.include_row_label_column {
-                                    "ASCII: left row-number column: on".into()
+                                    "Left row# column: on".into()
                                 } else {
-                                    "ASCII: left row-number column: off".into()
+                                    "Left row# column: off".into()
                                 };
                             }
                             'd' | 'D' => {
@@ -6488,6 +6515,17 @@ Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard 
                                     "Row/column margin labels: on".into()
                                 } else {
                                     "Row/column margin labels: off".into()
+                                };
+                            }
+                            'r' | 'R' => {
+                                self.export_delimited_options.include_row_label_column =
+                                    !self.export_delimited_options.include_row_label_column;
+                                self.status = if self.export_delimited_options
+                                    .include_row_label_column
+                                {
+                                    "Left row# column: on".into()
+                                } else {
+                                    "Left row# column: off".into()
                                 };
                             }
                             _ => {}

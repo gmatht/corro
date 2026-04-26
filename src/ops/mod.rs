@@ -751,74 +751,96 @@ fn parse_log_addr(
 
 pub fn parse_workbook_line(line: &str) -> Result<WorkbookOp, std::io::Error> {
     let t = line.trim();
-    if let Some(rest) = t.strip_prefix("SET ") {
+    if let Some(raw_rest) = t.strip_prefix("SET ") {
+        // Trim so `SET  $1:...` matches sheet-qualified form.
+        let rest = raw_rest.trim_start();
+        // Sheet-qualified `SET` from the first column of the log line. Parse
+        // `$id:` at the start of `rest` and allow **whitespace after the
+        // colon** so `SET $1: [A_1 v` (split across spaces) is not rejected.
+        if let Some((sheet_id, plen)) = parse_sheet_id_prefix_at(rest) {
+            if let Some(after_colon) = rest.get(plen..).and_then(|s| s.strip_prefix(':')) {
+                let after_colon = after_colon.trim_start();
+                if !after_colon.is_empty() {
+                    if let Some((cref, clen)) = crate::celladdr::CellRef::parse_at(after_colon) {
+                        let value = after_colon[clen..].trim_start().to_string();
+                        return Ok(WorkbookOp::SheetOp {
+                            sheet_id,
+                            op: Op::SetCellRef { cref, value },
+                        });
+                    }
+                    if let Some((cell_addr, clen)) = parse_log_addr(after_colon, 0, true) {
+                        let value = after_colon[clen..].trim_start().to_string();
+                        return Ok(WorkbookOp::SheetOp {
+                            sheet_id,
+                            op: Op::SetCell {
+                                addr: cell_addr,
+                                value,
+                            },
+                        });
+                    }
+                }
+            }
+        }
+        // Unqualified: first whitespace-delimited token is the whole cell ref
+        // (e.g. `[A_1` or `A1`). Value is the rest of the line.
         let mut parts = rest.split_whitespace();
         let addr = parts
             .next()
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad SET line"))?;
-        // Handle sheet-qualified SET like "$2:A2" where unprefixed Excel
-        // letters should be parsed as Data columns. We parse into the
-        // high-level CellRef and defer conversion to grid::CellAddr until
-        // apply-time by using Op::SetCellRef.
-        if let Some((sheet_id, prefix_len)) = parse_sheet_id_prefix_at(addr) {
-            if let Some(cell_ref_text) = addr.get(prefix_len..).and_then(|s| s.strip_prefix(':')) {
-                // Prefer the new CellRef parser (treats unprefixed letters as Data)
-                if let Some((cref, cell_len)) = crate::celladdr::CellRef::parse_at(cell_ref_text) {
-                    let len = prefix_len + 1 + cell_len;
-                    let value = rest
-                        .get(len..)
-                        .unwrap_or("\n+                    ")
-                        .trim_start()
-                        .to_string();
-                    return Ok(WorkbookOp::SheetOp {
-                        sheet_id,
-                        op: Op::SetCellRef { cref, value },
-                    });
-                }
-                // Fallback to legacy parse that can handle forms like `_1O`.
-                if let Some((cell_addr, cell_len)) = parse_log_addr(cell_ref_text, 0, true) {
-                    let len = prefix_len + 1 + cell_len;
-                    let value = rest.get(len..).unwrap_or("").trim_start().to_string();
-                    return Ok(WorkbookOp::SheetOp {
-                        sheet_id,
-                        op: Op::SetCell {
-                            addr: cell_addr,
-                            value,
-                        },
-                    });
-                }
-            }
-        } else {
-            if let Some((cref, cell_len)) = crate::celladdr::CellRef::parse_at(addr) {
-                if cell_len == addr.len() {
-                    let value = rest
-                        .get(addr.len()..)
-                        .unwrap_or("")
-                        .trim_start()
-                        .to_string();
-                    return Ok(WorkbookOp::SheetOp {
-                        sheet_id: 1,
-                        op: Op::SetCellRef { cref, value },
-                    });
-                }
-            }
-            if let Some((cell_addr, cell_len)) = parse_log_addr(addr, 0, true) {
-                if cell_len == addr.len() {
-                    let value = rest
-                        .get(addr.len()..)
-                        .unwrap_or("")
-                        .trim_start()
-                        .to_string();
-                    return Ok(WorkbookOp::SheetOp {
-                        sheet_id: 1,
-                        op: Op::SetCell {
-                            addr: cell_addr,
-                            value,
-                        },
-                    });
-                }
+        if let Some((cref, cell_len)) = crate::celladdr::CellRef::parse_at(addr) {
+            if cell_len == addr.len() {
+                let value = rest
+                    .get(addr.len()..)
+                    .unwrap_or("")
+                    .trim_start()
+                    .to_string();
+                return Ok(WorkbookOp::SheetOp {
+                    sheet_id: 1,
+                    op: Op::SetCellRef { cref, value },
+                });
             }
         }
+        if let Some((cell_addr, cell_len)) = parse_log_addr(addr, 0, true) {
+            if cell_len == addr.len() {
+                let value = rest
+                    .get(addr.len()..)
+                    .unwrap_or("")
+                    .trim_start()
+                    .to_string();
+                return Ok(WorkbookOp::SheetOp {
+                    sheet_id: 1,
+                    op: Op::SetCell {
+                        addr: cell_addr,
+                        value,
+                    },
+                });
+            }
+        }
+        // #region agent log
+        {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("debug-53234c.log")
+            {
+                let esc = t
+                    .replace('\\', "\\\\")
+                    .replace('"', "\\\"")
+                    .replace('\n', "\\n");
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0);
+                let _ = writeln!(
+                    f,
+                    r#"{{"sessionId":"53234c","location":"ops/mod.rs:parse_workbook_line","message":"set_parse_miss","data":{{"line":"{esc}"}},"hypothesisId":"H1","timestamp":{ts}}}"#,
+                    esc = esc,
+                    ts = ts
+                );
+            }
+        }
+        // #endregion
     }
     let Some((sheet_id, prefix_len)) = parse_sheet_id_prefix_at(t) else {
         let op = parse_op_line(t).ok_or_else(|| {
@@ -1499,6 +1521,13 @@ mod tests {
             },
         };
         assert_eq!(op.to_log_line(2), "SET $1:]A~1 TOTAL");
+    }
+
+    #[test]
+    fn workbook_set_accepts_space_after_sheet_colon() {
+        let tight = parse_workbook_line("SET $1:[A_1 TOTAL").unwrap();
+        let spaced = parse_workbook_line("SET $1: [A_1 TOTAL").unwrap();
+        assert_eq!(tight, spaced, "tight and spaced $id: should parse the same op");
     }
 
     #[test]

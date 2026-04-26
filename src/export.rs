@@ -10,8 +10,15 @@ use zip::write::FileOptions;
 pub struct DelimitedExportOptions {
     /// If true, emit a first line of column names (`A` / `[A` / `]B` with margins, etc.).
     pub include_header_row: bool,
-    /// If true, include the row-label column and margin columns; if false, main block only.
+    /// If true, include margin/header/footer *regions*; if false, main block only.
     pub include_margins: bool,
+    /// If true, prefix each data line with the sheet row label and the delimiter, and when
+    /// `include_header_row` the header has an empty first field for that row-address column (if the
+    /// width style is margin-style, or a leading delimiter for main-block-only export). If false,
+    /// data starts with the first data column. Independent of `include_margins` (main-only export
+    /// can still show row `1`/`2` in the first field). Same idea as
+    /// `AsciiTableOptions::include_row_label_column`.
+    pub include_row_label_column: bool,
 }
 
 impl Default for DelimitedExportOptions {
@@ -19,6 +26,7 @@ impl Default for DelimitedExportOptions {
         Self {
             include_header_row: true,
             include_margins: true,
+            include_row_label_column: true,
         }
     }
 }
@@ -496,6 +504,7 @@ fn export_delimited(
 ) {
     let include_headers = options.include_header_row;
     let include_margins = options.include_margins;
+    let row_key_col = options.include_row_label_column;
     let mr = grid.main_rows();
     let mc = grid.main_cols();
     let hr = HEADER_ROWS;
@@ -518,23 +527,42 @@ fn export_delimited(
 
     if include_headers {
         if include_margins {
-            // Match UI: leading row-label column; header cell is blank. First field is empty, so
-            // the line starts with the delimiter (tab for TSV, comma for CSV).
-            let _ = write!(
-                out,
-                "{}{}",
-                delim,
-                crate::addr::ui_column_fragment(col_start, mc)
-            );
-            for c in (col_start + 1)..col_end {
+            if row_key_col {
+                // Match UI: leading row-label column; header cell is blank. First field is empty,
+                // so the line starts with the delimiter (tab for TSV, comma for CSV).
                 let _ = write!(
                     out,
                     "{}{}",
                     delim,
-                    crate::addr::ui_column_fragment(c, mc)
+                    crate::addr::ui_column_fragment(col_start, mc)
                 );
+                for c in (col_start + 1)..col_end {
+                    let _ = write!(
+                        out,
+                        "{}{}",
+                        delim,
+                        crate::addr::ui_column_fragment(c, mc)
+                    );
+                }
+            } else {
+                let _ = write!(
+                    out,
+                    "{}",
+                    crate::addr::ui_column_fragment(col_start, mc)
+                );
+                for c in (col_start + 1)..col_end {
+                    let _ = write!(
+                        out,
+                        "{}{}",
+                        delim,
+                        crate::addr::ui_column_fragment(c, mc)
+                    );
+                }
             }
         } else {
+            if row_key_col {
+                let _ = write!(out, "{delim}");
+            }
             for c in col_start..col_end {
                 if c > col_start {
                     let _ = write!(out, "{delim}");
@@ -562,7 +590,7 @@ fn export_delimited(
         })
         .collect();
     for r in rows {
-        if include_margins {
+        if row_key_col {
             let _ = write!(out, "{}", sheet_row_label(r, mr));
             let _ = write!(out, "{delim}");
         }
@@ -964,12 +992,37 @@ mod tests {
         let opts = DelimitedExportOptions {
             include_header_row: false,
             include_margins: false,
+            include_row_label_column: false,
+            ..Default::default()
         };
         let mut out = Vec::new();
         export_tsv_with_options(&gb, &mut out, &opts);
         let tsv = String::from_utf8(out).unwrap();
         let first = tsv.lines().next().expect("at least one line");
         assert_eq!(first, "V1\tV2", "first line should be data, not A/B");
+    }
+
+    #[test]
+    fn delimited_main_only_can_keep_row_key_without_margins() {
+        let mut grid = crate::grid::Grid::new(2, 2);
+        grid.set(&CellAddr::Main { row: 0, col: 0 }, "V1".into());
+        grid.set(&CellAddr::Main { row: 0, col: 1 }, "V2".into());
+        let gb = crate::grid::GridBox::from(grid);
+        let opts = DelimitedExportOptions {
+            include_header_row: false,
+            include_margins: false,
+            include_row_label_column: true,
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        export_tsv_with_options(&gb, &mut out, &opts);
+        let tsv = String::from_utf8(out).unwrap();
+        let first = tsv.lines().next().expect("at least one line");
+        assert!(
+            first.starts_with("1\t"),
+            "main-only TSV with row# on should start with row label: {first:?}"
+        );
+        assert!(first.contains("V1"));
     }
 
     #[test]
