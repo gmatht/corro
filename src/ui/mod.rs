@@ -11,9 +11,8 @@ use crate::grid::{
     SortSpec, TextAlign, FOOTER_ROWS, HEADER_ROWS, MARGIN_COLS,
 };
 use crate::io::{
-    commit_line, commit_workbook_op, load_full, load_full_partial, load_revisions,
-    load_revisions_partial, load_workbook_revisions, load_workbook_revisions_partial, IoError,
-    LogWatcher, PartialReplay,
+    commit_line, commit_workbook_op, load_full, load_revisions, load_revisions_partial,
+    load_workbook_revisions_partial, IoError, LogWatcher, PartialReplay,
 };
 use crate::ops::{AggFunc, AggregateDef, Op, SheetState, WorkbookState};
 use crossterm::cursor::{Hide, Show};
@@ -923,6 +922,21 @@ impl App {
         }
     }
 
+    fn start_edit_current_cell(&mut self) -> Mode {
+        let addr = self.cursor.to_addr(&self.state.grid);
+        let cur = cell_display(&self.state.grid, &addr);
+        self.start_edit_mode(
+            cur.clone(),
+            if cur.trim() == "=" {
+                Some(self.cursor)
+            } else {
+                None
+            },
+            false,
+            false,
+        )
+    }
+
     fn open_special_picker(&mut self) {
         self.special_picker = Some(0);
         self.mode = Mode::Normal;
@@ -988,14 +1002,29 @@ impl App {
                         if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
                             if ext.eq_ignore_ascii_case("corro") {
                                 self.revision_browse = true;
-                                self.revision_browse_limit = usize::MAX;
                                 self.source_path = Some(path.clone());
                                 self.path = None;
-                                if let Ok((off, replay)) = load_full_partial(&path, &mut self.state)
-                                {
+                                self.workbook = WorkbookState::new();
+                                self.state = SheetState::new(1, 1);
+                                let mut active_sheet =
+                                    self.workbook.sheet_id(self.workbook.active_sheet);
+                                if let Ok((off, replay)) = load_workbook_revisions_partial(
+                                    &path,
+                                    usize::MAX,
+                                    &mut self.workbook,
+                                    &mut active_sheet,
+                                ) {
+                                    self.view_sheet_id = active_sheet;
+                                    self.sync_active_sheet_cache();
+                                    self.sync_persisted_sort_cache_from_workbook();
+                                    for c in 0..self.state.grid.main_cols() {
+                                        self.fit_column_to_rendered_content(MARGIN_COLS + c);
+                                    }
                                     self.offset = off;
                                     self.ops_applied = replay.op_count;
+                                    self.revision_browse_limit = replay.op_count;
                                     self.status = Self::replay_status("Replayed", &path, &replay);
+                                    self.cursor.clamp(&self.state.grid);
                                 }
                                 return Mode::RevisionBrowse;
                             }
@@ -2095,6 +2124,7 @@ pub struct App {
     about_scroll: usize,
     export_preview_scroll: usize,
     pub op_history: Vec<Op>,
+    redo_history: Vec<Op>,
     selection_kind: SelectionKind,
     edit_special_palette: bool,
     edit_cursor: Option<usize>,
@@ -2156,6 +2186,7 @@ impl App {
             about_scroll: 0,
             export_preview_scroll: 0,
             op_history: Vec::new(),
+            redo_history: Vec::new(),
             selection_kind: SelectionKind::Cells,
             edit_special_palette: false,
             edit_cursor: None,
@@ -2530,9 +2561,13 @@ impl App {
     fn replay_status(prefix: &str, path: &Path, replay: &PartialReplay) -> String {
         match (replay.failed_line, replay.error.as_deref()) {
             (Some(line), Some(err)) => {
-                format!("{prefix} {} stopped at line {line}: {err}", path.display())
+                format!(
+                    "{prefix} {} @ revision {} stopped at line {line}: {err}",
+                    path.display(),
+                    replay.op_count
+                )
             }
-            _ => format!("{prefix} {}", path.display()),
+            _ => format!("{prefix} {} @ revision {}", path.display(), replay.op_count),
         }
     }
 
@@ -2553,24 +2588,27 @@ impl App {
         self.path = None;
         self.watcher = None;
         let mut active_sheet = self.workbook.sheet_id(self.workbook.active_sheet);
-        let (off, n) = load_workbook_revisions(
+        let requested_limit = self.revision_browse_limit;
+        let (off, replay) = load_workbook_revisions_partial(
             &path,
-            self.revision_browse_limit,
+            requested_limit,
             &mut self.workbook,
             &mut active_sheet,
         )?;
         self.view_sheet_id = active_sheet;
         self.sync_active_sheet_cache();
+        self.sync_persisted_sort_cache_from_workbook();
         for c in 0..self.state.grid.main_cols() {
             self.fit_column_to_rendered_content(MARGIN_COLS + c);
         }
         self.offset = off;
-        self.ops_applied = n;
-        self.status = format!(
-            "Browsing {} @ revision {}",
-            path.display(),
-            self.revision_browse_limit
-        );
+        self.ops_applied = replay.op_count;
+        self.revision_browse_limit = replay.op_count;
+        self.status = if replay.failed_line.is_some() {
+            Self::replay_status("Browsing", &path, &replay)
+        } else {
+            format!("Browsing {} @ revision {}", path.display(), replay.op_count)
+        };
         self.cursor.clamp(&self.state.grid);
         Ok(())
     }
@@ -2812,6 +2850,7 @@ impl App {
         if let Some(inverse) = self.state.reverse_op(op) {
             self.op_history.push(inverse);
         }
+        self.redo_history.clear();
     }
 
     fn current_selection_range(&self) -> Option<(Vec<usize>, Vec<usize>)> {
@@ -4433,6 +4472,10 @@ impl App {
 
     fn apply_single_op(&mut self, op: Op) -> Result<(), RunError> {
         self.push_inverse_op(&op);
+        self.apply_op_without_history(op)
+    }
+
+    fn apply_op_without_history(&mut self, op: Op) -> Result<(), RunError> {
         if let Some(ref p) = self.path.clone() {
             let mut active_sheet = self.view_sheet_id;
             commit_workbook_op(
@@ -5204,7 +5247,23 @@ impl App {
                 if self.anchor.is_some() {
                     "  r·move-rows   c·move-cols   v·deselect   Esc·cancel".into()
                 } else {
-                    "  type to edit; F2·edit; Ctrl+V·paste; Ctrl+S·save; F1·help".into()
+                    let mut hints =
+                        vec!["type/F2·edit", "Ctrl+C·copy", "Ctrl+X·cut", "Ctrl+V·paste"];
+                    if !self.op_history.is_empty() {
+                        hints.push("Ctrl+Z·undo");
+                    }
+                    if !self.redo_history.is_empty() {
+                        hints.push("Ctrl+Y·redo");
+                    }
+                    hints.push("Ctrl+;·date");
+                    hints.push("Ctrl+:·time");
+                    hints.push(if self.path.is_some() {
+                        "Ctrl+S·save"
+                    } else {
+                        "Ctrl+S·save as"
+                    });
+                    hints.push("F1·help");
+                    format!("  {}", hints.join("; "))
                 }
             }
             Mode::Edit { .. } => {
@@ -5524,6 +5583,19 @@ impl App {
             }
 
             if key.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S'))
+            {
+                if let Some(path) = self.path.clone() {
+                    self.save_to_path(&path)?;
+                } else {
+                    self.mode = Mode::SavePath {
+                        buffer: self.start_input_mode(String::new()),
+                    };
+                }
+                return Ok(false);
+            }
+
+            if key.modifiers.contains(KeyModifiers::CONTROL)
                 && matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V'))
             {
                 self.paste_from_clipboard(!shift)?;
@@ -5599,6 +5671,21 @@ impl App {
         }
 
         let mut mode = std::mem::replace(&mut self.mode, Mode::Normal);
+
+        if matches!(mode, Mode::Normal) {
+            match key.code {
+                KeyCode::F(1) => {
+                    self.help_scroll = 0;
+                    self.mode = Mode::Help;
+                    return Ok(false);
+                }
+                KeyCode::F(2) => {
+                    self.mode = self.start_edit_current_cell();
+                    return Ok(false);
+                }
+                _ => {}
+            }
+        }
 
         if matches!(mode, Mode::Normal | Mode::Edit { .. })
             && (key.modifiers.contains(KeyModifiers::CONTROL)
@@ -5810,29 +5897,17 @@ impl App {
                 match ch {
                     ';' if key.modifiers.contains(KeyModifiers::SHIFT) => {
                         let buffer = chrono::Local::now().format("%H:%M:%S").to_string();
-                        self.mode = Mode::Edit {
-                            buffer,
-                            formula_cursor: None,
-                            fit_to_content_on_commit: false,
-                        };
+                        self.mode = self.start_edit_mode(buffer, None, false, false);
                         return Ok(false);
                     }
                     ':' => {
                         let buffer = chrono::Local::now().format("%H:%M:%S").to_string();
-                        self.mode = Mode::Edit {
-                            buffer,
-                            formula_cursor: None,
-                            fit_to_content_on_commit: false,
-                        };
+                        self.mode = self.start_edit_mode(buffer, None, false, false);
                         return Ok(false);
                     }
                     ';' => {
                         let buffer = chrono::Local::now().format("%Y-%m-%d").to_string();
-                        self.mode = Mode::Edit {
-                            buffer,
-                            formula_cursor: None,
-                            fit_to_content_on_commit: true,
-                        };
+                        self.mode = self.start_edit_mode(buffer, None, false, true);
                         return Ok(false);
                     }
                     _ => {}
@@ -6698,29 +6773,22 @@ impl App {
                     self.mode = mode;
                     return Ok(true);
                 }
-                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('z') {
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && matches!(key.code, KeyCode::Char('z') | KeyCode::Char('Z'))
+                {
                     if let Some(undo_op) = self.op_history.pop() {
-                        if let Some(ref p) = self.path.clone() {
-                            let mut active_sheet = self.view_sheet_id;
-                            if let Err(e) = commit_workbook_op(
-                                p,
-                                &mut self.offset,
-                                &mut self.workbook,
-                                &mut active_sheet,
-                                &crate::ops::WorkbookOp::SheetOp {
-                                    sheet_id: self.view_sheet_id,
-                                    op: undo_op.clone(),
-                                },
-                            ) {
-                                self.status = format!("Undo failed: {}", e);
-                            } else {
-                                self.ops_applied = self.ops_applied.saturating_add(1);
-                                self.sync_active_sheet_cache();
-                                self.status = "Undo applied".to_string();
-                            }
+                        let redo_op = self.state.reverse_op(&undo_op);
+                        if let Err(e) = self.apply_op_without_history(undo_op) {
+                            self.status = format!("Undo failed: {}", e);
                         } else {
-                            undo_op.apply(&mut self.state);
-                            self.status = "Undo applied (memory only)".to_string();
+                            if let Some(redo_op) = redo_op {
+                                self.redo_history.push(redo_op);
+                            }
+                            self.status = if self.path.is_some() {
+                                "Undo applied".to_string()
+                            } else {
+                                "Undo applied (memory only)".to_string()
+                            };
                         }
                     } else {
                         self.status = "Nothing to undo".to_string();
@@ -6728,8 +6796,35 @@ impl App {
                     self.mode = mode;
                     return Ok(false);
                 }
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y'))
+                {
+                    if let Some(redo_op) = self.redo_history.pop() {
+                        let undo_op = self.state.reverse_op(&redo_op);
+                        if let Err(e) = self.apply_op_without_history(redo_op) {
+                            self.status = format!("Redo failed: {}", e);
+                        } else {
+                            if let Some(undo_op) = undo_op {
+                                self.op_history.push(undo_op);
+                            }
+                            self.status = if self.path.is_some() {
+                                "Redo applied".to_string()
+                            } else {
+                                "Redo applied (memory only)".to_string()
+                            };
+                        }
+                    } else {
+                        self.status = "Nothing to redo".to_string();
+                    }
+                    self.mode = mode;
+                    return Ok(false);
+                }
 
-                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('x') {
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && matches!(key.code, KeyCode::Char('x') | KeyCode::Char('X'))
+                {
+                    let data = self.selection_tsv_text();
+                    let _ = self.copy_selection_to_clipboard(&data);
                     if !self.delete_selection() {
                         let addr = self.cursor.to_addr(&self.state.grid);
                         if self.state.grid.get(&addr).is_some() {
@@ -8092,7 +8187,10 @@ mod tests {
         app.mode = Mode::Menu {
             stack: vec![MenuLevel {
                 section: MenuSection::Insert,
-                item: 1,
+                item: menu_items(MenuSection::Insert)
+                    .iter()
+                    .position(|item| item.label == "Cols")
+                    .unwrap(),
             }],
         };
 
@@ -8127,7 +8225,10 @@ mod tests {
         app.mode = Mode::Menu {
             stack: vec![MenuLevel {
                 section: MenuSection::Insert,
-                item: 2,
+                item: menu_items(MenuSection::Insert)
+                    .iter()
+                    .position(|item| item.label == "Special Char")
+                    .unwrap(),
             }],
         };
 
@@ -8144,7 +8245,10 @@ mod tests {
         app.mode = Mode::Menu {
             stack: vec![MenuLevel {
                 section: MenuSection::Insert,
-                item: 2,
+                item: menu_items(MenuSection::Insert)
+                    .iter()
+                    .position(|item| item.label == "Special Char")
+                    .unwrap(),
             }],
         };
 
@@ -8185,7 +8289,10 @@ mod tests {
         app.mode = Mode::Menu {
             stack: vec![MenuLevel {
                 section: MenuSection::Insert,
-                item: 5,
+                item: menu_items(MenuSection::Insert)
+                    .iter()
+                    .position(|item| item.label == "Hyperlink")
+                    .unwrap(),
             }],
         };
 
@@ -8412,6 +8519,74 @@ mod tests {
         // With the new address semantics the computed rendered width may
         // include the left-margin offset; update expectation accordingly.
         assert_eq!(app.state.grid.col_width(MARGIN_COLS), 11);
+    }
+
+    #[test]
+    fn f2_starts_editing_current_cell() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 1);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "hello".into());
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        };
+
+        app.handle_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::empty()))
+            .unwrap();
+
+        match &app.mode {
+            Mode::Edit { buffer, .. } => assert_eq!(buffer, "hello"),
+            other => panic!("expected edit mode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn undo_enables_redo_and_hints_follow_state() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 1);
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        };
+
+        assert!(!app.hints_line().contains("Ctrl+Z"));
+        assert!(!app.hints_line().contains("Ctrl+Y"));
+
+        app.commit_edit_buffer("one").unwrap();
+        assert_eq!(
+            app.state
+                .grid
+                .get(&CellAddr::Main { row: 0, col: 0 })
+                .as_deref(),
+            Some("one")
+        );
+        assert!(app.hints_line().contains("Ctrl+Z"));
+        assert!(!app.hints_line().contains("Ctrl+Y"));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL))
+            .unwrap();
+        assert_eq!(
+            app.state
+                .grid
+                .get(&CellAddr::Main { row: 0, col: 0 })
+                .as_deref()
+                .unwrap_or(""),
+            ""
+        );
+        assert!(app.hints_line().contains("Ctrl+Y"));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL))
+            .unwrap();
+        assert_eq!(
+            app.state
+                .grid
+                .get(&CellAddr::Main { row: 0, col: 0 })
+                .as_deref(),
+            Some("one")
+        );
+        assert!(!app.hints_line().contains("Ctrl+Y"));
     }
 
     #[test]
@@ -9603,6 +9778,56 @@ mod tests {
     }
 
     #[test]
+    fn file_replay_loads_workbook_log_and_uses_real_revision_count() {
+        let path = tempfile::Builder::new()
+            .suffix(".corro")
+            .tempfile()
+            .unwrap();
+        std::fs::write(path.path(), "SET $1:A1 7\nSET $1:B1 DONE\n").unwrap();
+        let mut app = App::new(Some(path.path().to_path_buf()));
+
+        let mode = app.menu_action_mode(MenuAction::Replay);
+
+        assert!(matches!(mode, Mode::RevisionBrowse));
+        assert!(app.path.is_none());
+        assert_eq!(app.source_path, Some(path.path().to_path_buf()));
+        assert_eq!(app.revision_browse_limit, 2);
+        assert!(app.status.contains("@ revision 2"));
+        assert!(!app.status.contains("184467440737095516"));
+        assert_eq!(
+            app.state
+                .grid
+                .get(&CellAddr::Main { row: 0, col: 0 })
+                .as_deref(),
+            Some("7")
+        );
+        assert_eq!(
+            app.state
+                .grid
+                .get(&CellAddr::Main { row: 0, col: 1 })
+                .as_deref(),
+            Some("DONE")
+        );
+
+        app.mode = mode;
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::empty()))
+            .unwrap();
+        assert_eq!(app.revision_browse_limit, 1);
+        assert_eq!(
+            app.state
+                .grid
+                .get(&CellAddr::Main { row: 0, col: 0 })
+                .as_deref(),
+            Some("7")
+        );
+        assert!(app
+            .state
+            .grid
+            .get(&CellAddr::Main { row: 0, col: 1 })
+            .is_none());
+    }
+
+    #[test]
     fn new_sheet_creates_second_tab() {
         let mut app = App::new(None);
         app.add_sheet("Sheet2".into());
@@ -10629,7 +10854,10 @@ mod tests {
         app.mode = Mode::Menu {
             stack: vec![MenuLevel {
                 section: MenuSection::Insert,
-                item: 2,
+                item: menu_items(MenuSection::Insert)
+                    .iter()
+                    .position(|item| item.label == "Special Char")
+                    .unwrap(),
             }],
         };
 
