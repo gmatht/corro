@@ -249,6 +249,8 @@ enum Mode {
         focus: BalanceBooksFocus,
     },
     QuitPrompt,
+    /// No `.corro` on disk (e.g. opened from ODS/TSV/CSV); user should save to `.corro` or discard.
+    QuitImportPrompt,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1035,16 +1037,9 @@ impl App {
                     buffer: self.start_input_mode(buffer),
                 }
             }
-            MenuAction::SaveAs => {
-                let buffer = self
-                    .path
-                    .as_ref()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                Mode::SavePath {
-                    buffer: self.start_input_mode(buffer),
-                }
-            }
+            MenuAction::SaveAs => Mode::SavePath {
+                buffer: self.start_input_mode(self.suggested_corro_save_path()),
+            },
             MenuAction::RenameSheet => Mode::SheetRename {
                 buffer: self.start_input_mode(self.current_sheet_title()),
                 sheet_id: self.view_sheet_id,
@@ -1060,7 +1055,13 @@ impl App {
             MenuAction::GoToCell => Mode::GoToCell {
                 buffer: self.start_input_mode(String::new()),
             },
-            MenuAction::Exit => Mode::QuitPrompt,
+            MenuAction::Exit => {
+                if self.path.is_none() {
+                    Mode::QuitImportPrompt
+                } else {
+                    Mode::QuitPrompt
+                }
+            }
             MenuAction::ExportTsv => {
                 self.export_preview_scroll = 0;
                 Mode::ExportTsv {
@@ -2119,6 +2120,8 @@ fn read_clipboard() -> Result<String, String> {
 
 pub struct App {
     pub path: Option<PathBuf>,
+    /// Set when the workbook was read from a non-`corro` file (e.g. ODS). `path` stays `None` until saved as `.corro`.
+    import_source: Option<PathBuf>,
     source_path: Option<PathBuf>,
     revision_limit: Option<usize>,
     revision_browse: bool,
@@ -2184,6 +2187,7 @@ impl App {
         };
         App {
             path,
+            import_source: None,
             source_path,
             revision_limit,
             revision_browse: false,
@@ -2239,6 +2243,30 @@ impl App {
         }
         if let Some(path) = &self.path {
             return path.to_string_lossy().into_owned();
+        }
+        String::new()
+    }
+
+    /// Normalize so saving never targets `.ods` / `.tsv` / etc. (which would be confused for reload).
+    fn to_corro_path(path: &Path) -> PathBuf {
+        if path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("corro"))
+        {
+            path.to_path_buf()
+        } else {
+            path.with_extension("corro")
+        }
+    }
+
+    /// Default path for Save / Save as when there is no `.corro` `path` yet.
+    fn suggested_corro_save_path(&self) -> String {
+        if let Some(p) = &self.path {
+            return Self::to_corro_path(p).to_string_lossy().into_owned();
+        }
+        if let Some(p) = &self.import_source {
+            return Self::to_corro_path(p).to_string_lossy().into_owned();
         }
         String::new()
     }
@@ -2740,6 +2768,7 @@ impl App {
                         }
                         self.offset = data.len() as u64;
                         self.ops_applied = replay.op_count;
+                        self.import_source = None;
                         self.path = Some(p.clone());
                         self.source_path = None;
                         self.revision_limit = None;
@@ -2751,28 +2780,37 @@ impl App {
                     "tsv" => {
                         let data = std::fs::read_to_string(p).map_err(|e| IoError::Io(e))?;
                         crate::io::import_tsv(&data, &mut self.state);
-                        self.path = Some(p.clone());
+                        self.commit_active_sheet_cache();
+                        self.path = None;
+                        self.import_source = Some(p.clone());
                         self.source_path = None;
                         self.revision_limit = None;
                         self.watcher = None;
                         for c in 0..self.state.grid.main_cols() {
                             self.fit_column_to_rendered_content(MARGIN_COLS + c);
                         }
-                        self.status = format!("Imported TSV {}", p.display());
+                        self.status = format!(
+                            "Imported TSV (not saved) — use Save as a .corro file: {}",
+                            p.display()
+                        );
                     }
                     "ods" => match crate::ods::import_ods_workbook(p) {
                         Ok(workbook) => {
                             self.workbook = workbook;
                             self.sync_active_sheet_cache();
                             self.persisted_view_sort_cols.clear();
-                            self.path = Some(p.clone());
+                            self.path = None;
+                            self.import_source = Some(p.clone());
                             self.source_path = None;
                             self.revision_limit = None;
                             self.watcher = None;
                             for c in 0..self.state.grid.main_cols() {
                                 self.state.grid.fit_column_to_content(MARGIN_COLS + c);
                             }
-                            self.status = format!("Imported ODS {}", p.display());
+                            self.status = format!(
+                                "Imported ODS (not saved) — use Save as a .corro file: {}",
+                                p.display()
+                            );
                             return Ok(());
                         }
                         Err(e) => {
@@ -2783,14 +2821,19 @@ impl App {
                     "csv" => {
                         let data = std::fs::read_to_string(p).map_err(|e| IoError::Io(e))?;
                         crate::io::import_csv(&data, &mut self.state);
-                        self.path = Some(p.clone());
+                        self.commit_active_sheet_cache();
+                        self.path = None;
+                        self.import_source = Some(p.clone());
                         self.source_path = None;
                         self.revision_limit = None;
                         self.watcher = None;
                         for c in 0..self.state.grid.main_cols() {
                             self.state.grid.auto_fit_column(MARGIN_COLS + c);
                         }
-                        self.status = format!("Imported CSV {}", p.display());
+                        self.status = format!(
+                            "Imported CSV (not saved) — use Save as a .corro file: {}",
+                            p.display()
+                        );
                     }
                     _ => {
                         if browsing {
@@ -4343,6 +4386,7 @@ impl App {
 
     fn save_to_path(&mut self, path: &Path) -> Result<(), RunError> {
         self.commit_active_sheet_cache();
+        let path = Self::to_corro_path(path);
         let mut buf = String::new();
         buf.push_str(&format!(
             "{} {}\n",
@@ -4500,13 +4544,14 @@ impl App {
                 }
             }
         }
-        std::fs::write(path, buf)?;
-        self.path = Some(path.to_path_buf());
+        std::fs::write(&path, buf)?;
+        self.path = Some(path.clone());
+        self.import_source = None;
         self.source_path = None;
         self.revision_limit = None;
         self.status = format!("Saved {}", path.display());
         if self.watcher.is_none() {
-            self.watcher = Some(LogWatcher::new(path.to_path_buf()).map_err(IoError::from)?);
+            self.watcher = Some(LogWatcher::new(path).map_err(IoError::from)?);
         }
         Ok(())
     }
@@ -5462,6 +5507,7 @@ Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard 
             }
             Mode::FormatDecimals { .. } => "  type decimals   Enter·apply   Esc·cancel".into(),
             Mode::QuitPrompt => "  Q·quit   B·back   Esc·cancel".into(),
+            Mode::QuitImportPrompt => "  S·save as .corro   D·discard   B·back".into(),
             Mode::Help => "  up/down·scroll   Esc·close   ?·help   A·about".into(),
             Mode::About => "  up/down·scroll   Esc·close   ?·help   A·about".into(),
             Mode::Menu { .. } => {
@@ -5780,7 +5826,7 @@ Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard 
                     self.save_to_path(&path)?;
                 } else {
                     self.mode = Mode::SavePath {
-                        buffer: self.start_input_mode(String::new()),
+                        buffer: self.start_input_mode(self.suggested_corro_save_path()),
                     };
                 }
                 return Ok(false);
@@ -6889,6 +6935,21 @@ Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard 
                 }
                 _ => {}
             },
+            Mode::QuitImportPrompt => match key.code {
+                KeyCode::Char('s') | KeyCode::Char('S') => {
+                    mode = Mode::SavePath {
+                        buffer: self.start_input_mode(self.suggested_corro_save_path()),
+                    };
+                }
+                KeyCode::Char('d') | KeyCode::Char('D') => {
+                    self.mode = mode;
+                    return Ok(true);
+                }
+                KeyCode::Char('b') | KeyCode::Char('B') | KeyCode::Esc => {
+                    mode = Mode::Normal;
+                }
+                _ => {}
+            },
             Mode::OpenPath { buffer } => match key.code {
                 KeyCode::Enter => match parse_open_path_request(buffer) {
                     Err(OpenPathError::Empty) => {
@@ -6898,14 +6959,20 @@ Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard 
                         self.status = "Syntax: link <file> <revision>".into();
                     }
                     Ok(OpenPathRequest::Plain(path)) => {
-                        self.path = Some(path.clone());
                         self.source_path = None;
                         self.offset = 0;
-                        self.state = SheetState::new(1, 1);
                         self.persisted_view_sort_cols.clear();
                         self.ops_applied = 0;
                         self.revision_limit = None;
-                        if path.exists() {
+                        self.import_source = None;
+                        if !path.exists() {
+                            self.workbook = WorkbookState::new();
+                            self.state = SheetState::new(1, 1);
+                            self.view_sheet_id = 1;
+                            self.path = Some(path.clone());
+                            self.watcher = None;
+                            self.status = format!("New file {}", path.display());
+                        } else {
                             let ext = path
                                 .extension()
                                 .and_then(|e| e.to_str())
@@ -6913,18 +6980,64 @@ Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard 
                                 .to_lowercase();
                             match ext.as_str() {
                                 "tsv" => {
+                                    self.workbook = WorkbookState::new();
+                                    self.state = SheetState::new(1, 1);
+                                    self.view_sheet_id = 1;
                                     if let Ok(data) = std::fs::read_to_string(&path) {
                                         crate::io::import_tsv(&data, &mut self.state);
                                     }
+                                    self.commit_active_sheet_cache();
+                                    self.path = None;
+                                    self.import_source = Some(path.clone());
+                                    self.watcher = None;
+                                    self.status = format!(
+                                        "Imported TSV (not saved) — save as .corro: {}",
+                                        path.display()
+                                    );
                                 }
                                 "csv" => {
+                                    self.workbook = WorkbookState::new();
+                                    self.state = SheetState::new(1, 1);
+                                    self.view_sheet_id = 1;
                                     if let Ok(data) = std::fs::read_to_string(&path) {
                                         crate::io::import_csv(&data, &mut self.state);
                                     }
+                                    self.commit_active_sheet_cache();
+                                    self.path = None;
+                                    self.import_source = Some(path.clone());
+                                    self.watcher = None;
+                                    self.status = format!(
+                                        "Imported CSV (not saved) — save as .corro: {}",
+                                        path.display()
+                                    );
                                 }
-                                _ => {
+                                "ods" => match crate::ods::import_ods_workbook(&path) {
+                                    Ok(workbook) => {
+                                        self.workbook = workbook;
+                                        self.view_sheet_id = self.workbook.sheet_id(0);
+                                        self.sync_active_sheet_cache();
+                                        self.persisted_view_sort_cols.clear();
+                                        for c in 0..self.state.grid.main_cols() {
+                                            self.state
+                                                .grid
+                                                .fit_column_to_content(MARGIN_COLS + c);
+                                        }
+                                        self.path = None;
+                                        self.import_source = Some(path.clone());
+                                        self.watcher = None;
+                                        self.status = format!(
+                                            "Imported ODS (not saved) — save as .corro: {}",
+                                            path.display()
+                                        );
+                                    }
+                                    Err(e) => {
+                                        self.status = format!("Failed to import ODS: {e}");
+                                    }
+                                },
+                                "corro" | _ => {
                                     self.workbook = WorkbookState::new();
                                     self.state = SheetState::new(1, 1);
+                                    self.view_sheet_id = 1;
                                     let mut active_sheet =
                                         self.workbook.sheet_id(self.workbook.active_sheet);
                                     let loaded = load_workbook_revisions_partial(
@@ -6940,25 +7053,20 @@ Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard 
                                         self.sync_active_sheet_cache();
                                         self.sync_persisted_sort_cache_from_workbook();
                                     }
+                                    self.path = Some(path.clone());
+                                    self.watcher = Some(
+                                        LogWatcher::new(path.clone()).map_err(IoError::from)?,
+                                    );
+                                    self.status = format!("Opened {}", path.display());
                                 }
                             }
                         }
-                        self.watcher = if path.exists() {
-                            Some(LogWatcher::new(path.clone()).map_err(IoError::from)?)
-                        } else {
-                            None
-                        };
                         self.cursor = SheetCursor {
                             row: HEADER_ROWS,
                             col: MARGIN_COLS,
                         };
                         self.row_scroll = 0;
                         self.col_scroll = 0;
-                        self.status = if path.exists() {
-                            format!("Opened {}", path.display())
-                        } else {
-                            format!("New file {}", path.display())
-                        };
                         mode = Mode::Normal;
                     }
                     Ok(OpenPathRequest::Revision { path, revision }) => {
@@ -6988,6 +7096,7 @@ Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard 
                                     self.sync_active_sheet_cache();
                                     self.sync_persisted_sort_cache_from_workbook();
                                     self.path = None;
+                                    self.import_source = None;
                                     self.source_path = Some(path.clone());
                                     self.revision_limit = Some(revision);
                                     self.offset = off;
@@ -7398,7 +7507,11 @@ Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard 
                     KeyCode::Esc => {
                         self.anchor = None;
                         if self.anchor.is_none() {
-                            mode = Mode::QuitPrompt;
+                            mode = if self.path.is_none() {
+                                Mode::QuitImportPrompt
+                            } else {
+                                Mode::QuitPrompt
+                            };
                         }
                     }
                     KeyCode::Delete => {
@@ -7885,6 +7998,10 @@ Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard 
             .style(prompt_style),
             Mode::QuitPrompt => Paragraph::new(" Quit Corro? (Q)uit, (B)ack ")
                 .style(Style::default().fg(Color::White).bg(Color::Red)),
+            Mode::QuitImportPrompt => {
+                Paragraph::new(" No .corro on disk. (S)ave as .corro, (D)iscard and quit, (B)ack ")
+                    .style(Style::default().fg(Color::White).bg(Color::Red))
+            }
             Mode::Help => Paragraph::new(" Help - Up/Down scroll, Esc closes ")
                 .style(Style::default().fg(Color::White).bg(Color::Blue)),
             Mode::About => Paragraph::new(" About - Up/Down scroll, Esc closes ")
@@ -10353,7 +10470,8 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         app.save_to_path(tmp.path()).unwrap();
 
-        assert_eq!(app.path, Some(tmp.path().to_path_buf()));
+        let expected = tmp.path().to_path_buf().with_extension("corro");
+        assert_eq!(app.path, Some(expected));
         assert_eq!(app.source_path, None);
         assert_eq!(app.revision_limit, None);
     }

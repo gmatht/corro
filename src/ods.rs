@@ -368,6 +368,8 @@ fn parse_ods_content(xml: &str) -> Result<WorkbookState, OdsError> {
     let mut buf = Vec::new();
     let mut workbook = WorkbookState::new();
     workbook.sheets.clear();
+    // `new()` left `next_sheet_id` at 2; the first imported sheet would incorrectly get id 2.
+    workbook.next_sheet_id = 1;
     let mut current_sheet: Option<SheetRecord> = None;
     let mut odf_uses_global_logical: Option<bool> = None;
     let mut row_idx = 0usize;
@@ -494,9 +496,14 @@ fn parse_ods_content(xml: &str) -> Result<WorkbookState, OdsError> {
         let cols = ods_col_end_for_sheet(&sheet.state.grid);
         sheet.state.grid.set_main_size(rows.max(1), cols.max(1));
     }
+    let active_sheet_id = workbook
+        .sheets
+        .first()
+        .map(|s| s.id)
+        .unwrap_or(1);
     let snapshot = WorkbookSnapshot {
         next_sheet_id: workbook.next_sheet_id,
-        active_sheet_id: 1,
+        active_sheet_id,
         sheets: workbook.sheets,
         volatile_seed: 0,
     };
