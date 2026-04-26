@@ -499,6 +499,20 @@ fn templated_formula(grid: &Grid, addr: &CellAddr) -> Option<String> {
     None
 }
 
+/// Public for export: `=A1*0.1` from header/left ` -- ` template (no ` -- ` in output).
+pub fn export_templated_formula(grid: &Grid, addr: &CellAddr) -> Option<String> {
+    templated_formula(grid, addr)
+}
+
+/// ` -- ` display label for a main column, from the column header's labeled formula (e.g. TAX from `=A*0.1 -- TAX`).
+pub fn main_column_label_from_header(grid: &Grid, main_col: usize) -> Option<String> {
+    let header_addr = CellAddr::Header {
+        row: (HEADER_ROWS - 1) as u32,
+        col: (MARGIN_COLS as u32) + main_col as u32,
+    };
+    control_formula_label(grid, &header_addr)
+}
+
 /// True if the stored cell text is a formula (`=` prefix after trim).
 pub fn is_formula(raw: &str) -> bool {
     raw.trim_start().starts_with('=')

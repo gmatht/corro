@@ -436,7 +436,8 @@ fn ods_cell_addr(grid: &Grid, logical_row: usize, global_col: usize) -> CellAddr
     }
 }
 
-fn ods_formula_expr(raw: &str) -> Option<String> {
+/// Strip a stored cell formula to a single `=…` (no ` -- LABEL`), for ODF or generic export.
+pub fn ods_labeled_prefix_strip_to_formula(raw: &str) -> Option<String> {
     let t = raw.trim();
     let expr = t.strip_prefix('=')?;
     let expr = expr
@@ -447,6 +448,28 @@ fn ods_formula_expr(raw: &str) -> Option<String> {
         None
     } else {
         Some(format!("={expr}"))
+    }
+}
+
+fn ods_formula_expr(raw: &str) -> Option<String> {
+    ods_labeled_prefix_strip_to_formula(raw)
+}
+
+/// Same `value` string as [`ods_cell_xml`] uses for `table:formula` (SUBTOTAL, raw, header base, …).
+pub fn cell_export_value_string(
+    grid: &Grid,
+    logical_row: usize,
+    global_col: usize,
+) -> String {
+    let hr = HEADER_ROWS;
+    let mr = grid.main_rows();
+    let mc = grid.main_cols();
+    if logical_row < hr {
+        header_formula_or_value(grid, logical_row, global_col, mc)
+    } else if logical_row < hr + mr {
+        main_formula_or_value(grid, logical_row - hr, global_col, mc)
+    } else {
+        footer_formula_or_value(grid, logical_row - hr - mr, global_col, mc)
     }
 }
 

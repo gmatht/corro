@@ -1367,7 +1367,7 @@ File menu\n\
  - Open file loads a .corro, .csv, .tsv, or .ods file. Use `link <file> <revision>` to open a log at a revision.\n\
  - New sheet adds another sheet to the workbook.\n\
  - Ctrl+PageUp and Ctrl+PageDown switch between workbook tabs.\n\
-- Export opens TSV, CSV, ASCII, full export, or ODS prompts; Alt+F vs Alt+V choose formulas (stored =…) or values (calculated) for that export.\n\
+- Export opens TSV, CSV, ASCII, full export, or ODS prompts; Alt+F / Alt+V / Alt+G choose formulas, values, or generic interop for that export.\n\
 - Width opens default width and per-column width prompts.\n\
 - Sort view changes the visible order of main rows.\n\
 - Exit opens the quit prompt.\n\n\
@@ -5741,9 +5741,10 @@ impl App {
                 let vf = match self.export_delimited_options.content {
                     export::ExportContent::Values => "values",
                     export::ExportContent::Formulas => "formulas",
+                    export::ExportContent::Generic => "generic",
                 };
                 format!(
-                    "  Alt+F·formulas   Alt+V·values   ·{vf}   Alt+H·header {h}   Alt+M·margins {m}   \
+                    "  Alt+F·formulas   Alt+V·values   Alt+G·generic   ·{vf}   Alt+H·header {h}   Alt+M·margins {m}   \
 Alt+R·left row# {r}   ↑/↓/k/j·scroll   PgUp/PgDn·page   path or empty+Enter=clipboard   Esc"
                 )
             }
@@ -5785,9 +5786,10 @@ Alt+R·left row# {r}   ↑/↓/k/j·scroll   PgUp/PgDn·page   path or empty+Ent
                 let vf = match self.export_ascii_options.content {
                     export::ExportContent::Values => "values",
                     export::ExportContent::Formulas => "formulas",
+                    export::ExportContent::Generic => "generic",
                 };
                 format!(
-                    "  Alt+F·formulas   Alt+V·values   ·{vf}   Alt+H·top A/B label row {a}   Alt+R·left row# column {r}   Alt+M·margins {m}   \
+                    "  Alt+F·formulas   Alt+V·values   Alt+G·generic   ·{vf}   Alt+H·top A/B label row {a}   Alt+R·left row# column {r}   Alt+M·margins {m}   \
 Alt+O·data frame {f}   Alt+D·row rules {d}   Alt+E·padding {pad_letter} ({pad_desc})   \
 Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard   Esc"
                 )
@@ -5796,9 +5798,10 @@ Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard 
                 let vf = match self.export_ods_content {
                     export::ExportContent::Values => "values",
                     export::ExportContent::Formulas => "formulas",
+                    export::ExportContent::Generic => "generic",
                 };
                 format!(
-                    "  Alt+F·formulas   Alt+V·values   ·{vf}   up/down·scroll   type .ods path   Enter·save   Esc"
+                    "  Alt+F·formulas   Alt+V·values   Alt+G·generic   ·{vf}   up/down·scroll   type .ods path   Enter·save   Esc"
                 )
             }
             Mode::SetMaxColWidth { .. } => {
@@ -6665,6 +6668,10 @@ Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard 
                                 self.export_delimited_options.content = export::ExportContent::Values;
                                 self.status = "Export: values (calculated)".into();
                             }
+                            'g' | 'G' => {
+                                self.export_delimited_options.content = export::ExportContent::Generic;
+                                self.status = "Export: generic (labels + =interop)".into();
+                            }
                             _ => {}
                         }
                     }
@@ -6738,6 +6745,10 @@ Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard 
                             'v' | 'V' => {
                                 self.export_delimited_options.content = export::ExportContent::Values;
                                 self.status = "Export: values (calculated)".into();
+                            }
+                            'g' | 'G' => {
+                                self.export_delimited_options.content = export::ExportContent::Generic;
+                                self.status = "Export: generic (labels + =interop)".into();
                             }
                             _ => {}
                         }
@@ -6862,6 +6873,10 @@ Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard 
                                 self.export_ascii_options.content = export::ExportContent::Values;
                                 self.status = "Export: values (calculated)".into();
                             }
+                            'g' | 'G' => {
+                                self.export_ascii_options.content = export::ExportContent::Generic;
+                                self.status = "Export: generic (labels + =interop)".into();
+                            }
                             _ => {}
                         }
                     }
@@ -6919,6 +6934,10 @@ Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard 
                             'v' | 'V' => {
                                 self.export_ods_content = export::ExportContent::Values;
                                 self.status = "ODS: values only (static cells)".into();
+                            }
+                            'g' | 'G' => {
+                                self.export_ods_content = export::ExportContent::Generic;
+                                self.status = "ODS: generic (same as formulas; ODF `;` args)".into();
                             }
                             _ => {}
                         }
@@ -7000,6 +7019,10 @@ Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard 
                             'v' | 'V' => {
                                 self.export_delimited_options.content = export::ExportContent::Values;
                                 self.status = "Export: values (calculated)".into();
+                            }
+                            'g' | 'G' => {
+                                self.export_delimited_options.content = export::ExportContent::Generic;
+                                self.status = "Export: generic (labels + =interop)".into();
                             }
                             _ => {}
                         }
@@ -8507,6 +8530,7 @@ Alt+B·label|data {b}   ↑/↓/k/j   PgUp/PgDn   path or empty+Enter=clipboard 
                 let mode = match self.export_ods_content {
                     export::ExportContent::Values => "values only (static)",
                     export::ExportContent::Formulas => "formulas (with ODF formula attributes)",
+                    export::ExportContent::Generic => "generic (interop formulas; ODF `;` separators)",
                 };
                 Some((
                     format!(

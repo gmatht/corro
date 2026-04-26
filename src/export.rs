@@ -1,5 +1,6 @@
 //! TSV and CSV export for the main data region.
 
+use crate::formula;
 use crate::grid::{CellAddr, GridBox as Grid, FOOTER_ROWS, HEADER_ROWS, MARGIN_COLS};
 use std::collections::HashSet;
 use std::io::Write;
@@ -13,6 +14,8 @@ pub enum ExportContent {
     Values,
     /// Raw storage: formula text where present, labels as stored.
     Formulas,
+    /// Labeled ` -- ` column headers, rows use interop `=…` (comma-separated args; see plan).
+    Generic,
 }
 
 /// Options for tab/comma (and "export all") delimited text.
@@ -235,7 +238,7 @@ pub fn export_ascii_table_with_options(
 
     let mut col_widths: Vec<usize> = vec![0; tc];
     for c in col_start..col_end {
-        let label = col_header_label(c, mc);
+        let label = col_header_label_for_export(grid, c, mc, cell_content);
         col_widths[c] = label.chars().count().max(1);
     }
 
@@ -287,7 +290,7 @@ pub fn export_ascii_table_with_options(
             ascii_push_cell(&mut header_line, pre, pad, "", row_label_w);
         }
         for c in col_start..col_end {
-            let label = col_header_label(c, mc);
+            let label = col_header_label_for_export(grid, c, mc, cell_content);
             let w = col_widths[c];
             ascii_push_cell(&mut header_line, pre, pad, &label, w);
         }
@@ -413,7 +416,7 @@ pub fn export_selection(
             if ci > 0 {
                 let _ = write!(out, "\t");
             }
-            let label = col_header_label(c, grid.main_cols());
+            let label = col_header_label_for_export(grid, c, grid.main_cols(), content);
             let _ = write!(out, "{}", label);
         }
         let _ = writeln!(out);
@@ -431,6 +434,44 @@ pub fn export_selection(
     }
 }
 
+/// TSV/CSV main-only / selection header token: `<`/`>` margins or `A`/`B` or generic `TAX`.
+fn col_header_label_for_export(
+    grid: &Grid,
+    global_col: usize,
+    main_cols: usize,
+    content: ExportContent,
+) -> String {
+    let m = MARGIN_COLS;
+    if global_col < m {
+        format!("<{}", m - 1 - global_col)
+    } else if global_col < m + main_cols {
+        if content == ExportContent::Generic {
+            if let Some(label) = formula::main_column_label_from_header(grid, global_col - m) {
+                return label;
+            }
+        }
+        crate::addr::excel_column_name(global_col - m)
+    } else {
+        format!(">{}", global_col - m - main_cols)
+    }
+}
+
+/// With margins: [A / B / ]C unless Generic replaces the main `B` with a label.
+fn delimited_marginal_header_token(
+    grid: &Grid,
+    global_col: usize,
+    main_cols: usize,
+    content: ExportContent,
+) -> String {
+    let m = MARGIN_COLS;
+    if content == ExportContent::Generic && (m..(m + main_cols)).contains(&global_col) {
+        if let Some(label) = formula::main_column_label_from_header(grid, global_col - m) {
+            return label;
+        }
+    }
+    crate::addr::ui_column_fragment(global_col, main_cols)
+}
+
 fn col_header_label(global_col: usize, main_cols: usize) -> String {
     let m = MARGIN_COLS;
     if global_col < m {
@@ -440,6 +481,41 @@ fn col_header_label(global_col: usize, main_cols: usize) -> String {
     } else {
         format!(">{}", global_col - m - main_cols)
     }
+}
+
+/// ODF `;` → Excel `,` in function call lists.
+fn interop_excel_list_separators(s: &str) -> String {
+    s.replace(';', ",")
+}
+
+fn generic_interop_text(grid: &Grid, logical_row: usize, global_col: usize) -> Option<String> {
+    use crate::ui::SheetCursor;
+    let cur = SheetCursor {
+        row: logical_row,
+        col: global_col,
+    };
+    let addr = cur.to_addr(grid);
+
+    if let Some(tf) = formula::export_templated_formula(grid, &addr) {
+        return Some(interop_excel_list_separators(
+            &crate::ods::ods_labeled_prefix_strip_to_formula(&tf).unwrap_or(tf),
+        ));
+    }
+
+    let v = crate::ods::cell_export_value_string(grid, logical_row, global_col);
+    if !v.is_empty() {
+        if let Some(st) = crate::ods::ods_labeled_prefix_strip_to_formula(&v) {
+            return Some(interop_excel_list_separators(&st));
+        }
+    }
+    if let Some(raw) = grid.get(&addr) {
+        if formula::is_formula(&raw) {
+            if let Some(st) = crate::ods::ods_labeled_prefix_strip_to_formula(&raw) {
+                return Some(interop_excel_list_separators(&st));
+            }
+        }
+    }
+    None
 }
 
 fn sheet_row_label(logical_row: usize, main_rows: usize) -> String {
@@ -518,6 +594,8 @@ fn export_cell_text(
     match content {
         ExportContent::Values => rendered_value_at(grid, logical_row, global_col),
         ExportContent::Formulas => cell_value_at(grid, logical_row, global_col),
+        ExportContent::Generic => generic_interop_text(grid, logical_row, global_col)
+            .unwrap_or_else(|| rendered_value_at(grid, logical_row, global_col)),
     }
 }
 
@@ -568,28 +646,28 @@ fn export_delimited(
                     out,
                     "{}{}",
                     delim,
-                    crate::addr::ui_column_fragment(col_start, mc)
+                    delimited_marginal_header_token(grid, col_start, mc, content)
                 );
                 for c in (col_start + 1)..col_end {
                     let _ = write!(
                         out,
                         "{}{}",
                         delim,
-                        crate::addr::ui_column_fragment(c, mc)
+                        delimited_marginal_header_token(grid, c, mc, content)
                     );
                 }
             } else {
                 let _ = write!(
                     out,
                     "{}",
-                    crate::addr::ui_column_fragment(col_start, mc)
+                    delimited_marginal_header_token(grid, col_start, mc, content)
                 );
                 for c in (col_start + 1)..col_end {
                     let _ = write!(
                         out,
                         "{}{}",
                         delim,
-                        crate::addr::ui_column_fragment(c, mc)
+                        delimited_marginal_header_token(grid, c, mc, content)
                     );
                 }
             }
@@ -601,7 +679,7 @@ fn export_delimited(
                 if c > col_start {
                     let _ = write!(out, "{delim}");
                 }
-                let label = col_header_label(c, mc);
+                let label = col_header_label_for_export(grid, c, mc, content);
                 let _ = write!(out, "{}", label);
             }
         }
@@ -1057,6 +1135,72 @@ mod tests {
             "main-only TSV with row# on should start with row label: {first:?}"
         );
         assert!(first.contains("V1"));
+    }
+
+    #[test]
+    fn generic_tsv_uses_tsv_header_and_interop_formula() {
+        use crate::grid::HEADER_ROWS;
+
+        let mut grid = crate::grid::Grid::new(2, 2);
+        grid.set(
+            &CellAddr::Header {
+                row: (HEADER_ROWS - 1) as u32,
+                col: MARGIN_COLS as u32 + 1,
+            },
+            "=A*0.1 -- TAX".into(),
+        );
+        grid.set(&CellAddr::Main { row: 0, col: 0 }, "100".into());
+        let gb = crate::grid::GridBox::from(grid);
+        let opts = DelimitedExportOptions {
+            content: ExportContent::Generic,
+            include_margins: false,
+            include_header_row: true,
+            include_row_label_column: false,
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        export_tsv_with_options(&gb, &mut out, &opts);
+        let tsv = String::from_utf8(out).unwrap();
+        let lines: Vec<_> = tsv.lines().collect();
+        assert_eq!(lines[0], "A\tTAX", "header: letter + label");
+        // `row_order` lists non-empty header rows before the main block, so the control-strip row
+        // appears as an extra data line before the first main data row.
+        let main_row = lines
+            .iter()
+            .find(|l| l.starts_with("100\t"))
+            .expect("main data row with 100 in column A");
+        assert!(
+            main_row.contains("=A1*0.1") && main_row.ends_with("=A1*0.1"),
+            "TAX column: =A1*0.1, got {main_row:?}"
+        );
+    }
+
+    #[test]
+    fn generic_right_margin_uses_excel_list_sep() {
+        use crate::grid::HEADER_ROWS;
+
+        let mut grid = crate::grid::Grid::new(1, 2);
+        grid.set(
+            &CellAddr::Header {
+                row: (HEADER_ROWS - 1) as u32,
+                col: MARGIN_COLS as u32 + 1,
+            },
+            "MAX".into(),
+        );
+        grid.set(&CellAddr::Main { row: 0, col: 0 }, "3".into());
+        grid.set(&CellAddr::Right { col: 0, row: 0 }, "MAX".into());
+        let gb = crate::grid::GridBox::from(grid);
+        let opts = DelimitedExportOptions {
+            content: ExportContent::Generic,
+            include_margins: true,
+            include_header_row: true,
+            include_row_label_column: true,
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        export_tsv_with_options(&gb, &mut out, &opts);
+        let tsv = String::from_utf8(out).unwrap();
+        assert!(tsv.contains("=SUBTOTAL(4,"), "expect comma, got {tsv}");
     }
 
     #[test]
