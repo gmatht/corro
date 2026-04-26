@@ -1036,7 +1036,8 @@ fn split_top_level_args(s: &str) -> Result<Vec<&str>, ()> {
             }
             '(' if !in_string => depth += 1,
             ')' if !in_string => depth -= 1,
-            ',' if depth == 0 && !in_string => {
+            // European / ODF list separator as well as U.S. comma: both delimit function args.
+            ',' | ';' if depth == 0 && !in_string => {
                 out.push(s[start..i].trim());
                 start = i + c.len_utf8();
             }

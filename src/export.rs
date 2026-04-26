@@ -260,7 +260,7 @@ pub fn export_ascii_table_with_options(
 
     for r in row_start..row_end {
         for c in col_start..col_end {
-            let val = export_cell_text(grid, r, c, cell_content, generic_rebase);
+            let val = export_cell_text(grid, r, c, cell_content, generic_rebase, true);
             let content_w = val.chars().count();
             col_widths[c] = col_widths[c].max(content_w);
         }
@@ -346,7 +346,7 @@ pub fn export_ascii_table_with_options(
                     data_line.push('+');
                 }
             }
-            let val = export_cell_text(grid, r, c, cell_content, generic_rebase);
+            let val = export_cell_text(grid, r, c, cell_content, generic_rebase, true);
             let w = col_widths[c];
             ascii_push_cell(&mut data_line, pre, pad, &val, w);
             if frame_active
@@ -449,7 +449,7 @@ pub fn export_selection(
             if ci > 0 {
                 let _ = write!(out, "\t");
             }
-            let val = export_cell_text(grid, r, c, content, generic_rebase);
+            let val = export_cell_text(grid, r, c, content, generic_rebase, true);
             let _ = write!(out, "{}", val);
         }
         let _ = writeln!(out);
@@ -495,9 +495,37 @@ fn col_header_label(global_col: usize, main_cols: usize) -> String {
     }
 }
 
-/// ODF `;` → Excel `,` in function call lists.
-fn interop_excel_list_separators(s: &str) -> String {
+/// ODF `;` → Excel `,` in function call lists (TSV generic column).
+pub fn interop_excel_list_separators(s: &str) -> String {
     s.replace(';', ",")
+}
+
+/// After rebase, the formula pretty-printer joins call arguments with `,`. ODF/Calc
+/// expects `;` between arguments; replace top-level-argument commas (inside parens) without
+/// touching commas inside string literals.
+fn interop_odf_function_commas_to_semicolons(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut depth = 0i32;
+    let mut in_string = false;
+    for c in s.chars() {
+        match c {
+            '"' => {
+                in_string = !in_string;
+                out.push(c);
+            }
+            '(' if !in_string => {
+                depth += 1;
+                out.push(c);
+            }
+            ')' if !in_string => {
+                depth -= 1;
+                out.push(c);
+            }
+            ',' if !in_string && depth > 0 => out.push(';'),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 fn finish_generic_interop(s: String, rebase: Option<(i32, i32)>) -> String {
@@ -624,7 +652,7 @@ pub fn generic_interop_cell_text(
         if excel {
             interop_excel_list_separators(s)
         } else {
-            s.to_string()
+            interop_odf_function_commas_to_semicolons(s)
         }
     }
 
@@ -655,6 +683,11 @@ pub fn generic_interop_cell_text(
     if let Some(tf) = formula::export_templated_formula(grid, &addr) {
         let s0 = crate::ods::ods_labeled_prefix_strip_to_formula(&tf).unwrap_or(tf);
         let s1 = finish_generic_interop(s0, rebase);
+        return Some(after_rebase(&s1, excel_list_arg_comma));
+    }
+
+    if let Some(agg) = left_margin_row_aggregate_formula(grid, logical_row, global_col) {
+        let s1 = finish_generic_interop(agg, rebase);
         return Some(after_rebase(&s1, excel_list_arg_comma));
     }
 
@@ -711,6 +744,99 @@ fn right_margin_aggregate_formula_name(grid: &Grid, global_col: usize) -> Option
         .find_map(|(_, val)| aggregate_formula_name(&val))
 }
 
+fn main_row_aggregate_formula_name(grid: &Grid, main_row: usize) -> Option<&'static str> {
+    let label = grid.text(&CellAddr::Left {
+        col: MARGIN_COLS - 1,
+        row: main_row as u32,
+    });
+    aggregate_formula_name(&label)
+}
+
+fn raw_main_row_runs_before_aggregate(grid: &Grid, current_main_row: usize) -> Vec<(usize, usize)> {
+    let mut start = 0usize;
+    for candidate in (0..current_main_row).rev() {
+        if main_row_aggregate_formula_name(grid, candidate).is_some() {
+            start = candidate + 1;
+            break;
+        }
+    }
+    if start < current_main_row {
+        vec![(start, current_main_row)]
+    } else {
+        Vec::new()
+    }
+}
+
+fn non_aggregate_main_row_runs(grid: &Grid) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new();
+    let mut start: Option<usize> = None;
+    for row in 0..grid.main_rows() {
+        if main_row_aggregate_formula_name(grid, row).is_some() {
+            if let Some(s) = start.take() {
+                if s < row {
+                    runs.push((s, row));
+                }
+            }
+        } else if start.is_none() {
+            start = Some(row);
+        }
+    }
+    if let Some(s) = start {
+        if s < grid.main_rows() {
+            runs.push((s, grid.main_rows()));
+        }
+    }
+    runs
+}
+
+fn aggregate_formula_over_runs(
+    func: &str,
+    col: &str,
+    runs: &[(usize, usize)],
+) -> Option<String> {
+    let ranges: Vec<String> = runs
+        .iter()
+        .filter(|(start, end)| start < end)
+        .map(|(start, end)| format!("{col}{}:{col}{}", start + 1, end))
+        .collect();
+    if ranges.is_empty() {
+        return None;
+    }
+    if func == "SUM" && ranges.len() > 1 {
+        Some(
+            ranges
+                .iter()
+                .map(|range| format!("SUM({range})"))
+                .collect::<Vec<_>>()
+                .join("+"),
+        )
+    } else {
+        // ODF/LibreOffice use `;` between function args; TSV generic converts to `,` for Excel
+        // via [interop_excel_list_separators] in [generic_interop_cell_text] when
+        // `excel_list_arg_comma` is true. Commas here caused Err:508 in Calc (treated as wrong syntax).
+        Some(format!("{func}({})", ranges.join(";")))
+    }
+}
+
+fn left_margin_row_aggregate_formula(
+    grid: &Grid,
+    logical_row: usize,
+    global_col: usize,
+) -> Option<String> {
+    let main_cols = grid.main_cols();
+    if logical_row < HEADER_ROWS || logical_row >= HEADER_ROWS + grid.main_rows() {
+        return None;
+    }
+    if global_col < MARGIN_COLS || global_col >= MARGIN_COLS + main_cols {
+        return None;
+    }
+    let main_row = logical_row - HEADER_ROWS;
+    let func = main_row_aggregate_formula_name(grid, main_row)?;
+    let col = crate::addr::excel_column_name(global_col - MARGIN_COLS);
+    let body = aggregate_formula_over_runs(func, &col, &raw_main_row_runs_before_aggregate(grid, main_row))?;
+    Some(format!("={body}"))
+}
+
 fn right_margin_row_aggregate_formula(
     grid: &Grid,
     logical_row: usize,
@@ -749,7 +875,8 @@ fn footer_column_aggregate_formula(
     let func = aggregate_formula_name(&key)?;
     let exported_col = global_col - MARGIN_COLS;
     let col = crate::addr::excel_column_name(exported_col);
-    Some(format!("={func}({col}1:{col}{main_rows})"))
+    let body = aggregate_formula_over_runs(func, &col, &non_aggregate_main_row_runs(grid))?;
+    Some(format!("={body}"))
 }
 
 fn sheet_row_label(logical_row: usize, main_rows: usize) -> String {
@@ -821,19 +948,30 @@ fn rendered_value_at(grid: &Grid, logical_row: usize, global_col: usize) -> Stri
 
 /// What one cell would be in TSV/CSV/ASCII for the given [ExportContent] and (for Generic) the
 /// same `generic_rebase` that [`export_delimited`] / [`export_tsv_with_options`] use.
+///
+/// For [`ExportContent::Generic`] only, `generic_excel_list_arg_comma` is passed to
+/// [`generic_interop_cell_text`]: `true` = Excel/TSV (`,` between function args), `false` = ODF /
+/// LibreOffice in `of:` (`;` between args). Ignored for other modes (pass `true`).
 pub fn export_cell_text(
     grid: &Grid,
     logical_row: usize,
     global_col: usize,
     content: ExportContent,
     generic_rebase: Option<(i32, i32)>,
+    generic_excel_list_arg_comma: bool,
 ) -> String {
     match content {
         ExportContent::Values => rendered_value_at(grid, logical_row, global_col),
         ExportContent::Formulas => cell_value_at(grid, logical_row, global_col),
         ExportContent::Generic => {
-            generic_interop_cell_text(grid, logical_row, global_col, generic_rebase, true)
-                .unwrap_or_else(|| rendered_value_at(grid, logical_row, global_col))
+            generic_interop_cell_text(
+                grid,
+                logical_row,
+                global_col,
+                generic_rebase,
+                generic_excel_list_arg_comma,
+            )
+            .unwrap_or_else(|| rendered_value_at(grid, logical_row, global_col))
         }
     }
 }
@@ -885,18 +1023,26 @@ fn delimited_table_col_span_and_rows(
     (col_start, col_end, rows)
 }
 
-/// Rebase (Δrow, Δcol) for interop `=…` relative to a default TSV/CSV table (A1 = file top-left
-/// with header row, margins, and row key column; same layout as `DelimitedExportOptions::default`).
-pub fn delimited_default_generic_rebase(grid: &Grid) -> (i32, i32) {
-    let o = DelimitedExportOptions::default();
-    let (c0, c1, ref rows) = delimited_table_col_span_and_rows(grid, &o);
+/// Rebase (Δrow, Δcol) for interop `=…` for the given delimited layout ([`delimited_export_matrix`]
+/// uses the same span and row list as this).
+pub fn delimited_options_generic_rebase(
+    grid: &Grid,
+    options: &DelimitedExportOptions,
+) -> (i32, i32) {
+    let (c0, c1, ref rows) = delimited_table_col_span_and_rows(grid, options);
     delimited_generic_rebase(
         c0,
         c1,
-        o.include_header_row,
-        o.include_row_label_column,
+        options.include_header_row,
+        options.include_row_label_column,
         rows,
     )
+}
+
+/// Rebase (Δrow, Δcol) for interop `=…` relative to a default TSV/CSV table (A1 = file top-left
+/// with header row, margins, and row key column; same layout as `DelimitedExportOptions::default`).
+pub fn delimited_default_generic_rebase(grid: &Grid) -> (i32, i32) {
+    delimited_options_generic_rebase(grid, &DelimitedExportOptions::default())
 }
 
 fn export_delimited(
@@ -990,7 +1136,7 @@ fn export_delimited(
                 let _ = write!(out, "{delim}");
             }
             first = false;
-            let val = export_cell_text(grid, r, c, content, generic_rebase);
+            let val = export_cell_text(grid, r, c, content, generic_rebase, true);
             if delim == ',' && needs_csv_quoting(&val, delim) {
                 let _ = write!(out, "{}", csv_quote(&val));
             } else {
@@ -1059,6 +1205,7 @@ pub fn delimited_export_matrix(
                 c,
                 content,
                 generic_rebase,
+                true,
             ));
         }
         out.push(line);
@@ -1276,6 +1423,24 @@ mod tests {
         workbook
     }
 
+    /// `split_top_level_args` must treat `;` like `,` (ODF / aggregate multi-range) or rebase is a
+    /// no-op and refs stay in grid-space (`A1` instead of the exported sheet’s `C3`).
+    #[test]
+    fn rebase_interop_shifts_max_with_semicolon_list_separator() {
+        let out = crate::formula::rebase_interop_formula_row_col("=MAX(A1:A5;A7:A9)", 2, 2);
+        assert_eq!(out, "=MAX(C3:C7,C9:C11)");
+    }
+
+    /// After a successful rebase, the pretty-printer joins args with `,`; ODF still
+    /// needs `;` between function arguments.
+    #[test]
+    fn odf_interop_rewrites_commas_in_calls_to_semicolons() {
+        assert_eq!(
+            interop_odf_function_commas_to_semicolons("=MAX(C3:C7,C9:C11)"),
+            "=MAX(C3:C7;C9:C11)"
+        );
+    }
+
     fn parse_delimited(data: &str, delim: char) -> Vec<Vec<String>> {
         data.lines()
             .map(|line| parse_delimited_line(line, delim))
@@ -1453,7 +1618,7 @@ mod tests {
                 let lr = rows[data_i];
                 let gc = c0 + (j - rk);
                 let computed =
-                    export_cell_text(grid, lr, gc, ExportContent::Values, None);
+                    export_cell_text(grid, lr, gc, ExportContent::Values, None, true);
                 assert_eq!(
                     v_cell, &computed,
                     "Values export at matrix[{i}][{j}] (logical row {lr}, col {gc})"
@@ -1540,6 +1705,7 @@ mod tests {
             gc,
             ExportContent::Generic,
             Some(re),
+            true,
         );
         assert_eq!(g.trim(), "TOTAL");
         assert!(
@@ -1574,7 +1740,7 @@ mod tests {
         let gb = crate::grid::GridBox::from(grid);
         let lr = HEADER_ROWS + 2;
         let gc = MARGIN_COLS + 1;
-        let v = export_cell_text(&gb, lr, gc, ExportContent::Values, None);
+        let v = export_cell_text(&gb, lr, gc, ExportContent::Values, None, true);
         assert!(!v.trim().eq_ignore_ascii_case("MAX"), "result was {v:?}, want numeric max, not the label word MAX; =SUBTOTAL(4,…) is not a MAX string");
     }
 
@@ -1809,6 +1975,7 @@ mod tests {
             MARGIN_COLS + 2,
             ExportContent::Values,
             None,
+            true,
         );
 
         g.set(&CellAddr::Main { row: 0, col: 0 }, "6".into());
@@ -1829,6 +1996,7 @@ mod tests {
             MARGIN_COLS + 2,
             ExportContent::Values,
             None,
+            true,
         );
         assert_ne!(
             before_formula_value, after_formula_value,
@@ -1847,6 +2015,7 @@ mod tests {
                     source_gc,
                     ExportContent::Values,
                     None,
+                    true,
                 );
                 let v_target = export_cell_text(
                     &edited_target,
@@ -1854,6 +2023,7 @@ mod tests {
                     target_gc,
                     ExportContent::Values,
                     None,
+                    true,
                 );
                 assert_eq!(
                     v_src, v_target,
@@ -1891,7 +2061,7 @@ mod tests {
             crate::grid::GridBox::from(g)
         }
 
-        let mut g = crate::grid::Grid::new(1, 2);
+        let mut g = crate::grid::Grid::new(2, 2);
         g.set(
             &CellAddr::Header {
                 row: (HEADER_ROWS - 1) as u32,
@@ -1947,6 +2117,7 @@ mod tests {
             MARGIN_COLS + 2,
             ExportContent::Values,
             None,
+            true,
         );
         let target_total = export_cell_text(
             &edited_target,
@@ -1954,6 +2125,7 @@ mod tests {
             MARGIN_COLS + total_field,
             ExportContent::Values,
             None,
+            true,
         );
         assert_eq!(
             source_total, target_total,
@@ -2003,6 +2175,7 @@ mod tests {
         );
         g.set(&CellAddr::Left { col: MARGIN_COLS - 1, row: 0 }, "Hammers".into());
         g.set(&CellAddr::Main { row: 0, col: 0 }, "5".into());
+        g.set(&CellAddr::Left { col: MARGIN_COLS - 1, row: 1 }, "TOTAL".into());
         g.set(
             &CellAddr::Footer {
                 row: 0,
@@ -2022,6 +2195,11 @@ mod tests {
             delimited_export_matrix(&crate::grid::GridBox::from(g.clone()), &opts);
         let h = 1usize;
         let data_row = h + rows.iter().position(|&r| r == HEADER_ROWS).unwrap();
+        let subtotal_row = h
+            + rows
+                .iter()
+                .position(|&r| r == HEADER_ROWS + 1)
+                .unwrap();
         let footer_row = h
             + rows
                 .iter()
@@ -2031,8 +2209,23 @@ mod tests {
         let total_field = 1 + (MARGIN_COLS + 2 - col_start);
         assert_eq!(matrix0[data_row][amount_field], "5");
         assert!(
+            matrix0[subtotal_row][amount_field].starts_with('='),
+            "main TOTAL row amount must be a formula, not a hardcoded subtotal; got {:?}",
+            matrix0[subtotal_row][amount_field]
+        );
+        assert!(
+            matrix0[subtotal_row][amount_field].contains("C3:C3"),
+            "main TOTAL row should sum only the preceding raw block; got {:?}",
+            matrix0[subtotal_row][amount_field]
+        );
+        assert!(
             matrix0[footer_row][total_field].starts_with('='),
             "footer TOTAL must be a formula in Generic export, not a hardcoded value like 5.5; got {:?}",
+            matrix0[footer_row][total_field]
+        );
+        assert!(
+            matrix0[footer_row][total_field].contains("E3:E3"),
+            "footer TOTAL must skip the main TOTAL row to avoid double counting; got {:?}",
             matrix0[footer_row][total_field]
         );
 
@@ -2049,6 +2242,7 @@ mod tests {
             MARGIN_COLS + 2,
             ExportContent::Values,
             None,
+            true,
         );
         let target_footer_total = export_cell_text(
             &edited_target,
@@ -2056,6 +2250,7 @@ mod tests {
             MARGIN_COLS + total_field,
             ExportContent::Values,
             None,
+            true,
         );
         assert_eq!(
             source_footer_total, target_footer_total,
@@ -2088,6 +2283,65 @@ mod tests {
         let gc = m + 2;
         let tsv_s = generic_interop_cell_text(&gb, lr, gc, Some(re), true).expect("tsv interop");
         let ods_s = generic_interop_cell_text(&gb, lr, gc, Some(re), false).expect("ods interop");
+        assert_eq!(tsv_s, super::interop_excel_list_separators(&ods_s));
+    }
+
+    /// [aggregate_formula_over_runs] joins multiple non-contiguous ranges with `;` (ODF). LibreOffice
+    /// reported Err:508 on `MAX(A1:B1,A2:B2)`-style commas; TSV still uses commas after
+    /// [interop_excel_list_separators].
+    #[test]
+    fn generic_footer_max_multirange_ods_semicolon_tsv_comma() {
+        use crate::grid::HEADER_ROWS;
+
+        let mut g = crate::grid::Grid::new(4, 2);
+        g.set(
+            &CellAddr::Left {
+                col: MARGIN_COLS - 1,
+                row: 0,
+            },
+            "a".into(),
+        );
+        g.set(
+            &CellAddr::Left {
+                col: MARGIN_COLS - 1,
+                row: 1,
+            },
+            "b".into(),
+        );
+        g.set(
+            &CellAddr::Left {
+                col: MARGIN_COLS - 1,
+                row: 2,
+            },
+            "TOTAL".into(),
+        );
+        g.set(
+            &CellAddr::Left {
+                col: MARGIN_COLS - 1,
+                row: 3,
+            },
+            "c".into(),
+        );
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "1".into());
+        g.set(&CellAddr::Main { row: 1, col: 0 }, "2".into());
+        g.set(&CellAddr::Main { row: 3, col: 0 }, "3".into());
+        g.set(
+            &CellAddr::Footer {
+                row: 0,
+                col: (MARGIN_COLS - 1) as u32,
+            },
+            "MAX".into(),
+        );
+        let gb = crate::grid::GridBox::from(g);
+        let re = delimited_default_generic_rebase(&gb);
+        let lr = HEADER_ROWS + gb.main_rows();
+        let gc = MARGIN_COLS;
+        let tsv_s = generic_interop_cell_text(&gb, lr, gc, Some(re), true).expect("tsv");
+        let ods_s = generic_interop_cell_text(&gb, lr, gc, Some(re), false).expect("ods");
+        assert!(
+            ods_s.contains("MAX(") && ods_s.contains(';'),
+            "ODF interop should use `;` between MAX range args: {ods_s:?}"
+        );
         assert_eq!(tsv_s, super::interop_excel_list_separators(&ods_s));
     }
 

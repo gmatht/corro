@@ -1118,7 +1118,7 @@ impl App {
             },
             MenuAction::ExportOdt => {
                 self.export_preview_scroll = 0;
-                self.export_ods_content = export::ExportContent::Formulas;
+                self.export_ods_content = export::ExportContent::Generic;
                 Mode::ExportOdt {
                     buffer: self.start_input_mode(self.suggested_export_save_path("ods")),
                 }
@@ -2208,7 +2208,7 @@ pub struct App {
     export_delimited_options: export::DelimitedExportOptions,
     /// Session-only. Applies to "ASCII table" export and its preview.
     export_ascii_options: export::AsciiTableOptions,
-    /// ODS only: [export::ExportContent::Formulas] matches legacy export (keeps ODF formulas).
+    /// ODS only: default [export::ExportContent::Generic] (same as TSV generic; use [export::ExportContent::Formulas] for native ODF).
     export_ods_content: export::ExportContent,
     pub op_history: Vec<Op>,
     redo_history: Vec<Op>,
@@ -2278,7 +2278,7 @@ impl App {
             export_preview_scroll: 0,
             export_delimited_options: export::DelimitedExportOptions::default(),
             export_ascii_options: export::AsciiTableOptions::default(),
-            export_ods_content: export::ExportContent::Formulas,
+            export_ods_content: export::ExportContent::Generic,
             op_history: Vec::new(),
             redo_history: Vec::new(),
             selection_kind: SelectionKind::Cells,
@@ -4839,7 +4839,9 @@ impl App {
 
     fn do_export_ods(&mut self) -> Vec<u8> {
         crate::formula::refresh_spills(&mut self.state.grid);
-        crate::ods::export_ods_bytes_with_options(&self.state.grid, self.export_ods_content)
+        let mut o = self.export_delimited_options;
+        o.content = self.export_ods_content;
+        crate::ods::export_ods_bytes_with_options(&self.state.grid, &o)
             .unwrap_or_default()
     }
 
@@ -8749,7 +8751,7 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                 };
                 Some((
                     format!(
-                        "OpenDocument (.ods) is a binary ZIP package.\n\nExport: {mode}. There is no text preview. Type a file path and press Enter to save."
+                        "OpenDocument (.ods) is a binary ZIP package.\n\nExport: {mode}. Table shape matches your current TSV/CSV options (margins, header row, row labels). There is no text preview. Type a file path and press Enter to save."
                     ),
                     " Export ODS ",
                     false,

@@ -193,20 +193,22 @@ fn parse_corro_ods_layout_str(buf: &str) -> OdsTableLayout {
 }
 
 pub fn export_ods_bytes(grid: &Grid) -> Result<Vec<u8>, OdsError> {
-    export_ods_bytes_with_options(grid, ExportContent::Formulas)
-}
-
-/// `ExportContent::Formulas` preserves `table:formula` where applicable; `Values` writes static cells
-/// from computed display (no formulas in the ODF file).
-pub fn export_ods_bytes_with_options(
-    grid: &Grid,
-    content: ExportContent,
-) -> Result<Vec<u8>, OdsError> {
     let options = DelimitedExportOptions {
-        content,
+        content: ExportContent::Generic,
         ..Default::default()
     };
-    let (matrix, col_start, col_end, data_rows) = export::delimited_export_matrix(grid, &options);
+    export_ods_bytes_with_options(grid, &options)
+}
+
+/// Layout (margins, header row, row-key column) follows `options`, same as
+/// [`export::export_tsv_with_options`]. Set `options.content` to choose values vs native ODF formulas vs
+/// generic interop; the parameterless [export_ods_bytes] uses generic content and
+/// [`DelimitedExportOptions::default`].
+pub fn export_ods_bytes_with_options(
+    grid: &Grid,
+    options: &DelimitedExportOptions,
+) -> Result<Vec<u8>, OdsError> {
+    let (matrix, col_start, col_end, data_rows) = export::delimited_export_matrix(grid, options);
     let content_xml = ods_content_xml_tsv_shaped(
         grid,
         &matrix,
@@ -327,7 +329,7 @@ fn ods_content_xml_tsv_shaped(
 ) -> String {
     let export_content = options.content;
     let generic_tsv_rebase = if export_content == ExportContent::Generic {
-        Some(export::delimited_default_generic_rebase(grid))
+        Some(export::delimited_options_generic_rebase(grid, options))
     } else {
         None
     };
@@ -449,21 +451,22 @@ fn ods_cell_xml(
         }
         return ods_cell_xml_values_only(&display, &value, &raw);
     }
-    // Generic: same string as default TSV “generic” (interop `=…`, commas in arg lists) — not
-    // [cell_effective_display] in <text:p> (that matches Values, not the TSV generic column).
+    // Generic: same interop `=…` as TSV generic after rebase, but ODF `;` list separators (not `,`),
+    // or LibreOffice reports Err:508 in `of:` / <text:p>.
     if export_content == ExportContent::Generic {
-        let tsv = export::export_cell_text(
+        let odf = export::export_cell_text(
             grid,
             logical_row,
             global_col,
             ExportContent::Generic,
             generic_tsv_rebase,
+            false,
         );
-        if tsv.trim().is_empty() {
+        if odf.trim().is_empty() {
             return "<table:table-cell/>".into();
         }
-        if tsv.trim_start().starts_with('=') {
-            let formula = ods_formula_expr(&tsv).unwrap_or_else(|| tsv.clone());
+        if odf.trim_start().starts_with('=') {
+            let formula = ods_formula_expr(&odf).unwrap_or_else(|| odf.clone());
             let value_attrs = match display.trim().parse::<f64>() {
                 Ok(n) => format!(r#" office:value-type="float" office:value="{n}""#),
                 Err(_) => r#" office:value-type="string""#.to_string(),
@@ -472,10 +475,10 @@ fn ods_cell_xml(
                 r#"<table:table-cell{} table:formula="of:{}"><text:p>{}</text:p></table:table-cell>"#,
                 value_attrs,
                 ods_escape(&formula),
-                ods_escape(&tsv)
+                ods_escape(&odf)
             );
         }
-        return ods_cell_xml_values_only(&tsv, &tsv, &tsv);
+        return ods_cell_xml_values_only(&odf, &odf, &odf);
     }
     if value.is_empty() && raw.is_empty() {
         return "<table:table-cell/>".into();
@@ -970,6 +973,7 @@ fn attr_value(e: &quick_xml::events::BytesStart<'_>, key: &[u8]) -> Option<Strin
 mod tests {
     use super::*;
     use crate::export;
+    use crate::export::DelimitedExportOptions;
     use std::io::{ErrorKind, Read};
     use std::process::Command;
     use tempfile::tempdir;
@@ -984,27 +988,41 @@ mod tests {
         assert!(bytes.starts_with(b"PK"));
     }
 
-    /// ODS “generic” must use the same per-cell string as TSV generic (not evaluated display in
-    /// &lt;text:p&gt;).
+    /// ODS “generic” &lt;text:p&gt; uses ODF `;` list args; TSV generic = Excel `,` =
+    /// [export::interop_excel_list_separators] applied to the ODF string.
     #[test]
     fn ods_generic_text_p_matches_tsv_cell_text() {
         let mut grid = crate::grid::Grid::new(2, 2);
         grid.set(&CellAddr::Main { row: 0, col: 0 }, "=2+2".into());
         let gb = crate::grid::GridBox::from(grid);
         let rebase = export::delimited_default_generic_rebase(&gb);
-        let expected = export::export_cell_text(
+        let expected_ods = export::export_cell_text(
             &gb,
             HEADER_ROWS,
             MARGIN_COLS,
             ExportContent::Generic,
             Some(rebase),
+            false,
         );
+        let tsv_style = export::export_cell_text(
+            &gb,
+            HEADER_ROWS,
+            MARGIN_COLS,
+            ExportContent::Generic,
+            Some(rebase),
+            true,
+        );
+        assert_eq!(tsv_style, export::interop_excel_list_separators(&expected_ods));
         assert!(
-            expected.contains("2+2") || expected.trim_start().starts_with('='),
-            "unexpected generic cell {expected:?}"
+            expected_ods.contains("2+2") || expected_ods.trim_start().starts_with('='),
+            "unexpected generic cell {expected_ods:?}"
         );
         let content_xml = {
-            let bytes = export_ods_bytes_with_options(&gb, ExportContent::Generic).unwrap();
+            let opts = DelimitedExportOptions {
+                content: ExportContent::Generic,
+                ..Default::default()
+            };
+            let bytes = export_ods_bytes_with_options(&gb, &opts).unwrap();
             let mut a = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
             let mut s = String::new();
             a.by_name("content.xml")
@@ -1014,9 +1032,9 @@ mod tests {
             s
         };
         assert!(
-            content_xml.contains(&format!("<text:p>{}</text:p>", ods_escape(&expected))),
-            "ODS <text:p> should equal TSV generic for that cell; want {:?}\n",
-            expected
+            content_xml.contains(&format!("<text:p>{}</text:p>", ods_escape(&expected_ods))),
+            "ODS <text:p> should equal ODF-style generic for that cell; want {:?}\n",
+            expected_ods
         );
     }
 
@@ -1139,16 +1157,30 @@ mod tests {
         );
         let gb = crate::grid::GridBox::from(grid);
         let re = export::delimited_default_generic_rebase(&gb);
+        let odf = export::export_cell_text(
+            &gb,
+            HEADER_ROWS,
+            m + 2,
+            ExportContent::Generic,
+            Some(re),
+            false,
+        );
         let tsv = export::export_cell_text(
             &gb,
             HEADER_ROWS,
             m + 2,
             ExportContent::Generic,
             Some(re),
+            true,
         );
-        let formula = ods_formula_expr(&tsv).expect("formula");
-        assert!(tsv.trim_start().starts_with('='), "{tsv}");
-        let bytes = export_ods_bytes_with_options(&gb, ExportContent::Generic).unwrap();
+        assert_eq!(tsv, export::interop_excel_list_separators(&odf));
+        let formula = ods_formula_expr(&odf).expect("formula");
+        assert!(odf.trim_start().starts_with('='), "{odf}");
+        let opts = DelimitedExportOptions {
+            content: ExportContent::Generic,
+            ..Default::default()
+        };
+        let bytes = export_ods_bytes_with_options(&gb, &opts).unwrap();
         let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
         let mut content = String::new();
         archive
@@ -1169,6 +1201,7 @@ mod tests {
         );
     }
 
+    // ExportContent::Formulas: native ODF SUBTOTAL for aggregate margin labels.
     #[test]
     fn export_converts_total_to_subtotal_formula() {
         let mut grid = crate::grid::Grid::new(1, 1);
@@ -1180,7 +1213,11 @@ mod tests {
             "TOTAL".into(),
         );
         let gb = crate::grid::GridBox::from(grid);
-        let content = exported_content_xml(&gb);
+        let opts = DelimitedExportOptions {
+            content: ExportContent::Formulas,
+            ..Default::default()
+        };
+        let content = exported_content_xml_with_options(&gb, &opts);
         assert!(content.contains(r#"table:formula="of:=SUBTOTAL(9;A1:A1)""#));
     }
 
@@ -1195,7 +1232,11 @@ mod tests {
             "MAX".into(),
         );
         let gb = crate::grid::GridBox::from(grid);
-        let content = exported_content_xml(&gb);
+        let opts = DelimitedExportOptions {
+            content: ExportContent::Formulas,
+            ..Default::default()
+        };
+        let content = exported_content_xml_with_options(&gb, &opts);
         assert!(
             content.contains(r#"table:formula="of:=SUBTOTAL(4;A1:A1)""#),
             "{}",
@@ -1220,7 +1261,16 @@ mod tests {
         let workbook = workbook_from_fixture("subtotal.corro");
         let grid = &workbook.active_sheet().grid;
         let content = exported_content_xml(grid);
-        assert!(content.contains(r#"table:formula="of:=SUBTOTAL("#));
+        assert!(
+            content.contains(r#"table:formula="of:="#) && content.contains("SUBTOTAL")
+                || content.contains("of:=SUM(")
+                || content.contains("of:=MAX(")
+                || content.contains("of:=MIN(")
+                || content.contains("of:=AVERAGE(")
+                || content.contains("of:=COUNT("),
+            "default (generic) ODS should write interop `of:` formulas; (fragment): {}",
+            &content[..content.len().min(2000)]
+        );
 
         let bytes = export_ods_bytes(grid).unwrap();
         let tmp = NamedTempFile::new().unwrap();
@@ -1229,20 +1279,27 @@ mod tests {
 
         let sheet = reimported.active_sheet();
         let mut saw_formula = false;
-        let mut saw_subtotal = false;
+        let mut saw_interop_fn = false;
         scan_grid(&sheet.grid, |value| {
             if value.starts_with('=') {
                 saw_formula = true;
             }
-            if value.contains("SUBTOTAL") {
-                saw_subtotal = true;
+            if value.contains("SUBTOTAL(")
+                || value.contains("SUM(")
+                || value.contains("MAX(")
+                || value.contains("MIN(")
+            {
+                saw_interop_fn = true;
             }
         });
         assert!(
             saw_formula,
             "expected at least one formula cell to survive roundtrip"
         );
-        assert!(saw_subtotal, "expected subtotal formulas to be preserved");
+        assert!(
+            saw_interop_fn,
+            "expected spreadsheet-style function names in reimported cells"
+        );
     }
 
     #[test]
@@ -1292,7 +1349,12 @@ mod tests {
             .unwrap()
             .read_to_string(&mut sheet_xml)
             .unwrap();
-        assert!(sheet_xml.contains("SUBTOTAL"));
+        assert!(
+            sheet_xml.contains("SUBTOTAL")
+                || sheet_xml.contains("SUM")
+                || sheet_xml.contains("MAX")
+                || sheet_xml.contains("MIN")
+        );
         assert!(sheet_xml.contains("<f"));
     }
 
@@ -1332,14 +1394,22 @@ mod tests {
     }
 
     fn exported_content_xml(grid: &Grid) -> String {
-        let bytes = export_ods_bytes(grid).unwrap();
+        let opts = DelimitedExportOptions {
+            content: ExportContent::Generic,
+            ..Default::default()
+        };
+        exported_content_xml_with_options(grid, &opts)
+    }
+
+    fn exported_content_xml_with_options(grid: &Grid, options: &DelimitedExportOptions) -> String {
+        let bytes = export_ods_bytes_with_options(grid, options).unwrap();
         let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
-        let mut content = String::new();
+        let mut s = String::new();
         archive
             .by_name("content.xml")
             .unwrap()
-            .read_to_string(&mut content)
+            .read_to_string(&mut s)
             .unwrap();
-        content
+        s
     }
 }
