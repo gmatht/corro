@@ -448,15 +448,62 @@ fn decode_log_value(value: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
+fn parse_set_target_and_value(payload: &str) -> Option<(&str, &str)> {
+    let payload = payload.trim_start();
+    if payload.is_empty() {
+        return None;
+    }
+    let target_len = payload
+        .char_indices()
+        .find_map(|(idx, ch)| ch.is_whitespace().then_some(idx))
+        .unwrap_or(payload.len());
+    let target = payload.get(..target_len)?;
+    let value = payload.get(target_len..).unwrap_or("").trim_start();
+    Some((target, value))
+}
+
+fn expand_tab_delimited_set_range(range: MainRange, value: &str) -> Option<Op> {
+    let rows = range.row_end.checked_sub(range.row_start)?;
+    let cols = range.col_end.checked_sub(range.col_start)?;
+    let count = rows.checked_mul(cols)? as usize;
+    if count <= 1 {
+        return None;
+    }
+    let values: Vec<&str> = value.split('\t').collect();
+    let mut cells = Vec::with_capacity(count);
+    for idx in 0..count {
+        let r = idx / cols as usize;
+        let c = idx % cols as usize;
+        let addr = CellAddr::Main {
+            row: range.row_start + r as u32,
+            col: range.col_start + c as u32,
+        };
+        let cell_value = values.get(idx).copied().unwrap_or("").to_string();
+        cells.push((addr, cell_value));
+    }
+    Some(Op::FillRange { cells })
+}
+
 fn parse_op_text(line: &str) -> Option<Op> {
     let mut parts = line.split_whitespace();
     let cmd = parts.next()?.to_ascii_uppercase();
     match cmd.as_str() {
         "SET" => {
-            let addr = parts.next()?;
-            let value = parts.collect::<Vec<_>>().join(" ");
+            let set_payload = line.trim_start().get(3..)?.trim_start();
+            let (target, value) = parse_set_target_and_value(set_payload)?;
+            if let Some((range, range_len)) = parse_main_range_at(target) {
+                if range_len == target.len() {
+                    if let Some(op) = expand_tab_delimited_set_range(range, value) {
+                        return Some(op);
+                    }
+                }
+            }
+            let addr = target;
             let (addr, _) = parse_log_addr(addr, 0, false)?;
-            Some(Op::SetCell { addr, value })
+            Some(Op::SetCell {
+                addr,
+                value: value.to_string(),
+            })
         }
         "FILL" => {
             let mut cells = Vec::new();
@@ -786,6 +833,15 @@ pub fn parse_workbook_line(line: &str) -> Result<WorkbookOp, std::io::Error> {
             if let Some(after_colon) = rest.get(plen..).and_then(|s| s.strip_prefix(':')) {
                 let after_colon = after_colon.trim_start();
                 if !after_colon.is_empty() {
+                    if let Some((target, value)) = parse_set_target_and_value(after_colon) {
+                        if let Some((range, range_len)) = parse_main_range_at(target) {
+                            if range_len == target.len() {
+                                if let Some(op) = expand_tab_delimited_set_range(range, value) {
+                                    return Ok(WorkbookOp::SheetOp { sheet_id, op });
+                                }
+                            }
+                        }
+                    }
                     if let Some((cref, clen)) = crate::celladdr::CellRef::parse_at(after_colon) {
                         let value = after_colon[clen..].trim_start().to_string();
                         return Ok(WorkbookOp::SheetOp {
@@ -812,6 +868,16 @@ pub fn parse_workbook_line(line: &str) -> Result<WorkbookOp, std::io::Error> {
         let addr = parts
             .next()
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad SET line"))?;
+        if let Some((range, range_len)) = parse_main_range_at(addr) {
+            if range_len == addr.len() {
+                if let Some(op) = expand_tab_delimited_set_range(
+                    range,
+                    rest.get(addr.len()..).unwrap_or("").trim_start(),
+                ) {
+                    return Ok(WorkbookOp::SheetOp { sheet_id: 1, op });
+                }
+            }
+        }
         if let Some((cref, cell_len)) = crate::celladdr::CellRef::parse_at(addr) {
             if cell_len == addr.len() {
                 let value = rest
@@ -1528,6 +1594,62 @@ mod tests {
         let tight = parse_workbook_line("SET $1:[A_1 TOTAL").unwrap();
         let spaced = parse_workbook_line("SET $1: [A_1 TOTAL").unwrap();
         assert_eq!(tight, spaced, "tight and spaced $id: should parse the same op");
+    }
+
+    #[test]
+    fn parse_op_set_main_range_uses_tab_delimited_values() {
+        let op = parse_op_line("SET A1:B2 v1\tv2\tv3\tv4").expect("parse");
+        assert_eq!(
+            op,
+            Op::FillRange {
+                cells: vec![
+                    (CellAddr::Main { row: 0, col: 0 }, "v1".into()),
+                    (CellAddr::Main { row: 0, col: 1 }, "v2".into()),
+                    (CellAddr::Main { row: 1, col: 0 }, "v3".into()),
+                    (CellAddr::Main { row: 1, col: 1 }, "v4".into()),
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn workbook_set_main_range_uses_tab_delimited_values() {
+        let op = parse_workbook_line("SET $2:A1:B2 x\ty\tz\tw").unwrap();
+        match op {
+            WorkbookOp::SheetOp { sheet_id, op } => {
+                assert_eq!(sheet_id, 2);
+                assert_eq!(
+                    op,
+                    Op::FillRange {
+                        cells: vec![
+                            (CellAddr::Main { row: 0, col: 0 }, "x".into()),
+                            (CellAddr::Main { row: 0, col: 1 }, "y".into()),
+                            (CellAddr::Main { row: 1, col: 0 }, "z".into()),
+                            (CellAddr::Main { row: 1, col: 1 }, "w".into()),
+                        ]
+                    }
+                );
+            }
+            other => panic!("unexpected workbook op: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workbook_set_single_cell_range_keeps_full_value_text() {
+        let op = parse_workbook_line("SET A1:A1 keep\tall\ttabs").unwrap();
+        match op {
+            WorkbookOp::SheetOp { sheet_id, op } => {
+                assert_eq!(sheet_id, 1);
+                match op {
+                    Op::SetCell { addr, value } => {
+                        assert_eq!(addr, CellAddr::Main { row: 0, col: 0 });
+                        assert_eq!(value, "keep\tall\ttabs");
+                    }
+                    other => panic!("unexpected op: {other:?}"),
+                }
+            }
+            other => panic!("unexpected workbook op: {other:?}"),
+        }
     }
 
     #[test]

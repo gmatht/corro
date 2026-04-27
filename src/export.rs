@@ -254,13 +254,17 @@ pub fn export_ascii_table_with_options(
 
     let mut col_widths: Vec<usize> = vec![0; tc];
     for c in col_start..col_end {
-        let label = col_header_label_for_export(grid, c, mc, cell_content);
+        let label = ascii_col_header_label(c, mc);
         col_widths[c] = label.chars().count().max(1);
     }
 
     for r in row_start..row_end {
         for c in col_start..col_end {
-            let val = export_cell_text(grid, r, c, cell_content, generic_rebase, true);
+            let val = if cell_content == ExportContent::Values {
+                rendered_value_at_ascii(grid, r, c)
+            } else {
+                export_cell_text(grid, r, c, cell_content, generic_rebase, true)
+            };
             let content_w = val.chars().count();
             col_widths[c] = col_widths[c].max(content_w);
         }
@@ -306,7 +310,7 @@ pub fn export_ascii_table_with_options(
             ascii_push_cell(&mut header_line, pre, pad, "", row_label_w);
         }
         for c in col_start..col_end {
-            let label = col_header_label_for_export(grid, c, mc, cell_content);
+            let label = ascii_col_header_label(c, mc);
             let w = col_widths[c];
             ascii_push_cell(&mut header_line, pre, pad, &label, w);
         }
@@ -346,7 +350,11 @@ pub fn export_ascii_table_with_options(
                     data_line.push('+');
                 }
             }
-            let val = export_cell_text(grid, r, c, cell_content, generic_rebase, true);
+            let val = if cell_content == ExportContent::Values {
+                rendered_value_at_ascii(grid, r, c)
+            } else {
+                export_cell_text(grid, r, c, cell_content, generic_rebase, true)
+            };
             let w = col_widths[c];
             ascii_push_cell(&mut data_line, pre, pad, &val, w);
             if frame_active
@@ -472,6 +480,10 @@ fn col_header_label_for_export(
     } else {
         format!(">{}", global_col - m - main_cols)
     }
+}
+
+fn ascii_col_header_label(global_col: usize, main_cols: usize) -> String {
+    crate::addr::ui_column_fragment(global_col, main_cols)
 }
 
 /// With margins: [A / B / ]C (same in Generic; labeled-column titles appear on the `~1` control row).
@@ -965,6 +977,36 @@ fn rendered_value_at(grid: &Grid, logical_row: usize, global_col: usize) -> Stri
     let addr = cur.to_addr(grid);
     let text = crate::ui::tsv_effective_unformatted_string(grid, logical_row, global_col);
     crate::ui::format_cell_display(grid, &addr, text)
+}
+
+fn rendered_value_at_ascii(grid: &Grid, logical_row: usize, global_col: usize) -> String {
+    let hr = HEADER_ROWS;
+    let mr = grid.main_rows();
+    let lm = MARGIN_COLS;
+
+    if logical_row >= hr && logical_row < hr + mr && global_col < lm {
+        let main_row = logical_row - hr;
+        let addr = CellAddr::Left {
+            col: global_col,
+            row: main_row as u32,
+        };
+        let raw = grid.text(&addr);
+        if crate::ods::subtotal_code_for_label(&raw).is_some() {
+            return raw;
+        }
+    }
+    if logical_row >= hr + mr && global_col == lm - 1 {
+        let footer_row = logical_row - hr - mr;
+        let addr = CellAddr::Footer {
+            row: footer_row as u32,
+            col: (lm - 1) as u32,
+        };
+        let raw = grid.text(&addr);
+        if crate::ods::subtotal_code_for_label(&raw).is_some() {
+            return raw;
+        }
+    }
+    rendered_value_at(grid, logical_row, global_col)
 }
 
 /// What one cell would be in TSV/CSV/ASCII for the given [ExportContent] and (for Generic) the
@@ -1522,6 +1564,35 @@ mod tests {
         assert!(!s.contains(">9"));
         assert!(s.contains("Aasdf"));
         assert!(s.contains("adsf"));
+    }
+
+    #[test]
+    fn ascii_headers_use_ui_margin_notation() {
+        let mut g = crate::grid::Grid::new(1, 1);
+        g.set(&CellAddr::Left { row: 0, col: 0 }, "L".into());
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "1".into());
+        let gb = crate::grid::GridBox::from(g);
+        let mut out = Vec::new();
+        export_ascii_table(&gb, &mut out, false);
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("[A"), "expected UI-style left margin header, got {s}");
+        assert!(!s.contains("<0"), "legacy <0 header should not appear, got {s}");
+    }
+
+    #[test]
+    fn ascii_values_keep_bare_total_label_in_left_key_column() {
+        let mut g = crate::grid::Grid::new(3, 1);
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "1".into());
+        g.set(&CellAddr::Main { row: 1, col: 0 }, "2".into());
+        g.set(&CellAddr::Left { row: 2, col: MARGIN_COLS - 1 }, "TOTAL".into());
+        let gb = crate::grid::GridBox::from(g);
+        let mut out = Vec::new();
+        export_ascii_table(&gb, &mut out, false);
+        let s = String::from_utf8(out).unwrap();
+        assert!(
+            s.contains("TOTAL"),
+            "left key label should stay TOTAL in ASCII output: {s}"
+        );
     }
 
     #[test]
