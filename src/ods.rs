@@ -3,10 +3,11 @@
 use crate::addr::excel_column_name;
 use crate::export::{self, DelimitedExportOptions, ExportContent};
 use crate::formula::{cell_effective_display, is_formula, rebase_interop_formula_row_col};
-use crate::grid::{CellAddr, GridBox as Grid, HEADER_ROWS, MARGIN_COLS};
+use crate::grid::{CellAddr, CellFormat, GridBox as Grid, NumberFormat, TextAlign, HEADER_ROWS, MARGIN_COLS};
 use crate::ops::{SheetRecord, SheetState, WorkbookSnapshot, WorkbookState};
 use quick_xml::events::Event;
 use quick_xml::Reader;
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::Path;
 use thiserror::Error;
@@ -471,7 +472,153 @@ fn ods_column_styles_tsv(
 }
 
 const ODS_CONTENT_XML_PREFIX: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
-<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:of="urn:oasis:names:tc:opendocument:xmlns:of:1.2" office:version="1.2"><office:automatic-styles>"#;
+<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:of="urn:oasis:names:tc:opendocument:xmlns:of:1.2" xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0" xmlns:number="urn:oasis:names:tc:opendocument:xmlns:datastyle:1.0" office:version="1.2"><office:automatic-styles>"#;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd)]
+struct OdsTuiFlags {
+    agg_cyan: bool,
+    footer_bold: bool,
+    underlined_boundary_row: bool,
+    left_vertical_divider: bool,
+    right_vertical_divider: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+enum OdsHorizontalAlign {
+    Left,
+    Center,
+    Right,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+enum OdsNumberStyleKey {
+    Fixed { decimals: usize },
+    Currency { decimals: usize },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct OdsCellStyleKey {
+    number: Option<OdsNumberStyleKey>,
+    align: Option<OdsHorizontalAlign>,
+    agg_cyan: bool,
+    footer_bold: bool,
+    underlined_boundary_row: bool,
+    left_vertical_divider: bool,
+    right_vertical_divider: bool,
+}
+
+impl OdsCellStyleKey {
+    fn is_default(self) -> bool {
+        self.number.is_none()
+            && self.align.is_none()
+            && !self.agg_cyan
+            && !self.footer_bold
+            && !self.underlined_boundary_row
+            && !self.left_vertical_divider
+            && !self.right_vertical_divider
+    }
+}
+
+#[derive(Default)]
+struct OdsStyleRegistry {
+    number_styles: BTreeMap<OdsNumberStyleKey, String>,
+    cell_styles: BTreeMap<OdsCellStyleKey, String>,
+    next_number_style: usize,
+    next_cell_style: usize,
+}
+
+impl OdsStyleRegistry {
+    fn cell_style_name(&mut self, key: OdsCellStyleKey) -> Option<String> {
+        if key.is_default() {
+            return None;
+        }
+        if let Some(nk) = key.number {
+            let _ = self.number_style_name(nk);
+        }
+        if let Some(n) = self.cell_styles.get(&key) {
+            return Some(n.clone());
+        }
+        self.next_cell_style += 1;
+        let name = format!("ce{}", self.next_cell_style);
+        self.cell_styles.insert(key, name.clone());
+        Some(name)
+    }
+
+    fn number_style_name(&mut self, key: OdsNumberStyleKey) -> String {
+        if let Some(n) = self.number_styles.get(&key) {
+            return n.clone();
+        }
+        self.next_number_style += 1;
+        let name = format!("ns{}", self.next_number_style);
+        self.number_styles.insert(key, name.clone());
+        name
+    }
+
+    fn xml(&self) -> String {
+        let mut out = String::new();
+        for (key, name) in &self.number_styles {
+            match key {
+                OdsNumberStyleKey::Fixed { decimals } => out.push_str(&format!(
+                    r#"<number:number-style style:name="{name}"><number:number number:min-integer-digits="1" number:decimal-places="{decimals}" number:min-decimal-places="{decimals}"/></number:number-style>"#
+                )),
+                OdsNumberStyleKey::Currency { decimals } => out.push_str(&format!(
+                    r#"<number:currency-style style:name="{name}"><number:currency-symbol>$</number:currency-symbol><number:number number:min-integer-digits="1" number:decimal-places="{decimals}" number:min-decimal-places="{decimals}"/></number:currency-style>"#
+                )),
+            }
+        }
+        for (key, name) in &self.cell_styles {
+            let data_style_name = key.number.and_then(|n| self.number_styles.get(&n).cloned());
+            let data_attr = data_style_name
+                .as_deref()
+                .map(|n| format!(r#" style:data-style-name="{n}""#))
+                .unwrap_or_default();
+            let mut props = String::new();
+            if key.underlined_boundary_row {
+                props.push_str(r#" fo:border-bottom="0.018cm solid #6b7280""#);
+            }
+            if key.left_vertical_divider {
+                props.push_str(r#" fo:border-right="0.018cm solid #6b7280""#);
+            }
+            if key.right_vertical_divider {
+                props.push_str(r#" fo:border-right="0.018cm solid #6b7280""#);
+            }
+            let table_props = if props.is_empty() {
+                String::new()
+            } else {
+                format!(r#"<style:table-cell-properties{props}/>"#)
+            };
+
+            let mut text_props = String::new();
+            if key.agg_cyan {
+                text_props.push_str(r##" fo:color="#00bcd4""##);
+            }
+            if key.footer_bold {
+                text_props.push_str(r#" fo:font-weight="bold" style:font-weight-asian="bold" style:font-weight-complex="bold""#);
+            }
+            let text_props = if text_props.is_empty() {
+                String::new()
+            } else {
+                format!(r#"<style:text-properties{text_props}/>"#)
+            };
+            let paragraph_props = match key.align {
+                Some(OdsHorizontalAlign::Left) => {
+                    r#"<style:paragraph-properties fo:text-align="start"/>"#.to_string()
+                }
+                Some(OdsHorizontalAlign::Center) => {
+                    r#"<style:paragraph-properties fo:text-align="center"/>"#.to_string()
+                }
+                Some(OdsHorizontalAlign::Right) => {
+                    r#"<style:paragraph-properties fo:text-align="end"/>"#.to_string()
+                }
+                None => String::new(),
+            };
+            out.push_str(&format!(
+                r#"<style:style style:name="{name}" style:family="table-cell"{data_attr}>{table_props}{text_props}{paragraph_props}</style:style>"#
+            ));
+        }
+        out
+    }
+}
 
 /// One `table:table` and its `table:column` definitions, rows/cells. `table_name` sets `table:name`
 /// (sheet tab in Calc); `None` keeps the legacy single-table export (no `table:name` attribute).
@@ -483,7 +630,7 @@ fn ods_table_fragment_tsv_shaped(
     data_rows: &[usize],
     column_style_naming: OdsColumnStyleNaming,
     table_name: Option<&str>,
-) -> String {
+) -> (String, String) {
     let export_content = options.content;
     let generic_tsv_rebase = if export_content == ExportContent::Generic {
         Some(export::delimited_options_generic_rebase(grid, options))
@@ -497,6 +644,20 @@ fn ods_table_fragment_tsv_shaped(
         .unwrap_or(1)
         .max(1);
     let mut s = String::new();
+    let mut styles = OdsStyleRegistry::default();
+    let last_display_main_row = data_rows
+        .iter()
+        .copied()
+        .filter(|r| *r >= HEADER_ROWS && *r < HEADER_ROWS + grid.main_rows())
+        .max();
+    let export_main_has_left = (0..tc).any(|c| {
+        let gc = col_start + c.saturating_sub(if options.include_row_label_column { 1 } else { 0 });
+        gc == MARGIN_COLS
+    });
+    let export_has_right_margin = (0..tc).any(|c| {
+        let gc = col_start + c.saturating_sub(if options.include_row_label_column { 1 } else { 0 });
+        gc == MARGIN_COLS + grid.main_cols()
+    });
     match table_name {
         None => s.push_str("<table:table>"),
         Some(n) => {
@@ -525,19 +686,29 @@ fn ods_table_fragment_tsv_shaped(
                 let data_i = if options.include_header_row { i - 1 } else { i };
                 let logical = data_rows.get(data_i).copied().unwrap_or(HEADER_ROWS);
                 let global = col_start + j.saturating_sub(rk);
+                let flags = ods_tui_flags(
+                    grid,
+                    logical,
+                    global,
+                    last_display_main_row,
+                    export_main_has_left,
+                    export_has_right_margin,
+                );
                 s.push_str(&ods_cell_xml(
                     grid,
                     logical,
                     global,
                     export_content,
                     generic_tsv_rebase,
+                    &mut styles,
+                    flags,
                 ));
             }
         }
         s.push_str("</table:table-row>");
     }
     s.push_str("</table:table>");
-    s
+    (s, styles.xml())
 }
 
 fn ods_workbook_content_xml_tsv_shaped(
@@ -545,6 +716,7 @@ fn ods_workbook_content_xml_tsv_shaped(
     options: &DelimitedExportOptions,
 ) -> (String, String) {
     let mut column_styles = String::new();
+    let mut cell_styles = String::new();
     let mut tables = String::new();
     let mut blocks: Vec<String> = Vec::new();
 
@@ -584,7 +756,7 @@ fn ods_workbook_content_xml_tsv_shaped(
                 t.to_string()
             }
         };
-        tables.push_str(&ods_table_fragment_tsv_shaped(
+        let (table, styles) = ods_table_fragment_tsv_shaped(
             g,
             &matrix,
             options,
@@ -592,11 +764,13 @@ fn ods_workbook_content_xml_tsv_shaped(
             &data_rows,
             naming,
             Some(&title),
-        ));
+        );
+        tables.push_str(&table);
+        cell_styles.push_str(&styles);
     }
 
     let content = format!(
-        "{ODS_CONTENT_XML_PREFIX}{column_styles}</office:automatic-styles><office:body><office:spreadsheet>{tables}</office:spreadsheet></office:body></office:document-content>"
+        "{ODS_CONTENT_XML_PREFIX}{column_styles}{cell_styles}</office:automatic-styles><office:body><office:spreadsheet>{tables}</office:spreadsheet></office:body></office:document-content>"
     );
     (content, corro_ods_layout_v2(&blocks))
 }
@@ -624,7 +798,7 @@ fn ods_content_xml_tsv_shaped(
         options.include_row_label_column,
         OdsColumnStyleNaming::Legacy,
     );
-    let table = ods_table_fragment_tsv_shaped(
+    let (table, cell_styles) = ods_table_fragment_tsv_shaped(
         grid,
         matrix,
         options,
@@ -634,7 +808,7 @@ fn ods_content_xml_tsv_shaped(
         None,
     );
     format!(
-        "{ODS_CONTENT_XML_PREFIX}{column_styles}</office:automatic-styles><office:body><office:spreadsheet>{table}</office:spreadsheet></office:body></office:document-content>"
+        "{ODS_CONTENT_XML_PREFIX}{column_styles}{cell_styles}</office:automatic-styles><office:body><office:spreadsheet>{table}</office:spreadsheet></office:body></office:document-content>"
     )
 }
 
@@ -643,7 +817,7 @@ fn ods_cell_from_export_matrix_string(s: &str, export_content: ExportContent) ->
         return "<table:table-cell/>".into();
     }
     match export_content {
-        ExportContent::Values => ods_cell_xml_values_only(s, s, s),
+        ExportContent::Values => ods_cell_xml_values_only(s, s, s, None),
         ExportContent::Formulas => {
             if s.trim().starts_with('=') || is_formula(s) {
                 let formula = ods_formula_expr(s).unwrap_or_else(|| s.to_string());
@@ -658,7 +832,7 @@ fn ods_cell_from_export_matrix_string(s: &str, export_content: ExportContent) ->
                     ods_escape(s)
                 );
             }
-            ods_cell_xml_values_only(s, s, s)
+            ods_cell_xml_values_only(s, s, s, None)
         }
         ExportContent::Generic => {
             let tsv = s;
@@ -675,7 +849,7 @@ fn ods_cell_from_export_matrix_string(s: &str, export_content: ExportContent) ->
                     ods_escape(&tsv)
                 );
             }
-            ods_cell_xml_values_only(&tsv, &tsv, &tsv)
+            ods_cell_xml_values_only(&tsv, &tsv, &tsv, None)
         }
     }
 }
@@ -686,13 +860,23 @@ fn ods_cell_xml(
     global_col: usize,
     export_content: ExportContent,
     generic_tsv_rebase: Option<(i32, i32)>,
+    styles: &mut OdsStyleRegistry,
+    flags: OdsTuiFlags,
 ) -> String {
     let hr = HEADER_ROWS;
     let mr = grid.main_rows();
     let mc = grid.main_cols();
     let addr = ods_cell_addr(grid, logical_row, global_col);
     let raw = grid.text(&addr);
-    let display = cell_effective_display(grid, &addr);
+    let display = export::export_cell_text(
+        grid,
+        logical_row,
+        global_col,
+        ExportContent::Values,
+        None,
+        true,
+    );
+    let style_attr = ods_cell_style_attr(styles, grid, &addr, &display, flags);
 
     let value = if logical_row < hr {
         header_formula_or_value(grid, logical_row, global_col, mc)
@@ -706,7 +890,7 @@ fn ods_cell_xml(
         if value.is_empty() && raw.is_empty() {
             return "<table:table-cell/>".into();
         }
-        return ods_cell_xml_values_only(&display, &value, &raw);
+        return ods_cell_xml_values_only(&display, &value, &raw, style_attr.as_deref());
     }
     // Generic: same interop `=…` as TSV generic after rebase, but ODF `;` list separators (not `,`),
     // or LibreOffice reports Err:508 in `of:` / <text:p>.
@@ -729,13 +913,14 @@ fn ods_cell_xml(
                 Err(_) => r#" office:value-type="string""#.to_string(),
             };
             return format!(
-                r#"<table:table-cell{} table:formula="of:{}"><text:p>{}</text:p></table:table-cell>"#,
+                r#"<table:table-cell{}{} table:formula="of:{}"><text:p>{}</text:p></table:table-cell>"#,
+                style_attr.as_deref().unwrap_or(""),
                 value_attrs,
                 ods_escape(&formula),
                 ods_escape(&odf)
             );
         }
-        return ods_cell_xml_values_only(&odf, &odf, &odf);
+        return ods_cell_xml_values_only(&odf, &odf, &odf, style_attr.as_deref());
     }
     if value.is_empty() && raw.is_empty() {
         return "<table:table-cell/>".into();
@@ -748,21 +933,28 @@ fn ods_cell_xml(
             Err(_) => r#" office:value-type="string""#.to_string(),
         };
         format!(
-            r#"<table:table-cell{} table:formula="of:{}"><text:p>{}</text:p></table:table-cell>"#,
+            r#"<table:table-cell{}{} table:formula="of:{}"><text:p>{}</text:p></table:table-cell>"#,
+            style_attr.as_deref().unwrap_or(""),
             value_attrs,
             ods_escape(&formula),
             ods_escape(&display)
         )
     } else {
         format!(
-            r#"<table:table-cell office:value-type="string"><text:p>{}</text:p></table:table-cell>"#,
+            r#"<table:table-cell{} office:value-type="string"><text:p>{}</text:p></table:table-cell>"#,
+            style_attr.as_deref().unwrap_or(""),
             ods_escape(if display.is_empty() { &value } else { &display })
         )
     }
 }
 
 /// Static ODF cell: `display` is preferred (evaluated for formulas), then `value` / `raw`.
-fn ods_cell_xml_values_only(display: &str, value: &str, raw: &str) -> String {
+fn ods_cell_xml_values_only(
+    display: &str,
+    value: &str,
+    raw: &str,
+    style_attr: Option<&str>,
+) -> String {
     let show = if !display.is_empty() {
         display
     } else if !value.is_empty() {
@@ -775,14 +967,379 @@ fn ods_cell_xml_values_only(display: &str, value: &str, raw: &str) -> String {
     }
     if let Ok(n) = show.trim().parse::<f64>() {
         return format!(
-            r#"<table:table-cell office:value-type="float" office:value="{n}"><text:p>{}</text:p></table:table-cell>"#,
+            r#"<table:table-cell{} office:value-type="float" office:value="{n}"><text:p>{}</text:p></table:table-cell>"#,
+            style_attr.unwrap_or(""),
             ods_escape(show)
         );
     }
     format!(
-        r#"<table:table-cell office:value-type="string"><text:p>{}</text:p></table:table-cell>"#,
+        r#"<table:table-cell{} office:value-type="string"><text:p>{}</text:p></table:table-cell>"#,
+        style_attr.unwrap_or(""),
         ods_escape(show)
     )
+}
+
+fn ods_cell_style_attr(
+    styles: &mut OdsStyleRegistry,
+    grid: &Grid,
+    addr: &CellAddr,
+    display: &str,
+    flags: OdsTuiFlags,
+) -> Option<String> {
+    let fmt = grid.format_for_addr(addr);
+    let number = match fmt.number {
+        Some(NumberFormat::Fixed { decimals }) => Some(OdsNumberStyleKey::Fixed { decimals }),
+        Some(NumberFormat::Currency { decimals }) => Some(OdsNumberStyleKey::Currency { decimals }),
+        None => None,
+    };
+    let align = effective_ods_align(fmt, display);
+    let key = OdsCellStyleKey {
+        number,
+        align,
+        agg_cyan: flags.agg_cyan,
+        footer_bold: flags.footer_bold,
+        underlined_boundary_row: flags.underlined_boundary_row,
+        left_vertical_divider: flags.left_vertical_divider,
+        right_vertical_divider: flags.right_vertical_divider,
+    };
+    styles
+        .cell_style_name(key)
+        .map(|name| format!(r#" table:style-name="{name}""#))
+}
+
+fn effective_ods_align(fmt: CellFormat, display: &str) -> Option<OdsHorizontalAlign> {
+    match fmt.align {
+        Some(TextAlign::Left) => Some(OdsHorizontalAlign::Left),
+        Some(TextAlign::Center) => Some(OdsHorizontalAlign::Center),
+        Some(TextAlign::Right) => Some(OdsHorizontalAlign::Right),
+        Some(TextAlign::Default) => None,
+        None => {
+            if fmt.number.is_some() || display.trim().parse::<f64>().is_ok() {
+                Some(OdsHorizontalAlign::Right)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn parse_num(s: &str) -> Option<f64> {
+    let t = s.trim();
+    if t.is_empty() {
+        return None;
+    }
+    t.parse::<f64>().ok()
+}
+
+fn fold_numbers(func: crate::ops::AggFunc, xs: &[f64]) -> String {
+    if xs.is_empty() {
+        return String::new();
+    }
+    match func {
+        crate::ops::AggFunc::Sum => format!("{}", xs.iter().sum::<f64>()),
+        crate::ops::AggFunc::Mean => format!("{}", xs.iter().sum::<f64>() / xs.len() as f64),
+        crate::ops::AggFunc::Median => {
+            let mut ys = xs.to_vec();
+            ys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let n = ys.len();
+            let m = if n % 2 == 1 {
+                ys[n / 2]
+            } else {
+                (ys[n / 2 - 1] + ys[n / 2]) / 2.0
+            };
+            format!("{m}")
+        }
+        crate::ops::AggFunc::Min => xs
+            .iter()
+            .copied()
+            .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|v| format!("{v}"))
+            .unwrap_or_default(),
+        crate::ops::AggFunc::Max => xs
+            .iter()
+            .copied()
+            .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|v| format!("{v}"))
+            .unwrap_or_default(),
+        crate::ops::AggFunc::Count => format!("{}", xs.len()),
+    }
+}
+
+fn footer_row_agg_func(grid: &Grid, footer_row_idx: usize) -> Option<crate::ops::AggFunc> {
+    let key_col = (MARGIN_COLS - 1) as u32;
+    let val = grid.get(&CellAddr::Footer {
+        row: footer_row_idx as u32,
+        col: key_col,
+    })?;
+    match val.trim().to_uppercase().as_str() {
+        "TOTAL" | "SUM" => Some(crate::ops::AggFunc::Sum),
+        "MEAN" | "AVERAGE" | "AVG" => Some(crate::ops::AggFunc::Mean),
+        "MEDIAN" => Some(crate::ops::AggFunc::Median),
+        "MIN" | "MINIMUM" => Some(crate::ops::AggFunc::Min),
+        "MAX" | "MAXIMUM" => Some(crate::ops::AggFunc::Max),
+        "COUNT" => Some(crate::ops::AggFunc::Count),
+        _ => None,
+    }
+}
+
+fn right_col_agg_func(grid: &Grid, global_col: usize) -> Option<crate::ops::AggFunc> {
+    let mut labels: Vec<(u32, String)> = grid
+        .iter_nonempty()
+        .filter_map(|(addr, val)| match addr {
+            CellAddr::Header { row, col } if col as usize == global_col => Some((row, val)),
+            _ => None,
+        })
+        .collect();
+    labels.sort_unstable_by_key(|(row, _)| *row);
+    for (_, val) in labels {
+        match val.trim().to_uppercase().as_str() {
+            "TOTAL" | "SUM" => return Some(crate::ops::AggFunc::Sum),
+            "MEAN" | "AVERAGE" | "AVG" => return Some(crate::ops::AggFunc::Mean),
+            "MEDIAN" => return Some(crate::ops::AggFunc::Median),
+            "MIN" | "MINIMUM" => return Some(crate::ops::AggFunc::Min),
+            "MAX" | "MAXIMUM" => return Some(crate::ops::AggFunc::Max),
+            "COUNT" => return Some(crate::ops::AggFunc::Count),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn left_margin_agg_func(grid: &Grid, main_row: u32) -> Option<crate::ops::AggFunc> {
+    let key_col = MARGIN_COLS - 1;
+    let val = grid.get(&CellAddr::Left {
+        col: key_col,
+        row: main_row,
+    })?;
+    match val.trim().to_uppercase().as_str() {
+        "TOTAL" | "SUM" => Some(crate::ops::AggFunc::Sum),
+        "MEAN" | "AVERAGE" | "AVG" => Some(crate::ops::AggFunc::Mean),
+        "MEDIAN" => Some(crate::ops::AggFunc::Median),
+        "MIN" | "MINIMUM" => Some(crate::ops::AggFunc::Min),
+        "MAX" | "MAXIMUM" => Some(crate::ops::AggFunc::Max),
+        "COUNT" => Some(crate::ops::AggFunc::Count),
+        _ => None,
+    }
+}
+
+fn data_main_col_count(grid: &Grid) -> usize {
+    let mut c = grid.main_cols();
+    while c > 0 {
+        let has = (0..grid.main_rows()).any(|r| {
+            !grid
+                .text(&CellAddr::Main {
+                    row: r as u32,
+                    col: (c - 1) as u32,
+                })
+                .trim()
+                .is_empty()
+        });
+        if has {
+            break;
+        }
+        c -= 1;
+    }
+    c.max(1)
+}
+
+fn previous_raw_block(grid: &Grid, current_main_row: u32) -> Option<(u32, u32)> {
+    if current_main_row == 0 {
+        return None;
+    }
+    let mut end = current_main_row;
+    while end > 0 {
+        let row = end - 1;
+        if left_margin_agg_func(grid, row).is_some() {
+            end = row;
+        } else {
+            break;
+        }
+    }
+    if end == 0 {
+        return None;
+    }
+    let mut start = 0u32;
+    for r in (0..end).rev() {
+        if left_margin_agg_func(grid, r).is_some() {
+            start = r + 1;
+            break;
+        }
+    }
+    if start < end {
+        Some((start, end))
+    } else {
+        None
+    }
+}
+
+fn left_margin_main_col_aggregate(
+    grid: &Grid,
+    subtotal_func: crate::ops::AggFunc,
+    main_row: u32,
+    main_col: u32,
+) -> String {
+    let row_start = row_total_block_start(grid, main_row);
+    let row_end = main_row;
+    crate::agg::compute_aggregate(
+        grid,
+        &crate::ops::AggregateDef {
+            func: subtotal_func,
+            source: crate::grid::MainRange {
+                row_start,
+                row_end,
+                col_start: main_col,
+                col_end: main_col + 1,
+            },
+        },
+    )
+}
+
+fn left_margin_special_col_aggregate(
+    grid: &Grid,
+    subtotal_func: crate::ops::AggFunc,
+    global_col: usize,
+    row_start: u32,
+    row_end: u32,
+    data_cols: usize,
+) -> Option<String> {
+    let row_func = right_col_agg_func(grid, global_col)?;
+    let mut samples: Vec<f64> = Vec::new();
+    for r in row_start..row_end {
+        let row_val = crate::agg::compute_aggregate(
+            grid,
+            &crate::ops::AggregateDef {
+                func: row_func,
+                source: crate::grid::MainRange {
+                    row_start: r,
+                    row_end: r + 1,
+                    col_start: 0,
+                    col_end: data_cols as u32,
+                },
+            },
+        );
+        if let Some(n) = parse_num(&row_val) {
+            samples.push(n);
+        }
+    }
+    Some(fold_numbers(subtotal_func, &samples))
+}
+
+fn footer_special_col_aggregate(
+    grid: &Grid,
+    footer_func: crate::ops::AggFunc,
+    global_col: usize,
+    main_rows: usize,
+    main_cols: usize,
+) -> Option<String> {
+    let row_func = right_col_agg_func(grid, global_col);
+    let data_cols = data_main_col_count(grid);
+    let mut samples: Vec<f64> = Vec::new();
+    for r in 0..main_rows {
+        let row_val = if let Some(func) = row_func {
+            crate::agg::compute_aggregate(
+                grid,
+                &crate::ops::AggregateDef {
+                    func,
+                    source: crate::grid::MainRange {
+                        row_start: r as u32,
+                        row_end: r as u32 + 1,
+                        col_start: 0,
+                        col_end: data_cols as u32,
+                    },
+                },
+            )
+        } else if global_col < MARGIN_COLS {
+            String::new()
+        } else if global_col < MARGIN_COLS + main_cols {
+            cell_effective_display(
+                grid,
+                &CellAddr::Main {
+                    row: r as u32,
+                    col: (global_col - MARGIN_COLS) as u32,
+                },
+            )
+        } else {
+            cell_effective_display(
+                grid,
+                &CellAddr::Right {
+                    col: global_col - MARGIN_COLS - main_cols,
+                    row: r as u32,
+                },
+            )
+        };
+        if let Some(n) = parse_num(&row_val) {
+            samples.push(n);
+        }
+    }
+    Some(fold_numbers(footer_func, &samples))
+}
+
+fn ods_tui_flags(
+    grid: &Grid,
+    logical_row: usize,
+    global_col: usize,
+    last_display_main_row: Option<usize>,
+    export_main_has_left: bool,
+    export_has_right_margin: bool,
+) -> OdsTuiFlags {
+    let hr = HEADER_ROWS;
+    let mr = grid.main_rows();
+    let lm = MARGIN_COLS;
+    let mc = grid.main_cols();
+    let is_underlined_boundary_row =
+        (hr > 0 && logical_row == hr - 1) || last_display_main_row == Some(logical_row);
+    let footer_agg = if logical_row >= hr + mr {
+        footer_row_agg_func(grid, logical_row - hr - mr)
+    } else {
+        None
+    };
+    let main_row_idx = if logical_row >= hr && logical_row < hr + mr {
+        Some((logical_row - hr) as u32)
+    } else {
+        None
+    };
+    let left_margin_agg = main_row_idx.and_then(|mri| left_margin_agg_func(grid, mri));
+    let left_margin_block_start = main_row_idx.map(|mri| row_total_block_start(grid, mri));
+    let right_col_agg = right_col_agg_func(grid, global_col);
+    let mut is_agg_cell = false;
+    if let Some(func) = footer_agg {
+        if right_col_agg.is_some() {
+            is_agg_cell = footer_special_col_aggregate(grid, func, global_col, mr, mc).is_some();
+        } else if global_col >= lm && global_col < lm + mc {
+            is_agg_cell = true;
+        }
+    } else if let (Some(func), Some(block_start), Some(main_row)) =
+        (left_margin_agg, left_margin_block_start, main_row_idx)
+    {
+        if global_col >= lm && global_col < lm + mc {
+            is_agg_cell = true;
+            if right_col_agg.is_some() {
+                let data_cols = data_main_col_count(grid);
+                let (row_start, row_end) = if block_start < main_row {
+                    (block_start, main_row)
+                } else {
+                    previous_raw_block(grid, main_row).unwrap_or((0, main_row))
+                };
+                let _ = left_margin_special_col_aggregate(
+                    grid, func, global_col, row_start, row_end, data_cols,
+                );
+            } else {
+                let main_col = (global_col - lm) as u32;
+                let _ = left_margin_main_col_aggregate(grid, func, main_row, main_col);
+            }
+        } else if right_col_agg.is_some() {
+            is_agg_cell = true;
+        }
+    } else if logical_row >= hr && logical_row < hr + mr && right_col_agg.is_some() {
+        is_agg_cell = true;
+    }
+    OdsTuiFlags {
+        agg_cyan: is_agg_cell,
+        footer_bold: is_agg_cell && footer_agg.is_some(),
+        underlined_boundary_row: is_underlined_boundary_row,
+        left_vertical_divider: global_col == lm - 1 && lm > 0 && export_main_has_left,
+        right_vertical_divider: global_col == lm + mc - 1 && export_has_right_margin,
+    }
 }
 
 fn ods_cell_addr(grid: &Grid, logical_row: usize, global_col: usize) -> CellAddr {
@@ -1800,6 +2357,82 @@ mod tests {
         assert!(content.contains(r#"style:style style:name="co0" style:family="table-column""#));
         assert!(content.contains(r#"style:column-width=""#));
         assert!(content.contains(r#"table:style-name="co0""#));
+    }
+
+    #[test]
+    fn export_values_uses_tsv_rendered_display_for_aggregates() {
+        let mut grid = crate::grid::Grid::new(2, 1);
+        grid.set(&CellAddr::Main { row: 0, col: 0 }, "2".into());
+        grid.set(&CellAddr::Main { row: 1, col: 0 }, "3".into());
+        grid.set(
+            &CellAddr::Footer {
+                row: 0,
+                col: (MARGIN_COLS - 1) as u32,
+            },
+            "TOTAL".into(),
+        );
+        let gb = crate::grid::GridBox::from(grid);
+        let opts = DelimitedExportOptions {
+            content: ExportContent::Values,
+            ..Default::default()
+        };
+        let content = exported_content_xml_with_options(&gb, &opts);
+        assert!(
+            content.contains("<text:p>5</text:p>"),
+            "footer aggregate should be exported as rendered value, got {content}"
+        );
+    }
+
+    #[test]
+    fn export_emits_cell_number_and_tui_decoration_styles() {
+        let mut grid = crate::grid::Grid::new(2, 1);
+        grid.set(&CellAddr::Main { row: 0, col: 0 }, "2".into());
+        grid.set(&CellAddr::Main { row: 1, col: 0 }, "3".into());
+        grid.set(
+            &CellAddr::Footer {
+                row: 0,
+                col: (MARGIN_COLS - 1) as u32,
+            },
+            "TOTAL".into(),
+        );
+        grid.set_column_format(
+            crate::grid::FormatScope::Data,
+            MARGIN_COLS,
+            crate::grid::CellFormat {
+                number: Some(crate::grid::NumberFormat::Currency { decimals: 2 }),
+                align: Some(crate::grid::TextAlign::Right),
+            },
+        );
+        let gb = crate::grid::GridBox::from(grid);
+        let opts = DelimitedExportOptions {
+            content: ExportContent::Values,
+            ..Default::default()
+        };
+        let content = exported_content_xml_with_options(&gb, &opts);
+        assert!(
+            content.contains("number:currency-style"),
+            "expected currency data style in content.xml"
+        );
+        assert!(
+            content.contains("style:data-style-name"),
+            "expected cell style to reference a data style"
+        );
+        assert!(
+            content.contains(r##"fo:color="#00bcd4""##),
+            "expected aggregate cyan text style"
+        );
+        assert!(
+            content.contains(r#"fo:font-weight="bold""#),
+            "expected footer aggregate bold style"
+        );
+        assert!(
+            content.contains(r#"fo:border-bottom="0.018cm solid #6b7280""#),
+            "expected boundary underline border style"
+        );
+        assert!(
+            content.contains(r#"fo:border-right="0.018cm solid #6b7280""#),
+            "expected vertical divider border style"
+        );
     }
 
     #[test]
