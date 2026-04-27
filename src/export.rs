@@ -541,6 +541,9 @@ fn finish_generic_interop(s: String, rebase: Option<(i32, i32)>) -> String {
 
 /// Deltas for [`formula::rebase_interop_formula_row_col`]: the exported TSV/CSV/ASCII file’s
 /// top-left cell (line 0, field 0) is treated as Excel A1, so all `=…` refs shift by these.
+///
+/// ODS re-import: apply the **inverse** shift (`-d_row, -d_col`) to `of:` bodies so they match
+/// Corro’s grid A1 again (see [`crate::ods::set_ods_cell_tsv_parity`]).
 fn delimited_generic_rebase(
     col_start: usize,
     col_end: usize,
@@ -563,6 +566,24 @@ fn delimited_generic_rebase(
         .map(|j| base + j as i32)
         .unwrap_or(0);
     (d_row, d_col)
+}
+
+/// Re-export the same rebase the ODS/TSV `corro-ods-layout` block was built with, so the importer
+/// can run [`crate::formula::rebase_interop_formula_row_col`] with negated `(d_row, d_col)`.
+pub fn delimited_layout_generic_rebase(
+    col_start: usize,
+    col_end: usize,
+    include_header_row: bool,
+    include_row_label_column: bool,
+    data_logical_rows: &[usize],
+) -> (i32, i32) {
+    delimited_generic_rebase(
+        col_start,
+        col_end,
+        include_header_row,
+        include_row_label_column,
+        data_logical_rows,
+    )
 }
 
 fn selection_generic_rebase(

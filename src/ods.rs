@@ -2,7 +2,7 @@
 
 use crate::addr::excel_column_name;
 use crate::export::{self, DelimitedExportOptions, ExportContent};
-use crate::formula::{cell_effective_display, is_formula};
+use crate::formula::{cell_effective_display, is_formula, rebase_interop_formula_row_col};
 use crate::grid::{CellAddr, GridBox as Grid, HEADER_ROWS, MARGIN_COLS};
 use crate::ops::{SheetRecord, SheetState, WorkbookSnapshot, WorkbookState};
 use quick_xml::events::Event;
@@ -72,9 +72,12 @@ enum OdsTableLayout {
     /// `(data_logical_rows[odf_r - header_ods], col_start + odf_c - row_key)`.
     TsvParity {
         col_start: usize,
+        col_end: usize,
         data_logical_rows: Vec<usize>,
         header_ods_rows: usize,
         row_key_cols: usize,
+        /// Main column count on export (enables re-import to classify B vs first right-marginal col).
+        export_main_cols: Option<usize>,
     },
 }
 
@@ -93,6 +96,7 @@ impl OdsTableLayout {
                 data_logical_rows,
                 header_ods_rows,
                 row_key_cols,
+                ..
             } => {
                 if odf_table_row < *header_ods_rows {
                     return None;
@@ -131,39 +135,45 @@ impl OdsTableLayout {
 }
 
 /// Body of a `tsv` layout block: numbers only (no `v1` / `tsv` header).
+/// Trailing `export_main_cols` helps ODS re-import classify B vs the first right-marginal column
+/// when `main_cols()` in the in-progress grid is still 1.
 fn corro_ods_layout_tsv_parity_block_lines(
     col_start: usize,
-    _col_end: usize,
+    col_end: usize,
     header_ods_rows: usize,
     row_key_cols: usize,
     data_logical_rows: &[usize],
+    export_main_cols: usize,
 ) -> String {
     use std::fmt::Write;
     let mut s = String::new();
     let _ = writeln!(&mut s, "{}", col_start);
-    let _ = writeln!(&mut s, "{}", _col_end);
+    let _ = writeln!(&mut s, "{}", col_end);
     let _ = writeln!(&mut s, "{}", header_ods_rows);
     let _ = writeln!(&mut s, "{}", row_key_cols);
     let _ = writeln!(&mut s, "{}", data_logical_rows.len());
     for r in data_logical_rows {
         let _ = writeln!(s, "{}", r);
     }
+    let _ = writeln!(&mut s, "{}", export_main_cols);
     s
 }
 
 fn corro_ods_layout_tsv_parity(
     col_start: usize,
-    _col_end: usize,
+    col_end: usize,
     header_ods_rows: usize,
     row_key_cols: usize,
     data_logical_rows: &[usize],
+    export_main_cols: usize,
 ) -> String {
     let block = corro_ods_layout_tsv_parity_block_lines(
         col_start,
-        _col_end,
+        col_end,
         header_ods_rows,
         row_key_cols,
         data_logical_rows,
+        export_main_cols,
     );
     format!("v1\ntsv\n{}", block)
 }
@@ -182,13 +192,14 @@ fn corro_ods_layout_v2(sheet_blocks: &[String]) -> String {
 }
 
 /// Parse a `tsv` numeric block starting at `lines[start]` = `col_start` line.
+/// Optional trailing line: `export_main_cols` (Corro 0.5+; absent in older ODS with `corro-ods-layout`).
 fn parse_tsv_parity_at(lines: &[&str], start: usize) -> Option<(OdsTableLayout, usize)> {
     let col_start = lines.get(start).and_then(|l| l.parse().ok())?;
-    let _c1: usize = lines.get(start + 1).and_then(|l| l.parse().ok())?;
+    let col_end = lines.get(start + 1).and_then(|l| l.parse().ok())?;
     let header_ods_rows = lines.get(start + 2).and_then(|l| l.parse().ok())?;
     let row_key_cols = lines.get(start + 3).and_then(|l| l.parse().ok())?;
     let n: usize = lines.get(start + 4).and_then(|l| l.parse().ok())?;
-    let need = 5 + n;
+    let mut need = 5 + n;
     if lines.len() < start + need {
         return None;
     }
@@ -198,12 +209,29 @@ fn parse_tsv_parity_at(lines: &[&str], start: usize) -> Option<(OdsTableLayout, 
     if data.len() != n {
         return None;
     }
+    // Optional: export main col count. Data logical rows are usually ~1e9+; "emc" is small, so
+    // a short trailing line (no prior large line) is unambiguous. Next-block `tsv` is non-numeric.
+    let mut export_main_cols: Option<usize> = None;
+    if let Some(s) = lines.get(start + need).copied() {
+        if !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()) {
+            if let Ok(v) = s.parse::<usize>() {
+                // Main col counts are always far below 1e9; logical data rows in Corro are ~1e9+.
+                let looks_like_emc = n == 0 || v < 1_000_000_000;
+                if looks_like_emc {
+                    export_main_cols = Some(v);
+                    need += 1;
+                }
+            }
+        }
+    }
     Some((
         OdsTableLayout::TsvParity {
             col_start,
+            col_end,
             data_logical_rows: data,
             header_ods_rows,
             row_key_cols,
+            export_main_cols,
         },
         need,
     ))
@@ -314,6 +342,7 @@ pub fn export_ods_bytes_with_options(
         header_ods_rows,
         row_key_cols,
         &data_rows,
+        grid.main_cols(),
     );
 
     let cursor = std::io::Cursor::new(Vec::new());
@@ -530,6 +559,7 @@ fn ods_workbook_content_xml_tsv_shaped(
             header_ods_rows,
             row_key_cols,
             &data_rows,
+            g.main_cols(),
         ));
 
         let tc = matrix
@@ -1110,6 +1140,7 @@ fn parse_ods_content_with_layout(
                         .and_then(|n| n.parse().ok())
                         .unwrap_or(1)
                         .max(1);
+                    let empty_formula = attr_value(&e, b"table:formula");
                     if let Some(sheet) = current_sheet.as_mut() {
                         let odf_full = odf_uses_global_logical == Some(true);
                         let tidx = open_table_i.unwrap_or(0);
@@ -1119,11 +1150,12 @@ fn parse_ods_content_with_layout(
                             if let Some((lr, gc, g)) =
                                 table_layout.map_ods_table_cell(row_idx, c, odf_full)
                             {
-                                set_ods_cell(
+                                apply_ods_table_cell(
                                     &mut sheet.state,
+                                    table_layout,
                                     lr,
                                     gc,
-                                    None,
+                                    empty_formula.as_deref(),
                                     "",
                                     g,
                                 );
@@ -1154,8 +1186,9 @@ fn parse_ods_content_with_layout(
                             if let Some((lr, gc, g)) =
                                 table_layout.map_ods_table_cell(row_idx, c, odf_full)
                             {
-                                set_ods_cell(
+                                apply_ods_table_cell(
                                     &mut sheet.state,
+                                    table_layout,
                                     lr,
                                     gc,
                                     pending_formula.as_deref(),
@@ -1189,11 +1222,6 @@ fn parse_ods_content_with_layout(
     if workbook.sheets.is_empty() {
         return Err(OdsError::Xml("no sheets found".into()));
     }
-    for sheet in &mut workbook.sheets {
-        let rows = ods_row_end_for_sheet(&sheet.state.grid);
-        let cols = ods_col_end_for_sheet(&sheet.state.grid);
-        sheet.state.grid.set_main_size(rows.max(1), cols.max(1));
-    }
     let active_sheet_id = workbook
         .sheets
         .first()
@@ -1206,6 +1234,169 @@ fn parse_ods_content_with_layout(
         volatile_seed: 0,
     };
     Ok(WorkbookState::from_snapshot(&snapshot))
+}
+
+/// Map ODF (logical row, global col) into the five regions using [SheetState] extents.
+fn full_logical_addr(state: &SheetState, row: usize, col: usize) -> CellAddr {
+    if row < HEADER_ROWS {
+        CellAddr::Header {
+            row: row as u32,
+            col: col as u32,
+        }
+    } else if row < HEADER_ROWS + state.grid.main_rows() {
+        let mr = row - HEADER_ROWS;
+        if col < MARGIN_COLS {
+            CellAddr::Left {
+                col: MARGIN_COLS - 1 - col,
+                row: mr as u32,
+            }
+        } else if col < MARGIN_COLS + state.grid.main_cols() {
+            CellAddr::Main {
+                row: mr as u32,
+                col: (col - MARGIN_COLS) as u32,
+            }
+        } else {
+            CellAddr::Right {
+                col: col - MARGIN_COLS - state.grid.main_cols(),
+                row: mr as u32,
+            }
+        }
+    } else {
+        let fr = row - HEADER_ROWS - state.grid.main_rows();
+        CellAddr::Footer {
+            row: fr as u32,
+            col: col as u32,
+        }
+    }
+}
+
+fn set_ods_cell_full_logical(
+    state: &mut SheetState,
+    row: usize,
+    col: usize,
+    formula: Option<&str>,
+    value: &str,
+) {
+    place_full_logical_cell(state, row, col, formula, value, None);
+}
+
+/// `tsv_ods_deltas` = the `(d_row, d_col)` from [`crate::export::delimited_layout_generic_rebase`]
+/// (same as export’s generic TSV/ODS interop rebase). The ODF `of:` text is in “file A1” space,
+/// so we negate to restore Corro’s grid A1 in [`set_ods_cell_tsv_parity`].
+fn place_full_logical_cell(
+    state: &mut SheetState,
+    row: usize,
+    col: usize,
+    formula: Option<&str>,
+    value: &str,
+    tsv_ods_deltas: Option<(i32, i32)>,
+) {
+    let target = full_logical_addr(state, row, col);
+    if let Some(f) = formula {
+        let body = ods_openformula_body_to_cell_text(f);
+        let cell = if let Some((dr, dc)) = tsv_ods_deltas {
+            rebase_interop_formula_row_col(&format!("={body}"), -dr, -dc)
+        } else {
+            format!("={body}")
+        };
+        state.grid.set(&target, cell);
+    } else {
+        state.grid.set(&target, value.to_string());
+    }
+}
+
+/// Re-import a cell from a Corro TSV-mapped ODF table. [`set_ods_cell_full_logical`] classifies
+/// "main" vs "right" using the grid's `main_rows` / `main_cols`, which is still 1×1 for the first
+/// few cells. Grow to the exported extents first so B and the second data row are not sent to
+/// the right margin or to the footer.
+fn set_ods_cell_tsv_parity(
+    state: &mut SheetState,
+    lr: usize,
+    gc: usize,
+    export_main_cols: Option<usize>,
+    interop_d_row: i32,
+    interop_d_col: i32,
+    formula: Option<&str>,
+    value: &str,
+) {
+    if value.is_empty() && formula.is_none() {
+        return;
+    }
+    if lr >= HEADER_ROWS {
+        let mri = lr - HEADER_ROWS;
+        let row_need = mri + 1;
+        // Never shrink: `set_main_size` truncates to smaller main_cols and can wipe the entire
+        // first main row (B..) while processing A of row 2, if we used only (gc - M + 1) for A.
+        let need_for_gc = if gc < MARGIN_COLS {
+            1
+        } else {
+            (gc - MARGIN_COLS + 1).max(1)
+        };
+        let main_cols = state
+            .grid
+            .main_cols()
+            .max(export_main_cols.unwrap_or(0))
+            .max(need_for_gc);
+        state.grid.set_main_size(
+            state.grid.main_rows().max(row_need),
+            main_cols,
+        );
+    }
+    let deltas = if interop_d_row != 0 || interop_d_col != 0 {
+        Some((interop_d_row, interop_d_col))
+    } else {
+        None
+    };
+    place_full_logical_cell(state, lr, gc, formula, value, deltas);
+}
+
+fn apply_ods_table_cell(
+    state: &mut SheetState,
+    table_layout: &OdsTableLayout,
+    lr: usize,
+    gc: usize,
+    formula: Option<&str>,
+    value: &str,
+    odf_uses_global_logical: bool,
+) {
+    match table_layout {
+        OdsTableLayout::TsvParity {
+            col_start,
+            col_end,
+            data_logical_rows,
+            header_ods_rows,
+            row_key_cols,
+            export_main_cols,
+        } => {
+            let (dr, dc) = export::delimited_layout_generic_rebase(
+                *col_start,
+                *col_end,
+                *header_ods_rows > 0,
+                *row_key_cols > 0,
+                data_logical_rows,
+            );
+            set_ods_cell_tsv_parity(
+                state,
+                lr,
+                gc,
+                *export_main_cols,
+                dr,
+                dc,
+                formula,
+                value,
+            );
+        }
+        _ => {
+            set_ods_cell(
+                state,
+                lr,
+                gc,
+                formula,
+                value,
+                odf_uses_global_logical,
+            );
+        }
+    }
 }
 
 fn set_ods_cell(
@@ -1236,62 +1427,7 @@ fn set_ods_cell(
         return;
     }
 
-    // Corro round-trip export: (row, col) are full logical coordinates (huge index rows, etc.)
-    let (row, col) = (odf_table_row, odf_table_col);
-    let target = if row < HEADER_ROWS {
-        CellAddr::Header {
-            row: row as u32,
-            col: col as u32,
-        }
-    } else if row < HEADER_ROWS + state.grid.main_rows() {
-        let mr = row - HEADER_ROWS;
-        if col < MARGIN_COLS {
-            CellAddr::Left {
-                col: MARGIN_COLS - 1 - col,
-                row: mr as u32,
-            }
-        } else if col < MARGIN_COLS + state.grid.main_cols() {
-            CellAddr::Main {
-                row: mr as u32,
-                col: (col - MARGIN_COLS) as u32,
-            }
-        } else {
-            CellAddr::Right {
-                col: col - MARGIN_COLS - state.grid.main_cols(),
-                row: mr as u32,
-            }
-        }
-    } else {
-        let fr = row - HEADER_ROWS - state.grid.main_rows();
-        CellAddr::Footer {
-            row: fr as u32,
-            col: col as u32,
-        }
-    };
-    if let Some(f) = formula {
-        let body = ods_openformula_body_to_cell_text(f);
-        state.grid.set(&target, format!("={body}"));
-    } else {
-        state.grid.set(&target, value.to_string());
-    }
-}
-
-fn ods_row_end_for_sheet(grid: &Grid) -> usize {
-    grid.iter_nonempty()
-        .filter_map(|(addr, _)| match addr {
-            CellAddr::Main { row, .. }
-            | CellAddr::Left { row, .. }
-            | CellAddr::Right { row, .. } => Some(row as usize + 1),
-            _ => None,
-        })
-        .max()
-        .unwrap_or_else(|| grid.main_rows())
-}
-
-/// Used after import to clip main extent — must be **main** width, not `total_cols()` (which
-/// includes both margins) or `set_main_size` will expand the main area by ~1400 columns.
-fn ods_col_end_for_sheet(grid: &Grid) -> usize {
-    grid.main_cols()
+    set_ods_cell_full_logical(state, odf_table_row, odf_table_col, formula, value);
 }
 
 fn attr_value(e: &quick_xml::events::BytesStart<'_>, key: &[u8]) -> Option<String> {
