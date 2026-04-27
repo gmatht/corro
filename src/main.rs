@@ -7,6 +7,8 @@ struct Args {
     revision: Option<RevisionMode>,
     file: Option<PathBuf>,
     export: Option<PathBuf>,
+    show_help: bool,
+    show_version: bool,
 }
 
 enum RevisionMode {
@@ -18,11 +20,19 @@ fn parse_args() -> Result<Args, String> {
     let mut revision = None;
     let mut file = None;
     let mut export = None;
+    let mut show_help = false;
+    let mut show_version = false;
     let mut positional = Vec::new();
     let mut it = std::env::args().skip(1).peekable();
 
     while let Some(arg) = it.next() {
         match arg.as_str() {
+            "-h" | "-?" | "--help" => {
+                show_help = true;
+            }
+            "-v" | "--version" => {
+                show_version = true;
+            }
             "-r" | "--revision" => {
                 if let Some(next) = it.peek() {
                     if let Ok(value) = next.parse::<usize>() {
@@ -57,6 +67,8 @@ fn parse_args() -> Result<Args, String> {
         revision,
         file,
         export,
+        show_help,
+        show_version,
     })
 }
 
@@ -69,6 +81,14 @@ fn main() {
 
 fn try_main() -> Result<(), corro::ui::RunError> {
     let args = parse_args().map_err(std::io::Error::other)?;
+    if args.show_help {
+        println!("{}", cli_help_text());
+        return Ok(());
+    }
+    if args.show_version {
+        println!("corro {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     if let Some(export_path) = args.export {
         let Some(input_path) = args.file else {
             return Err(std::io::Error::other(
@@ -90,6 +110,25 @@ fn try_main() -> Result<(), corro::ui::RunError> {
     app.load_initial()?;
     app.run()?;
     Ok(())
+}
+
+fn cli_help_text() -> String {
+    format!(
+        "corro {}\n\
+\n\
+USAGE:\n\
+  corro [OPTIONS] [FILE]\n\
+\n\
+OPTIONS:\n\
+  -h, -?, --help            Show help\n\
+  -v, --version             Show version\n\
+  -r, --revision [N]        Browse revisions (or limit to N)\n\
+  -e, --export <PATH>       Export input FILE to PATH (.tsv, .csv, .txt/.ascii, .ods)\n\
+\n\
+ARGS:\n\
+  FILE                      Input file (.corro, .ods, .tsv, .csv)\n",
+        env!("CARGO_PKG_VERSION")
+    )
 }
 
 fn load_workbook_for_export(path: &std::path::Path) -> Result<corro::ops::WorkbookState, String> {
@@ -225,6 +264,8 @@ mod tests {
         let mut revision = None;
         let mut file = None;
         let mut export = None;
+        let mut show_help = false;
+        let mut show_version = false;
         let mut positional = Vec::new();
         let mut rest = it.peekable();
 
@@ -232,6 +273,12 @@ mod tests {
             let arg = arg.into();
             let arg = arg.to_string_lossy().into_owned();
             match arg.as_str() {
+                "-h" | "-?" | "--help" => {
+                    show_help = true;
+                }
+                "-v" | "--version" => {
+                    show_version = true;
+                }
                 "-r" | "--revision" => {
                     if let Some(next) = rest.peek() {
                         let next = next.clone().into().to_string_lossy().into_owned();
@@ -261,6 +308,8 @@ mod tests {
             revision,
             file,
             export,
+            show_help,
+            show_version,
         }
     }
 
@@ -275,5 +324,18 @@ mod tests {
             args.file.as_deref(),
             Some(std::path::Path::new("docs/test/main.corro"))
         );
+    }
+
+    #[test]
+    fn parses_help_variants() {
+        assert!(parse_args_from(["corro", "--help"]).show_help);
+        assert!(parse_args_from(["corro", "-h"]).show_help);
+        assert!(parse_args_from(["corro", "-?"]).show_help);
+    }
+
+    #[test]
+    fn parses_version_variants() {
+        assert!(parse_args_from(["corro", "--version"]).show_version);
+        assert!(parse_args_from(["corro", "-v"]).show_version);
     }
 }
