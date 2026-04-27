@@ -573,6 +573,12 @@ impl OdsStyleRegistry {
                 .map(|n| format!(r#" style:data-style-name="{n}""#))
                 .unwrap_or_default();
             let mut props = String::new();
+            match key.align {
+                Some(OdsHorizontalAlign::Left) => props.push_str(r#" fo:text-align="start""#),
+                Some(OdsHorizontalAlign::Center) => props.push_str(r#" fo:text-align="center""#),
+                Some(OdsHorizontalAlign::Right) => props.push_str(r#" fo:text-align="end""#),
+                None => {}
+            }
             if key.underlined_boundary_row {
                 props.push_str(r#" fo:border-bottom="0.018cm solid #6b7280""#);
             }
@@ -888,6 +894,9 @@ fn ods_cell_xml(
 
     if export_content == ExportContent::Values {
         if value.is_empty() && raw.is_empty() {
+            if let Some(style_attr) = style_attr.as_deref() {
+                return format!(r#"<table:table-cell{style_attr}/>"#);
+            }
             return "<table:table-cell/>".into();
         }
         return ods_cell_xml_values_only(&display, &value, &raw, style_attr.as_deref());
@@ -904,6 +913,9 @@ fn ods_cell_xml(
             false,
         );
         if odf.trim().is_empty() {
+            if let Some(style_attr) = style_attr.as_deref() {
+                return format!(r#"<table:table-cell{style_attr}/>"#);
+            }
             return "<table:table-cell/>".into();
         }
         if odf.trim_start().starts_with('=') {
@@ -923,6 +935,9 @@ fn ods_cell_xml(
         return ods_cell_xml_values_only(&odf, &odf, &odf, style_attr.as_deref());
     }
     if value.is_empty() && raw.is_empty() {
+        if let Some(style_attr) = style_attr.as_deref() {
+            return format!(r#"<table:table-cell{style_attr}/>"#);
+        }
         return "<table:table-cell/>".into();
     }
     if value.starts_with('=') || is_formula(&raw) {
@@ -992,7 +1007,7 @@ fn ods_cell_style_attr(
         Some(NumberFormat::Currency { decimals }) => Some(OdsNumberStyleKey::Currency { decimals }),
         None => None,
     };
-    let align = effective_ods_align(fmt, display);
+    let align = effective_ods_align(fmt, display).or_else(|| ods_default_align_for_addr(addr));
     let key = OdsCellStyleKey {
         number,
         align,
@@ -1020,6 +1035,14 @@ fn effective_ods_align(fmt: CellFormat, display: &str) -> Option<OdsHorizontalAl
                 None
             }
         }
+    }
+}
+
+fn ods_default_align_for_addr(addr: &CellAddr) -> Option<OdsHorizontalAlign> {
+    match addr {
+        // Match the TUI visual: left-margin labels sit against the divider side.
+        CellAddr::Left { .. } => Some(OdsHorizontalAlign::Right),
+        _ => None,
     }
 }
 
@@ -1357,7 +1380,7 @@ fn ods_cell_addr(grid: &Grid, logical_row: usize, global_col: usize) -> CellAddr
         let main_row = (logical_row - hr) as u32;
         if global_col < lm {
             CellAddr::Left {
-                col: lm - 1 - global_col,
+                col: global_col,
                 row: main_row,
             }
         } else if global_col < lm + mc {
@@ -1440,7 +1463,7 @@ fn main_formula_or_value(
     let lm = MARGIN_COLS;
     let mr = grid.main_rows();
     if global_col < lm {
-        let c = lm - 1 - global_col;
+        let c = global_col;
         let raw = grid.text(&CellAddr::Left {
             col: c,
             row: main_row as u32,
