@@ -142,39 +142,7 @@ impl SheetCursor {
     }
 
     pub(crate) fn to_addr(self, grid: &Grid) -> CellAddr {
-        let hr = HEADER_ROWS;
-        let mr = grid.main_rows();
-        let mc = grid.main_cols();
-        if self.row < hr {
-            CellAddr::Header {
-                row: self.row as u32,
-                col: self.col as u32,
-            }
-        } else if self.row < hr + mr {
-            let mri = self.row - hr;
-            let mcc = self.col;
-            if mcc < MARGIN_COLS {
-                CellAddr::Left {
-                    col: mcc,
-                    row: mri as u32,
-                }
-            } else if mcc < MARGIN_COLS + mc {
-                CellAddr::Main {
-                    row: mri as u32,
-                    col: (mcc - MARGIN_COLS) as u32,
-                }
-            } else {
-                CellAddr::Right {
-                    col: (mcc - MARGIN_COLS - mc),
-                    row: mri as u32,
-                }
-            }
-        } else {
-            CellAddr::Footer {
-                row: (self.row - hr - mr) as u32,
-                col: self.col as u32,
-            }
-        }
+        addr::sheet_cursor_to_addr(self.row, self.col, grid.main_rows(), grid.main_cols())
     }
 }
 
@@ -3914,28 +3882,12 @@ impl App {
     }
 
     fn sheet_cursor_for_addr(&self, addr: &CellAddr) -> Option<SheetCursor> {
-        match addr {
-            CellAddr::Header { row, col } => Some(SheetCursor {
-                row: *row as usize,
-                col: *col as usize,
-            }),
-            CellAddr::Footer { row, col } => Some(SheetCursor {
-                row: HEADER_ROWS + self.state.grid.main_rows() + *row as usize,
-                col: *col as usize,
-            }),
-            CellAddr::Main { row, col } => Some(SheetCursor {
-                row: HEADER_ROWS + *row as usize,
-                col: MARGIN_COLS + *col as usize,
-            }),
-            CellAddr::Left { col, row } => Some(SheetCursor {
-                row: HEADER_ROWS + *row as usize,
-                col: *col as usize,
-            }),
-            CellAddr::Right { col, row } => Some(SheetCursor {
-                row: HEADER_ROWS + *row as usize,
-                col: MARGIN_COLS + self.state.grid.main_cols() + *col as usize,
-            }),
-        }
+        let (row, col) = addr::addr_to_sheet_cursor(
+            addr,
+            self.state.grid.main_rows(),
+            self.state.grid.main_cols(),
+        );
+        Some(SheetCursor { row, col })
     }
 
     /// Parse `old|new` (first `|` only; `a|b|c` → find `a`, replace `b|c`).

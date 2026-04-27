@@ -71,6 +71,66 @@ pub fn ui_row_label(logical_row: usize, main_rows: usize) -> String {
     }
 }
 
+/// Convert a logical sheet cursor (`row`, global `col`) to a concrete cell address.
+pub fn sheet_cursor_to_addr(
+    logical_row: usize,
+    global_col: usize,
+    main_rows: usize,
+    main_cols: usize,
+) -> CellAddr {
+    let hr = crate::grid::HEADER_ROWS;
+    if logical_row < hr {
+        CellAddr::Header {
+            row: logical_row as u32,
+            col: global_col as u32,
+        }
+    } else if logical_row < hr + main_rows {
+        let main_row = logical_row - hr;
+        if global_col < crate::grid::MARGIN_COLS {
+            CellAddr::Left {
+                col: global_col,
+                row: main_row as u32,
+            }
+        } else if global_col < crate::grid::MARGIN_COLS + main_cols {
+            CellAddr::Main {
+                row: main_row as u32,
+                col: (global_col - crate::grid::MARGIN_COLS) as u32,
+            }
+        } else {
+            CellAddr::Right {
+                col: global_col - crate::grid::MARGIN_COLS - main_cols,
+                row: main_row as u32,
+            }
+        }
+    } else {
+        CellAddr::Footer {
+            row: (logical_row - hr - main_rows) as u32,
+            col: global_col as u32,
+        }
+    }
+}
+
+/// Convert a concrete cell address to a logical sheet cursor (`row`, global `col`).
+pub fn addr_to_sheet_cursor(addr: &CellAddr, main_rows: usize, main_cols: usize) -> (usize, usize) {
+    let row_col = match addr {
+        CellAddr::Header { row, col } => (*row as usize, *col as usize),
+        CellAddr::Footer { row, col } => (
+            crate::grid::HEADER_ROWS + main_rows + *row as usize,
+            *col as usize,
+        ),
+        CellAddr::Main { row, col } => (
+            crate::grid::HEADER_ROWS + *row as usize,
+            crate::grid::MARGIN_COLS + *col as usize,
+        ),
+        CellAddr::Left { col, row } => (crate::grid::HEADER_ROWS + *row as usize, *col as usize),
+        CellAddr::Right { col, row } => (
+            crate::grid::HEADER_ROWS + *row as usize,
+            crate::grid::MARGIN_COLS + main_cols + *col as usize,
+        ),
+    };
+    row_col
+}
+
 /// Parse a column fragment at the start of a cell ref.
 pub fn parse_ui_column_fragment(s: &str, main_cols: usize) -> Option<(u32, usize)> {
     if let Some(rest) = s.strip_prefix('[') {
@@ -452,5 +512,32 @@ mod tests {
         assert_eq!(ui_row_label(0, main_rows), format!("~{}", crate::grid::HEADER_ROWS));
         assert_eq!(ui_row_label(crate::grid::HEADER_ROWS, main_rows), "1");
         assert_eq!(ui_row_label(crate::grid::HEADER_ROWS + main_rows, main_rows), "_1");
+    }
+
+    #[test]
+    fn cursor_addr_roundtrip_across_regions() {
+        let main_rows = 3usize;
+        let main_cols = 4usize;
+        let addrs = [
+            CellAddr::Header {
+                row: 0,
+                col: crate::grid::MARGIN_COLS as u32,
+            },
+            CellAddr::Left {
+                col: crate::grid::MARGIN_COLS - 1,
+                row: 1,
+            },
+            CellAddr::Main { row: 2, col: 3 },
+            CellAddr::Right { col: 0, row: 2 },
+            CellAddr::Footer {
+                row: 0,
+                col: (crate::grid::MARGIN_COLS + 1) as u32,
+            },
+        ];
+        for addr in addrs {
+            let (row, col) = addr_to_sheet_cursor(&addr, main_rows, main_cols);
+            let back = sheet_cursor_to_addr(row, col, main_rows, main_cols);
+            assert_eq!(back, addr);
+        }
     }
 }
