@@ -2,6 +2,18 @@
 
 use crate::grid::{CellAddr, HEADER_ROWS};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct LogicalRow(pub usize);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct GlobalCol(pub usize);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct MainRows(pub usize);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct MainCols(pub usize);
+
 /// Parse Excel-style column name `A`..`ZZZ` → 0-based main column index.
 pub fn parse_excel_column(name: &str) -> Option<u32> {
     let mut n: u32 = 0;
@@ -73,11 +85,15 @@ pub fn ui_row_label(logical_row: usize, main_rows: usize) -> String {
 
 /// Convert a logical sheet cursor (`row`, global `col`) to a concrete cell address.
 pub fn sheet_cursor_to_addr(
-    logical_row: usize,
-    global_col: usize,
-    main_rows: usize,
-    main_cols: usize,
+    logical_row: LogicalRow,
+    global_col: GlobalCol,
+    main_rows: MainRows,
+    main_cols: MainCols,
 ) -> CellAddr {
+    let logical_row = logical_row.0;
+    let global_col = global_col.0;
+    let main_rows = main_rows.0;
+    let main_cols = main_cols.0;
     let hr = crate::grid::HEADER_ROWS;
     if logical_row < hr {
         CellAddr::Header {
@@ -111,21 +127,30 @@ pub fn sheet_cursor_to_addr(
 }
 
 /// Convert a concrete cell address to a logical sheet cursor (`row`, global `col`).
-pub fn addr_to_sheet_cursor(addr: &CellAddr, main_rows: usize, main_cols: usize) -> (usize, usize) {
+pub fn addr_to_sheet_cursor(
+    addr: &CellAddr,
+    main_rows: MainRows,
+    main_cols: MainCols,
+) -> (LogicalRow, GlobalCol) {
+    let main_rows = main_rows.0;
+    let main_cols = main_cols.0;
     let row_col = match addr {
-        CellAddr::Header { row, col } => (*row as usize, *col as usize),
+        CellAddr::Header { row, col } => (LogicalRow(*row as usize), GlobalCol(*col as usize)),
         CellAddr::Footer { row, col } => (
-            crate::grid::HEADER_ROWS + main_rows + *row as usize,
-            *col as usize,
+            LogicalRow(crate::grid::HEADER_ROWS + main_rows + *row as usize),
+            GlobalCol(*col as usize),
         ),
         CellAddr::Main { row, col } => (
-            crate::grid::HEADER_ROWS + *row as usize,
-            crate::grid::MARGIN_COLS + *col as usize,
+            LogicalRow(crate::grid::HEADER_ROWS + *row as usize),
+            GlobalCol(crate::grid::MARGIN_COLS + *col as usize),
         ),
-        CellAddr::Left { col, row } => (crate::grid::HEADER_ROWS + *row as usize, *col as usize),
+        CellAddr::Left { col, row } => (
+            LogicalRow(crate::grid::HEADER_ROWS + *row as usize),
+            GlobalCol(*col as usize),
+        ),
         CellAddr::Right { col, row } => (
-            crate::grid::HEADER_ROWS + *row as usize,
-            crate::grid::MARGIN_COLS + main_cols + *col as usize,
+            LogicalRow(crate::grid::HEADER_ROWS + *row as usize),
+            GlobalCol(crate::grid::MARGIN_COLS + main_cols + *col as usize),
         ),
     };
     row_col
@@ -535,8 +560,8 @@ mod tests {
             },
         ];
         for addr in addrs {
-            let (row, col) = addr_to_sheet_cursor(&addr, main_rows, main_cols);
-            let back = sheet_cursor_to_addr(row, col, main_rows, main_cols);
+            let (row, col) = addr_to_sheet_cursor(&addr, MainRows(main_rows), MainCols(main_cols));
+            let back = sheet_cursor_to_addr(row, col, MainRows(main_rows), MainCols(main_cols));
             assert_eq!(back, addr);
         }
     }

@@ -142,7 +142,12 @@ impl SheetCursor {
     }
 
     pub(crate) fn to_addr(self, grid: &Grid) -> CellAddr {
-        addr::sheet_cursor_to_addr(self.row, self.col, grid.main_rows(), grid.main_cols())
+        addr::sheet_cursor_to_addr(
+            addr::LogicalRow(self.row),
+            addr::GlobalCol(self.col),
+            addr::MainRows(grid.main_rows()),
+            addr::MainCols(grid.main_cols()),
+        )
     }
 }
 
@@ -3884,10 +3889,13 @@ impl App {
     fn sheet_cursor_for_addr(&self, addr: &CellAddr) -> Option<SheetCursor> {
         let (row, col) = addr::addr_to_sheet_cursor(
             addr,
-            self.state.grid.main_rows(),
-            self.state.grid.main_cols(),
+            addr::MainRows(self.state.grid.main_rows()),
+            addr::MainCols(self.state.grid.main_cols()),
         );
-        Some(SheetCursor { row, col })
+        Some(SheetCursor {
+            row: row.0,
+            col: col.0,
+        })
     }
 
     /// Parse `old|new` (first `|` only; `a|b|c` → find `a`, replace `b|c`).
