@@ -58,6 +58,19 @@ pub fn ui_column_fragment(global_col: usize, main_cols: usize) -> String {
     }
 }
 
+/// UI-style row label for the left gutter (`~N`, `1`, `_N`).
+pub fn ui_row_label(logical_row: usize, main_rows: usize) -> String {
+    let hr = crate::grid::HEADER_ROWS;
+    if logical_row < hr {
+        format!("~{}", hr - logical_row)
+    } else if logical_row < hr + main_rows {
+        format!("{}", logical_row - hr + 1)
+    } else {
+        let fr = logical_row - hr - main_rows;
+        format!("_{}", fr + 1)
+    }
+}
+
 /// Parse a column fragment at the start of a cell ref.
 pub fn parse_ui_column_fragment(s: &str, main_cols: usize) -> Option<(u32, usize)> {
     if let Some(rest) = s.strip_prefix('[') {
@@ -414,5 +427,30 @@ mod tests {
         );
         assert!(parse_cell_ref_at("A~1000000000", 1).is_none());
         assert!(parse_cell_ref_at("A_1000000000", 1).is_none());
+    }
+
+    #[test]
+    fn ui_column_fragment_roundtrip() {
+        let main_cols = 3usize;
+        let cols = [
+            crate::grid::MARGIN_COLS - 1,
+            crate::grid::MARGIN_COLS,
+            crate::grid::MARGIN_COLS + 1,
+            crate::grid::MARGIN_COLS + main_cols,
+        ];
+        for col in cols {
+            let frag = ui_column_fragment(col, main_cols);
+            let (parsed, n) = parse_ui_column_fragment(&frag, main_cols).unwrap();
+            assert_eq!(n, frag.len());
+            assert_eq!(parsed as usize, col);
+        }
+    }
+
+    #[test]
+    fn ui_row_label_regions() {
+        let main_rows = 2usize;
+        assert_eq!(ui_row_label(0, main_rows), format!("~{}", crate::grid::HEADER_ROWS));
+        assert_eq!(ui_row_label(crate::grid::HEADER_ROWS, main_rows), "1");
+        assert_eq!(ui_row_label(crate::grid::HEADER_ROWS + main_rows, main_rows), "_1");
     }
 }

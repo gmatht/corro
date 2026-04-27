@@ -13806,29 +13806,11 @@ fn exponential_numeric_display(text: &str, width: usize) -> Option<String> {
 }
 
 fn sheet_row_label(logical_row: usize, main_rows: usize) -> String {
-    let hr = HEADER_ROWS;
-    if logical_row < hr {
-        format!("~{}", hr - logical_row)
-    } else if logical_row < hr + main_rows {
-        format!("{}", logical_row - hr + 1)
-    } else {
-        let fr = logical_row - hr - main_rows;
-        format!("_{}", fr + 1)
-    }
+    addr::ui_row_label(logical_row, main_rows)
 }
 
 fn col_header_label(global_col: usize, main_cols: usize) -> String {
-    let m = MARGIN_COLS;
-    if global_col < m {
-        format!("[{}", addr::mirror_margin_column_name(global_col, true))
-    } else if global_col < m + main_cols {
-        addr::excel_column_name(global_col - m)
-    } else {
-        format!(
-            "]{}",
-            addr::mirror_margin_column_name(global_col - m - main_cols, false)
-        )
-    }
+    addr::ui_column_fragment(global_col, main_cols)
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
