@@ -379,10 +379,13 @@ pub fn commit_workbook_set_column_format_batch(
         return Ok(());
     }
     for op in ops {
-        if !matches!(op, Op::SetColumnFormat { .. }) {
+        if !matches!(
+            op,
+            Op::SetColumnFormat { .. } | Op::SetAllColumnFormat { .. }
+        ) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "commit_workbook_set_column_format_batch requires only SetColumnFormat ops",
+                "commit_workbook_set_column_format_batch requires only SetColumnFormat/SetAllColumnFormat ops",
             )
             .into());
         }

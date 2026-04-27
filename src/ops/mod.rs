@@ -3,7 +3,7 @@
 use crate::addr::{
     parse_cell_ref_at, parse_excel_column, parse_main_range_at, parse_sheet_id_prefix_at,
 };
-use crate::grid::{CellAddr, CellFormat, FormatScope, GridBox, MainRange, SortSpec, MARGIN_COLS};
+use crate::grid::{CellAddr, CellFormat, FormatScope, MainRange, SortSpec, MARGIN_COLS};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
@@ -224,6 +224,16 @@ pub enum Op {
         col: usize,
         format: CellFormat,
     },
+    /// `FormatScope::All` for every current global column (`0..total_cols()` at apply time).
+    /// Log: `FORMAT COL ALL * <format>`.
+    SetAllColumnFormat {
+        format: CellFormat,
+    },
+    /// Undo / redo of [`Op::SetAllColumnFormat`]: restore per-column `FormatScope::All` state.
+    /// Serializes as multiple `FORMAT COL ALL <col> ...` lines; not accepted by [`parse_op_text`].
+    SetAllColumnFormatRestore {
+        per_col: Vec<CellFormat>,
+    },
     SetCellFormat {
         addr: CellAddr,
         format: CellFormat,
@@ -389,6 +399,16 @@ impl Op {
             }
             Op::SetColumnFormat { scope, col, format } => {
                 state.grid.set_column_format(*scope, *col, *format);
+            }
+            Op::SetAllColumnFormat { format } => {
+                for col in 0..state.grid.total_cols() {
+                    state.grid.set_column_format(FormatScope::All, col, *format);
+                }
+            }
+            Op::SetAllColumnFormatRestore { per_col } => {
+                for (col, format) in per_col.iter().enumerate() {
+                    state.grid.set_column_format(FormatScope::All, col, *format);
+                }
             }
             Op::SetCellFormat { addr, format } => {
                 state.grid.set_cell_format(addr.clone(), *format);
@@ -573,7 +593,15 @@ fn parse_op_text(line: &str) -> Option<Op> {
                         "SPECIAL" => FormatScope::Special,
                         _ => return None,
                     };
-                    let col = parts.next()?.parse::<usize>().ok()?;
+                    let col_tok = parts.next()?;
+                    if col_tok == "*"
+                        && scope == FormatScope::All
+                    {
+                        let text = parts.collect::<Vec<_>>().join(" ");
+                        let format = parse_format_text(&text).ok()?;
+                        return Some(Op::SetAllColumnFormat { format });
+                    }
+                    let col = col_tok.parse::<usize>().ok()?;
                     let text = parts.collect::<Vec<_>>().join(" ");
                     let format = parse_format_text(&text).ok()?;
                     Some(Op::SetColumnFormat { scope, col, format })
@@ -657,6 +685,27 @@ impl Op {
                 };
                 format!("FORMAT COL {scope} {col} {}", format_text(format))
             }
+            Op::SetAllColumnFormat { format } => {
+                format!("FORMAT COL ALL * {}", format_text(format))
+            }
+            Op::SetAllColumnFormatRestore { per_col } => {
+                if per_col.is_empty() {
+                    return String::new();
+                }
+                per_col
+                    .iter()
+                    .enumerate()
+                    .map(|(col, f)| {
+                        Op::SetColumnFormat {
+                            scope: FormatScope::All,
+                            col,
+                            format: *f,
+                        }
+                        .to_log_line(main_cols)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
             Op::SetCellFormat { addr, format } => {
                 format!(
                     "FORMAT CELL {} {}",
@@ -720,6 +769,19 @@ impl WorkbookOp {
                         let addr_text = cref.to_log_text(main_cols);
                         split_multiline_set_lines(sheet_prefix_text, addr_text, value)
                     }
+                    Op::SetAllColumnFormatRestore { per_col } => per_col
+                        .iter()
+                        .enumerate()
+                        .map(|(col, f)| {
+                            let line = Op::SetColumnFormat {
+                                scope: FormatScope::All,
+                                col,
+                                format: *f,
+                            }
+                            .to_log_line(main_cols);
+                            format!("{sheet_prefix_text}{line}")
+                        })
+                        .collect(),
                     _ => vec![format!("{sheet_prefix_text}{}", op.to_log_line(main_cols))],
                 }
             }
@@ -763,6 +825,20 @@ impl WorkbookOp {
                 Op::SetCellRef { cref, value } => {
                     format!("SET ${sheet_id}:{} {value}", cref.to_log_text(main_cols))
                 }
+                Op::SetAllColumnFormatRestore { per_col } => per_col
+                    .iter()
+                    .enumerate()
+                    .map(|(col, f)| {
+                        let line = Op::SetColumnFormat {
+                            scope: FormatScope::All,
+                            col,
+                            format: *f,
+                        }
+                        .to_log_line(main_cols);
+                        format!("{}{}", sheet_prefix(*sheet_id), line)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
                 _ => format!("{}{}", sheet_prefix(*sheet_id), op.to_log_line(main_cols)),
             },
         }
@@ -1006,12 +1082,19 @@ pub fn parse_workbook_line(line: &str) -> Result<WorkbookOp, std::io::Error> {
                         "SPECIAL" => FormatScope::Special,
                         _ => return Err(bad("bad format line")),
                     };
-                    let col = parts
+                    let col_tok = parts
                         .next()
-                        .and_then(|v| v.parse::<usize>().ok())
                         .ok_or_else(|| bad("bad format line"))?;
-                    let format = parse_format_text(&parts.collect::<Vec<_>>().join(" "))?;
-                    Op::SetColumnFormat { scope, col, format }
+                    if col_tok == "*" && scope == FormatScope::All {
+                        let format = parse_format_text(&parts.collect::<Vec<_>>().join(" "))?;
+                        Op::SetAllColumnFormat { format }
+                    } else {
+                        let col = col_tok
+                            .parse::<usize>()
+                            .map_err(|_| bad("bad format line"))?;
+                        let format = parse_format_text(&parts.collect::<Vec<_>>().join(" "))?;
+                        Op::SetColumnFormat { scope, col, format }
+                    }
                 }
                 "CELL" => {
                     let addr = parts.next().ok_or_else(|| bad("bad format line"))?;
@@ -1232,6 +1315,22 @@ impl SheetState {
                 col: *col,
                 format: self.grid.format_for_global_col(*scope, *col),
             }),
+            Op::SetAllColumnFormat { .. } => {
+                let per_col = (0..self.grid.total_cols())
+                    .map(|c| self.grid.format_for_global_col(FormatScope::All, c))
+                    .collect();
+                Some(Op::SetAllColumnFormatRestore { per_col })
+            }
+            Op::SetAllColumnFormatRestore { .. } => {
+                if self.grid.total_cols() == 0 {
+                    Some(Op::SetAllColumnFormat {
+                        format: CellFormat::default(),
+                    })
+                } else {
+                    let fmt0 = self.grid.format_for_global_col(FormatScope::All, 0);
+                    Some(Op::SetAllColumnFormat { format: fmt0 })
+                }
+            }
             Op::SetCellFormat { addr, .. } => Some(Op::SetCellFormat {
                 addr: addr.clone(),
                 format: self.grid.format_for_addr(addr),
@@ -1406,12 +1505,19 @@ fn apply_any_line(line: &str, state: &mut SheetState) -> Result<(), std::io::Err
                         "SPECIAL" => FormatScope::Special,
                         _ => return Err(bad("bad FORMAT line")),
                     };
-                    let col = parts
+                    let col_tok = parts
                         .next()
-                        .and_then(|v| v.parse::<usize>().ok())
                         .ok_or_else(|| bad("bad FORMAT line"))?;
-                    let format = parse_format_text(&parts.collect::<Vec<_>>().join(" "))?;
-                    state.grid.set_column_format(scope, col, format);
+                    if col_tok == "*" && scope == FormatScope::All {
+                        let format = parse_format_text(&parts.collect::<Vec<_>>().join(" "))?;
+                        Op::SetAllColumnFormat { format }.apply(state);
+                    } else {
+                        let col = col_tok
+                            .parse::<usize>()
+                            .map_err(|_| bad("bad FORMAT line"))?;
+                        let format = parse_format_text(&parts.collect::<Vec<_>>().join(" "))?;
+                        state.grid.set_column_format(scope, col, format);
+                    }
                     Ok(())
                 }
                 "CELL" => {
@@ -1482,7 +1588,12 @@ fn parse_format_text(text: &str) -> Result<CellFormat, std::io::Error> {
 pub fn append_op(path: &Path, op: &Op, main_cols: usize) -> std::io::Result<()> {
     let mut f = OpenOptions::new().create(true).append(true).open(path)?;
     let line = op.to_log_line(main_cols);
-    writeln!(f, "{line}")?;
+    if line.is_empty() {
+    } else {
+        for l in line.split('\n') {
+            writeln!(f, "{l}")?;
+        }
+    }
     f.sync_all()?;
     Ok(())
 }
@@ -1786,6 +1897,51 @@ mod tests {
                     align: Some(crate::grid::TextAlign::Right),
                 },
             })
+        );
+    }
+
+    #[test]
+    fn format_col_all_wildcard_round_trips_through_log_line() {
+        let fmt = CellFormat {
+            number: Some(crate::grid::NumberFormat::Fixed { decimals: 3 }),
+            align: Some(crate::grid::TextAlign::Left),
+        };
+        let op = Op::SetAllColumnFormat { format: fmt };
+        let line = op.to_log_line(2);
+        assert_eq!(line, "FORMAT COL ALL * fixed:3,align:left");
+        assert_eq!(parse_op_line(&line), Some(op));
+    }
+
+    #[test]
+    fn set_all_column_format_expands_on_apply() {
+        let mut state = SheetState::new(1, 2);
+        let fmt = CellFormat {
+            number: Some(crate::grid::NumberFormat::Currency { decimals: 1 }),
+            align: None,
+        };
+        Op::SetAllColumnFormat { format: fmt }.apply(&mut state);
+        for c in 0..state.grid.total_cols() {
+            assert_eq!(state.grid.format_for_global_col(FormatScope::All, c), fmt);
+        }
+    }
+
+    #[test]
+    fn legacy_format_col_all_single_column_still_parses() {
+        let line = format!(
+            "FORMAT COL ALL {} fixed:2",
+            MARGIN_COLS + 1
+        );
+        let op = parse_op_line(&line).expect("parse");
+        assert_eq!(
+            op,
+            Op::SetColumnFormat {
+                scope: FormatScope::All,
+                col: MARGIN_COLS + 1,
+                format: CellFormat {
+                    number: Some(crate::grid::NumberFormat::Fixed { decimals: 2 }),
+                    align: None,
+                },
+            }
         );
     }
 

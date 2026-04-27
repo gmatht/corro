@@ -288,6 +288,7 @@ enum MenuSection {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FormatTarget {
     All,
+    FullColumn,
     Data,
     Special,
     Cell,
@@ -337,6 +338,7 @@ enum MenuAction {
     SetMaxColWidth,
     SetColWidth,
     FormatApplyAll,
+    FormatApplyFullColumn,
     FormatApplyData,
     FormatApplySpecial,
     FormatApplyCell,
@@ -469,11 +471,16 @@ const FORMAT_MENU_ITEMS: [MenuItem; 4] = [
     },
 ];
 
-const FORMAT_SCOPE_MENU_ITEMS: [MenuItem; 5] = [
+const FORMAT_SCOPE_MENU_ITEMS: [MenuItem; 6] = [
     MenuItem {
         shortcut: 'A',
         label: "All",
         target: MenuTarget::Action(MenuAction::FormatApplyAll),
+    },
+    MenuItem {
+        shortcut: 'F',
+        label: "Full col",
+        target: MenuTarget::Action(MenuAction::FormatApplyFullColumn),
     },
     MenuItem {
         shortcut: 'D',
@@ -1202,6 +1209,15 @@ impl App {
             }
             MenuAction::FormatApplyAll => {
                 self.pending_format_target = Some(FormatTarget::All);
+                Mode::Menu {
+                    stack: vec![MenuLevel {
+                        section: MenuSection::Format,
+                        item: 0,
+                    }],
+                }
+            }
+            MenuAction::FormatApplyFullColumn => {
+                self.pending_format_target = Some(FormatTarget::FullColumn);
                 Mode::Menu {
                     stack: vec![MenuLevel {
                         section: MenuSection::Format,
@@ -2515,6 +2531,7 @@ impl App {
         self.open_menu(MenuSection::Format);
         self.status = match target {
             FormatTarget::All => "Formatting scope: All".into(),
+            FormatTarget::FullColumn => "Formatting scope: Full column (global col)".into(),
             FormatTarget::Data => "Formatting scope: Data".into(),
             FormatTarget::Special => "Formatting scope: Special".into(),
             FormatTarget::Cell => "Formatting scope: Cell".into(),
@@ -2541,13 +2558,18 @@ impl App {
         let mut ops = Vec::new();
         match target {
             FormatTarget::All => {
-                for col in 0..self.state.grid.total_cols() {
-                    ops.push(Op::SetColumnFormat {
-                        scope: FormatScope::All,
-                        col,
-                        format,
-                    });
-                }
+                ops.push(Op::SetAllColumnFormat { format });
+            }
+            FormatTarget::FullColumn => {
+                let col = self
+                    .cursor
+                    .col
+                    .min(self.state.grid.total_cols().saturating_sub(1));
+                ops.push(Op::SetColumnFormat {
+                    scope: FormatScope::All,
+                    col,
+                    format,
+                });
             }
             FormatTarget::Data => {
                 for col in MARGIN_COLS..MARGIN_COLS + self.state.grid.main_cols() {
@@ -2591,9 +2613,12 @@ impl App {
         if ops.is_empty() {
             return;
         }
-        let all_set_col = ops
-            .iter()
-            .all(|o| matches!(o, Op::SetColumnFormat { .. }));
+        let all_set_col = ops.iter().all(|o| {
+            matches!(
+                o,
+                Op::SetColumnFormat { .. } | Op::SetAllColumnFormat { .. }
+            )
+        });
         if all_set_col {
             if let Some(ref p) = self.path.clone() {
                 for op in &ops {
@@ -13218,6 +13243,44 @@ mod tests {
                 number: Some(NumberFormat::Fixed { decimals: 1 }),
                 align: Some(TextAlign::Right),
             }
+        );
+    }
+
+    #[test]
+    fn format_scope_all_column_sets_all_global_cols() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 2);
+        let fmt = CellFormat {
+            number: Some(NumberFormat::Fixed { decimals: 2 }),
+            align: None,
+        };
+        app.apply_format_to_target(FormatTarget::All, fmt);
+        for c in 0..app.state.grid.total_cols() {
+            assert_eq!(app.state.grid.format_for_global_col(FormatScope::All, c), fmt);
+        }
+    }
+
+    #[test]
+    fn format_scope_full_column_sets_only_global_cursor_column() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 2);
+        app.cursor.col = MARGIN_COLS + 1;
+        let fmt = CellFormat {
+            number: Some(NumberFormat::Currency { decimals: 0 }),
+            align: None,
+        };
+        app.apply_format_to_target(FormatTarget::FullColumn, fmt);
+        assert_eq!(
+            app.state
+                .grid
+                .format_for_global_col(FormatScope::All, MARGIN_COLS + 1),
+            fmt
+        );
+        assert_eq!(
+            app.state
+                .grid
+                .format_for_global_col(FormatScope::All, MARGIN_COLS),
+            CellFormat::default()
         );
     }
 
