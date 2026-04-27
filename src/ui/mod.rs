@@ -328,6 +328,7 @@ enum MenuAction {
     FormatReset,
     InsertRows,
     InsertMitosisRow,
+    InsertMitosisCol,
     InsertCols,
     InsertSpecialChars,
     InsertDate,
@@ -520,7 +521,7 @@ const SHEET_MENU_ITEMS: [MenuItem; 8] = [
     },
 ];
 
-const INSERT_ROOT_MENU_ITEMS: [MenuItem; 7] = [
+const INSERT_ROOT_MENU_ITEMS: [MenuItem; 8] = [
     MenuItem {
         shortcut: 'R',
         label: "Rows",
@@ -530,6 +531,11 @@ const INSERT_ROOT_MENU_ITEMS: [MenuItem; 7] = [
         shortcut: 'M',
         label: "Mitosis (Row)",
         target: MenuTarget::Action(MenuAction::InsertMitosisRow),
+    },
+    MenuItem {
+        shortcut: 'O',
+        label: "Mitosis (Col)",
+        target: MenuTarget::Action(MenuAction::InsertMitosisCol),
     },
     MenuItem {
         shortcut: 'C',
@@ -1115,6 +1121,10 @@ impl App {
             }
             MenuAction::InsertMitosisRow => {
                 let _ = self.insert_mitosis_row_after_cursor();
+                Mode::Normal
+            }
+            MenuAction::InsertMitosisCol => {
+                let _ = self.insert_mitosis_col_after_cursor();
                 Mode::Normal
             }
             MenuAction::InsertCols => {
@@ -4631,6 +4641,77 @@ impl App {
         self.anchor = None;
         self.selection_kind = SelectionKind::Cells;
         self.status = format!("Inserted mitosis row after row {}", source_row + 1);
+        Ok(true)
+    }
+
+    fn insert_mitosis_col_after_cursor(&mut self) -> Result<bool, RunError> {
+        let hm = MARGIN_COLS;
+        let original_main_cols = self.state.grid.main_cols() as u32;
+        if self.cursor.row < HEADER_ROWS
+            || self.cursor.row >= HEADER_ROWS + self.state.grid.main_rows()
+        {
+            return Ok(false);
+        }
+        if self.cursor.col < hm || self.cursor.col >= hm + original_main_cols as usize {
+            return Ok(false);
+        }
+
+        let source_col = (self.cursor.col - hm) as u32;
+        let dest_col = source_col + 1;
+        let source_global_col = (hm as u32) + source_col;
+        let dest_global_col = source_global_col + 1;
+        let mut copied_cells = Vec::new();
+
+        for row in 0..self.state.grid.main_rows() as u32 {
+            let src = CellAddr::Main {
+                row,
+                col: source_col,
+            };
+            if let Some(value) = self.state.grid.get(&src) {
+                copied_cells.push((CellAddr::Main { row, col: dest_col }, value.to_string()));
+            }
+        }
+
+        for (addr, value) in self.state.grid.iter_nonempty() {
+            match addr {
+                CellAddr::Header { row, col } if col == source_global_col => {
+                    copied_cells.push((CellAddr::Header { row, col: dest_global_col }, value));
+                }
+                CellAddr::Footer { row, col } if col == source_global_col => {
+                    copied_cells.push((CellAddr::Footer { row, col: dest_global_col }, value));
+                }
+                _ => {}
+            }
+        }
+
+        self.apply_single_op(Op::SetMainSize {
+            main_rows: self.state.grid.main_rows() as u32,
+            main_cols: original_main_cols + 1,
+        })?;
+
+        let cols_right = original_main_cols.saturating_sub(dest_col);
+        if cols_right > 0 {
+            self.apply_single_op(Op::MoveColRange {
+                from: dest_col,
+                count: cols_right,
+                to: original_main_cols + 1,
+            })?;
+        }
+
+        if !copied_cells.is_empty() {
+            self.apply_single_op(Op::FillRange {
+                cells: copied_cells,
+            })?;
+        }
+
+        self.cursor = SheetCursor {
+            row: self.cursor.row,
+            col: hm + dest_col as usize,
+        };
+        self.cursor.clamp(&self.state.grid);
+        self.anchor = None;
+        self.selection_kind = SelectionKind::Cells;
+        self.status = format!("Inserted mitosis col after col {}", source_col + 1);
         Ok(true)
     }
 
@@ -12753,11 +12834,101 @@ mod tests {
     }
 
     #[test]
+    fn mitosis_col_copies_current_col_after_it() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(2, 3);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "left".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 1 }, "copy-me".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 1, col: 1 }, "=A2*2".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 2 }, "right".into());
+        app.state
+            .grid
+            .set(&CellAddr::Header { row: 0, col: (MARGIN_COLS + 1) as u32 }, "hdr".into());
+        app.state
+            .grid
+            .set(&CellAddr::Footer { row: 0, col: (MARGIN_COLS + 1) as u32 }, "ftr".into());
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS + 1,
+        };
+
+        app.insert_mitosis_col_after_cursor().unwrap();
+
+        assert_eq!(app.state.grid.main_cols(), 4);
+        assert_eq!(app.cursor.col, MARGIN_COLS + 2);
+        assert_eq!(
+            app.state
+                .grid
+                .get(&CellAddr::Main { row: 0, col: 1 })
+                .as_deref(),
+            Some("copy-me")
+        );
+        assert_eq!(
+            app.state
+                .grid
+                .get(&CellAddr::Main { row: 0, col: 2 })
+                .as_deref(),
+            Some("copy-me")
+        );
+        assert_eq!(
+            app.state
+                .grid
+                .get(&CellAddr::Main { row: 1, col: 2 })
+                .as_deref(),
+            Some("=A2*2")
+        );
+        assert_eq!(
+            app.state
+                .grid
+                .get(&CellAddr::Main { row: 0, col: 3 })
+                .as_deref(),
+            Some("right")
+        );
+        assert_eq!(
+            app.state
+                .grid
+                .get(&CellAddr::Header {
+                    row: 0,
+                    col: (MARGIN_COLS + 2) as u32
+                })
+                .as_deref(),
+            Some("hdr")
+        );
+        assert_eq!(
+            app.state
+                .grid
+                .get(&CellAddr::Footer {
+                    row: 0,
+                    col: (MARGIN_COLS + 2) as u32
+                })
+                .as_deref(),
+            Some("ftr")
+        );
+    }
+
+    #[test]
     fn insert_menu_contains_mitosis_row() {
         assert!(INSERT_ROOT_MENU_ITEMS.iter().any(|item| {
             item.shortcut == 'M'
                 && item.label == "Mitosis (Row)"
                 && item.target == MenuTarget::Action(MenuAction::InsertMitosisRow)
+        }));
+    }
+
+    #[test]
+    fn insert_menu_contains_mitosis_col() {
+        assert!(INSERT_ROOT_MENU_ITEMS.iter().any(|item| {
+            item.shortcut == 'O'
+                && item.label == "Mitosis (Col)"
+                && item.target == MenuTarget::Action(MenuAction::InsertMitosisCol)
         }));
     }
 
