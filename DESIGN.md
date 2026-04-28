@@ -10,7 +10,7 @@ This document summarizes the architecture and key decisions implemented so far.
 - **Collaborative-ish via filesystem**: append-only text log as the source of truth; instances watch and apply new lines.
 - **Structural ops**: move row/column ranges without rewriting the whole file.
 - **Formulas**: cells whose value starts with `=` evaluate for display and for numeric range aggregation.
-- **Special rows/columns**: margin labels (`SUM`, `TOTAL`, …) drive computed totals over main data (see below).
+- **Special rows/columns**: margin labels (`SUM`, `=TOTAL`, …) drive computed totals over main data; the stored total directive is `=TOTAL` and the TUI shows `TOTAL` (see below).
 - **Sparse “infinite” sheet**: unbounded logical size without allocating huge dense grids.
 - **Workbook tabs**: stable numeric sheet IDs, per-sheet titles, and cross-sheet formula references.
 
@@ -48,7 +48,7 @@ Addresses are represented by `CellAddr` in `src/grid/mod.rs`:
 
 The current concrete `Grid` is sparse across editable cell regions:
 
-- **Main cells**: `HashMap<(u32, u32), String>`, keyed by main row and main column. Absent keys are empty cells.
+- **Main cells**: `HashMap<(u32, u32), String>`, keyed by main row and main column. Absent keys are empty cells. This is similar to Gnumeric which also uses a hashmap, though I am not sure it is optimal.
 - **Left margin cells**: `HashMap<(u32, MarginIndex), String>`, keyed by main row and left-margin column.
 - **Right margin cells**: `HashMap<(u32, MarginIndex), String>`, keyed by main row and right-margin column.
 - **Header/footer cells**: sparse `HashMap<(u32, u32), String>` maps keyed by special-row index and global column. Absent keys are empty cells.
@@ -331,7 +331,7 @@ There is **no** separate `SetAggregate` op. Numeric aggregation over a main-regi
 
 **Special header/footer behavior** (UI only): certain margin cells label a row or column as `SUM`, `MEAN`, etc. The TUI then **computes** that aggregate over the corresponding main strip using `compute_aggregate` in `src/agg/mod.rs` (`AggregateDef` + `AggFunc` are **not** persisted; they are constructed at render time). Those totals treat formula cells like any other cell: the formula’s numeric value is used.
 
-Supported aggregate names: `SUM`/`TOTAL`, `MEAN`/`AVERAGE`/`AVG`, `MEDIAN`, `MIN`/`MINIMUM`, `MAX`/`MAXIMUM`, `COUNT`.
+Supported aggregate names: `SUM` (bare), `=TOTAL` (stored; displayed as `TOTAL`), `MEAN`/`AVERAGE`/`AVG`, `MEDIAN`, `MIN`/`MINIMUM`, `MAX`/`MAXIMUM`, `COUNT`.
 
 ## TUI: viewport and navigation
 

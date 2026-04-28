@@ -18,6 +18,27 @@ pub enum AggFunc {
     Count,
 }
 
+/// Sum-of-block aggregate from a margin key cell. Only `=TOTAL` (ASCII case-insensitive) is the
+/// total directive; plain `TOTAL` is not special. `SUM` (bare) and other keyword forms are unchanged.
+pub fn margin_key_agg_func(val: &str) -> Option<AggFunc> {
+    let t = val.trim();
+    if t
+        .strip_prefix('=')
+        .is_some_and(|r| r.eq_ignore_ascii_case("TOTAL"))
+    {
+        return Some(AggFunc::Sum);
+    }
+    match t.to_uppercase().as_str() {
+        "SUM" => Some(AggFunc::Sum),
+        "MEAN" | "AVERAGE" | "AVG" => Some(AggFunc::Mean),
+        "MEDIAN" => Some(AggFunc::Median),
+        "MIN" | "MINIMUM" => Some(AggFunc::Min),
+        "MAX" | "MAXIMUM" => Some(AggFunc::Max),
+        "COUNT" => Some(AggFunc::Count),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AggregateDef {
     pub func: AggFunc,
@@ -1646,6 +1667,16 @@ mod tests {
     }
 
     #[test]
+    fn margin_key_agg_func_accepts_eq_total_not_bare() {
+        use super::margin_key_agg_func;
+        use super::AggFunc;
+        assert_eq!(margin_key_agg_func("=TOTAL"), Some(AggFunc::Sum));
+        assert_eq!(margin_key_agg_func("=total"), Some(AggFunc::Sum));
+        assert_eq!(margin_key_agg_func("TOTAL"), None);
+        assert_eq!(margin_key_agg_func("SUM"), Some(AggFunc::Sum));
+    }
+
+    #[test]
     fn replay_ignores_bare_aggregate_labels() {
         let mut s = SheetState::new(1, 1);
         apply_line("TOTAL", &mut s).unwrap();
@@ -1694,16 +1725,16 @@ mod tests {
                     row: (crate::grid::HEADER_ROWS - 1) as u32,
                     col: (crate::grid::MARGIN_COLS + 2) as u32,
                 },
-                value: "TOTAL".into(),
+                value: "=TOTAL".into(),
             },
         };
-        assert_eq!(op.to_log_line(2), "SET $1:]A~1 TOTAL");
+        assert_eq!(op.to_log_line(2), "SET $1:]A~1 =TOTAL");
     }
 
     #[test]
     fn workbook_set_accepts_space_after_sheet_colon() {
-        let tight = parse_workbook_line("SET $1:[A_1 TOTAL").unwrap();
-        let spaced = parse_workbook_line("SET $1: [A_1 TOTAL").unwrap();
+        let tight = parse_workbook_line("SET $1:[A_1 =TOTAL").unwrap();
+        let spaced = parse_workbook_line("SET $1: [A_1 =TOTAL").unwrap();
         assert_eq!(tight, spaced, "tight and spaced $id: should parse the same op");
     }
 
@@ -1805,7 +1836,7 @@ mod tests {
     fn right_margin_header_ref_does_not_expand_main_cols() {
         let mut wb = WorkbookState::new();
         let mut active = wb.sheet_id(wb.active_sheet);
-        let op = parse_workbook_line("SET $1:]A~1 TOTAL").unwrap();
+        let op = parse_workbook_line("SET $1:]A~1 =TOTAL").unwrap();
         apply_workbook_op(&mut wb, &mut active, op).unwrap();
 
         let sheet = wb.sheet_mut_by_id(1).unwrap();
@@ -1815,7 +1846,7 @@ mod tests {
             row: (crate::grid::HEADER_ROWS - 1) as u32,
             col: (crate::grid::MARGIN_COLS + 1) as u32,
         };
-        assert_eq!(sheet.grid.get(&addr).as_deref(), Some("TOTAL"));
+        assert_eq!(sheet.grid.get(&addr).as_deref(), Some("=TOTAL"));
         assert_eq!(
             crate::addr::cell_ref_text(&addr, sheet.grid.main_cols()),
             "]A~1"
@@ -1826,7 +1857,7 @@ mod tests {
     fn header_data_ref_can_expand_main_cols_when_needed() {
         let mut wb = WorkbookState::new();
         let mut active = wb.sheet_id(wb.active_sheet);
-        let op = parse_workbook_line("SET $1:K~1 TOTAL").unwrap();
+        let op = parse_workbook_line("SET $1:K~1 =TOTAL").unwrap();
         apply_workbook_op(&mut wb, &mut active, op).unwrap();
 
         let sheet = wb.sheet_mut_by_id(1).unwrap();
@@ -1835,7 +1866,7 @@ mod tests {
             row: (crate::grid::HEADER_ROWS - 1) as u32,
             col: (crate::grid::MARGIN_COLS + 10) as u32,
         };
-        assert_eq!(sheet.grid.get(&addr).as_deref(), Some("TOTAL"));
+        assert_eq!(sheet.grid.get(&addr).as_deref(), Some("=TOTAL"));
         assert_eq!(
             crate::addr::cell_ref_text(&addr, sheet.grid.main_cols()),
             "K~1"

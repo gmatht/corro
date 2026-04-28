@@ -6,6 +6,9 @@ use crate::ops::WorkbookState;
 use std::cell::RefCell;
 
 mod functions;
+pub mod number;
+
+pub use number::Number;
 
 thread_local! {
     static EVAL_WORKBOOK: RefCell<Option<WorkbookState>> = const { RefCell::new(None) };
@@ -57,15 +60,13 @@ fn workbook_lookup_sheet_ref(sheet: &str) -> Option<(u32, Grid)> {
 }
 const DEFAULT_BUDGET: usize = 10_000;
 
-const SPEED_OF_LIGHT_MPS: f64 = 299_792_458.0;
-
 /// Evaluation step budget for one aggregate range scan (many cells).
 pub const EVAL_BUDGET_AGG: usize = 1_000_000;
 
 /// Result of evaluating a cell (formula or plain).
 #[derive(Clone, Debug, PartialEq)]
 pub enum EvalResult {
-    Number(f64),
+    Number(Number),
     Text(String),
     Array(Vec<Vec<EvalResult>>),
     /// Display as `#msg` in the UI.
@@ -100,12 +101,8 @@ impl EvalResult {
     }
 }
 
-fn parse_number_literal(s: &str) -> Option<f64> {
-    let t = s.trim();
-    if t.is_empty() {
-        return None;
-    }
-    t.parse::<f64>().ok()
+pub(crate) fn parse_number_literal(s: &str) -> Option<Number> {
+    number::parse_number_literal(s)
 }
 
 fn resolve_name(name: &str, bindings: &[(String, EvalResult)]) -> Option<EvalResult> {
@@ -114,14 +111,14 @@ fn resolve_name(name: &str, bindings: &[(String, EvalResult)]) -> Option<EvalRes
     }
 
     match name {
-        "π" => Some(EvalResult::Number(std::f64::consts::PI)),
-        "e" => Some(EvalResult::Number(std::f64::consts::E)),
-        "c" => Some(EvalResult::Number(SPEED_OF_LIGHT_MPS)),
+        "π" => Some(EvalResult::Number(Number::from_f64_unchecked(std::f64::consts::PI))),
+        "e" => Some(EvalResult::Number(Number::from_f64_unchecked(std::f64::consts::E))),
+        "c" => Some(EvalResult::Number(Number::from_i64(299_792_458))),
         _ => None,
     }
 }
 
-fn split_labeled_formula(raw: &str) -> Option<(&str, &str)> {
+pub(crate) fn split_labeled_formula(raw: &str) -> Option<(&str, &str)> {
     let t = raw.trim();
     let expr = t.strip_prefix('=')?;
     let (expr, label) = expr.rsplit_once(" -- ")?;
@@ -139,7 +136,7 @@ fn render_addr(addr: &CellAddr) -> String {
 
 fn render_ast(ast: &Ast) -> String {
     match ast {
-        Ast::Number(n) => format!("{n}"),
+        Ast::Number(n) => n.to_formula_string(),
         Ast::Text(s) => format!("\"{}\"", s.replace('"', "\"\"")),
         Ast::Name(name) => name.clone(),
         Ast::Ref(addr) => render_addr(addr),
@@ -224,13 +221,16 @@ pub fn translate_formula_text_by_offset(
         return Some(raw.trim().to_string());
     }
     let t = raw.trim();
-    let (expr, label) =
-        split_labeled_formula(t).map_or((t, None), |(expr, label)| (expr, Some(label)));
-    if !expr.starts_with('=') {
+    let (expr_to_parse, label_opt) = if let Some((e, l)) = split_labeled_formula(t) {
+        (format!("={}", e.trim()), Some(l.to_string()))
+    } else {
+        (t.to_string(), None)
+    };
+    if !expr_to_parse.starts_with('=') {
         return None;
     }
     let mut parser = Parser {
-        s: &expr[1..],
+        s: &expr_to_parse[1..],
         i: 0,
         main_cols: 0,
     };
@@ -241,7 +241,7 @@ pub fn translate_formula_text_by_offset(
     }
     let translated = translate_ast_by_offset(&ast, row_delta, col_delta)?;
     let mut out = format!("={}", render_ast(&translated));
-    if let Some(label) = label {
+    if let Some(ref label) = label_opt {
         out.push_str(" -- ");
         out.push_str(label);
     }
@@ -308,7 +308,7 @@ fn translate_range_by_offset(
 
 fn translate_ast_by_offset(ast: &Ast, row_delta: i32, col_delta: i32) -> Option<Ast> {
     Some(match ast {
-        Ast::Number(n) => Ast::Number(*n),
+        Ast::Number(n) => Ast::Number(n.clone()),
         Ast::Text(s) => Ast::Text(s.clone()),
         Ast::Name(name) => Ast::Name(name.clone()),
         Ast::Ref(addr) => Ast::Ref(translate_cell_addr_by_offset(addr, row_delta, col_delta)?),
@@ -350,7 +350,7 @@ fn translate_ast_by_offset(ast: &Ast, row_delta: i32, col_delta: i32) -> Option<
 
 fn translate_ast(ast: &Ast, ctx: &FormulaCopyContext) -> Option<Ast> {
     Some(match ast {
-        Ast::Number(n) => Ast::Number(*n),
+        Ast::Number(n) => Ast::Number(n.clone()),
         Ast::Text(s) => Ast::Text(s.clone()),
         Ast::Name(name) => Ast::Name(name.clone()),
         Ast::Ref(addr) => Ast::Ref(translate_addr(addr, ctx)?),
@@ -473,13 +473,35 @@ fn rewrite_row_template(expr: &str, col: usize) -> String {
 fn control_formula_expr(grid: &Grid, addr: &CellAddr) -> Option<String> {
     let raw_owned = grid.get(addr);
     let raw = raw_owned.as_deref()?;
-    let (expr, _label) = split_labeled_formula(raw)?;
-    Some(expr.to_string())
+    if let Some((expr, _label)) = split_labeled_formula(raw) {
+        return Some(expr.to_string());
+    }
+    // ODS generic historically stored only `of:` (=…) in the cell; round-trip lost ` -- LABEL`.
+    let t = raw.trim().strip_prefix('=')?;
+    if t.contains(" -- ") {
+        return None;
+    }
+    Some(t.to_string())
 }
 
 fn control_formula_label(grid: &Grid, addr: &CellAddr) -> Option<String> {
     let raw_owned = grid.get(addr);
     let raw = raw_owned.as_deref()?;
+    if matches!(
+        addr,
+        CellAddr::Header { .. }
+            | CellAddr::Footer { .. }
+            | CellAddr::Left { .. }
+            | CellAddr::Right { .. }
+    ) {
+        let t = raw.trim();
+        if t
+            .strip_prefix('=')
+            .is_some_and(|r| r.eq_ignore_ascii_case("TOTAL"))
+        {
+            return Some("TOTAL".to_string());
+        }
+    }
     let (_expr, label) = split_labeled_formula(raw)?;
     Some(label.to_string())
 }
@@ -527,13 +549,13 @@ pub fn is_formula(raw: &str) -> bool {
     raw.trim_start().starts_with('=')
 }
 
-/// Numeric value for aggregation: formulas evaluate to a number if possible; plain text uses `f64` parse.
+/// Numeric value for aggregation: formulas evaluate to a number if possible; plain text uses exact/approx parse.
 pub fn effective_numeric(
     grid: &Grid,
     addr: &CellAddr,
     visiting: &mut Vec<CellAddr>,
     budget: &mut usize,
-) -> Option<f64> {
+) -> Option<Number> {
     let raw_owned = grid.get(addr);
     let raw = raw_owned.as_deref().unwrap_or("");
     let template_formula = templated_formula(grid, addr);
@@ -542,7 +564,7 @@ pub fn effective_numeric(
     }
     match eval_cell(grid, addr, visiting, budget) {
         EvalResult::Number(n) if !n.is_nan() => {
-            if n == 0.0
+            if n.is_zeroish()
                 && template_formula
                     .as_deref()
                     .is_some_and(|formula| formula_references_all_empty(grid, formula))
@@ -584,7 +606,7 @@ fn eval_cell_with_sheet(
     let raw = raw_owned.as_deref().unwrap_or("");
     let t = raw.trim();
     if t.is_empty() {
-        return EvalResult::Number(0.0);
+        return EvalResult::Number(Number::exact_zero());
     }
     if !t.starts_with('=') {
         return if let Some(n) = parse_number_literal(t) {
@@ -638,7 +660,7 @@ fn eval_cell_inner(
     let raw = raw_owned.as_deref().unwrap_or("");
     let t = raw.trim();
     if t.is_empty() {
-        return EvalResult::Number(0.0);
+        return EvalResult::Number(Number::exact_zero());
     }
     if !t.starts_with('=') {
         return if let Some(n) = parse_number_literal(t) {
@@ -688,7 +710,7 @@ fn eval_expr_str(
 
 #[derive(Clone, Debug)]
 enum Ast {
-    Number(f64),
+    Number(Number),
     Text(String),
     Name(String),
     Ref(CellAddr),
@@ -946,7 +968,7 @@ impl<'a> Parser<'a> {
         Err(())
     }
 
-    fn parse_number(&mut self) -> Result<f64, ()> {
+    fn parse_number(&mut self) -> Result<Number, ()> {
         let start = self.i;
         while let Some(b) = self.peek() {
             if b.is_ascii_digit() || b == b'.' {
@@ -955,7 +977,7 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        self.s[start..self.i].parse::<f64>().map_err(|_| ())
+        number::parse_number_literal(&self.s[start..self.i]).ok_or(())
     }
 
     /// Find index of closing `)` matching an already-open `(` at depth starting at `from`.
@@ -1060,7 +1082,7 @@ fn eval_ast(
     allow_templates: bool,
 ) -> EvalResult {
     match ast {
-        Ast::Number(n) => EvalResult::Number(*n),
+        Ast::Number(n) => EvalResult::Number(n.clone()),
         Ast::Text(s) => EvalResult::Text(s.clone()),
         Ast::Name(name) => resolve_name(name, bindings).unwrap_or(EvalResult::Error("NAME")),
         Ast::Ref(addr) => eval_cell_inner(grid, addr, visiting, budget, allow_templates),
@@ -1082,10 +1104,10 @@ fn eval_ast(
         }
         Ast::Range(_) => EvalResult::Error("RANGE"),
         Ast::Neg(a) => match eval_ast(a, grid, visiting, bindings, budget, allow_templates) {
-            EvalResult::Number(n) => EvalResult::Number(-n),
+            EvalResult::Number(n) => EvalResult::Number(n.neg()),
             e => e,
         },
-        Ast::Add(a, b) => eval_binary(
+        Ast::Add(a, b) => eval_binary_op(
             a,
             b,
             grid,
@@ -1093,9 +1115,9 @@ fn eval_ast(
             bindings,
             budget,
             allow_templates,
-            |x, y| x + y,
+            BinaryOp::Add,
         ),
-        Ast::Sub(a, b) => eval_binary(
+        Ast::Sub(a, b) => eval_binary_op(
             a,
             b,
             grid,
@@ -1103,9 +1125,9 @@ fn eval_ast(
             bindings,
             budget,
             allow_templates,
-            |x, y| x - y,
+            BinaryOp::Sub,
         ),
-        Ast::Mul(a, b) => eval_binary(
+        Ast::Mul(a, b) => eval_binary_op(
             a,
             b,
             grid,
@@ -1113,9 +1135,9 @@ fn eval_ast(
             bindings,
             budget,
             allow_templates,
-            |x, y| x * y,
+            BinaryOp::Mul,
         ),
-        Ast::Div(a, b) => eval_binary(
+        Ast::Div(a, b) => eval_binary_op(
             a,
             b,
             grid,
@@ -1123,15 +1145,9 @@ fn eval_ast(
             bindings,
             budget,
             allow_templates,
-            |x, y| {
-                if y == 0.0 {
-                    f64::NAN
-                } else {
-                    x / y
-                }
-            },
+            BinaryOp::Div,
         ),
-        Ast::Pow(a, b) => eval_binary(
+        Ast::Pow(a, b) => eval_binary_op(
             a,
             b,
             grid,
@@ -1139,7 +1155,7 @@ fn eval_ast(
             bindings,
             budget,
             allow_templates,
-            |x, y| x.powf(y),
+            BinaryOp::Pow,
         ),
         Ast::Call { name, args } => functions::eval_builtin(
             name,
@@ -1155,16 +1171,86 @@ fn eval_ast(
 
 fn truthy(e: EvalResult) -> bool {
     match e.scalar_coerce() {
-        EvalResult::Number(n) => n != 0.0 && !n.is_nan(),
+        EvalResult::Number(n) => !n.is_nan() && !n.is_zeroish(),
         EvalResult::Text(s) => functions::parse_numeric_or_date_literal(&s)
-            .map(|n| n != 0.0)
+            .map(|v| !v.is_nan() && !v.is_zeroish())
             .unwrap_or(false),
         EvalResult::Error(_) => false,
         EvalResult::Array(_) => false,
     }
 }
 
-fn eval_binary(
+enum BinaryOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Pow,
+}
+
+fn eval_binary_op(
+    a: &Ast,
+    b: &Ast,
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+    op: BinaryOp,
+) -> EvalResult {
+    let ea = eval_ast(
+        a,
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+    )
+    .scalar_coerce();
+    let eb = eval_ast(
+        b,
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+    )
+    .scalar_coerce();
+    let na = match coerce_cell_number(ea) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let nb = match coerce_cell_number(eb) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let out = match op {
+        BinaryOp::Add => na.add(nb),
+        BinaryOp::Sub => na.sub(nb),
+        BinaryOp::Mul => na.mul(nb),
+        BinaryOp::Div => na.div(nb),
+        BinaryOp::Pow => na.pow(nb),
+    };
+    EvalResult::Number(out)
+}
+
+fn coerce_cell_number(e: EvalResult) -> Result<Number, EvalResult> {
+    match e {
+        EvalResult::Number(n) => Ok(n),
+        EvalResult::Text(s) => {
+            if let Some(n) = functions::parse_numeric_or_date_literal(&s) {
+                Ok(n)
+            } else {
+                Err(EvalResult::Error("VALUE"))
+            }
+        }
+        EvalResult::Error(e) => Err(EvalResult::Error(e)),
+        EvalResult::Array(_) => Err(EvalResult::Error("CALC")),
+    }
+}
+
+/// Used by builtins that need float semantics (`POWER`, trigonometry, etc.).
+pub(super) fn eval_binary_float(
     a: &Ast,
     b: &Ast,
     grid: &Grid,
@@ -1174,35 +1260,33 @@ fn eval_binary(
     allow_templates: bool,
     f: fn(f64, f64) -> f64,
 ) -> EvalResult {
-    let (ea, eb) = (
-        eval_ast(a, grid, visiting, bindings, budget, allow_templates).scalar_coerce(),
-        eval_ast(b, grid, visiting, bindings, budget, allow_templates).scalar_coerce(),
-    );
-    let na = match ea {
-        EvalResult::Number(n) => n,
-        EvalResult::Text(s) => {
-            if let Some(n) = functions::parse_numeric_or_date_literal(&s) {
-                n
-            } else {
-                return EvalResult::Error("VALUE");
-            }
-        }
-        EvalResult::Error(e) => return EvalResult::Error(e),
-        EvalResult::Array(_) => return EvalResult::Error("CALC"),
+    let ea = eval_ast(
+        a,
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+    )
+    .scalar_coerce();
+    let eb = eval_ast(
+        b,
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+    )
+    .scalar_coerce();
+    let na = match coerce_cell_number(ea) {
+        Ok(n) => n,
+        Err(e) => return e,
     };
-    let nb = match eb {
-        EvalResult::Number(n) => n,
-        EvalResult::Text(s) => {
-            if let Some(n) = functions::parse_numeric_or_date_literal(&s) {
-                n
-            } else {
-                return EvalResult::Error("VALUE");
-            }
-        }
-        EvalResult::Error(e) => return EvalResult::Error(e),
-        EvalResult::Array(_) => return EvalResult::Error("CALC"),
+    let nb = match coerce_cell_number(eb) {
+        Ok(n) => n,
+        Err(e) => return e,
     };
-    EvalResult::Number(f(na, nb))
+    EvalResult::Number(Number::from_f64_unchecked(f(na.to_f64(), nb.to_f64())))
 }
 
 fn eval_sum(
@@ -1216,7 +1300,7 @@ fn eval_sum(
         Ast::Range(r) => EvalResult::Number(sum_main_range(grid, r, visiting, budget)),
         Ast::Ref(addr) => {
             let n = effective_numeric(grid, addr, visiting, budget);
-            EvalResult::Number(n.unwrap_or(0.0))
+            EvalResult::Number(n.unwrap_or_else(Number::exact_zero))
         }
         Ast::Call { .. }
         | Ast::Neg(_)
@@ -1248,7 +1332,7 @@ fn eval_sum(
             EvalResult::Error(e) => EvalResult::Error(e),
             EvalResult::Array(_) => EvalResult::Error("CALC"),
         },
-        Ast::Number(n) => EvalResult::Number(*n),
+        Ast::Number(n) => EvalResult::Number(n.clone()),
     }
 }
 
@@ -1257,16 +1341,17 @@ fn sum_main_range(
     range: &MainRange,
     visiting: &mut Vec<CellAddr>,
     budget: &mut usize,
-) -> f64 {
+) -> Number {
     if range.is_empty() {
-        return 0.0;
+        return Number::exact_zero();
     }
-    let mut s = 0.0;
+    let mut s = Number::exact_zero();
     for r in range.row_start..range.row_end {
         for c in range.col_start..range.col_end {
             let addr = CellAddr::Main { row: r, col: c };
-            let n = effective_numeric(grid, &addr, visiting, budget).unwrap_or(0.0);
-            s += n;
+            let n = effective_numeric(grid, &addr, visiting, budget)
+                .unwrap_or_else(Number::exact_zero);
+            s = s.add(n);
         }
     }
     s
@@ -1316,13 +1401,17 @@ pub fn refresh_spills(grid: &mut Grid) {
     }
 }
 
+fn format_number(n: &Number) -> String {
+    format_significant_10(n.to_f64())
+}
+
 fn eval_result_to_string(result: &EvalResult) -> String {
     match result {
         EvalResult::Number(n) => {
             if n.is_nan() {
                 "#NUM!".to_string()
             } else {
-                format_significant_10(*n)
+                format_number(n)
             }
         }
         EvalResult::Text(s) => s.clone(),
@@ -1427,14 +1516,14 @@ pub fn cell_effective_display(grid: &Grid, addr: &CellAddr) -> String {
         EvalResult::Number(n) => {
             if n.is_nan() {
                 "#NUM!".to_string()
-            } else if n == 0.0
+            } else if n.is_zeroish()
                 && template_formula
                     .as_deref()
                     .is_some_and(|formula| formula_references_all_empty(grid, formula))
             {
                 String::new()
             } else {
-                format_significant_10(n)
+                format_number(&n)
             }
         }
         EvalResult::Text(s) => s,
@@ -1472,7 +1561,34 @@ fn format_significant_10(n: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::grid::Grid;
+
+    fn nf(n: &Number) -> f64 {
+        n.to_f64()
+    }
+
+    /// Classic float hazard: 0.1+0.2 stays exact as a rational, not 0.30000000000000004.
+    #[test]
+    fn decimal_fractions_sum_exactly() {
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(1, 1));
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "=0.1+0.2".into());
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 0 }, &mut v, &mut b) {
+            EvalResult::Number(n) => assert!((nf(&n) - 0.3).abs() < 1e-15),
+            e => panic!("expected number {:?}", e),
+        }
+    }
+
+    #[test]
+    fn margin_stored_eq_total_displays_as_total_label() {
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(1, 1));
+        let addr = CellAddr::Header {
+            row: (HEADER_ROWS - 1) as u32,
+            col: (MARGIN_COLS + 1) as u32,
+        };
+        g.set(&addr, "=ToTaL".into());
+        assert_eq!(cell_effective_display(&g, &addr), "TOTAL");
+    }
 
     #[test]
     fn formula_add() {
@@ -1481,7 +1597,7 @@ mod tests {
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
         match eval_cell(&g, &CellAddr::Main { row: 0, col: 0 }, &mut v, &mut b) {
-            EvalResult::Number(n) => assert!((n - 7.0).abs() < 1e-9),
+            EvalResult::Number(n) => assert!((nf(&n) - 7.0).abs() < 1e-9),
             e => panic!("expected number {:?}", e),
         }
     }
@@ -1494,13 +1610,13 @@ mod tests {
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
         match eval_cell(&g, &CellAddr::Main { row: 0, col: 0 }, &mut v, &mut b) {
-            EvalResult::Number(n) => assert!((n - 8.0).abs() < 1e-9),
+            EvalResult::Number(n) => assert!((nf(&n) - 8.0).abs() < 1e-9),
             e => panic!("expected 8 {:?}", e),
         }
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
         match eval_cell(&g, &CellAddr::Main { row: 0, col: 1 }, &mut v, &mut b) {
-            EvalResult::Number(n) => assert!((n - 2.0).abs() < 1e-9),
+            EvalResult::Number(n) => assert!((nf(&n) - 2.0).abs() < 1e-9),
             e => panic!("expected 2 {:?}", e),
         }
     }
@@ -1518,7 +1634,7 @@ mod tests {
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
         match eval_cell(&g, &CellAddr::Main { row: 0, col: 0 }, &mut v, &mut b) {
-            EvalResult::Number(n) => assert!((n - 512.0).abs() < 1e-9),
+            EvalResult::Number(n) => assert!((nf(&n) - 512.0).abs() < 1e-9),
             e => panic!("expected 512 {:?}", e),
         }
     }
@@ -1530,7 +1646,7 @@ mod tests {
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
         match eval_cell(&g, &CellAddr::Main { row: 0, col: 0 }, &mut v, &mut b) {
-            EvalResult::Number(n) => assert!((n + 4.0).abs() < 1e-9),
+            EvalResult::Number(n) => assert!((nf(&n) + 4.0).abs() < 1e-9),
             e => panic!("expected -4 {:?}", e),
         }
     }
@@ -1544,7 +1660,7 @@ mod tests {
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
         match eval_cell(&g, &CellAddr::Main { row: 1, col: 0 }, &mut v, &mut b) {
-            EvalResult::Number(n) => assert!((n - 7.0).abs() < 1e-9),
+            EvalResult::Number(n) => assert!((nf(&n) - 7.0).abs() < 1e-9),
             e => panic!("expected 7 {:?}", e),
         }
     }
@@ -1583,7 +1699,7 @@ mod tests {
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
         match eval_cell(&g, &CellAddr::Main { row: 0, col: 0 }, &mut v, &mut b) {
-            EvalResult::Number(n) => assert!((n - 7.0).abs() < 1e-9),
+            EvalResult::Number(n) => assert!((nf(&n) - 7.0).abs() < 1e-9),
             e => panic!("expected 7 {:?}", e),
         }
     }
@@ -1598,7 +1714,7 @@ mod tests {
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
         match eval_cell(&g, &CellAddr::Main { row: 0, col: 0 }, &mut v, &mut b) {
-            EvalResult::Number(n) => assert!((n - 3.0).abs() < 1e-9),
+            EvalResult::Number(n) => assert!((nf(&n) - 3.0).abs() < 1e-9),
             e => panic!("expected 3 {:?}", e),
         }
     }
@@ -1625,21 +1741,21 @@ mod tests {
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
         match eval_cell(&g, &CellAddr::Main { row: 0, col: 0 }, &mut v, &mut b) {
-            EvalResult::Number(n) => assert!(n.abs() < 1e-12),
+            EvalResult::Number(n) => assert!(nf(&n).abs() < 1e-12),
             e => panic!("expected 0 {:?}", e),
         }
 
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
         match eval_cell(&g, &CellAddr::Main { row: 0, col: 1 }, &mut v, &mut b) {
-            EvalResult::Number(n) => assert!((n - std::f64::consts::E).abs() < 1e-12),
+            EvalResult::Number(n) => assert!((nf(&n) - std::f64::consts::E).abs() < 1e-12),
             e => panic!("expected e {:?}", e),
         }
 
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
         match eval_cell(&g, &CellAddr::Main { row: 0, col: 2 }, &mut v, &mut b) {
-            EvalResult::Number(n) => assert!((n - SPEED_OF_LIGHT_MPS).abs() < 1e-12),
+            EvalResult::Number(n) => assert!((nf(&n) - 299_792_458.0).abs() < 1e-12),
             e => panic!("expected c {:?}", e),
         }
     }
@@ -1655,7 +1771,7 @@ mod tests {
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
         match eval_cell(&g, &CellAddr::Main { row: 0, col: 0 }, &mut v, &mut b) {
-            EvalResult::Number(n) => assert!((n - 3.0).abs() < 1e-9),
+            EvalResult::Number(n) => assert!((nf(&n) - 3.0).abs() < 1e-9),
             e => panic!("expected 3 {:?}", e),
         }
     }
@@ -1690,7 +1806,7 @@ mod tests {
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
         match eval_cell(&g, &CellAddr::Main { row: 0, col: 2 }, &mut v, &mut b) {
-            EvalResult::Number(n) => assert!((n - 1.0).abs() < 1e-9),
+            EvalResult::Number(n) => assert!((nf(&n) - 1.0).abs() < 1e-9),
             e => panic!("expected 1 {:?}", e),
         }
     }
@@ -1709,7 +1825,7 @@ mod tests {
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
         match eval_cell(&g, &CellAddr::Main { row: 0, col: 4 }, &mut v, &mut b) {
-            EvalResult::Number(n) => assert!((n - 30.0).abs() < 1e-9),
+            EvalResult::Number(n) => assert!((nf(&n) - 30.0).abs() < 1e-9),
             e => panic!("expected 30 {:?}", e),
         }
     }
@@ -1838,7 +1954,7 @@ mod tests {
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
         match eval_cell(&g, &CellAddr::Main { row: 0, col: 2 }, &mut v, &mut b) {
-            EvalResult::Number(n) => assert!((n - 2.0).abs() < 1e-9),
+            EvalResult::Number(n) => assert!((nf(&n) - 2.0).abs() < 1e-9),
             e => panic!("expected 2 {:?}", e),
         }
         let mut v = Vec::new();
@@ -1871,19 +1987,19 @@ mod tests {
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
         match eval_cell(&g, &CellAddr::Main { row: 0, col: 2 }, &mut v, &mut b) {
-            EvalResult::Number(n) => assert!((n - 2.0).abs() < 1e-9),
+            EvalResult::Number(n) => assert!((nf(&n) - 2.0).abs() < 1e-9),
             e => panic!("expected 2 {:?}", e),
         }
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
         match eval_cell(&g, &CellAddr::Main { row: 0, col: 3 }, &mut v, &mut b) {
-            EvalResult::Number(n) => assert!((n - 4.0).abs() < 1e-9),
+            EvalResult::Number(n) => assert!((nf(&n) - 4.0).abs() < 1e-9),
             e => panic!("expected 4 {:?}", e),
         }
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
         match eval_cell(&g, &CellAddr::Main { row: 1, col: 2 }, &mut v, &mut b) {
-            EvalResult::Number(n) => assert!((n - 2.0).abs() < 1e-9),
+            EvalResult::Number(n) => assert!((nf(&n) - 2.0).abs() < 1e-9),
             e => panic!("expected 2 {:?}", e),
         }
     }
@@ -1977,7 +2093,7 @@ mod tests {
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
         match eval_cell(&g, &CellAddr::Main { row: 0, col: 0 }, &mut v, &mut b) {
-            EvalResult::Number(n) => assert!((n - 3.0).abs() < 1e-9),
+            EvalResult::Number(n) => assert!((nf(&n) - 3.0).abs() < 1e-9),
             e => panic!("expected 3 {:?}", e),
         }
         let mut v = Vec::new();
@@ -2064,13 +2180,13 @@ mod tests {
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
         match eval_cell(&g, &CellAddr::Main { row: 0, col: 5 }, &mut v, &mut b) {
-            EvalResult::Number(n) => assert!((n - 3.0).abs() < 1e-9),
+            EvalResult::Number(n) => assert!((nf(&n) - 3.0).abs() < 1e-9),
             e => panic!("expected 3 {:?}", e),
         }
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
         match eval_cell(&g, &CellAddr::Main { row: 0, col: 6 }, &mut v, &mut b) {
-            EvalResult::Number(n) => assert!((n - 3.0).abs() < 1e-9),
+            EvalResult::Number(n) => assert!((nf(&n) - 3.0).abs() < 1e-9),
             e => panic!("expected 3 {:?}", e),
         }
     }
@@ -2103,37 +2219,37 @@ mod tests {
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
         match eval_cell(&g, &CellAddr::Main { row: 0, col: 1 }, &mut v, &mut b) {
-            EvalResult::Number(n) => assert!(n > 45000.0),
+            EvalResult::Number(n) => assert!(nf(&n) > 45000.0),
             e => panic!("expected date arithmetic {:?}", e),
         }
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
         match eval_cell(&g, &CellAddr::Main { row: 0, col: 2 }, &mut v, &mut b) {
-            EvalResult::Number(n) => assert!((n - 2024.0).abs() < 1e-9),
+            EvalResult::Number(n) => assert!((nf(&n) - 2024.0).abs() < 1e-9),
             e => panic!("expected year {:?}", e),
         }
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
         match eval_cell(&g, &CellAddr::Main { row: 0, col: 3 }, &mut v, &mut b) {
-            EvalResult::Number(n) => assert!((n - 1.0).abs() < 1e-9),
+            EvalResult::Number(n) => assert!((nf(&n) - 1.0).abs() < 1e-9),
             e => panic!("expected month {:?}", e),
         }
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
         match eval_cell(&g, &CellAddr::Main { row: 0, col: 4 }, &mut v, &mut b) {
-            EvalResult::Number(n) => assert!((n - 2.0).abs() < 1e-9),
+            EvalResult::Number(n) => assert!((nf(&n) - 2.0).abs() < 1e-9),
             e => panic!("expected day {:?}", e),
         }
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
         match eval_cell(&g, &CellAddr::Main { row: 0, col: 5 }, &mut v, &mut b) {
-            EvalResult::Number(n) => assert!((0.0..24.0).contains(&n)),
+            EvalResult::Number(n) => assert!((0.0..24.0).contains(&nf(&n))),
             e => panic!("expected hour {:?}", e),
         }
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
         match eval_cell(&g, &CellAddr::Main { row: 0, col: 6 }, &mut v, &mut b) {
-            EvalResult::Number(n) => assert!((0.0..60.0).contains(&n)),
+            EvalResult::Number(n) => assert!((0.0..60.0).contains(&nf(&n))),
             e => panic!("expected minute {:?}", e),
         }
     }
@@ -2149,20 +2265,20 @@ mod tests {
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
         let first = match eval_cell(&g, &CellAddr::Main { row: 0, col: 0 }, &mut v, &mut b) {
-            EvalResult::Number(n) => n,
+            EvalResult::Number(n) => nf(&n),
             e => panic!("expected rand {:?}", e),
         };
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
         let second = match eval_cell(&g, &CellAddr::Main { row: 0, col: 0 }, &mut v, &mut b) {
-            EvalResult::Number(n) => n,
+            EvalResult::Number(n) => nf(&n),
             e => panic!("expected rand {:?}", e),
         };
         assert!((first - second).abs() < 1e-12);
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
         let between = match eval_cell(&g, &CellAddr::Main { row: 0, col: 1 }, &mut v, &mut b) {
-            EvalResult::Number(n) => n,
+            EvalResult::Number(n) => nf(&n),
             e => panic!("expected randbetween {:?}", e),
         };
         assert!((1.0..=10.0).contains(&between));
@@ -2170,7 +2286,7 @@ mod tests {
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
         let changed = match eval_cell(&g, &CellAddr::Main { row: 0, col: 0 }, &mut v, &mut b) {
-            EvalResult::Number(n) => n,
+            EvalResult::Number(n) => nf(&n),
             e => panic!("expected rand {:?}", e),
         };
         assert!((first - changed).abs() > 1e-12);
@@ -2205,31 +2321,31 @@ mod tests {
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
         match eval_cell(&g, &CellAddr::Main { row: 2, col: 0 }, &mut v, &mut b) {
-            EvalResult::Number(n) => assert!((n - 1.0).abs() < 1e-9),
+            EvalResult::Number(n) => assert!((nf(&n) - 1.0).abs() < 1e-9),
             e => panic!("expected 1 {:?}", e),
         }
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
         match eval_cell(&g, &CellAddr::Main { row: 0, col: 2 }, &mut v, &mut b) {
-            EvalResult::Number(n) => assert!((n - 1.0).abs() < 1e-9),
+            EvalResult::Number(n) => assert!((nf(&n) - 1.0).abs() < 1e-9),
             e => panic!("expected 1 {:?}", e),
         }
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
         match eval_cell(&g, &CellAddr::Main { row: 0, col: 3 }, &mut v, &mut b) {
-            EvalResult::Number(n) => assert!((n - 1.0).abs() < 1e-9),
+            EvalResult::Number(n) => assert!((nf(&n) - 1.0).abs() < 1e-9),
             e => panic!("expected 1 {:?}", e),
         }
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
         match eval_cell(&g, &CellAddr::Main { row: 0, col: 4 }, &mut v, &mut b) {
-            EvalResult::Number(n) => assert!((n - 1.0).abs() < 1e-9),
+            EvalResult::Number(n) => assert!((nf(&n) - 1.0).abs() < 1e-9),
             e => panic!("expected 1 {:?}", e),
         }
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
         match eval_cell(&g, &CellAddr::Main { row: 0, col: 5 }, &mut v, &mut b) {
-            EvalResult::Number(n) => assert!((n - 1.0).abs() < 1e-9),
+            EvalResult::Number(n) => assert!((nf(&n) - 1.0).abs() < 1e-9),
             e => panic!("expected 1 {:?}", e),
         }
         let mut v = Vec::new();
@@ -2288,7 +2404,7 @@ mod tests {
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
         match eval_cell(&g, &CellAddr::Main { row: 0, col: 2 }, &mut v, &mut b) {
-            EvalResult::Number(n) => assert!((n - 10.0).abs() < 1e-9),
+            EvalResult::Number(n) => assert!((nf(&n) - 10.0).abs() < 1e-9),
             e => panic!("expected 10 {:?}", e),
         }
     }
@@ -2300,7 +2416,7 @@ mod tests {
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
         match eval_cell(&g, &CellAddr::Main { row: 0, col: 0 }, &mut v, &mut b) {
-            EvalResult::Number(n) => assert!((n - 2.0).abs() < 1e-9),
+            EvalResult::Number(n) => assert!((nf(&n) - 2.0).abs() < 1e-9),
             e => panic!("expected 2 {:?}", e),
         }
     }
@@ -2318,7 +2434,7 @@ mod tests {
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
         match eval_cell(&g, &CellAddr::Main { row: 0, col: 3 }, &mut v, &mut b) {
-            EvalResult::Number(n) => assert!((n - 2.0).abs() < 1e-9),
+            EvalResult::Number(n) => assert!((nf(&n) - 2.0).abs() < 1e-9),
             e => panic!("expected 2 {:?}", e),
         }
     }
@@ -2344,13 +2460,13 @@ mod tests {
         let mut b = DEFAULT_BUDGET;
         assert!(matches!(
             eval_cell(&g, &CellAddr::Main { row: 0, col: 1 }, &mut v, &mut b),
-            EvalResult::Number(n) if (n - 5.0).abs() < 1e-9
+            EvalResult::Number(n) if (nf(&n) - 5.0).abs() < 1e-9
         ));
         v.clear();
         b = DEFAULT_BUDGET;
         assert!(matches!(
             eval_cell(&g, &CellAddr::Main { row: 1, col: 1 }, &mut v, &mut b),
-            EvalResult::Number(n) if (n - 1.0).abs() < 1e-9
+            EvalResult::Number(n) if (nf(&n) - 1.0).abs() < 1e-9
         ));
     }
 
@@ -2363,19 +2479,19 @@ mod tests {
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
         match eval_cell(&g, &CellAddr::Main { row: 0, col: 0 }, &mut v, &mut b) {
-            EvalResult::Number(n) => assert!((n - 1.0).abs() < 1e-9),
+            EvalResult::Number(n) => assert!((nf(&n) - 1.0).abs() < 1e-9),
             e => panic!("expected 1 {:?}", e),
         }
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
         match eval_cell(&g, &CellAddr::Main { row: 0, col: 1 }, &mut v, &mut b) {
-            EvalResult::Number(n) => assert!((n - 1.0).abs() < 1e-9),
+            EvalResult::Number(n) => assert!((nf(&n) - 1.0).abs() < 1e-9),
             e => panic!("expected 1 {:?}", e),
         }
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
         match eval_cell(&g, &CellAddr::Main { row: 0, col: 2 }, &mut v, &mut b) {
-            EvalResult::Number(n) => assert!((n - 1.0).abs() < 1e-9),
+            EvalResult::Number(n) => assert!((nf(&n) - 1.0).abs() < 1e-9),
             e => panic!("expected 1 {:?}", e),
         }
     }
@@ -2455,7 +2571,7 @@ mod tests {
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
         match eval_cell(&g, &CellAddr::Main { row: 0, col: 2 }, &mut v, &mut b) {
-            EvalResult::Number(n) => assert!((n - 2.0).abs() < 1e-9),
+            EvalResult::Number(n) => assert!((nf(&n) - 2.0).abs() < 1e-9),
             e => panic!("expected 2 {:?}", e),
         }
     }
@@ -2478,7 +2594,7 @@ mod tests {
             "14"
         );
         match eval_cell(&g, &CellAddr::Main { row: 0, col: 1 }, &mut v, &mut b) {
-            EvalResult::Number(n) => assert!((n - 14.0).abs() < 1e-9),
+            EvalResult::Number(n) => assert!((nf(&n) - 14.0).abs() < 1e-9),
             e => panic!("expected 14 {:?}", e),
         }
         assert_eq!(
@@ -2530,7 +2646,7 @@ mod tests {
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
         match eval_cell(&g, &CellAddr::Main { row: 0, col: 0 }, &mut v, &mut b) {
-            EvalResult::Number(n) => assert!((n - 1.0).abs() < 1e-9),
+            EvalResult::Number(n) => assert!((nf(&n) - 1.0).abs() < 1e-9),
             e => panic!("expected 1 {:?}", e),
         }
         assert_eq!(

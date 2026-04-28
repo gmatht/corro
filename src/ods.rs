@@ -64,6 +64,7 @@ fn ods_xml_attr_escape(s: &str) -> String {
 /// How to interpret 0-based ODF table `row_idx` when writing into the Corro grid. Corro exports
 /// include a `corro-ods-layout` sidecar; files without it use the first row's
 /// [ODS_GLOBAL_LAYOUT_MIN_FIRST_ROW_REPEAT] as before (LibreOffice / interop ODS).
+#[derive(Clone)]
 enum OdsTableLayout {
     Odf,
     Rebase { min: usize },
@@ -1094,15 +1095,7 @@ fn footer_row_agg_func(grid: &Grid, footer_row_idx: usize) -> Option<crate::ops:
         row: footer_row_idx as u32,
         col: key_col,
     })?;
-    match val.trim().to_uppercase().as_str() {
-        "TOTAL" | "SUM" => Some(crate::ops::AggFunc::Sum),
-        "MEAN" | "AVERAGE" | "AVG" => Some(crate::ops::AggFunc::Mean),
-        "MEDIAN" => Some(crate::ops::AggFunc::Median),
-        "MIN" | "MINIMUM" => Some(crate::ops::AggFunc::Min),
-        "MAX" | "MAXIMUM" => Some(crate::ops::AggFunc::Max),
-        "COUNT" => Some(crate::ops::AggFunc::Count),
-        _ => None,
-    }
+    crate::ops::margin_key_agg_func(&val)
 }
 
 fn right_col_agg_func(grid: &Grid, global_col: usize) -> Option<crate::ops::AggFunc> {
@@ -1115,14 +1108,8 @@ fn right_col_agg_func(grid: &Grid, global_col: usize) -> Option<crate::ops::AggF
         .collect();
     labels.sort_unstable_by_key(|(row, _)| *row);
     for (_, val) in labels {
-        match val.trim().to_uppercase().as_str() {
-            "TOTAL" | "SUM" => return Some(crate::ops::AggFunc::Sum),
-            "MEAN" | "AVERAGE" | "AVG" => return Some(crate::ops::AggFunc::Mean),
-            "MEDIAN" => return Some(crate::ops::AggFunc::Median),
-            "MIN" | "MINIMUM" => return Some(crate::ops::AggFunc::Min),
-            "MAX" | "MAXIMUM" => return Some(crate::ops::AggFunc::Max),
-            "COUNT" => return Some(crate::ops::AggFunc::Count),
-            _ => {}
+        if let Some(f) = crate::ops::margin_key_agg_func(&val) {
+            return Some(f);
         }
     }
     None
@@ -1134,15 +1121,7 @@ fn left_margin_agg_func(grid: &Grid, main_row: u32) -> Option<crate::ops::AggFun
         col: key_col,
         row: main_row,
     })?;
-    match val.trim().to_uppercase().as_str() {
-        "TOTAL" | "SUM" => Some(crate::ops::AggFunc::Sum),
-        "MEAN" | "AVERAGE" | "AVG" => Some(crate::ops::AggFunc::Mean),
-        "MEDIAN" => Some(crate::ops::AggFunc::Median),
-        "MIN" | "MINIMUM" => Some(crate::ops::AggFunc::Min),
-        "MAX" | "MAXIMUM" => Some(crate::ops::AggFunc::Max),
-        "COUNT" => Some(crate::ops::AggFunc::Count),
-        _ => None,
-    }
+    crate::ops::margin_key_agg_func(&val)
 }
 
 fn data_main_col_count(grid: &Grid) -> usize {
@@ -1525,13 +1504,14 @@ fn footer_formula_or_value(
 }
 
 pub(crate) fn subtotal_code_for_label(raw: &str) -> Option<u8> {
-    match raw.trim().to_ascii_uppercase().as_str() {
-        "TOTAL" | "SUM" => Some(9),
-        "MEAN" | "AVERAGE" | "AVG" => Some(1),
-        "COUNT" => Some(2),
-        "MAX" | "MAXIMUM" => Some(4),
-        "MIN" | "MINIMUM" => Some(5),
-        _ => None,
+    use crate::ops::AggFunc;
+    match crate::ops::margin_key_agg_func(raw)? {
+        AggFunc::Sum => Some(9),
+        AggFunc::Mean => Some(1),
+        AggFunc::Count => Some(2),
+        AggFunc::Max => Some(4),
+        AggFunc::Min => Some(5),
+        AggFunc::Median => None,
     }
 }
 
@@ -1686,10 +1666,18 @@ fn parse_ods_content_with_layout(
                     });
                     workbook.next_sheet_id += 1;
                     row_idx = 0;
+                    col_idx = 0;
                     odf_uses_global_logical = None;
+                    in_cell = false;
+                    in_p = false;
+                    pending_value.clear();
+                    pending_formula = None;
+                    table_cell_num_cols = 1;
                 }
                 b"table:table-row" => {
                     col_idx = 0;
+                    in_cell = false;
+                    in_p = false;
                     current_row_repeat = attr_value(&e, b"table:number-rows-repeated")
                         .and_then(|n| n.parse().ok())
                         .unwrap_or(1);
@@ -1716,12 +1704,15 @@ fn parse_ods_content_with_layout(
             },
             Ok(Event::Empty(e)) => match e.name().as_ref() {
                 b"table:table-cell" => {
-                    let n = attr_value(&e, b"table:number-columns-repeated")
-                        .and_then(|n| n.parse().ok())
-                        .unwrap_or(1)
-                        .max(1);
-                    let empty_formula = attr_value(&e, b"table:formula");
+                    // Only ODF `table:table-cell` inside a `table:table` maps to a sheet. Advancing
+                    // `col_idx` with no `current_sheet` (e.g. interleaved or malformed XML) would
+                    // desync columns and shift TsvParity re-import.
                     if let Some(sheet) = current_sheet.as_mut() {
+                        let n = attr_value(&e, b"table:number-columns-repeated")
+                            .and_then(|n| n.parse().ok())
+                            .unwrap_or(1)
+                            .max(1);
+                        let empty_formula = attr_value(&e, b"table:formula");
                         let odf_full = odf_uses_global_logical == Some(true);
                         let tidx = open_table_i.unwrap_or(0);
                         let table_layout = ods_layout_for_table_index(layouts, tidx, &default_layout);
@@ -1741,8 +1732,6 @@ fn parse_ods_content_with_layout(
                                 );
                             }
                         }
-                        col_idx += n;
-                    } else {
                         col_idx += n;
                     }
                 }
@@ -1778,8 +1767,6 @@ fn parse_ods_content_with_layout(
                             }
                         }
                         col_idx += n;
-                    } else {
-                        col_idx += table_cell_num_cols;
                     }
                     in_cell = false;
                 }
@@ -1873,6 +1860,16 @@ fn place_full_logical_cell(
 ) {
     let target = full_logical_addr(state, row, col);
     if let Some(f) = formula {
+        let value_trim = value.trim();
+        if value_trim.starts_with('=') && crate::formula::split_labeled_formula(value_trim).is_some() {
+            let cell = if let Some((dr, dc)) = tsv_ods_deltas {
+                rebase_interop_formula_row_col(value_trim, -dr, -dc)
+            } else {
+                value_trim.to_string()
+            };
+            state.grid.set(&target, cell);
+            return;
+        }
         let body = ods_openformula_body_to_cell_text(f);
         let cell = if let Some((dr, dc)) = tsv_ods_deltas {
             rebase_interop_formula_row_col(&format!("={body}"), -dr, -dc)
@@ -2336,7 +2333,7 @@ mod tests {
                 row: 0,
                 col: MARGIN_COLS as u32,
             },
-            "TOTAL".into(),
+            "=TOTAL".into(),
         );
         let gb = crate::grid::GridBox::from(grid);
         let opts = DelimitedExportOptions {
@@ -2392,7 +2389,7 @@ mod tests {
                 row: 0,
                 col: (MARGIN_COLS - 1) as u32,
             },
-            "TOTAL".into(),
+            "=TOTAL".into(),
         );
         let gb = crate::grid::GridBox::from(grid);
         let opts = DelimitedExportOptions {
@@ -2416,7 +2413,7 @@ mod tests {
                 row: 0,
                 col: (MARGIN_COLS - 1) as u32,
             },
-            "TOTAL".into(),
+            "=TOTAL".into(),
         );
         grid.set_column_format(
             crate::grid::FormatScope::Data,
@@ -2613,5 +2610,537 @@ mod tests {
             .read_to_string(&mut s)
             .unwrap();
         s
+    }
+
+    /// TSV-mapped re-import: the 4th ODF `table:table-cell` in a data row must map to
+    /// `col_start + 2` global (with `row_key_cols == 1`), e.g. 701+2 = 703 for the TAX label.
+    #[test]
+    fn import_tsv_parity_data_row_taxes_ods_col_maps_to_703() {
+        let data_lr = 999_999_998usize;
+        let layouts = vec![OdsTableLayout::TsvParity {
+            col_start: 701,
+            col_end: 706,
+            data_logical_rows: vec![data_lr],
+            header_ods_rows: 1,
+            row_key_cols: 1,
+            export_main_cols: Some(2),
+        }];
+        // Same 6 cells as a generic subtotal TAX data row (export uses self-closing empties + formula cell).
+        let tax_row = r#"<table:table-cell office:value-type="string"><text:p>~1</text:p></table:table-cell><table:table-cell table:style-name="ce1"/><table:table-cell table:style-name="ce2"/><table:table-cell table:style-name="ce2" office:value-type="string" table:formula="of:=(A*0.1)"><text:p>=(A*0.1) -- TAX</text:p></table:table-cell><table:table-cell table:style-name="ce3"/><table:table-cell table:style-name="ce2" office:value-type="string"><text:p>TOTAL</text:p></table:table-cell>"#;
+        // Synthetic header row: 6 cells (row-key + 5) like export, all written so the row advances col_idx.
+        let header6: String = (0..6)
+            .map(|_| {
+                r#"<table:table-cell office:value-type="string"><text:p>.</text:p></table:table-cell>"#
+            })
+            .collect();
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:of="urn:oasis:names:tc:opendocument:xmlns:of:1.2" office:version="1.2">
+<office:body><office:spreadsheet>
+<table:table table:name="Sheet1">
+<table:table-row>{header6}</table:table-row>
+<table:table-row>{tax_row}</table:table-row>
+</table:table>
+</office:spreadsheet></office:body>
+</office:document-content>"#,
+        );
+        let wb = parse_ods_content_with_layout(&xml, &layouts).expect("parse");
+        let g = &wb.sheets[0].state.grid;
+        let h703 = CellAddr::Header {
+            row: (HEADER_ROWS - 1) as u32,
+            col: 703,
+        };
+        let h706 = CellAddr::Header {
+            row: (HEADER_ROWS - 1) as u32,
+            col: 706,
+        };
+        let t703 = g.text(&h703);
+        let t706 = g.text(&h706);
+        assert!(
+            t703.contains("TAX") && t706.is_empty(),
+            "TAX must land in header col 703, not 706: 703={t703:?} 706={t706:?}"
+        );
+    }
+
+    /// ODF: `<table:table` is a prefix of `<table:table-column>`, etc. Find the data
+    /// `table:table` element (the byte after `table:table` is not `-` — column/row have `…-column`,
+    /// `…-row`, `…-cell`, …).
+    fn table_table_open_byte_offset(s: &str) -> Option<usize> {
+        const OPEN: &str = "<table:table";
+        let mut at = 0usize;
+        while let Some(i) = s[at..].find(OPEN) {
+            let abs = at + i;
+            // `…-cell`, `…-column`, `…-row` all use `-` right after the second `table` in the tag
+            // name; the sheet element is `table:table` (space, `>`, or attr) with no extra `-` here.
+            let is_data_table = s
+                .as_bytes()
+                .get(abs + OPEN.len())
+                .map_or(true, |&b| b != b'-');
+            if is_data_table {
+                return Some(abs);
+            }
+            at = abs + OPEN.len();
+        }
+        None
+    }
+
+    /// String-level: the first **data** ODF `table:table-row` (2nd `table:table-row` in the
+    /// `split`, after `.skip(1)` drops the prologue) must have TAX in the 4th cell (`gc` 703 for
+    /// `row_key=1` when `c=3`).
+    #[test]
+    fn subtotal_export_ods_2nd_row_4th_cell_is_tax_string() {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("subtotal.corro");
+        if !p.is_file() {
+            return;
+        }
+        let data = std::fs::read_to_string(&p).expect("read");
+        let mut wb = WorkbookState::new();
+        let mut active = wb.sheet_id(wb.active_sheet);
+        for line in data.lines() {
+            let t = line.trim();
+            if t.is_empty() || t.starts_with('#') {
+                continue;
+            }
+            crate::ops::apply_log_line_to_workbook(t, &mut wb, &mut active).expect("log");
+        }
+        let opts = DelimitedExportOptions {
+            content: ExportContent::Generic,
+            ..Default::default()
+        };
+        let bytes = export_ods_bytes_workbook_with_options(&wb, &opts).expect("export");
+        let mut a = zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("zip");
+        let mut full = String::new();
+        a.by_name("content.xml")
+            .expect("content.xml")
+            .read_to_string(&mut full)
+            .expect("read");
+        let sp = full.find("<office:spreadsheet>").expect("spreadsheet");
+        let rel = &full[sp..];
+        let t0 = table_table_open_byte_offset(rel).expect("data table");
+        let t_from = sp + t0;
+        let t_tail = &full[t_from..];
+        let t_end = t_tail.find("</table:table>").expect("end table");
+        let t_only = &t_tail[..t_end];
+        let row_parts: Vec<&str> = t_only
+            .split("<table:table-row>")
+            .skip(1)
+            .map(|s| s.split("</table:table-row>").next().unwrap_or(""))
+            .collect();
+        assert!(
+            row_parts.len() >= 2,
+            "expected prologue+ ≥2 ODF rows, got {} row segments",
+            row_parts.len()
+        );
+        // `skip(1)` removed `parts[0]` (prologue); `row_parts[0]` = 1st ODF row = TSV header,
+        // `row_parts[1]` = 2nd ODF row = 1st data line (`~1` + TAX).
+        let first_data = row_parts[1];
+        let cell_chunks: Vec<&str> = first_data.split("<table:table-cell").skip(1).collect();
+        assert!(
+            cell_chunks.len() >= 4,
+            "1st data ODF row: want ≥4 cells, got {} (prefix ~800B: {})",
+            cell_chunks.len(),
+            first_data.chars().take(800).collect::<String>()
+        );
+        let tax_chunk = cell_chunks[3];
+        assert!(
+            tax_chunk.contains("TAX") && tax_chunk.contains("0.1"),
+            "4th ODF cell in 1st data row must be TAX; got prefix: {}",
+            tax_chunk.chars().take(200).collect::<String>()
+        );
+    }
+
+    /// The first **data** row (TAX) must stay on global col 703 even when a second data row is
+    /// present: widening `main_cols` during re-import used to remapped header `gc` 703→706+.
+    #[test]
+    fn subtotal_ods_table_3_ods_row_prefix_taxes_703() {
+        use crate::formula::refresh_spills;
+        const K: usize = 3;
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("subtotal.corro");
+        if !p.is_file() {
+            return;
+        }
+        let data = std::fs::read_to_string(&p).expect("read");
+        let mut wb = WorkbookState::new();
+        let mut active = wb.sheet_id(wb.active_sheet);
+        for line in data.lines() {
+            let t = line.trim();
+            if t.is_empty() || t.starts_with('#') {
+                continue;
+            }
+            crate::ops::apply_log_line_to_workbook(t, &mut wb, &mut active).expect("log");
+        }
+        for s in &mut wb.sheets {
+            refresh_spills(&mut s.state.grid);
+        }
+        let opts = DelimitedExportOptions {
+            content: ExportContent::Generic,
+            ..Default::default()
+        };
+        let bytes = export_ods_bytes_workbook_with_options(&wb, &opts).expect("export");
+        let mut z = zip::ZipArchive::new(std::io::Cursor::new(&bytes)).expect("zip");
+        let mut full = String::new();
+        z.by_name("content.xml")
+            .expect("content")
+            .read_to_string(&mut full)
+            .expect("read");
+        let mut s2 = z.by_name(CORRO_ODS_LAYOUT_PATH).expect("sidecar");
+        let mut side = String::new();
+        s2.read_to_string(&mut side).expect("read");
+        let one_layout = vec![parse_corro_ods_layout_list(&side)
+            .first()
+            .expect("v2[0]")
+            .clone()];
+        let sp = full.find("<office:spreadsheet>").expect("spreadsheet");
+        let rel = &full[sp..];
+        let t0 = table_table_open_byte_offset(rel).expect("data table");
+        let t_from = sp + t0;
+        let t_tail = &full[t_from..];
+        let t_end = t_tail.find("</table:table>").expect("end table");
+        let t_only = &t_tail[..t_end];
+        let row_parts: Vec<&str> = t_only.split("<table:table-row>").collect();
+        assert!(row_parts.len() > K, "expected ODF data rows, got {} parts", row_parts.len());
+        let mut inner = String::new();
+        inner.push_str(row_parts[0]);
+        for p in &row_parts[1..=K] {
+            inner.push_str("<table:table-row>");
+            inner.push_str(p);
+        }
+        inner.push_str("</table:table>");
+        let one_table_xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:of="urn:oasis:names:tc:opendocument:xmlns:of:1.2" office:version="1.2">
+<office:body><office:spreadsheet>{}</office:spreadsheet></office:body>
+</office:document-content>"#,
+            inner
+        );
+        let back = parse_ods_content_with_layout(&one_table_xml, &one_layout).expect("import");
+        let g = &back.sheets[0].state.grid;
+        let t703 = g.text(&CellAddr::Header {
+            row: (HEADER_ROWS - 1) as u32,
+            col: 703,
+        });
+        assert!(t703.contains("TAX"), "TAX in 703 after 3 ODF row prefix; 706={:?}", g.text(&CellAddr::Header { row: (HEADER_ROWS - 1) as u32, col: 706 }));
+    }
+
+    /// Only the TSV **header** + first **data** ODF `table:table-row` (two rows), from a real
+    /// `subtotal.corro` ODS. If the full sheet shifts TAX to 706, this test isolates whether a
+    /// 2×`tc` first table re-imports TAX to 703.
+    #[test]
+    fn subtotal_two_ods_header_plus_data_row_only_taxes_703() {
+        use crate::formula::refresh_spills;
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("subtotal.corro");
+        if !p.is_file() {
+            return;
+        }
+        let data = std::fs::read_to_string(&p).expect("read");
+        let mut wb = WorkbookState::new();
+        let mut active = wb.sheet_id(wb.active_sheet);
+        for line in data.lines() {
+            let t = line.trim();
+            if t.is_empty() || t.starts_with('#') {
+                continue;
+            }
+            crate::ops::apply_log_line_to_workbook(t, &mut wb, &mut active).expect("log");
+        }
+        for s in &mut wb.sheets {
+            refresh_spills(&mut s.state.grid);
+        }
+        let opts = DelimitedExportOptions {
+            content: ExportContent::Generic,
+            ..Default::default()
+        };
+        let bytes = export_ods_bytes_workbook_with_options(&wb, &opts).expect("export");
+        let mut z = zip::ZipArchive::new(std::io::Cursor::new(&bytes)).expect("zip");
+        let mut full = String::new();
+        z.by_name("content.xml")
+            .expect("content.xml")
+            .read_to_string(&mut full)
+            .expect("read");
+        let mut s2 = z.by_name(CORRO_ODS_LAYOUT_PATH).expect("sidecar");
+        let mut side = String::new();
+        s2.read_to_string(&mut side).expect("read");
+        let layouts = parse_corro_ods_layout_list(&side);
+        let one_layout = vec![layouts.first().expect("v2[0]").clone()];
+        let sp = full.find("<office:spreadsheet>").expect("spreadsheet");
+        let rel = &full[sp..];
+        let t0 = table_table_open_byte_offset(rel).expect("data table");
+        let t_from = sp + t0;
+        let t_tail = &full[t_from..];
+        let t_end = t_tail.find("</table:table>").expect("end table");
+        let t_only = &t_tail[..t_end];
+        let row_parts: Vec<&str> = t_only.split("<table:table-row>").collect();
+        assert!(
+            row_parts.len() > 2,
+            "expected ≥2 ODF data rows, got {} parts",
+            row_parts.len() - 1
+        );
+        // `t_only` omits the closing `</table:table>`. `parts[0]` already starts with
+        // `<table:table…>`; only rebuild the first two data rows.
+        let two_rows_inner = {
+            let mut o = String::new();
+            o.push_str(row_parts[0]);
+            for p in &row_parts[1..3] {
+                o.push_str("<table:table-row>");
+                o.push_str(p);
+            }
+            o.push_str("</table:table>");
+            o
+        };
+        let one_table_xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:of="urn:oasis:names:tc:opendocument:xmlns:of:1.2" office:version="1.2">
+<office:body><office:spreadsheet>{}</office:spreadsheet></office:body>
+</office:document-content>"#,
+            two_rows_inner
+        );
+        let back = parse_ods_content_with_layout(&one_table_xml, &one_layout).expect("import");
+        let g = &back.sheets[0].state.grid;
+        let t = g.text(&CellAddr::Header {
+            row: (HEADER_ROWS - 1) as u32,
+            col: 703,
+        });
+        assert!(t.contains("TAX"), "2-row slice of real export: TAX in 703, got {t:?}");
+    }
+
+    /// `subtotal.corro` multi-sheet: re-import only the first `table:table` from exported ODS. If
+    /// TAX then lands on 703, the +3 error comes from the second `table` / v2 `layouts` handoff.
+    #[test]
+    fn subtotal_first_ods_table_only_taxes_703() {
+        use crate::formula::refresh_spills;
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("subtotal.corro");
+        if !p.is_file() {
+            return;
+        }
+        let data = std::fs::read_to_string(&p).expect("read");
+        let mut wb = WorkbookState::new();
+        let mut active = wb.sheet_id(wb.active_sheet);
+        for line in data.lines() {
+            let t = line.trim();
+            if t.is_empty() || t.starts_with('#') {
+                continue;
+            }
+            crate::ops::apply_log_line_to_workbook(t, &mut wb, &mut active).expect("log");
+        }
+        for s in &mut wb.sheets {
+            refresh_spills(&mut s.state.grid);
+        }
+        let opts = DelimitedExportOptions {
+            content: ExportContent::Generic,
+            ..Default::default()
+        };
+        let bytes = export_ods_bytes_workbook_with_options(&wb, &opts).expect("export");
+        let mut z = zip::ZipArchive::new(std::io::Cursor::new(&bytes)).expect("zip");
+        let mut full = String::new();
+        z.by_name("content.xml")
+            .expect("content.xml")
+            .read_to_string(&mut full)
+            .expect("read");
+        let mut s = z.by_name(CORRO_ODS_LAYOUT_PATH).expect("sidecar");
+        let mut side = String::new();
+        s.read_to_string(&mut side).expect("read side");
+        let layouts = parse_corro_ods_layout_list(&side);
+        let one_layout = vec![layouts.first().expect("v2 layout").clone()];
+        let only_first_table = {
+            let sp = full.find("<office:spreadsheet>").expect("spreadsheet");
+            let rel = &full[sp..];
+            let t0 = table_table_open_byte_offset(rel).expect("data table");
+            let from = sp + t0;
+            let tail = &full[from..];
+            let end = tail.find("</table:table>").expect("end table")
+                + "</table:table>".len();
+            &full[from..from + end]
+        };
+        let one_table_xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:of="urn:oasis:names:tc:opendocument:xmlns:of:1.2" office:version="1.2">
+<office:body><office:spreadsheet>{only_first_table}</office:spreadsheet></office:body>
+</office:document-content>"#,
+        );
+        let back = parse_ods_content_with_layout(&one_table_xml, &one_layout).expect("import");
+        let g = &back.sheets[0].state.grid;
+        let h703 = CellAddr::Header {
+            row: (HEADER_ROWS - 1) as u32,
+            col: 703,
+        };
+        let t = g.text(&h703);
+        assert!(
+            t.contains("TAX"),
+            "isolated first `table` only: TAX must be in header col 703, got {t:?} (706={:?})",
+            g.text(&CellAddr::Header {
+                row: (HEADER_ROWS - 1) as u32,
+                col: 706,
+            })
+        );
+    }
+
+    /// The first three ODF `table:table-cell` tags in a TAX data row (before the formula cell) must
+    /// not use `table:number-columns-repeated` or import maps TAX to global col 706, not 703.
+    #[test]
+    fn subtotal_export_ods_tax_row_no_cell_column_repeated() {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("subtotal.corro");
+        if !p.is_file() {
+            return;
+        }
+        let data = std::fs::read_to_string(&p).expect("read");
+        let mut wb = WorkbookState::new();
+        let mut active = wb.sheet_id(wb.active_sheet);
+        for line in data.lines() {
+            let t = line.trim();
+            if t.is_empty() || t.starts_with('#') {
+                continue;
+            }
+            crate::ops::apply_log_line_to_workbook(t, &mut wb, &mut active).expect("log");
+        }
+        let opts = DelimitedExportOptions {
+            content: ExportContent::Generic,
+            ..Default::default()
+        };
+        let bytes = export_ods_bytes_workbook_with_options(&wb, &opts).expect("export");
+        let mut a = zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("zip");
+        let mut xml = String::new();
+        a.by_name("content.xml")
+            .expect("content.xml")
+            .read_to_string(&mut xml)
+            .expect("read");
+        for seg in xml.split("<table:table-row>") {
+            if !seg.contains("TAX")
+                || !seg.contains("0.1")
+                || !seg.contains("~1")
+            {
+                continue;
+            }
+            let row = seg.split("</table:table-row>").next().unwrap_or("");
+            // First three physical cells: row label + two style-only empties; each tag must not repeat
+            // over multiple logical columns, or the importer will advance col_idx (and map TAX to gc 706).
+            let mut parts = row.split("table:table-cell");
+            let _prologue = parts.next();
+            for (i, chunk) in parts.take(3).enumerate() {
+                if chunk.contains("table:number-columns-repeated") {
+                    panic!(
+                        "TAX row cell {i} must not set table:number-columns-repeated; first 400B of cell: {}",
+                        &chunk.chars().take(400).collect::<String>()
+                    );
+                }
+            }
+        }
+    }
+
+    /// `subtotal.corro` (optional in repo): the TAX data row in exported `content.xml` should have
+    /// a small fixed number of ODF `table:table-cell` opens (current export: row key + four), with
+    /// no `table:number-columns-repeated` on cells (import advances `col_idx` per repeated column).
+    #[test]
+    fn subtotal_export_ods_tax_row_table_cell_count() {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("subtotal.corro");
+        if !p.is_file() {
+            return;
+        }
+        let data = std::fs::read_to_string(&p).expect("read subtotal.corro");
+        let mut wb = WorkbookState::new();
+        let mut active = wb.sheet_id(wb.active_sheet);
+        for line in data.lines() {
+            let t = line.trim();
+            if t.is_empty() || t.starts_with('#') {
+                continue;
+            }
+            crate::ops::apply_log_line_to_workbook(t, &mut wb, &mut active).expect("log");
+        }
+        let opts = DelimitedExportOptions {
+            content: ExportContent::Generic,
+            ..Default::default()
+        };
+        let bytes = export_ods_bytes_workbook_with_options(&wb, &opts).expect("export");
+        let mut a = zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("zip");
+        let mut xml = String::new();
+        a.by_name("content.xml")
+            .expect("content.xml")
+            .read_to_string(&mut xml)
+            .expect("read");
+        for seg in xml.split("<table:table-row>") {
+            if seg.contains("TAX")
+                && seg.contains("0.1")
+                && seg.contains("~1")
+            {
+                let row_only = seg.split("</table:table-row>").next().unwrap_or("");
+                let n_cell = row_only.matches("<table:table-cell").count();
+                assert_eq!(
+                    n_cell, 5,
+                    "TAX data row: expected 5 ODF <table:table-cell opens>, got {n_cell} (extra opens or column-repeat break TsvParity col_idx)"
+                );
+            }
+        }
+    }
+
+    /// Optional `subtotal.corro`: re-import the exported ODS and assert the TAX label lands on the
+    /// same marginal **header** B column (global 703) as a live workbook, not +3 (706).
+    #[test]
+    fn subtotal_ods_reimport_tsv_parity_taxes_marginal_col_703() {
+        use crate::formula::refresh_spills;
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("subtotal.corro");
+        if !p.is_file() {
+            return;
+        }
+        let data = std::fs::read_to_string(&p).expect("read");
+        let mut wb = WorkbookState::new();
+        let mut active = wb.sheet_id(wb.active_sheet);
+        for line in data.lines() {
+            let t = line.trim();
+            if t.is_empty() || t.starts_with('#') {
+                continue;
+            }
+            crate::ops::apply_log_line_to_workbook(t, &mut wb, &mut active).expect("log");
+        }
+        for s in &mut wb.sheets {
+            refresh_spills(&mut s.state.grid);
+        }
+        let opts = DelimitedExportOptions {
+            content: ExportContent::Generic,
+            ..Default::default()
+        };
+        let bytes = export_ods_bytes_workbook_with_options(&wb, &opts).expect("export");
+        let mut z = zip::ZipArchive::new(std::io::Cursor::new(&bytes)).expect("zip");
+        let mut side = String::new();
+        z.by_name(CORRO_ODS_LAYOUT_PATH)
+            .expect("sidecar")
+            .read_to_string(&mut side)
+            .expect("read side");
+        let layouts = parse_corro_ods_layout_list(&side);
+        let lay0 = &layouts[0];
+        if let OdsTableLayout::TsvParity {
+            col_start,
+            row_key_cols,
+            ..
+        } = lay0
+        {
+            assert_eq!(
+                *col_start, 701,
+                "v2[0] col_start: expected 701 from export, got {col_start} (sidecar parse bug?)"
+            );
+            assert_eq!(*row_key_cols, 1, "v2[0] row_key_cols");
+        } else {
+            panic!("first layout not TsvParity");
+        }
+        let mut tmp = NamedTempFile::new().expect("tmp");
+        std::io::Write::write_all(&mut tmp, &bytes).expect("write");
+        let back = import_ods_workbook(tmp.path()).expect("re-import");
+        let g = &back.sheets[0].state.grid;
+        let h703 = CellAddr::Header {
+            row: (HEADER_ROWS - 1) as u32,
+            col: 703,
+        };
+        let h706 = CellAddr::Header {
+            row: (HEADER_ROWS - 1) as u32,
+            col: 706,
+        };
+        let t = g.text(&h703);
+        assert!(
+            t.contains("TAX"),
+            "TAX re-import: expected in header col 703, got {t:?}; col 706={:?}",
+            g.text(&h706)
+        );
+        assert!(
+            !g.text(&h706).contains("TAX"),
+            "TAX should not be shifted to col 706: {:?}",
+            g.text(&h706)
+        );
     }
 }

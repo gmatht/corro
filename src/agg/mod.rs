@@ -1,6 +1,6 @@
 //! Aggregate functions over main-region numeric samples.
 
-use crate::formula;
+use crate::formula::{self, Number};
 use crate::grid::{CellAddr, GridBox as Grid, MainRange};
 use crate::ops::{AggFunc, AggregateDef};
 
@@ -16,7 +16,7 @@ fn format_aggregate_value(value: f64) -> String {
     }
 }
 
-fn collect_numbers(grid: &Grid, range: &MainRange) -> Vec<f64> {
+fn collect_numbers(grid: &Grid, range: &MainRange) -> Vec<Number> {
     let mut v = Vec::new();
     if range.is_empty() {
         return v;
@@ -55,35 +55,42 @@ pub fn compute_aggregate(grid: &Grid, def: &AggregateDef) -> String {
             if xs.is_empty() {
                 String::new()
             } else {
-                let s: f64 = xs.iter().sum();
-                format_aggregate_value(s)
+                let s = xs
+                    .iter()
+                    .cloned()
+                    .fold(Number::exact_zero(), |a, b| a.add(b));
+                format_aggregate_value(s.to_f64())
             }
         }
         AggFunc::Mean => {
             if xs.is_empty() {
                 String::new()
             } else {
-                let s: f64 = xs.iter().sum::<f64>() / xs.len() as f64;
-                format_aggregate_value(s)
+                let sum = xs
+                    .iter()
+                    .cloned()
+                    .fold(Number::exact_zero(), |a, b| a.add(b));
+                let s = sum.div(Number::from_i64(xs.len() as i64));
+                format_aggregate_value(s.to_f64())
             }
         }
         AggFunc::Median => {
             if xs.is_empty() {
                 String::new()
             } else {
-                let m = median(xs);
+                let m = median(xs.iter().map(|n| n.to_f64()).collect());
                 format_aggregate_value(m)
             }
         }
         AggFunc::Min => xs
             .into_iter()
             .min_by(|a, b| a.partial_cmp(b).unwrap())
-            .map(format_aggregate_value)
+            .map(|n| format_aggregate_value(n.to_f64()))
             .unwrap_or_default(),
         AggFunc::Max => xs
             .into_iter()
             .max_by(|a, b| a.partial_cmp(b).unwrap())
-            .map(format_aggregate_value)
+            .map(|n| format_aggregate_value(n.to_f64()))
             .unwrap_or_default(),
         AggFunc::Count => {
             if xs.is_empty() {

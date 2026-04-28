@@ -689,14 +689,6 @@ pub fn generic_interop_cell_text(
         }
     }
 
-    if logical_row + 1 == HEADER_ROWS
-        && (MARGIN_COLS..(MARGIN_COLS + grid.main_cols())).contains(&global_col)
-    {
-        let main_c = global_col - MARGIN_COLS;
-        if let Some(lab) = formula::main_column_label_from_header(grid, main_c) {
-            return Some(lab);
-        }
-    }
     use crate::ui::SheetCursor;
     let cur = SheetCursor {
         row: logical_row,
@@ -736,6 +728,10 @@ pub fn generic_interop_cell_text(
 
     let v = crate::ods::cell_export_value_string(grid, logical_row, global_col);
     if !v.is_empty() {
+        if formula::split_labeled_formula(&v).is_some() {
+            let s1 = finish_generic_interop(v, rebase);
+            return Some(after_rebase(&s1, excel_list_arg_comma));
+        }
         if let Some(st) = crate::ods::ods_labeled_prefix_strip_to_formula(&v) {
             let s1 = finish_generic_interop(st, rebase);
             return Some(after_rebase(&s1, excel_list_arg_comma));
@@ -753,13 +749,14 @@ pub fn generic_interop_cell_text(
 }
 
 fn aggregate_formula_name(raw: &str) -> Option<&'static str> {
-    match raw.trim().to_ascii_uppercase().as_str() {
-        "TOTAL" | "SUM" => Some("SUM"),
-        "MEAN" | "AVERAGE" | "AVG" => Some("AVERAGE"),
-        "COUNT" => Some("COUNT"),
-        "MAX" | "MAXIMUM" => Some("MAX"),
-        "MIN" | "MINIMUM" => Some("MIN"),
-        _ => None,
+    use crate::ops::AggFunc;
+    match crate::ops::margin_key_agg_func(raw)? {
+        AggFunc::Sum => Some("SUM"),
+        AggFunc::Mean => Some("AVERAGE"),
+        AggFunc::Count => Some("COUNT"),
+        AggFunc::Max => Some("MAX"),
+        AggFunc::Min => Some("MIN"),
+        AggFunc::Median => None,
     }
 }
 
@@ -992,7 +989,7 @@ fn rendered_value_at_ascii(grid: &Grid, logical_row: usize, global_col: usize) -
         };
         let raw = grid.text(&addr);
         if crate::ods::subtotal_code_for_label(&raw).is_some() {
-            return raw;
+            return crate::formula::cell_effective_display(grid, &addr);
         }
     }
     if logical_row >= hr + mr && global_col == lm - 1 {
@@ -1003,7 +1000,7 @@ fn rendered_value_at_ascii(grid: &Grid, logical_row: usize, global_col: usize) -
         };
         let raw = grid.text(&addr);
         if crate::ods::subtotal_code_for_label(&raw).is_some() {
-            return raw;
+            return crate::formula::cell_effective_display(grid, &addr);
         }
     }
     rendered_value_at(grid, logical_row, global_col)
@@ -1580,18 +1577,18 @@ mod tests {
     }
 
     #[test]
-    fn ascii_values_keep_bare_total_label_in_left_key_column() {
+    fn ascii_values_shows_total_label_for_stored_eq_total() {
         let mut g = crate::grid::Grid::new(3, 1);
         g.set(&CellAddr::Main { row: 0, col: 0 }, "1".into());
         g.set(&CellAddr::Main { row: 1, col: 0 }, "2".into());
-        g.set(&CellAddr::Left { row: 2, col: MARGIN_COLS - 1 }, "TOTAL".into());
+        g.set(&CellAddr::Left { row: 2, col: MARGIN_COLS - 1 }, "=TOTAL".into());
         let gb = crate::grid::GridBox::from(g);
         let mut out = Vec::new();
         export_ascii_table(&gb, &mut out, false);
         let s = String::from_utf8(out).unwrap();
         assert!(
             s.contains("TOTAL"),
-            "left key label should stay TOTAL in ASCII output: {s}"
+            "left key should display TOTAL (stored =TOTAL) in ASCII output: {s}"
         );
     }
 
@@ -1650,9 +1647,10 @@ mod tests {
     }
 
     /// Default TSV adds a synthetic header row and row-key column before the logical grid. For
-    /// `subtotal.corro`, Values match computed display. Generic keeps bare aggregate **words**
-    /// (TOTAL, MAX, …) as on-sheet text, not `=SUBTOTAL(4,…)` / `=SUBTOTAL(9,…)` — those interop
-    /// strings are formulas whose **Values** are numeric, never the label word `MAX`.
+    /// `subtotal.corro`, Values match computed display. Generic keeps bare non-formula aggregate
+    /// **words** (e.g. `MAX`, `SUM`, …) as on-sheet text, not `=SUBTOTAL(4,…)`; the `=TOTAL` margin
+    /// directive uses interop `=SUBTOTAL(9,…)` while the TUI still shows `TOTAL`. True `=SUBTOTAL(4,…)`
+    /// interop is a formula whose **Values** are numeric, never the label word `MAX`.
     #[test]
     fn subtotal_delimited_values_match_computed_display_and_generic_matches_non_formula() {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("subtotal.corro");
@@ -1743,6 +1741,11 @@ mod tests {
                     if is_subtotal_interop
                         && is_subtotal_following_label_replaced_by_interop(v_cell)
                     {
+                        if lr < HEADER_ROWS {
+                            // Top/header band: e.g. `=TOTAL` displays as the word TOTAL in Values while
+                            // Generic uses `=SUBTOTAL(9,…)` for the same column; not a data-cell bug.
+                            continue;
+                        }
                         panic!(
                             "Values TSV must show computed subtotal, not label text {v_cell:?}; \
                              Generic is {g_cell:?} at matrix[{i}][{j}] (lr={lr} gc={gc})"
@@ -1763,10 +1766,11 @@ mod tests {
         }
     }
 
-    /// Regresses a bad Generic interop that turned a bare `TOTAL` into `=SUBTOTAL(9,…)` over the
-    /// main block (e.g. `=SUBTOTAL(9,A1:B10)`): the export must keep the word **TOTAL**.
+    /// A right-margin cell that holds the plain word `TOTAL` (not the `=TOTAL` aggregate directive
+    /// and with no column header `=TOTAL`) must stay the literal `TOTAL` in Generic export, not
+    /// `=SUBTOTAL(9,…)` over the main block.
     #[test]
-    fn generic_bare_total_label_stays_total_not_subtotal_range() {
+    fn generic_bare_text_total_in_cell_stays_total_not_subtotal_range() {
         use crate::grid::HEADER_ROWS;
 
         let mut grid = crate::grid::Grid::new(10, 2);
@@ -2166,7 +2170,7 @@ mod tests {
                 row: (HEADER_ROWS - 1) as u32,
                 col: (MARGIN_COLS + 2) as u32,
             },
-            "TOTAL".into(),
+            "=TOTAL".into(),
         );
         g.set(&CellAddr::Left { col: MARGIN_COLS - 1, row: 0 }, "Hammers".into());
         g.set(&CellAddr::Main { row: 0, col: 0 }, "5".into());
@@ -2187,7 +2191,7 @@ mod tests {
         assert_eq!(matrix0[data_row][amount_field], "5");
         assert!(
             matrix0[data_row][total_field].starts_with('='),
-            "right-margin TOTAL must be a formula in the Generic target, not a static value like 5.5; got {:?}",
+            "right-margin =TOTAL must become a formula in the Generic target, not a static value like 5.5; got {:?}",
             matrix0[data_row][total_field]
         );
         assert!(
@@ -2263,17 +2267,17 @@ mod tests {
                 row: (HEADER_ROWS - 1) as u32,
                 col: (MARGIN_COLS + 2) as u32,
             },
-            "TOTAL".into(),
+            "=TOTAL".into(),
         );
         g.set(&CellAddr::Left { col: MARGIN_COLS - 1, row: 0 }, "Hammers".into());
         g.set(&CellAddr::Main { row: 0, col: 0 }, "5".into());
-        g.set(&CellAddr::Left { col: MARGIN_COLS - 1, row: 1 }, "TOTAL".into());
+        g.set(&CellAddr::Left { col: MARGIN_COLS - 1, row: 1 }, "=TOTAL".into());
         g.set(
             &CellAddr::Footer {
                 row: 0,
                 col: (MARGIN_COLS - 1) as u32,
             },
-            "TOTAL".into(),
+            "=TOTAL".into(),
         );
 
         let opts = DelimitedExportOptions {
@@ -2405,7 +2409,7 @@ mod tests {
                 col: MARGIN_COLS - 1,
                 row: 2,
             },
-            "TOTAL".into(),
+            "=TOTAL".into(),
         );
         g.set(
             &CellAddr::Left {

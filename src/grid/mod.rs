@@ -683,8 +683,11 @@ impl Grid {
             return;
         }
 
-        let old_total = MARGIN_COLS + old_main_cols + MARGIN_COLS;
-        let new_total = MARGIN_COLS + new_main_cols + MARGIN_COLS;
+        // Body cells (left / main / right) live in a split that moves when the main block grows;
+        // header and footer are keyed by absolute global full-logical columns (see
+        // `place_full_logical_cell` for `row < HEADER_ROWS`), so we must not shift them on resize —
+        // otherwise a marginal cell at `gc=703` would slide to `703 + delta` when a later `set_main_size`
+        // widens the main area (e.g. ODS TsvParity re-import of N>2 rows).
         let old_right_start = MARGIN_COLS + old_main_cols;
         let new_right_start = MARGIN_COLS + new_main_cols;
 
@@ -704,49 +707,6 @@ impl Grid {
                 Some(new_right_start + right_idx)
             }
         }
-
-        fn remap_sparse_rows(
-            cells: &mut HashMap<(u32, u32), String>,
-            new_main_cols: usize,
-            old_right_start: usize,
-            new_right_start: usize,
-            old_total: usize,
-            new_total: usize,
-        ) {
-            let mut remapped = HashMap::new();
-            for ((row, col), value) in cells.drain() {
-                let old_col = col as usize;
-                if old_col >= old_total {
-                    continue;
-                }
-                let Some(new_col) =
-                    remap_col(old_col, new_main_cols, old_right_start, new_right_start)
-                else {
-                    continue;
-                };
-                if new_col < new_total && !value.is_empty() {
-                    remapped.insert((row, new_col as u32), value);
-                }
-            }
-            *cells = remapped;
-        }
-
-        remap_sparse_rows(
-            &mut self.header,
-            new_main_cols,
-            old_right_start,
-            new_right_start,
-            old_total,
-            new_total,
-        );
-        remap_sparse_rows(
-            &mut self.footer,
-            new_main_cols,
-            old_right_start,
-            new_right_start,
-            old_total,
-            new_total,
-        );
 
         let mut remapped = HashMap::new();
         for (col, width) in self.col_width_overrides.drain() {

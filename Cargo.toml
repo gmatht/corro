@@ -19,9 +19,13 @@ zip = { version = "0.6", default-features = false, features = ["deflate"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 quick-xml = "0.37"
 balance-core = { path = "balance-core" }
+num-bigint = "0.4"
+num-rational = { version = "0.4", default-features = false, features = ["std", "num-bigint"] }
+num-traits = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
 
 [profile.release]
 opt-level = "z"

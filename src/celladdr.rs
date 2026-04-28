@@ -416,7 +416,7 @@ mod tests {
             row: (crate::grid::HEADER_ROWS - 1) as u32,
             col: (MARGIN_COLS + 2) as u32,
         };
-        g.set(&addr, "TOTAL".into());
+        g.set(&addr, "=TOTAL".into());
         let cref = CellRef::from_grid(&addr, g.main_cols());
         assert!(matches!(cref.col, ColRegion::Data(_)));
         let back = cref.to_grid_addr(g.main_cols());

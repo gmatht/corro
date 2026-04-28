@@ -1835,15 +1835,7 @@ fn footer_row_agg_func(grid: &Grid, footer_row_idx: usize) -> Option<AggFunc> {
         row: footer_row_idx as u32,
         col: key_col,
     })?;
-    match val.trim().to_uppercase().as_str() {
-        "TOTAL" | "SUM" => Some(AggFunc::Sum),
-        "MEAN" | "AVERAGE" | "AVG" => Some(AggFunc::Mean),
-        "MEDIAN" => Some(AggFunc::Median),
-        "MIN" | "MINIMUM" => Some(AggFunc::Min),
-        "MAX" | "MAXIMUM" => Some(AggFunc::Max),
-        "COUNT" => Some(AggFunc::Count),
-        _ => None,
-    }
+    crate::ops::margin_key_agg_func(&val)
 }
 
 fn right_col_agg_func(grid: &Grid, global_col: usize) -> Option<AggFunc> {
@@ -1856,14 +1848,8 @@ fn right_col_agg_func(grid: &Grid, global_col: usize) -> Option<AggFunc> {
         .collect();
     labels.sort_unstable_by_key(|(row, _)| *row);
     for (_, val) in labels {
-        match val.trim().to_uppercase().as_str() {
-            "TOTAL" | "SUM" => return Some(AggFunc::Sum),
-            "MEAN" | "AVERAGE" | "AVG" => return Some(AggFunc::Mean),
-            "MEDIAN" => return Some(AggFunc::Median),
-            "MIN" | "MINIMUM" => return Some(AggFunc::Min),
-            "MAX" | "MAXIMUM" => return Some(AggFunc::Max),
-            "COUNT" => return Some(AggFunc::Count),
-            _ => {}
+        if let Some(f) = crate::ops::margin_key_agg_func(&val) {
+            return Some(f);
         }
     }
     None
@@ -1900,15 +1886,7 @@ fn left_margin_agg_func(grid: &Grid, main_row: u32) -> Option<AggFunc> {
         col: key_col,
         row: main_row,
     })?;
-    match val.trim().to_uppercase().as_str() {
-        "TOTAL" | "SUM" => Some(AggFunc::Sum),
-        "MEAN" | "AVERAGE" | "AVG" => Some(AggFunc::Mean),
-        "MEDIAN" => Some(AggFunc::Median),
-        "MIN" | "MINIMUM" => Some(AggFunc::Min),
-        "MAX" | "MAXIMUM" => Some(AggFunc::Max),
-        "COUNT" => Some(AggFunc::Count),
-        _ => None,
-    }
+    crate::ops::margin_key_agg_func(&val)
 }
 
 fn fold_numbers(func: AggFunc, xs: &[f64]) -> String {
@@ -4579,6 +4557,20 @@ impl App {
 
     fn insert_mitosis_row_after_cursor(&mut self) -> Result<bool, RunError> {
         let hr = HEADER_ROWS;
+        let main_rows = self.state.grid.main_rows();
+        if self.cursor.row < hr {
+            return self.insert_mitosis_header_row_after_cursor();
+        }
+        if self.cursor.row >= hr + main_rows {
+            return self.insert_mitosis_footer_row_after_cursor();
+        }
+        self.insert_mitosis_main_data_row_after_cursor()
+    }
+
+    /// Mitosis in the main band (and margins): duplicate the logical row to the line below, shifting
+    /// any rows beneath it down (same as row insert before the new duplicate).
+    fn insert_mitosis_main_data_row_after_cursor(&mut self) -> Result<bool, RunError> {
+        let hr = HEADER_ROWS;
         let original_main_rows = self.state.grid.main_rows() as u32;
         if self.cursor.row < hr || self.cursor.row >= hr + original_main_rows as usize {
             return Ok(false);
@@ -4644,14 +4636,249 @@ impl App {
         Ok(true)
     }
 
-    fn insert_mitosis_col_after_cursor(&mut self) -> Result<bool, RunError> {
-        let hm = MARGIN_COLS;
-        let original_main_cols = self.state.grid.main_cols() as u32;
-        if self.cursor.row < HEADER_ROWS
-            || self.cursor.row >= HEADER_ROWS + self.state.grid.main_rows()
-        {
+    /// Duplicate a `~` row: insert a new line under the cursor, shifting lower `~` rows down.
+    fn insert_mitosis_header_row_after_cursor(&mut self) -> Result<bool, RunError> {
+        let hr = HEADER_ROWS as u32;
+        let h = self.cursor.row as u32;
+        if h >= hr {
             return Ok(false);
         }
+
+        if h + 1 < hr {
+            return self.mitosis_header_row_shift_within_band(h, hr);
+        }
+        // Last header row (~1): duplicate into a new first main data row, pushing main down.
+        self.mitosis_header_last_row_into_new_main_0()
+    }
+
+    /// Rebuild header rows after inserting a full duplicate line under row `h` (`h+1` < `HEADER_ROWS`).
+    fn mitosis_header_row_shift_within_band(&mut self, h: u32, hr: u32) -> Result<bool, RunError> {
+        let mut old: HashMap<(u32, u32), String> = HashMap::new();
+        for (addr, v) in self.state.grid.iter_nonempty() {
+            if let CellAddr::Header { row, col } = addr {
+                old.insert((row, col), v);
+            }
+        }
+
+        let mut newm: HashMap<(u32, u32), String> = HashMap::new();
+        for ((r, c), v) in &old {
+            if *r < h {
+                newm.insert((*r, *c), v.clone());
+            }
+        }
+        for r in (h + 1)..hr {
+            for c in 0u32..self.state.grid.total_cols() as u32 {
+                if let Some(v) = old.get(&(r, c)) {
+                    if r + 1 < hr {
+                        newm.insert((r + 1, c), v.clone());
+                    }
+                }
+            }
+        }
+        for c in 0u32..self.state.grid.total_cols() as u32 {
+            if let Some(v) = old.get(&(h, c)) {
+                newm.insert((h, c), v.clone());
+                newm.insert((h + 1, c), v.clone());
+            }
+        }
+
+        self.apply_fill_replacing_region_map(&old, &newm, |(r, c)| CellAddr::Header { row: r, col: c })?;
+
+        self.cursor = SheetCursor {
+            row: (h + 1) as usize,
+            col: self.cursor.col,
+        };
+        self.cursor.clamp(&self.state.grid);
+        self.anchor = None;
+        self.selection_kind = SelectionKind::Cells;
+        self.status = format!("Inserted mitosis header after ~{}", (hr as usize) - 1 - h as usize);
+        Ok(true)
+    }
+
+    /// `~1` and adjacent main: add a new row 1 with a copy of the `~1` line (main/margins/headers in that band).
+    fn mitosis_header_last_row_into_new_main_0(&mut self) -> Result<bool, RunError> {
+        let hr = HEADER_ROWS;
+        let h = (hr - 1) as u32;
+        let mut line: HashMap<u32, String> = HashMap::new();
+        for (addr, v) in self.state.grid.iter_nonempty() {
+            if let CellAddr::Header { row, col } = addr {
+                if row == h {
+                    line.insert(col, v);
+                }
+            }
+        }
+        if line.is_empty() {
+            return Ok(false);
+        }
+        self.insert_main_rows_at(0, 1)?;
+
+        let mc = self.state.grid.main_cols();
+        let mut fill: Vec<(CellAddr, String)> = Vec::new();
+        for (gc_u, v) in &line {
+            let gc = *gc_u as usize;
+            if let Some(a) = self.global_to_main_col0_addr_for_main_band(gc, mc) {
+                fill.push((a, v.clone()));
+            }
+        }
+        if !fill.is_empty() {
+            self.apply_single_op(Op::FillRange { cells: fill })?;
+        }
+        self.cursor = SheetCursor {
+            row: hr,
+            col: self.cursor.col,
+        };
+        self.cursor.clamp(&self.state.grid);
+        self.anchor = None;
+        self.selection_kind = SelectionKind::Cells;
+        self.status = "Inserted mitosis row: duplicate of ~1 as new row 1".into();
+        Ok(true)
+    }
+
+    fn global_to_main_col0_addr_for_main_band(
+        &self,
+        global_col: usize,
+        main_cols: usize,
+    ) -> Option<CellAddr> {
+        if global_col < MARGIN_COLS {
+            return Some(CellAddr::Left {
+                col: global_col,
+                row: 0,
+            });
+        }
+        if global_col < MARGIN_COLS + main_cols {
+            return Some(CellAddr::Main {
+                row: 0,
+                col: (global_col - MARGIN_COLS) as u32,
+            });
+        }
+        if global_col < MARGIN_COLS + main_cols + MARGIN_COLS {
+            return Some(CellAddr::Right {
+                col: global_col - MARGIN_COLS - main_cols,
+                row: 0,
+            });
+        }
+        None
+    }
+
+    fn insert_main_rows_at(&mut self, at_main_row: u32, count: u32) -> Result<(), RunError> {
+        let n = self.state.grid.main_rows() as u32;
+        self.apply_single_op(Op::SetMainSize {
+            main_rows: n + count,
+            main_cols: self.state.grid.main_cols() as u32,
+        })?;
+        if n > at_main_row {
+            self.apply_single_op(Op::MoveRowRange {
+                from: at_main_row,
+                count: n - at_main_row,
+                to: n + count,
+            })?;
+        }
+        Ok(())
+    }
+
+    /// `_` row mitosis: insert a line under the current footer row, shifting lower `_` content down.
+    fn insert_mitosis_footer_row_after_cursor(&mut self) -> Result<bool, RunError> {
+        let hr = HEADER_ROWS;
+        let mr = self.state.grid.main_rows();
+        let fr = self
+            .cursor
+            .row
+            .saturating_sub(hr)
+            .saturating_sub(mr) as u32;
+        if fr >= FOOTER_ROWS as u32 {
+            return Ok(false);
+        }
+        if fr + 1 >= FOOTER_ROWS as u32 {
+            return Ok(false);
+        }
+
+        self.mitosis_footer_row_shift_within_band(fr)
+    }
+
+    fn mitosis_footer_row_shift_within_band(&mut self, f: u32) -> Result<bool, RunError> {
+        let fr = FOOTER_ROWS as u32;
+        let mut old: HashMap<(u32, u32), String> = HashMap::new();
+        for (addr, v) in self.state.grid.iter_nonempty() {
+            if let CellAddr::Footer { row, col } = addr {
+                old.insert((row, col), v);
+            }
+        }
+        let mut newm: HashMap<(u32, u32), String> = HashMap::new();
+        for ((r, c), v) in &old {
+            if *r < f {
+                newm.insert((*r, *c), v.clone());
+            }
+        }
+        for r in (f + 1)..fr {
+            for c in 0u32..self.state.grid.total_cols() as u32 {
+                if let Some(v) = old.get(&(r, c)) {
+                    if r + 1 < fr {
+                        newm.insert((r + 1, c), v.clone());
+                    }
+                }
+            }
+        }
+        for c in 0u32..self.state.grid.total_cols() as u32 {
+            if let Some(v) = old.get(&(f, c)) {
+                newm.insert((f, c), v.clone());
+                newm.insert((f + 1, c), v.clone());
+            }
+        }
+
+        self.apply_fill_replacing_region_map(&old, &newm, |(r, c)| CellAddr::Footer { row: r, col: c })?;
+
+        let hr = HEADER_ROWS;
+        self.cursor = SheetCursor {
+            row: hr + self.state.grid.main_rows() + (f + 1) as usize,
+            col: self.cursor.col,
+        };
+        self.cursor.clamp(&self.state.grid);
+        self.anchor = None;
+        self.selection_kind = SelectionKind::Cells;
+        self.status = format!("Inserted mitosis footer after _{}", f + 1);
+        Ok(true)
+    }
+
+    fn apply_fill_replacing_region_map(
+        &mut self,
+        old: &HashMap<(u32, u32), String>,
+        newm: &HashMap<(u32, u32), String>,
+        key_to_addr: impl Fn((u32, u32)) -> CellAddr,
+    ) -> Result<(), RunError> {
+        let mut fill: Vec<(CellAddr, String)> = Vec::new();
+        for (k, v) in newm {
+            if old.get(k).map(|s| s.as_str()) != Some(v.as_str()) {
+                fill.push((key_to_addr(*k), v.clone()));
+            }
+        }
+        for k in old.keys() {
+            if !newm.contains_key(k) {
+                fill.push((key_to_addr(*k), String::new()));
+            }
+        }
+        if !fill.is_empty() {
+            self.apply_single_op(Op::FillRange { cells: fill })?;
+        }
+        Ok(())
+    }
+
+    fn insert_mitosis_col_after_cursor(&mut self) -> Result<bool, RunError> {
+        let hm = MARGIN_COLS;
+        let original_main_cols = self.state.grid.main_cols() as usize;
+        if self.cursor.col < hm {
+            return self.insert_mitosis_left_margin_col_after_cursor();
+        }
+        if self.cursor.col >= hm + original_main_cols {
+            return self.insert_mitosis_right_margin_col_after_cursor();
+        }
+        self.insert_mitosis_main_data_col_after_cursor()
+    }
+
+    /// Main-grid column: insert to the right and copy source column (works when the cursor is in
+    /// header/footer for that main column, not only in the main row band).
+    fn insert_mitosis_main_data_col_after_cursor(&mut self) -> Result<bool, RunError> {
+        let hm = MARGIN_COLS;
+        let original_main_cols = self.state.grid.main_cols() as u32;
         if self.cursor.col < hm || self.cursor.col >= hm + original_main_cols as usize {
             return Ok(false);
         }
@@ -4713,6 +4940,196 @@ impl App {
         self.selection_kind = SelectionKind::Cells;
         self.status = format!("Inserted mitosis col after col {}", source_col + 1);
         Ok(true)
+    }
+
+    /// Left margin: duplicate a `[A]`-style margin column, shifting the band right (last column
+    /// spills into column A in the same main row).
+    fn insert_mitosis_left_margin_col_after_cursor(&mut self) -> Result<bool, RunError> {
+        let c0 = self.cursor.col;
+        if c0 + 1 >= MARGIN_COLS {
+            return Ok(false);
+        }
+        self.mitosis_one_margin_col_after(c0, true)
+    }
+
+    /// Right `]A` margin: duplicate that column; last column spills into the rightmost data column.
+    fn insert_mitosis_right_margin_col_after_cursor(&mut self) -> Result<bool, RunError> {
+        let mc = self.state.grid.main_cols();
+        let c0 = self.cursor.col.saturating_sub(MARGIN_COLS + mc);
+        if c0 + 1 >= MARGIN_COLS {
+            return Ok(false);
+        }
+        self.mitosis_one_margin_col_after(c0, false)
+    }
+
+    /// Insert after margin index `c0` (0..MARGIN_COLS-1) in the left or right margin.
+    fn mitosis_one_margin_col_after(&mut self, c0: usize, is_left: bool) -> Result<bool, RunError> {
+        let m = MARGIN_COLS;
+        let main_cols = self.state.grid.main_cols();
+        if main_cols < 1 {
+            return Ok(false);
+        }
+        let gbase = if is_left {
+            0usize
+        } else {
+            MARGIN_COLS + main_cols
+        };
+        let last_main = (main_cols - 1) as u32;
+
+        let mut old: HashMap<CellAddr, String> = HashMap::new();
+        for (addr, v) in self.state.grid.iter_nonempty() {
+            match &addr {
+                CellAddr::Header { col, .. } => {
+                    let g = *col as usize;
+                    if g >= gbase && g < gbase + m {
+                        old.insert(addr, v);
+                    }
+                }
+                CellAddr::Footer { col, .. } => {
+                    let g = *col as usize;
+                    if g >= gbase && g < gbase + m {
+                        old.insert(addr, v);
+                    }
+                }
+                CellAddr::Left { .. } if is_left => {
+                    old.insert(addr, v);
+                }
+                CellAddr::Right { .. } if !is_left => {
+                    old.insert(addr, v);
+                }
+                _ => {}
+            }
+        }
+
+        // Group sparse margin columns per logical line, then 1D insert (avoids overwrites).
+        let mut h_lines: HashMap<u32, HashMap<usize, String>> = HashMap::new();
+        let mut f_lines: HashMap<u32, HashMap<usize, String>> = HashMap::new();
+        let mut l_lines: HashMap<u32, HashMap<usize, String>> = HashMap::new();
+        let mut r_lines: HashMap<u32, HashMap<usize, String>> = HashMap::new();
+        for (a, v) in &old {
+            match a {
+                CellAddr::Header { row, col } => {
+                    let l = *col as usize - gbase;
+                    h_lines
+                        .entry(*row)
+                        .or_default()
+                        .insert(l, v.clone());
+                }
+                CellAddr::Footer { row, col } => {
+                    let l = *col as usize - gbase;
+                    f_lines
+                        .entry(*row)
+                        .or_default()
+                        .insert(l, v.clone());
+                }
+                CellAddr::Left { col, row } => {
+                    l_lines.entry(*row).or_default().insert(*col, v.clone());
+                }
+                CellAddr::Right { col, row } => {
+                    r_lines.entry(*row).or_default().insert(*col, v.clone());
+                }
+                _ => {}
+            }
+        }
+
+        let mut new: HashMap<CellAddr, String> = HashMap::new();
+        for (row, line) in h_lines {
+            for (l, val) in Self::margin_line_map_insert_after(&line, c0, m) {
+                new.insert(
+                    CellAddr::Header {
+                        row,
+                        col: (gbase + l) as u32,
+                    },
+                    val,
+                );
+            }
+        }
+        for (row, line) in f_lines {
+            for (l, val) in Self::margin_line_map_insert_after(&line, c0, m) {
+                new.insert(
+                    CellAddr::Footer {
+                        row,
+                        col: (gbase + l) as u32,
+                    },
+                    val,
+                );
+            }
+        }
+        for (row, line) in l_lines {
+            for (l, val) in Self::margin_line_map_insert_after(&line, c0, m) {
+                if l < m {
+                    new.insert(CellAddr::Left { col: l, row }, val);
+                } else {
+                    new.insert(CellAddr::Main { row, col: 0 }, val);
+                }
+            }
+        }
+        for (row, line) in r_lines {
+            for (l, val) in Self::margin_line_map_insert_after(&line, c0, m) {
+                if l < m {
+                    new.insert(CellAddr::Right { col: l, row }, val);
+                } else {
+                    new.insert(
+                        CellAddr::Main {
+                            row,
+                            col: last_main,
+                        },
+                        val,
+                    );
+                }
+            }
+        }
+
+        let mut fill: Vec<(CellAddr, String)> = Vec::new();
+        for (a, v) in &new {
+            if old.get(a).map(|s| s.as_str()) != Some(v.as_str()) {
+                fill.push((a.clone(), v.clone()));
+            }
+        }
+        for a in old.keys() {
+            if !new.contains_key(a) {
+                fill.push((a.clone(), String::new()));
+            }
+        }
+        if !fill.is_empty() {
+            self.apply_single_op(Op::FillRange { cells: fill })?;
+        }
+        self.cursor = SheetCursor {
+            row: self.cursor.row,
+            col: self.cursor.col + 1,
+        };
+        self.cursor.clamp(&self.state.grid);
+        self.anchor = None;
+        self.selection_kind = SelectionKind::Cells;
+        self.status = if is_left {
+            "Inserted mitosis after left margin column".into()
+        } else {
+            "Inserted mitosis after right margin column".into()
+        };
+        Ok(true)
+    }
+
+    /// Local margin indices 0..m-1, optional spill at local index `m`, after a mitosis "copy column"
+    /// at `c0`.
+    fn margin_line_map_insert_after(
+        line: &HashMap<usize, String>,
+        c0: usize,
+        m: usize,
+    ) -> HashMap<usize, String> {
+        let mut out: HashMap<usize, String> = HashMap::new();
+        for l in 0..m {
+            if let Some(v) = line.get(&l) {
+                if l < c0 {
+                    out.insert(l, v.clone());
+                } else if l == c0 {
+                    out.insert(c0, v.clone());
+                    out.insert(c0 + 1, v.clone());
+                } else {
+                    out.insert(l + 1, v.clone());
+                }
+            }
+        }
+        out
     }
 
     fn insert_cols_left_of_cursor(&mut self, count: u32) -> Result<bool, RunError> {
@@ -10010,7 +10427,7 @@ mod tests {
                 row: (HEADER_ROWS - 1) as u32,
                 col: MARGIN_COLS as u32 + 2,
             },
-            "TOTAL".into(),
+            "=TOTAL".into(),
         );
         app.state
             .grid
@@ -10216,7 +10633,7 @@ mod tests {
                 col: key_col,
                 row: 2,
             },
-            "TOTAL".into(),
+            "=TOTAL".into(),
         );
 
         let backend = TestBackend::new(80, 18);
@@ -10258,7 +10675,7 @@ mod tests {
                 col: (MARGIN_COLS - 1),
                 row: 2,
             },
-            "TOTAL".into(),
+            "=TOTAL".into(),
         );
         state
             .grid
@@ -10277,7 +10694,7 @@ mod tests {
                 col: (MARGIN_COLS - 1),
                 row: 5,
             },
-            "TOTAL".into(),
+            "=TOTAL".into(),
         );
         let right_col = MARGIN_COLS + state.grid.main_cols() + 1;
         state.grid.set(
@@ -10285,7 +10702,7 @@ mod tests {
                 row: (HEADER_ROWS - 1) as u32,
                 col: right_col as u32,
             },
-            "TOTAL".into(),
+            "=TOTAL".into(),
         );
 
         assert_eq!(
@@ -10306,7 +10723,7 @@ mod tests {
                 row: 0,
                 col: (MARGIN_COLS + 2) as u32,
             },
-            "TOTAL".into(),
+            "=TOTAL".into(),
         );
         state
             .grid
@@ -10336,7 +10753,7 @@ mod tests {
                 row: 0,
                 col: (MARGIN_COLS + 2) as u32,
             },
-            "TOTAL".into(),
+            "=TOTAL".into(),
         );
         state
             .grid
@@ -10651,7 +11068,7 @@ mod tests {
                 row: 0,
                 col: (MARGIN_COLS + 2) as u32,
             },
-            "TOTAL".into(),
+            "=TOTAL".into(),
         );
         state.grid.set(
             &CellAddr::Header {
@@ -10700,14 +11117,14 @@ mod tests {
                 col: (MARGIN_COLS - 1),
                 row: 2,
             },
-            "TOTAL".into(),
+            "=TOTAL".into(),
         );
         app.state.grid.set(
             &CellAddr::Header {
                 row: (HEADER_ROWS - 1) as u32,
                 col: (MARGIN_COLS + app.state.grid.main_cols() + 1) as u32,
             },
-            "TOTAL".into(),
+            "=TOTAL".into(),
         );
 
         let backend = TestBackend::new(96, 20);
@@ -10758,7 +11175,7 @@ mod tests {
                 col: (MARGIN_COLS - 1),
                 row: 2,
             },
-            "TOTAL".into(),
+            "=TOTAL".into(),
         );
         state
             .grid
@@ -10786,7 +11203,7 @@ mod tests {
                 row: (HEADER_ROWS - 1) as u32,
                 col: right_col as u32,
             },
-            "TOTAL".into(),
+            "=TOTAL".into(),
         );
 
         assert_eq!(row_total_block_start(&state.grid, 5), 3);
@@ -10810,7 +11227,7 @@ mod tests {
                 col: (MARGIN_COLS - 1),
                 row: 2,
             },
-            "TOTAL".into(),
+            "=TOTAL".into(),
         );
         state
             .grid
@@ -10823,7 +11240,7 @@ mod tests {
                 col: (MARGIN_COLS - 1),
                 row: 5,
             },
-            "TOTAL".into(),
+            "=TOTAL".into(),
         );
         state
             .grid
@@ -10836,7 +11253,7 @@ mod tests {
                 col: (MARGIN_COLS - 1),
                 row: 8,
             },
-            "TOTAL".into(),
+            "=TOTAL".into(),
         );
 
         assert_eq!(row_total_block_start(&state.grid, 8), 6);
@@ -10870,7 +11287,7 @@ mod tests {
                 col: (MARGIN_COLS - 1),
                 row: 2,
             },
-            "TOTAL".into(),
+            "=TOTAL".into(),
         );
         app.state.grid.set(
             &CellAddr::Left {
@@ -10884,7 +11301,7 @@ mod tests {
                 row: (HEADER_ROWS - 1) as u32,
                 col: (MARGIN_COLS + app.state.grid.main_cols() + 1) as u32,
             },
-            "TOTAL".into(),
+            "=TOTAL".into(),
         );
 
         let backend = TestBackend::new(90, 18);
@@ -10944,7 +11361,7 @@ mod tests {
                 row: (HEADER_ROWS - 1) as u32,
                 col: MARGIN_COLS as u32 + 3,
             },
-            "TOTAL".into(),
+            "=TOTAL".into(),
         );
         let backend = TestBackend::new(80, 18);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -10993,7 +11410,7 @@ mod tests {
                     row: (HEADER_ROWS - 1) as u32,
                     col: (right_start + i) as u32,
                 },
-                "TOTAL".into(),
+                "=TOTAL".into(),
             );
         }
 
@@ -12911,6 +13328,123 @@ mod tests {
                 })
                 .as_deref(),
             Some("ftr")
+        );
+    }
+
+    #[test]
+    fn mitosis_main_col_works_when_cursor_in_header() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 2);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "data".into());
+        app.state
+            .grid
+            .set(&CellAddr::Header { row: 0, col: 0 }, "h0".into());
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS - 1,
+            col: MARGIN_COLS,
+        };
+
+        app.insert_mitosis_col_after_cursor().unwrap();
+
+        assert_eq!(app.state.grid.main_cols(), 3);
+        assert_eq!(
+            app.state
+                .grid
+                .get(&CellAddr::Main { row: 0, col: 0 })
+                .as_deref(),
+            Some("data")
+        );
+        assert_eq!(
+            app.state
+                .grid
+                .get(&CellAddr::Main { row: 0, col: 1 })
+                .as_deref(),
+            Some("data")
+        );
+    }
+
+    #[test]
+    fn mitosis_header_row_not_last_duplicates() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 1);
+        app.state
+            .grid
+            .set(
+                &CellAddr::Header {
+                    row: (HEADER_ROWS - 2) as u32,
+                    col: 0,
+                },
+                "t".into(),
+            );
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS - 2,
+            col: 0,
+        };
+
+        app.insert_mitosis_row_after_cursor().unwrap();
+
+        assert_eq!(
+            app.state
+                .grid
+                .get(&CellAddr::Header {
+                    row: (HEADER_ROWS - 2) as u32,
+                    col: 0
+                })
+                .as_deref(),
+            Some("t")
+        );
+        assert_eq!(
+            app.state
+                .grid
+                .get(&CellAddr::Header {
+                    row: (HEADER_ROWS - 1) as u32,
+                    col: 0
+                })
+                .as_deref(),
+            Some("t")
+        );
+    }
+
+    #[test]
+    fn mitosis_left_margin_col_duplicates() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 1);
+        app.state
+            .grid
+            .set(&CellAddr::Left { col: 0, row: 0 }, "L".into());
+        app.state
+            .grid
+            .set(&CellAddr::Left { col: 1, row: 0 }, "M".into());
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: 0,
+        };
+
+        app.insert_mitosis_col_after_cursor().unwrap();
+
+        assert_eq!(app.cursor.col, 1);
+        assert_eq!(
+            app.state
+                .grid
+                .get(&CellAddr::Left { col: 0, row: 0 })
+                .as_deref(),
+            Some("L")
+        );
+        assert_eq!(
+            app.state
+                .grid
+                .get(&CellAddr::Left { col: 1, row: 0 })
+                .as_deref(),
+            Some("L")
+        );
+        assert_eq!(
+            app.state
+                .grid
+                .get(&CellAddr::Left { col: 2, row: 0 })
+                .as_deref(),
+            Some("M")
         );
     }
 
