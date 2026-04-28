@@ -6597,7 +6597,22 @@ impl App {
                 ),
                 _ => Vec::new(),
             };
-            f.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), inner);
+            let focus_line = match &self.mode {
+                Mode::BalanceBooks { focus, .. } => Self::balance_dialog_focus_line(*focus),
+                _ => 0,
+            };
+            let max_visible = inner.height as usize;
+            let max_scroll = body.len().saturating_sub(max_visible);
+            let mut scroll_y = 0usize;
+            if max_scroll > 0 && max_visible > 0 && focus_line >= max_visible {
+                scroll_y = (focus_line + 1).saturating_sub(max_visible).min(max_scroll);
+            }
+            f.render_widget(
+                Paragraph::new(body)
+                    .wrap(Wrap { trim: false })
+                    .scroll((scroll_y as u16, 0)),
+                inner,
+            );
             return;
         }
 
@@ -7217,7 +7232,6 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
         heading_style: Style,
         caret_style: Style,
     ) -> Vec<Line<'static>> {
-        let header = " Balance books ".to_string();
         let column_focused = matches!(focus, BalanceBooksFocus::Column);
         let report_view_focused = matches!(focus, BalanceBooksFocus::ReportViewOnly);
         let report_persisted_focused = matches!(focus, BalanceBooksFocus::ReportPersisted);
@@ -7256,8 +7270,6 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
         };
 
         vec![
-            Line::from(Span::styled(header, heading_style)),
-            Line::from(""),
             Line::from(Span::styled(
                 "Balance rows into groups that sum to zero. The selected numeric column is used to score rows; all other columns are copied unchanged.",
                 text_style,
@@ -7298,6 +7310,17 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                 Span::styled(" ]", text_style),
             ]),
         ]
+    }
+
+    fn balance_dialog_focus_line(focus: BalanceBooksFocus) -> usize {
+        match focus {
+            BalanceBooksFocus::Column => 3,
+            BalanceBooksFocus::ReportViewOnly => 6,
+            BalanceBooksFocus::ReportPersisted => 7,
+            BalanceBooksFocus::PosToNeg => 10,
+            BalanceBooksFocus::NegToPos => 11,
+            BalanceBooksFocus::Generate | BalanceBooksFocus::Cancel => 13,
+        }
     }
 
     fn cycle_balance_focus(focus: BalanceBooksFocus, backwards: bool) -> BalanceBooksFocus {
