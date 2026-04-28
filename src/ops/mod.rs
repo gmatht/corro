@@ -292,6 +292,8 @@ pub enum WorkbookOp {
         amount_col: usize,
         direction: crate::balance::BalanceDirection,
         row_order: Vec<usize>,
+        show_unmatched_heading: bool,
+        unmatched_start: usize,
         preserve_formulas: bool,
     },
     SheetOp {
@@ -828,16 +830,20 @@ impl WorkbookOp {
                 amount_col,
                 direction,
                 row_order,
+                show_unmatched_heading,
+                unmatched_start,
                 preserve_formulas,
             } => format!(
-                "${id}:BALANCE_REPORT {title} {source_sheet_id} {amount_col} {:?} {} {}",
+                "${id}:BALANCE_REPORT {title} {source_sheet_id} {amount_col} {:?} {} {} {} {}",
                 direction,
                 if *preserve_formulas { 1 } else { 0 },
                 row_order
                     .iter()
                     .map(|n| n.to_string())
                     .collect::<Vec<_>>()
-                    .join(",")
+                    .join(","),
+                if *show_unmatched_heading { 1 } else { 0 },
+                unmatched_start
             ),
             WorkbookOp::SheetOp { sheet_id, op } => match op {
                 Op::SetCell { addr, value } => {
@@ -1083,6 +1089,18 @@ pub fn parse_workbook_line(line: &str) -> Result<WorkbookOp, std::io::Error> {
                 .filter(|s| !s.is_empty())
                 .map(|s| s.parse::<usize>().map_err(|_| bad("bad balance line")))
                 .collect::<Result<Vec<_>, _>>()?;
+            // Optional fields for persisted unmatched section metadata.
+            // Backward-compatible with older logs that only have row_order.
+            let show_unmatched_heading = match parts.next() {
+                Some("1") => true,
+                Some("0") => false,
+                Some(_) => return Err(bad("bad balance line")),
+                None => false,
+            };
+            let unmatched_start = match parts.next() {
+                Some(v) => v.parse::<usize>().map_err(|_| bad("bad balance line"))?,
+                None => row_order.len(),
+            };
             Ok(WorkbookOp::BalanceReport {
                 id: sheet_id,
                 title,
@@ -1090,6 +1108,8 @@ pub fn parse_workbook_line(line: &str) -> Result<WorkbookOp, std::io::Error> {
                 amount_col,
                 direction,
                 row_order,
+                show_unmatched_heading,
+                unmatched_start,
                 preserve_formulas,
             })
         }
@@ -1213,8 +1233,10 @@ pub fn apply_workbook_op(
             title,
             source_sheet_id,
             amount_col,
-            direction,
+            direction: _direction,
             row_order,
+            show_unmatched_heading,
+            unmatched_start,
             preserve_formulas,
         } => {
             let source = workbook
@@ -1223,22 +1245,17 @@ pub fn apply_workbook_op(
                 .find(|s| s.id == source_sheet_id)
                 .ok_or_else(|| bad("unknown sheet id"))?
                 .clone();
-            let report = crate::balance::BalanceReport {
-                direction,
-                amount_col,
-                groups: Vec::new(),
-                leftovers: row_order,
-            };
-            let plan = crate::balance::balance_copy_plan(
+            let plan = crate::balance::BalanceCopyPlan {
                 source_sheet_id,
-                source.title.clone(),
-                id,
-                title,
+                source_sheet_title: source.title.clone(),
+                target_sheet_id: id,
+                target_title: title,
                 amount_col,
-                source.state.grid.main_rows(),
-                &report,
+                row_order,
+                unmatched_start,
+                show_unmatched_heading,
                 preserve_formulas,
-            );
+            };
             let mut target_state =
                 SheetState::new(source.state.grid.main_rows(), source.state.grid.main_cols());
             crate::balance::apply_balance_copy(&source.state, &mut target_state, &plan);
@@ -2027,6 +2044,8 @@ mod tests {
             amount_col: 0,
             direction: crate::balance::BalanceDirection::PosToNeg,
             row_order: vec![1, 0],
+            show_unmatched_heading: false,
+            unmatched_start: 2,
             preserve_formulas: true,
         };
 

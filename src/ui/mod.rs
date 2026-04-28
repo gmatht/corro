@@ -7375,6 +7375,8 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                         amount_col: col,
                         direction,
                         row_order: plan.row_order.clone(),
+                        show_unmatched_heading: plan.show_unmatched_heading,
+                        unmatched_start: plan.unmatched_start,
                         preserve_formulas: true,
                     },
                 )?;
