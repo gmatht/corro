@@ -7,6 +7,10 @@ struct Args {
     revision: Option<RevisionMode>,
     file: Option<PathBuf>,
     export: Option<PathBuf>,
+    movie: bool,
+    movie_typing_cps: f64,
+    movie_confirm_ms: u64,
+    movie_menu_hold_ms: u64,
     show_help: bool,
     show_version: bool,
 }
@@ -20,6 +24,10 @@ fn parse_args() -> Result<Args, String> {
     let mut revision = None;
     let mut file = None;
     let mut export = None;
+    let mut movie = false;
+    let mut movie_typing_cps = 22.0f64;
+    let mut movie_confirm_ms = 120u64;
+    let mut movie_menu_hold_ms = 1200u64;
     let mut show_help = false;
     let mut show_version = false;
     let mut positional = Vec::new();
@@ -49,6 +57,39 @@ fn parse_args() -> Result<Args, String> {
                 };
                 export = Some(PathBuf::from(path));
             }
+            "--movie" => {
+                movie = true;
+            }
+            "--movie-typing-cps" => {
+                let Some(raw) = it.next() else {
+                    return Err("--movie-typing-cps requires a positive number".into());
+                };
+                let Ok(value) = raw.parse::<f64>() else {
+                    return Err(format!("invalid --movie-typing-cps value: {raw}"));
+                };
+                if value <= 0.0 {
+                    return Err("--movie-typing-cps must be > 0".into());
+                }
+                movie_typing_cps = value;
+            }
+            "--movie-confirm-ms" => {
+                let Some(raw) = it.next() else {
+                    return Err("--movie-confirm-ms requires a non-negative integer".into());
+                };
+                let Ok(value) = raw.parse::<u64>() else {
+                    return Err(format!("invalid --movie-confirm-ms value: {raw}"));
+                };
+                movie_confirm_ms = value;
+            }
+            "--movie-menu-hold-ms" => {
+                let Some(raw) = it.next() else {
+                    return Err("--movie-menu-hold-ms requires a non-negative integer".into());
+                };
+                let Ok(value) = raw.parse::<u64>() else {
+                    return Err(format!("invalid --movie-menu-hold-ms value: {raw}"));
+                };
+                movie_menu_hold_ms = value;
+            }
             _ if arg.starts_with('-') => {
                 return Err(format!("unrecognized option: {arg}"));
             }
@@ -67,6 +108,10 @@ fn parse_args() -> Result<Args, String> {
         revision,
         file,
         export,
+        movie,
+        movie_typing_cps,
+        movie_confirm_ms,
+        movie_menu_hold_ms,
         show_help,
         show_version,
     })
@@ -100,6 +145,9 @@ fn try_main() -> Result<(), corro::ui::RunError> {
         export_workbook_to_path(&workbook, &export_path).map_err(std::io::Error::other)?;
         return Ok(());
     }
+    if args.movie && args.revision.is_some() {
+        return Err(std::io::Error::other("--movie cannot be combined with --revision").into());
+    }
     let mut app = match args.revision {
         None => App::new(args.file),
         Some(RevisionMode::Browse) => App::new_with_revision_browser(args.file),
@@ -107,8 +155,16 @@ fn try_main() -> Result<(), corro::ui::RunError> {
             App::new_with_revision_limit(args.file, Some(revision))
         }
     };
-    app.load_initial()?;
-    app.run()?;
+    if args.movie {
+        app.run_movie(corro::ui::MovieReplayOptions {
+            typing_cps: args.movie_typing_cps,
+            confirm_delay_ms: args.movie_confirm_ms,
+            menu_hold_ms: args.movie_menu_hold_ms,
+        })?;
+    } else {
+        app.load_initial()?;
+        app.run()?;
+    }
     Ok(())
 }
 
@@ -124,6 +180,10 @@ OPTIONS:\n\
   -v, --version             Show version\n\
   -r, --revision [N]        Browse revisions (or limit to N)\n\
   -e, --export <PATH>       Export input FILE to PATH (.tsv, .csv, .txt/.ascii, .ods)\n\
+  --movie                   Replay a .corro file line-by-line, then quit\n\
+  --movie-typing-cps <N>    Movie typing speed in chars/sec (default: 22)\n\
+  --movie-confirm-ms <N>    Delay before Enter/confirm per line (default: 120)\n\
+  --movie-menu-hold-ms <N>  Hold menu/dialog moments in movie mode (default: 1200)\n\
 \n\
 ARGS:\n\
   FILE                      Input file (.corro, .ods, .tsv, .csv)\n",
@@ -264,6 +324,10 @@ mod tests {
         let mut revision = None;
         let mut file = None;
         let mut export = None;
+        let mut movie = false;
+        let mut movie_typing_cps = 22.0f64;
+        let mut movie_confirm_ms = 120u64;
+        let mut movie_menu_hold_ms = 1200u64;
         let mut show_help = false;
         let mut show_version = false;
         let mut positional = Vec::new();
@@ -295,6 +359,24 @@ mod tests {
                     let next = next.into().to_string_lossy().into_owned();
                     export = Some(PathBuf::from(next));
                 }
+                "--movie" => {
+                    movie = true;
+                }
+                "--movie-typing-cps" => {
+                    let next = rest.next().expect("movie typing cps");
+                    let next = next.into().to_string_lossy().into_owned();
+                    movie_typing_cps = next.parse::<f64>().expect("valid movie typing cps");
+                }
+                "--movie-confirm-ms" => {
+                    let next = rest.next().expect("movie confirm delay");
+                    let next = next.into().to_string_lossy().into_owned();
+                    movie_confirm_ms = next.parse::<u64>().expect("valid movie confirm delay");
+                }
+                "--movie-menu-hold-ms" => {
+                    let next = rest.next().expect("movie menu hold delay");
+                    let next = next.into().to_string_lossy().into_owned();
+                    movie_menu_hold_ms = next.parse::<u64>().expect("valid movie menu hold delay");
+                }
                 _ if arg.starts_with('-') => panic!("unexpected option"),
                 _ => positional.push(arg),
             }
@@ -308,6 +390,10 @@ mod tests {
             revision,
             file,
             export,
+            movie,
+            movie_typing_cps,
+            movie_confirm_ms,
+            movie_menu_hold_ms,
             show_help,
             show_version,
         }
@@ -324,6 +410,25 @@ mod tests {
             args.file.as_deref(),
             Some(std::path::Path::new("docs/test/main.corro"))
         );
+    }
+
+    #[test]
+    fn parses_movie_options() {
+        let args = parse_args_from([
+            "corro",
+            "--movie",
+            "--movie-typing-cps",
+            "30",
+            "--movie-confirm-ms",
+            "500",
+            "--movie-menu-hold-ms",
+            "1600",
+            "docs/test/main.corro",
+        ]);
+        assert!(args.movie);
+        assert!((args.movie_typing_cps - 30.0).abs() < f64::EPSILON);
+        assert_eq!(args.movie_confirm_ms, 500);
+        assert_eq!(args.movie_menu_hold_ms, 1600);
     }
 
     #[test]

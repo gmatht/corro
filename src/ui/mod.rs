@@ -26,7 +26,9 @@ use ratatui::widgets::{
     Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
 };
 use std::collections::HashMap;
+use std::fs::OpenOptions;
 use std::io::{self, stdout};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 use unicode_truncate::{Alignment as UTruncAlign, UnicodeTruncateStr};
@@ -40,6 +42,28 @@ const DISPLAY_EDGE_BLANK: usize = 1;
 const NAV_BLANK_ROWS: usize = 2;
 /// Trailing blank main cols allowed before Right transitions into the right margin.
 const NAV_BLANK_COLS: usize = 1;
+
+fn debug_json_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn debug_log_ndjson(hypothesis_id: &str, location: &str, message: &str, data_json: String) {
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("debug-1c96f4.log")
+    {
+        let _ = writeln!(
+            file,
+            "{{\"sessionId\":\"1c96f4\",\"runId\":\"pre-fix\",\"hypothesisId\":\"{}\",\"location\":\"{}\",\"message\":\"{}\",\"data\":{},\"timestamp\":{}}}",
+            debug_json_escape(hypothesis_id),
+            debug_json_escape(location),
+            debug_json_escape(message),
+            data_json,
+            chrono::Utc::now().timestamp_millis()
+        );
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SelectionKind {
@@ -120,6 +144,13 @@ pub enum RunError {
     Io(#[from] IoError),
     #[error("Terminal: {0}")]
     Term(#[from] io::Error),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct MovieReplayOptions {
+    pub typing_cps: f64,
+    pub confirm_delay_ms: u64,
+    pub menu_hold_ms: u64,
 }
 
 /// Logical cursor position across header+main+footer rows × total global columns.
@@ -3590,11 +3621,42 @@ impl App {
         let Some(pos) = rows.iter().position(|&r| r == self.cursor.row) else {
             return false;
         };
+        // #region agent log
+        debug_log_ndjson(
+            "H1",
+            "src/ui/mod.rs:move_cursor_row_through_view:pre_next_pos",
+            "sorted row move precompute",
+            format!(
+                "{{\"down\":{},\"cursor_row\":{},\"mr_before\":{},\"first_footer_before\":{},\"last_display_main\":{},\"rows_len\":{},\"pos\":{}}}",
+                down,
+                self.cursor.row,
+                mr,
+                first_footer,
+                last_display_main.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string()),
+                rows.len(),
+                pos
+            ),
+        );
+        // #endregion
         let next_pos = if down {
             if last_display_main == Some(self.cursor.row)
                 && trailing_blank_main_rows(&self.state) < NAV_BLANK_ROWS
             {
                 self.state.grid.grow_main_row_at_bottom();
+                // #region agent log
+                debug_log_ndjson(
+                    "H1",
+                    "src/ui/mod.rs:move_cursor_row_through_view:grow_main",
+                    "grow main row inside sorted move",
+                    format!(
+                        "{{\"cursor_row\":{},\"mr_after_growth\":{},\"rows_len_stale\":{},\"next_row_candidate\":{}}}",
+                        self.cursor.row,
+                        self.state.grid.main_rows(),
+                        rows.len(),
+                        rows.get(pos.saturating_add(1)).copied().unwrap_or(self.cursor.row)
+                    ),
+                );
+                // #endregion
             }
             if self.cursor.row >= first_footer {
                 let blank_row = self
@@ -3626,6 +3688,20 @@ impl App {
         self.state
             .grid
             .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
+        // #region agent log
+        debug_log_ndjson(
+            "H1",
+            "src/ui/mod.rs:move_cursor_row_through_view:post_apply",
+            "sorted row move applied",
+            format!(
+                "{{\"next_pos\":{},\"cursor_row_after\":{},\"mr_after\":{},\"first_footer_after\":{}}}",
+                next_pos,
+                self.cursor.row,
+                self.state.grid.main_rows(),
+                HEADER_ROWS + self.state.grid.main_rows()
+            ),
+        );
+        // #endregion
         true
     }
 
@@ -4206,6 +4282,43 @@ impl App {
 
     fn commit_edit_and_move_down(&mut self, buffer: &str) -> Result<Mode, RunError> {
         self.edit_cursor = None;
+        if let Some(edit_addr) = self.edit_target_addr.clone() {
+            if let CellAddr::Main { row, col } = edit_addr {
+                let target_row = HEADER_ROWS + row as usize;
+                let target_col = MARGIN_COLS + col as usize;
+                self.state
+                    .grid
+                    .ensure_extent_for_cursor(target_row, target_col);
+                self.cursor = SheetCursor {
+                    row: target_row,
+                    col: target_col,
+                };
+                self.cursor.clamp(&self.state.grid);
+            }
+        }
+        // #region agent log
+        debug_log_ndjson(
+            "H2",
+            "src/ui/mod.rs:commit_edit_and_move_down:entry",
+            "commit move-down start",
+            format!(
+                "{{\"cursor_row\":{},\"cursor_col\":{},\"main_rows_before\":{},\"edit_target_present\":{},\"is_footer_before\":{},\"edit_target_kind\":\"{}\"}}",
+                self.cursor.row,
+                self.cursor.col,
+                self.state.grid.main_rows(),
+                self.edit_target_addr.is_some(),
+                self.cursor.row >= HEADER_ROWS + self.state.grid.main_rows(),
+                match self.edit_target_addr.as_ref() {
+                    Some(CellAddr::Header { .. }) => "header",
+                    Some(CellAddr::Main { .. }) => "main",
+                    Some(CellAddr::Footer { .. }) => "footer",
+                    Some(CellAddr::Left { .. }) => "left",
+                    Some(CellAddr::Right { .. }) => "right",
+                    None => "none",
+                }
+            ),
+        );
+        // #endregion
         self.commit_edit_buffer(buffer)?;
 
         if !self.move_cursor_row_through_view(true) {
@@ -4225,6 +4338,28 @@ impl App {
 
         let addr = self.cursor.to_addr(&self.state.grid);
         let cur = cell_display(&self.state.grid, &addr);
+        // #region agent log
+        debug_log_ndjson(
+            "H3",
+            "src/ui/mod.rs:commit_edit_and_move_down:post_move",
+            "post move cursor classification",
+            format!(
+                "{{\"cursor_row\":{},\"cursor_col\":{},\"main_rows_after\":{},\"first_footer\":{},\"is_footer_by_row\":{},\"addr_kind\":\"{}\"}}",
+                self.cursor.row,
+                self.cursor.col,
+                self.state.grid.main_rows(),
+                HEADER_ROWS + self.state.grid.main_rows(),
+                self.cursor.row >= HEADER_ROWS + self.state.grid.main_rows(),
+                match addr {
+                    CellAddr::Header { .. } => "header",
+                    CellAddr::Main { .. } => "main",
+                    CellAddr::Footer { .. } => "footer",
+                    CellAddr::Left { .. } => "left",
+                    CellAddr::Right { .. } => "right",
+                }
+            ),
+        );
+        // #endregion
         Ok(self.start_edit_mode(
             cur.clone(),
             if cur.trim() == "=" {
@@ -5744,6 +5879,486 @@ impl App {
         })
     }
 
+    fn movie_input_path(&self) -> Result<PathBuf, RunError> {
+        let Some(path) = self.path.clone().or(self.source_path.clone()) else {
+            return Err(io::Error::other("--movie requires a .corro file path").into());
+        };
+        if !path.exists() {
+            return Err(io::Error::other(format!("movie input does not exist: {}", path.display())).into());
+        }
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if ext != "corro" {
+            return Err(io::Error::other(format!(
+                "--movie only supports .corro input (got {})",
+                if ext.is_empty() { "<none>" } else { ext.as_str() }
+            ))
+            .into());
+        }
+        Ok(path)
+    }
+
+    fn reset_workbook_for_movie(&mut self, path: &Path) {
+        self.workbook = WorkbookState::new();
+        self.view_sheet_id = self.workbook.sheet_id(self.workbook.active_sheet);
+        self.sync_active_sheet_cache();
+        self.sync_persisted_sort_cache_from_workbook();
+        self.offset = 0;
+        self.ops_applied = 0;
+        // Movie replay must stay detached from on-disk log commit/watcher paths,
+        // otherwise commit_edit_buffer can rehydrate the whole workbook from file.
+        self.path = None;
+        self.source_path = Some(path.to_path_buf());
+        self.import_source = None;
+        self.revision_limit = None;
+        self.revision_browse = false;
+        self.watcher = None;
+        self.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        };
+        self.row_scroll = 0;
+        self.col_scroll = 0;
+        self.mode = Mode::Normal;
+    }
+
+    fn movie_apply_set_cell_value(&mut self, value: &str) {
+        let addr = self.cursor.to_addr(&self.state.grid);
+        let op = Op::SetCell {
+            addr: addr.clone(),
+            value: value.to_string(),
+        };
+        op.apply(&mut self.state);
+        if let CellAddr::Main { col, .. } = addr {
+            self.state
+                .grid
+                .auto_fit_column(MARGIN_COLS + col as usize);
+        }
+        self.commit_active_sheet_cache();
+    }
+
+    fn movie_draw_and_sleep(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+        delay: std::time::Duration,
+    ) -> Result<bool, RunError> {
+        terminal.draw(|f| self.draw(f))?;
+        let sleep_slice = std::time::Duration::from_millis(25);
+        let start = std::time::Instant::now();
+        while start.elapsed() < delay {
+            if self.movie_should_quit()? {
+                return Ok(true);
+            }
+            let remaining = delay.saturating_sub(start.elapsed());
+            std::thread::sleep(remaining.min(sleep_slice));
+        }
+        Ok(false)
+    }
+
+    fn movie_should_quit(&mut self) -> Result<bool, RunError> {
+        while event::poll(std::time::Duration::from_millis(0))? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind == KeyEventKind::Release {
+                    continue;
+                }
+                if matches!(key.code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q')) {
+                    return Ok(true);
+                }
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    fn movie_focus_sheet(&mut self, sheet_id: u32) {
+        self.view_sheet_id = sheet_id;
+        self.sync_active_sheet_cache();
+        self.sync_persisted_sort_cache_from_workbook();
+        self.cursor.clamp(&self.state.grid);
+    }
+
+    fn movie_move_cursor_to_addr(&mut self, addr: &CellAddr) {
+        let (r, c) = crate::addr::addr_to_sheet_cursor(
+            addr,
+            crate::addr::MainRows(self.state.grid.main_rows()),
+            crate::addr::MainCols(self.state.grid.main_cols()),
+        );
+        self.cursor = SheetCursor { row: r.0, col: c.0 };
+        self.cursor.clamp(&self.state.grid);
+    }
+
+    fn movie_type_and_commit_current_cell(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+        text: &str,
+        line_i: usize,
+        line_n: usize,
+        char_delay: std::time::Duration,
+        confirm_delay: std::time::Duration,
+    ) -> Result<(), RunError> {
+        self.mode = self.start_edit_mode(String::new(), None, false, false, None);
+        self.status = format!("Movie {}/{} edit", line_i + 1, line_n);
+        if self.movie_draw_and_sleep(terminal, char_delay)? {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "movie interrupted by user").into());
+        }
+        let mut typed = String::new();
+        for ch in text.chars() {
+            typed.push(ch);
+            self.mode = self.start_edit_mode(typed.clone(), None, false, false, None);
+            self.status = format!("Movie {}/{} typing: {}", line_i + 1, line_n, typed);
+            if self.movie_draw_and_sleep(terminal, char_delay)? {
+                return Err(
+                    io::Error::new(io::ErrorKind::Interrupted, "movie interrupted by user").into(),
+                );
+            }
+        }
+        self.status = format!("Movie {}/{} confirm", line_i + 1, line_n);
+        if self.movie_draw_and_sleep(terminal, confirm_delay)? {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "movie interrupted by user").into());
+        }
+        self.movie_apply_set_cell_value(&typed);
+        self.edit_target_addr = None;
+        self.mode = Mode::Normal;
+        Ok(())
+    }
+
+    fn movie_show_menu(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+        section: MenuSection,
+        action: MenuAction,
+        label: &str,
+        line_i: usize,
+        line_n: usize,
+        menu_hold: std::time::Duration,
+    ) -> Result<(), RunError> {
+        self.mode = Mode::Menu {
+            stack: vec![MenuLevel { section, item: 0 }],
+        };
+        self.status = format!("Movie {}/{} menu: {}", line_i + 1, line_n, label);
+        if self.movie_draw_and_sleep(terminal, menu_hold)? {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "movie interrupted by user").into());
+        }
+        let selected_item = menu_items(section)
+            .iter()
+            .position(|item| item.target == MenuTarget::Action(action))
+            .unwrap_or(0);
+        self.mode = Mode::Menu {
+            stack: vec![MenuLevel {
+                section,
+                item: selected_item,
+            }],
+        };
+        self.status = format!("Movie {}/{} confirm: {}", line_i + 1, line_n, label);
+        if self.movie_draw_and_sleep(terminal, menu_hold)? {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "movie interrupted by user").into());
+        }
+        self.mode = Mode::Normal;
+        Ok(())
+    }
+
+    fn movie_show_balance_books_dialog(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+        amount_col: usize,
+        direction: BalanceDirection,
+        line_i: usize,
+        line_n: usize,
+        menu_hold: std::time::Duration,
+    ) -> Result<(), RunError> {
+        let dialog_delay = menu_hold.max(std::time::Duration::from_millis(120));
+        self.mode = Mode::BalanceBooks {
+            buffer: addr::excel_column_name(amount_col),
+            direction,
+            // A logged BalanceReport op is a persisted report operation.
+            persist: true,
+            focus: BalanceBooksFocus::Column,
+        };
+        self.status = format!("Movie {}/{} dialog: Balance books", line_i + 1, line_n);
+        if self.movie_draw_and_sleep(terminal, dialog_delay)? {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "movie interrupted by user").into());
+        }
+        self.mode = Mode::BalanceBooks {
+            buffer: addr::excel_column_name(amount_col),
+            direction,
+            // A logged BalanceReport op is a persisted report operation.
+            persist: true,
+            focus: BalanceBooksFocus::Generate,
+        };
+        self.status = format!("Movie {}/{} confirm: Balance books", line_i + 1, line_n);
+        if self.movie_draw_and_sleep(terminal, dialog_delay)? {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "movie interrupted by user").into());
+        }
+        self.mode = Mode::Normal;
+        Ok(())
+    }
+
+    fn movie_apply_line_as_user(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+        line: &str,
+        active_sheet: &mut u32,
+        line_i: usize,
+        line_n: usize,
+        char_delay: std::time::Duration,
+        confirm_delay: std::time::Duration,
+        menu_hold: std::time::Duration,
+    ) -> Result<bool, RunError> {
+        let op = match crate::ops::parse_workbook_line(line) {
+            Ok(op) => op,
+            Err(_) => return Ok(false),
+        };
+        match op {
+            crate::ops::WorkbookOp::SheetOp { sheet_id, op } => {
+                self.movie_focus_sheet(sheet_id);
+                match op {
+                    crate::ops::Op::SetCell { addr, value } => {
+                        self.movie_move_cursor_to_addr(&addr);
+                        self.movie_type_and_commit_current_cell(
+                            terminal,
+                            &value,
+                            line_i,
+                            line_n,
+                            char_delay,
+                            confirm_delay,
+                        )?;
+                        self.ops_applied += 1;
+                        return Ok(true);
+                    }
+                    crate::ops::Op::SetCellRef { cref, value } => {
+                        let addr = cref.to_grid_addr(self.state.grid.main_cols());
+                        self.movie_move_cursor_to_addr(&addr);
+                        self.movie_type_and_commit_current_cell(
+                            terminal,
+                            &value,
+                            line_i,
+                            line_n,
+                            char_delay,
+                            confirm_delay,
+                        )?;
+                        self.ops_applied += 1;
+                        return Ok(true);
+                    }
+                    crate::ops::Op::FillRange { cells } => {
+                        for (addr, value) in cells {
+                            self.movie_move_cursor_to_addr(&addr);
+                            self.movie_type_and_commit_current_cell(
+                                terminal,
+                                &value,
+                                line_i,
+                                line_n,
+                                char_delay,
+                                confirm_delay,
+                            )?;
+                            self.ops_applied += 1;
+                        }
+                        return Ok(true);
+                    }
+                    _ => {}
+                }
+            }
+            crate::ops::WorkbookOp::NewSheet { .. } => {
+                self.movie_show_menu(
+                    terminal,
+                    MenuSection::Sheet,
+                    MenuAction::NewSheet,
+                    "New sheet",
+                    line_i,
+                    line_n,
+                    menu_hold,
+                )?;
+            }
+            crate::ops::WorkbookOp::CopySheet { .. } => {
+                self.movie_show_menu(
+                    terminal,
+                    MenuSection::Sheet,
+                    MenuAction::CopySheet,
+                    "Copy sheet",
+                    line_i,
+                    line_n,
+                    menu_hold,
+                )?;
+            }
+            crate::ops::WorkbookOp::RenameSheet { .. } => {
+                self.movie_show_menu(
+                    terminal,
+                    MenuSection::Sheet,
+                    MenuAction::RenameSheet,
+                    "Rename sheet",
+                    line_i,
+                    line_n,
+                    menu_hold,
+                )?;
+            }
+            crate::ops::WorkbookOp::MoveSheet { .. } => {
+                self.movie_show_menu(
+                    terminal,
+                    MenuSection::Sheet,
+                    MenuAction::MoveSheet,
+                    "Move sheet",
+                    line_i,
+                    line_n,
+                    menu_hold,
+                )?;
+            }
+            crate::ops::WorkbookOp::ActivateSheet { id } => {
+                self.movie_focus_sheet(id);
+                self.status = format!("Movie {}/{} activate sheet {}", line_i + 1, line_n, id);
+                if self.movie_draw_and_sleep(terminal, confirm_delay)? {
+                    return Err(
+                        io::Error::new(io::ErrorKind::Interrupted, "movie interrupted by user")
+                            .into(),
+                    );
+                }
+                self.ops_applied += 1;
+                return Ok(true);
+            }
+            crate::ops::WorkbookOp::BalanceReport {
+                amount_col,
+                direction,
+                ..
+            } => {
+                self.movie_show_menu(
+                    terminal,
+                    MenuSection::Sheet,
+                    MenuAction::BalanceBooks,
+                    "Balance report",
+                    line_i,
+                    line_n,
+                    menu_hold,
+                )?;
+                self.movie_show_balance_books_dialog(
+                    terminal,
+                    amount_col,
+                    direction,
+                    line_i,
+                    line_n,
+                    menu_hold,
+                )?;
+                self.status = format!("Movie {}/{} generate balance report", line_i + 1, line_n);
+                if self.movie_draw_and_sleep(terminal, confirm_delay)? {
+                    return Err(
+                        io::Error::new(io::ErrorKind::Interrupted, "movie interrupted by user")
+                            .into(),
+                    );
+                }
+                crate::ops::apply_log_line_to_workbook(line, &mut self.workbook, active_sheet)?;
+                self.view_sheet_id = *active_sheet;
+                self.sync_active_sheet_cache();
+                self.sync_persisted_sort_cache_from_workbook();
+                self.ops_applied += 1;
+                self.cursor.clamp(&self.state.grid);
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub fn run_movie(&mut self, options: MovieReplayOptions) -> Result<(), RunError> {
+        let path = self.movie_input_path()?;
+        let data = std::fs::read_to_string(&path).map_err(IoError::Io)?;
+        let mut log_lines: Vec<String> = Vec::new();
+        for raw in data.lines() {
+            let t = raw.trim();
+            if t.is_empty() {
+                continue;
+            }
+            log_lines.push(t.to_string());
+        }
+        self.reset_workbook_for_movie(&path);
+
+        let char_delay = std::time::Duration::from_secs_f64(1.0 / options.typing_cps.max(0.1));
+        let confirm_delay = std::time::Duration::from_millis(options.confirm_delay_ms);
+        let menu_hold = std::time::Duration::from_millis(options.menu_hold_ms);
+
+        enable_raw_mode()?;
+        let mut stdout = stdout();
+        execute!(stdout, EnterAlternateScreen, Hide)?;
+        let backend = CrosstermBackend::new(stdout);
+        let mut terminal = Terminal::new(backend)?;
+
+        let run_result = (|| -> Result<(), RunError> {
+            let mut active_sheet = self.workbook.sheet_id(self.workbook.active_sheet);
+            for (i, line) in log_lines.iter().enumerate() {
+                if self.movie_should_quit()? {
+                    self.status = "Movie stopped by user".into();
+                    return Ok(());
+                }
+                if !self.movie_apply_line_as_user(
+                    &mut terminal,
+                    line,
+                    &mut active_sheet,
+                    i,
+                    log_lines.len(),
+                    char_delay,
+                    confirm_delay,
+                    menu_hold,
+                )? {
+                    // Fallback for ops that don't map cleanly to one edit interaction.
+                    self.status =
+                        format!("Movie {}/{} apply op", i + 1, log_lines.len());
+                    if self.movie_draw_and_sleep(&mut terminal, confirm_delay)? {
+                        self.status = "Movie stopped by user".into();
+                        return Ok(());
+                    }
+                    crate::ops::apply_log_line_to_workbook(
+                        line,
+                        &mut self.workbook,
+                        &mut active_sheet,
+                    )?;
+                    self.view_sheet_id = active_sheet;
+                    self.sync_active_sheet_cache();
+                    self.sync_persisted_sort_cache_from_workbook();
+                    self.ops_applied += 1;
+                    self.cursor.clamp(&self.state.grid);
+                }
+            }
+            self.status = format!(
+                "Movie complete: {} lines from {}",
+                self.ops_applied,
+                path.display()
+            );
+            terminal.draw(|f| self.draw(f))?;
+            std::thread::sleep(confirm_delay);
+            Ok(())
+        })();
+
+        let run_result = match run_result {
+            Err(RunError::Term(err)) if err.kind() == io::ErrorKind::Interrupted => {
+                self.status = "Movie stopped by user".into();
+                Ok(())
+            }
+            other => other,
+        };
+
+        let disable_result = disable_raw_mode();
+        let leave_result = execute!(terminal.backend_mut(), LeaveAlternateScreen, Show);
+        let restore_result = match (disable_result, leave_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(disable_err), Ok(())) => Err(RunError::Term(disable_err)),
+            (Ok(()), Err(leave_err)) => Err(RunError::Term(leave_err)),
+            (Err(disable_err), Err(leave_err)) => Err(RunError::Term(io::Error::other(format!(
+                "disable_raw_mode failed: {disable_err}; restore failed: {leave_err}"
+            )))),
+        };
+
+        match (run_result, restore_result) {
+            (Err(run_err), Err(restore_err)) => Err(RunError::Term(io::Error::other(format!(
+                "{run_err}; cleanup failed: {restore_err}"
+            )))),
+            (Err(run_err), Ok(())) => Err(run_err),
+            (Ok(()), Err(restore_err)) => Err(restore_err),
+            (Ok(()), Ok(())) => Ok(()),
+        }
+    }
+
     pub fn run(&mut self) -> Result<(), RunError> {
         enable_raw_mode()?;
         let mut stdout = stdout();
@@ -5874,6 +6489,35 @@ impl App {
         // ── Formula bar ───────────────────────────────────────────────────────
         let addr = self.cursor.to_addr(grid);
         let edit_addr = self.edit_target_addr.clone().unwrap_or(addr.clone());
+        // #region agent log
+        debug_log_ndjson(
+            "H4",
+            "src/ui/mod.rs:draw:cursor_render_class",
+            "draw cursor class snapshot",
+            format!(
+                "{{\"cursor_row\":{},\"cursor_col\":{},\"main_rows\":{},\"first_footer\":{},\"row_looks_footer\":{},\"addr_kind\":\"{}\",\"edit_addr_kind\":\"{}\"}}",
+                self.cursor.row,
+                self.cursor.col,
+                grid.main_rows(),
+                HEADER_ROWS + grid.main_rows(),
+                self.cursor.row >= HEADER_ROWS + grid.main_rows(),
+                match addr {
+                    CellAddr::Header { .. } => "header",
+                    CellAddr::Main { .. } => "main",
+                    CellAddr::Footer { .. } => "footer",
+                    CellAddr::Left { .. } => "left",
+                    CellAddr::Right { .. } => "right",
+                },
+                match edit_addr {
+                    CellAddr::Header { .. } => "header",
+                    CellAddr::Main { .. } => "main",
+                    CellAddr::Footer { .. } => "footer",
+                    CellAddr::Left { .. } => "left",
+                    CellAddr::Right { .. } => "right",
+                }
+            ),
+        );
+        // #endregion
         let prompt_style = Style::default().fg(Color::White).bg(Color::DarkGray);
         let prompt_style_bold = prompt_style.add_modifier(Modifier::BOLD);
         let caret_style = Style::default()
@@ -9583,6 +10227,46 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()))
             .unwrap();
         assert_eq!(app.cursor.row, HEADER_ROWS + 3);
+    }
+
+    #[test]
+    fn enter_in_edit_mode_uses_edit_target_row_for_cursor_progression() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(2, 1);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "1".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 1, col: 0 }, "2".into());
+
+        // Simulate the observed mismatch: cursor row now maps to footer after
+        // extent drift, but edit target still points to the next main row.
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS + 2,
+            col: MARGIN_COLS,
+        };
+        app.edit_target_addr = Some(CellAddr::Main { row: 2, col: 0 });
+        app.mode = Mode::Edit {
+            buffer: "3".into(),
+            formula_cursor: None,
+            fit_to_content_on_commit: false,
+        };
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .unwrap();
+
+        assert_eq!(
+            app.state
+                .grid
+                .get(&CellAddr::Main { row: 2, col: 0 })
+                .as_deref(),
+            Some("3")
+        );
+        assert_eq!(
+            app.cursor.to_addr(&app.state.grid),
+            CellAddr::Main { row: 3, col: 0 }
+        );
     }
 
     #[test]
