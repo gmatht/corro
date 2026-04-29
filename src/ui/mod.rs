@@ -4990,59 +4990,14 @@ impl App {
     /// any rows beneath it down (same as row insert before the new duplicate).
     fn insert_mitosis_main_data_row_after_cursor(&mut self) -> Result<bool, RunError> {
         let hr = HEADER_ROWS;
-        let original_main_rows = self.state.grid.main_rows() as u32;
-        if self.cursor.row < hr || self.cursor.row >= hr + original_main_rows as usize {
+        let main_rows = self.state.grid.main_rows() as u32;
+        if self.cursor.row < hr || self.cursor.row >= hr + main_rows as usize {
             return Ok(false);
         }
 
         let source_row = (self.cursor.row - hr) as u32;
         let dest_row = source_row + 1;
-        let mut copied_cells = Vec::new();
-        for col in 0..self.state.grid.main_cols() as u32 {
-            let src = CellAddr::Main {
-                row: source_row,
-                col,
-            };
-            if let Some(value) = self.state.grid.get(&src) {
-                copied_cells.push((CellAddr::Main { row: dest_row, col }, value.to_string()));
-            }
-        }
-        for col in 0..MARGIN_COLS {
-            let src = CellAddr::Left {
-                col,
-                row: source_row,
-            };
-            if let Some(value) = self.state.grid.get(&src) {
-                copied_cells.push((CellAddr::Left { col, row: dest_row }, value.to_string()));
-            }
-            let src = CellAddr::Right {
-                col,
-                row: source_row,
-            };
-            if let Some(value) = self.state.grid.get(&src) {
-                copied_cells.push((CellAddr::Right { col, row: dest_row }, value.to_string()));
-            }
-        }
-
-        self.apply_single_op(Op::SetMainSize {
-            main_rows: original_main_rows + 1,
-            main_cols: self.state.grid.main_cols() as u32,
-        })?;
-
-        let rows_below = original_main_rows.saturating_sub(dest_row);
-        if rows_below > 0 {
-            self.apply_single_op(Op::MoveRowRange {
-                from: dest_row,
-                count: rows_below,
-                to: original_main_rows + 1,
-            })?;
-        }
-
-        if !copied_cells.is_empty() {
-            self.apply_single_op(Op::FillRange {
-                cells: copied_cells,
-            })?;
-        }
+        self.apply_single_op(Op::DuplicateRow { row: source_row })?;
 
         self.cursor = SheetCursor {
             row: hr + dest_row as usize,
@@ -5297,58 +5252,14 @@ impl App {
     /// header/footer for that main column, not only in the main row band).
     fn insert_mitosis_main_data_col_after_cursor(&mut self) -> Result<bool, RunError> {
         let hm = MARGIN_COLS;
-        let original_main_cols = self.state.grid.main_cols() as u32;
-        if self.cursor.col < hm || self.cursor.col >= hm + original_main_cols as usize {
+        let main_cols = self.state.grid.main_cols() as u32;
+        if self.cursor.col < hm || self.cursor.col >= hm + main_cols as usize {
             return Ok(false);
         }
 
         let source_col = (self.cursor.col - hm) as u32;
         let dest_col = source_col + 1;
-        let source_global_col = (hm as u32) + source_col;
-        let dest_global_col = source_global_col + 1;
-        let mut copied_cells = Vec::new();
-
-        for row in 0..self.state.grid.main_rows() as u32 {
-            let src = CellAddr::Main {
-                row,
-                col: source_col,
-            };
-            if let Some(value) = self.state.grid.get(&src) {
-                copied_cells.push((CellAddr::Main { row, col: dest_col }, value.to_string()));
-            }
-        }
-
-        for (addr, value) in self.state.grid.iter_nonempty() {
-            match addr {
-                CellAddr::Header { row, col } if col == source_global_col => {
-                    copied_cells.push((CellAddr::Header { row, col: dest_global_col }, value));
-                }
-                CellAddr::Footer { row, col } if col == source_global_col => {
-                    copied_cells.push((CellAddr::Footer { row, col: dest_global_col }, value));
-                }
-                _ => {}
-            }
-        }
-
-        self.apply_single_op(Op::SetMainSize {
-            main_rows: self.state.grid.main_rows() as u32,
-            main_cols: original_main_cols + 1,
-        })?;
-
-        let cols_right = original_main_cols.saturating_sub(dest_col);
-        if cols_right > 0 {
-            self.apply_single_op(Op::MoveColRange {
-                from: dest_col,
-                count: cols_right,
-                to: original_main_cols + 1,
-            })?;
-        }
-
-        if !copied_cells.is_empty() {
-            self.apply_single_op(Op::FillRange {
-                cells: copied_cells,
-            })?;
-        }
+        self.apply_single_op(Op::DuplicateCol { col: source_col })?;
 
         self.cursor = SheetCursor {
             row: self.cursor.row,
@@ -6448,6 +6359,142 @@ impl App {
         Ok(())
     }
 
+    fn movie_apply_with_menu(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+        line: &str,
+        active_sheet: &mut u32,
+        line_i: usize,
+        line_n: usize,
+        menu_hold: std::time::Duration,
+        confirm_delay: std::time::Duration,
+        section: MenuSection,
+        action: MenuAction,
+        label: &str,
+        status: &str,
+    ) -> Result<bool, RunError> {
+        self.movie_show_menu(terminal, section, action, label, line_i, line_n, menu_hold)?;
+        self.movie_apply_after_preview(
+            terminal,
+            line,
+            active_sheet,
+            line_i,
+            line_n,
+            confirm_delay,
+            status,
+        )
+    }
+
+    fn movie_apply_after_preview(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+        line: &str,
+        active_sheet: &mut u32,
+        line_i: usize,
+        line_n: usize,
+        confirm_delay: std::time::Duration,
+        status: &str,
+    ) -> Result<bool, RunError> {
+        self.status = format!("Movie {}/{} {}", line_i + 1, line_n, status);
+        if self.movie_draw_and_sleep(terminal, confirm_delay)? {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "movie interrupted by user").into());
+        }
+        crate::ops::apply_log_line_to_workbook(line, &mut self.workbook, active_sheet)?;
+        self.view_sheet_id = *active_sheet;
+        self.sync_active_sheet_cache();
+        self.sync_persisted_sort_cache_from_workbook();
+        self.ops_applied += 1;
+        self.cursor.clamp(&self.state.grid);
+        Ok(true)
+    }
+
+    fn movie_show_format_flow(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+        line_i: usize,
+        line_n: usize,
+        menu_hold: std::time::Duration,
+        scope_action: MenuAction,
+        final_section: MenuSection,
+        final_action: MenuAction,
+        final_label: &str,
+    ) -> Result<(), RunError> {
+        self.movie_show_menu(
+            terminal,
+            MenuSection::FormatScope,
+            scope_action,
+            "Format scope",
+            line_i,
+            line_n,
+            menu_hold,
+        )?;
+        self.movie_show_menu(
+            terminal,
+            final_section,
+            final_action,
+            final_label,
+            line_i,
+            line_n,
+            menu_hold,
+        )?;
+        Ok(())
+    }
+
+    fn movie_infer_insert_menu_action(value: &str) -> Option<(MenuAction, &'static str)> {
+        if value.starts_with("http://") || value.starts_with("https://") {
+            return Some((MenuAction::InsertHyperlink, "Hyperlink"));
+        }
+        let date_like = value.len() == 10
+            && value.chars().enumerate().all(|(i, ch)| match i {
+                4 | 7 => ch == '-',
+                _ => ch.is_ascii_digit(),
+            });
+        if date_like {
+            return Some((MenuAction::InsertDate, "Date"));
+        }
+        let time_like = value.len() == 8
+            && value.chars().enumerate().all(|(i, ch)| match i {
+                2 | 5 => ch == ':',
+                _ => ch.is_ascii_digit(),
+            });
+        if time_like {
+            return Some((MenuAction::InsertTime, "Time"));
+        }
+        if SPECIAL_VALUE_CHOICES.contains(&value) {
+            return Some((MenuAction::InsertSpecialChars, "Special Char"));
+        }
+        None
+    }
+
+    fn movie_infer_format_action(
+        format: CellFormat,
+    ) -> Option<(MenuSection, MenuAction, &'static str)> {
+        if format == CellFormat::default() {
+            return Some((MenuSection::Format, MenuAction::FormatReset, "Reset"));
+        }
+        if let Some(align) = format.align {
+            let action = match align {
+                TextAlign::Left => MenuAction::FormatAlignLeft,
+                TextAlign::Center => MenuAction::FormatAlignCenter,
+                TextAlign::Right => MenuAction::FormatAlignRight,
+                TextAlign::Default => MenuAction::FormatAlignDefault,
+            };
+            return Some((MenuSection::FormatAlign, action, "Align"));
+        }
+        if let Some(number) = format.number {
+            let action = match number {
+                NumberFormat::Currency { .. } => MenuAction::FormatCurrency,
+                NumberFormat::Rational => MenuAction::FormatRational,
+                NumberFormat::Fixed { decimals: 0 } => MenuAction::FormatFixed0,
+                NumberFormat::Fixed { decimals: 1 } => MenuAction::FormatFixed1,
+                NumberFormat::Fixed { decimals: 2 } => MenuAction::FormatFixed2,
+                NumberFormat::Fixed { .. } => MenuAction::FormatFixedCustom,
+            };
+            return Some((MenuSection::FormatNumber, action, "Number"));
+        }
+        None
+    }
+
     fn movie_apply_line_as_user(
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
@@ -6468,6 +6515,17 @@ impl App {
                 self.movie_focus_sheet(sheet_id);
                 match op {
                     crate::ops::Op::SetCell { addr, value } => {
+                        if let Some((action, label)) = Self::movie_infer_insert_menu_action(&value) {
+                            self.movie_show_menu(
+                                terminal,
+                                MenuSection::Insert,
+                                action,
+                                label,
+                                line_i,
+                                line_n,
+                                menu_hold,
+                            )?;
+                        }
                         self.movie_move_cursor_to_addr(&addr);
                         self.movie_type_and_commit_current_cell(
                             terminal,
@@ -6495,6 +6553,27 @@ impl App {
                         return Ok(true);
                     }
                     crate::ops::Op::FillRange { cells } => {
+                        if cells.iter().all(|(_, value)| value.is_empty()) {
+                            self.movie_show_menu(
+                                terminal,
+                                MenuSection::Edit,
+                                MenuAction::Cut,
+                                "Cut",
+                                line_i,
+                                line_n,
+                                menu_hold,
+                            )?;
+                        } else if cells.len() > 1 {
+                            self.movie_show_menu(
+                                terminal,
+                                MenuSection::Edit,
+                                MenuAction::Paste,
+                                "Paste",
+                                line_i,
+                                line_n,
+                                menu_hold,
+                            )?;
+                        }
                         for (addr, value) in cells {
                             self.movie_move_cursor_to_addr(&addr);
                             self.movie_type_and_commit_current_cell(
@@ -6510,54 +6589,188 @@ impl App {
                         return Ok(true);
                     }
                     crate::ops::Op::DuplicateRow { .. } => {
-                        self.movie_show_menu(
+                        return self.movie_apply_with_menu(
                             terminal,
+                            line,
+                            active_sheet,
+                            line_i,
+                            line_n,
+                            menu_hold,
+                            confirm_delay,
                             MenuSection::Insert,
                             MenuAction::InsertMitosisRow,
                             "Mitosis row",
+                            "apply mitosis row",
+                        );
+                    }
+                    crate::ops::Op::DuplicateCol { .. } => {
+                        return self.movie_apply_with_menu(
+                            terminal,
+                            line,
+                            active_sheet,
                             line_i,
                             line_n,
                             menu_hold,
-                        )?;
-                        self.status = format!("Movie {}/{} apply mitosis row", line_i + 1, line_n);
-                        if self.movie_draw_and_sleep(terminal, confirm_delay)? {
-                            return Err(
-                                io::Error::new(io::ErrorKind::Interrupted, "movie interrupted by user")
-                                    .into(),
-                            );
-                        }
-                        crate::ops::apply_log_line_to_workbook(line, &mut self.workbook, active_sheet)?;
-                        self.view_sheet_id = *active_sheet;
-                        self.sync_active_sheet_cache();
-                        self.sync_persisted_sort_cache_from_workbook();
-                        self.ops_applied += 1;
-                        self.cursor.clamp(&self.state.grid);
-                        return Ok(true);
-                    }
-                    crate::ops::Op::DuplicateCol { .. } => {
-                        self.movie_show_menu(
-                            terminal,
+                            confirm_delay,
                             MenuSection::Insert,
                             MenuAction::InsertMitosisCol,
                             "Mitosis col",
+                            "apply mitosis col",
+                        );
+                    }
+                    crate::ops::Op::SetMainSize {
+                        main_rows,
+                        main_cols,
+                    } => {
+                        let menu_action = if main_rows as usize > self.state.grid.main_rows() {
+                            Some((MenuAction::InsertRows, "Rows", "apply row insert"))
+                        } else if main_cols as usize > self.state.grid.main_cols() {
+                            Some((MenuAction::InsertCols, "Cols", "apply col insert"))
+                        } else {
+                            None
+                        };
+                        if let Some((action, label, status)) = menu_action {
+                            return self.movie_apply_with_menu(
+                                terminal,
+                                line,
+                                active_sheet,
+                                line_i,
+                                line_n,
+                                menu_hold,
+                                confirm_delay,
+                                MenuSection::Insert,
+                                action,
+                                label,
+                                status,
+                            );
+                        }
+                    }
+                    crate::ops::Op::SetMaxColWidth { .. } => {
+                        return self.movie_apply_with_menu(
+                            terminal,
+                            line,
+                            active_sheet,
                             line_i,
                             line_n,
                             menu_hold,
+                            confirm_delay,
+                            MenuSection::Width,
+                            MenuAction::SetMaxColWidth,
+                            "Default width",
+                            "apply default width",
+                        );
+                    }
+                    crate::ops::Op::SetColWidth { .. } => {
+                        return self.movie_apply_with_menu(
+                            terminal,
+                            line,
+                            active_sheet,
+                            line_i,
+                            line_n,
+                            menu_hold,
+                            confirm_delay,
+                            MenuSection::Width,
+                            MenuAction::SetColWidth,
+                            "Column width",
+                            "apply column width",
+                        );
+                    }
+                    crate::ops::Op::CopyFromTo { .. } => {
+                        return self.movie_apply_with_menu(
+                            terminal,
+                            line,
+                            active_sheet,
+                            line_i,
+                            line_n,
+                            menu_hold,
+                            confirm_delay,
+                            MenuSection::Edit,
+                            MenuAction::Paste,
+                            "Paste",
+                            "apply paste",
+                        );
+                    }
+                    crate::ops::Op::SetColumnFormat { scope, format, .. } => {
+                        let scope_action = match scope {
+                            FormatScope::All => MenuAction::FormatApplyFullColumn,
+                            FormatScope::Data => MenuAction::FormatApplyData,
+                            FormatScope::Special => MenuAction::FormatApplySpecial,
+                        };
+                        let Some((section, action, label)) = Self::movie_infer_format_action(format)
+                        else {
+                            return Ok(false);
+                        };
+                        self.movie_show_format_flow(
+                            terminal,
+                            line_i,
+                            line_n,
+                            menu_hold,
+                            scope_action,
+                            section,
+                            action,
+                            label,
                         )?;
-                        self.status = format!("Movie {}/{} apply mitosis col", line_i + 1, line_n);
-                        if self.movie_draw_and_sleep(terminal, confirm_delay)? {
-                            return Err(
-                                io::Error::new(io::ErrorKind::Interrupted, "movie interrupted by user")
-                                    .into(),
-                            );
-                        }
-                        crate::ops::apply_log_line_to_workbook(line, &mut self.workbook, active_sheet)?;
-                        self.view_sheet_id = *active_sheet;
-                        self.sync_active_sheet_cache();
-                        self.sync_persisted_sort_cache_from_workbook();
-                        self.ops_applied += 1;
-                        self.cursor.clamp(&self.state.grid);
-                        return Ok(true);
+                        return self.movie_apply_after_preview(
+                            terminal,
+                            line,
+                            active_sheet,
+                            line_i,
+                            line_n,
+                            confirm_delay,
+                            "apply format",
+                        );
+                    }
+                    crate::ops::Op::SetAllColumnFormat { format } => {
+                        let scope_action = MenuAction::FormatApplyAll;
+                        let Some((section, action, label)) = Self::movie_infer_format_action(format)
+                        else {
+                            return Ok(false);
+                        };
+                        self.movie_show_format_flow(
+                            terminal,
+                            line_i,
+                            line_n,
+                            menu_hold,
+                            scope_action,
+                            section,
+                            action,
+                            label,
+                        )?;
+                        return self.movie_apply_after_preview(
+                            terminal,
+                            line,
+                            active_sheet,
+                            line_i,
+                            line_n,
+                            confirm_delay,
+                            "apply format",
+                        );
+                    }
+                    crate::ops::Op::SetCellFormat { format, .. } => {
+                        let scope_action = MenuAction::FormatApplyCell;
+                        let Some((section, action, label)) = Self::movie_infer_format_action(format)
+                        else {
+                            return Ok(false);
+                        };
+                        self.movie_show_format_flow(
+                            terminal,
+                            line_i,
+                            line_n,
+                            menu_hold,
+                            scope_action,
+                            section,
+                            action,
+                            label,
+                        )?;
+                        return self.movie_apply_after_preview(
+                            terminal,
+                            line,
+                            active_sheet,
+                            line_i,
+                            line_n,
+                            confirm_delay,
+                            "apply format",
+                        );
                     }
                     crate::ops::Op::SetViewSortCols { cols } => {
                         self.movie_show_menu(
@@ -15435,6 +15648,71 @@ mod tests {
                 .align,
             Some(TextAlign::Center)
         );
+    }
+
+    #[test]
+    fn movie_infer_insert_menu_action_detects_known_shapes() {
+        assert_eq!(
+            App::movie_infer_insert_menu_action("https://example.com"),
+            Some((MenuAction::InsertHyperlink, "Hyperlink"))
+        );
+        assert_eq!(
+            App::movie_infer_insert_menu_action("2026-04-29"),
+            Some((MenuAction::InsertDate, "Date"))
+        );
+        assert_eq!(
+            App::movie_infer_insert_menu_action("12:34:56"),
+            Some((MenuAction::InsertTime, "Time"))
+        );
+        assert_eq!(
+            App::movie_infer_insert_menu_action("∞"),
+            Some((MenuAction::InsertSpecialChars, "Special Char"))
+        );
+        assert_eq!(App::movie_infer_insert_menu_action("plain text"), None);
+    }
+
+    #[test]
+    fn mitosis_row_logs_duplicate_row_for_main_band() {
+        let tmp = tempfile::Builder::new()
+            .suffix(".corro")
+            .tempfile()
+            .unwrap();
+        let mut app = App::new(Some(tmp.path().to_path_buf()));
+        app.state.grid.set_main_size(2, 1);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "A".into());
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        };
+
+        app.insert_mitosis_main_data_row_after_cursor().unwrap();
+
+        let log = std::fs::read_to_string(tmp.path()).unwrap();
+        assert!(log.contains("DUPLICATE_ROW 0"), "{log}");
+    }
+
+    #[test]
+    fn mitosis_col_logs_duplicate_col_for_main_band() {
+        let tmp = tempfile::Builder::new()
+            .suffix(".corro")
+            .tempfile()
+            .unwrap();
+        let mut app = App::new(Some(tmp.path().to_path_buf()));
+        app.state.grid.set_main_size(1, 2);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "A".into());
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        };
+
+        app.insert_mitosis_main_data_col_after_cursor().unwrap();
+
+        let log = std::fs::read_to_string(tmp.path()).unwrap();
+        assert!(log.contains("DUPLICATE_COL 0"), "{log}");
     }
 
     #[test]
