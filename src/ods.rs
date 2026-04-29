@@ -1004,6 +1004,7 @@ fn ods_cell_style_attr(
 ) -> Option<String> {
     let fmt = grid.format_for_addr(addr);
     let number = match fmt.number {
+        Some(NumberFormat::DecimalGeneric) => None,
         Some(NumberFormat::Fixed { decimals }) => Some(OdsNumberStyleKey::Fixed { decimals }),
         Some(NumberFormat::Currency { decimals }) => Some(OdsNumberStyleKey::Currency { decimals }),
         Some(NumberFormat::Rational) => None,

@@ -976,6 +976,9 @@ fn format_text(format: &CellFormat) -> String {
     let mut parts = Vec::new();
     if let Some(number) = format.number {
         match number {
+            crate::grid::NumberFormat::DecimalGeneric => {
+                parts.push("decimal:1".into());
+            }
             crate::grid::NumberFormat::Currency { decimals } => {
                 parts.push(format!("currency:{decimals}"));
             }
@@ -1841,6 +1844,9 @@ fn parse_format_text(text: &str) -> Result<CellFormat, std::io::Error> {
             return Err(bad("bad FORMAT line"));
         };
         match k {
+            "decimal" => {
+                format.number = Some(crate::grid::NumberFormat::DecimalGeneric);
+            }
             "currency" => {
                 let decimals = v.parse::<usize>().map_err(|_| bad("bad FORMAT line"))?;
                 format.number = Some(crate::grid::NumberFormat::Currency { decimals });
@@ -1938,6 +1944,18 @@ mod tests {
         assert_eq!(s, "rational:1");
         let round = parse_format_text(&s).unwrap();
         assert_eq!(round.number, Some(crate::grid::NumberFormat::Rational));
+    }
+
+    #[test]
+    fn format_decimal_generic_serializes_and_parses() {
+        let f = crate::grid::CellFormat {
+            number: Some(crate::grid::NumberFormat::DecimalGeneric),
+            align: None,
+        };
+        let s = format_text(&f);
+        assert_eq!(s, "decimal:1");
+        let round = parse_format_text(&s).unwrap();
+        assert_eq!(round.number, Some(crate::grid::NumberFormat::DecimalGeneric));
     }
 
     #[test]

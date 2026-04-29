@@ -363,6 +363,8 @@ pub struct SortSpec {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum NumberFormat {
+    /// Generic decimal display (may switch to scientific notation for extreme magnitudes).
+    DecimalGeneric,
     Currency { decimals: usize },
     Fixed { decimals: usize },
     /// Prefer exact rationals when the cell value has one; approximate values use decimal display.

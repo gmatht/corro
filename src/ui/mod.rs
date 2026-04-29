@@ -6,7 +6,7 @@ use crate::balance::{self, BalanceDirection};
 use crate::export;
 use crate::formula::translate_formula_text_by_offset;
 use crate::formula::{
-    cell_effective_display, effective_numeric, format_number_cell_display, is_formula,
+    cell_effective_display, effective_numeric, format_number_cell_display, is_formula, Number,
 };
 use crate::grid::{
     CellAddr, CellFormat, FormatScope, GridBox as Grid, MainRange, MarginIndex, NumberFormat,
@@ -349,6 +349,7 @@ enum MenuAction {
     FormatApplySpecial,
     FormatApplyCell,
     FormatApplySelection,
+    FormatDecimalGeneric,
     FormatCurrency,
     FormatFixed0,
     FormatFixed1,
@@ -639,7 +640,12 @@ const WIDTH_MENU_ITEMS: [MenuItem; 2] = [
     },
 ];
 
-const FORMAT_NUMBER_MENU_ITEMS: [MenuItem; 6] = [
+const FORMAT_NUMBER_MENU_ITEMS: [MenuItem; 7] = [
+    MenuItem {
+        shortcut: 'D',
+        label: "Decimal (generic)",
+        target: MenuTarget::Action(MenuAction::FormatDecimalGeneric),
+    },
     MenuItem {
         shortcut: '$',
         label: "Currency ($)",
@@ -1287,6 +1293,18 @@ impl App {
                 buffer: self.start_input_mode(String::new()),
                 decimals_for: FormatDecimalsFor::Currency,
             },
+            MenuAction::FormatDecimalGeneric => {
+                self.apply_format_to_target(
+                    self.selected_format_target(),
+                    CellFormat {
+                        number: Some(NumberFormat::DecimalGeneric),
+                        align: None,
+                    },
+                );
+                self.clear_pending_format_target();
+                self.status = "Decimal generic format set".into();
+                Mode::Normal
+            }
             MenuAction::FormatFixed0 => {
                 self.apply_format_number(0, false);
                 Mode::Normal
@@ -3694,9 +3712,9 @@ impl App {
             .sorted_main_rows()
             .last()
             .map(|row| hr + *row);
-        let first_footer = hr + mr;
-        let rows = self.view_row_order();
-        let Some(pos) = rows.iter().position(|&r| r == self.cursor.row) else {
+        let mut first_footer = hr + mr;
+        let mut rows = self.view_row_order();
+        let Some(mut pos) = rows.iter().position(|&r| r == self.cursor.row) else {
             return false;
         };
         // #region agent log
@@ -3717,10 +3735,14 @@ impl App {
         );
         // #endregion
         let next_pos = if down {
-            if last_display_main == Some(self.cursor.row)
-                && trailing_blank_main_rows(&self.state) < NAV_BLANK_ROWS
-            {
+            if last_display_main == Some(self.cursor.row) {
                 self.state.grid.grow_main_row_at_bottom();
+                first_footer = HEADER_ROWS + self.state.grid.main_rows();
+                rows = self.view_row_order();
+                let Some(new_pos) = rows.iter().position(|&r| r == self.cursor.row) else {
+                    return false;
+                };
+                pos = new_pos;
                 // #region agent log
                 debug_log_ndjson(
                     "H1",
@@ -3790,12 +3812,15 @@ impl App {
             if !self.move_cursor_row_through_view(true) {
                 let hr = HEADER_ROWS;
                 let last_main = hr + self.state.grid.main_rows().saturating_sub(1);
-                if self.cursor.row == last_main
-                    && trailing_blank_main_rows(&self.state) < NAV_BLANK_ROWS
-                {
+                let first_footer_before = hr + self.state.grid.main_rows();
+                let was_in_main = self.cursor.row >= hr && self.cursor.row < first_footer_before;
+                if self.cursor.row == last_main {
                     self.state.grid.grow_main_row_at_bottom();
                 }
                 self.cursor.row = self.cursor.row.saturating_add(1);
+                if was_in_main && self.cursor.row >= first_footer_before {
+                    self.state.grid.grow_main_row_at_bottom();
+                }
                 self.cursor.clamp(&self.state.grid);
                 self.state
                     .grid
@@ -6483,6 +6508,7 @@ impl App {
         }
         if let Some(number) = format.number {
             let action = match number {
+                NumberFormat::DecimalGeneric => MenuAction::FormatDecimalGeneric,
                 NumberFormat::Currency { .. } => MenuAction::FormatCurrency,
                 NumberFormat::Rational => MenuAction::FormatRational,
                 NumberFormat::Fixed { decimals: 0 } => MenuAction::FormatFixed0,
@@ -7452,7 +7478,10 @@ impl App {
                 let fw = formatted.width();
                 let cell_fmt = grid.format_for_addr(&cell_addr);
                 let numeric_like = formatted.trim().parse::<f64>().is_ok()
-                    || matches!(cell_fmt.number, Some(NumberFormat::Rational));
+                    || matches!(
+                        cell_fmt.number,
+                        Some(NumberFormat::Rational | NumberFormat::DecimalGeneric)
+                    );
                 let allow_text_spill =
                     spill_row && !is_agg_cell && !numeric_like && align != Some(TextAlign::Right);
 
@@ -7469,6 +7498,25 @@ impl App {
                         if !spill_remain.is_empty() && is_agg_cell {
                             spill_remain.clear();
                         }
+                        let rational_hint = if matches!(
+                            cell_fmt.number,
+                            Some(NumberFormat::Rational | NumberFormat::DecimalGeneric)
+                        )
+                            && would_ellipsis_hide_decimal_point(&formatted, cw)
+                        {
+                            let mut visiting = Vec::new();
+                            let mut budget = 10_000usize;
+                            effective_numeric(grid, &cell_addr, &mut visiting, &mut budget)
+                                .map(|n| n.to_f64())
+                                .filter(|v| v.is_finite())
+                        } else {
+                            None
+                        };
+                        let exp_preferred = if would_ellipsis_hide_decimal_point(&formatted, cw) {
+                            exponential_numeric_display_with_hint(&formatted, cw, rational_hint)
+                        } else {
+                            None
+                        };
                         let inner: String = if allow_text_spill && fw > cw {
                             let extra = spill_blank_suffix_width(grid, r, &col_ixs, i);
                             if fw <= cw + extra {
@@ -7477,13 +7525,16 @@ impl App {
                                 shown
                             } else {
                                 spill_remain.clear();
-                                shrink_numeric_display(&formatted, cw)
+                                exp_preferred
+                                    .clone()
+                                    .or_else(|| shrink_numeric_display(&formatted, cw))
                                     .or_else(|| exponential_numeric_display(&formatted, cw))
                                     .unwrap_or_else(|| truncate_with_ellipsis(&formatted, cw))
                             }
                         } else if fw > cw {
                             spill_remain.clear();
-                            shrink_numeric_display(&formatted, cw)
+                            exp_preferred
+                                .or_else(|| shrink_numeric_display(&formatted, cw))
                                 .or_else(|| exponential_numeric_display(&formatted, cw))
                                 .unwrap_or_else(|| truncate_with_ellipsis(&formatted, cw))
                         } else {
@@ -14585,6 +14636,56 @@ mod tests {
     }
 
     #[test]
+    fn ellipsis_before_decimal_prefers_exponential() {
+        assert!(would_ellipsis_hide_decimal_point("1234567.89", 6));
+        assert!(!would_ellipsis_hide_decimal_point("12.3456", 6));
+        let sci = exponential_numeric_display_with_hint("123456789/2", 8, Some(61_728_394.5));
+        assert!(sci.as_deref().is_some_and(|s| s.contains('e')));
+    }
+
+    #[test]
+    fn fixed_format_uses_scientific_before_infinity_for_large_finite_values() {
+        let mut grid = crate::grid::GridBox::from(crate::grid::Grid::new(1, 1));
+        let addr = CellAddr::Main { row: 0, col: 0 };
+        grid.set_cell_format(
+            addr.clone(),
+            CellFormat {
+                number: Some(NumberFormat::Fixed { decimals: 2 }),
+                align: None,
+            },
+        );
+        let huge = format!("1{}", "0".repeat(1000));
+        let shown = format_cell_display(&grid, &addr, huge);
+        assert!(shown.contains('e'), "{shown}");
+        assert!(!shown.to_ascii_lowercase().contains("inf"), "{shown}");
+    }
+
+    #[test]
+    fn format_number_menu_includes_decimal_generic_option() {
+        assert!(FORMAT_NUMBER_MENU_ITEMS
+            .iter()
+            .any(|item| item.target == MenuTarget::Action(MenuAction::FormatDecimalGeneric)));
+    }
+
+    #[test]
+    fn decimal_generic_displays_tiny_powers_as_scientific_not_rational() {
+        let mut grid = crate::grid::GridBox::from(crate::grid::Grid::new(1, 1));
+        let addr = CellAddr::Main { row: 0, col: 0 };
+        grid.set(&addr, "=10^-999".into());
+        grid.set_cell_format(
+            addr.clone(),
+            CellFormat {
+                number: Some(NumberFormat::DecimalGeneric),
+                align: None,
+            },
+        );
+        let raw = cell_effective_display(&grid, &addr);
+        let shown = format_cell_display(&grid, &addr, raw);
+        assert!(shown.contains('e'), "{shown}");
+        assert!(!shown.contains('/'), "{shown}");
+    }
+
+    #[test]
     fn aligned_columns_keep_e_in_same_screen_column() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
@@ -16046,6 +16147,23 @@ pub(crate) fn format_cell_display(grid: &Grid, addr: &CellAddr, raw: String) -> 
         return raw;
     };
     match number {
+        NumberFormat::DecimalGeneric => {
+            let mut visiting = Vec::new();
+            let mut budget = 10_000usize;
+            if let Some(n) = effective_numeric(grid, addr, &mut visiting, &mut budget) {
+                if let Some(sci) = scientific_from_exact_ratio(&n) {
+                    return sci;
+                }
+                return format_significant_10_local(n.to_f64());
+            }
+            if let Some(n) = crate::formula::parse_number_literal(raw.trim()) {
+                if let Some(sci) = scientific_from_exact_ratio(&n) {
+                    return sci;
+                }
+                return format_significant_10_local(n.to_f64());
+            }
+            raw
+        }
         NumberFormat::Rational => {
             let mut visiting = Vec::new();
             let mut budget = 10_000usize;
@@ -16059,16 +16177,44 @@ pub(crate) fn format_cell_display(grid: &Grid, addr: &CellAddr, raw: String) -> 
             raw
         }
         NumberFormat::Currency { decimals } => {
-            let Some(value) = raw.trim().parse::<f64>().ok() else {
-                return raw;
-            };
-            format!("${value:.decimals$}")
+            let trimmed = raw.trim();
+            if let Ok(value) = trimmed.parse::<f64>() {
+                if value.is_finite() {
+                    return format!("${value:.decimals$}");
+                }
+                if value.is_infinite() {
+                    if crate::formula::parse_number_literal(trimmed).is_some() {
+                        if let Some(sci) = scientific_from_decimal_literal(trimmed, decimals.min(6)) {
+                            return format!("${sci}");
+                        }
+                    }
+                }
+            } else if crate::formula::parse_number_literal(trimmed).is_some() {
+                if let Some(sci) = scientific_from_decimal_literal(trimmed, decimals.min(6)) {
+                    return format!("${sci}");
+                }
+            }
+            raw
         }
         NumberFormat::Fixed { decimals } => {
-            let Some(value) = raw.trim().parse::<f64>().ok() else {
-                return raw;
-            };
-            format!("{value:.decimals$}")
+            let trimmed = raw.trim();
+            if let Ok(value) = trimmed.parse::<f64>() {
+                if value.is_finite() {
+                    return format!("{value:.decimals$}");
+                }
+                if value.is_infinite() {
+                    if crate::formula::parse_number_literal(trimmed).is_some() {
+                        if let Some(sci) = scientific_from_decimal_literal(trimmed, decimals.min(6)) {
+                            return sci;
+                        }
+                    }
+                }
+            } else if crate::formula::parse_number_literal(trimmed).is_some() {
+                if let Some(sci) = scientific_from_decimal_literal(trimmed, decimals.min(6)) {
+                    return sci;
+                }
+            }
+            raw
         }
     }
 }
@@ -16173,8 +16319,8 @@ fn shrink_numeric_display(text: &str, width: usize) -> Option<String> {
     }
 }
 
-fn exponential_numeric_display(text: &str, width: usize) -> Option<String> {
-    let value = text.trim().parse::<f64>().ok()?;
+fn exponential_numeric_display_with_hint(text: &str, width: usize, numeric_hint: Option<f64>) -> Option<String> {
+    let value = numeric_hint.or_else(|| text.trim().parse::<f64>().ok())?;
     if !value.is_finite() {
         return None;
     }
@@ -16192,6 +16338,140 @@ fn exponential_numeric_display(text: &str, width: usize) -> Option<String> {
         }
     }
     None
+}
+
+fn exponential_numeric_display(text: &str, width: usize) -> Option<String> {
+    exponential_numeric_display_with_hint(text, width, None)
+}
+
+fn would_ellipsis_hide_decimal_point(text: &str, width: usize) -> bool {
+    if width == 0 {
+        return false;
+    }
+    let trimmed = text.trim();
+    if trimmed.width() <= width {
+        return false;
+    }
+    let Some(dot_idx) = trimmed.find('.') else {
+        return false;
+    };
+    let int_part = &trimmed[..dot_idx];
+    int_part.width() >= width
+}
+
+fn scientific_from_decimal_literal(text: &str, decimals: usize) -> Option<String> {
+    let t = text.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let (sign, body) = if let Some(rest) = t.strip_prefix('-') {
+        ("-", rest)
+    } else {
+        ("", t)
+    };
+    let body = body.trim();
+    if body.is_empty() || !body.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        return None;
+    }
+    let mut parts = body.split('.');
+    let int_part = parts.next().unwrap_or("");
+    let frac_part = parts.next().unwrap_or("");
+    if parts.next().is_some() {
+        return None;
+    }
+    if int_part.is_empty() && frac_part.is_empty() {
+        return None;
+    }
+
+    let int_trim = int_part.trim_start_matches('0');
+    let (lead_digits, exponent) = if !int_trim.is_empty() {
+        (
+            format!("{int_trim}{frac_part}"),
+            (int_trim.chars().count() as i64) - 1,
+        )
+    } else {
+        let first_non_zero = frac_part.chars().position(|c| c != '0')?;
+        (
+            frac_part[first_non_zero..].to_string(),
+            -((first_non_zero as i64) + 1),
+        )
+    };
+
+    let mut chars = lead_digits.chars();
+    let first = chars.next()?;
+    let mut mantissa_tail: String = chars.collect();
+    while mantissa_tail.chars().count() < decimals {
+        mantissa_tail.push('0');
+    }
+    let mantissa_tail = mantissa_tail.chars().take(decimals).collect::<String>();
+    let mantissa = if decimals == 0 {
+        first.to_string()
+    } else {
+        format!("{first}.{mantissa_tail}")
+    };
+    Some(format!("{sign}{mantissa}e{exponent}"))
+}
+
+fn format_significant_10_local(n: f64) -> String {
+    if !n.is_finite() {
+        return n.to_string();
+    }
+    if n == 0.0 {
+        return "0".into();
+    }
+    let abs = n.abs();
+    if (1e-4..1e10).contains(&abs) {
+        let exp = abs.log10().floor() as i32;
+        let decimals = (9 - exp).max(0) as usize;
+        let s = format!("{n:.decimals$}");
+        if s.contains('.') {
+            s.trim_end_matches('0').trim_end_matches('.').to_string()
+        } else {
+            s
+        }
+    } else {
+        format!("{n:.9e}")
+    }
+}
+
+fn scientific_from_exact_ratio(n: &Number) -> Option<String> {
+    let Number::Exact(r) = n else {
+        return None;
+    };
+    if r.numer().to_string() == "0" {
+        return Some("0".to_string());
+    }
+    let numer_s = r.numer().to_string();
+    let denom_s = r.denom().to_string();
+    let sign = if numer_s.starts_with('-') { "-" } else { "" };
+    let n_abs = numer_s.trim_start_matches('-');
+    let d_abs = denom_s.as_str();
+    if n_abs.is_empty() || d_abs.is_empty() {
+        return None;
+    }
+    let n_take = n_abs.chars().take(15).collect::<String>().parse::<f64>().ok()?;
+    let d_take = d_abs.chars().take(15).collect::<String>().parse::<f64>().ok()?;
+    if d_take == 0.0 {
+        return None;
+    }
+    let mut exponent = (n_abs.len() as i64) - (d_abs.len() as i64);
+    let mut mantissa = n_take / d_take;
+    if mantissa == 0.0 {
+        return None;
+    }
+    while mantissa < 1.0 {
+        mantissa *= 10.0;
+        exponent -= 1;
+    }
+    while mantissa >= 10.0 {
+        mantissa /= 10.0;
+        exponent += 1;
+    }
+    let mant = format!("{mantissa:.9}")
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_string();
+    Some(format!("{sign}{mant}e{exponent}"))
 }
 
 fn sheet_row_label(logical_row: usize, main_rows: usize) -> String {

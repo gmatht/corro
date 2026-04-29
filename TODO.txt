@@ -5,3 +5,5 @@ Add support for asciinema casts in scripts/ movies in place of corro files.
 Implement absolute ($A$1) and relative (A1) fill references -- see: plans/absolute_fill_references_2c6bf3e2.plan.md
 
 (End of file)
+
+When selecting down from a data cell, we should remain in the data area, growing the data area instead of moving into the footer.
