@@ -3106,7 +3106,9 @@ mod tests {
             .name("circular_ref".into())
             // Give the test thread a larger stack to avoid platform-dependent
             // stack overflows when evaluation recurses deeply on some hosts.
-            .stack_size(32 * 1024 * 1024)
+            // Increase from 32 MB to 128 MB to be more robust on CI/platforms
+            // where the default/native thread stack may be smaller.
+            .stack_size(128 * 1024 * 1024)
             .spawn(|| {
                 let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(1, 2));
                 g.set(&CellAddr::Main { row: 0, col: 0 }, "=B1".into());
@@ -3131,7 +3133,9 @@ mod tests {
             .name("cross_sheet_circular_ref".into())
             // Give the test thread a larger stack to avoid platform-dependent
             // stack overflows when evaluation recurses across sheets on some hosts.
-            .stack_size(32 * 1024 * 1024)
+            // Increase from 32 MB to 128 MB to be more robust on CI/platforms
+            // where the default/native thread stack may be smaller.
+            .stack_size(128 * 1024 * 1024)
             .spawn(|| {
                 // A!A1 -> B!A1 -> A!A1 should be detected as CIRC using SHEET_VISITING.
                 let mut wb = crate::ops::WorkbookState::new();
