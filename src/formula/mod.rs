@@ -3104,7 +3104,9 @@ mod tests {
         // platform-dependent stack overflow in deeply recursive paths.
         std::thread::Builder::new()
             .name("circular_ref".into())
-            .stack_size(8 * 1024 * 1024)
+            // Give the test thread a larger stack to avoid platform-dependent
+            // stack overflows when evaluation recurses deeply on some hosts.
+            .stack_size(32 * 1024 * 1024)
             .spawn(|| {
                 let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(1, 2));
                 g.set(&CellAddr::Main { row: 0, col: 0 }, "=B1".into());
@@ -3127,7 +3129,9 @@ mod tests {
         // platform-dependent stack overflow in deeply recursive paths.
         std::thread::Builder::new()
             .name("cross_sheet_circular_ref".into())
-            .stack_size(8 * 1024 * 1024)
+            // Give the test thread a larger stack to avoid platform-dependent
+            // stack overflows when evaluation recurses across sheets on some hosts.
+            .stack_size(32 * 1024 * 1024)
             .spawn(|| {
                 // A!A1 -> B!A1 -> A!A1 should be detected as CIRC using SHEET_VISITING.
                 let mut wb = crate::ops::WorkbookState::new();

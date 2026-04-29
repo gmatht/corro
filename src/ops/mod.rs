@@ -250,6 +250,10 @@ pub enum Op {
     FillRange {
         cells: Vec<(CellAddr, String)>,
     },
+    RelFillRange {
+        range: MainRange,
+        value: String,
+    },
     CopyFromTo {
         source: MainRange,
         target: MainRange,
@@ -407,6 +411,18 @@ impl Op {
                 }
                 state.grid.bump_volatile_seed();
             }
+            Op::RelFillRange { range, value } => {
+                for r in range.row_start..range.row_end {
+                    for c in range.col_start..range.col_end {
+                        let row_delta = r as i32 - range.row_start as i32;
+                        let col_delta = c as i32 - range.col_start as i32;
+                        let v = rel_fill_value_for_cell(value, row_delta, col_delta);
+                        let addr = CellAddr::Main { row: r, col: c };
+                        state.grid.set(&addr, v);
+                    }
+                }
+                state.grid.bump_volatile_seed();
+            }
             Op::CopyFromTo { source, target } => {
                 let rows = source.row_end.saturating_sub(source.row_start);
                 let cols = source.col_end.saturating_sub(source.col_start);
@@ -485,7 +501,14 @@ fn encode_log_value(value: &str) -> String {
     let mut out = String::new();
     for b in value.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'_'
+            | b'.'
+            | b'~'
+            | b'=' => {
                 out.push(b as char)
             }
             _ => out.push_str(&format!("%{b:02X}")),
@@ -551,6 +574,18 @@ fn expand_tab_delimited_set_range(range: MainRange, value: &str) -> Option<Op> {
     Some(Op::FillRange { cells })
 }
 
+fn is_formula_text(value: &str) -> bool {
+    value.trim_start().starts_with('=')
+}
+
+fn rel_fill_value_for_cell(base: &str, row_delta: i32, col_delta: i32) -> String {
+    if !is_formula_text(base) {
+        return base.to_string();
+    }
+    crate::formula::translate_formula_text_by_offset(base, row_delta, col_delta)
+        .unwrap_or_else(|| base.to_string())
+}
+
 fn parse_op_text(line: &str) -> Option<Op> {
     let mut parts = line.split_whitespace();
     let cmd = parts.next()?.to_ascii_uppercase();
@@ -580,6 +615,18 @@ fn parse_op_text(line: &str) -> Option<Op> {
                 cells.push((addr, decode_log_value(value)?));
             }
             Some(Op::FillRange { cells })
+        }
+        "RFILL" => {
+            let payload = line.trim_start().get(5..)?.trim_start();
+            let (target, value) = parse_set_target_and_value(payload)?;
+            let (range, range_len) = parse_main_range_at(target)?;
+            if range_len != target.len() {
+                return None;
+            }
+            Some(Op::RelFillRange {
+                range,
+                value: value.to_string(),
+            })
         }
         "COPY_FROM_TO" => {
             let source_text = parts.next()?;
@@ -687,6 +734,9 @@ impl Op {
                     .collect::<Vec<_>>()
                     .join(" ")
             ),
+            Op::RelFillRange { range, value } => {
+                format!("RFILL {} {}", main_range_text(range), value)
+            }
             Op::CopyFromTo { source, target } => {
                 format!(
                     "COPY_FROM_TO {} {}",
@@ -1352,6 +1402,17 @@ impl SheetState {
                     })
                     .collect(),
             }),
+            Op::RelFillRange { range, .. } => {
+                let mut cells = Vec::new();
+                for r in range.row_start..range.row_end {
+                    for c in range.col_start..range.col_end {
+                        let addr = CellAddr::Main { row: r, col: c };
+                        let prev_value = self.grid.text(&addr);
+                        cells.push((addr, prev_value));
+                    }
+                }
+                Some(Op::FillRange { cells })
+            }
             Op::CopyFromTo { target, .. } => {
                 let mut cells = Vec::new();
                 for r in target.row_start..target.row_end {
@@ -1946,6 +2007,62 @@ mod tests {
         let line = op.to_log_line(0);
         assert_eq!(line, "FILL A1=1 B1=2");
         assert_eq!(parse_op_line(&line), Some(op));
+    }
+
+    #[test]
+    fn fill_formula_values_keep_leading_equals_unescaped() {
+        let op = Op::FillRange {
+            cells: vec![
+                (CellAddr::Main { row: 1, col: 5 }, "=A1".into()),
+                (CellAddr::Main { row: 2, col: 5 }, "=A2".into()),
+            ],
+        };
+        let line = op.to_log_line(0);
+        assert_eq!(line, "FILL F2==A1 F3==A2");
+        assert_eq!(parse_op_line(&line), Some(op));
+    }
+
+    #[test]
+    fn rfill_round_trips_through_log_line() {
+        let op = Op::RelFillRange {
+            range: MainRange {
+                row_start: 1,
+                row_end: 5,
+                col_start: 1,
+                col_end: 2,
+            },
+            value: "=A1".into(),
+        };
+        let line = op.to_log_line(0);
+        assert_eq!(line, "RFILL B2:B5 =A1");
+        assert_eq!(parse_op_line(&line), Some(op));
+    }
+
+    #[test]
+    fn rfill_translates_formula_by_destination_offset() {
+        let mut state = SheetState::new(8, 8);
+        let op = Op::RelFillRange {
+            range: MainRange {
+                row_start: 1,
+                row_end: 5,
+                col_start: 1,
+                col_end: 2,
+            },
+            value: "=A1".into(),
+        };
+        op.apply(&mut state);
+        assert_eq!(
+            state.grid.get(&CellAddr::Main { row: 1, col: 1 }).as_deref(),
+            Some("=A1")
+        );
+        assert_eq!(
+            state.grid.get(&CellAddr::Main { row: 2, col: 1 }).as_deref(),
+            Some("=A2")
+        );
+        assert_eq!(
+            state.grid.get(&CellAddr::Main { row: 4, col: 1 }).as_deref(),
+            Some("=A4")
+        );
     }
 
     #[test]

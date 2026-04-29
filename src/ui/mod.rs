@@ -27,7 +27,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::{
     Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::{self, stdout};
 use std::io::Write;
@@ -3924,6 +3924,64 @@ impl App {
             .unwrap_or_else(|| raw.to_string())
     }
 
+    fn main_rect_range(addrs: &[CellAddr]) -> Option<MainRange> {
+        if addrs.is_empty() {
+            return None;
+        }
+        let mut min_row = u32::MAX;
+        let mut max_row = 0u32;
+        let mut min_col = u32::MAX;
+        let mut max_col = 0u32;
+        let mut seen: HashSet<(u32, u32)> = HashSet::with_capacity(addrs.len());
+        for addr in addrs {
+            let CellAddr::Main { row, col } = addr else {
+                return None;
+            };
+            min_row = min_row.min(*row);
+            max_row = max_row.max(*row);
+            min_col = min_col.min(*col);
+            max_col = max_col.max(*col);
+            seen.insert((*row, *col));
+        }
+        let rows = max_row.saturating_sub(min_row) + 1;
+        let cols = max_col.saturating_sub(min_col) + 1;
+        if rows.saturating_mul(cols) as usize != addrs.len() || seen.len() != addrs.len() {
+            return None;
+        }
+        Some(MainRange {
+            row_start: min_row,
+            row_end: max_row + 1,
+            col_start: min_col,
+            col_end: max_col + 1,
+        })
+    }
+
+    fn relative_fill_op_for_main_range(
+        addrs: &[CellAddr],
+        anchor: &CellAddr,
+        raw_value: &str,
+    ) -> Option<Op> {
+        if !is_formula(raw_value) {
+            return None;
+        }
+        let range = Self::main_rect_range(addrs)?;
+        let CellAddr::Main {
+            row: anchor_row,
+            col: anchor_col,
+        } = anchor
+        else {
+            return None;
+        };
+        let base_row_delta = range.row_start as i32 - *anchor_row as i32;
+        let base_col_delta = range.col_start as i32 - *anchor_col as i32;
+        let base_value = translate_formula_text_by_offset(raw_value, base_row_delta, base_col_delta)
+            .unwrap_or_else(|| raw_value.to_string());
+        Some(Op::RelFillRange {
+            range,
+            value: base_value,
+        })
+    }
+
     fn commit_edit_buffer(&mut self, buffer: &str) -> Result<(), RunError> {
         self.edit_special_palette = false;
         self.pending_lost_edit = None;
@@ -3946,17 +4004,21 @@ impl App {
                     self.pending_fit_to_content_on_commit = false;
                     return Ok(());
                 }
-                let cells: Vec<(CellAddr, String)> = addrs
-                    .iter()
-                    .cloned()
-                    .map(|a| {
-                        (
-                            a.clone(),
-                            Self::formula_text_for_range_cell(anchor, &a, &value),
-                        )
-                    })
-                    .collect();
-                let op = Op::FillRange { cells };
+                let op = Self::relative_fill_op_for_main_range(addrs, anchor, &value).unwrap_or_else(
+                    || {
+                        let cells: Vec<(CellAddr, String)> = addrs
+                            .iter()
+                            .cloned()
+                            .map(|a| {
+                                (
+                                    a.clone(),
+                                    Self::formula_text_for_range_cell(anchor, &a, &value),
+                                )
+                            })
+                            .collect();
+                        Op::FillRange { cells }
+                    },
+                );
                 self.push_inverse_op(&op);
                 if let Some(ref p) = self.path.clone() {
                     let mut active_sheet = self.view_sheet_id;
@@ -11515,6 +11577,37 @@ mod tests {
             Some("one")
         );
         assert!(!app.hints_line().contains("Ctrl+Y"));
+    }
+
+    #[test]
+    fn multi_cell_formula_edit_logs_rfill_for_relative_pattern() {
+        let path = tempfile::NamedTempFile::new().unwrap();
+        let mut app = App::new(Some(path.path().to_path_buf()));
+        app.state.grid.set_main_size(4, 1);
+        app.edit_target_addr = Some(CellAddr::Main { row: 0, col: 0 });
+        app.edit_range_addrs = Some(vec![
+            CellAddr::Main { row: 0, col: 0 },
+            CellAddr::Main { row: 1, col: 0 },
+            CellAddr::Main { row: 2, col: 0 },
+            CellAddr::Main { row: 3, col: 0 },
+        ]);
+
+        app.commit_edit_buffer("=A1").unwrap();
+
+        let log = std::fs::read_to_string(path.path()).unwrap();
+        assert!(log.contains("RFILL A1:A4 =A1"), "{log}");
+        assert_eq!(
+            app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }).as_deref(),
+            Some("=A1")
+        );
+        assert_eq!(
+            app.state.grid.get(&CellAddr::Main { row: 1, col: 0 }).as_deref(),
+            Some("=A2")
+        );
+        assert_eq!(
+            app.state.grid.get(&CellAddr::Main { row: 3, col: 0 }).as_deref(),
+            Some("=A4")
+        );
     }
 
     #[test]
