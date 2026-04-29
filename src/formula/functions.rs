@@ -2125,12 +2125,16 @@ fn eval_sort(
     if matrix.is_empty() || key_col >= matrix[0].len() {
         return EvalResult::Error("REF");
     }
+    // Stable sort: apply ascending/descending in the comparator — do not sort then reverse(),
+    // which would reverse relative order among ties.
     matrix.sort_by(|a, b| {
-        compare_eval_cells(&a[key_col], &b[key_col]).then(std::cmp::Ordering::Equal)
+        let ord = compare_eval_cells(&a[key_col], &b[key_col]);
+        if sort_order < 0 {
+            ord.reverse()
+        } else {
+            ord
+        }
     });
-    if sort_order < 0 {
-        matrix.reverse();
-    }
     if by_col {
         transpose_matrix(&mut matrix);
     }
@@ -2260,7 +2264,11 @@ fn collect_matrix_values(
     allow_templates: bool,
 ) -> Result<Vec<Vec<EvalResult>>, &'static str> {
     match arg {
-        Ast::Range(r) => {
+        Ast::Range {
+            range: r,
+            locks_tl: _,
+            locks_br: _,
+        } => {
             let mut out = Vec::new();
             for row in r.row_start..r.row_end {
                 let mut out_row = Vec::new();
@@ -2275,7 +2283,7 @@ fn collect_matrix_values(
             }
             Ok(out)
         }
-        Ast::Ref(addr) => Ok(vec![vec![eval_cell_inner(
+        Ast::Ref { addr, .. } => Ok(vec![vec![eval_cell_inner(
             grid,
             addr,
             visiting,
@@ -2581,15 +2589,23 @@ fn eval_countblank(
         return EvalResult::Error("ARGS");
     }
     let count = match &args[0] {
-        Ast::Range(r) => count_blank_range(grid, r, visiting, budget, allow_templates),
-        Ast::Ref(addr) => usize::from(cell_is_blank_for_count(
+        Ast::Range {
+            range: r,
+            locks_tl: _,
+            locks_br: _,
+        } => count_blank_range(grid, r, visiting, budget, allow_templates),
+        Ast::Ref { addr, .. } => usize::from(cell_is_blank_for_count(
             grid,
             addr,
             visiting,
             budget,
             allow_templates,
         )),
-        Ast::SheetRef { sheet_id, addr } => {
+        Ast::SheetRef {
+            sheet_id,
+            addr,
+            locks: _,
+        } => {
             let Some(sheet_grid) = super::workbook_lookup(*sheet_id) else {
                 return EvalResult::Error("SHEET");
             };
@@ -2739,8 +2755,12 @@ fn matches_blank_ref(
     allow_templates: bool,
 ) -> bool {
     match ast {
-        Ast::Ref(addr) => cell_is_blank_raw(grid, addr),
-        Ast::SheetRef { sheet_id, addr } => {
+        Ast::Ref { addr, .. } => cell_is_blank_raw(grid, addr),
+        Ast::SheetRef {
+            sheet_id,
+            addr,
+            locks: _,
+        } => {
             let Some(sheet_grid) = super::workbook_lookup(*sheet_id) else {
                 return false;
             };
@@ -2906,7 +2926,11 @@ fn collect_numeric_values(
     allow_templates: bool,
 ) -> Result<Vec<Number>, &'static str> {
     match arg {
-        Ast::Range(r) => {
+        Ast::Range {
+            range: r,
+            locks_tl: _,
+            locks_br: _,
+        } => {
             let mut out = Vec::new();
             for row in r.row_start..r.row_end {
                 for col in r.col_start..r.col_end {
@@ -2918,7 +2942,7 @@ fn collect_numeric_values(
             }
             Ok(out)
         }
-        Ast::Ref(addr) => Ok(super::effective_numeric(grid, addr, visiting, budget)
+        Ast::Ref { addr, .. } => Ok(super::effective_numeric(grid, addr, visiting, budget)
             .into_iter()
             .collect()),
         _ => match eval_ast(arg, grid, visiting, bindings, budget, allow_templates).scalar_coerce()
@@ -2946,7 +2970,7 @@ fn numeric_value(result: EvalResult) -> Option<f64> {
 
 fn as_main_range(ast: &Ast) -> Option<MainRange> {
     match ast {
-        Ast::Range(r) => Some(r.clone()),
+        Ast::Range { range, .. } => Some(range.clone()),
         _ => None,
     }
 }
@@ -2960,7 +2984,11 @@ fn count_numeric_values(
     allow_templates: bool,
 ) -> Result<usize, &'static str> {
     match arg {
-        Ast::Range(r) => {
+        Ast::Range {
+            range: r,
+            locks_tl: _,
+            locks_br: _,
+        } => {
             let mut n = 0usize;
             for row in r.row_start..r.row_end {
                 for col in r.col_start..r.col_end {
@@ -2972,7 +3000,7 @@ fn count_numeric_values(
             }
             Ok(n)
         }
-        Ast::Ref(addr) => Ok(
+        Ast::Ref { addr, .. } => Ok(
             if super::effective_numeric(grid, addr, visiting, budget).is_some() {
                 1
             } else {
@@ -2998,7 +3026,11 @@ fn count_nonempty_values(
     allow_templates: bool,
 ) -> Result<usize, &'static str> {
     match arg {
-        Ast::Range(r) => {
+        Ast::Range {
+            range: r,
+            locks_tl: _,
+            locks_br: _,
+        } => {
             let mut n = 0usize;
             for row in r.row_start..r.row_end {
                 for col in r.col_start..r.col_end {
@@ -3010,7 +3042,7 @@ fn count_nonempty_values(
             }
             Ok(n)
         }
-        Ast::Ref(addr) => Ok(grid.get(addr).map(|s| !s.is_empty()).unwrap_or(false) as usize),
+        Ast::Ref { addr, .. } => Ok(grid.get(addr).map(|s| !s.is_empty()).unwrap_or(false) as usize),
         _ => match eval_ast(arg, grid, visiting, bindings, budget, allow_templates).scalar_coerce()
         {
             EvalResult::Number(_) => Ok(1),
@@ -3710,7 +3742,11 @@ fn collect_array_values(
     allow_templates: bool,
 ) -> Result<Vec<EvalResult>, &'static str> {
     match arg {
-        Ast::Range(r) => {
+        Ast::Range {
+            range: r,
+            locks_tl: _,
+            locks_br: _,
+        } => {
             let mut out = Vec::new();
             for row in r.row_start..r.row_end {
                 for col in r.col_start..r.col_end {
@@ -3726,7 +3762,7 @@ fn collect_array_values(
             }
             Ok(out)
         }
-        Ast::Ref(addr) => Ok(vec![eval_cell_inner(
+        Ast::Ref { addr, .. } => Ok(vec![eval_cell_inner(
             grid,
             addr,
             visiting,

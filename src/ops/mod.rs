@@ -18,17 +18,41 @@ pub enum AggFunc {
     Count,
 }
 
-/// Sum-of-block aggregate from a margin key cell. Only `=TOTAL` (ASCII case-insensitive) is the
-/// total directive; plain `TOTAL` is not special. `SUM` (bare) and other keyword forms are unchanged.
+/// Margin aggregate directives for the key column / header-band cells.
+///
+/// Preferred form is `==KEYWORD` (ASCII case-insensitive) so it stays distinct from spreadsheet
+/// formulas like `=MIN(A1)`. Legacy `=TOTAL` (single leading `=`) still maps to sum. Bare `SUM`,
+/// `MIN`, … (no equals) behave as today; bare `TOTAL` is not treated as aggregate.
 pub fn margin_key_agg_func(val: &str) -> Option<AggFunc> {
     let t = val.trim();
+
+    fn keyword_to_agg(rest: &str) -> Option<AggFunc> {
+        match rest.trim().to_ascii_uppercase().as_str() {
+            "SUM" | "TOTAL" => Some(AggFunc::Sum),
+            "MEAN" | "AVERAGE" | "AVG" => Some(AggFunc::Mean),
+            "MEDIAN" => Some(AggFunc::Median),
+            "MIN" | "MINIMUM" => Some(AggFunc::Min),
+            "MAX" | "MAXIMUM" => Some(AggFunc::Max),
+            "COUNT" => Some(AggFunc::Count),
+            _ => None,
+        }
+    }
+
+    if let Some(rest) = t.strip_prefix("==") {
+        return keyword_to_agg(rest);
+    }
+    // Legacy totals row
     if t
         .strip_prefix('=')
-        .is_some_and(|r| r.eq_ignore_ascii_case("TOTAL"))
+        .is_some_and(|r| !r.starts_with('=') && r.eq_ignore_ascii_case("TOTAL"))
     {
         return Some(AggFunc::Sum);
     }
-    match t.to_uppercase().as_str() {
+    // Bare keywords — but not prefixed with `=` (so `=MIN`/`=TOTAL`/`=TOTAL` spreadsheets stay formulas)
+    if t.starts_with('=') {
+        return None;
+    }
+    match t.to_ascii_uppercase().as_str() {
         "SUM" => Some(AggFunc::Sum),
         "MEAN" | "AVERAGE" | "AVG" => Some(AggFunc::Mean),
         "MEDIAN" => Some(AggFunc::Median),
@@ -756,6 +780,9 @@ fn format_text(format: &CellFormat) -> String {
             crate::grid::NumberFormat::Fixed { decimals } => {
                 parts.push(format!("fixed:{decimals}"));
             }
+            crate::grid::NumberFormat::Rational => {
+                parts.push("rational:1".into());
+            }
         }
     }
     if let Some(align) = format.align {
@@ -889,8 +916,8 @@ fn parse_log_addr(
     main_cols: usize,
     legacy_footer_right: bool,
 ) -> Option<(CellAddr, usize)> {
-    if let Some(parsed) = parse_cell_ref_at(addr, main_cols) {
-        return Some(parsed);
+    if let Some((cell, _locks, len)) = parse_cell_ref_at(addr, main_cols) {
+        return Some((cell, len));
     }
     if !legacy_footer_right {
         return None;
@@ -1607,6 +1634,9 @@ fn parse_format_text(text: &str) -> Result<CellFormat, std::io::Error> {
                 let decimals = v.parse::<usize>().map_err(|_| bad("bad FORMAT line"))?;
                 format.number = Some(crate::grid::NumberFormat::Fixed { decimals });
             }
+            "rational" => {
+                format.number = Some(crate::grid::NumberFormat::Rational);
+            }
             "align" => {
                 format.align = Some(match v {
                     "left" => crate::grid::TextAlign::Left,
@@ -1684,11 +1714,26 @@ mod tests {
     }
 
     #[test]
+    fn format_rational_serializes_and_parses() {
+        let f = crate::grid::CellFormat {
+            number: Some(crate::grid::NumberFormat::Rational),
+            align: None,
+        };
+        let s = format_text(&f);
+        assert_eq!(s, "rational:1");
+        let round = parse_format_text(&s).unwrap();
+        assert_eq!(round.number, Some(crate::grid::NumberFormat::Rational));
+    }
+
+    #[test]
     fn margin_key_agg_func_accepts_eq_total_not_bare() {
         use super::margin_key_agg_func;
         use super::AggFunc;
         assert_eq!(margin_key_agg_func("=TOTAL"), Some(AggFunc::Sum));
         assert_eq!(margin_key_agg_func("=total"), Some(AggFunc::Sum));
+        assert_eq!(margin_key_agg_func("==TOTAL"), Some(AggFunc::Sum));
+        assert_eq!(margin_key_agg_func("==min"), Some(AggFunc::Min));
+        assert_eq!(margin_key_agg_func("=MIN"), None);
         assert_eq!(margin_key_agg_func("TOTAL"), None);
         assert_eq!(margin_key_agg_func("SUM"), Some(AggFunc::Sum));
     }

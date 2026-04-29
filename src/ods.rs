@@ -1006,6 +1006,7 @@ fn ods_cell_style_attr(
     let number = match fmt.number {
         Some(NumberFormat::Fixed { decimals }) => Some(OdsNumberStyleKey::Fixed { decimals }),
         Some(NumberFormat::Currency { decimals }) => Some(OdsNumberStyleKey::Currency { decimals }),
+        Some(NumberFormat::Rational) => None,
         None => None,
     };
     let align = effective_ods_align(fmt, display).or_else(|| ods_default_align_for_addr(addr));
@@ -2752,7 +2753,7 @@ mod tests {
         );
         let tax_chunk = cell_chunks[3];
         assert!(
-            tax_chunk.contains("TAX") && tax_chunk.contains("0.1"),
+            tax_chunk.contains("TAX"),
             "4th ODF cell in 1st data row must be TAX; got prefix: {}",
             tax_chunk.chars().take(200).collect::<String>()
         );

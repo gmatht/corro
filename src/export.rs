@@ -705,12 +705,10 @@ pub fn generic_interop_cell_text(
         }
     }
 
-    if let Some(tf) = formula::export_templated_formula(grid, &addr) {
-        let s0 = crate::ods::ods_labeled_prefix_strip_to_formula(&tf).unwrap_or(tf);
-        let s1 = finish_generic_interop(s0, rebase);
-        return Some(after_rebase(&s1, excel_list_arg_comma));
-    }
-
+    // Margin / footer aggregate interop (`=SUM(…)`, etc.) must win over
+    // [`formula::export_templated_formula`], which also reads the left-margin row key. A row
+    // labeled `=TOTAL` would otherwise synthesize `=TOTAL` for every main cell from the row
+    // template before we can emit `=SUM(…)` for the amount columns.
     if let Some(agg) = left_margin_row_aggregate_formula(grid, logical_row, global_col) {
         let s1 = finish_generic_interop(agg, rebase);
         return Some(after_rebase(&s1, excel_list_arg_comma));
@@ -723,6 +721,12 @@ pub fn generic_interop_cell_text(
 
     if let Some(agg) = footer_column_aggregate_formula(grid, logical_row, global_col) {
         let s1 = finish_generic_interop(agg, rebase);
+        return Some(after_rebase(&s1, excel_list_arg_comma));
+    }
+
+    if let Some(tf) = formula::export_templated_formula(grid, &addr) {
+        let s0 = crate::ods::ods_labeled_prefix_strip_to_formula(&tf).unwrap_or(tf);
+        let s1 = finish_generic_interop(s0, rebase);
         return Some(after_rebase(&s1, excel_list_arg_comma));
     }
 
@@ -862,12 +866,19 @@ fn left_margin_row_aggregate_formula(
     if logical_row < HEADER_ROWS || logical_row >= HEADER_ROWS + grid.main_rows() {
         return None;
     }
-    if global_col < MARGIN_COLS || global_col >= MARGIN_COLS + main_cols {
+    // Same rule as [`main_formula_or_value`] for [`CellAddr::Left`]: the rightmost left-margin column
+    // (global `MARGIN_COLS - 1`) holds the row key / `=TOTAL` margin key. Generic export must emit
+    // `=SUBTOTAL` / `=SUM(…)` there, not the raw `=TOTAL` string (see `generic_tsv_target_footer_total_recomputes_after_parallel_data_edit`).
+    let main_col_idx = if global_col == MARGIN_COLS - 1 {
+        0usize
+    } else if global_col >= MARGIN_COLS && global_col < MARGIN_COLS + main_cols {
+        global_col - MARGIN_COLS
+    } else {
         return None;
-    }
+    };
     let main_row = logical_row - HEADER_ROWS;
     let func = main_row_aggregate_formula_name(grid, main_row)?;
-    let col = crate::addr::excel_column_name(global_col - MARGIN_COLS);
+    let col = crate::addr::excel_column_name(main_col_idx);
     let body = aggregate_formula_over_runs(func, &col, &raw_main_row_runs_before_aggregate(grid, main_row))?;
     Some(format!("={body}"))
 }
@@ -1543,14 +1554,26 @@ mod tests {
         fields
     }
 
-    fn export_delimited_text(grid: &Grid, csv: bool) -> String {
-        let mut out = Vec::new();
-        if csv {
-            export_csv(grid, &mut out);
-        } else {
-            export_tsv(grid, &mut out);
+    /// Same field rules as [`export_delimited`], for comparing CSV vs TSV without evaluating
+    /// volatile formulas twice (two full exports can shift `NOW()` between passes).
+    fn matrix_render_same_as_export(rows: &[Vec<String>], delim: char) -> String {
+        let mut out = String::new();
+        for row in rows {
+            let mut first = true;
+            for val in row {
+                if !first {
+                    out.push(delim);
+                }
+                first = false;
+                if delim == ',' && needs_csv_quoting(val, delim) {
+                    out.push_str(&csv_quote(val));
+                } else {
+                    out.push_str(val);
+                }
+            }
+            out.push('\n');
         }
-        String::from_utf8(out).unwrap()
+        out
     }
 
     #[test]
@@ -1878,8 +1901,9 @@ mod tests {
         for fixture in fixtures {
             let workbook = load_fixture(&fixture);
             let grid = &workbook.active_sheet().grid;
-            let csv = export_delimited_text(grid, true);
-            let tsv = export_delimited_text(grid, false);
+            let (matrix, ..) = delimited_export_matrix(grid, &DelimitedExportOptions::default());
+            let csv = matrix_render_same_as_export(&matrix, ',');
+            let tsv = matrix_render_same_as_export(&matrix, '\t');
             let csv_rows = parse_delimited(&csv, ',');
             let tsv_rows = parse_delimited(&tsv, '\t');
             assert_eq!(

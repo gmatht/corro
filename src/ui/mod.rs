@@ -5,7 +5,9 @@ use crate::agg::{cell_display, compute_aggregate};
 use crate::balance::{self, BalanceDirection};
 use crate::export;
 use crate::formula::translate_formula_text_by_offset;
-use crate::formula::{cell_effective_display, is_formula};
+use crate::formula::{
+    cell_effective_display, effective_numeric, format_number_cell_display, is_formula,
+};
 use crate::grid::{
     CellAddr, CellFormat, FormatScope, GridBox as Grid, MainRange, MarginIndex, NumberFormat,
     SortSpec, TextAlign, FOOTER_ROWS, HEADER_ROWS, MARGIN_COLS,
@@ -32,7 +34,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 use unicode_truncate::{Alignment as UTruncAlign, UnicodeTruncateStr};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Width of the row-label gutter (`]A~1`, `A1`, `A_1`).
 const ROW_LABEL_CHARS: usize = 5;
@@ -352,6 +354,7 @@ enum MenuAction {
     FormatFixed1,
     FormatFixed2,
     FormatFixedCustom,
+    FormatRational,
     FormatAlignLeft,
     FormatAlignCenter,
     FormatAlignRight,
@@ -636,11 +639,16 @@ const WIDTH_MENU_ITEMS: [MenuItem; 2] = [
     },
 ];
 
-const FORMAT_NUMBER_MENU_ITEMS: [MenuItem; 5] = [
+const FORMAT_NUMBER_MENU_ITEMS: [MenuItem; 6] = [
     MenuItem {
         shortcut: '$',
         label: "Currency ($)",
         target: MenuTarget::Action(MenuAction::FormatCurrency),
+    },
+    MenuItem {
+        shortcut: 'R',
+        label: "Rational",
+        target: MenuTarget::Action(MenuAction::FormatRational),
     },
     MenuItem {
         shortcut: '0',
@@ -1295,6 +1303,10 @@ impl App {
                 buffer: self.start_input_mode(String::new()),
                 decimals_for: FormatDecimalsFor::Fixed,
             },
+            MenuAction::FormatRational => {
+                self.apply_format_rational();
+                Mode::Normal
+            },
             MenuAction::FormatAlignLeft => {
                 self.apply_format_align(TextAlign::Left);
                 Mode::Normal
@@ -1393,6 +1405,7 @@ impl App {
             "Corro Help\n\n\
 Basics\n\
 - Arrow keys or hjkl move the cursor; PageUp/PageDown move by one screen of rows.\n\
+- Home and End jump to the leftmost and rightmost non-blank cells in the current row.\n\
 - Enter or e starts editing the current cell.\n\
 - Header/footer/margin cells use the active address syntax.\n\
 - Any printable key starts editing with that character.\n\
@@ -2014,7 +2027,7 @@ fn parse_cell_shorthand(buf: &str, main_cols: usize) -> Option<(CellAddr, String
         if addr_part.is_empty() {
             return None;
         }
-        let (addr, n) = parse_cell_ref_at(addr_part, main_cols)?;
+        let (addr, _locks, n) = parse_cell_ref_at(addr_part, main_cols)?;
         if n != addr_part.len() {
             return None;
         }
@@ -2028,7 +2041,7 @@ fn parse_cell_shorthand(buf: &str, main_cols: usize) -> Option<(CellAddr, String
     if addr_part.is_empty() {
         return None;
     }
-    let (addr, n) = parse_cell_ref_at(addr_part, main_cols)?;
+    let (addr, _locks, n) = parse_cell_ref_at(addr_part, main_cols)?;
     if n != addr_part.len() {
         return None;
     }
@@ -2668,6 +2681,18 @@ impl App {
         };
     }
 
+    fn apply_format_rational(&mut self) {
+        self.apply_format_to_target(
+            self.selected_format_target(),
+            CellFormat {
+                number: Some(NumberFormat::Rational),
+                align: None,
+            },
+        );
+        self.clear_pending_format_target();
+        self.status = "Rational number format set".into();
+    }
+
     fn apply_format_align(&mut self, align: TextAlign) {
         self.apply_format_to_target(
             self.selected_format_target(),
@@ -3149,6 +3174,50 @@ impl App {
         }
     }
 
+    /// Leftmost and rightmost sheet columns on `sheet_row` that have non-empty cell content.
+    fn row_nonblank_horizontal_extremes(&self, sheet_row: usize) -> Option<(usize, usize)> {
+        let total_rows = self.state.grid.total_logical_rows();
+        let total_cols = self.state.grid.total_cols();
+        if total_rows == 0 || total_cols == 0 {
+            return None;
+        }
+        let row = sheet_row.min(total_rows - 1);
+        let mut first: Option<usize> = None;
+        let mut last: Option<usize> = None;
+        for c in 0..total_cols {
+            if self.selection_cell_is_nonblank(row, c) {
+                if first.is_none() {
+                    first = Some(c);
+                }
+                last = Some(c);
+            }
+        }
+        match (first, last) {
+            (Some(a), Some(b)) => Some((a, b)),
+            _ => None,
+        }
+    }
+
+    /// Move [`cursor`] to the leftmost (`home`) or rightmost (`!home`) non-blank column on the
+    /// current row. Clears range selection anchor. No-op when the row has no non-blank cells.
+    fn jump_cursor_row_horizontal_nonblank(&mut self, home: bool) {
+        let Some((leftmost, rightmost)) = self.row_nonblank_horizontal_extremes(self.cursor.row)
+        else {
+            return;
+        };
+        let target = if home { leftmost } else { rightmost };
+        self.anchor = None;
+        self.selection_kind = SelectionKind::Cells;
+        if self.cursor.col == target {
+            return;
+        }
+        self.cursor.col = target;
+        self.cursor.clamp(&self.state.grid);
+        self.state
+            .grid
+            .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
+    }
+
     fn extend_selection_to_edge(&mut self, direction: SelectionEdgeDirection) -> bool {
         let Some(cursor) = self.selection_edge_cursor(direction) else {
             return false;
@@ -3402,8 +3471,17 @@ impl App {
         let preview_grid = if let Mode::Edit { buffer, .. } = &self.mode {
             let mut grid = self.state.grid.clone();
             if let Some(ref addrs) = self.edit_range_addrs {
+                let anchor = self
+                    .edit_target_addr
+                    .as_ref()
+                    .filter(|e| addrs.iter().any(|a| a == *e))
+                    .or_else(|| addrs.first())
+                    .expect("multi-edit addresses");
                 for a in addrs {
-                    grid.set(a, buffer.clone());
+                    grid.set(
+                        a,
+                        Self::formula_text_for_range_cell(anchor, a, buffer),
+                    );
                 }
             } else {
                 let addr = self.cursor.to_addr(&self.state.grid);
@@ -3824,6 +3902,28 @@ impl App {
         })
     }
 
+    /// Apply the same edit buffer to `dest` relative to the active cell `anchor`. For `=…`
+    /// formulas this shifts non-`$`-locked refs like Excel (anchor cell keeps the text as typed).
+    fn formula_text_for_range_cell(anchor: &CellAddr, dest: &CellAddr, raw: &str) -> String {
+        if !is_formula(raw) {
+            return raw.to_string();
+        }
+        let (
+            CellAddr::Main {
+                row: ar,
+                col: ac,
+            },
+            CellAddr::Main { row, col },
+        ) = (anchor, dest)
+        else {
+            return raw.to_string();
+        };
+        let row_delta = *row as i32 - *ar as i32;
+        let col_delta = *col as i32 - *ac as i32;
+        translate_formula_text_by_offset(raw, row_delta, col_delta)
+            .unwrap_or_else(|| raw.to_string())
+    }
+
     fn commit_edit_buffer(&mut self, buffer: &str) -> Result<(), RunError> {
         self.edit_special_palette = false;
         self.pending_lost_edit = None;
@@ -3833,8 +3933,15 @@ impl App {
         if let Some(ref addrs) = range {
             if addrs.len() > 1 && explicit_addr.is_none() {
                 let value = buffer.to_string();
+                let anchor = self
+                    .edit_target_addr
+                    .as_ref()
+                    .filter(|e| addrs.iter().any(|a| a == *e))
+                    .or_else(|| addrs.first())
+                    .expect("multiple edit targets");
                 if addrs.iter().all(|a| {
-                    self.state.grid.get(a).as_deref().unwrap_or("") == value.as_str()
+                    let expected = Self::formula_text_for_range_cell(anchor, a, &value);
+                    self.state.grid.get(a).as_deref().unwrap_or("") == expected.as_str()
                 }) {
                     self.pending_fit_to_content_on_commit = false;
                     return Ok(());
@@ -3842,7 +3949,12 @@ impl App {
                 let cells: Vec<(CellAddr, String)> = addrs
                     .iter()
                     .cloned()
-                    .map(|a| (a, value.clone()))
+                    .map(|a| {
+                        (
+                            a.clone(),
+                            Self::formula_text_for_range_cell(anchor, &a, &value),
+                        )
+                    })
                     .collect();
                 let op = Op::FillRange { cells };
                 self.push_inverse_op(&op);
@@ -3912,6 +4024,7 @@ impl App {
             }
             return Ok(());
         }
+        let committed_for_hint = value.clone();
         let op = Op::SetCell {
             addr: addr.clone(),
             value,
@@ -3934,7 +4047,6 @@ impl App {
             self.start_log_watcher_if_needed()?;
         } else {
             op.apply(&mut self.state);
-            self.status = "No file — edit in memory only".into();
         }
         if let Some((explicit_addr, _)) = explicit_addr {
             self.cursor = self
@@ -3947,7 +4059,67 @@ impl App {
             self.commit_active_sheet_cache();
             self.pending_fit_to_content_on_commit = false;
         }
+        let hinted = self.suggest_margin_aggregate_hint(&addr, committed_for_hint.as_str());
+        if self.path.is_none() && !hinted {
+            self.status = "No file — edit in memory only".into();
+        }
         Ok(())
+    }
+
+    /// Hint when the footer/left row key column suggests an aggregate directive but typing `TOTAL`,
+    /// `=TOTAL`, `=MIN`, … is ambiguous versus spreadsheet formulas (`=MIN(...)`, …).
+    /// Returns `true` if status was set to a hint string.
+    fn suggest_margin_aggregate_hint(&mut self, addr: &CellAddr, committed: &str) -> bool {
+        let key_col = MARGIN_COLS - 1;
+        let matches_key = match addr {
+            CellAddr::Left { col, .. } => *col == key_col,
+            CellAddr::Footer { col, .. } => *col as usize == key_col,
+            _ => false,
+        };
+        if !matches_key {
+            return false;
+        }
+        let t = committed.trim();
+        if t.is_empty() || t.starts_with("==") {
+            return false;
+        }
+
+        fn hint_for_plain_single_equals(rest: &str) -> &'static str {
+            match rest.to_ascii_uppercase().as_str() {
+                "TOTAL" => "Single `=` on totals rows is ambiguous; prefer `==TOTAL`.",
+                "MIN" => "Use `==MIN` in the row-key column so it is not confused with `=MIN(...)`.",
+                "MAX" => "Use `==MAX` in the row-key column so it is not confused with `=MAX(...)`.",
+                "SUM" => "Use `==SUM` in the row-key column so it is not confused with `=SUM(...)`.",
+                "MEAN" | "AVERAGE" | "AVG" => {
+                    "Use `==MEAN` in the row-key column so it is not confused with worksheet functions."
+                }
+                "COUNT" => "Use `==COUNT` in the row-key column so it is not confused with `=COUNT(...)`.",
+                "MEDIAN" => "Use `==MEDIAN` in the row-key column so it is not confused with worksheet functions.",
+                _ => return "",
+            }
+        }
+
+        if !t.starts_with('=') && t.eq_ignore_ascii_case("TOTAL") {
+            self.status = "Bare `TOTAL` is not an aggregate tag; use `==TOTAL` in the row-key column."
+                .into();
+            return true;
+        }
+
+        let Some(rest) = t.strip_prefix('=') else {
+            return false;
+        };
+        if rest.starts_with('=') {
+            return false;
+        }
+        if rest.contains('(') || rest.contains(',') {
+            return false;
+        }
+        let msg = hint_for_plain_single_equals(rest.trim());
+        if !msg.is_empty() {
+            self.status = msg.into();
+            return true;
+        }
+        false
     }
 
     fn sheet_cursor_for_addr(&self, addr: &CellAddr) -> Option<SheetCursor> {
@@ -4075,7 +4247,7 @@ impl App {
                 (sheet_id, None)
             } else if let Some(after) = text.get(plen..).and_then(|r| r.strip_prefix(':')) {
                 let main_cols = self.main_cols_for_sheet_id(sheet_id);
-                let Some((addr, len)) = parse_cell_ref_at(after, main_cols) else {
+                let Some((addr, _locks, len)) = parse_cell_ref_at(after, main_cols) else {
                     self.status = "Bad cell address".into();
                     return false;
                 };
@@ -4106,7 +4278,7 @@ impl App {
                 (sheet_id, None)
             } else if let Some(after) = text.get(j..).and_then(|r| r.strip_prefix(':')) {
                 let main_cols = self.main_cols_for_sheet_id(sheet_id);
-                let Some((addr, len)) = parse_cell_ref_at(after, main_cols) else {
+                let Some((addr, _locks, len)) = parse_cell_ref_at(after, main_cols) else {
                     self.status = "Bad cell address".into();
                     return false;
                 };
@@ -4272,6 +4444,42 @@ impl App {
         Some(self.start_edit_mode(buffer, None, false, false, None))
     }
 
+    /// After edit-mode navigation, keep [`edit_target_addr`] aligned with [`SheetCursor`] so the
+    /// formula bar address and [`commit_edit_buffer`] target match the highlighted cell.
+    ///
+    /// Preserves the intentional split where the cursor sits on the `_` footer row while
+    /// [`edit_target_addr`] remains a main cell (see [`Self::commit_edit_and_move_down`]).
+    fn maybe_sync_edit_target_with_highlighted_cell(&mut self) {
+        let Mode::Edit {
+            formula_cursor, ..
+        } = &self.mode
+        else {
+            return;
+        };
+        if formula_cursor.is_some() {
+            return;
+        }
+        if self
+            .edit_range_addrs
+            .as_ref()
+            .is_some_and(|addrs| !addrs.is_empty())
+        {
+            return;
+        }
+        let hr = HEADER_ROWS;
+        let mr = self.state.grid.main_rows();
+        let first_footer_sheet_row = hr + mr;
+        let cursor_on_footer_band = self.cursor.row >= first_footer_sheet_row;
+        let preserve_main_edit_from_footer_band = matches!(
+            self.edit_target_addr.as_ref(),
+            Some(CellAddr::Main { .. })
+        ) && cursor_on_footer_band;
+        if preserve_main_edit_from_footer_band {
+            return;
+        }
+        self.edit_target_addr = Some(self.cursor.to_addr(&self.state.grid));
+    }
+
     fn cell_ref_is_in_supported_bounds(cref: &crate::celladdr::CellRef) -> bool {
         match cref.row {
             crate::celladdr::RowRegion::Header(row) => row > 0 && (row as usize) <= HEADER_ROWS,
@@ -4282,18 +4490,32 @@ impl App {
 
     fn commit_edit_and_move_down(&mut self, buffer: &str) -> Result<Mode, RunError> {
         self.edit_cursor = None;
+        // Keep `edit_target_addr` and physical cursor consistent before commit.
+        // - Footer-band cursor with a main `edit_target`: snap cursor to the edited main cell
+        //   (fixes highlight at `_` while insert targets main).
+        // - Otherwise, if the user moved the cursor in-edit (e.g. EdgeLeft into an empty
+        //   column), `edit_target_addr` can still point at the previous cell; follow the cursor.
+        let hr = HEADER_ROWS;
+        let mr = self.state.grid.main_rows();
+        let first_footer = hr + mr;
+        let cur_addr = self.cursor.to_addr(&self.state.grid);
         if let Some(edit_addr) = self.edit_target_addr.clone() {
-            if let CellAddr::Main { row, col } = edit_addr {
-                let target_row = HEADER_ROWS + row as usize;
-                let target_col = MARGIN_COLS + col as usize;
-                self.state
-                    .grid
-                    .ensure_extent_for_cursor(target_row, target_col);
-                self.cursor = SheetCursor {
-                    row: target_row,
-                    col: target_col,
-                };
-                self.cursor.clamp(&self.state.grid);
+            let cursor_on_footer_band = self.cursor.row >= first_footer;
+            if cursor_on_footer_band && matches!(edit_addr, CellAddr::Main { .. }) {
+                if let CellAddr::Main { row, col } = edit_addr {
+                    let target_row = hr + row as usize;
+                    let target_col = MARGIN_COLS + col as usize;
+                    self.state
+                        .grid
+                        .ensure_extent_for_cursor(target_row, target_col);
+                    self.cursor = SheetCursor {
+                        row: target_row,
+                        col: target_col,
+                    };
+                    self.cursor.clamp(&self.state.grid);
+                }
+            } else if edit_addr != cur_addr {
+                self.edit_target_addr = Some(cur_addr);
             }
         }
         // #region agent log
@@ -6733,6 +6955,11 @@ impl App {
 
             let left_margin_agg = main_row_idx.and_then(|mri| left_margin_agg_func(grid, mri));
             let left_margin_block_start = main_row_idx.map(|mri| row_total_block_start(grid, mri));
+            // Rows with footer aggregates / left TOTAL rows keep per-cell truncation (no visual spill).
+            let spill_row = footer_agg.is_none()
+                && left_margin_agg.is_none()
+                && main_row_idx.is_some();
+            let mut spill_remain = String::new();
 
             for (i, &c) in col_ixs.iter().enumerate() {
                 let cur = SheetCursor { row: r, col: c };
@@ -6823,14 +7050,48 @@ impl App {
                 let cw = grid.col_width(c).max(1);
                 let formatted = format_cell_display(grid, &cell_addr, text);
                 let align = effective_cell_align(grid, &cell_addr, &formatted);
-                let disp = if formatted.width() > cw {
-                    shrink_numeric_display(&formatted, cw)
-                        .or_else(|| exponential_numeric_display(&formatted, cw))
-                        .unwrap_or_else(|| truncate_with_ellipsis(&formatted, cw))
-                } else {
-                    formatted
-                };
-                let disp = align_cell_display(disp, cw, align);
+                let fw = formatted.width();
+                let cell_fmt = grid.format_for_addr(&cell_addr);
+                let numeric_like = formatted.trim().parse::<f64>().is_ok()
+                    || matches!(cell_fmt.number, Some(NumberFormat::Rational));
+                let allow_text_spill =
+                    spill_row && !is_agg_cell && !numeric_like && align != Some(TextAlign::Right);
+
+                let disp =
+                    if allow_text_spill && !spill_remain.is_empty() && formatted.trim().is_empty() {
+                        let (chunk, rest) = take_display_prefix(&spill_remain, cw);
+                        spill_remain = rest;
+                        align_cell_display(chunk, cw, Some(TextAlign::Left))
+                    } else {
+                        if allow_text_spill && !spill_remain.is_empty() && !formatted.trim().is_empty()
+                        {
+                            spill_remain.clear();
+                        }
+                        if !spill_remain.is_empty() && is_agg_cell {
+                            spill_remain.clear();
+                        }
+                        let inner: String = if allow_text_spill && fw > cw {
+                            let extra = spill_blank_suffix_width(grid, r, &col_ixs, i);
+                            if fw <= cw + extra {
+                                let (shown, rest) = take_display_prefix(&formatted, cw);
+                                spill_remain = rest;
+                                shown
+                            } else {
+                                spill_remain.clear();
+                                shrink_numeric_display(&formatted, cw)
+                                    .or_else(|| exponential_numeric_display(&formatted, cw))
+                                    .unwrap_or_else(|| truncate_with_ellipsis(&formatted, cw))
+                            }
+                        } else if fw > cw {
+                            spill_remain.clear();
+                            shrink_numeric_display(&formatted, cw)
+                                .or_else(|| exponential_numeric_display(&formatted, cw))
+                                .unwrap_or_else(|| truncate_with_ellipsis(&formatted, cw))
+                        } else {
+                            formatted.clone()
+                        };
+                        align_cell_display(inner, cw, align)
+                    };
                 let sel = self.anchor.is_some_and(|a| match self.selection_kind {
                     SelectionKind::Cells => {
                         let r0 = a.row.min(self.cursor.row);
@@ -7051,7 +7312,9 @@ impl App {
             Mode::RevisionBrowse => "  left/right·step revisions   Enter·close   Esc·close".into(),
             Mode::SheetRename { .. } => "  type sheet title   Enter·rename   Esc·cancel".into(),
             Mode::SheetCopy { .. } => "  type sheet title   Enter·copy   Esc·cancel".into(),
-            Mode::GoToCell { .. } => "  type cell address   Enter·go   Esc·cancel".into(),
+            Mode::GoToCell { .. } => {
+                "  type cell/ref or part · e.g. $1 · $sheet1 · A · 1   Enter·go   Esc·cancel".into()
+            }
             Mode::SavePath { .. } => "  type file path   Enter·save as   Esc·cancel".into(),
             Mode::ExportTsv { .. } | Mode::ExportCsv { .. } | Mode::ExportAll { .. } => {
                 let h = if self.export_delimited_options.include_header_row {
@@ -9051,6 +9314,22 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                             self.state
                                 .grid
                                 .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
+                            self.edit_target_addr = Some(self.cursor.to_addr(&self.state.grid));
+                            // #region agent log
+                            debug_log_ndjson(
+                                "H5",
+                                "src/ui/mod.rs:Edit:EdgeLeft",
+                                "edit edge-left: sync edit target to cursor",
+                                format!(
+                                    "{{\"cursor_col\":{},\"edit_target_main_col\":{}}}",
+                                    self.cursor.col,
+                                    match self.edit_target_addr.as_ref() {
+                                        Some(CellAddr::Main { col, .. }) => *col as i64,
+                                        _ => -1,
+                                    }
+                                ),
+                            );
+                            // #endregion
                         }
                         TextInputAction::EdgeRight => {
                             let raw = buffer.clone();
@@ -9633,6 +9912,12 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                         let steps = self.grid_viewport_data_rows.max(1);
                         self.move_cursor_vertical_steps(steps, true);
                     }
+                    KeyCode::Home => {
+                        self.jump_cursor_row_horizontal_nonblank(true);
+                    }
+                    KeyCode::End => {
+                        self.jump_cursor_row_horizontal_nonblank(false);
+                    }
                     KeyCode::Char(c) if !c.is_control() => {
                         self.edit_special_palette = false;
                         let buffer = c.to_string();
@@ -9655,6 +9940,7 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
         }
 
         self.mode = mode;
+        self.maybe_sync_edit_target_with_highlighted_cell();
         Ok(false)
     }
 
@@ -10320,6 +10606,46 @@ mod tests {
         );
     }
 
+    /// After EdgeLeft (or any in-edit cursor move), `edit_target_addr` must match
+    /// `cursor` or commits go to the stale column (e.g. B7 vs A7).
+    #[test]
+    fn commit_syncs_edit_target_to_cursor_when_addresses_differ_in_main() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(10, 5);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 6, col: 1 }, "filled".into());
+
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS + 6,
+            col: MARGIN_COLS,
+        };
+        app.edit_target_addr = Some(CellAddr::Main { row: 6, col: 1 });
+        app.mode = Mode::Edit {
+            buffer: "typed-in-A".into(),
+            formula_cursor: None,
+            fit_to_content_on_commit: false,
+        };
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .unwrap();
+
+        assert_eq!(
+            app.state
+                .grid
+                .get(&CellAddr::Main { row: 6, col: 0 })
+                .as_deref(),
+            Some("typed-in-A")
+        );
+        assert_eq!(
+            app.state
+                .grid
+                .get(&CellAddr::Main { row: 6, col: 1 })
+                .as_deref(),
+            Some("filled")
+        );
+    }
+
     #[test]
     fn ctrl_shift_plus_inserts_one_row_above_cursor() {
         let mut app = App::new(None);
@@ -10632,6 +10958,67 @@ mod tests {
     }
 
     #[test]
+    fn home_moves_to_leftmost_nonblank_in_row_and_clears_anchor() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 5);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "start".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 1 }, "next".into());
+        app.anchor = Some(SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS + 2,
+        });
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS + 3,
+        };
+        app.mode = Mode::Normal;
+
+        app.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::empty()))
+            .unwrap();
+
+        assert!(app.anchor.is_none());
+        assert_eq!(
+            app.cursor,
+            SheetCursor {
+                row: HEADER_ROWS,
+                col: MARGIN_COLS,
+            }
+        );
+    }
+
+    #[test]
+    fn end_moves_to_rightmost_nonblank_in_row() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 5);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 2 }, "mid".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 3 }, "end".into());
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS + 1,
+        };
+        app.mode = Mode::Normal;
+
+        app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::empty()))
+            .unwrap();
+
+        assert_eq!(
+            app.cursor,
+            SheetCursor {
+                row: HEADER_ROWS,
+                col: MARGIN_COLS + 3,
+            }
+        );
+    }
+
+    #[test]
     fn ctrl_shift_down_extends_to_last_nonblank_cell_in_column() {
         let mut app = App::new(None);
         app.state.grid.set_main_size(5, 1);
@@ -10920,7 +11307,7 @@ mod tests {
     }
 
     #[test]
-    fn formula_bar_shows_evaluated_formula_text() {
+    fn formula_bar_shows_stored_formula_outside_edit_mode() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
@@ -10944,7 +11331,8 @@ mod tests {
                 .collect::<String>()
         };
 
-        assert!(row(1).contains("3.141"));
+        assert!(row(1).contains("=π"));
+        assert!(!row(1).contains("3.141"));
 
         app.state
             .grid
@@ -10959,7 +11347,8 @@ mod tests {
                 .collect::<String>()
         };
 
-        assert!(row(1).contains("6.283"));
+        assert!(row(1).contains("=2*π"));
+        assert!(!row(1).contains("6.283"));
 
         app.mode = Mode::Edit {
             buffer: "=2*π".into(),
@@ -13392,6 +13781,32 @@ mod tests {
     }
 
     #[test]
+    fn edit_mode_left_from_column_b_syncs_edit_target_to_a() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 2);
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS + 1,
+        };
+        app.mode = Mode::Edit {
+            buffer: String::new(),
+            formula_cursor: None,
+            fit_to_content_on_commit: false,
+        };
+        app.edit_target_addr = Some(CellAddr::Main { row: 0, col: 1 });
+        app.edit_cursor = Some(0);
+
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::empty()))
+            .unwrap();
+
+        assert_eq!(app.cursor.col, MARGIN_COLS);
+        assert_eq!(
+            app.edit_target_addr,
+            Some(CellAddr::Main { row: 0, col: 0 })
+        );
+    }
+
+    #[test]
     fn esc_while_quit_prompted_exits() {
         let mut app = App::new(None);
         app.mode = Mode::QuitPrompt;
@@ -14702,6 +15117,24 @@ mod tests {
     }
 
     #[test]
+    fn rational_cell_display_uses_exact_fractions() {
+        let mut grid = crate::grid::GridBox::from(crate::grid::Grid::new(1, 1));
+        let addr = CellAddr::Main { row: 0, col: 0 };
+        // Denominator 7 ⇒ not a terminating decimal in base 10 ⇒ `n/d` form in eval display.
+        grid.set(&addr, "=1/7".into());
+        grid.set_cell_format(
+            addr.clone(),
+            CellFormat {
+                number: Some(NumberFormat::Rational),
+                align: None,
+            },
+        );
+        let eff = cell_effective_display(&grid, &addr);
+        let formatted = format_cell_display(&grid, &addr, eff);
+        assert_eq!(formatted, "1/7");
+    }
+
+    #[test]
     fn aligned_columns_keep_separate_widths() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
@@ -14924,14 +15357,19 @@ fn formula_edit_preview(grid: &Grid, addr: &CellAddr, buffer: &str) -> Option<St
     Some(cell_effective_display(&preview_grid, addr))
 }
 
+/// Text for the formula bar outside **Edit**: show what is stored (`=…`) or the synthesized
+/// template formula for blank templated mains — not the evaluated cell surface value.
 fn formula_bar_value(grid: &Grid, addr: &CellAddr) -> String {
     let raw = normalize_inline_text(&cell_display(grid, addr));
     let trimmed = raw.trim();
     if trimmed.is_empty() {
+        if let Some(template) = crate::formula::export_templated_formula(grid, addr) {
+            return normalize_inline_text(&template);
+        }
         return String::new();
     }
-    if trimmed.starts_with('=') {
-        return normalize_inline_text(&cell_effective_display(grid, addr));
+    if crate::formula::is_formula(&raw) {
+        return raw;
     }
     raw
 }
@@ -15112,12 +15550,31 @@ pub(crate) fn format_cell_display(grid: &Grid, addr: &CellAddr, raw: String) -> 
     let Some(number) = fmt.number else {
         return raw;
     };
-    let Some(value) = raw.trim().parse::<f64>().ok() else {
-        return raw;
-    };
     match number {
-        NumberFormat::Currency { decimals } => format!("${value:.decimals$}"),
-        NumberFormat::Fixed { decimals } => format!("{value:.decimals$}"),
+        NumberFormat::Rational => {
+            let mut visiting = Vec::new();
+            let mut budget = 10_000usize;
+            if let Some(n) = effective_numeric(grid, addr, &mut visiting, &mut budget) {
+                return format_number_cell_display(&n);
+            }
+            let t = raw.trim();
+            if let Some(n) = crate::formula::parse_number_literal(t) {
+                return format_number_cell_display(&n);
+            }
+            raw
+        }
+        NumberFormat::Currency { decimals } => {
+            let Some(value) = raw.trim().parse::<f64>().ok() else {
+                return raw;
+            };
+            format!("${value:.decimals$}")
+        }
+        NumberFormat::Fixed { decimals } => {
+            let Some(value) = raw.trim().parse::<f64>().ok() else {
+                return raw;
+            };
+            format!("{value:.decimals$}")
+        }
     }
 }
 
@@ -15160,6 +15617,43 @@ fn truncate_with_ellipsis(text: &str, width: usize) -> String {
     }
     let (prefix, _) = text.unicode_truncate(keep);
     format!("{prefix}…")
+}
+
+/// Prefix of `text` consuming at most `display_width` terminal columns (Unicode width-aware).
+fn take_display_prefix(text: &str, display_width: usize) -> (String, String) {
+    if display_width == 0 || text.is_empty() {
+        return (String::new(), text.to_string());
+    }
+    let mut acc = 0usize;
+    let mut end = 0usize;
+    for ch in text.chars() {
+        let wch = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if acc + wch > display_width {
+            break;
+        }
+        acc += wch;
+        end += ch.len_utf8();
+    }
+    let (pre, suf) = text.split_at(end);
+    (pre.to_string(), suf.to_string())
+}
+
+/// Sum [`Grid::col_width`] for consecutive blank-looking cells (`cell_effective_display` empty).
+fn spill_blank_suffix_width(grid: &Grid, sheet_row: usize, col_ixs: &[usize], start_idx: usize) -> usize {
+    let mut extra = 0usize;
+    for j in start_idx + 1..col_ixs.len() {
+        let addr = SheetCursor {
+            row: sheet_row,
+            col: col_ixs[j],
+        }
+        .to_addr(grid);
+        let t = cell_effective_display(grid, &addr);
+        if !t.trim().is_empty() {
+            break;
+        }
+        extra += grid.col_width(col_ixs[j]).max(1);
+    }
+    extra
 }
 
 fn shrink_numeric_display(text: &str, width: usize) -> Option<String> {

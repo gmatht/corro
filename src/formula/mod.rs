@@ -1,8 +1,11 @@
 //! `=...` cell formulas: parse, evaluate, display.
 
-use crate::addr::{excel_column_name, parse_cell_ref_at, parse_main_range_at};
+use crate::addr::{
+    corner_locks_for_bbox, excel_column_name, formula_cell_ref_text, parse_cell_ref_at,
+    parse_main_range_formula_at, A1RefLocks,
+};
 use crate::grid::{CellAddr, GridBox as Grid, MainRange, HEADER_ROWS, MARGIN_COLS};
-use crate::ops::WorkbookState;
+use crate::ops::{AggFunc, WorkbookState};
 use std::cell::RefCell;
 
 mod functions;
@@ -80,7 +83,9 @@ const DEFAULT_BUDGET: usize = 10_000;
 // detection) which can overflow the thread stack. This limits the number of
 // active cell visits on the evaluation stack; when exceeded we return a
 // transient LIMIT error so the caller can handle it rather than crashing.
-const MAX_VISIT_DEPTH: usize = 1_000;
+// Lowered from 1000 to 128 to reduce the chance of exhausting the OS stack
+// before our logical guard fires.
+const MAX_VISIT_DEPTH: usize = 128;
 
 /// Evaluation step budget for one aggregate range scan (many cells).
 pub const EVAL_BUDGET_AGG: usize = 1_000_000;
@@ -156,8 +161,8 @@ pub(crate) fn split_labeled_formula(raw: &str) -> Option<(&str, &str)> {
     Some((expr, label))
 }
 
-fn render_addr(addr: &CellAddr) -> String {
-    crate::addr::cell_ref_text(addr, 0)
+fn render_addr(addr: &CellAddr, locks: &A1RefLocks) -> String {
+    formula_cell_ref_text(addr, 0, *locks)
 }
 
 fn render_ast(ast: &Ast) -> String {
@@ -165,18 +170,32 @@ fn render_ast(ast: &Ast) -> String {
         Ast::Number(n) => n.to_formula_string(),
         Ast::Text(s) => format!("\"{}\"", s.replace('"', "\"\"")),
         Ast::Name(name) => name.clone(),
-        Ast::Ref(addr) => render_addr(addr),
-        Ast::SheetRef { sheet_id, addr } => format!("#{sheet_id}!{}", render_addr(addr)),
-        Ast::Range(range) => format!(
+        Ast::Ref { addr, locks } => render_addr(addr, locks),
+        Ast::SheetRef {
+            sheet_id,
+            addr,
+            locks,
+        } => format!("#{sheet_id}!{}", render_addr(addr, locks)),
+        Ast::Range {
+            range,
+            locks_tl,
+            locks_br,
+        } => format!(
             "{}:{}",
-            render_addr(&CellAddr::Main {
-                row: range.row_start,
-                col: range.col_start,
-            }),
-            render_addr(&CellAddr::Main {
-                row: range.row_end.saturating_sub(1),
-                col: range.col_end.saturating_sub(1),
-            })
+            render_addr(
+                &CellAddr::Main {
+                    row: range.row_start,
+                    col: range.col_start,
+                },
+                locks_tl,
+            ),
+            render_addr(
+                &CellAddr::Main {
+                    row: range.row_end.saturating_sub(1),
+                    col: range.col_end.saturating_sub(1),
+                },
+                locks_br,
+            ),
         ),
         Ast::Neg(a) => format!("(-{})", render_ast(a)),
         Ast::Add(a, b) => format!("({}+{})", render_ast(a), render_ast(b)),
@@ -192,40 +211,80 @@ fn render_ast(ast: &Ast) -> String {
     }
 }
 
-fn translate_addr(addr: &CellAddr, ctx: &FormulaCopyContext) -> Option<CellAddr> {
+fn translate_addr(addr: &CellAddr, locks: &A1RefLocks, ctx: &FormulaCopyContext) -> Option<CellAddr> {
     match addr {
         CellAddr::Header { .. } | CellAddr::Footer { .. } => Some(addr.clone()),
         CellAddr::Main { row, col } => Some(CellAddr::Main {
-            row: *ctx.row_map.get(*row as usize)?,
+            row: if locks.row_absolute {
+                *row
+            } else {
+                *ctx.row_map.get(*row as usize)?
+            },
             col: *col,
         }),
         CellAddr::Left { col, row } => Some(CellAddr::Left {
             col: *col,
-            row: *ctx.row_map.get(*row as usize)?,
+            row: if locks.row_absolute {
+                *row
+            } else {
+                *ctx.row_map.get(*row as usize)?
+            },
         }),
         CellAddr::Right { col, row } => Some(CellAddr::Right {
             col: *col,
-            row: *ctx.row_map.get(*row as usize)?,
+            row: if locks.row_absolute {
+                *row
+            } else {
+                *ctx.row_map.get(*row as usize)?
+            },
         }),
     }
 }
 
-fn translate_range(range: &MainRange, ctx: &FormulaCopyContext) -> Option<MainRange> {
-    let mut mapped_rows = Vec::new();
-    for row in range.row_start..range.row_end {
-        mapped_rows.push(*ctx.row_map.get(row as usize)?);
-    }
-    if mapped_rows.is_empty() {
-        return Some(range.clone());
-    }
-    if !mapped_rows.windows(2).all(|w| w[1] == w[0] + 1) {
-        return None;
-    }
+fn translate_range(
+    range: &MainRange,
+    locks_tl: &A1RefLocks,
+    locks_br: &A1RefLocks,
+    ctx: &FormulaCopyContext,
+) -> Option<MainRange> {
+    let tl = translate_addr(
+        &CellAddr::Main {
+            row: range.row_start,
+            col: range.col_start,
+        },
+        locks_tl,
+        ctx,
+    )?;
+    let br = translate_addr(
+        &CellAddr::Main {
+            row: range.row_end.saturating_sub(1),
+            col: range.col_end.saturating_sub(1),
+        },
+        locks_br,
+        ctx,
+    )?;
+    let (r1, c1, r2, c2) = match (tl, br) {
+        (
+            CellAddr::Main {
+                row: r1,
+                col: c1,
+            },
+            CellAddr::Main {
+                row: r2,
+                col: c2,
+            },
+        ) => (r1, c1, r2, c2),
+        _ => return None,
+    };
+    let row_start = r1.min(r2);
+    let row_end = r1.max(r2).saturating_add(1);
+    let col_start = c1.min(c2);
+    let col_end = c1.max(c2).saturating_add(1);
     Some(MainRange {
-        row_start: *mapped_rows.first()?,
-        row_end: mapped_rows.last().copied()?.saturating_add(1),
-        col_start: range.col_start,
-        col_end: range.col_end,
+        row_start,
+        row_end,
+        col_start,
+        col_end,
     })
 }
 
@@ -278,6 +337,7 @@ fn translate_cell_addr_by_offset(
     addr: &CellAddr,
     row_delta: i32,
     col_delta: i32,
+    locks: &A1RefLocks,
 ) -> Option<CellAddr> {
     let shift_u32 = |v: u32, delta: i32| -> Option<u32> {
         if delta >= 0 {
@@ -296,12 +356,18 @@ fn translate_cell_addr_by_offset(
             col: shift_u32(*col, col_delta)?,
         }),
         CellAddr::Main { row, col } => Some(CellAddr::Main {
-            row: shift_u32(*row, row_delta)?,
-            col: shift_u32(*col, col_delta)?,
+            row: if locks.row_absolute {
+                *row
+            } else {
+                shift_u32(*row, row_delta)?
+            },
+            col: if locks.col_absolute {
+                *col
+            } else {
+                shift_u32(*col, col_delta)?
+            },
         }),
         CellAddr::Left { col, row } => Some(CellAddr::Left {
-            // Margin indices are now usize (MarginIndex). Shift via u32 and cast
-            // back to usize to preserve range while using existing shift helper.
             col: shift_u32(*col as u32, col_delta)? as usize,
             row: shift_u32(*row, row_delta)?,
         }),
@@ -314,22 +380,57 @@ fn translate_cell_addr_by_offset(
 
 fn translate_range_by_offset(
     range: &MainRange,
+    locks_tl: A1RefLocks,
+    locks_br: A1RefLocks,
     row_delta: i32,
     col_delta: i32,
-) -> Option<MainRange> {
-    let shift_u32 = |v: u32, delta: i32| -> Option<u32> {
-        if delta >= 0 {
-            v.checked_add(delta as u32)
-        } else {
-            v.checked_sub(delta.unsigned_abs())
-        }
+) -> Option<(MainRange, A1RefLocks, A1RefLocks)> {
+    let tl = translate_cell_addr_by_offset(
+        &CellAddr::Main {
+            row: range.row_start,
+            col: range.col_start,
+        },
+        row_delta,
+        col_delta,
+        &locks_tl,
+    )?;
+    let br = translate_cell_addr_by_offset(
+        &CellAddr::Main {
+            row: range.row_end.saturating_sub(1),
+            col: range.col_end.saturating_sub(1),
+        },
+        row_delta,
+        col_delta,
+        &locks_br,
+    )?;
+    let (r1, c1, r2, c2) = match (tl, br) {
+        (
+            CellAddr::Main {
+                row: r1,
+                col: c1,
+            },
+            CellAddr::Main {
+                row: r2,
+                col: c2,
+            },
+        ) => (r1, c1, r2, c2),
+        _ => return None,
     };
-    Some(MainRange {
-        row_start: shift_u32(range.row_start, row_delta)?,
-        row_end: shift_u32(range.row_end, row_delta)?,
-        col_start: shift_u32(range.col_start, col_delta)?,
-        col_end: shift_u32(range.col_end, col_delta)?,
-    })
+    let row_start = r1.min(r2);
+    let row_end = r1.max(r2).saturating_add(1);
+    let col_start = c1.min(c2);
+    let col_end = c1.max(c2).saturating_add(1);
+    let (out_tl, out_br) = corner_locks_for_bbox(r1, c1, locks_tl, r2, c2, locks_br);
+    Some((
+        MainRange {
+            row_start,
+            row_end,
+            col_start,
+            col_end,
+        },
+        out_tl,
+        out_br,
+    ))
 }
 
 fn translate_ast_by_offset(ast: &Ast, row_delta: i32, col_delta: i32) -> Option<Ast> {
@@ -337,12 +438,32 @@ fn translate_ast_by_offset(ast: &Ast, row_delta: i32, col_delta: i32) -> Option<
         Ast::Number(n) => Ast::Number(n.clone()),
         Ast::Text(s) => Ast::Text(s.clone()),
         Ast::Name(name) => Ast::Name(name.clone()),
-        Ast::Ref(addr) => Ast::Ref(translate_cell_addr_by_offset(addr, row_delta, col_delta)?),
-        Ast::SheetRef { sheet_id, addr } => Ast::SheetRef {
-            sheet_id: *sheet_id,
-            addr: translate_cell_addr_by_offset(addr, row_delta, col_delta)?,
+        Ast::Ref { addr, locks } => Ast::Ref {
+            addr: translate_cell_addr_by_offset(addr, row_delta, col_delta, locks)?,
+            locks: *locks,
         },
-        Ast::Range(range) => Ast::Range(translate_range_by_offset(range, row_delta, col_delta)?),
+        Ast::SheetRef {
+            sheet_id,
+            addr,
+            locks,
+        } => Ast::SheetRef {
+            sheet_id: *sheet_id,
+            addr: translate_cell_addr_by_offset(addr, row_delta, col_delta, locks)?,
+            locks: *locks,
+        },
+        Ast::Range {
+            range,
+            locks_tl,
+            locks_br,
+        } => {
+            let (rng, otl, obr) =
+                translate_range_by_offset(range, *locks_tl, *locks_br, row_delta, col_delta)?;
+            Ast::Range {
+                range: rng,
+                locks_tl: otl,
+                locks_br: obr,
+            }
+        }
         Ast::Neg(a) => Ast::Neg(Box::new(translate_ast_by_offset(a, row_delta, col_delta)?)),
         Ast::Add(a, b) => Ast::Add(
             Box::new(translate_ast_by_offset(a, row_delta, col_delta)?),
@@ -379,18 +500,37 @@ fn translate_ast(ast: &Ast, ctx: &FormulaCopyContext) -> Option<Ast> {
         Ast::Number(n) => Ast::Number(n.clone()),
         Ast::Text(s) => Ast::Text(s.clone()),
         Ast::Name(name) => Ast::Name(name.clone()),
-        Ast::Ref(addr) => Ast::Ref(translate_addr(addr, ctx)?),
-        Ast::SheetRef { sheet_id, addr } => {
+        Ast::Ref { addr, locks } => Ast::Ref {
+            addr: translate_addr(addr, locks, ctx)?,
+            locks: *locks,
+        },
+        Ast::SheetRef {
+            sheet_id,
+            addr,
+            locks,
+        } => {
             if *sheet_id == ctx.source_sheet_id {
-                Ast::Ref(translate_addr(addr, ctx)?)
+                Ast::Ref {
+                    addr: translate_addr(addr, locks, ctx)?,
+                    locks: *locks,
+                }
             } else {
                 Ast::SheetRef {
                     sheet_id: *sheet_id,
                     addr: addr.clone(),
+                    locks: *locks,
                 }
             }
         }
-        Ast::Range(range) => Ast::Range(translate_range(range, ctx)?),
+        Ast::Range {
+            range,
+            locks_tl,
+            locks_br,
+        } => Ast::Range {
+            range: translate_range(range, locks_tl, locks_br, ctx)?,
+            locks_tl: *locks_tl,
+            locks_br: *locks_br,
+        },
         Ast::Neg(a) => Ast::Neg(Box::new(translate_ast(a, ctx)?)),
         Ast::Add(a, b) => Ast::Add(
             Box::new(translate_ast(a, ctx)?),
@@ -503,11 +643,36 @@ fn control_formula_expr(grid: &Grid, addr: &CellAddr) -> Option<String> {
         return Some(expr.to_string());
     }
     // ODS generic historically stored only `of:` (=…) in the cell; round-trip lost ` -- LABEL`.
-    let t = raw.trim().strip_prefix('=')?;
+    let raw_trim = raw.trim();
+    let after_first_eq = raw_trim.strip_prefix('=')?;
+    if after_first_eq.starts_with('=') {
+        // `==…` aggregate row markers are not spreadsheet expressions here.
+        return None;
+    }
+    let t = after_first_eq;
     if t.contains(" -- ") {
         return None;
     }
     Some(t.to_string())
+}
+
+fn margin_control_label_after_double_equals(t: &str) -> Option<String> {
+    crate::ops::margin_key_agg_func(t)?;
+    let kw = t.strip_prefix("==").map(str::trim).unwrap_or_default();
+    match crate::ops::margin_key_agg_func(t)? {
+        AggFunc::Sum => {
+            Some(if kw.eq_ignore_ascii_case("SUM") {
+                "SUM".into()
+            } else {
+                "TOTAL".into()
+            })
+        }
+        AggFunc::Mean => Some("MEAN".into()),
+        AggFunc::Median => Some("MEDIAN".into()),
+        AggFunc::Min => Some("MIN".into()),
+        AggFunc::Max => Some("MAX".into()),
+        AggFunc::Count => Some("COUNT".into()),
+    }
 }
 
 fn control_formula_label(grid: &Grid, addr: &CellAddr) -> Option<String> {
@@ -521,9 +686,14 @@ fn control_formula_label(grid: &Grid, addr: &CellAddr) -> Option<String> {
             | CellAddr::Right { .. }
     ) {
         let t = raw.trim();
+        if t.starts_with("==") {
+            if let Some(l) = margin_control_label_after_double_equals(t) {
+                return Some(l);
+            }
+        }
         if t
             .strip_prefix('=')
-            .is_some_and(|r| r.eq_ignore_ascii_case("TOTAL"))
+            .is_some_and(|r| !r.starts_with('=') && r.eq_ignore_ascii_case("TOTAL"))
         {
             return Some("TOTAL".to_string());
         }
@@ -570,9 +740,14 @@ pub fn main_column_label_from_header(grid: &Grid, main_col: usize) -> Option<Str
     control_formula_label(grid, &header_addr)
 }
 
-/// True if the stored cell text is a formula (`=` prefix after trim).
+/// True if the stored cell text is a spreadsheet formula (`=` prefix after trim). `==…`
+/// margin aggregate directives are not formulas here.
 pub fn is_formula(raw: &str) -> bool {
-    raw.trim_start().starts_with('=')
+    let t = raw.trim_start();
+    if t.starts_with("==") {
+        return false;
+    }
+    t.starts_with('=')
 }
 
 /// Numeric value for aggregation: formulas evaluate to a number if possible; plain text uses exact/approx parse.
@@ -662,6 +837,9 @@ fn eval_cell_with_sheet(
     let t = raw.trim();
     if t.is_empty() {
         return EvalResult::Number(Number::exact_zero());
+    }
+    if t.starts_with("==") {
+        return EvalResult::Text(String::new());
     }
     if !t.starts_with('=') {
         return if let Some(n) = parse_number_literal(t) {
@@ -778,7 +956,9 @@ fn eval_cell_inner(
         if SHEET_VISITING.with(|stack| stack.borrow().iter().any(|a| a.0 == sheet_id && &a.1 == addr)) {
             return EvalResult::Error("CIRC");
         }
-        SHEET_VISITING.with(|stack| stack.borrow_mut().push((sheet_id, addr.clone())));
+        SHEET_VISITING.with(|stack| {
+            stack.borrow_mut().push((sheet_id, addr.clone()));
+        });
         _sheet_guard.pushed = true;
     }
 
@@ -808,6 +988,9 @@ fn eval_cell_inner(
     let t = raw.trim();
     if t.is_empty() {
         return EvalResult::Number(Number::exact_zero());
+    }
+    if t.starts_with("==") {
+        return EvalResult::Text(String::new());
     }
     if !t.starts_with('=') {
         return if let Some(n) = parse_number_literal(t) {
@@ -869,13 +1052,21 @@ enum Ast {
     Number(Number),
     Text(String),
     Name(String),
-    Ref(CellAddr),
+    Ref {
+        addr: CellAddr,
+        locks: A1RefLocks,
+    },
     SheetRef {
         sheet_id: u32,
         addr: CellAddr,
+        locks: A1RefLocks,
     },
     /// Main grid only (`A1:B2`).
-    Range(MainRange),
+    Range {
+        range: MainRange,
+        locks_tl: A1RefLocks,
+        locks_br: A1RefLocks,
+    },
     Neg(Box<Ast>),
     Add(Box<Ast>, Box<Ast>),
     Sub(Box<Ast>, Box<Ast>),
@@ -1025,9 +1216,13 @@ impl<'a> Parser<'a> {
         let rest = &self.s[self.i..];
 
         if rest.starts_with('#') {
-            if let Some((sheet_id, addr, len)) = parse_sheet_qualified_ref(rest) {
+            if let Some((sheet_id, addr, locks, len)) = parse_sheet_qualified_ref(rest) {
                 self.i += len;
-                return Ok(Ast::SheetRef { sheet_id, addr });
+                return Ok(Ast::SheetRef {
+                    sheet_id,
+                    addr,
+                    locks,
+                });
             }
             return Err(());
         }
@@ -1040,11 +1235,15 @@ impl<'a> Parser<'a> {
         }
 
         if rest.starts_with('$') {
-            if let Some((sheet_id, addr, len)) =
+            if let Some((sheet_id, addr, locks, len)) =
                 parse_sheet_qualified_cell_ref_at_for_workbook(rest)
             {
                 self.i += len;
-                return Ok(Ast::SheetRef { sheet_id, addr });
+                return Ok(Ast::SheetRef {
+                    sheet_id,
+                    addr,
+                    locks,
+                });
             }
             let bytes = rest.as_bytes();
             let mut j = 1usize;
@@ -1055,18 +1254,26 @@ impl<'a> Parser<'a> {
                 let sheet = &rest[1..j];
                 let after = &rest[j + 1..];
                 if let Some((sheet_id, grid)) = workbook_lookup_sheet_ref(sheet) {
-                    let (addr, len) = parse_cell_ref_at(after, grid.main_cols()).ok_or(())?;
+                    let (addr, locks, len) = parse_cell_ref_at(after, grid.main_cols()).ok_or(())?;
                     self.i += j + 1 + len;
-                    return Ok(Ast::SheetRef { sheet_id, addr });
+                    return Ok(Ast::SheetRef {
+                        sheet_id,
+                        addr,
+                        locks,
+                    });
                 }
+            }
+            if let Some((addr, locks, len)) = parse_cell_ref_at(rest, self.main_cols) {
+                self.i += len;
+                return Ok(Ast::Ref { addr, locks });
             }
             return Err(());
         }
 
         if rest.starts_with('[') || rest.starts_with(']') {
-            let (addr, len) = parse_cell_ref_at(rest, 0).ok_or(())?;
+            let (addr, locks, len) = parse_cell_ref_at(rest, 0).ok_or(())?;
             self.i += len;
-            return Ok(Ast::Ref(addr));
+            return Ok(Ast::Ref { addr, locks });
         }
 
         // Letter: A1:B2, sum( … ), A1, or bare name.
@@ -1081,9 +1288,13 @@ impl<'a> Parser<'a> {
             }
             let token = &self.s[start..self.i];
             let rest = &self.s[start..];
-            if let Some((range, len)) = parse_main_range_at(rest) {
+            if let Some((range, locks_tl, locks_br, len)) = parse_main_range_formula_at(rest) {
                 self.i = start + len;
-                return Ok(Ast::Range(range));
+                return Ok(Ast::Range {
+                    range,
+                    locks_tl,
+                    locks_br,
+                });
             }
             if self.peek() == Some(b'(') {
                 let name = token.to_string();
@@ -1114,9 +1325,9 @@ impl<'a> Parser<'a> {
                     args: arg_asts,
                 });
             }
-            if let Some((addr, len)) = parse_cell_ref_at(rest, self.main_cols) {
+            if let Some((addr, locks, len)) = parse_cell_ref_at(rest, self.main_cols) {
                 self.i = start + len;
-                return Ok(Ast::Ref(addr));
+                return Ok(Ast::Ref { addr, locks });
             }
             return Ok(Ast::Name(token.to_string()));
         }
@@ -1166,7 +1377,7 @@ impl<'a> Parser<'a> {
     }
 }
 
-fn parse_sheet_qualified_ref(s: &str) -> Option<(u32, CellAddr, usize)> {
+fn parse_sheet_qualified_ref(s: &str) -> Option<(u32, CellAddr, A1RefLocks, usize)> {
     let bytes = s.as_bytes();
     if bytes.first().copied()? != b'#' {
         return None;
@@ -1179,11 +1390,11 @@ fn parse_sheet_qualified_ref(s: &str) -> Option<(u32, CellAddr, usize)> {
         return None;
     }
     let sheet_id = std::str::from_utf8(&bytes[1..i]).ok()?.parse().ok()?;
-    let (addr, len) = parse_cell_ref_at(&s[i + 1..], 0)?;
-    Some((sheet_id, addr, i + 1 + len))
+    let (addr, locks, len) = parse_cell_ref_at(&s[i + 1..], 0)?;
+    Some((sheet_id, addr, locks, i + 1 + len))
 }
 
-fn parse_sheet_qualified_cell_ref_at_for_workbook(s: &str) -> Option<(u32, CellAddr, usize)> {
+fn parse_sheet_qualified_cell_ref_at_for_workbook(s: &str) -> Option<(u32, CellAddr, A1RefLocks, usize)> {
     let bytes = s.as_bytes();
     let mut i = 1usize;
     while i < bytes.len() && bytes[i].is_ascii_digit() {
@@ -1194,8 +1405,8 @@ fn parse_sheet_qualified_cell_ref_at_for_workbook(s: &str) -> Option<(u32, CellA
     }
     let sheet_id = std::str::from_utf8(&bytes[1..i]).ok()?.parse().ok()?;
     let grid = workbook_lookup(sheet_id)?;
-    let (addr, len) = parse_cell_ref_at(&s[i + 1..], grid.main_cols())?;
-    Some((sheet_id, addr, i + 1 + len))
+    let (addr, locks, len) = parse_cell_ref_at(&s[i + 1..], grid.main_cols())?;
+    Some((sheet_id, addr, locks, i + 1 + len))
 }
 
 fn split_top_level_args(s: &str) -> Result<Vec<&str>, ()> {
@@ -1237,11 +1448,36 @@ fn eval_ast(
     budget: &mut usize,
     allow_templates: bool,
 ) -> EvalResult {
+    // Guard overall evaluation recursion depth to avoid blowing the OS stack
+    // from unexpected recursive AST structures (deeply nested expressions).
+    // Mirrors the checks in eval_cell_inner / eval_cell_with_sheet.
+    let _depth_guard = {
+        let mut entered = false;
+        EVAL_RECURSION_DEPTH.with(|d| {
+            let cur = d.get();
+            if cur >= MAX_VISIT_DEPTH {
+                entered = false;
+            } else {
+                d.set(cur + 1);
+                entered = true;
+            }
+        });
+        struct Guard;
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                EVAL_RECURSION_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+            }
+        }
+        if !entered {
+            return EvalResult::Error("LIMIT");
+        }
+        Guard
+    };
     match ast {
         Ast::Number(n) => EvalResult::Number(n.clone()),
         Ast::Text(s) => EvalResult::Text(s.clone()),
         Ast::Name(name) => resolve_name(name, bindings).unwrap_or(EvalResult::Error("NAME")),
-        Ast::Ref(addr) => {
+        Ast::Ref { addr, locks: _ } => {
             // Early detect same-sheet cycles before recursing to avoid
             // consuming another stack frame in obvious circular cases.
             if visiting.iter().any(|a| a == addr) {
@@ -1272,7 +1508,11 @@ fn eval_ast(
             }
             eval_cell_inner(grid, addr, visiting, budget, allow_templates)
         }
-        Ast::SheetRef { sheet_id, addr } => {
+        Ast::SheetRef {
+            sheet_id,
+            addr,
+            locks: _,
+        } => {
             // Early detect sheet-qualified cycles using the global visiting
             // stack so we don't recurse into eval_cell_with_sheet and risk
             // overflowing the thread stack in pathological cases.
@@ -1285,7 +1525,7 @@ fn eval_ast(
             let mut sheet_bindings: Vec<(String, EvalResult)> = Vec::new();
             eval_cell_with_sheet(&sheet_grid, *sheet_id, addr, &mut sheet_bindings, budget, allow_templates)
         }
-        Ast::Range(_) => EvalResult::Error("RANGE"),
+        Ast::Range { .. } => EvalResult::Error("RANGE"),
         Ast::Neg(a) => match eval_ast(a, grid, visiting, bindings, budget, allow_templates) {
             EvalResult::Number(n) => EvalResult::Number(n.neg()),
             e => e,
@@ -1480,8 +1720,12 @@ fn eval_sum(
     allow_templates: bool,
 ) -> EvalResult {
     match arg {
-        Ast::Range(r) => EvalResult::Number(sum_main_range(grid, r, visiting, budget)),
-        Ast::Ref(addr) => {
+        Ast::Range {
+            range: r,
+            locks_tl: _,
+            locks_br: _,
+        } => EvalResult::Number(sum_main_range(grid, r, visiting, budget)),
+        Ast::Ref { addr, locks: _ } => {
             let n = effective_numeric(grid, addr, visiting, budget);
             EvalResult::Number(n.unwrap_or_else(Number::exact_zero))
         }
@@ -1588,6 +1832,12 @@ fn format_number(n: &Number) -> String {
     n.format_eval_display(format_significant_10)
 }
 
+/// Display for UI/export when a column uses [`crate::grid::NumberFormat::Rational`]: exact rationals
+/// as literals; approximate values use the same float rendering as evaluation.
+pub(crate) fn format_number_cell_display(n: &Number) -> String {
+    format_number(n)
+}
+
 fn eval_result_to_string(result: &EvalResult) -> String {
     match result {
         EvalResult::Number(n) => {
@@ -1633,18 +1883,18 @@ fn formula_references_all_empty(grid: &Grid, formula: &str) -> bool {
 fn ast_references_all_empty(ast: &Ast, grid: &Grid, saw_ref: &mut bool) -> bool {
     match ast {
         Ast::Number(_) | Ast::Text(_) | Ast::Name(_) => true,
-        Ast::Ref(addr) => {
+        Ast::Ref { addr, .. } => {
             *saw_ref = true;
             cell_reference_is_empty(grid, addr)
         }
-        Ast::SheetRef { sheet_id, addr } => {
+        Ast::SheetRef { sheet_id, addr, .. } => {
             let Some(sheet_grid) = workbook_lookup(*sheet_id) else {
                 return false;
             };
             *saw_ref = true;
             cell_reference_is_empty(&sheet_grid, addr)
         }
-        Ast::Range(range) => {
+        Ast::Range { range, .. } => {
             let mut all_empty = true;
             for row in range.row_start..range.row_end {
                 for col in range.col_start..range.col_end {
@@ -1691,6 +1941,14 @@ pub fn cell_effective_display(grid: &Grid, addr: &CellAddr) -> String {
     let raw = raw_owned.as_deref().unwrap_or("");
     let template_formula = templated_formula(grid, addr);
     if template_formula.is_none() && !is_formula(raw) {
+        // Normalize plain numeric/date literals for display. This makes
+        // effective display stable across import/export round-trips which may
+        // change stored textual formatting (e.g. "0.00" -> "0"). If the
+        // cell looks like a number/date, format it using the canonical
+        // evaluator formatter; otherwise show the raw text unchanged.
+        if let Some(n) = functions::parse_numeric_or_date_literal(raw) {
+            return format_number(&n);
+        }
         return raw.to_string();
     }
     let mut visiting = Vec::new();
@@ -1811,6 +2069,25 @@ mod tests {
         };
         g.set(&addr, "=ToTaL".into());
         assert_eq!(cell_effective_display(&g, &addr), "TOTAL");
+    }
+
+    #[test]
+    fn margin_stored_double_eq_total_displays_as_total_label() {
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(1, 1));
+        let addr = CellAddr::Header {
+            row: (HEADER_ROWS - 1) as u32,
+            col: (MARGIN_COLS + 1) as u32,
+        };
+        g.set(&addr, "==ToTaL".into());
+        assert_eq!(cell_effective_display(&g, &addr), "TOTAL");
+    }
+
+    #[test]
+    fn double_equals_aggregate_not_is_formula() {
+        assert!(!is_formula("==TOTAL"));
+        assert!(!is_formula("  ==MIN"));
+        assert!(is_formula("=TOTAL"));
+        assert!(is_formula("=MIN(A1)"));
     }
 
     #[test]
@@ -1952,6 +2229,29 @@ mod tests {
         };
         let out = translate_formula_text("=A1+B2", &ctx).expect("translated formula");
         assert_eq!(out, "=(A2+B1)");
+    }
+
+    #[test]
+    fn translate_formula_text_by_offset_shifts_relative_only() {
+        assert_eq!(
+            translate_formula_text_by_offset("=$A$1+B2", 1, 1).unwrap(),
+            "=($A$1+C3)"
+        );
+        assert_eq!(translate_formula_text_by_offset("=A1", 1, 0).unwrap(), "=A2");
+    }
+
+    #[test]
+    fn translate_formula_text_keeps_absolute_ref_under_row_map() {
+        let ctx = FormulaCopyContext {
+            source_sheet_id: 1,
+            target_sheet_id: 2,
+            row_map: vec![1, 0],
+            main_cols: 1,
+        };
+        assert_eq!(
+            translate_formula_text("=$A$1+B2", &ctx).expect("translate"),
+            "=($A$1+B1)"
+        );
     }
 
     #[test]
@@ -2290,6 +2590,31 @@ mod tests {
         assert_eq!(
             cell_effective_display(&g, &CellAddr::Main { row: 0, col: 8 }),
             "d"
+        );
+    }
+
+    #[test]
+    fn sort_descending_preserves_original_order_for_equal_keys() {
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(4, 3));
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "2".into());
+        g.set(&CellAddr::Main { row: 1, col: 0 }, "9".into());
+        g.set(&CellAddr::Main { row: 2, col: 0 }, "9".into());
+        g.set(
+            &CellAddr::Main { row: 0, col: 1 },
+            "=SORT(A1:A3,1,-1)".into(),
+        );
+        refresh_spills(&mut g);
+        assert_eq!(
+            cell_effective_display(&g, &CellAddr::Main { row: 0, col: 1 }),
+            "9"
+        );
+        assert_eq!(
+            cell_effective_display(&g, &CellAddr::Main { row: 1, col: 1 }),
+            "9"
+        );
+        assert_eq!(
+            cell_effective_display(&g, &CellAddr::Main { row: 2, col: 1 }),
+            "2"
         );
     }
 
@@ -2727,7 +3052,7 @@ mod tests {
             main_cols: 0,
         };
         match p.parse_expr().unwrap() {
-            Ast::SheetRef { sheet_id, addr } => {
+            Ast::SheetRef { sheet_id, addr, .. } => {
                 assert_eq!(sheet_id, 2);
                 assert_eq!(addr, CellAddr::Main { row: 0, col: 0 });
             }
@@ -2746,7 +3071,7 @@ mod tests {
             main_cols: 0,
         };
         match p.parse_expr().unwrap() {
-            Ast::SheetRef { sheet_id, addr } => {
+            Ast::SheetRef { sheet_id, addr, .. } => {
                 assert_eq!(sheet_id, 2);
                 assert_eq!(addr, CellAddr::Main { row: 0, col: 0 });
             }
@@ -2765,7 +3090,7 @@ mod tests {
             main_cols: 0,
         };
         match p.parse_expr().unwrap() {
-            Ast::SheetRef { sheet_id, addr } => {
+            Ast::SheetRef { sheet_id, addr, .. } => {
                 assert_eq!(sheet_id, 2);
                 assert_eq!(addr, CellAddr::Main { row: 0, col: 0 });
             }
@@ -2775,36 +3100,61 @@ mod tests {
 
     #[test]
     fn circular_ref() {
-        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(1, 2));
-        g.set(&CellAddr::Main { row: 0, col: 0 }, "=B1".into());
-        g.set(&CellAddr::Main { row: 0, col: 1 }, "=A1".into());
-        let mut v = Vec::new();
-        let mut b = DEFAULT_BUDGET;
-        match eval_cell(&g, &CellAddr::Main { row: 0, col: 0 }, &mut v, &mut b) {
-            EvalResult::Error(e) => assert_eq!(e, "CIRC"),
-            e => panic!("expected CIRC {:?}", e),
-        }
+        // Run the evaluation in a thread with a larger stack to avoid
+        // platform-dependent stack overflow in deeply recursive paths.
+        std::thread::Builder::new()
+            .name("circular_ref".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(1, 2));
+                g.set(&CellAddr::Main { row: 0, col: 0 }, "=B1".into());
+                g.set(&CellAddr::Main { row: 0, col: 1 }, "=A1".into());
+                let mut v = Vec::new();
+                let mut b = DEFAULT_BUDGET;
+                match eval_cell(&g, &CellAddr::Main { row: 0, col: 0 }, &mut v, &mut b) {
+                    EvalResult::Error(e) => assert_eq!(e, "CIRC"),
+                    e => panic!("expected CIRC {:?}", e),
+                }
+            })
+            .expect("spawn test thread")
+            .join()
+            .expect("test thread panicked");
     }
 
     #[test]
     fn cross_sheet_circular_ref() {
-        // A!A1 -> B!A1 -> A!A1 should be detected as CIRC using SHEET_VISITING.
-        let mut wb = crate::ops::WorkbookState::new();
-        // Ensure two sheets with ids 1 and 2
-        let mut sheet2 = crate::ops::SheetState::new(1, 1);
-        sheet2.grid.set(&CellAddr::Main { row: 0, col: 0 }, "=$1:A1".into());
-        // Sheet 1 references sheet 2
-        wb.sheets[0].state.grid.set(&CellAddr::Main { row: 0, col: 0 }, "=#2!A1".into());
-        wb.add_sheet("Sheet2".to_string(), sheet2);
-        let guard = set_eval_context(&wb);
-        let sheet1_grid = workbook_lookup(1).expect("sheet1");
-        let mut v = Vec::new();
-        let mut b = DEFAULT_BUDGET;
-        match eval_cell(&sheet1_grid, &CellAddr::Main { row: 0, col: 0 }, &mut v, &mut b) {
-            EvalResult::Error(e) => assert_eq!(e, "CIRC"),
-            e => panic!("expected CIRC {:?}", e),
-        }
-        drop(guard);
+        // Run the evaluation in a thread with a larger stack to avoid
+        // platform-dependent stack overflow in deeply recursive paths.
+        std::thread::Builder::new()
+            .name("cross_sheet_circular_ref".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                // A!A1 -> B!A1 -> A!A1 should be detected as CIRC using SHEET_VISITING.
+                let mut wb = crate::ops::WorkbookState::new();
+                // Ensure two sheets with ids 1 and 2
+                let mut sheet2 = crate::ops::SheetState::new(1, 1);
+                sheet2
+                    .grid
+                    .set(&CellAddr::Main { row: 0, col: 0 }, "=$1:A1".into());
+                // Sheet 1 references sheet 2
+                wb.sheets[0]
+                    .state
+                    .grid
+                    .set(&CellAddr::Main { row: 0, col: 0 }, "=#2!A1".into());
+                wb.add_sheet("Sheet2".to_string(), sheet2);
+                let guard = set_eval_context(&wb);
+                let sheet1_grid = workbook_lookup(1).expect("sheet1");
+                let mut v = Vec::new();
+                let mut b = DEFAULT_BUDGET;
+                match eval_cell(&sheet1_grid, &CellAddr::Main { row: 0, col: 0 }, &mut v, &mut b) {
+                    EvalResult::Error(e) => assert_eq!(e, "CIRC"),
+                    e => panic!("expected CIRC {:?}", e),
+                }
+                drop(guard);
+            })
+            .expect("spawn test thread")
+            .join()
+            .expect("test thread panicked");
     }
 
     #[test]

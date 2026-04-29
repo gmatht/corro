@@ -365,6 +365,8 @@ pub struct SortSpec {
 pub enum NumberFormat {
     Currency { decimals: usize },
     Fixed { decimals: usize },
+    /// Prefer exact rationals when the cell value has one; approximate values use decimal display.
+    Rational,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1496,6 +1498,20 @@ mod tests {
         }]);
 
         assert_eq!(g.sorted_main_rows(), vec![1, 0, 2]);
+    }
+
+    #[test]
+    fn view_sort_is_stable_for_equal_keys() {
+        let mut g = Grid::new(3, 2);
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "x".into());
+        g.set(&CellAddr::Main { row: 1, col: 0 }, "y".into());
+        g.set(&CellAddr::Main { row: 2, col: 0 }, "x".into());
+        g.set_view_sort_cols(vec![SortSpec {
+            col: MARGIN_COLS,
+            desc: false,
+        }]);
+        // Ties on "x": rows 0 and 2 stay in original order (0 before 2).
+        assert_eq!(g.sorted_main_rows(), vec![0, 2, 1]);
     }
 
     #[test]

@@ -215,7 +215,7 @@ pub fn parse_sheet_qualified_cell_ref_at(
     let (sheet_id, prefix_len) = parse_sheet_id_prefix_at(s)?;
     let rest = s.get(prefix_len..)?;
     let rest = rest.strip_prefix(':')?;
-    let (addr, addr_len) = parse_cell_ref_at(rest, main_cols)?;
+    let (addr, _, addr_len) = parse_cell_ref_at(rest, main_cols)?;
     Some((sheet_id, addr, prefix_len + 1 + addr_len))
 }
 
@@ -237,40 +237,78 @@ pub(crate) fn parse_mirror_margin_column_name(name: &str, left_side: bool) -> Op
     Some(mapped)
 }
 
+/// Lock flags from Excel-style `$` in unprefixed A1 references (`$A$1` fixes both axes).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
+pub struct A1RefLocks {
+    pub col_absolute: bool,
+    pub row_absolute: bool,
+}
+
 /// Parse one cell reference at the start of `s` (no leading whitespace).
-/// Returns `(address, byte length consumed)`.
-pub fn parse_cell_ref_at(s: &str, main_cols: usize) -> Option<(CellAddr, usize)> {
+/// Returns `(address, lock flags for main-style A1 translation, byte length consumed)`.
+///
+/// `$` locking applies only to plain `A1`/`$A1`/`A$1`/`$A$1` forms (no `[` / `]` / `~` / `_`).
+pub fn parse_cell_ref_at(s: &str, main_cols: usize) -> Option<(CellAddr, A1RefLocks, usize)> {
     let bytes = s.as_bytes();
     if bytes.is_empty() {
         return None;
     }
 
-    let (prefix, rest, prefix_len) = match bytes[0] {
-        b'[' => (Some(true), &s[1..], 1usize),
-        b']' => (Some(false), &s[1..], 1usize),
-        _ => (None, s, 0usize),
-    };
-
-    let col_len = {
-        let len = rest.chars().take_while(|c| c.is_ascii_uppercase()).count();
-        if len == 0 {
-            return None;
+    let mut i: usize = 0;
+    let prefix = match bytes[0] {
+        b'[' => {
+            i = 1;
+            Some(true)
         }
-        len
+        b']' => {
+            i = 1;
+            Some(false)
+        }
+        _ => None,
     };
-    let col_name = &rest[..col_len];
-    let after = &rest[col_len..];
 
-    if let Some(marker) = after.chars().next().filter(|c| *c == '~' || *c == '_') {
-        let row_digits = after[1..]
+    let mut locks = A1RefLocks::default();
+
+    // Optional `$` before column letters (only plain `A1` style, not `[`/`]`).
+    if prefix.is_none()
+        && bytes.get(i) == Some(&b'$')
+        && bytes
+            .get(i + 1)
+            .is_some_and(|b| b.is_ascii_uppercase())
+    {
+        locks.col_absolute = true;
+        i += 1;
+    }
+
+    let col_byte_len = bytes
+        .get(i..)?
+        .iter()
+        .take_while(|b| b.is_ascii_uppercase())
+        .count();
+    if col_byte_len == 0 {
+        return None;
+    }
+    let col_name = s.get(i..i + col_byte_len)?;
+    i += col_byte_len;
+
+    let after_col = s.get(i..)?;
+
+    // Header/footer: `A~1` / `A_1`
+    if let Some(marker) = after_col
+        .as_bytes()
+        .first()
+        .copied()
+        .filter(|b| *b == b'~' || *b == b'_')
+    {
+        let row_digits = after_col[1..]
             .chars()
             .take_while(|c| c.is_ascii_digit())
             .count();
         if row_digits == 0 {
             return None;
         }
-        let row_num: usize = after[1..1 + row_digits].parse().ok()?;
-        let row = if marker == '~' {
+        let row_num: usize = after_col[1..1 + row_digits].parse().ok()?;
+        let row = if marker == b'~' {
             if row_num == 0 || row_num > crate::grid::HEADER_ROWS {
                 return None;
             }
@@ -286,26 +324,40 @@ pub fn parse_cell_ref_at(s: &str, main_cols: usize) -> Option<(CellAddr, usize)>
             Some(false) => parse_mirror_margin_column_name(col_name, false)
                 .map(|c| (crate::grid::MARGIN_COLS + main_cols + c as usize) as u32)
                 .or_else(|| Some(parse_excel_column(col_name)?))?,
-            // Unprefixed Excel letters always refer to the main/data region
-            // column. Map to a global column index by adding the left-margin
-            // offset.
             None => crate::grid::MARGIN_COLS as u32 + parse_excel_column(col_name)?,
         };
-        return Some((
-            if marker == '~' {
-                CellAddr::Header { row, col }
-            } else {
-                CellAddr::Footer { row, col }
-            },
-            prefix_len + col_len + 1 + row_digits,
-        ));
+        let addr = if marker == b'~' {
+            CellAddr::Header { row, col }
+        } else {
+            CellAddr::Footer { row, col }
+        };
+        return Some((addr, A1RefLocks::default(), i + 1 + row_digits));
     }
 
-    let row_digits = after.chars().take_while(|c| c.is_ascii_digit()).count();
+    // Optional `$` before row digits (main-style only).
+    if prefix.is_none()
+        && after_col
+            .as_bytes()
+            .first()
+            .is_some_and(|b| *b == b'$')
+        && after_col
+            .as_bytes()
+            .get(1)
+            .is_some_and(|b| b.is_ascii_digit())
+    {
+        locks.row_absolute = true;
+        i += 1;
+    }
+
+    let tail = s.get(i..)?;
+    let row_digits = tail
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .count();
     if row_digits == 0 {
         return None;
     }
-    let row_num: u32 = after[..row_digits].parse().ok()?;
+    let row_num: u32 = tail[..row_digits].parse().ok()?;
     if row_num == 0 {
         return None;
     }
@@ -320,11 +372,10 @@ pub fn parse_cell_ref_at(s: &str, main_cols: usize) -> Option<(CellAddr, usize)>
         },
         None => CellAddr::Main {
             row: row_num - 1,
-            // Always map unprefixed Excel letters to main/data columns.
             col: parse_excel_column(col_name)?,
         },
     };
-    Some((addr, prefix_len + col_len + row_digits))
+    Some((addr, locks, i + row_digits))
 }
 
 pub fn cell_ref_text(addr: &CellAddr, main_cols: usize) -> String {
@@ -387,20 +438,72 @@ pub fn cell_ref_text(addr: &CellAddr, main_cols: usize) -> String {
     }
 }
 
+/// Like [`cell_ref_text`], but preserves Excel `$` locks for main-region `A1` references.
+pub fn formula_cell_ref_text(addr: &CellAddr, main_cols: usize, locks: A1RefLocks) -> String {
+    match addr {
+        CellAddr::Main { row, col } => {
+            let col_s = excel_column_name(*col as usize);
+            let row_s = (row + 1).to_string();
+            format!(
+                "{}{}{}{}",
+                if locks.col_absolute { "$" } else { "" },
+                col_s,
+                if locks.row_absolute { "$" } else { "" },
+                row_s
+            )
+        }
+        _ => cell_ref_text(addr, main_cols),
+    }
+}
+
 pub fn sheet_qualified_cell_ref_text(sheet_id: u32, addr: &CellAddr, main_cols: usize) -> String {
     format!("${sheet_id}:{}", cell_ref_text(addr, main_cols))
 }
 
-/// Parse `A1:B2` at start of `s`; both ends must be main cells. Returns range + consumed length.
-pub fn parse_main_range_at(s: &str) -> Option<(crate::grid::MainRange, usize)> {
-    let (a, na) = parse_cell_ref_at(s, 0)?;
-    let CellAddr::Main { row: ra, col: ca } = a else {
+pub(crate) fn corner_locks_for_bbox(
+    ra: u32,
+    ca: u32,
+    la: A1RefLocks,
+    rb: u32,
+    cb: u32,
+    lb: A1RefLocks,
+) -> (A1RefLocks, A1RefLocks) {
+    let tl_r = ra.min(rb);
+    let tl_c = ca.min(cb);
+    let br_r = ra.max(rb);
+    let br_c = ca.max(cb);
+    let pick = |r: u32, c: u32| -> A1RefLocks {
+        if r == ra && c == ca {
+            la
+        } else if r == rb && c == cb {
+            lb
+        } else {
+            A1RefLocks::default()
+        }
+    };
+    (pick(tl_r, tl_c), pick(br_r, br_c))
+}
+
+/// Parse `A1:B2` at start of `s`; both ends must be main cells with lock metadata for translation.
+pub fn parse_main_range_formula_at(
+    s: &str,
+) -> Option<(crate::grid::MainRange, A1RefLocks, A1RefLocks, usize)> {
+    let (a, la, na) = parse_cell_ref_at(s, 0)?;
+    let CellAddr::Main {
+        row: ra,
+        col: ca,
+    } = a
+    else {
         return None;
     };
     let rest = s.get(na..)?;
     let rest = rest.strip_prefix(':')?;
-    let (b, nb) = parse_cell_ref_at(rest, 0)?;
-    let CellAddr::Main { row: rb, col: cb } = b else {
+    let (b, lb, nb) = parse_cell_ref_at(rest, 0)?;
+    let CellAddr::Main {
+        row: rb,
+        col: cb,
+    } = b
+    else {
         return None;
     };
     let r0 = ra.min(rb);
@@ -413,7 +516,15 @@ pub fn parse_main_range_at(s: &str) -> Option<(crate::grid::MainRange, usize)> {
         col_start: c0,
         col_end: c1 + 1,
     };
-    Some((range, na + 1 + nb))
+    let (locks_tl, locks_br) = corner_locks_for_bbox(ra, ca, la, rb, cb, lb);
+    Some((range, locks_tl, locks_br, na + 1 + nb))
+}
+
+/// Parse `A1:B2` at start of `s`; both ends must be main cells. Returns range + consumed length.
+pub fn parse_main_range_at(s: &str) -> Option<(crate::grid::MainRange, usize)> {
+    let (range, locks_a, locks_b, na) = parse_main_range_formula_at(s)?;
+    let _ = (locks_a, locks_b);
+    Some((range, na))
 }
 
 #[cfg(test)]
@@ -422,9 +533,32 @@ mod tests {
 
     #[test]
     fn a1_roundtrip() {
-        let (a, n) = parse_cell_ref_at("A1", 1).unwrap();
+        let (a, locks, n) = parse_cell_ref_at("A1", 1).unwrap();
         assert_eq!(n, 2);
         assert_eq!(a, CellAddr::Main { row: 0, col: 0 });
+        assert_eq!(locks, A1RefLocks::default());
+    }
+
+    #[test]
+    fn dollar_absolute_variants_parse() {
+        let (_, l, _) = parse_cell_ref_at("$A1", 1).unwrap();
+        assert!(l.col_absolute && !l.row_absolute);
+        let (_, l, _) = parse_cell_ref_at("A$1", 1).unwrap();
+        assert!(!l.col_absolute && l.row_absolute);
+        let (_, l, _) = parse_cell_ref_at("$A$1", 1).unwrap();
+        assert!(l.col_absolute && l.row_absolute);
+        let (_, _, n) = parse_cell_ref_at("$A$1", 1).unwrap();
+        assert_eq!(n, 4);
+    }
+
+    #[test]
+    fn formula_cell_ref_preserves_locks_roundtrip() {
+        let addr = CellAddr::Main { row: 0, col: 0 };
+        let locks = A1RefLocks {
+            col_absolute: true,
+            row_absolute: true,
+        };
+        assert_eq!(formula_cell_ref_text(&addr, 1, locks), "$A$1");
     }
 
     #[test]
@@ -439,10 +573,10 @@ mod tests {
 
     #[test]
     fn legacy_special_refs_parse() {
-        assert_eq!(parse_cell_ref_at("A~1", 1).unwrap().1, 3);
-        assert_eq!(parse_cell_ref_at("A_1", 1).unwrap().1, 3);
-        assert_eq!(parse_cell_ref_at("[A1", 1).unwrap().1, 3);
-        assert_eq!(parse_cell_ref_at("]A1", 1).unwrap().1, 3);
+        assert_eq!(parse_cell_ref_at("A~1", 1).unwrap().2, 3);
+        assert_eq!(parse_cell_ref_at("A_1", 1).unwrap().2, 3);
+        assert_eq!(parse_cell_ref_at("[A1", 1).unwrap().2, 3);
+        assert_eq!(parse_cell_ref_at("]A1", 1).unwrap().2, 3);
     }
 
     #[test]
