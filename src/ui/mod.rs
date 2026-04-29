@@ -6410,6 +6410,44 @@ impl App {
         Ok(())
     }
 
+    fn movie_show_sort_dialog(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+        cols: &[SortSpec],
+        persist: bool,
+        line_i: usize,
+        line_n: usize,
+        menu_hold: std::time::Duration,
+    ) -> Result<(), RunError> {
+        let dialog_delay = menu_hold.max(std::time::Duration::from_millis(120));
+        let buffer = cols
+            .iter()
+            .map(|spec| {
+                let col_name = addr::excel_column_name(spec.col.saturating_sub(MARGIN_COLS));
+                if spec.desc {
+                    format!("!{col_name}")
+                } else {
+                    col_name
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        self.mode = Mode::SortView {
+            buffer,
+            persist,
+        };
+        self.status = format!("Movie {}/{} dialog: Sort view", line_i + 1, line_n);
+        if self.movie_draw_and_sleep(terminal, dialog_delay)? {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "movie interrupted by user").into());
+        }
+        self.status = format!("Movie {}/{} confirm: Sort view", line_i + 1, line_n);
+        if self.movie_draw_and_sleep(terminal, dialog_delay)? {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "movie interrupted by user").into());
+        }
+        self.mode = Mode::Normal;
+        Ok(())
+    }
+
     fn movie_apply_line_as_user(
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
@@ -6469,6 +6507,67 @@ impl App {
                             )?;
                             self.ops_applied += 1;
                         }
+                        return Ok(true);
+                    }
+                    crate::ops::Op::DuplicateRow { .. } => {
+                        self.movie_show_menu(
+                            terminal,
+                            MenuSection::Insert,
+                            MenuAction::InsertMitosisRow,
+                            "Mitosis row",
+                            line_i,
+                            line_n,
+                            menu_hold,
+                        )?;
+                        self.status = format!("Movie {}/{} apply mitosis row", line_i + 1, line_n);
+                        if self.movie_draw_and_sleep(terminal, confirm_delay)? {
+                            return Err(
+                                io::Error::new(io::ErrorKind::Interrupted, "movie interrupted by user")
+                                    .into(),
+                            );
+                        }
+                        crate::ops::apply_log_line_to_workbook(line, &mut self.workbook, active_sheet)?;
+                        self.view_sheet_id = *active_sheet;
+                        self.sync_active_sheet_cache();
+                        self.sync_persisted_sort_cache_from_workbook();
+                        self.ops_applied += 1;
+                        self.cursor.clamp(&self.state.grid);
+                        return Ok(true);
+                    }
+                    crate::ops::Op::SetViewSortCols { cols } => {
+                        self.movie_show_menu(
+                            terminal,
+                            MenuSection::File,
+                            MenuAction::SortView,
+                            "Sort view",
+                            line_i,
+                            line_n,
+                            menu_hold,
+                        )?;
+                        self.movie_show_sort_dialog(
+                            terminal,
+                            &cols,
+                            true,
+                            line_i,
+                            line_n,
+                            menu_hold,
+                        )?;
+                        self.status = format!("Movie {}/{} apply sort", line_i + 1, line_n);
+                        if self.movie_draw_and_sleep(terminal, confirm_delay)? {
+                            return Err(
+                                io::Error::new(
+                                    io::ErrorKind::Interrupted,
+                                    "movie interrupted by user",
+                                )
+                                .into(),
+                            );
+                        }
+                        crate::ops::apply_log_line_to_workbook(line, &mut self.workbook, active_sheet)?;
+                        self.view_sheet_id = *active_sheet;
+                        self.sync_active_sheet_cache();
+                        self.sync_persisted_sort_cache_from_workbook();
+                        self.ops_applied += 1;
+                        self.cursor.clamp(&self.state.grid);
                         return Ok(true);
                     }
                     _ => {}
