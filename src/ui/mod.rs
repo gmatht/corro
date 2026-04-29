@@ -14644,6 +14644,15 @@ mod tests {
     }
 
     #[test]
+    fn shrink_numeric_display_shrinks_complex_for_narrow_columns() {
+        let raw = "0.5403023059+0.8414709848i";
+        let shrunk = shrink_numeric_display(raw, 20).expect("complex shrink");
+        assert!(shrunk.width() <= 20, "{shrunk}");
+        assert!(shrunk.ends_with('i'), "{shrunk}");
+        assert!(shrunk.contains('+') || shrunk.contains('-'), "{shrunk}");
+    }
+
+    #[test]
     fn fixed_format_uses_scientific_before_infinity_for_large_finite_values() {
         let mut grid = crate::grid::GridBox::from(crate::grid::Grid::new(1, 1));
         let addr = CellAddr::Main { row: 0, col: 0 };
@@ -16298,7 +16307,28 @@ fn spill_blank_suffix_width(grid: &Grid, sheet_row: usize, col_ixs: &[usize], st
 }
 
 fn shrink_numeric_display(text: &str, width: usize) -> Option<String> {
-    let mut s = text.trim().to_string();
+    let trimmed = text.trim();
+    if let Some((re, im, sep)) = parse_complex_display(trimmed) {
+        for decimals in (0..=9).rev() {
+            let re_s = format_fixed_trimmed(re, decimals);
+            let im_s = format_fixed_trimmed(im.abs(), decimals);
+            let cand = format!("{re_s}{sep}{im_s}i");
+            if cand.width() <= width {
+                return Some(cand);
+            }
+        }
+        for decimals in (0..=4).rev() {
+            let re_s = format!("{re:.decimals$e}");
+            let im_s = format!("{:.decimals$e}", im.abs());
+            let cand = format!("{re_s}{sep}{im_s}i");
+            if cand.width() <= width {
+                return Some(cand);
+            }
+        }
+        return None;
+    }
+
+    let mut s = trimmed.to_string();
     if s.parse::<f64>().is_err() || !s.contains('.') {
         return None;
     }
@@ -16316,6 +16346,37 @@ fn shrink_numeric_display(text: &str, width: usize) -> Option<String> {
         Some(s)
     } else {
         None
+    }
+}
+
+fn parse_complex_display(text: &str) -> Option<(f64, f64, char)> {
+    let body = text.strip_suffix('i')?;
+    let mut split_idx = None;
+    let mut split_sep = '+';
+    let mut prev = '\0';
+    for (idx, ch) in body.char_indices().skip(1) {
+        if (ch == '+' || ch == '-') && prev != 'e' && prev != 'E' {
+            split_idx = Some(idx);
+            split_sep = ch;
+        }
+        prev = ch;
+    }
+    let idx = split_idx?;
+    let (re_s, im_s) = body.split_at(idx);
+    let re = re_s.parse::<f64>().ok()?;
+    let im = im_s.parse::<f64>().ok()?;
+    Some((re, im, split_sep))
+}
+
+fn format_fixed_trimmed(n: f64, decimals: usize) -> String {
+    if decimals == 0 {
+        return format!("{n:.0}");
+    }
+    let s = format!("{n:.decimals$}");
+    if s.contains('.') {
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
+    } else {
+        s
     }
 }
 
