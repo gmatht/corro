@@ -251,6 +251,10 @@ pub enum Op {
     DuplicateRow {
         row: u32,
     },
+    /// Duplicate a main-data column into the column to the right (insert-style).
+    DuplicateCol {
+        col: u32,
+    },
     FillRange {
         cells: Vec<(CellAddr, String)>,
     },
@@ -468,6 +472,69 @@ impl Op {
                     state
                         .grid
                         .move_main_rows(dest_row, original_main_rows - dest_row, original_main_rows + 1);
+                }
+                for (addr, value) in copied_cells {
+                    state.grid.set(&addr, value);
+                }
+                state.grid.bump_volatile_seed();
+            }
+            Op::DuplicateCol { col } => {
+                let source_col = *col as usize;
+                let original_main_cols = state.grid.main_cols();
+                if source_col >= original_main_cols {
+                    return;
+                }
+                let dest_col = source_col + 1;
+                let source_global_col = MARGIN_COLS + source_col;
+                let dest_global_col = source_global_col + 1;
+                let mut copied_cells = Vec::new();
+
+                for row in 0..state.grid.main_rows() {
+                    let src = CellAddr::Main {
+                        row: row as u32,
+                        col: source_col as u32,
+                    };
+                    if let Some(value) = state.grid.get(&src) {
+                        copied_cells.push((
+                            CellAddr::Main {
+                                row: row as u32,
+                                col: dest_col as u32,
+                            },
+                            value.to_string(),
+                        ));
+                    }
+                }
+                for (addr, value) in state.grid.iter_nonempty() {
+                    match addr {
+                        CellAddr::Header { row, col } if col as usize == source_global_col => {
+                            copied_cells.push((
+                                CellAddr::Header {
+                                    row,
+                                    col: dest_global_col as u32,
+                                },
+                                value,
+                            ));
+                        }
+                        CellAddr::Footer { row, col } if col as usize == source_global_col => {
+                            copied_cells.push((
+                                CellAddr::Footer {
+                                    row,
+                                    col: dest_global_col as u32,
+                                },
+                                value,
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+
+                state
+                    .grid
+                    .set_main_size(state.grid.main_rows(), original_main_cols.saturating_add(1));
+                if dest_col < original_main_cols {
+                    state
+                        .grid
+                        .move_main_cols(dest_col, original_main_cols - dest_col, original_main_cols + 1);
                 }
                 for (addr, value) in copied_cells {
                     state.grid.set(&addr, value);
@@ -725,6 +792,13 @@ fn parse_op_text(line: &str) -> Option<Op> {
             }
             Some(Op::DuplicateRow { row })
         }
+        "DUPLICATE_COL" => {
+            let col = parts.next()?.parse::<u32>().ok()?;
+            if parts.next().is_some() {
+                return None;
+            }
+            Some(Op::DuplicateCol { col })
+        }
         "SIZE" => {
             let rows = parts.next()?.parse::<u32>().ok()?;
             let cols = parts.next()?.parse::<u32>().ok()?;
@@ -823,6 +897,7 @@ impl Op {
             Op::MoveRowRange { from, count, to } => format!("MOVE ROW {from} {count} {to}"),
             Op::MoveColRange { from, count, to } => format!("MOVE COL {from} {count} {to}"),
             Op::DuplicateRow { row } => format!("DUPLICATE_ROW {row}"),
+            Op::DuplicateCol { col } => format!("DUPLICATE_COL {col}"),
             Op::SetMainSize {
                 main_rows,
                 main_cols,
@@ -1471,6 +1546,7 @@ impl SheetState {
                 })
             }
             Op::DuplicateRow { .. } => None,
+            Op::DuplicateCol { .. } => None,
             Op::FillRange { cells } => Some(Op::FillRange {
                 cells: cells
                     .iter()
@@ -2165,6 +2241,79 @@ mod tests {
         assert_eq!(
             state.grid.get(&CellAddr::Right { col: 0, row: 3 }).as_deref(),
             Some("R")
+        );
+    }
+
+    #[test]
+    fn duplicate_col_round_trips_through_log_line() {
+        let op = Op::DuplicateCol { col: 2 };
+        let line = op.to_log_line(0);
+        assert_eq!(line, "DUPLICATE_COL 2");
+        assert_eq!(parse_op_line(&line), Some(op));
+    }
+
+    #[test]
+    fn duplicate_col_copies_main_header_footer_and_shifts_right_cols() {
+        let mut state = SheetState::new(2, 4);
+        state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 1 }, "S".into());
+        state
+            .grid
+            .set(&CellAddr::Main { row: 1, col: 1 }, "T".into());
+        state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 2 }, "Tail".into());
+        let global_source_col = (MARGIN_COLS + 1) as u32;
+        state.grid.set(
+            &CellAddr::Header {
+                row: 0,
+                col: global_source_col,
+            },
+            "H".into(),
+        );
+        state.grid.set(
+            &CellAddr::Footer {
+                row: 0,
+                col: global_source_col,
+            },
+            "F".into(),
+        );
+
+        Op::DuplicateCol { col: 1 }.apply(&mut state);
+
+        assert_eq!(state.grid.main_cols(), 5);
+        assert_eq!(
+            state.grid.get(&CellAddr::Main { row: 0, col: 2 }).as_deref(),
+            Some("S")
+        );
+        assert_eq!(
+            state.grid.get(&CellAddr::Main { row: 1, col: 2 }).as_deref(),
+            Some("T")
+        );
+        assert_eq!(
+            state.grid.get(&CellAddr::Main { row: 0, col: 3 }).as_deref(),
+            Some("Tail")
+        );
+        assert_eq!(
+            state
+                .grid
+                .get(&CellAddr::Header {
+                    row: 0,
+                    col: global_source_col + 1,
+                })
+                .as_deref(),
+            Some("H")
+        );
+        assert_eq!(
+            state
+                .grid
+                .get(&CellAddr::Footer {
+                    row: 0,
+                    col: global_source_col + 1,
+                })
+                .as_deref(),
+            Some("F")
         );
     }
 

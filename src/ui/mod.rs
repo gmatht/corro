@@ -6534,6 +6534,31 @@ impl App {
                         self.cursor.clamp(&self.state.grid);
                         return Ok(true);
                     }
+                    crate::ops::Op::DuplicateCol { .. } => {
+                        self.movie_show_menu(
+                            terminal,
+                            MenuSection::Insert,
+                            MenuAction::InsertMitosisCol,
+                            "Mitosis col",
+                            line_i,
+                            line_n,
+                            menu_hold,
+                        )?;
+                        self.status = format!("Movie {}/{} apply mitosis col", line_i + 1, line_n);
+                        if self.movie_draw_and_sleep(terminal, confirm_delay)? {
+                            return Err(
+                                io::Error::new(io::ErrorKind::Interrupted, "movie interrupted by user")
+                                    .into(),
+                            );
+                        }
+                        crate::ops::apply_log_line_to_workbook(line, &mut self.workbook, active_sheet)?;
+                        self.view_sheet_id = *active_sheet;
+                        self.sync_active_sheet_cache();
+                        self.sync_persisted_sort_cache_from_workbook();
+                        self.ops_applied += 1;
+                        self.cursor.clamp(&self.state.grid);
+                        return Ok(true);
+                    }
                     crate::ops::Op::SetViewSortCols { cols } => {
                         self.movie_show_menu(
                             terminal,
