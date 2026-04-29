@@ -13,6 +13,22 @@ pub use number::Number;
 thread_local! {
     static EVAL_WORKBOOK: RefCell<Option<WorkbookState>> = const { RefCell::new(None) };
 }
+thread_local! {
+    // Global per-thread stack of (sheet_id, CellAddr) pairs used when
+    // evaluating sheet-qualified references. Using a shared stack (instead
+    // of creating a fresh Vec for every SheetRef) lets us detect cycles that
+    // span multiple sheets (A!X -> B!Y -> A!X) and avoid infinite recursion
+    // / stack overflow.
+    static SHEET_VISITING: RefCell<Vec<(u32, CellAddr)>> = const { RefCell::new(Vec::new()) };
+}
+
+// Lightweight per-thread recursion depth counter to guard against evaluation
+// paths that recurse without pushing to the visiting stack (and so would not
+// otherwise be bounded by MAX_VISIT_DEPTH). We use an RAII guard to ensure
+// the counter is decremented on function exit.
+thread_local! {
+    static EVAL_RECURSION_DEPTH: std::cell::Cell<usize> = std::cell::Cell::new(0);
+}
 
 #[derive(Clone, Debug)]
 pub struct FormulaCopyContext {
@@ -60,6 +76,12 @@ fn workbook_lookup_sheet_ref(sheet: &str) -> Option<(u32, Grid)> {
 }
 const DEFAULT_BUDGET: usize = 10_000;
 
+// Protect against runaway recursion (deep acyclic graphs or missed cycle
+// detection) which can overflow the thread stack. This limits the number of
+// active cell visits on the evaluation stack; when exceeded we return a
+// transient LIMIT error so the caller can handle it rather than crashing.
+const MAX_VISIT_DEPTH: usize = 1_000;
+
 /// Evaluation step budget for one aggregate range scan (many cells).
 pub const EVAL_BUDGET_AGG: usize = 1_000_000;
 
@@ -103,6 +125,10 @@ impl EvalResult {
 
 pub(crate) fn parse_number_literal(s: &str) -> Option<Number> {
     number::parse_number_literal(s)
+}
+
+pub(crate) fn parse_numeric_or_date_literal(s: &str) -> Option<Number> {
+    functions::parse_numeric_or_date_literal(s)
 }
 
 fn resolve_name(name: &str, bindings: &[(String, EvalResult)]) -> Option<EvalResult> {
@@ -593,13 +619,42 @@ fn eval_cell_with_sheet(
     grid: &Grid,
     sheet_id: u32,
     addr: &CellAddr,
-    visiting: &mut Vec<(u32, CellAddr)>,
     bindings: &mut Vec<(String, EvalResult)>,
     budget: &mut usize,
     allow_templates: bool,
 ) -> EvalResult {
+    // Guard overall evaluation recursion depth to avoid blowing the OS stack
+    // from unexpected recursive paths. Use the same logical limit as the
+    // visiting-stack guard.
+    let _depth_guard = {
+        let mut entered = false;
+        EVAL_RECURSION_DEPTH.with(|d| {
+            let cur = d.get();
+            if cur >= MAX_VISIT_DEPTH {
+                entered = false;
+            } else {
+                d.set(cur + 1);
+                entered = true;
+            }
+        });
+        // RAII guard that decrements on drop.
+        struct Guard;
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                EVAL_RECURSION_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+            }
+        }
+        if !entered {
+            return EvalResult::Error("LIMIT");
+        }
+        Guard
+    };
     *budget = budget.saturating_sub(1);
     if *budget == 0 {
+        return EvalResult::Error("LIMIT");
+    }
+    // Guard against too-deep evaluation stacks causing stack overflow.
+    if SHEET_VISITING.with(|stack| stack.borrow().len() >= MAX_VISIT_DEPTH) {
         return EvalResult::Error("LIMIT");
     }
     let raw_owned = grid.get(addr);
@@ -615,10 +670,19 @@ fn eval_cell_with_sheet(
             EvalResult::Text(t.to_string())
         };
     }
-    if visiting.iter().any(|a| a.0 == sheet_id && &a.1 == addr) {
+
+    // Check for circular reference across sheet-qualified visits using the
+    // shared per-thread SHEET_VISITING stack.
+    if SHEET_VISITING.with(|stack| stack.borrow().iter().any(|a| a.0 == sheet_id && &a.1 == addr)) {
         return EvalResult::Error("CIRC");
     }
-    visiting.push((sheet_id, addr.clone()));
+
+    // Push this sheet/cell onto the global stack, evaluate, then pop. We do
+    // not hold the RefMut across the recursive evaluation; we borrow_mut()
+    // only to mutate and then drop so nested borrows are allowed.
+    SHEET_VISITING.with(|stack| {
+        stack.borrow_mut().push((sheet_id, addr.clone()));
+    });
     let r = eval_expr_str(
         &t[1..],
         grid,
@@ -627,7 +691,9 @@ fn eval_cell_with_sheet(
         budget,
         allow_templates,
     );
-    visiting.pop();
+    SHEET_VISITING.with(|stack| {
+        stack.borrow_mut().pop();
+    });
     r
 }
 
@@ -638,14 +704,93 @@ fn eval_cell_inner(
     budget: &mut usize,
     allow_templates: bool,
 ) -> EvalResult {
+    // Guard overall evaluation recursion depth to avoid blowing the OS stack
+    // from unexpected recursive paths. Use the same logical limit as the
+    // visiting-stack guard. This mirrors the check in eval_cell_with_sheet so
+    // non-sheet-qualified evaluation paths are also protected.
+    let _depth_guard = {
+        let mut entered = false;
+        EVAL_RECURSION_DEPTH.with(|d| {
+            let cur = d.get();
+            if cur >= MAX_VISIT_DEPTH {
+                entered = false;
+            } else {
+                d.set(cur + 1);
+                entered = true;
+            }
+        });
+        struct Guard;
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                EVAL_RECURSION_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+            }
+        }
+        if !entered {
+            return EvalResult::Error("LIMIT");
+        }
+        Guard
+    };
     *budget = budget.saturating_sub(1);
     if *budget == 0 {
         return EvalResult::Error("LIMIT");
     }
 
+    // Also guard the local visiting stack depth.
+    if visiting.len() >= MAX_VISIT_DEPTH {
+        return EvalResult::Error("LIMIT");
+    }
+
+    // If this grid is part of the current eval workbook, push a
+    // sheet-qualified entry onto the shared SHEET_VISITING stack so
+    // cross-sheet cycles are visible early (avoids deep recursion
+    // before the sheet-visit detection fires). We only push when
+    // the current grid can be mapped to a sheet id in the active
+    // workbook. Use an RAII guard to ensure the stack is popped on
+    // every exit path.
+    struct SheetGuard {
+        pushed: bool,
+    }
+    impl Drop for SheetGuard {
+        fn drop(&mut self) {
+            if self.pushed {
+                SHEET_VISITING.with(|stack| {
+                    stack.borrow_mut().pop();
+                });
+            }
+        }
+    }
+
+    let mut _sheet_guard = SheetGuard { pushed: false };
+    // Try to find a matching sheet id for this grid; if found, and the
+    // exact (sheet_id, addr) pair is already on the stack, treat as
+    // a circular reference. Otherwise push the pair so nested
+    // sheet-qualified evaluations will see it.
+    if let Some(sheet_id) = {
+        // Lookup by scanning the workbook for a sheet whose stored
+        // GridBox id matches this grid's id. This is a cheap linear
+        // scan and only done when set_eval_context was used.
+        EVAL_WORKBOOK.with(|wb| {
+            wb.borrow()
+                .as_ref()
+                .and_then(|w| w.sheets.iter().find(|s| s.state.grid.id() == grid.id()).map(|s| s.id))
+        })
+    } {
+        if SHEET_VISITING.with(|stack| stack.borrow().iter().any(|a| a.0 == sheet_id && &a.1 == addr)) {
+            return EvalResult::Error("CIRC");
+        }
+        SHEET_VISITING.with(|stack| stack.borrow_mut().push((sheet_id, addr.clone())));
+        _sheet_guard.pushed = true;
+    }
+
     if allow_templates {
         if let Some(formula) = templated_formula(grid, addr) {
-            return eval_expr_str(
+            // Ensure we mark this cell as being visited so cycles via templated
+            // formulas are detected the same way as normal formulas.
+            if visiting.iter().any(|a| a == addr) {
+                return EvalResult::Error("CIRC");
+            }
+            visiting.push(addr.clone());
+            let r = eval_expr_str(
                 &formula[1..],
                 grid,
                 visiting,
@@ -653,6 +798,8 @@ fn eval_cell_inner(
                 budget,
                 false,
             );
+            visiting.pop();
+            return r;
         }
     }
 
@@ -671,7 +818,16 @@ fn eval_cell_inner(
     }
 
     if let Some(expr) = control_formula_expr(grid, addr) {
-        return eval_expr_str(&expr, grid, visiting, &mut Vec::new(), budget, false);
+        // Same cycle-detection handling as for normal `=` formulas: push the
+        // current cell before evaluating the expression so a reference back
+        // to this cell will be detected.
+        if visiting.iter().any(|a| a == addr) {
+            return EvalResult::Error("CIRC");
+        }
+        visiting.push(addr.clone());
+        let r = eval_expr_str(&expr, grid, visiting, &mut Vec::new(), budget, false);
+        visiting.pop();
+        return r;
     }
 
     if visiting.iter().any(|a| a == addr) {
@@ -1085,22 +1241,49 @@ fn eval_ast(
         Ast::Number(n) => EvalResult::Number(n.clone()),
         Ast::Text(s) => EvalResult::Text(s.clone()),
         Ast::Name(name) => resolve_name(name, bindings).unwrap_or(EvalResult::Error("NAME")),
-        Ast::Ref(addr) => eval_cell_inner(grid, addr, visiting, budget, allow_templates),
+        Ast::Ref(addr) => {
+            // Early detect same-sheet cycles before recursing to avoid
+            // consuming another stack frame in obvious circular cases.
+            if visiting.iter().any(|a| a == addr) {
+                // Special-case: when the reference is to the same cell that
+                // we're currently evaluating (direct self-reference via a
+                // templated formula), treat it as a read of the stored/raw
+                // cell text rather than recursively re-evaluating the cell.
+                // This lets left-/header-templates like `=:1*0.1 -- TAX`
+                // compute using the cell's raw value (e.g. "10") without
+                // triggering a CIRC false-positive. If the stored value is
+                // itself a formula, consider it a circular reference.
+                if visiting.last().map_or(false, |last| last == addr) {
+                    let raw_owned = grid.get(addr);
+                    let raw = raw_owned.as_deref().unwrap_or("");
+                    if raw.trim().is_empty() {
+                        return EvalResult::Number(Number::exact_zero());
+                    }
+                    // If the stored cell is a formula, treat as circular.
+                    if raw.trim().starts_with('=') {
+                        return EvalResult::Error("CIRC");
+                    }
+                    if let Some(n) = parse_number_literal(raw) {
+                        return EvalResult::Number(n);
+                    }
+                    return EvalResult::Text(raw.to_string());
+                }
+                return EvalResult::Error("CIRC");
+            }
+            eval_cell_inner(grid, addr, visiting, budget, allow_templates)
+        }
         Ast::SheetRef { sheet_id, addr } => {
+            // Early detect sheet-qualified cycles using the global visiting
+            // stack so we don't recurse into eval_cell_with_sheet and risk
+            // overflowing the thread stack in pathological cases.
+            if SHEET_VISITING.with(|stack| stack.borrow().iter().any(|a| a.0 == *sheet_id && &a.1 == addr)) {
+                return EvalResult::Error("CIRC");
+            }
             let Some(sheet_grid) = workbook_lookup(*sheet_id) else {
                 return EvalResult::Error("SHEET");
             };
-            let mut sheet_visiting: Vec<(u32, CellAddr)> = Vec::new();
             let mut sheet_bindings: Vec<(String, EvalResult)> = Vec::new();
-            eval_cell_with_sheet(
-                &sheet_grid,
-                *sheet_id,
-                addr,
-                &mut sheet_visiting,
-                &mut sheet_bindings,
-                budget,
-                allow_templates,
-            )
+            eval_cell_with_sheet(&sheet_grid, *sheet_id, addr, &mut sheet_bindings, budget, allow_templates)
         }
         Ast::Range(_) => EvalResult::Error("RANGE"),
         Ast::Neg(a) => match eval_ast(a, grid, visiting, bindings, budget, allow_templates) {
@@ -1234,7 +1417,7 @@ fn eval_binary_op(
     EvalResult::Number(out)
 }
 
-fn coerce_cell_number(e: EvalResult) -> Result<Number, EvalResult> {
+pub(super) fn coerce_cell_number(e: EvalResult) -> Result<Number, EvalResult> {
     match e {
         EvalResult::Number(n) => Ok(n),
         EvalResult::Text(s) => {
@@ -1402,7 +1585,7 @@ pub fn refresh_spills(grid: &mut Grid) {
 }
 
 fn format_number(n: &Number) -> String {
-    format_significant_10(n.to_f64())
+    n.format_eval_display(format_significant_10)
 }
 
 fn eval_result_to_string(result: &EvalResult) -> String {
@@ -1574,8 +1757,48 @@ mod tests {
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
         match eval_cell(&g, &CellAddr::Main { row: 0, col: 0 }, &mut v, &mut b) {
-            EvalResult::Number(n) => assert!((nf(&n) - 0.3).abs() < 1e-15),
+            EvalResult::Number(n) => {
+                assert!((nf(&n) - 0.3).abs() < 1e-15);
+                assert_eq!(format!("{}", n), "0.3");
+            }
             e => panic!("expected number {:?}", e),
+        }
+    }
+
+    #[test]
+    fn abs_preserves_exact_rational_display() {
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(1, 2));
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "=ABS(-5)".into());
+        g.set(&CellAddr::Main { row: 0, col: 1 }, "=ABS(-3.25)".into());
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 0 }, &mut v, &mut b) {
+            EvalResult::Number(n) => assert_eq!(format!("{}", n), "5"),
+            e => panic!("expected Abs int {:?}", e),
+        }
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 1 }, &mut v, &mut b) {
+            EvalResult::Number(n) => assert_eq!(format!("{}", n), "3.25"),
+            e => panic!("expected Abs dec {:?}", e),
+        }
+    }
+
+    #[test]
+    fn round_mod_keeps_exact_where_applicable() {
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(1, 3));
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "=ROUND(0.126,2)".into());
+        g.set(&CellAddr::Main { row: 0, col: 1 }, "=MOD(17,7)".into());
+        g.set(&CellAddr::Main { row: 0, col: 2 }, "=ROUND(33145.764,-3)".into());
+
+        let cases = [(0usize, "0.13"), (1, "3"), (2, "33000")];
+        for &(col, want) in &cases {
+            let mut v = Vec::new();
+            let mut b = DEFAULT_BUDGET;
+            match eval_cell(&g, &CellAddr::Main { row: 0, col: col as u32 }, &mut v, &mut b) {
+                EvalResult::Number(n) => assert_eq!(format!("{}", n), want),
+                e => panic!("col {}: {:?}", col, e),
+            }
         }
     }
 
@@ -2561,6 +2784,27 @@ mod tests {
             EvalResult::Error(e) => assert_eq!(e, "CIRC"),
             e => panic!("expected CIRC {:?}", e),
         }
+    }
+
+    #[test]
+    fn cross_sheet_circular_ref() {
+        // A!A1 -> B!A1 -> A!A1 should be detected as CIRC using SHEET_VISITING.
+        let mut wb = crate::ops::WorkbookState::new();
+        // Ensure two sheets with ids 1 and 2
+        let mut sheet2 = crate::ops::SheetState::new(1, 1);
+        sheet2.grid.set(&CellAddr::Main { row: 0, col: 0 }, "=$1:A1".into());
+        // Sheet 1 references sheet 2
+        wb.sheets[0].state.grid.set(&CellAddr::Main { row: 0, col: 0 }, "=#2!A1".into());
+        wb.add_sheet("Sheet2".to_string(), sheet2);
+        let guard = set_eval_context(&wb);
+        let sheet1_grid = workbook_lookup(1).expect("sheet1");
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&sheet1_grid, &CellAddr::Main { row: 0, col: 0 }, &mut v, &mut b) {
+            EvalResult::Error(e) => assert_eq!(e, "CIRC"),
+            e => panic!("expected CIRC {:?}", e),
+        }
+        drop(guard);
     }
 
     #[test]

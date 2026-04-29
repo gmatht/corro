@@ -4,6 +4,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::formula::{parse_numeric_or_date_literal, Number};
 
 pub const HEADER_ROWS: usize = 999_999_999;
 pub const FOOTER_ROWS: usize = 999_999_999;
@@ -123,13 +126,20 @@ pub trait GridImpl {
 }
 
 /// A boxed handle to an abstract Grid implementation.
+static GRIDBOX_NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
 pub struct GridBox {
     pub inner: Box<dyn GridImpl>,
+    id: u64,
 }
 
 impl GridBox {
     pub fn new<G: GridImpl + 'static>(g: G) -> Self {
-        Self { inner: Box::new(g) }
+        Self { inner: Box::new(g), id: GRIDBOX_NEXT_ID.fetch_add(1, Ordering::Relaxed) }
+    }
+
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     pub fn main_rows(&self) -> usize {
@@ -379,7 +389,7 @@ pub enum FormatScope {
 }
 
 /// Full sheet with sparse storage for each editable region.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Grid {
     /// Main cells; absent key = empty.
     pub main_cells: HashMap<(u32, u32), String>,
@@ -1349,9 +1359,7 @@ impl From<Grid> for GridBox {
 
 impl Clone for GridBox {
     fn clone(&self) -> Self {
-        GridBox {
-            inner: self.inner.clone_box(),
-        }
+        GridBox { inner: self.inner.clone_box(), id: self.id }
     }
 }
 
@@ -1371,16 +1379,14 @@ impl Default for GridBox {
 enum SortKey<'a> {
     Blank,
     Text(&'a str),
-    Number(f64),
+    Number(Number),
 }
-
-impl<'a> Eq for SortKey<'a> {}
 
 fn sort_key(value: &str) -> SortKey<'_> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         SortKey::Blank
-    } else if let Ok(n) = trimmed.parse::<f64>() {
+    } else if let Some(n) = parse_numeric_or_date_literal(trimmed) {
         SortKey::Number(n)
     } else {
         SortKey::Text(trimmed)

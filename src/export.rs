@@ -728,7 +728,12 @@ pub fn generic_interop_cell_text(
 
     let v = crate::ods::cell_export_value_string(grid, logical_row, global_col);
     if !v.is_empty() {
-        if formula::split_labeled_formula(&v).is_some() {
+        if let Some((_expr, label)) = formula::split_labeled_formula(&v) {
+            // Bottom control-strip row (`~1`): Generic shows column labels only (`TAX`), not `=… -- TAX`,
+            // matching DESIGN "labeled column headers" (see `generic_tsv_uses_tsv_header_and_interop_formula`).
+            if logical_row == HEADER_ROWS - 1 {
+                return Some(after_rebase(label, excel_list_arg_comma));
+            }
             let s1 = finish_generic_interop(v, rebase);
             return Some(after_rebase(&s1, excel_list_arg_comma));
         }

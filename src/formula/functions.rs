@@ -1,9 +1,11 @@
 use super::{
-    eval_ast, eval_binary_float, eval_cell_inner, eval_sum, parse_number_literal, Ast, EvalResult,
-    Number,
+    coerce_cell_number, eval_ast, eval_binary_float, eval_cell_inner, eval_sum, parse_number_literal,
+    Ast, EvalResult, Number,
 };
+use crate::formula::number::{mod_trunc_toward_zero, round_rational_decimal_places};
 use crate::grid::{CellAddr, GridBox as Grid, MainRange};
 use chrono::{Datelike, Local, NaiveDate, NaiveDateTime, Timelike};
+use num_traits::Zero;
 use std::hash::{Hash, Hasher};
 
 pub(crate) fn eval_builtin(
@@ -62,25 +64,9 @@ pub(crate) fn eval_builtin(
             allow_templates,
             NumericAgg::Product,
         ),
-        "ABS" => eval_unary_numeric(
-            &args,
-            grid,
-            visiting,
-            bindings,
-            budget,
-            allow_templates,
-            f64::abs,
-        ),
+        "ABS" => eval_abs(&args, grid, visiting, bindings, budget, allow_templates),
         "ROUND" => eval_round(&args, grid, visiting, bindings, budget, allow_templates),
-        "MOD" => eval_binary_numeric(
-            &args,
-            grid,
-            visiting,
-            bindings,
-            budget,
-            allow_templates,
-            |x, y| x % y,
-        ),
+        "MOD" => eval_mod(&args, grid, visiting, bindings, budget, allow_templates),
         "POWER" => {
             if args.len() != 2 {
                 EvalResult::Error("ARGS")
@@ -220,6 +206,149 @@ enum NumericAgg {
     Product,
 }
 
+fn eval_abs(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    if args.len() != 1 {
+        return EvalResult::Error("ARGS");
+    }
+    let ea = eval_ast(
+        &args[0],
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+    )
+    .scalar_coerce();
+    match coerce_cell_number(ea) {
+        Ok(n) => EvalResult::Number(n.abs()),
+        Err(e) => e,
+    }
+}
+
+fn round_builtin_decimal_places(nd: &Number) -> Option<i32> {
+    let f = nd.to_f64();
+    if !f.is_finite() {
+        return None;
+    }
+    let p = f.round().clamp(-30.0, 30.0);
+    Some(p as i32)
+}
+
+fn eval_round(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    if args.len() != 2 {
+        return EvalResult::Error("ARGS");
+    }
+    let ea = eval_ast(
+        &args[0],
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+    )
+    .scalar_coerce();
+    let na = match coerce_cell_number(ea) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let eb = eval_ast(
+        &args[1],
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+    )
+    .scalar_coerce();
+    let digits_n = match coerce_cell_number(eb) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    if let Number::Exact(r) = &na {
+        if let Some(place) = round_builtin_decimal_places(&digits_n) {
+            return EvalResult::Number(Number::Exact(round_rational_decimal_places(r, place)));
+        }
+    }
+    let n = na.to_f64();
+    let digits = digits_n.to_f64();
+    let factor = 10f64.powf(digits);
+    EvalResult::Number(Number::from_f64_unchecked((n * factor).round() / factor))
+}
+
+fn eval_mod(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    if args.len() != 2 {
+        return EvalResult::Error("ARGS");
+    }
+    let ea = eval_ast(
+        &args[0],
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+    )
+    .scalar_coerce();
+    let na = match coerce_cell_number(ea) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let eb = eval_ast(
+        &args[1],
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+    )
+    .scalar_coerce();
+    let nb = match coerce_cell_number(eb) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    match (&na, &nb) {
+        (Number::Exact(a), Number::Exact(b)) => {
+            if b.is_zero() {
+                return EvalResult::Number(Number::from_f64_unchecked(f64::NAN));
+            }
+            if let Some(rem) = mod_trunc_toward_zero(a, b) {
+                return EvalResult::Number(Number::Exact(rem));
+            }
+            EvalResult::Number(Number::from_f64_unchecked(f64::NAN))
+        }
+        _ => eval_binary_float(
+            &args[0],
+            &args[1],
+            grid,
+            visiting,
+            bindings,
+            budget,
+            allow_templates,
+            std::ops::Rem::rem,
+        ),
+    }
+}
+
 fn eval_numeric_aggregate(
     args: &[Ast],
     grid: &Grid,
@@ -293,30 +422,6 @@ fn eval_unary_numeric(
     }
 }
 
-fn eval_binary_numeric(
-    args: &[Ast],
-    grid: &Grid,
-    visiting: &mut Vec<CellAddr>,
-    bindings: &mut Vec<(String, EvalResult)>,
-    budget: &mut usize,
-    allow_templates: bool,
-    f: fn(f64, f64) -> f64,
-) -> EvalResult {
-    if args.len() != 2 {
-        return EvalResult::Error("ARGS");
-    }
-    eval_binary_float(
-        &args[0],
-        &args[1],
-        grid,
-        visiting,
-        bindings,
-        budget,
-        allow_templates,
-        f,
-    )
-}
-
 pub(crate) fn parse_date_serial_literal(s: &str) -> Option<f64> {
     let t = s.trim();
     if t.len() != 10 {
@@ -334,43 +439,6 @@ pub(crate) fn parse_date_serial_literal(s: &str) -> Option<f64> {
 
 pub(crate) fn parse_numeric_or_date_literal(s: &str) -> Option<Number> {
     parse_number_literal(s).or_else(|| parse_date_serial_literal(s).map(Number::approx))
-}
-
-fn eval_round(
-    args: &[Ast],
-    grid: &Grid,
-    visiting: &mut Vec<CellAddr>,
-    bindings: &mut Vec<(String, EvalResult)>,
-    budget: &mut usize,
-    allow_templates: bool,
-) -> EvalResult {
-    if args.len() != 2 {
-        return EvalResult::Error("ARGS");
-    }
-    let n = match numeric_value(eval_ast(
-        &args[0],
-        grid,
-        visiting,
-        bindings,
-        budget,
-        allow_templates,
-    )) {
-        Some(n) => n,
-        None => return EvalResult::Error("VALUE"),
-    };
-    let digits = match numeric_value(eval_ast(
-        &args[1],
-        grid,
-        visiting,
-        bindings,
-        budget,
-        allow_templates,
-    )) {
-        Some(n) => n,
-        None => return EvalResult::Error("VALUE"),
-    };
-    let factor = 10f64.powf(digits);
-    EvalResult::Number(Number::from_f64_unchecked((n * factor).round() / factor))
 }
 
 fn eval_trim(

@@ -1878,7 +1878,7 @@ fn place_full_logical_cell(
         };
         state.grid.set(&target, cell);
     } else {
-        state.grid.set(&target, value.to_string());
+        state.grid.set(&target, normalize_ods_import_plain_cell(value));
     }
 }
 
@@ -1976,6 +1976,15 @@ fn apply_ods_table_cell(
     }
 }
 
+/// Map plain ODF cell text to Corro storage: decimal literals become exact [`Number`] literals.
+fn normalize_ods_import_plain_cell(value: &str) -> String {
+    if let Some(n) = crate::formula::parse_number_literal(value.trim()) {
+        n.to_formula_string()
+    } else {
+        value.to_string()
+    }
+}
+
 fn set_ods_cell(
     state: &mut SheetState,
     odf_table_row: usize,
@@ -1999,7 +2008,7 @@ fn set_ods_cell(
             let body = ods_openformula_body_to_cell_text(f);
             state.grid.set(&target, format!("={body}"));
         } else {
-            state.grid.set(&target, value.to_string());
+            state.grid.set(&target, normalize_ods_import_plain_cell(value));
         }
         return;
     }

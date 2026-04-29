@@ -65,9 +65,16 @@ func resolveEntryPath(rootDir string, rawPath string) string {
 		return filepath.Clean(rawPath)
 	}
 
+	candidates := make([]string, 0, 3)
 	cwd, err := os.Getwd()
 	if err == nil {
-		candidate := filepath.Clean(filepath.Join(cwd, rawPath))
+		candidates = append(candidates, filepath.Clean(filepath.Join(cwd, rawPath)))
+	}
+	candidates = append(candidates, filepath.Clean(filepath.Join(rootDir, rawPath)))
+	// Common case: script lives under repo/scripts and paths are repo-relative.
+	candidates = append(candidates, filepath.Clean(filepath.Join(filepath.Dir(rootDir), rawPath)))
+
+	for _, candidate := range candidates {
 		if _, statErr := os.Stat(candidate); statErr == nil {
 			return candidate
 		}
@@ -85,8 +92,9 @@ func (p *parseState) finish(entries *[]movieEntry, rootDir string, lineNo int) e
 		return fmt.Errorf("line %d: incomplete block (need FILE, TITLE, DESC)", lineNo)
 	}
 
-	if !strings.EqualFold(filepath.Ext(p.filePath), ".corro") {
-		return fmt.Errorf("line %d: FILE must end with .corro: %s", p.start, p.filePath)
+	ext := strings.ToLower(filepath.Ext(p.filePath))
+	if ext != ".corro" && ext != ".cast" {
+		return fmt.Errorf("line %d: FILE must end with .corro or .cast: %s", p.start, p.filePath)
 	}
 
 	resolved := resolveEntryPath(rootDir, p.filePath)
@@ -134,6 +142,9 @@ func parseMovieScript(scriptPath string) ([]movieEntry, error) {
 			if err := state.finish(&entries, rootDir, lineNo); err != nil {
 				return nil, err
 			}
+			continue
+		}
+		if strings.HasPrefix(line, "#") {
 			continue
 		}
 
@@ -217,7 +228,11 @@ func runCommandStreaming(ctx context.Context, command string, args ...string) er
 
 func printTitleWithCowsay(ctx context.Context, title string, forceWSL bool) {
 	switch {
-	case !forceWSL && commandExists("cowsay"):
+	case forceWSL && commandExists("wsl"):
+		if err := runCommandStreaming(ctx, "wsl", "cowsay", title); err == nil {
+			return
+		}
+	case commandExists("cowsay"):
 		if err := runCommandStreaming(ctx, "cowsay", title); err == nil {
 			return
 		}
@@ -232,10 +247,26 @@ func printTitleWithCowsay(ctx context.Context, title string, forceWSL bool) {
 }
 
 func runCorroMovie(ctx context.Context, corroBin string, filePath string, forceWSL bool) error {
-	if forceWSL {
+	if forceWSL && commandExists("wsl") {
 		return runCommandStreaming(ctx, "wsl", corroBin, "--movie", filePath)
 	}
 	return runCommandStreaming(ctx, corroBin, "--movie", filePath)
+}
+
+func runCastMovie(ctx context.Context, filePath string, forceWSL bool) error {
+	if forceWSL && commandExists("wsl") {
+		return runCommandStreaming(ctx, "wsl", "asciinema", "play", filePath)
+	}
+
+	if commandExists("asciinema") {
+		return runCommandStreaming(ctx, "asciinema", "play", filePath)
+	}
+
+	if commandExists("wsl") {
+		return runCommandStreaming(ctx, "wsl", "asciinema", "play", filePath)
+	}
+
+	return errors.New("asciinema not found (install asciinema or use -wsl)")
 }
 
 func main() {
@@ -291,6 +322,7 @@ func main() {
 		fmt.Printf("\n[%d/%d] %s\n", idx+1, total, entry.FilePath)
 		ansiBlueBackground(os.Stdout)
 		printTitleWithCowsay(ctx, entry.Title, *wslFlag)
+		fmt.Fprintln(os.Stdout)
 
 		if err := typeText(ctx, os.Stdout, entry.Desc, *cpsFlag); err != nil {
 			fmt.Fprintf(os.Stderr, "typing failed: %v\n", err)
@@ -300,8 +332,15 @@ func main() {
 		time.Sleep(pause)
 		ansiResetAndClear(os.Stdout)
 
-		if err := runCorroMovie(ctx, *corroBinFlag, entry.FilePath, *wslFlag); err != nil {
-			fmt.Fprintf(os.Stderr, "failed running corro --movie for %s: %v\n", entry.FilePath, err)
+		var runErr error
+		switch strings.ToLower(filepath.Ext(entry.FilePath)) {
+		case ".cast":
+			runErr = runCastMovie(ctx, entry.FilePath, *wslFlag)
+		default:
+			runErr = runCorroMovie(ctx, *corroBinFlag, entry.FilePath, *wslFlag)
+		}
+		if runErr != nil {
+			fmt.Fprintf(os.Stderr, "failed running movie for %s: %v\n", entry.FilePath, runErr)
 			os.Exit(1)
 		}
 	}

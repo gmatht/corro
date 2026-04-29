@@ -5985,12 +5985,38 @@ impl App {
     }
 
     fn movie_move_cursor_to_addr(&mut self, addr: &CellAddr) {
-        let (r, c) = crate::addr::addr_to_sheet_cursor(
-            addr,
-            crate::addr::MainRows(self.state.grid.main_rows()),
-            crate::addr::MainCols(self.state.grid.main_cols()),
-        );
-        self.cursor = SheetCursor { row: r.0, col: c.0 };
+        // Movie replay can target cells beyond the current in-memory bounds.
+        // Grow main dimensions first so address->cursor mapping doesn't clamp away
+        // the final data row/col during replay.
+        let mut needed_rows = self.state.grid.main_rows();
+        let mut needed_cols = self.state.grid.main_cols();
+        match addr {
+            CellAddr::Main { row, col } => {
+                needed_rows = needed_rows.max(*row as usize + 1);
+                needed_cols = needed_cols.max(*col as usize + 1);
+            }
+            CellAddr::Left { row, .. } | CellAddr::Right { row, .. } => {
+                needed_rows = needed_rows.max(*row as usize + 1);
+            }
+            CellAddr::Header { .. } | CellAddr::Footer { .. } => {}
+        }
+        if needed_rows != self.state.grid.main_rows() || needed_cols != self.state.grid.main_cols() {
+            self.state.grid.set_main_size(needed_rows, needed_cols);
+            self.commit_active_sheet_cache();
+        }
+
+        let (row, col) = match addr {
+            CellAddr::Header { row, col } => (*row as usize, *col as usize),
+            CellAddr::Main { row, col } => (HEADER_ROWS + *row as usize, MARGIN_COLS + *col as usize),
+            CellAddr::Footer { row, col } => {
+                (HEADER_ROWS + self.state.grid.main_rows() + *row as usize, *col as usize)
+            }
+            CellAddr::Left { row, col } => (HEADER_ROWS + *row as usize, *col as usize),
+            CellAddr::Right { row, col } => {
+                (HEADER_ROWS + *row as usize, MARGIN_COLS + self.state.grid.main_cols() + *col as usize)
+            }
+        };
+        self.cursor = SheetCursor { row, col };
         self.cursor.clamp(&self.state.grid);
     }
 
@@ -6326,7 +6352,7 @@ impl App {
                 path.display()
             );
             terminal.draw(|f| self.draw(f))?;
-            std::thread::sleep(confirm_delay);
+            std::thread::sleep(confirm_delay * 2);
             Ok(())
         })();
 

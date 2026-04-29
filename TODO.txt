@@ -1,37 +1,7 @@
-* A lot of the issues is that the tradition TUI menu where you press Alt-F to get to the file subment and Alt-H to get to the Help submenu etc. doesn't seem to be done you. This makes it hard to test features, and is a bit of a blocker. ✓
+Stop movie mode putting all but one data row in the footer. Put data rows in the data rows like in normal mode. -- Investigate and Fix
+Seperate UI from datastructures, only communicate via log -- See: "plans/log_replay_determinism_audit_54b5150d.plan.md" but note that CONTINUE_LINE is an intensional way of allowing one LOG operation to spread across multiple lines, and is not a problem. Focus on the seperation, but also add a 1UI1LOG_violations.md file for review.
+Add a "Rational" format option to display ration numbers in n/m notation (Still display f64 as decimals).
+Add support for asciinema casts in scripts/ movies in place of corro files.
+Implement absolute ($A$1) and relative (A1) fill references -- see: plans/absolute_fill_references_2c6bf3e2.plan.md
 
-* entering TOTAL now give JSON: unrecognized log line ✓
-
-* Export to ASCII table ✓
-How do we do this? It says a, but by design a will just enter a in the current cell. ✓
-
-* Export all including headers etc., Export Selection only ✓
-> When cells selected Alt-E seems to still export all. ✓
-> Now it doesn't even seem to recognise Alt-E ✓
-
-* Give example of formula Referencing Header/footer/margin cells ✓
-> DESIGN.md specification doesn't seem to work. Fix or give an exact example of a format that works. ✓
-
-* export to ODT (not implemented - requires additional dependency) ✓
->Cannot test without menu ✓
-
-* slightly colour row/col/margins that border on data. ✓
-> I don't see any colour ✓
-
-* Moving to _B shouldn't expand ^* etc. (This makes view jump) ✓
-> I still see the headers ^* being expanded in the view when I scroll down ✓
-
-* When selecting, holding down ALT and pressing arrow keys should move selection arround, submitting to disk a `MOVE [selection] [destination]` command at the end of the corro on-disk file. ✓
-
-* Columns should expand to up to a default 20 chars wide. This should be configurable per file, by adding document settings to the menu and appending `MAX_COL_WIDTH [NEW_WIDTH]` to the file. The user should also be able to override this per column. ✓
-
-* There should be an option in the menu to Sort the view. This doesn't change the underlying data, but sorts the view by the Column(s) the user chooses. The user can choose to set the default view in the file, (`SORT [COL1 [COL2 [...]]]`) or just temporarily for this session. Default to temp. ✓
-> The option exists but it doesn't actually sort.
-
-* Option to run as auto-merge for git. Check that order that conflicting log entries is merged does not affect resulting table. If not, then just write both sets of LOG entries in the original order without the <<<<<<<<<< and >>>>>>>>>> etc. to resolve the merge conflict. Otherwise leave it to human intervention. ✓
-
-* Should look at expanding Menu to traditional File...Help menu with dropdown submenus. Alt-F to open File Submenu, Alt-H to open Help submenu etc. ✓
-
-* After entering just '=' to cell, arrow keys should select which cell this cell is equal to. ✓
-  - Otherwise UpDown arrow keys when editing a cell, should submit edit and go to next/previous cell ✓
-> This is partially implemented, but arrowing here should not change the cell being edited. This should be a seperate kind of selection. ✓
+(End of file)
