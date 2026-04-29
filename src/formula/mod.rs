@@ -144,6 +144,7 @@ fn resolve_name(name: &str, bindings: &[(String, EvalResult)]) -> Option<EvalRes
     match name {
         "π" => Some(EvalResult::Number(Number::from_f64_unchecked(std::f64::consts::PI))),
         "e" => Some(EvalResult::Number(Number::from_f64_unchecked(std::f64::consts::E))),
+        "i" => Some(EvalResult::Number(Number::from_complex_unchecked(0.0, 1.0))),
         "c" => Some(EvalResult::Number(Number::from_i64(299_792_458))),
         _ => None,
     }
@@ -1712,6 +1713,47 @@ pub(super) fn eval_binary_float(
     EvalResult::Number(Number::from_f64_unchecked(f(na.to_f64(), nb.to_f64())))
 }
 
+/// Real-first binary helper with complex fallback for operations that leave the real domain.
+fn eval_binary_float_with_complex_fallback(
+    a: &Ast,
+    b: &Ast,
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+    real: fn(f64, f64) -> f64,
+    complex: fn(num_complex::Complex64, num_complex::Complex64) -> num_complex::Complex64,
+) -> EvalResult {
+    let ea = eval_ast(
+        a,
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+    )
+    .scalar_coerce();
+    let eb = eval_ast(
+        b,
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+    )
+    .scalar_coerce();
+    let na = match coerce_cell_number(ea) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let nb = match coerce_cell_number(eb) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    EvalResult::Number(na.apply_binary_f64_with_complex_fallback(nb, real, complex))
+}
+
 fn eval_sum(
     arg: &Ast,
     grid: &Grid,
@@ -2122,6 +2164,32 @@ mod tests {
     }
 
     #[test]
+    fn complex_fallback_for_sqrt_and_pow_display() {
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(1, 4));
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "=SQRT(-1)".into());
+        g.set(&CellAddr::Main { row: 0, col: 1 }, "=(-1)^0.5".into());
+        g.set(&CellAddr::Main { row: 0, col: 2 }, "=SQRT(-1)+2".into());
+        g.set(&CellAddr::Main { row: 0, col: 3 }, "=SQRT(-1)*SQRT(-1)".into());
+
+        assert_eq!(
+            cell_effective_display(&g, &CellAddr::Main { row: 0, col: 0 }),
+            "0+1i"
+        );
+        assert_eq!(
+            cell_effective_display(&g, &CellAddr::Main { row: 0, col: 1 }),
+            "0+1i"
+        );
+        assert_eq!(
+            cell_effective_display(&g, &CellAddr::Main { row: 0, col: 2 }),
+            "2+1i"
+        );
+        assert_eq!(
+            cell_effective_display(&g, &CellAddr::Main { row: 0, col: 3 }),
+            "-1+0i"
+        );
+    }
+
+    #[test]
     fn numeric_display_trims_fractional_trailing_zeroes() {
         assert_eq!(format_significant_10(0.4040000), "0.404");
         assert_eq!(format_significant_10(100.0), "100");
@@ -2256,10 +2324,11 @@ mod tests {
 
     #[test]
     fn math_constants_evaluate() {
-        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(1, 3));
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(1, 4));
         g.set(&CellAddr::Main { row: 0, col: 0 }, "=sin(π)".into());
         g.set(&CellAddr::Main { row: 0, col: 1 }, "=e".into());
         g.set(&CellAddr::Main { row: 0, col: 2 }, "=c".into());
+        g.set(&CellAddr::Main { row: 0, col: 3 }, "=e^i".into());
 
         let mut v = Vec::new();
         let mut b = DEFAULT_BUDGET;
@@ -2280,6 +2349,16 @@ mod tests {
         match eval_cell(&g, &CellAddr::Main { row: 0, col: 2 }, &mut v, &mut b) {
             EvalResult::Number(n) => assert!((nf(&n) - 299_792_458.0).abs() < 1e-12),
             e => panic!("expected c {:?}", e),
+        }
+
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 3 }, &mut v, &mut b) {
+            EvalResult::Number(Number::Complex(c)) => {
+                assert!((c.re - 1.0f64.cos()).abs() < 1e-12);
+                assert!((c.im - 1.0f64.sin()).abs() < 1e-12);
+            }
+            e => panic!("expected complex e^i {:?}", e),
         }
     }
 

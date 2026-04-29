@@ -1,6 +1,6 @@
 use super::{
-    coerce_cell_number, eval_ast, eval_binary_float, eval_cell_inner, eval_sum, parse_number_literal,
-    Ast, EvalResult, Number,
+    coerce_cell_number, eval_ast, eval_binary_float, eval_binary_float_with_complex_fallback,
+    eval_cell_inner, eval_sum, parse_number_literal, Ast, EvalResult, Number,
 };
 use crate::formula::number::{mod_trunc_toward_zero, round_rational_decimal_places};
 use crate::grid::{CellAddr, GridBox as Grid, MainRange};
@@ -71,7 +71,7 @@ pub(crate) fn eval_builtin(
             if args.len() != 2 {
                 EvalResult::Error("ARGS")
             } else {
-                eval_binary_float(
+                eval_binary_float_with_complex_fallback(
                     &args[0],
                     &args[1],
                     grid,
@@ -79,11 +79,12 @@ pub(crate) fn eval_builtin(
                     bindings,
                     budget,
                     allow_templates,
-                    |x, y| x.powf(y),
+                    f64::powf,
+                    |x, y| x.powc(y),
                 )
             }
         }
-        "SQRT" => eval_unary_numeric(
+        "SQRT" => eval_unary_numeric_with_complex_fallback(
             &args,
             grid,
             visiting,
@@ -91,6 +92,7 @@ pub(crate) fn eval_builtin(
             budget,
             allow_templates,
             f64::sqrt,
+            num_complex::Complex64::sqrt,
         ),
         "PI" => {
             if !args.is_empty() {
@@ -382,12 +384,12 @@ fn eval_numeric_aggregate(
         }
         NumericAgg::Min => nums
             .into_iter()
-            .min_by(|a, b| a.partial_cmp(b).unwrap())
+            .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
             .map(EvalResult::Number)
             .unwrap_or(EvalResult::Number(Number::exact_zero())),
         NumericAgg::Max => nums
             .into_iter()
-            .max_by(|a, b| a.partial_cmp(b).unwrap())
+            .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
             .map(EvalResult::Number)
             .unwrap_or(EvalResult::Number(Number::exact_zero())),
         NumericAgg::Product => EvalResult::Number(
@@ -420,6 +422,35 @@ fn eval_unary_numeric(
         Some(n) => EvalResult::Number(Number::from_f64_unchecked(f(n))),
         None => EvalResult::Error("VALUE"),
     }
+}
+
+fn eval_unary_numeric_with_complex_fallback(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+    real: fn(f64) -> f64,
+    complex: fn(num_complex::Complex64) -> num_complex::Complex64,
+) -> EvalResult {
+    if args.len() != 1 {
+        return EvalResult::Error("ARGS");
+    }
+    let evaluated = eval_ast(
+        &args[0],
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+    )
+    .scalar_coerce();
+    let number = match coerce_cell_number(evaluated) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    EvalResult::Number(number.apply_unary_f64_with_complex_fallback(real, complex))
 }
 
 pub(crate) fn parse_date_serial_literal(s: &str) -> Option<f64> {
