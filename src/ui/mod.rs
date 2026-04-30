@@ -7577,7 +7577,7 @@ impl App {
                 let numeric_like = formatted.trim().parse::<f64>().is_ok()
                     || matches!(
                         cell_fmt.number,
-                        Some(NumberFormat::Rational | NumberFormat::DecimalGeneric)
+                        None | Some(NumberFormat::Rational | NumberFormat::DecimalGeneric)
                     );
                 let allow_text_spill =
                     spill_row && !is_agg_cell && !numeric_like && align != Some(TextAlign::Right);
@@ -7597,7 +7597,7 @@ impl App {
                         }
                         let rational_hint = if matches!(
                             cell_fmt.number,
-                            Some(NumberFormat::Rational | NumberFormat::DecimalGeneric)
+                            None | Some(NumberFormat::Rational | NumberFormat::DecimalGeneric)
                         )
                             && would_ellipsis_hide_decimal_point(&formatted, cw)
                         {
@@ -9851,6 +9851,40 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                 KeyCode::Enter => {
                     mode = self.commit_edit_and_move_down(buffer)?;
                 }
+                KeyCode::Home
+                    if is_formula(buffer)
+                        && !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                    =>
+                {
+                    self.edit_special_palette = false;
+                    *formula_cursor = None;
+                    self.edit_cursor = Some(0);
+                }
+                KeyCode::End
+                    if is_formula(buffer)
+                        && !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                    =>
+                {
+                    self.edit_special_palette = false;
+                    *formula_cursor = None;
+                    self.edit_cursor = Some(buffer.chars().count());
+                }
+                KeyCode::Delete if is_formula(buffer) => {
+                    self.edit_special_palette = false;
+                    *formula_cursor = None;
+                    let len = buffer.chars().count();
+                    let pos = self.edit_cursor.unwrap_or(len).min(len);
+                    if pos < len {
+                        let mut chars: Vec<char> = buffer.chars().collect();
+                        chars.remove(pos);
+                        *buffer = chars.into_iter().collect();
+                        self.edit_cursor = Some(pos);
+                    }
+                }
                 KeyCode::Delete => {
                     self.edit_special_palette = false;
                     *formula_cursor = None;
@@ -9984,6 +10018,18 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                     chars.insert(pos, c);
                     *buffer = chars.into_iter().collect();
                     *cursor = pos + 1;
+                }
+                KeyCode::Backspace if is_formula(buffer) => {
+                    self.edit_special_palette = false;
+                    *formula_cursor = None;
+                    let len = buffer.chars().count();
+                    let pos = self.edit_cursor.unwrap_or(len).min(len);
+                    if pos > 0 {
+                        let mut chars: Vec<char> = buffer.chars().collect();
+                        chars.remove(pos - 1);
+                        *buffer = chars.into_iter().collect();
+                        self.edit_cursor = Some(pos - 1);
+                    }
                 }
                 KeyCode::Backspace => {
                     *formula_cursor = None;
@@ -13557,6 +13603,44 @@ mod tests {
     }
 
     #[test]
+    fn formula_edit_delete_backspace_and_home_end_use_text_caret() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 1);
+        app.mode = Mode::Edit {
+            buffer: "=A1+B2".into(),
+            formula_cursor: None,
+            fit_to_content_on_commit: false,
+        };
+
+        // Forward delete removes the '+' (caret before '+').
+        app.edit_cursor = Some(3);
+        app.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::empty()))
+            .unwrap();
+        match &app.mode {
+            Mode::Edit { buffer, .. } => assert_eq!(buffer, "=A1B2"),
+            other => panic!("expected Edit mode, got {other:?}"),
+        }
+
+        // Backspace removes the '1' (caret immediately before `B`).
+        app.edit_cursor = Some(3);
+        app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::empty()))
+            .unwrap();
+        match &app.mode {
+            Mode::Edit { buffer, .. } => assert_eq!(buffer, "=AB2"),
+            other => panic!("expected Edit mode, got {other:?}"),
+        }
+
+        app.edit_cursor = Some(2);
+        app.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::empty()))
+            .unwrap();
+        assert_eq!(app.edit_cursor, Some(0));
+
+        app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::empty()))
+            .unwrap();
+        assert_eq!(app.edit_cursor, Some(4));
+    }
+
+    #[test]
     fn open_path_parses_link_revision() {
         let fixture = docs_test_path("main.corro");
         let parsed = parse_open_path_request(&format!("link {} 2", fixture.display())).unwrap();
@@ -14998,10 +15082,81 @@ mod tests {
     }
 
     #[test]
+    fn fixed_decimal_formats_complex_with_decimal_places_not_nan() {
+        let mut grid = crate::grid::GridBox::from(crate::grid::Grid::new(1, 1));
+        let addr = CellAddr::Main { row: 0, col: 0 };
+        grid.set(&addr, "=i*10^-9".into());
+        grid.set_cell_format(
+            addr.clone(),
+            CellFormat {
+                number: Some(NumberFormat::Fixed { decimals: 13 }),
+                align: None,
+            },
+        );
+        let raw = cell_effective_display(&grid, &addr);
+        let shown = format_cell_display(&grid, &addr, raw);
+        assert!(
+            !shown.to_ascii_lowercase().contains("nan"),
+            "{shown}"
+        );
+        assert!(shown.contains('.'), "{shown}");
+        assert!(shown.ends_with('i'), "{shown}");
+    }
+
+    #[test]
+    fn decimal_generic_complex_uses_eval_display_not_nan() {
+        let mut grid = crate::grid::GridBox::from(crate::grid::Grid::new(1, 1));
+        let addr = CellAddr::Main { row: 0, col: 0 };
+        grid.set(&addr, "=i*10^-9".into());
+        grid.set_cell_format(
+            addr.clone(),
+            CellFormat {
+                number: Some(NumberFormat::DecimalGeneric),
+                align: None,
+            },
+        );
+        let raw = cell_effective_display(&grid, &addr);
+        let shown = format_cell_display(&grid, &addr, raw);
+        assert!(
+            !shown.to_ascii_lowercase().contains("nan"),
+            "{shown}"
+        );
+        assert!(shown.contains('i'), "{shown}");
+    }
+
+    #[test]
     fn format_number_menu_includes_decimal_generic_option() {
         assert!(FORMAT_NUMBER_MENU_ITEMS
             .iter()
             .any(|item| item.target == MenuTarget::Action(MenuAction::FormatDecimalGeneric)));
+    }
+
+    #[test]
+    fn default_and_decimal_generic_show_human_scale_without_exponential() {
+        let mut grid = crate::grid::GridBox::from(crate::grid::Grid::new(1, 1));
+        let addr = CellAddr::Main { row: 0, col: 0 };
+        grid.set(&addr, "=1/50".into());
+        let eff = cell_effective_display(&grid, &addr);
+
+        assert!(
+            format_cell_display(&grid, &addr, eff.clone())
+                .chars()
+                .all(|c| c != 'e' && c != 'E'),
+            "unset format should default to plain decimal-style display ({eff:?})",
+        );
+
+        grid.set_cell_format(
+            addr.clone(),
+            CellFormat {
+                number: Some(NumberFormat::DecimalGeneric),
+                align: None,
+            },
+        );
+        let shown = format_cell_display(&grid, &addr, eff);
+        assert!(
+            !shown.contains('e') && !shown.contains('E'),
+            "explicit decimalgeneric should avoid e-notation here: {shown}",
+        );
     }
 
     #[test]
@@ -16575,30 +16730,42 @@ fn normalize_inline_text(text: &str) -> String {
     text.replace('\n', "¶")
 }
 
+/// Decimal / generic display: plain decimals for human-scale magnitudes; scientific only when
+/// [`crate::formula::number::prefer_scientific_for_number`] agrees (and for extreme exacts via
+/// `exact_decimal_generic_scientific`).
+fn format_cell_display_decimal_generic(grid: &Grid, addr: &CellAddr, raw: String) -> String {
+    let mut visiting = Vec::new();
+    let mut budget = 10_000usize;
+    if let Some(n) = effective_numeric(grid, addr, &mut visiting, &mut budget) {
+        if matches!(n, crate::formula::number::Number::Complex(_)) {
+            return format_number_cell_display(&n);
+        }
+        if crate::formula::number::prefer_scientific_for_number(&n) {
+            if let Some(sci) = exact_decimal_generic_scientific(&n) {
+                return sci;
+            }
+        }
+        return format_significant_10_local(n.to_f64());
+    }
+    if let Some(n) = crate::formula::parse_number_literal(raw.trim()) {
+        if matches!(n, crate::formula::number::Number::Complex(_)) {
+            return format_number_cell_display(&n);
+        }
+        if crate::formula::number::prefer_scientific_for_number(&n) {
+            if let Some(sci) = exact_decimal_generic_scientific(&n) {
+                return sci;
+            }
+        }
+        return format_significant_10_local(n.to_f64());
+    }
+    raw
+}
+
 pub(crate) fn format_cell_display(grid: &Grid, addr: &CellAddr, raw: String) -> String {
     let raw = normalize_inline_text(&raw);
     let fmt = grid.format_for_addr(addr);
-    let Some(number) = fmt.number else {
-        return raw;
-    };
-    match number {
-        NumberFormat::DecimalGeneric => {
-            let mut visiting = Vec::new();
-            let mut budget = 10_000usize;
-            if let Some(n) = effective_numeric(grid, addr, &mut visiting, &mut budget) {
-                if let Some(sci) = exact_decimal_generic_scientific(&n) {
-                    return sci;
-                }
-                return format_significant_10_local(n.to_f64());
-            }
-            if let Some(n) = crate::formula::parse_number_literal(raw.trim()) {
-                if let Some(sci) = exact_decimal_generic_scientific(&n) {
-                    return sci;
-                }
-                return format_significant_10_local(n.to_f64());
-            }
-            raw
-        }
+    match fmt.number.unwrap_or(NumberFormat::DecimalGeneric) {
+        NumberFormat::DecimalGeneric => format_cell_display_decimal_generic(grid, addr, raw),
         NumberFormat::Rational => {
             let mut visiting = Vec::new();
             let mut budget = 10_000usize;
@@ -16616,13 +16783,22 @@ pub(crate) fn format_cell_display(grid: &Grid, addr: &CellAddr, raw: String) -> 
             let mut budget = 10_000usize;
             if let Some(n) = effective_numeric(grid, addr, &mut visiting, &mut budget) {
                 if crate::formula::number::prefer_scientific_for_number(&n) {
-                    let sci = exact_decimal_generic_scientific(&n)
-                        .unwrap_or_else(|| format_significant_10_local(n.to_f64()));
+                    let sci = match &n {
+                        crate::formula::number::Number::Complex(c) => {
+                            crate::formula::number::format_complex_fixed_decimal(*c, decimals)
+                        }
+                        _ => exact_decimal_generic_scientific(&n)
+                            .unwrap_or_else(|| format_significant_10_local(n.to_f64())),
+                    };
                     return format!("${sci}");
                 }
                 let value = n.to_f64();
                 if value.is_finite() {
                     return format!("${value:.decimals$}");
+                }
+                if let crate::formula::number::Number::Complex(c) = &n {
+                    let s = crate::formula::number::format_complex_fixed_decimal(*c, decimals);
+                    return format!("${s}");
                 }
             }
             let trimmed = raw.trim();
@@ -16649,12 +16825,20 @@ pub(crate) fn format_cell_display(grid: &Grid, addr: &CellAddr, raw: String) -> 
             let mut budget = 10_000usize;
             if let Some(n) = effective_numeric(grid, addr, &mut visiting, &mut budget) {
                 if crate::formula::number::prefer_scientific_for_number(&n) {
-                    return exact_decimal_generic_scientific(&n)
-                        .unwrap_or_else(|| format_significant_10_local(n.to_f64()));
+                    return match &n {
+                        crate::formula::number::Number::Complex(c) => {
+                            crate::formula::number::format_complex_fixed_decimal(*c, decimals)
+                        }
+                        _ => exact_decimal_generic_scientific(&n)
+                            .unwrap_or_else(|| format_significant_10_local(n.to_f64())),
+                    };
                 }
                 let value = n.to_f64();
                 if value.is_finite() {
                     return format!("{value:.decimals$}");
+                }
+                if let crate::formula::number::Number::Complex(c) = &n {
+                    return crate::formula::number::format_complex_fixed_decimal(*c, decimals);
                 }
             }
             let trimmed = raw.trim();
