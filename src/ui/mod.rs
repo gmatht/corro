@@ -156,6 +156,37 @@ pub struct MovieReplayOptions {
     pub menu_hold_ms: u64,
 }
 
+/// Plain navigation keys in [`Mode::Normal`] eligible for stdin coalescing (no modifiers).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PlainArrowAxis {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+impl PlainArrowAxis {
+    fn from_key_event(key: &KeyEvent) -> Option<Self> {
+        if key.kind == KeyEventKind::Release || !key.modifiers.is_empty() {
+            return None;
+        }
+        match key.code {
+            KeyCode::Up => Some(PlainArrowAxis::Up),
+            KeyCode::Down => Some(PlainArrowAxis::Down),
+            KeyCode::Left => Some(PlainArrowAxis::Left),
+            KeyCode::Right => Some(PlainArrowAxis::Right),
+            KeyCode::Char(c) => match c.to_ascii_lowercase() {
+                'h' => Some(PlainArrowAxis::Left),
+                'j' => Some(PlainArrowAxis::Down),
+                'k' => Some(PlainArrowAxis::Up),
+                'l' => Some(PlainArrowAxis::Right),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+}
+
 /// Logical cursor position across header+main+footer rows × total global columns.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SheetCursor {
@@ -2361,6 +2392,8 @@ pub struct App {
     pending_lost_edit: Option<(CellAddr, String)>,
     pending_fit_to_content_on_commit: bool,
     clipboard_snapshot: Option<(MainRange, String)>,
+    /// Event read during arrow coalescing that must be handled before the next `poll`.
+    pending_event: Option<Event>,
 }
 
 impl App {
@@ -2431,6 +2464,7 @@ impl App {
             pending_lost_edit: None,
             pending_fit_to_content_on_commit: false,
             clipboard_snapshot: None,
+            pending_event: None,
         }
     }
 
@@ -3939,6 +3973,32 @@ impl App {
         while steps > 0 {
             self.move_cursor_one_row_vertical(down);
             steps -= 1;
+        }
+    }
+
+    /// One horizontal column step (matches plain Left/Right in normal mode).
+    fn move_cursor_one_col_horizontal(&mut self, right: bool) {
+        if right {
+            let lm = MARGIN_COLS;
+            let mc = self.state.grid.main_cols();
+            if self.cursor.col == lm + mc.saturating_sub(1)
+                && trailing_blank_main_cols(&self.state) < NAV_BLANK_COLS
+            {
+                self.state.grid.grow_main_col_at_right();
+            }
+            self.cursor.col = self.cursor.col.saturating_add(1);
+        } else {
+            self.cursor.col = self.cursor.col.saturating_sub(1);
+        }
+        self.cursor.clamp(&self.state.grid);
+        self.state
+            .grid
+            .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
+    }
+
+    fn move_cursor_horizontal_steps(&mut self, steps: usize, right: bool) {
+        for _ in 0..steps {
+            self.move_cursor_one_col_horizontal(right);
         }
     }
 
@@ -7132,6 +7192,41 @@ impl App {
         }
     }
 
+    fn coalesce_buffered_plain_arrows(
+        &mut self,
+        first: KeyEvent,
+    ) -> Result<(KeyEvent, usize), RunError> {
+        const MAX_PLAIN_ARROW_COALESCE: usize = 16_384;
+        let axis = PlainArrowAxis::from_key_event(&first).expect("coalesce only after filter");
+        let mut count = 1usize;
+        while count < MAX_PLAIN_ARROW_COALESCE && event::poll(std::time::Duration::ZERO)? {
+            match event::read()? {
+                Event::Key(k) => {
+                    if PlainArrowAxis::from_key_event(&k) == Some(axis) {
+                        count = count.saturating_add(1);
+                    } else {
+                        self.pending_event = Some(Event::Key(k));
+                        break;
+                    }
+                }
+                ev => {
+                    self.pending_event = Some(ev);
+                    break;
+                }
+            }
+        }
+        Ok((first, count))
+    }
+
+    fn apply_coalesced_plain_arrows_extra(&mut self, axis: PlainArrowAxis, extra_steps: usize) {
+        match axis {
+            PlainArrowAxis::Up => self.move_cursor_vertical_steps(extra_steps, false),
+            PlainArrowAxis::Down => self.move_cursor_vertical_steps(extra_steps, true),
+            PlainArrowAxis::Left => self.move_cursor_horizontal_steps(extra_steps, false),
+            PlainArrowAxis::Right => self.move_cursor_horizontal_steps(extra_steps, true),
+        }
+    }
+
     pub fn run(&mut self) -> Result<(), RunError> {
         enable_raw_mode()?;
         let mut stdout = stdout();
@@ -7154,17 +7249,36 @@ impl App {
                     last_paint = Instant::now();
                 }
 
-                if !event::poll(Duration::from_millis(200))? {
+                let evt = if let Some(e) = self.pending_event.take() {
+                    e
+                } else if !event::poll(Duration::from_millis(200))? {
                     if last_paint.elapsed() >= Duration::from_secs(1) {
                         pending_redraw = true;
                     }
                     continue;
-                }
+                } else {
+                    event::read()?
+                };
 
-                match event::read()? {
+                match evt {
                     Event::Key(key) => {
+                        if key.kind == KeyEventKind::Release {
+                            continue;
+                        }
+                        let (key, arrow_steps) = if matches!(self.mode, Mode::Normal)
+                            && PlainArrowAxis::from_key_event(&key).is_some()
+                        {
+                            self.coalesce_buffered_plain_arrows(key)?
+                        } else {
+                            (key, 1usize)
+                        };
                         if self.handle_key(key)? {
                             break;
+                        }
+                        if arrow_steps > 1 {
+                            if let Some(ax) = PlainArrowAxis::from_key_event(&key) {
+                                self.apply_coalesced_plain_arrows_extra(ax, arrow_steps - 1);
+                            }
                         }
                         pending_redraw = true;
                     }
@@ -10558,25 +10672,10 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                         }
                     }
                     KeyCode::Left | KeyCode::Char('h') => {
-                        self.cursor.col = self.cursor.col.saturating_sub(1);
-                        self.cursor.clamp(&self.state.grid);
-                        self.state
-                            .grid
-                            .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
+                        self.move_cursor_one_col_horizontal(false);
                     }
                     KeyCode::Right | KeyCode::Char('l') => {
-                        let lm = MARGIN_COLS;
-                        let mc = self.state.grid.main_cols();
-                        if self.cursor.col == lm + mc.saturating_sub(1)
-                            && trailing_blank_main_cols(&self.state) < NAV_BLANK_COLS
-                        {
-                            self.state.grid.grow_main_col_at_right();
-                        }
-                        self.cursor.col = self.cursor.col.saturating_add(1);
-                        self.cursor.clamp(&self.state.grid);
-                        self.state
-                            .grid
-                            .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
+                        self.move_cursor_one_col_horizontal(true);
                     }
                     KeyCode::Up | KeyCode::Char('k') => {
                         self.move_cursor_one_row_vertical(false);
