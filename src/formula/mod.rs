@@ -12,6 +12,7 @@ mod functions;
 pub mod number;
 
 pub use number::Number;
+pub(crate) use number::exact_decimal_generic_scientific;
 
 thread_local! {
     static EVAL_WORKBOOK: RefCell<Option<WorkbookState>> = const { RefCell::new(None) };

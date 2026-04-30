@@ -6,7 +6,8 @@ use crate::balance::{self, BalanceDirection};
 use crate::export;
 use crate::formula::translate_formula_text_by_offset;
 use crate::formula::{
-    cell_effective_display, effective_numeric, format_number_cell_display, is_formula, Number,
+    cell_effective_display, effective_numeric, exact_decimal_generic_scientific,
+    format_number_cell_display, is_formula,
 };
 use crate::grid::{
     CellAddr, CellFormat, FormatScope, GridBox as Grid, MainRange, MarginIndex, NumberFormat,
@@ -9754,6 +9755,9 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                     temp.clamp(&self.state.grid);
                     let addr = temp.to_addr(&self.state.grid);
                     *buffer = format!("={}", self.formula_ref_for_addr(&addr));
+                    // Keep typing after the inserted ref (otherwise `edit_cursor` stays at 1 from
+                    // `start_edit_mode` when the buffer was just `=`).
+                    self.edit_cursor = Some(buffer.chars().count());
                 }
                 KeyCode::Left | KeyCode::Right => {
                     match Self::handle_text_input_key(buffer, &mut self.edit_cursor, key.code) {
@@ -13256,6 +13260,29 @@ mod tests {
     }
 
     #[test]
+    fn formula_arrow_ref_then_append_inserts_after_ref() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 2);
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS + 1,
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Char('='), KeyModifiers::empty()))
+            .unwrap();
+        assert!(matches!(&app.mode, Mode::Edit { formula_cursor: Some(_), .. }));
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::empty()))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('*'), KeyModifiers::empty()))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::empty()))
+            .unwrap();
+        match &app.mode {
+            Mode::Edit { buffer, .. } => assert_eq!(buffer, "=A1*2"),
+            other => panic!("expected Edit mode, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn open_path_parses_link_revision() {
         let fixture = docs_test_path("main.corro");
         let parsed = parse_open_path_request(&format!("link {} 2", fixture.display())).unwrap();
@@ -16199,13 +16226,13 @@ pub(crate) fn format_cell_display(grid: &Grid, addr: &CellAddr, raw: String) -> 
             let mut visiting = Vec::new();
             let mut budget = 10_000usize;
             if let Some(n) = effective_numeric(grid, addr, &mut visiting, &mut budget) {
-                if let Some(sci) = scientific_from_exact_ratio(&n) {
+                if let Some(sci) = exact_decimal_generic_scientific(&n) {
                     return sci;
                 }
                 return format_significant_10_local(n.to_f64());
             }
             if let Some(n) = crate::formula::parse_number_literal(raw.trim()) {
-                if let Some(sci) = scientific_from_exact_ratio(&n) {
+                if let Some(sci) = exact_decimal_generic_scientific(&n) {
                     return sci;
                 }
                 return format_significant_10_local(n.to_f64());
@@ -16532,46 +16559,6 @@ fn format_significant_10_local(n: f64) -> String {
     } else {
         format!("{n:.9e}")
     }
-}
-
-fn scientific_from_exact_ratio(n: &Number) -> Option<String> {
-    let Number::Exact(r) = n else {
-        return None;
-    };
-    if r.numer().to_string() == "0" {
-        return Some("0".to_string());
-    }
-    let numer_s = r.numer().to_string();
-    let denom_s = r.denom().to_string();
-    let sign = if numer_s.starts_with('-') { "-" } else { "" };
-    let n_abs = numer_s.trim_start_matches('-');
-    let d_abs = denom_s.as_str();
-    if n_abs.is_empty() || d_abs.is_empty() {
-        return None;
-    }
-    let n_take = n_abs.chars().take(15).collect::<String>().parse::<f64>().ok()?;
-    let d_take = d_abs.chars().take(15).collect::<String>().parse::<f64>().ok()?;
-    if d_take == 0.0 {
-        return None;
-    }
-    let mut exponent = (n_abs.len() as i64) - (d_abs.len() as i64);
-    let mut mantissa = n_take / d_take;
-    if mantissa == 0.0 {
-        return None;
-    }
-    while mantissa < 1.0 {
-        mantissa *= 10.0;
-        exponent -= 1;
-    }
-    while mantissa >= 10.0 {
-        mantissa /= 10.0;
-        exponent += 1;
-    }
-    let mant = format!("{mantissa:.9}")
-        .trim_end_matches('0')
-        .trim_end_matches('.')
-        .to_string();
-    Some(format!("{sign}{mant}e{exponent}"))
 }
 
 fn sheet_row_label(logical_row: usize, main_rows: usize) -> String {

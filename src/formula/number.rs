@@ -4,6 +4,7 @@ use num_bigint::BigInt;
 use num_complex::Complex64;
 use num_rational::BigRational;
 use num_traits::{One, Signed, ToPrimitive, Zero};
+use std::cmp::Ordering;
 
 /// Spreadsheet number: either an exact reduced rational, or a host float.
 #[derive(Clone, Debug, PartialEq)]
@@ -308,6 +309,96 @@ pub(crate) fn mod_trunc_toward_zero(a: &BigRational, divisor: &BigRational) -> O
     }
     let q = quotient_numer / quotient_den;
     Some(a.clone() - (divisor * BigRational::from_integer(q)))
+}
+
+/// `|p/q|` compared to `10^exp` (integer `exp`), using only big-int scaling (no `f64` rounding).
+fn cmp_abs_rational_to_pow10(p: &BigInt, q: &BigInt, exp: i128) -> Ordering {
+    let p_abs = p.abs();
+    let q_abs = q.abs();
+    if exp >= 0 {
+        let ten_e = BigInt::from(10u32).pow(exp as u32);
+        p_abs.cmp(&(q_abs * ten_e))
+    } else {
+        let ten_e = BigInt::from(10u32).pow((-exp) as u32);
+        (p_abs * ten_e).cmp(&q_abs)
+    }
+}
+
+fn rat_pow10_i128(exp: i128) -> Option<BigRational> {
+    const LIM: i128 = 120_000;
+    if exp < -LIM || exp > LIM {
+        return None;
+    }
+    Some(if exp >= 0 {
+        BigRational::from_integer(BigInt::from(10u32).pow(exp as u32))
+    } else {
+        BigRational::new(
+            BigInt::one(),
+            BigInt::from(10u32).pow((-exp) as u32),
+        )
+    })
+}
+
+/// Largest integer `e` with `|r| >= 10^e` (i.e. `floor(log10 |r|)` for positive rationals).
+fn floor_log10_positive_rational(r: &BigRational) -> Option<i128> {
+    if r.is_zero() {
+        return None;
+    }
+    let p = r.numer();
+    let q = r.denom();
+    if p.is_zero() || q.is_zero() {
+        return None;
+    }
+    let lp = p.abs().to_string().len() as i128 - 1;
+    let lq = q.abs().to_string().len() as i128 - 1;
+    let est = lp - lq;
+    let mut lo = (est - 35).max(-120_000);
+    let mut hi = (est + 35).min(120_000);
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2;
+        match cmp_abs_rational_to_pow10(p, q, mid) {
+            Ordering::Less => hi = mid - 1,
+            Ordering::Equal | Ordering::Greater => lo = mid,
+        }
+    }
+    Some(lo)
+}
+
+/// Scientific `me{exp}` notation for Generic (decimal) display when the value is [`Number::Exact`].
+///
+/// Needed for extremes like `=10^-999` where truncating numerator/denominator to `f64` fails and
+/// `to_f64()` underflows to `0`.
+pub(crate) fn exact_decimal_generic_scientific(n: &Number) -> Option<String> {
+    let Number::Exact(r) = n else {
+        return None;
+    };
+    if r.is_zero() || r.numer().is_zero() {
+        return Some("0".to_string());
+    }
+    let sign = if r.is_negative() { "-" } else { "" };
+    let r_pos = r.abs();
+    let exponent = floor_log10_positive_rational(&r_pos)?;
+    let ten_to_exp = rat_pow10_i128(exponent)?;
+    let ten = BigRational::from_integer(BigInt::from(10u32));
+    let one = BigRational::one();
+
+    let mut mant = &r_pos / &ten_to_exp;
+    let mut exp_out = exponent;
+    while mant >= ten {
+        mant = mant / &ten;
+        exp_out += 1;
+    }
+    while mant < one {
+        mant = mant * &ten;
+        exp_out -= 1;
+    }
+
+    let mf = mant.to_f64().filter(|v| v.is_finite() && *v > 0.0)?;
+    let mant_str = format!("{mf:.15}")
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_string();
+    Some(format!("{sign}{mant_str}e{exp_out}"))
 }
 
 /// Parse a formula literal: digits, optional one `.` (no exponent). Produces an exact rational.
@@ -646,5 +737,14 @@ mod tests {
             }
             other => panic!("expected complex, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn decimal_generic_sci_one_over_pow10_999() {
+        let denom = BigInt::from(10u32).pow(999);
+        let r = BigRational::new(BigInt::one(), denom);
+        let s = exact_decimal_generic_scientific(&Number::Exact(r)).expect("sci display");
+        assert!(s.starts_with('1'), "{s}");
+        assert!(s.contains("e-999"), "{s}");
     }
 }
