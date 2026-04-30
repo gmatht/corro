@@ -3701,7 +3701,8 @@ impl App {
         cells
     }
 
-    fn sync_external(&mut self) -> Result<(), IoError> {
+    fn sync_external(&mut self) -> Result<bool, IoError> {
+        let mut changed = false;
         if let Some(w) = &self.watcher {
             if w.poll_dirty() {
                 if let Some(ref p) = self.path {
@@ -3715,6 +3716,7 @@ impl App {
                             self.offset = new_off;
                             self.sync_active_sheet_cache();
                             self.status = "External change applied".into();
+                            changed = true;
                         }
                         Err(_) => {
                             let data = std::fs::read_to_string(p).map_err(IoError::Io)?;
@@ -3738,12 +3740,13 @@ impl App {
                             self.ops_applied =
                                 data.lines().filter(|line| !line.trim().is_empty()).count();
                             self.status = "File reset; full reload".into();
+                            changed = true;
                         }
                     }
                 }
             }
         }
-        Ok(())
+        Ok(changed)
     }
 
     fn selection_main_row_range(&self) -> Option<(u32, u32)> {
@@ -7137,16 +7140,39 @@ impl App {
         let mut terminal = Terminal::new(backend)?;
 
         let run_result = (|| -> Result<(), RunError> {
+            use std::time::{Duration, Instant};
+            let mut pending_redraw = true;
+            let mut last_paint = Instant::now();
             loop {
-                self.sync_external()?;
-                terminal.draw(|f| self.draw(f))?;
+                if self.sync_external()? {
+                    pending_redraw = true;
+                }
 
-                if !event::poll(std::time::Duration::from_millis(200))? {
+                if pending_redraw {
+                    terminal.draw(|f| self.draw(f))?;
+                    pending_redraw = false;
+                    last_paint = Instant::now();
+                }
+
+                if !event::poll(Duration::from_millis(200))? {
+                    if last_paint.elapsed() >= Duration::from_secs(1) {
+                        pending_redraw = true;
+                    }
                     continue;
                 }
-                if let Event::Key(key) = event::read()? {
-                    if self.handle_key(key)? {
-                        break;
+
+                match event::read()? {
+                    Event::Key(key) => {
+                        if self.handle_key(key)? {
+                            break;
+                        }
+                        pending_redraw = true;
+                    }
+                    Event::Resize(_, _) => {
+                        pending_redraw = true;
+                    }
+                    _ => {
+                        pending_redraw = true;
                     }
                 }
             }
@@ -7174,9 +7200,17 @@ impl App {
         }
     }
 
-    fn draw(&mut self, f: &mut Frame) {
-        let _ctx = crate::formula::set_eval_context(&self.workbook);
+    pub(crate) fn prepare_eval_context_and_spills(
+        &mut self,
+    ) -> crate::formula::EvalContextGuard {
+        let guard = crate::formula::set_eval_context(&self.workbook);
         crate::formula::refresh_spills(&mut self.state.grid);
+        guard
+    }
+
+    /// Full frame paint; caller must hold an active [`crate::formula::EvalContextGuard`] from
+    /// [`Self::prepare_eval_context_and_spills`] (same as [`Self::draw`]).
+    pub(crate) fn draw_visual(&mut self, f: &mut Frame) {
         f.render_widget(Clear, f.area());
         let special_picker = self.special_picker;
         let has_tabs = self.workbook.sheet_count() > 1;
@@ -7574,14 +7608,23 @@ impl App {
                 let align = effective_cell_align(grid, &cell_addr, &formatted);
                 let fw = formatted.width();
                 let cell_fmt = grid.format_for_addr(&cell_addr);
-                // Numeric-like cells do not spill into neighbors. Do not treat `number: None` as
-                // numeric here: default display is decimal-generic but plain text must still spill
-                // across blank columns (`format_cell_display` already applies decimal rules).
-                let numeric_like = formatted.trim().parse::<f64>().is_ok()
-                    || matches!(
-                        cell_fmt.number,
-                        Some(NumberFormat::Rational | NumberFormat::DecimalGeneric)
-                    );
+                // Numeric-like cells do not spill into neighbors.
+                // - `number: None` uses decimal-generic *display* via `format_cell_display` but must
+                //   still allow text spill.
+                // - `DecimalGeneric` on the column must not block spill for non-numeric cells (e.g.
+                //   notes beside numbers); only suppress when the cell actually has a numeric value.
+                let numeric_like = if formatted.trim().parse::<f64>().is_ok() {
+                    true
+                } else if matches!(cell_fmt.number, Some(NumberFormat::Rational)) {
+                    true
+                } else if matches!(cell_fmt.number, Some(NumberFormat::DecimalGeneric)) {
+                    let mut spill_visiting = Vec::new();
+                    let mut spill_budget = 10_000usize;
+                    effective_numeric(grid, &cell_addr, &mut spill_visiting, &mut spill_budget)
+                        .is_some()
+                } else {
+                    false
+                };
                 let allow_text_spill =
                     spill_row && !is_agg_cell && !numeric_like && align != Some(TextAlign::Right);
 
@@ -7830,6 +7873,11 @@ impl App {
             f.render_widget(Clear, area);
             f.render_stateful_widget(picker, area, &mut state);
         }
+    }
+
+    fn draw(&mut self, f: &mut Frame) {
+        let _guard = self.prepare_eval_context_and_spills();
+        self.draw_visual(f);
     }
 
     fn hints_line(&self) -> String {
@@ -16375,7 +16423,8 @@ mod tests {
     }
 
     /// Times one `<Up>` key cycle as in [`App::run`] after input arrives: `sync_external` +
-    /// `terminal.draw(draw)` + `handle_key(<Up>)` (polling the event queue is omitted).
+    /// eval workbook context + `refresh_spills` + `draw_visual` + `handle_key(<Up>)` (polling
+    /// omitted). Sub-timers match phases inside [`App::draw`] + key handling.
     ///
     /// Run (release recommended):
     /// `cargo test --release tui_up_arrow_latency_harness -- --ignored --nocapture`
@@ -16403,6 +16452,22 @@ mod tests {
             ns / 1000.0
         }
 
+        fn summarize(label: &str, mut v: Vec<u128>) {
+            v.sort_unstable();
+            let n = v.len();
+            let min_ns = v[0];
+            let max_ns = v[n - 1];
+            let med = median_sorted_ns(&v);
+            let sum: u128 = v.iter().copied().sum();
+            eprintln!(
+                "  {label}: sum={:.3} ms  per-press μs min={:.2} median={:.2} max={:.2}",
+                sum as f64 / 1_000_000.0,
+                micros(min_ns as f64),
+                micros(med),
+                micros(max_ns as f64),
+            );
+        }
+
         let mut app = App::new(None);
         app.load_initial().unwrap();
         app.state.grid.set_main_size(SAMPLES + 16, 12);
@@ -16426,38 +16491,58 @@ mod tests {
             col: MARGIN_COLS,
         };
 
-        let mut ns_samples: Vec<u128> = Vec::with_capacity(SAMPLES);
-        let t_total = Instant::now();
+        let mut sync_ns: Vec<u128> = Vec::with_capacity(SAMPLES);
+        let mut ctx_ns: Vec<u128> = Vec::with_capacity(SAMPLES);
+        let mut spill_ns: Vec<u128> = Vec::with_capacity(SAMPLES);
+        let mut paint_ns: Vec<u128> = Vec::with_capacity(SAMPLES);
+        let mut key_ns: Vec<u128> = Vec::with_capacity(SAMPLES);
+        let mut total_ns: Vec<u128> = Vec::with_capacity(SAMPLES);
+        let t_wall = Instant::now();
 
         for _ in 0..SAMPLES {
-            let t0 = Instant::now();
-            app.sync_external().unwrap();
-            terminal.draw(|f| app.draw(f)).unwrap();
+            let t_outer = Instant::now();
+
+            let t = Instant::now();
+            let _ = app.sync_external().unwrap();
+            sync_ns.push(t.elapsed().as_nanos() as u128);
+
+            let t = Instant::now();
+            let guard = crate::formula::set_eval_context(&app.workbook);
+            ctx_ns.push(t.elapsed().as_nanos() as u128);
+
+            let t = Instant::now();
+            crate::formula::refresh_spills(&mut app.state.grid);
+            spill_ns.push(t.elapsed().as_nanos() as u128);
+
+            let t = Instant::now();
+            terminal.draw(|f| app.draw_visual(f)).unwrap();
+            paint_ns.push(t.elapsed().as_nanos() as u128);
+            drop(guard);
+
+            let t = Instant::now();
             app.handle_key(up).unwrap();
-            ns_samples.push(t0.elapsed().as_nanos() as u128);
+            key_ns.push(t.elapsed().as_nanos() as u128);
+
+            total_ns.push(t_outer.elapsed().as_nanos() as u128);
         }
 
-        let wall_total_ns = t_total.elapsed().as_nanos() as u128;
-        ns_samples.sort_unstable();
-
-        let min_ns = ns_samples[0];
-        let max_ns = ns_samples[SAMPLES - 1];
-        let median_ns = median_sorted_ns(&ns_samples);
-        let sum_ns: u128 = ns_samples.iter().copied().sum();
+        let wall_ns = t_wall.elapsed().as_nanos() as u128;
+        let sum_total: u128 = total_ns.iter().copied().sum();
 
         eprintln!(
-            "\
-tui_up_arrow_latency_harness (sync_external + draw + handle_key(<Up>), N={})\n\
-  wall_total:    {:.3} ms\n\
-  sample_sum:    {:.3} ms\n\
-  per-press μs: min={:.2} median={:.2} max={:.2}",
+            "tui_up_arrow_latency_harness (N={})\n\
+  wall_total: {:.3} ms\n\
+  sample_sum: {:.3} ms",
             SAMPLES,
-            wall_total_ns as f64 / 1_000_000.0,
-            sum_ns as f64 / 1_000_000.0,
-            micros(min_ns as f64),
-            micros(median_ns),
-            micros(max_ns as f64),
+            wall_ns as f64 / 1_000_000.0,
+            sum_total as f64 / 1_000_000.0,
         );
+        summarize("sync_external", sync_ns);
+        summarize("set_eval_context (workbook clone)", ctx_ns);
+        summarize("refresh_spills", spill_ns);
+        summarize("draw_visual (ratatui TestBackend)", paint_ns);
+        summarize("handle_key(<Up>)", key_ns);
+        summarize("total per iteration", total_ns);
     }
 }
 
@@ -16885,10 +16970,26 @@ fn effective_cell_align(grid: &Grid, addr: &CellAddr, formatted: &str) -> Option
     if fmt.align.is_some() {
         return fmt.align;
     }
-    if fmt.number.is_some() || formatted.trim().parse::<f64>().is_ok() {
-        Some(TextAlign::Right)
-    } else {
-        None
+    let t = formatted.trim();
+    if t.parse::<f64>().is_ok() {
+        return Some(TextAlign::Right);
+    }
+    // Decimal-generic columns mix numbers and labels: only right-align when this cell is numeric,
+    // so prose can stay left-aligned and spill into blank neighbors (see `allow_text_spill`).
+    match fmt.number {
+        Some(NumberFormat::DecimalGeneric) => {
+            let mut visiting = Vec::new();
+            let mut budget = 10_000usize;
+            if effective_numeric(grid, addr, &mut visiting, &mut budget).is_some() {
+                Some(TextAlign::Right)
+            } else {
+                None
+            }
+        }
+        Some(
+            NumberFormat::Rational | NumberFormat::Fixed { .. } | NumberFormat::Currency { .. },
+        ) => Some(TextAlign::Right),
+        None => None,
     }
 }
 

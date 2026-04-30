@@ -114,6 +114,11 @@ pub trait GridImpl {
     fn volatile_seed(&self) -> u64;
     fn set_volatile_seed(&mut self, seed: u64);
 
+    /// False after [`crate::formula::refresh_spills`] runs; callers set dirty on grid mutations / volatile bumps.
+    fn spills_refresh_dirty(&self) -> bool;
+    fn note_spills_refreshed(&mut self);
+    fn mark_spills_stale(&mut self);
+
     // Logical content queries
     fn logical_row_has_content(&self, r: usize) -> bool;
     fn logical_col_has_content(&self, c: usize) -> bool;
@@ -205,6 +210,14 @@ impl GridBox {
 
     pub fn bump_volatile_seed(&mut self) {
         self.inner.bump_volatile_seed()
+    }
+
+    pub(crate) fn spills_refresh_dirty(&self) -> bool {
+        self.inner.spills_refresh_dirty()
+    }
+
+    pub(crate) fn note_spills_refreshed(&mut self) {
+        self.inner.note_spills_refreshed()
     }
 
     pub fn volatile_seed(&self) -> u64 {
@@ -423,6 +436,8 @@ pub struct Grid {
     pub(crate) spill_followers: HashMap<CellAddr, String>,
     pub(crate) spill_errors: HashMap<CellAddr, &'static str>,
     pub(crate) volatile_seed: u64,
+    /// When false, [`crate::formula::refresh_spills`] is a cheap no-op (spill maps unchanged).
+    pub(crate) spills_dirty: bool,
 }
 
 impl Default for Grid {
@@ -451,6 +466,7 @@ impl Grid {
             spill_followers: HashMap::new(),
             spill_errors: HashMap::new(),
             volatile_seed: 0,
+            spills_dirty: true,
         };
         g
     }
@@ -458,6 +474,7 @@ impl Grid {
     /// One new main row at the bottom (cursor moving down from the last main row).
     pub fn grow_main_row_at_bottom(&mut self) {
         self.extent_main_rows = self.extent_main_rows.saturating_add(1);
+        self.mark_spills_stale();
     }
 
     /// One new main column at the right (cursor moving right from the last sheet column).
@@ -467,6 +484,7 @@ impl Grid {
         self.remap_main_col_layout_for_resize(old_main_cols, new_main_cols);
         self.remap_formats_for_resize(old_main_cols, new_main_cols);
         self.extent_main_cols = new_main_cols as u32;
+        self.mark_spills_stale();
     }
 
     /// Back-compat: logical main row count.
@@ -527,6 +545,9 @@ impl Grid {
                 self.extent_main_rows = mr + 1;
                 grown = true;
             }
+        }
+        if grown {
+            self.mark_spills_stale();
         }
         grown
     }
@@ -599,6 +620,7 @@ impl Grid {
         self.left.retain(|&(r, _), _| r < self.extent_main_rows);
         self.right.retain(|&(r, _), _| r < self.extent_main_rows);
         self.resize_header_footer_width();
+        self.mark_spills_stale();
     }
 
     pub fn col_width(&self, global_col: usize) -> usize {
@@ -995,6 +1017,7 @@ impl Grid {
                 }
             }
         }
+        self.mark_spills_stale();
     }
 
     pub(crate) fn clear_spills(&mut self) {
@@ -1012,6 +1035,17 @@ impl Grid {
 
     pub(crate) fn bump_volatile_seed(&mut self) {
         self.volatile_seed = self.volatile_seed.wrapping_add(1);
+        self.mark_spills_stale();
+    }
+
+    #[inline]
+    pub(crate) fn mark_spills_stale(&mut self) {
+        self.spills_dirty = true;
+    }
+
+    #[inline]
+    pub(crate) fn note_spills_refreshed(&mut self) {
+        self.spills_dirty = false;
     }
 
     pub fn move_main_rows(&mut self, from: usize, count: usize, to: usize) {
@@ -1060,6 +1094,7 @@ impl Grid {
         self.right = new_right;
 
         self.extent_main_rows = order.len() as u32;
+        self.mark_spills_stale();
     }
 
     pub fn move_main_cols(&mut self, from: usize, count: usize, to: usize) {
@@ -1116,6 +1151,7 @@ impl Grid {
         self.remap_main_col_width_overrides_for_order(&order);
 
         self.extent_main_cols = order.len() as u32;
+        self.mark_spills_stale();
     }
 }
 
@@ -1147,6 +1183,18 @@ impl GridImpl for Grid {
 
     fn bump_volatile_seed(&mut self) {
         self.bump_volatile_seed()
+    }
+
+    fn spills_refresh_dirty(&self) -> bool {
+        self.spills_dirty
+    }
+
+    fn note_spills_refreshed(&mut self) {
+        Grid::note_spills_refreshed(self)
+    }
+
+    fn mark_spills_stale(&mut self) {
+        Grid::mark_spills_stale(self)
     }
 
     fn iter_nonempty(&self) -> Box<dyn Iterator<Item = (CellAddr, String)> + '_> {
@@ -1316,6 +1364,7 @@ impl GridImpl for Grid {
         self.main_cells.clear();
         self.left.clear();
         self.right.clear();
+        self.mark_spills_stale()
     }
 
     fn set_col_width_overrides(&mut self, overrides: Vec<(usize, usize)>) {
@@ -1340,6 +1389,7 @@ impl GridImpl for Grid {
 
     fn set_volatile_seed(&mut self, seed: u64) {
         self.volatile_seed = seed;
+        self.mark_spills_stale();
     }
 
     fn logical_row_has_content(&self, r: usize) -> bool {

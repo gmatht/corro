@@ -2475,6 +2475,9 @@ fn sum_main_range(
 }
 
 pub fn refresh_spills(grid: &mut Grid) {
+    if !grid.spills_refresh_dirty() {
+        return;
+    }
     let mut prev_followers: Vec<(CellAddr, String)> = grid.spill_followers().into_iter().collect();
     let mut prev_errors: Vec<(CellAddr, &'static str)> = grid.spill_errors().into_iter().collect();
     for _ in 0..8 {
@@ -2516,6 +2519,7 @@ pub fn refresh_spills(grid: &mut Grid) {
         prev_followers = grid.spill_followers();
         prev_errors = grid.spill_errors();
     }
+    grid.note_spills_refreshed();
 }
 
 fn format_number(n: &Number) -> String {
