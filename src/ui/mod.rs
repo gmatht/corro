@@ -6764,6 +6764,7 @@ impl App {
         line_i: usize,
         line_n: usize,
         char_delay: std::time::Duration,
+        menu_hold: std::time::Duration,
         confirm_delay: std::time::Duration,
         choice_index: usize,
         special_char_pos: usize,
@@ -6784,14 +6785,14 @@ impl App {
                     "Special Char",
                     line_i,
                     line_n,
-                    char_delay,
+                    menu_hold,
                 )?;
                 self.movie_flash_special_character_picker(
                     terminal,
                     line_i,
                     line_n,
                     choice_index,
-                    char_delay,
+                    menu_hold,
                 )?;
                 self.mode = self.start_edit_mode(typed.clone(), None, false, false, None);
                 self.status = format!("Movie {}/{} typing: {}", line_i + 1, line_n, typed);
@@ -6879,6 +6880,7 @@ impl App {
                                 line_i,
                                 line_n,
                                 char_delay,
+                                menu_hold,
                                 confirm_delay,
                                 choice_idx,
                                 char_pos,
@@ -6915,6 +6917,7 @@ impl App {
                                 line_i,
                                 line_n,
                                 char_delay,
+                                menu_hold,
                                 confirm_delay,
                                 choice_idx,
                                 char_pos,

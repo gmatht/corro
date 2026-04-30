@@ -20,6 +20,13 @@ enum RevisionMode {
     Limit(usize),
 }
 
+fn cli_option_suggestion(arg: &str) -> Option<&'static str> {
+    match arg {
+        "--movie-cps" => Some("--movie-typing-cps"),
+        _ => None,
+    }
+}
+
 fn parse_args() -> Result<Args, String> {
     let mut revision = None;
     let mut file = None;
@@ -91,6 +98,11 @@ fn parse_args() -> Result<Args, String> {
                 movie_menu_hold_ms = value;
             }
             _ if arg.starts_with('-') => {
+                if let Some(suggested) = cli_option_suggestion(&arg) {
+                    return Err(format!(
+                        "unrecognized option: {arg} (did you mean {suggested}?)"
+                    ));
+                }
                 return Err(format!("unrecognized option: {arg}"));
             }
             _ => positional.push(arg),
@@ -442,5 +454,14 @@ mod tests {
     fn parses_version_variants() {
         assert!(parse_args_from(["corro", "--version"]).show_version);
         assert!(parse_args_from(["corro", "-v"]).show_version);
+    }
+
+    #[test]
+    fn movie_cps_option_has_typing_cps_suggestion() {
+        assert_eq!(
+            super::cli_option_suggestion("--movie-cps"),
+            Some("--movie-typing-cps")
+        );
+        assert_eq!(super::cli_option_suggestion("--unknown"), None);
     }
 }
