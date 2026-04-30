@@ -927,10 +927,40 @@ fn menu_popup_area(area: Rect, section: MenuSection, parent: Option<(Rect, usize
 }
 
 impl App {
-    fn open_menu(&mut self, section: MenuSection) {
+    /// Captures Edit buffer / caret before replacing [`Self::mode`] with the menu bar.
+    ///
+    /// `from_mode` must be the logical UI mode **before** the menu opens. In [`Self::handle_key`],
+    /// [`std::mem::replace`] puts a temporary `Normal` into [`Self::mode`] while [`Mode::Edit`] lives
+    /// in a local variable — pass that local, not [`Self::mode`].
+    fn suspend_edit_for_menu_bar(&mut self, from_mode: &Mode) {
+        match from_mode {
+            Mode::Edit {
+                buffer,
+                formula_cursor,
+                ..
+            } => {
+                let caret = self
+                    .edit_cursor
+                    .unwrap_or_else(|| buffer.chars().count())
+                    .min(buffer.chars().count());
+                self.pending_menu_edit = Some((buffer.clone(), caret, *formula_cursor));
+            }
+            _ => {
+                self.pending_menu_edit = None;
+            }
+        }
+    }
+
+    fn open_menu_with_prior_mode(&mut self, section: MenuSection, mode_before_menu: &Mode) {
+        self.suspend_edit_for_menu_bar(mode_before_menu);
         self.mode = Mode::Menu {
             stack: vec![MenuLevel { section, item: 0 }],
         };
+    }
+
+    fn open_menu(&mut self, section: MenuSection) {
+        let prior = self.mode.clone();
+        self.open_menu_with_prior_mode(section, &prior);
     }
 
     fn clear_pending_format_target(&mut self) {
@@ -938,13 +968,21 @@ impl App {
     }
 
     fn open_menu_item(&mut self, section: MenuSection, item: usize) {
+        let prior = self.mode.clone();
+        self.suspend_edit_for_menu_bar(&prior);
         self.mode = Mode::Menu {
             stack: vec![MenuLevel { section, item }],
         };
     }
 
-    fn open_menu_path(&mut self, stack: Vec<MenuLevel>) {
+    fn open_menu_path_with_prior_mode(&mut self, stack: Vec<MenuLevel>, mode_before_menu: &Mode) {
+        self.suspend_edit_for_menu_bar(mode_before_menu);
         self.mode = Mode::Menu { stack };
+    }
+
+    fn open_menu_path(&mut self, stack: Vec<MenuLevel>) {
+        let prior = self.mode.clone();
+        self.open_menu_path_with_prior_mode(stack, &prior);
     }
 
     fn start_edit_mode(
@@ -988,51 +1026,71 @@ impl App {
         )
     }
 
-    fn snapshot_for_special_insert(&self) -> (String, usize) {
+    fn snapshot_for_special_insert(&self) -> (String, usize, Option<SheetCursor>) {
+        if let Some((buffer, caret, fc)) = self.pending_menu_edit.as_ref() {
+            return (
+                buffer.clone(),
+                (*caret).min(buffer.chars().count()),
+                *fc,
+            );
+        }
         match &self.mode {
-            Mode::Edit { buffer, .. } => (
+            Mode::Edit {
+                buffer,
+                formula_cursor,
+                ..
+            } => (
                 buffer.clone(),
                 self.edit_cursor
                     .unwrap_or_else(|| buffer.chars().count())
                     .min(buffer.chars().count()),
+                *formula_cursor,
             ),
             _ => {
                 let addr = self.cursor.to_addr(&self.state.grid);
                 let s = cell_display(&self.state.grid, &addr);
                 let len = s.chars().count();
-                (s, len)
+                (s, len, None)
             }
         }
     }
 
     fn open_special_picker(&mut self) {
-        self.special_insert_snap = Some(self.snapshot_for_special_insert());
+        let snap = self.snapshot_for_special_insert();
+        self.special_insert_snap = Some(snap);
         self.special_picker = Some(0);
         self.mode = Mode::Normal;
     }
 
     fn commit_special_choice(&mut self, idx: usize) {
         let choice = SPECIAL_VALUE_CHOICES[idx];
-        let (mut buf, snap_pos) = self.special_insert_snap.take().unwrap_or_else(|| {
-            let addr = self.cursor.to_addr(&self.state.grid);
-            let s = cell_display(&self.state.grid, &addr);
-            let len = s.chars().count();
-            (s, len)
-        });
+        self.pending_menu_edit = None;
+        let (mut buf, snap_pos, snap_formula) =
+            self.special_insert_snap.take().unwrap_or_else(|| {
+                let addr = self.cursor.to_addr(&self.state.grid);
+                let s = cell_display(&self.state.grid, &addr);
+                let len = s.chars().count();
+                (s, len, None)
+            });
         let mut cur = Some(snap_pos.min(buf.chars().count()));
         Self::insert_text_into_buffer(&mut buf, &mut cur, choice);
         let caret = cur.unwrap_or(buf.chars().count());
-        let formula_cursor = if buf.trim() == "=" {
-            Some(self.cursor)
-        } else {
-            None
-        };
+        let formula_cursor = snap_formula.or_else(|| {
+            if buf.trim() == "=" {
+                Some(self.cursor)
+            } else {
+                None
+            }
+        });
         self.mode = self.start_edit_mode(buf, formula_cursor, true, false, None);
         self.edit_cursor = Some(caret);
     }
 
     fn menu_action_mode(&mut self, action: MenuAction) -> Mode {
         self.edit_special_palette = false;
+        if !matches!(action, MenuAction::InsertSpecialChars) {
+            self.pending_menu_edit = None;
+        }
         match action {
             MenuAction::Cut => {
                 let cells = self.selection_clear_cells();
@@ -2289,8 +2347,11 @@ pub struct App {
     edit_cursor: Option<usize>,
     input_cursor: Option<usize>,
     special_picker: Option<usize>,
-    /// Text and caret (Unicode scalar/`char` index) when opening the special-character picker.
-    special_insert_snap: Option<(String, usize)>,
+    /// Buffer, caret (`char` index), formula ref mode — saved when entering the menu bar from Edit mode
+    /// so Insert → Special Character can splice at the real caret.
+    pending_menu_edit: Option<(String, usize, Option<SheetCursor>)>,
+    /// Text and caret when opening the special-character picker (`formula_cursor` restores `=`-ref picks).
+    special_insert_snap: Option<(String, usize, Option<SheetCursor>)>,
     pending_format_target: Option<FormatTarget>,
     view_sheet_id: u32,
     persisted_view_sort_cols: HashMap<u32, Vec<SortSpec>>,
@@ -2360,6 +2421,7 @@ impl App {
             edit_cursor: None,
             input_cursor: None,
             special_picker: None,
+            pending_menu_edit: None,
             special_insert_snap: None,
             pending_format_target: None,
             view_sheet_id: 1,
@@ -3771,7 +3833,9 @@ impl App {
         );
         // #endregion
         let next_pos = if down {
-            if last_display_main == Some(self.cursor.row) {
+            if last_display_main == Some(self.cursor.row)
+                && trailing_blank_main_rows(&self.state) < NAV_BLANK_ROWS
+            {
                 self.state.grid.grow_main_row_at_bottom();
                 first_footer = HEADER_ROWS + self.state.grid.main_rows();
                 rows = self.view_row_order();
@@ -3848,15 +3912,12 @@ impl App {
             if !self.move_cursor_row_through_view(true) {
                 let hr = HEADER_ROWS;
                 let last_main = hr + self.state.grid.main_rows().saturating_sub(1);
-                let first_footer_before = hr + self.state.grid.main_rows();
-                let was_in_main = self.cursor.row >= hr && self.cursor.row < first_footer_before;
-                if self.cursor.row == last_main {
+                if self.cursor.row == last_main
+                    && trailing_blank_main_rows(&self.state) < NAV_BLANK_ROWS
+                {
                     self.state.grid.grow_main_row_at_bottom();
                 }
                 self.cursor.row = self.cursor.row.saturating_add(1);
-                if was_in_main && self.cursor.row >= first_footer_before {
-                    self.state.grid.grow_main_row_at_bottom();
-                }
                 self.cursor.clamp(&self.state.grid);
                 self.state
                     .grid
@@ -8261,6 +8322,11 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                 KeyCode::Esc => {
                     self.special_picker = None;
                     self.special_insert_snap = None;
+                    if let Some((buf, caret, fc)) = self.pending_menu_edit.take() {
+                        let c = caret.min(buf.chars().count());
+                        self.mode = self.start_edit_mode(buf, fc, false, false, None);
+                        self.edit_cursor = Some(c);
+                    }
                     return Ok(false);
                 }
                 KeyCode::Enter => {
@@ -8379,7 +8445,15 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
 
         if let Mode::Menu { stack } = &mut mode {
             match key.code {
-                KeyCode::Esc => mode = Mode::Normal,
+                KeyCode::Esc => {
+                    if let Some((buf, caret, fc)) = self.pending_menu_edit.take() {
+                        let c = caret.min(buf.chars().count());
+                        mode = self.start_edit_mode(buf, fc, false, false, None);
+                        self.edit_cursor = Some(c);
+                    } else {
+                        mode = Mode::Normal;
+                    }
+                }
                 KeyCode::Left | KeyCode::Char('h') => {
                     stack.truncate(1);
                     if let Some(level) = stack.last_mut() {
@@ -8479,65 +8553,83 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
             if let KeyCode::Char(ch) = key.code {
                 match ch {
                     'f' | 'F' => {
-                        self.open_menu(MenuSection::File);
+                        self.open_menu_with_prior_mode(MenuSection::File, &mode);
                         return Ok(false);
                     }
                     'h' | 'H' => {
-                        self.open_menu(MenuSection::Help);
+                        self.open_menu_with_prior_mode(MenuSection::Help, &mode);
                         return Ok(false);
                     }
                     't' | 'T' => {
-                        self.open_menu_path(vec![MenuLevel {
-                            section: MenuSection::Export,
-                            item: 0,
-                        }]);
+                        self.open_menu_path_with_prior_mode(
+                            vec![MenuLevel {
+                                section: MenuSection::Export,
+                                item: 0,
+                            }],
+                            &mode,
+                        );
                         return Ok(false);
                     }
                     'a' | 'A' => {
-                        self.open_menu_path(vec![MenuLevel {
-                            section: MenuSection::Export,
-                            item: 2,
-                        }]);
+                        self.open_menu_path_with_prior_mode(
+                            vec![MenuLevel {
+                                section: MenuSection::Export,
+                                item: 2,
+                            }],
+                            &mode,
+                        );
                         return Ok(false);
                     }
                     'e' | 'E' => {
                         if shift {
-                            self.open_menu_path(vec![MenuLevel {
-                                section: MenuSection::Export,
-                                item: 3,
-                            }]);
+                            self.open_menu_path_with_prior_mode(
+                                vec![MenuLevel {
+                                    section: MenuSection::Export,
+                                    item: 3,
+                                }],
+                                &mode,
+                            );
                         } else {
-                            self.open_menu(MenuSection::Edit);
+                            self.open_menu_with_prior_mode(MenuSection::Edit, &mode);
                         }
                         return Ok(false);
                     }
                     'i' | 'I' => {
-                        self.open_menu(MenuSection::Insert);
+                        self.open_menu_with_prior_mode(MenuSection::Insert, &mode);
                         return Ok(false);
                     }
                     's' | 'S' => {
-                        self.open_menu(MenuSection::Sheet);
+                        self.open_menu_with_prior_mode(MenuSection::Sheet, &mode);
                         return Ok(false);
                     }
                     'o' | 'O' => {
-                        self.open_menu_path(vec![MenuLevel {
-                            section: MenuSection::File,
-                            item: 0,
-                        }]);
+                        self.open_menu_path_with_prior_mode(
+                            vec![MenuLevel {
+                                section: MenuSection::File,
+                                item: 0,
+                            }],
+                            &mode,
+                        );
                         return Ok(false);
                     }
                     'w' | 'W' => {
-                        self.open_menu_path(vec![MenuLevel {
-                            section: MenuSection::Width,
-                            item: 0,
-                        }]);
+                        self.open_menu_path_with_prior_mode(
+                            vec![MenuLevel {
+                                section: MenuSection::Width,
+                                item: 0,
+                            }],
+                            &mode,
+                        );
                         return Ok(false);
                     }
                     'x' | 'X' => {
-                        self.open_menu_path(vec![MenuLevel {
-                            section: MenuSection::Width,
-                            item: 1,
-                        }]);
+                        self.open_menu_path_with_prior_mode(
+                            vec![MenuLevel {
+                                section: MenuSection::Width,
+                                item: 1,
+                            }],
+                            &mode,
+                        );
                         return Ok(false);
                     }
                     _ => {}
@@ -11079,6 +11171,39 @@ mod tests {
     }
 
     #[test]
+    fn down_reaches_footer_with_row_selection_anchor() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(5, 1);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "x".into());
+        let mc = app.state.grid.main_cols();
+        app.anchor = Some(SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        });
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS + 4,
+            col: MARGIN_COLS + mc.saturating_sub(1),
+        };
+        app.selection_kind = SelectionKind::Rows;
+        app.mode = Mode::Normal;
+
+        assert!(matches!(
+            app.cursor.to_addr(&app.state.grid),
+            CellAddr::Main { .. }
+        ));
+
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()))
+            .unwrap();
+
+        assert!(matches!(
+            app.cursor.to_addr(&app.state.grid),
+            CellAddr::Footer { .. }
+        ));
+    }
+
+    #[test]
     fn enter_in_edit_mode_uses_edit_target_row_for_cursor_progression() {
         let mut app = App::new(None);
         app.state.grid.set_main_size(2, 1);
@@ -11672,6 +11797,74 @@ mod tests {
             other => panic!("expected Edit, got {other:?}"),
         }
         assert_eq!(app.edit_cursor, Some("prefπ".chars().count()));
+    }
+
+    #[test]
+    fn insert_menu_special_inserts_at_suspended_edit_caret() {
+        let mut app = App::new(None);
+        app.state.grid.set(
+            &CellAddr::Main { row: 0, col: 0 },
+            "zz".into(),
+        );
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        };
+        app.edit_target_addr = Some(CellAddr::Main { row: 0, col: 0 });
+        app.mode = Mode::Edit {
+            buffer: "ab".into(),
+            formula_cursor: None,
+            fit_to_content_on_commit: false,
+        };
+        app.edit_cursor = Some(1);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::ALT))
+            .unwrap();
+        assert!(matches!(app.mode, Mode::Menu { .. }));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::empty()))
+            .unwrap();
+        assert!(app.special_picker.is_some());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::empty()))
+            .unwrap();
+
+        match &app.mode {
+            Mode::Edit { buffer, .. } => assert_eq!(buffer, "a∞b"),
+            other => panic!("expected Edit after insert special via menu: {other:?}"),
+        }
+        assert_eq!(app.edit_cursor, Some(2));
+    }
+
+    #[test]
+    fn insert_menu_esc_restores_suspend_edit_buffer() {
+        let mut app = App::new(None);
+        app.state.grid.set(
+            &CellAddr::Main { row: 0, col: 0 },
+            "z".into(),
+        );
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        };
+        app.edit_target_addr = Some(CellAddr::Main { row: 0, col: 0 });
+        app.mode = Mode::Edit {
+            buffer: "ab".into(),
+            formula_cursor: None,
+            fit_to_content_on_commit: false,
+        };
+        app.edit_cursor = Some(1);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::ALT))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()))
+            .unwrap();
+
+        match &app.mode {
+            Mode::Edit { buffer, .. } => assert_eq!(buffer, "ab"),
+            other => panic!("expected Edit restored after menu Esc: {other:?}"),
+        }
+        assert_eq!(app.edit_cursor, Some(1));
     }
 
     #[test]
@@ -16022,6 +16215,92 @@ mod tests {
             other => panic!("unexpected mode: {other:?}"),
         }
     }
+
+    /// Times one `<Up>` key cycle as in [`App::run`] after input arrives: `sync_external` +
+    /// `terminal.draw(draw)` + `handle_key(<Up>)` (polling the event queue is omitted).
+    ///
+    /// Run (release recommended):
+    /// `cargo test --release tui_up_arrow_latency_harness -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn tui_up_arrow_latency_harness() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use std::time::Instant;
+
+        const SAMPLES: usize = 1000;
+        const WARMUP: usize = 32;
+
+        fn median_sorted_ns(sorted: &[u128]) -> f64 {
+            let n = sorted.len();
+            debug_assert!(n > 0);
+            if n % 2 == 1 {
+                sorted[n / 2] as f64
+            } else {
+                (sorted[n / 2 - 1] + sorted[n / 2]) as f64 / 2.0
+            }
+        }
+
+        fn micros(ns: f64) -> f64 {
+            ns / 1000.0
+        }
+
+        let mut app = App::new(None);
+        app.load_initial().unwrap();
+        app.state.grid.set_main_size(SAMPLES + 16, 12);
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS + SAMPLES,
+            col: MARGIN_COLS,
+        };
+
+        let backend = TestBackend::new(120, 28);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::empty());
+
+        for _ in 0..WARMUP {
+            app.sync_external().unwrap();
+            terminal.draw(|f| app.draw(f)).unwrap();
+            app.handle_key(up).unwrap();
+        }
+
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS + SAMPLES,
+            col: MARGIN_COLS,
+        };
+
+        let mut ns_samples: Vec<u128> = Vec::with_capacity(SAMPLES);
+        let t_total = Instant::now();
+
+        for _ in 0..SAMPLES {
+            let t0 = Instant::now();
+            app.sync_external().unwrap();
+            terminal.draw(|f| app.draw(f)).unwrap();
+            app.handle_key(up).unwrap();
+            ns_samples.push(t0.elapsed().as_nanos() as u128);
+        }
+
+        let wall_total_ns = t_total.elapsed().as_nanos() as u128;
+        ns_samples.sort_unstable();
+
+        let min_ns = ns_samples[0];
+        let max_ns = ns_samples[SAMPLES - 1];
+        let median_ns = median_sorted_ns(&ns_samples);
+        let sum_ns: u128 = ns_samples.iter().copied().sum();
+
+        eprintln!(
+            "\
+tui_up_arrow_latency_harness (sync_external + draw + handle_key(<Up>), N={})\n\
+  wall_total:    {:.3} ms\n\
+  sample_sum:    {:.3} ms\n\
+  per-press μs: min={:.2} median={:.2} max={:.2}",
+            SAMPLES,
+            wall_total_ns as f64 / 1_000_000.0,
+            sum_ns as f64 / 1_000_000.0,
+            micros(min_ns as f64),
+            micros(median_ns),
+            micros(max_ns as f64),
+        );
+    }
 }
 
 // ── Display helpers ───────────────────────────────────────────────────────────
@@ -16333,6 +16612,19 @@ pub(crate) fn format_cell_display(grid: &Grid, addr: &CellAddr, raw: String) -> 
             raw
         }
         NumberFormat::Currency { decimals } => {
+            let mut visiting = Vec::new();
+            let mut budget = 10_000usize;
+            if let Some(n) = effective_numeric(grid, addr, &mut visiting, &mut budget) {
+                if crate::formula::number::prefer_scientific_for_number(&n) {
+                    let sci = exact_decimal_generic_scientific(&n)
+                        .unwrap_or_else(|| format_significant_10_local(n.to_f64()));
+                    return format!("${sci}");
+                }
+                let value = n.to_f64();
+                if value.is_finite() {
+                    return format!("${value:.decimals$}");
+                }
+            }
             let trimmed = raw.trim();
             if let Ok(value) = trimmed.parse::<f64>() {
                 if value.is_finite() {
@@ -16353,6 +16645,18 @@ pub(crate) fn format_cell_display(grid: &Grid, addr: &CellAddr, raw: String) -> 
             raw
         }
         NumberFormat::Fixed { decimals } => {
+            let mut visiting = Vec::new();
+            let mut budget = 10_000usize;
+            if let Some(n) = effective_numeric(grid, addr, &mut visiting, &mut budget) {
+                if crate::formula::number::prefer_scientific_for_number(&n) {
+                    return exact_decimal_generic_scientific(&n)
+                        .unwrap_or_else(|| format_significant_10_local(n.to_f64()));
+                }
+                let value = n.to_f64();
+                if value.is_finite() {
+                    return format!("{value:.decimals$}");
+                }
+            }
             let trimmed = raw.trim();
             if let Ok(value) = trimmed.parse::<f64>() {
                 if value.is_finite() {

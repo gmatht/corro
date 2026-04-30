@@ -235,15 +235,55 @@ impl Number {
     }
 
     /// Cell/evaluation display strings: [`Number::Exact`] uses rational formatting (no `f64`
-    /// round-trip); approximate uses `format_approx` (typically significant-figures float).
+    /// round-trip) for human-scale values; extremes use exponential form like `format_approx` on
+    /// floats. Approximate numbers use `format_approx` directly.
     pub fn format_eval_display(&self, format_approx: impl FnMut(f64) -> String) -> String {
         let mut format_approx = format_approx;
         match self {
-            Number::Exact(r) => rational_to_formula_literal(r),
+            Number::Exact(r) => {
+                if prefer_scientific_exact(r) {
+                    if let Some(s) = exact_decimal_generic_scientific(&Number::Exact(r.clone())) {
+                        return s;
+                    }
+                }
+                rational_to_formula_literal(r)
+            }
             Number::Approx(f) => format_approx(*f),
             Number::Complex(c) => format_complex(*c, &mut format_approx),
         }
     }
+}
+
+/// Same magnitude rule as evaluator float display: outside ~\\(10^{-4}..10^{10}\\) ⇒ scientific.
+pub(crate) fn prefer_scientific_for_number(n: &Number) -> bool {
+    match n {
+        Number::Exact(r) => prefer_scientific_exact(r),
+        Number::Approx(f) => prefer_scientific_f64_abs(f.abs()),
+        Number::Complex(c) => prefer_scientific_f64_abs(c.re) || prefer_scientific_f64_abs(c.im),
+    }
+}
+
+fn prefer_scientific_f64_abs(abs: f64) -> bool {
+    if !abs.is_finite() {
+        return true;
+    }
+    if abs == 0.0 {
+        return false;
+    }
+    !(1e-4..1e10).contains(&abs)
+}
+
+fn prefer_scientific_exact(r: &BigRational) -> bool {
+    if r.is_zero() {
+        return false;
+    }
+    let Some(f) = r.to_f64().filter(|v| v.is_finite()) else {
+        return true;
+    };
+    if f == 0.0 {
+        return true;
+    }
+    prefer_scientific_f64_abs(f.abs())
 }
 
 fn format_complex(c: Complex64, format_approx: &mut impl FnMut(f64) -> String) -> String {
