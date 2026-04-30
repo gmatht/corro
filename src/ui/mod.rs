@@ -7574,10 +7574,13 @@ impl App {
                 let align = effective_cell_align(grid, &cell_addr, &formatted);
                 let fw = formatted.width();
                 let cell_fmt = grid.format_for_addr(&cell_addr);
+                // Numeric-like cells do not spill into neighbors. Do not treat `number: None` as
+                // numeric here: default display is decimal-generic but plain text must still spill
+                // across blank columns (`format_cell_display` already applies decimal rules).
                 let numeric_like = formatted.trim().parse::<f64>().is_ok()
                     || matches!(
                         cell_fmt.number,
-                        None | Some(NumberFormat::Rational | NumberFormat::DecimalGeneric)
+                        Some(NumberFormat::Rational | NumberFormat::DecimalGeneric)
                     );
                 let allow_text_spill =
                     spill_row && !is_agg_cell && !numeric_like && align != Some(TextAlign::Right);
