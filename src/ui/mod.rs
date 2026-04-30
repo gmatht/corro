@@ -1089,9 +1089,11 @@ impl App {
 
     fn open_special_picker(&mut self) {
         let snap = self.snapshot_for_special_insert();
-        self.special_insert_snap = Some(snap);
+        self.special_insert_snap = Some(snap.clone());
+        // Keep formula-bar/edit context visible while navigating the picker.
+        self.mode = self.start_edit_mode(snap.0.clone(), snap.2, false, false, None);
+        self.edit_cursor = Some(snap.1.min(snap.0.chars().count()));
         self.special_picker = Some(0);
-        self.mode = Mode::Normal;
     }
 
     fn commit_special_choice(&mut self, idx: usize) {
@@ -1301,7 +1303,7 @@ impl App {
             }
             MenuAction::InsertSpecialChars => {
                 self.open_special_picker();
-                Mode::Normal
+                self.mode.clone()
             }
             MenuAction::InsertDate => self.start_edit_mode(
                 chrono::Local::now().format("%Y-%m-%d").to_string(),
@@ -6706,7 +6708,6 @@ impl App {
     ) -> Result<(), RunError> {
         let max = SPECIAL_VALUE_CHOICES.len().saturating_sub(1);
         let idx = choice_index.min(max);
-        self.mode = Mode::Normal;
         self.special_picker = Some(idx);
         let sym = SPECIAL_VALUE_CHOICES[idx];
         self.status =
@@ -6778,6 +6779,9 @@ impl App {
         let mut shown_special_menu = false;
         for (char_i, ch) in text.chars().enumerate() {
             if !shown_special_menu && char_i == special_char_pos {
+                // In movie replay we open menu mode directly; seed the suspended edit snapshot so
+                // formula-bar rendering in `Mode::Menu` can still show the in-progress buffer.
+                self.pending_menu_edit = Some((typed.clone(), typed.chars().count(), None));
                 self.movie_show_menu(
                     terminal,
                     MenuSection::Insert,
@@ -6787,6 +6791,9 @@ impl App {
                     line_n,
                     menu_hold,
                 )?;
+                // Keep formula/edit context visible while the picker is shown.
+                self.mode = self.start_edit_mode(typed.clone(), None, false, false, None);
+                self.edit_cursor = Some(typed.chars().count());
                 self.movie_flash_special_character_picker(
                     terminal,
                     line_i,
@@ -6794,6 +6801,7 @@ impl App {
                     choice_index,
                     menu_hold,
                 )?;
+                self.pending_menu_edit = None;
                 self.mode = self.start_edit_mode(typed.clone(), None, false, false, None);
                 self.status = format!("Movie {}/{} typing: {}", line_i + 1, line_n, typed);
                 if self.movie_draw_and_sleep(terminal, char_delay)? {
@@ -11105,7 +11113,15 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
             Mode::Menu { .. } | Mode::Normal | Mode::RevisionBrowse => {
                 let prompt_cyan = Style::default().fg(Color::Cyan);
                 let prompt_cyan_bold = prompt_cyan.add_modifier(Modifier::BOLD);
-                let formula = formula_bar_value(grid, addr);
+                let formula = if matches!(&self.mode, Mode::Menu { .. }) {
+                    self.pending_menu_edit
+                        .as_ref()
+                        .map(|(buffer, _, _)| buffer.clone())
+                        .or_else(|| self.special_insert_snap.as_ref().map(|(buffer, _, _)| buffer.clone()))
+                        .unwrap_or_else(|| formula_bar_value(grid, addr))
+                } else {
+                    formula_bar_value(grid, addr)
+                };
                 let addr_str = addr_label(addr, grid.main_cols());
                 let mut spans: Vec<Span<'static>> = vec![Span::styled(
                     format!(" {addr_str}  "),
@@ -12239,6 +12255,31 @@ mod tests {
     }
 
     #[test]
+    fn insert_special_picker_keeps_edit_context_open() {
+        let mut app = App::new(None);
+        app.state.grid.set(&CellAddr::Main { row: 0, col: 0 }, "=Sin(".into());
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        };
+        app.edit_target_addr = Some(CellAddr::Main { row: 0, col: 0 });
+        app.mode = Mode::Edit {
+            buffer: "=Sin(".into(),
+            formula_cursor: None,
+            fit_to_content_on_commit: false,
+        };
+        app.edit_cursor = Some("=Sin(".chars().count());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::ALT))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::empty()))
+            .unwrap();
+
+        assert!(app.special_picker.is_some());
+        assert!(matches!(app.mode, Mode::Edit { .. }));
+    }
+
+    #[test]
     fn insert_menu_esc_restores_suspend_edit_buffer() {
         let mut app = App::new(None);
         app.state.grid.set(
@@ -12541,6 +12582,44 @@ mod tests {
         };
 
         assert!(row(1).contains("=π"));
+    }
+
+    #[test]
+    fn formula_bar_keeps_edit_buffer_visible_while_insert_menu_open() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 1);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "old".into());
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        };
+        app.edit_target_addr = Some(CellAddr::Main { row: 0, col: 0 });
+        app.mode = Mode::Edit {
+            buffer: "=Sin(".into(),
+            formula_cursor: None,
+            fit_to_content_on_commit: false,
+        };
+        app.edit_cursor = Some("=Sin(".chars().count());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::ALT))
+            .unwrap();
+        assert!(matches!(app.mode, Mode::Menu { .. }));
+
+        let backend = TestBackend::new(50, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = |y: u16| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+        assert!(row(1).contains("=Sin("), "{}", row(1));
     }
 
     #[test]
