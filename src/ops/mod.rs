@@ -405,12 +405,39 @@ impl Op {
                 state
                     .grid
                     .move_main_rows(*from as usize, *count as usize, *to as usize);
+                let er = state.grid.main_rows();
+                let from_us = *from as usize;
+                let count_us = *count as usize;
+                let remainder = er.saturating_sub(from_us).saturating_sub(count_us);
+                if remainder > 0 {
+                    let mc = state.grid.main_cols();
+                    crate::formula::repair_all_formulas_after_main_row_insert(
+                        &mut state.grid,
+                        mc,
+                        *from,
+                        remainder as u32,
+                        None,
+                    );
+                }
                 state.grid.bump_volatile_seed();
             }
             Op::MoveColRange { from, count, to } => {
                 state
                     .grid
                     .move_main_cols(*from as usize, *count as usize, *to as usize);
+                let ec = state.grid.main_cols();
+                let from_us = *from as usize;
+                let count_us = *count as usize;
+                let remainder = ec.saturating_sub(from_us).saturating_sub(count_us);
+                if remainder > 0 {
+                    crate::formula::repair_all_formulas_after_main_col_insert(
+                        &mut state.grid,
+                        ec,
+                        *from,
+                        remainder as u32,
+                        None,
+                    );
+                }
                 state.grid.bump_volatile_seed();
             }
             Op::DuplicateRow { row } => {
@@ -465,16 +492,37 @@ impl Op {
                     }
                 }
 
+                let mc = state.grid.main_cols();
                 state
                     .grid
-                    .set_main_size(original_main_rows.saturating_add(1), state.grid.main_cols());
+                    .set_main_size(original_main_rows.saturating_add(1), mc);
                 if dest_row < original_main_rows {
-                    state
-                        .grid
-                        .move_main_rows(dest_row, original_main_rows - dest_row, original_main_rows + 1);
+                    state.grid.move_main_rows(
+                        dest_row,
+                        original_main_rows - dest_row,
+                        original_main_rows + 1,
+                    );
+                }
+                let er = state.grid.main_rows();
+                let remainder =
+                    er.saturating_sub(dest_row).saturating_sub(original_main_rows - dest_row);
+                if remainder > 0 {
+                    crate::formula::repair_all_formulas_after_main_row_insert(
+                        &mut state.grid,
+                        mc,
+                        dest_row as u32,
+                        remainder as u32,
+                        None,
+                    );
                 }
                 for (addr, value) in copied_cells {
-                    state.grid.set(&addr, value);
+                    let pasted = if is_formula_text(&value) {
+                        crate::formula::translate_formula_text_by_offset(&value, 1, 0)
+                            .unwrap_or_else(|| value.clone())
+                    } else {
+                        value.clone()
+                    };
+                    state.grid.set(&addr, pasted);
                 }
                 state.grid.bump_volatile_seed();
             }
@@ -528,16 +576,35 @@ impl Op {
                     }
                 }
 
-                state
-                    .grid
-                    .set_main_size(state.grid.main_rows(), original_main_cols.saturating_add(1));
+                let mr = state.grid.main_rows();
+                state.grid.set_main_size(mr, original_main_cols.saturating_add(1));
                 if dest_col < original_main_cols {
-                    state
-                        .grid
-                        .move_main_cols(dest_col, original_main_cols - dest_col, original_main_cols + 1);
+                    state.grid.move_main_cols(
+                        dest_col,
+                        original_main_cols - dest_col,
+                        original_main_cols + 1,
+                    );
+                }
+                let mc = state.grid.main_cols();
+                let remainder =
+                    mc.saturating_sub(dest_col).saturating_sub(original_main_cols - dest_col);
+                if remainder > 0 {
+                    crate::formula::repair_all_formulas_after_main_col_insert(
+                        &mut state.grid,
+                        mc,
+                        dest_col as u32,
+                        remainder as u32,
+                        None,
+                    );
                 }
                 for (addr, value) in copied_cells {
-                    state.grid.set(&addr, value);
+                    let pasted = if is_formula_text(&value) {
+                        crate::formula::translate_formula_text_by_offset(&value, 0, 1)
+                            .unwrap_or_else(|| value.clone())
+                    } else {
+                        value.clone()
+                    };
+                    state.grid.set(&addr, pasted);
                 }
                 state.grid.bump_volatile_seed();
             }

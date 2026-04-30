@@ -335,6 +335,653 @@ pub fn translate_formula_text_by_offset(
     Some(out)
 }
 
+/// Like Excel row insert: relative main‑band row refs at or below `gap_start` shift by `delta_rows`
+/// (positive = rows pushed down). Absolute `$` row locks are preserved.
+/// `translate_qualified_same_sheet_refs`: When `Some(id)`, row refs inside `id!…` qualifiers are
+/// updated; when `None`, only unqualified refs are shifted (foreign sheet qualifiers unchanged).
+pub fn translate_formula_text_insert_main_rows(
+    raw: &str,
+    main_cols: usize,
+    gap_start: u32,
+    delta_rows: i32,
+    translate_qualified_same_sheet_refs: Option<u32>,
+) -> Option<String> {
+    if delta_rows == 0 {
+        return Some(raw.trim().to_string());
+    }
+    let t = raw.trim();
+    let (expr_to_parse, label_opt) = if let Some((e, l)) = split_labeled_formula(t) {
+        (format!("={}", e.trim()), Some(l.to_string()))
+    } else {
+        (t.to_string(), None)
+    };
+    if !expr_to_parse.starts_with('=') {
+        return None;
+    }
+    let mut parser = Parser {
+        s: &expr_to_parse[1..],
+        i: 0,
+        main_cols,
+    };
+    let ast = parser.parse_expr().ok()?;
+    parser.skip_ws();
+    if parser.i != parser.s.len() {
+        return None;
+    }
+    let translated =
+        translate_ast_insert_main_rows(&ast, gap_start, delta_rows, translate_qualified_same_sheet_refs)?;
+    let mut out = format!("={}", render_ast(&translated));
+    if let Some(ref label) = label_opt {
+        out.push_str(" -- ");
+        out.push_str(label);
+    }
+    Some(out)
+}
+
+/// Like Excel column insert: relative main‑band column refs at or right of `gap_start` shift by
+/// `delta_cols` (positive = columns pushed right). Absolute `$` column locks are preserved.
+/// See [`translate_formula_text_insert_main_rows`] for `translate_qualified_same_sheet_refs`.
+pub fn translate_formula_text_insert_main_cols(
+    raw: &str,
+    main_cols: usize,
+    gap_start: u32,
+    delta_cols: i32,
+    translate_qualified_same_sheet_refs: Option<u32>,
+) -> Option<String> {
+    if delta_cols == 0 {
+        return Some(raw.trim().to_string());
+    }
+    let t = raw.trim();
+    let (expr_to_parse, label_opt) = if let Some((e, l)) = split_labeled_formula(t) {
+        (format!("={}", e.trim()), Some(l.to_string()))
+    } else {
+        (t.to_string(), None)
+    };
+    if !expr_to_parse.starts_with('=') {
+        return None;
+    }
+    let mut parser = Parser {
+        s: &expr_to_parse[1..],
+        i: 0,
+        main_cols,
+    };
+    let ast = parser.parse_expr().ok()?;
+    parser.skip_ws();
+    if parser.i != parser.s.len() {
+        return None;
+    }
+    let translated = translate_ast_insert_main_cols(
+        &ast,
+        gap_start,
+        delta_cols,
+        main_cols,
+        translate_qualified_same_sheet_refs,
+    )?;
+    let mut out = format!("={}", render_ast(&translated));
+    if let Some(ref label) = label_opt {
+        out.push_str(" -- ");
+        out.push_str(label);
+    }
+    Some(out)
+}
+
+/// After creating an insert gap for main rows starting at `gap_start` with height `gap_len`,
+/// update every stored `=…` cell on the grid (Excel-style).
+pub fn repair_all_formulas_after_main_row_insert(
+    grid: &mut Grid,
+    main_cols: usize,
+    gap_start: u32,
+    gap_len: u32,
+    translate_qualified_same_sheet_refs: Option<u32>,
+) {
+    if gap_len == 0 {
+        return;
+    }
+    let delta = gap_len as i32;
+    let updates: Vec<(CellAddr, String)> = grid
+        .iter_nonempty()
+        .filter_map(|(addr, raw)| {
+            if !raw.trim_start().starts_with('=') {
+                return None;
+            }
+            let new_s = translate_formula_text_insert_main_rows(
+                &raw,
+                main_cols,
+                gap_start,
+                delta,
+                translate_qualified_same_sheet_refs,
+            )?;
+            (new_s != raw).then_some((addr, new_s))
+        })
+        .collect();
+    for (addr, s) in updates {
+        grid.set(&addr, s);
+    }
+}
+
+/// After creating an insert gap for main columns starting at `gap_start` with width `gap_len`,
+/// update every stored `=…` cell on the grid (Excel-style).
+pub fn repair_all_formulas_after_main_col_insert(
+    grid: &mut Grid,
+    main_cols: usize,
+    gap_start: u32,
+    gap_len: u32,
+    translate_qualified_same_sheet_refs: Option<u32>,
+) {
+    if gap_len == 0 {
+        return;
+    }
+    let delta = gap_len as i32;
+    let updates: Vec<(CellAddr, String)> = grid
+        .iter_nonempty()
+        .filter_map(|(addr, raw)| {
+            if !raw.trim_start().starts_with('=') {
+                return None;
+            }
+            let new_s = translate_formula_text_insert_main_cols(
+                &raw,
+                main_cols,
+                gap_start,
+                delta,
+                translate_qualified_same_sheet_refs,
+            )?;
+            (new_s != raw).then_some((addr, new_s))
+        })
+        .collect();
+    for (addr, s) in updates {
+        grid.set(&addr, s);
+    }
+}
+
+fn shift_if_unlocked_row(row: u32, locks: &A1RefLocks, gap_start: u32, delta: i32) -> Option<u32> {
+    if locks.row_absolute || row < gap_start {
+        return Some(row);
+    }
+    let r = row as i64 + delta as i64;
+    if r < 0 || r > u32::MAX as i64 {
+        None
+    } else {
+        Some(r as u32)
+    }
+}
+
+fn shift_if_unlocked_col(col: u32, locks: &A1RefLocks, gap_start: u32, delta: i32) -> Option<u32> {
+    if locks.col_absolute || col < gap_start {
+        return Some(col);
+    }
+    let c = col as i64 + delta as i64;
+    if c < 0 || c > u32::MAX as i64 {
+        None
+    } else {
+        Some(c as u32)
+    }
+}
+
+fn translate_cell_addr_insert_main_rows(
+    addr: &CellAddr,
+    locks: &A1RefLocks,
+    gap_start: u32,
+    delta: i32,
+) -> Option<CellAddr> {
+    Some(match addr {
+        CellAddr::Main { row, col } => CellAddr::Main {
+            row: shift_if_unlocked_row(*row, locks, gap_start, delta)?,
+            col: *col,
+        },
+        CellAddr::Left { col, row } => CellAddr::Left {
+            col: *col,
+            row: shift_if_unlocked_row(*row, locks, gap_start, delta)?,
+        },
+        CellAddr::Right { col, row } => CellAddr::Right {
+            col: *col,
+            row: shift_if_unlocked_row(*row, locks, gap_start, delta)?,
+        },
+        CellAddr::Header { .. } | CellAddr::Footer { .. } => addr.clone(),
+    })
+}
+
+fn translate_cell_addr_insert_main_cols(
+    addr: &CellAddr,
+    locks: &A1RefLocks,
+    gap_start: u32,
+    delta: i32,
+    main_cols: usize,
+) -> Option<CellAddr> {
+    Some(match addr {
+        CellAddr::Main { row, col } => CellAddr::Main {
+            row: *row,
+            col: shift_if_unlocked_col(*col, locks, gap_start, delta)?,
+        },
+        CellAddr::Header { row, col } => {
+            let gc = *col as usize;
+            if gc >= MARGIN_COLS && gc < MARGIN_COLS + main_cols {
+                let mc = (gc - MARGIN_COLS) as u32;
+                let nmc = shift_if_unlocked_col(mc, locks, gap_start, delta)?;
+                CellAddr::Header {
+                    row: *row,
+                    col: (MARGIN_COLS + nmc as usize) as u32,
+                }
+            } else {
+                addr.clone()
+            }
+        }
+        CellAddr::Footer { row, col } => {
+            let gc = *col as usize;
+            if gc >= MARGIN_COLS && gc < MARGIN_COLS + main_cols {
+                let mc = (gc - MARGIN_COLS) as u32;
+                let nmc = shift_if_unlocked_col(mc, locks, gap_start, delta)?;
+                CellAddr::Footer {
+                    row: *row,
+                    col: (MARGIN_COLS + nmc as usize) as u32,
+                }
+            } else {
+                addr.clone()
+            }
+        }
+        CellAddr::Left { .. } | CellAddr::Right { .. } => addr.clone(),
+    })
+}
+
+fn translate_range_insert_main_rows(
+    range: &MainRange,
+    locks_tl: A1RefLocks,
+    locks_br: A1RefLocks,
+    gap_start: u32,
+    delta: i32,
+) -> Option<(MainRange, A1RefLocks, A1RefLocks)> {
+    let tl = translate_cell_addr_insert_main_rows(
+        &CellAddr::Main {
+            row: range.row_start,
+            col: range.col_start,
+        },
+        &locks_tl,
+        gap_start,
+        delta,
+    )?;
+    let br = translate_cell_addr_insert_main_rows(
+        &CellAddr::Main {
+            row: range.row_end.saturating_sub(1),
+            col: range.col_end.saturating_sub(1),
+        },
+        &locks_br,
+        gap_start,
+        delta,
+    )?;
+    let (r1, c1, r2, c2) = match (tl, br) {
+        (
+            CellAddr::Main {
+                row: r1,
+                col: c1,
+            },
+            CellAddr::Main {
+                row: r2,
+                col: c2,
+            },
+        ) => (r1, c1, r2, c2),
+        _ => return None,
+    };
+    let row_start = r1.min(r2);
+    let row_end = r1.max(r2).saturating_add(1);
+    let col_start = c1.min(c2);
+    let col_end = c1.max(c2).saturating_add(1);
+    let (out_tl, out_br) = corner_locks_for_bbox(r1, c1, locks_tl, r2, c2, locks_br);
+    Some((
+        MainRange {
+            row_start,
+            row_end,
+            col_start,
+            col_end,
+        },
+        out_tl,
+        out_br,
+    ))
+}
+
+fn translate_range_insert_main_cols(
+    range: &MainRange,
+    locks_tl: A1RefLocks,
+    locks_br: A1RefLocks,
+    gap_start: u32,
+    delta: i32,
+    main_cols: usize,
+) -> Option<(MainRange, A1RefLocks, A1RefLocks)> {
+    let tl = translate_cell_addr_insert_main_cols(
+        &CellAddr::Main {
+            row: range.row_start,
+            col: range.col_start,
+        },
+        &locks_tl,
+        gap_start,
+        delta,
+        main_cols,
+    )?;
+    let br = translate_cell_addr_insert_main_cols(
+        &CellAddr::Main {
+            row: range.row_end.saturating_sub(1),
+            col: range.col_end.saturating_sub(1),
+        },
+        &locks_br,
+        gap_start,
+        delta,
+        main_cols,
+    )?;
+    let (r1, c1, r2, c2) = match (tl, br) {
+        (
+            CellAddr::Main {
+                row: r1,
+                col: c1,
+            },
+            CellAddr::Main {
+                row: r2,
+                col: c2,
+            },
+        ) => (r1, c1, r2, c2),
+        _ => return None,
+    };
+    let row_start = r1.min(r2);
+    let row_end = r1.max(r2).saturating_add(1);
+    let col_start = c1.min(c2);
+    let col_end = c1.max(c2).saturating_add(1);
+    let (out_tl, out_br) = corner_locks_for_bbox(r1, c1, locks_tl, r2, c2, locks_br);
+    Some((
+        MainRange {
+            row_start,
+            row_end,
+            col_start,
+            col_end,
+        },
+        out_tl,
+        out_br,
+    ))
+}
+
+fn translate_ast_insert_main_rows(
+    ast: &Ast,
+    gap_start: u32,
+    delta: i32,
+    translate_qualified_same_sheet_refs: Option<u32>,
+) -> Option<Ast> {
+    Some(match ast {
+        Ast::Number(n) => Ast::Number(n.clone()),
+        Ast::Text(s) => Ast::Text(s.clone()),
+        Ast::Name(name) => Ast::Name(name.clone()),
+        Ast::Ref { addr, locks } => Ast::Ref {
+            addr: translate_cell_addr_insert_main_rows(addr, locks, gap_start, delta)?,
+            locks: *locks,
+        },
+        Ast::SheetRef {
+            sheet_id,
+            addr,
+            locks,
+        } => {
+            let new_addr =
+                if translate_qualified_same_sheet_refs.map_or(false, |id| id == *sheet_id) {
+                    translate_cell_addr_insert_main_rows(addr, locks, gap_start, delta)?
+                } else {
+                    addr.clone()
+                };
+            Ast::SheetRef {
+                sheet_id: *sheet_id,
+                addr: new_addr,
+                locks: *locks,
+            }
+        }
+        Ast::Range {
+            range,
+            locks_tl,
+            locks_br,
+        } => {
+            let (rng, otl, obr) =
+                translate_range_insert_main_rows(range, *locks_tl, *locks_br, gap_start, delta)?;
+            Ast::Range {
+                range: rng,
+                locks_tl: otl,
+                locks_br: obr,
+            }
+        }
+        Ast::Neg(a) => Ast::Neg(Box::new(translate_ast_insert_main_rows(
+            a,
+            gap_start,
+            delta,
+            translate_qualified_same_sheet_refs,
+        )?)),
+        Ast::Add(a, b) => Ast::Add(
+            Box::new(translate_ast_insert_main_rows(
+                a,
+                gap_start,
+                delta,
+                translate_qualified_same_sheet_refs,
+            )?),
+            Box::new(translate_ast_insert_main_rows(
+                b,
+                gap_start,
+                delta,
+                translate_qualified_same_sheet_refs,
+            )?),
+        ),
+        Ast::Sub(a, b) => Ast::Sub(
+            Box::new(translate_ast_insert_main_rows(
+                a,
+                gap_start,
+                delta,
+                translate_qualified_same_sheet_refs,
+            )?),
+            Box::new(translate_ast_insert_main_rows(
+                b,
+                gap_start,
+                delta,
+                translate_qualified_same_sheet_refs,
+            )?),
+        ),
+        Ast::Mul(a, b) => Ast::Mul(
+            Box::new(translate_ast_insert_main_rows(
+                a,
+                gap_start,
+                delta,
+                translate_qualified_same_sheet_refs,
+            )?),
+            Box::new(translate_ast_insert_main_rows(
+                b,
+                gap_start,
+                delta,
+                translate_qualified_same_sheet_refs,
+            )?),
+        ),
+        Ast::Div(a, b) => Ast::Div(
+            Box::new(translate_ast_insert_main_rows(
+                a,
+                gap_start,
+                delta,
+                translate_qualified_same_sheet_refs,
+            )?),
+            Box::new(translate_ast_insert_main_rows(
+                b,
+                gap_start,
+                delta,
+                translate_qualified_same_sheet_refs,
+            )?),
+        ),
+        Ast::Pow(a, b) => Ast::Pow(
+            Box::new(translate_ast_insert_main_rows(
+                a,
+                gap_start,
+                delta,
+                translate_qualified_same_sheet_refs,
+            )?),
+            Box::new(translate_ast_insert_main_rows(
+                b,
+                gap_start,
+                delta,
+                translate_qualified_same_sheet_refs,
+            )?),
+        ),
+        Ast::Call { name, args } => Ast::Call {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|a| {
+                    translate_ast_insert_main_rows(
+                        a,
+                        gap_start,
+                        delta,
+                        translate_qualified_same_sheet_refs,
+                    )
+                })
+                .collect::<Option<Vec<_>>>()?,
+        },
+    })
+}
+
+fn translate_ast_insert_main_cols(
+    ast: &Ast,
+    gap_start: u32,
+    delta: i32,
+    main_cols: usize,
+    translate_qualified_same_sheet_refs: Option<u32>,
+) -> Option<Ast> {
+    Some(match ast {
+        Ast::Number(n) => Ast::Number(n.clone()),
+        Ast::Text(s) => Ast::Text(s.clone()),
+        Ast::Name(name) => Ast::Name(name.clone()),
+        Ast::Ref { addr, locks } => Ast::Ref {
+            addr: translate_cell_addr_insert_main_cols(addr, locks, gap_start, delta, main_cols)?,
+            locks: *locks,
+        },
+        Ast::SheetRef {
+            sheet_id,
+            addr,
+            locks,
+        } => {
+            let new_addr =
+                if translate_qualified_same_sheet_refs.map_or(false, |id| id == *sheet_id) {
+                    translate_cell_addr_insert_main_cols(addr, locks, gap_start, delta, main_cols)?
+                } else {
+                    addr.clone()
+                };
+            Ast::SheetRef {
+                sheet_id: *sheet_id,
+                addr: new_addr,
+                locks: *locks,
+            }
+        }
+        Ast::Range {
+            range,
+            locks_tl,
+            locks_br,
+        } => {
+            let (rng, otl, obr) =
+                translate_range_insert_main_cols(range, *locks_tl, *locks_br, gap_start, delta, main_cols)?;
+            Ast::Range {
+                range: rng,
+                locks_tl: otl,
+                locks_br: obr,
+            }
+        }
+        Ast::Neg(a) => Ast::Neg(Box::new(translate_ast_insert_main_cols(
+            a,
+            gap_start,
+            delta,
+            main_cols,
+            translate_qualified_same_sheet_refs,
+        )?)),
+        Ast::Add(a, b) => Ast::Add(
+            Box::new(translate_ast_insert_main_cols(
+                a,
+                gap_start,
+                delta,
+                main_cols,
+                translate_qualified_same_sheet_refs,
+            )?),
+            Box::new(translate_ast_insert_main_cols(
+                b,
+                gap_start,
+                delta,
+                main_cols,
+                translate_qualified_same_sheet_refs,
+            )?),
+        ),
+        Ast::Sub(a, b) => Ast::Sub(
+            Box::new(translate_ast_insert_main_cols(
+                a,
+                gap_start,
+                delta,
+                main_cols,
+                translate_qualified_same_sheet_refs,
+            )?),
+            Box::new(translate_ast_insert_main_cols(
+                b,
+                gap_start,
+                delta,
+                main_cols,
+                translate_qualified_same_sheet_refs,
+            )?),
+        ),
+        Ast::Mul(a, b) => Ast::Mul(
+            Box::new(translate_ast_insert_main_cols(
+                a,
+                gap_start,
+                delta,
+                main_cols,
+                translate_qualified_same_sheet_refs,
+            )?),
+            Box::new(translate_ast_insert_main_cols(
+                b,
+                gap_start,
+                delta,
+                main_cols,
+                translate_qualified_same_sheet_refs,
+            )?),
+        ),
+        Ast::Div(a, b) => Ast::Div(
+            Box::new(translate_ast_insert_main_cols(
+                a,
+                gap_start,
+                delta,
+                main_cols,
+                translate_qualified_same_sheet_refs,
+            )?),
+            Box::new(translate_ast_insert_main_cols(
+                b,
+                gap_start,
+                delta,
+                main_cols,
+                translate_qualified_same_sheet_refs,
+            )?),
+        ),
+        Ast::Pow(a, b) => Ast::Pow(
+            Box::new(translate_ast_insert_main_cols(
+                a,
+                gap_start,
+                delta,
+                main_cols,
+                translate_qualified_same_sheet_refs,
+            )?),
+            Box::new(translate_ast_insert_main_cols(
+                b,
+                gap_start,
+                delta,
+                main_cols,
+                translate_qualified_same_sheet_refs,
+            )?),
+        ),
+        Ast::Call { name, args } => Ast::Call {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|a| {
+                    translate_ast_insert_main_cols(
+                        a,
+                        gap_start,
+                        delta,
+                        main_cols,
+                        translate_qualified_same_sheet_refs,
+                    )
+                })
+                .collect::<Option<Vec<_>>>()?,
+        },
+    })
+}
+
 fn translate_cell_addr_by_offset(
     addr: &CellAddr,
     row_delta: i32,
@@ -2307,6 +2954,22 @@ mod tests {
             "=($A$1+C3)"
         );
         assert_eq!(translate_formula_text_by_offset("=A1", 1, 0).unwrap(), "=A2");
+    }
+
+    #[test]
+    fn translate_formula_insert_main_rows_bumps_refs_on_or_below_gap_start() {
+        assert_eq!(
+            translate_formula_text_insert_main_rows("=A10+A11+A12", 2, 10, 2, None).unwrap(),
+            "=((A10+A13)+A14)"
+        );
+    }
+
+    #[test]
+    fn translate_formula_insert_main_cols_bumps_refs_on_or_right_of_gap_start() {
+        assert_eq!(
+            translate_formula_text_insert_main_cols("=A1+C1+E1", 5, 2, 1, None).unwrap(),
+            "=((A1+D1)+F1)"
+        );
     }
 
     #[test]

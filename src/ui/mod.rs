@@ -988,15 +988,47 @@ impl App {
         )
     }
 
+    fn snapshot_for_special_insert(&self) -> (String, usize) {
+        match &self.mode {
+            Mode::Edit { buffer, .. } => (
+                buffer.clone(),
+                self.edit_cursor
+                    .unwrap_or_else(|| buffer.chars().count())
+                    .min(buffer.chars().count()),
+            ),
+            _ => {
+                let addr = self.cursor.to_addr(&self.state.grid);
+                let s = cell_display(&self.state.grid, &addr);
+                let len = s.chars().count();
+                (s, len)
+            }
+        }
+    }
+
     fn open_special_picker(&mut self) {
+        self.special_insert_snap = Some(self.snapshot_for_special_insert());
         self.special_picker = Some(0);
         self.mode = Mode::Normal;
     }
 
     fn commit_special_choice(&mut self, idx: usize) {
         let choice = SPECIAL_VALUE_CHOICES[idx];
-        let buffer = choice.to_string();
-        self.mode = self.start_edit_mode(buffer, None, true, false, None);
+        let (mut buf, snap_pos) = self.special_insert_snap.take().unwrap_or_else(|| {
+            let addr = self.cursor.to_addr(&self.state.grid);
+            let s = cell_display(&self.state.grid, &addr);
+            let len = s.chars().count();
+            (s, len)
+        });
+        let mut cur = Some(snap_pos.min(buf.chars().count()));
+        Self::insert_text_into_buffer(&mut buf, &mut cur, choice);
+        let caret = cur.unwrap_or(buf.chars().count());
+        let formula_cursor = if buf.trim() == "=" {
+            Some(self.cursor)
+        } else {
+            None
+        };
+        self.mode = self.start_edit_mode(buf, formula_cursor, true, false, None);
+        self.edit_cursor = Some(caret);
     }
 
     fn menu_action_mode(&mut self, action: MenuAction) -> Mode {
@@ -2257,6 +2289,8 @@ pub struct App {
     edit_cursor: Option<usize>,
     input_cursor: Option<usize>,
     special_picker: Option<usize>,
+    /// Text and caret (Unicode scalar/`char` index) when opening the special-character picker.
+    special_insert_snap: Option<(String, usize)>,
     pending_format_target: Option<FormatTarget>,
     view_sheet_id: u32,
     persisted_view_sort_cols: HashMap<u32, Vec<SortSpec>>,
@@ -2326,6 +2360,7 @@ impl App {
             edit_cursor: None,
             input_cursor: None,
             special_picker: None,
+            special_insert_snap: None,
             pending_format_target: None,
             view_sheet_id: 1,
             persisted_view_sort_cols: HashMap::new(),
@@ -7597,6 +7632,10 @@ impl App {
                 }
                 spans.push(Span::styled(disp, st));
                 if i + 1 < col_ixs.len() {
+                    // No gutter space before the next cell when overflowing text spills into blank
+                    // columns — avoids a gap like `s │ imple` that reads as two words.
+                    let suppress_plain_gap =
+                        allow_text_spill && !spill_remain.is_empty();
                     if c == lm - 1 && lm > 0 && col_ixs.contains(&lm) {
                         spans.push(Span::styled(
                             "│",
@@ -7615,7 +7654,7 @@ impl App {
                             " ",
                             boundary_gap_style(is_underlined_boundary_row),
                         ));
-                    } else {
+                    } else if !suppress_plain_gap {
                         spans.push(Span::styled(
                             " ",
                             boundary_gap_style(is_underlined_boundary_row),
@@ -8221,6 +8260,7 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
             match key.code {
                 KeyCode::Esc => {
                     self.special_picker = None;
+                    self.special_insert_snap = None;
                     return Ok(false);
                 }
                 KeyCode::Enter => {
@@ -8237,12 +8277,10 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                     return Ok(false);
                 }
                 KeyCode::Char(c) if c.is_ascii_digit() => {
-                    if let Some(idx) = c.to_digit(10).map(|i| i as usize) {
-                        if idx < SPECIAL_VALUE_CHOICES.len() {
-                            self.commit_special_choice(idx);
-                            self.special_picker = None;
-                            return Ok(false);
-                        }
+                    if let Some(idx) = special_choice_index_for_digit(c) {
+                        self.commit_special_choice(idx);
+                        self.special_picker = None;
+                        return Ok(false);
                     }
                 }
                 _ => {}
@@ -9737,8 +9775,7 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                 }
                 KeyCode::Char(c) if self.edit_special_palette && c.is_ascii_digit() => {
                     if let Some(choice) = special_value_for_digit(c) {
-                        self.edit_cursor = Some(choice.chars().count());
-                        *buffer = choice.to_string();
+                        Self::insert_text_into_buffer(buffer, &mut self.edit_cursor, choice);
                     }
                 }
                 KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down
@@ -11617,6 +11654,51 @@ mod tests {
     }
 
     #[test]
+    fn special_char_picker_appends_symbol_to_existing_cell_text() {
+        let mut app = App::new(None);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "pref".into());
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        };
+        app.open_special_picker();
+        // Palette labels match special_choice_label: `4` picks π (index 3).
+        app.handle_key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::empty()))
+            .unwrap();
+        match &app.mode {
+            Mode::Edit { buffer, .. } => assert_eq!(buffer.as_str(), "prefπ"),
+            other => panic!("expected Edit, got {other:?}"),
+        }
+        assert_eq!(app.edit_cursor, Some("prefπ".chars().count()));
+    }
+
+    #[test]
+    fn special_char_palette_digit_inserts_at_edit_caret() {
+        let mut app = App::new(None);
+        app.mode = Mode::Edit {
+            buffer: "ab".into(),
+            formula_cursor: None,
+            fit_to_content_on_commit: false,
+        };
+        app.edit_cursor = Some(1);
+        app.edit_special_palette = true;
+        app.edit_target_addr = Some(CellAddr::Main { row: 0, col: 0 });
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::empty()))
+            .unwrap();
+        match &app.mode {
+            Mode::Edit { buffer, .. } => assert_eq!(buffer.as_str(), "a∞b"),
+            other => panic!("expected Edit, got {other:?}"),
+        }
+        assert_eq!(app.edit_cursor, Some(2));
+    }
+
+    #[test]
     fn insert_menu_special_chars_reuses_existing_special_value() {
         let mut app = App::new(None);
         app.state
@@ -11925,9 +12007,8 @@ mod tests {
         } else {
             panic!("expected edit mode");
         }
-        // With the new address semantics the computed rendered width may
-        // include the left-margin offset; update expectation accordingly.
-        assert_eq!(app.state.grid.col_width(MARGIN_COLS), 11);
+        // Column width follows rendered display of the committed value (not raw ISO length).
+        assert_eq!(app.state.grid.col_width(MARGIN_COLS), 6);
     }
 
     #[test]
@@ -14966,7 +15047,7 @@ mod tests {
                 .grid
                 .get(&CellAddr::Main { row: 2, col: 1 })
                 .as_deref(),
-            Some("=A2*2")
+            Some("=(A3*2)")
         );
         assert_eq!(
             app.state
@@ -15044,7 +15125,7 @@ mod tests {
                 .grid
                 .get(&CellAddr::Main { row: 1, col: 2 })
                 .as_deref(),
-            Some("=A2*2")
+            Some("=(B2*2)")
         );
         assert_eq!(
             app.state
