@@ -33,6 +33,7 @@ use std::fs::OpenOptions;
 use std::io::{self, stdout};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use thiserror::Error;
 use unicode_truncate::{Alignment as UTruncAlign, UnicodeTruncateStr};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -2474,6 +2475,29 @@ impl App {
         app.revision_browse = true;
         app.mode = Mode::RevisionBrowse;
         app
+    }
+
+    /// Apply one `.corro` log line to the workbook and sync UI sheet state (`view_sheet_id` /
+    /// [`Self::sync_active_sheet_cache`]).
+    ///
+    /// Used by the `pgo_mix_benchmark` workload and profiling without a real terminal.
+    pub fn bench_apply_corro_log_line(&mut self, line: &str) -> std::io::Result<()> {
+        let mut active_sheet = self.view_sheet_id;
+        crate::ops::apply_log_line_to_workbook(line, &mut self.workbook, &mut active_sheet)?;
+        self.view_sheet_id = active_sheet;
+        self.sync_active_sheet_cache();
+        Ok(())
+    }
+
+    pub fn bench_handle_key(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+    ) -> Result<bool, RunError> {
+        self.handle_key(key)
+    }
+
+    pub fn bench_draw(&mut self, f: &mut ratatui::Frame<'_>) {
+        self.draw(f);
     }
 
     fn open_path_prompt_buffer(&self) -> String {
@@ -6645,10 +6669,154 @@ impl App {
         if time_like {
             return Some((MenuAction::InsertTime, "Time"));
         }
-        if SPECIAL_VALUE_CHOICES.contains(&value) {
+        if SPECIAL_VALUE_CHOICES.iter().any(|sym| value.contains(sym)) {
             return Some((MenuAction::InsertSpecialChars, "Special Char"));
         }
         None
+    }
+
+    fn movie_special_choice_highlight_index(value: &str) -> Option<usize> {
+        SPECIAL_VALUE_CHOICES
+            .iter()
+            .position(|sym| value.contains(sym))
+    }
+
+    /// Earliest special-character occurrence in `value`: returns `(choice_index, char_pos)`.
+    fn movie_special_choice_position(value: &str) -> Option<(usize, usize)> {
+        let mut best: Option<(usize, usize)> = None;
+        for (idx, sym) in SPECIAL_VALUE_CHOICES.iter().enumerate() {
+            if let Some(byte_pos) = value.find(sym) {
+                let char_pos = value[..byte_pos].chars().count();
+                match best {
+                    Some((_, best_char_pos)) if char_pos >= best_char_pos => {}
+                    _ => best = Some((idx, char_pos)),
+                }
+            }
+        }
+        best
+    }
+
+    fn movie_flash_special_character_picker(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+        line_i: usize,
+        line_n: usize,
+        choice_index: usize,
+        menu_hold: std::time::Duration,
+    ) -> Result<(), RunError> {
+        let max = SPECIAL_VALUE_CHOICES.len().saturating_sub(1);
+        let idx = choice_index.min(max);
+        self.mode = Mode::Normal;
+        self.special_picker = Some(idx);
+        let sym = SPECIAL_VALUE_CHOICES[idx];
+        self.status =
+            format!("Movie {}/{} special picker: {}", line_i + 1, line_n, sym);
+        if self.movie_draw_and_sleep(terminal, menu_hold)? {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "movie interrupted by user").into());
+        }
+        let confirm = menu_hold.mul_f64(0.45).max(Duration::from_millis(240));
+        self.status = format!("Movie {}/{} special: {}", line_i + 1, line_n, sym);
+        if self.movie_draw_and_sleep(terminal, confirm)? {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "movie interrupted by user").into());
+        }
+        self.special_picker = None;
+        Ok(())
+    }
+
+    fn movie_maybe_preview_insert_hints(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+        value: &str,
+        line_i: usize,
+        line_n: usize,
+        menu_hold: std::time::Duration,
+    ) -> Result<(), RunError> {
+        let Some((action, label)) = Self::movie_infer_insert_menu_action(value) else {
+            return Ok(());
+        };
+        self.movie_show_menu(
+            terminal,
+            MenuSection::Insert,
+            action,
+            label,
+            line_i,
+            line_n,
+            menu_hold,
+        )?;
+        if action == MenuAction::InsertSpecialChars {
+            if let Some(ix) = Self::movie_special_choice_highlight_index(value) {
+                self.movie_flash_special_character_picker(
+                    terminal,
+                    line_i,
+                    line_n,
+                    ix,
+                    menu_hold,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn movie_type_with_special_character_preview_and_commit(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+        text: &str,
+        line_i: usize,
+        line_n: usize,
+        char_delay: std::time::Duration,
+        confirm_delay: std::time::Duration,
+        choice_index: usize,
+        special_char_pos: usize,
+    ) -> Result<(), RunError> {
+        self.mode = self.start_edit_mode(String::new(), None, false, false, None);
+        self.status = format!("Movie {}/{} edit", line_i + 1, line_n);
+        if self.movie_draw_and_sleep(terminal, char_delay)? {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "movie interrupted by user").into());
+        }
+        let mut typed = String::new();
+        let mut shown_special_menu = false;
+        for (char_i, ch) in text.chars().enumerate() {
+            if !shown_special_menu && char_i == special_char_pos {
+                self.movie_show_menu(
+                    terminal,
+                    MenuSection::Insert,
+                    MenuAction::InsertSpecialChars,
+                    "Special Char",
+                    line_i,
+                    line_n,
+                    char_delay,
+                )?;
+                self.movie_flash_special_character_picker(
+                    terminal,
+                    line_i,
+                    line_n,
+                    choice_index,
+                    char_delay,
+                )?;
+                self.mode = self.start_edit_mode(typed.clone(), None, false, false, None);
+                self.status = format!("Movie {}/{} typing: {}", line_i + 1, line_n, typed);
+                if self.movie_draw_and_sleep(terminal, char_delay)? {
+                    return Err(
+                        io::Error::new(io::ErrorKind::Interrupted, "movie interrupted by user").into(),
+                    );
+                }
+                shown_special_menu = true;
+            }
+            typed.push(ch);
+            self.mode = self.start_edit_mode(typed.clone(), None, false, false, None);
+            self.status = format!("Movie {}/{} typing: {}", line_i + 1, line_n, typed);
+            if self.movie_draw_and_sleep(terminal, char_delay)? {
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "movie interrupted by user").into());
+            }
+        }
+        self.status = format!("Movie {}/{} confirm", line_i + 1, line_n);
+        if self.movie_draw_and_sleep(terminal, confirm_delay)? {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "movie interrupted by user").into());
+        }
+        self.movie_apply_set_cell_value(&typed);
+        self.edit_target_addr = None;
+        self.mode = Mode::Normal;
+        Ok(())
     }
 
     fn movie_infer_format_action(
@@ -6701,40 +6869,73 @@ impl App {
                 self.movie_focus_sheet(sheet_id);
                 match op {
                     crate::ops::Op::SetCell { addr, value } => {
-                        if let Some((action, label)) = Self::movie_infer_insert_menu_action(&value) {
-                            self.movie_show_menu(
+                        self.movie_move_cursor_to_addr(&addr);
+                        if let Some((choice_idx, char_pos)) =
+                            Self::movie_special_choice_position(&value)
+                        {
+                            self.movie_type_with_special_character_preview_and_commit(
                                 terminal,
-                                MenuSection::Insert,
-                                action,
-                                label,
+                                &value,
+                                line_i,
+                                line_n,
+                                char_delay,
+                                confirm_delay,
+                                choice_idx,
+                                char_pos,
+                            )?;
+                        } else {
+                            self.movie_maybe_preview_insert_hints(
+                                terminal,
+                                &value,
                                 line_i,
                                 line_n,
                                 menu_hold,
                             )?;
+                            self.movie_type_and_commit_current_cell(
+                                terminal,
+                                &value,
+                                line_i,
+                                line_n,
+                                char_delay,
+                                confirm_delay,
+                            )?;
                         }
-                        self.movie_move_cursor_to_addr(&addr);
-                        self.movie_type_and_commit_current_cell(
-                            terminal,
-                            &value,
-                            line_i,
-                            line_n,
-                            char_delay,
-                            confirm_delay,
-                        )?;
                         self.ops_applied += 1;
                         return Ok(true);
                     }
                     crate::ops::Op::SetCellRef { cref, value } => {
                         let addr = cref.to_grid_addr(self.state.grid.main_cols());
                         self.movie_move_cursor_to_addr(&addr);
-                        self.movie_type_and_commit_current_cell(
-                            terminal,
-                            &value,
-                            line_i,
-                            line_n,
-                            char_delay,
-                            confirm_delay,
-                        )?;
+                        if let Some((choice_idx, char_pos)) =
+                            Self::movie_special_choice_position(&value)
+                        {
+                            self.movie_type_with_special_character_preview_and_commit(
+                                terminal,
+                                &value,
+                                line_i,
+                                line_n,
+                                char_delay,
+                                confirm_delay,
+                                choice_idx,
+                                char_pos,
+                            )?;
+                        } else {
+                            self.movie_maybe_preview_insert_hints(
+                                terminal,
+                                &value,
+                                line_i,
+                                line_n,
+                                menu_hold,
+                            )?;
+                            self.movie_type_and_commit_current_cell(
+                                terminal,
+                                &value,
+                                line_i,
+                                line_n,
+                                char_delay,
+                                confirm_delay,
+                            )?;
+                        }
                         self.ops_applied += 1;
                         return Ok(true);
                     }
@@ -6774,7 +6975,8 @@ impl App {
                         }
                         return Ok(true);
                     }
-                    crate::ops::Op::DuplicateRow { .. } => {
+                    crate::ops::Op::DuplicateRow { row } => {
+                        self.movie_move_cursor_to_addr(&CellAddr::Main { row, col: 0 });
                         return self.movie_apply_with_menu(
                             terminal,
                             line,
@@ -6789,7 +6991,8 @@ impl App {
                             "apply mitosis row",
                         );
                     }
-                    crate::ops::Op::DuplicateCol { .. } => {
+                    crate::ops::Op::DuplicateCol { col } => {
+                        self.movie_move_cursor_to_addr(&CellAddr::Main { row: 0, col });
                         return self.movie_apply_with_menu(
                             terminal,
                             line,
@@ -16411,7 +16614,20 @@ mod tests {
             App::movie_infer_insert_menu_action("∞"),
             Some((MenuAction::InsertSpecialChars, "Special Char"))
         );
+        assert_eq!(
+            App::movie_infer_insert_menu_action("=Sin(π)"),
+            Some((MenuAction::InsertSpecialChars, "Special Char"))
+        );
+        assert_eq!(App::movie_special_choice_highlight_index("=Sin(π)"), Some(3));
+        assert_eq!(App::movie_special_choice_highlight_index("=1+√2"), Some(6));
         assert_eq!(App::movie_infer_insert_menu_action("plain text"), None);
+    }
+
+    #[test]
+    fn movie_special_choice_position_uses_earliest_symbol_offset() {
+        assert_eq!(App::movie_special_choice_position("=Sin(π)"), Some((3, 5)));
+        assert_eq!(App::movie_special_choice_position("π+√2"), Some((3, 0)));
+        assert_eq!(App::movie_special_choice_position("plain text"), None);
     }
 
     #[test]
