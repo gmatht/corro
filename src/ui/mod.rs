@@ -30,9 +30,9 @@ use ratatui::widgets::{
 };
 use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
-use std::io::{self, stdout};
-use std::io::Write;
+use std::io::{self, stdout, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use thiserror::Error;
 use unicode_truncate::{Alignment as UTruncAlign, UnicodeTruncateStr};
@@ -47,6 +47,10 @@ const NAV_BLANK_ROWS: usize = 2;
 /// Trailing blank main cols allowed before Right transitions into the right margin.
 const NAV_BLANK_COLS: usize = 1;
 
+fn debug_agent_log_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("debug-45b689.log")
+}
+
 fn debug_json_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
@@ -55,11 +59,11 @@ fn debug_log_ndjson(hypothesis_id: &str, location: &str, message: &str, data_jso
     if let Ok(mut file) = OpenOptions::new()
         .create(true)
         .append(true)
-        .open("debug-1c96f4.log")
+        .open(debug_agent_log_path())
     {
         let _ = writeln!(
             file,
-            "{{\"sessionId\":\"1c96f4\",\"runId\":\"pre-fix\",\"hypothesisId\":\"{}\",\"location\":\"{}\",\"message\":\"{}\",\"data\":{},\"timestamp\":{}}}",
+            "{{\"sessionId\":\"45b689\",\"runId\":\"post-fix\",\"hypothesisId\":\"{}\",\"location\":\"{}\",\"message\":\"{}\",\"data\":{},\"timestamp\":{}}}",
             debug_json_escape(hypothesis_id),
             debug_json_escape(location),
             debug_json_escape(message),
@@ -68,6 +72,9 @@ fn debug_log_ndjson(hypothesis_id: &str, location: &str, message: &str, data_jso
         );
     }
 }
+
+static DEBUG_AGENT_H2_SAMPLES: AtomicU32 = AtomicU32::new(0);
+static DEBUG_AGENT_H3_SAMPLES: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SelectionKind {
@@ -224,6 +231,8 @@ enum Mode {
     Edit {
         buffer: String,
         formula_cursor: Option<SheetCursor>,
+        /// Char index into `buffer` where arrow-driven A1 text starts; active only with `formula_cursor`.
+        formula_ref_char_start: Option<usize>,
         fit_to_content_on_commit: bool,
     },
     OpenPath {
@@ -969,13 +978,19 @@ impl App {
             Mode::Edit {
                 buffer,
                 formula_cursor,
+                formula_ref_char_start,
                 ..
             } => {
                 let caret = self
                     .edit_cursor
                     .unwrap_or_else(|| buffer.chars().count())
                     .min(buffer.chars().count());
-                self.pending_menu_edit = Some((buffer.clone(), caret, *formula_cursor));
+                self.pending_menu_edit = Some((
+                    buffer.clone(),
+                    caret,
+                    *formula_cursor,
+                    *formula_ref_char_start,
+                ));
             }
             _ => {
                 self.pending_menu_edit = None;
@@ -1021,6 +1036,7 @@ impl App {
         &mut self,
         buffer: String,
         formula_cursor: Option<SheetCursor>,
+        formula_ref_char_start: Option<usize>,
         special_palette: bool,
         fit_to_content_on_commit: bool,
         edit_range_addrs: Option<Vec<CellAddr>>,
@@ -1035,9 +1051,12 @@ impl App {
         self.edit_cursor = Some(cursor);
         self.edit_special_palette = special_palette;
         self.pending_fit_to_content_on_commit = fit_to_content_on_commit;
+        let formula_ref_char_start =
+            formula_ref_char_start.or_else(|| (formula_cursor.is_some() && buffer.trim() == "=").then_some(1));
         Mode::Edit {
             buffer,
             formula_cursor,
+            formula_ref_char_start,
             fit_to_content_on_commit,
         }
     }
@@ -1052,24 +1071,27 @@ impl App {
             } else {
                 None
             },
+            None,
             false,
             false,
             None,
         )
     }
 
-    fn snapshot_for_special_insert(&self) -> (String, usize, Option<SheetCursor>) {
-        if let Some((buffer, caret, fc)) = self.pending_menu_edit.as_ref() {
+    fn snapshot_for_special_insert(&self) -> (String, usize, Option<SheetCursor>, Option<usize>) {
+        if let Some((buffer, caret, fc, frs)) = self.pending_menu_edit.as_ref() {
             return (
                 buffer.clone(),
                 (*caret).min(buffer.chars().count()),
                 *fc,
+                *frs,
             );
         }
         match &self.mode {
             Mode::Edit {
                 buffer,
                 formula_cursor,
+                formula_ref_char_start,
                 ..
             } => (
                 buffer.clone(),
@@ -1077,12 +1099,13 @@ impl App {
                     .unwrap_or_else(|| buffer.chars().count())
                     .min(buffer.chars().count()),
                 *formula_cursor,
+                *formula_ref_char_start,
             ),
             _ => {
                 let addr = self.cursor.to_addr(&self.state.grid);
                 let s = cell_display(&self.state.grid, &addr);
                 let len = s.chars().count();
-                (s, len, None)
+                (s, len, None, None)
             }
         }
     }
@@ -1091,7 +1114,7 @@ impl App {
         let snap = self.snapshot_for_special_insert();
         self.special_insert_snap = Some(snap.clone());
         // Keep formula-bar/edit context visible while navigating the picker.
-        self.mode = self.start_edit_mode(snap.0.clone(), snap.2, false, false, None);
+        self.mode = self.start_edit_mode(snap.0.clone(), snap.2, snap.3, false, false, None);
         self.edit_cursor = Some(snap.1.min(snap.0.chars().count()));
         self.special_picker = Some(0);
     }
@@ -1099,12 +1122,12 @@ impl App {
     fn commit_special_choice(&mut self, idx: usize) {
         let choice = SPECIAL_VALUE_CHOICES[idx];
         self.pending_menu_edit = None;
-        let (mut buf, snap_pos, snap_formula) =
+        let (mut buf, snap_pos, snap_formula, snap_ref_start) =
             self.special_insert_snap.take().unwrap_or_else(|| {
                 let addr = self.cursor.to_addr(&self.state.grid);
                 let s = cell_display(&self.state.grid, &addr);
                 let len = s.chars().count();
-                (s, len, None)
+                (s, len, None, None)
             });
         let mut cur = Some(snap_pos.min(buf.chars().count()));
         Self::insert_text_into_buffer(&mut buf, &mut cur, choice);
@@ -1116,7 +1139,7 @@ impl App {
                 None
             }
         });
-        self.mode = self.start_edit_mode(buf, formula_cursor, true, false, None);
+        self.mode = self.start_edit_mode(buf, formula_cursor, snap_ref_start, true, false, None);
         self.edit_cursor = Some(caret);
     }
 
@@ -1308,6 +1331,7 @@ impl App {
             MenuAction::InsertDate => self.start_edit_mode(
                 chrono::Local::now().format("%Y-%m-%d").to_string(),
                 None,
+                None,
                 false,
                 true,
                 None,
@@ -1315,12 +1339,13 @@ impl App {
             MenuAction::InsertTime => self.start_edit_mode(
                 chrono::Local::now().format("%H:%M:%S").to_string(),
                 None,
+                None,
                 false,
                 true,
                 None,
             ),
             MenuAction::InsertHyperlink => {
-                self.start_edit_mode(self.menu_insert_hyperlink_seed(), None, false, false, None)
+                self.start_edit_mode(self.menu_insert_hyperlink_seed(), None, None, false, false, None)
             }
             MenuAction::SortView => Mode::SortView {
                 buffer: self.start_input_mode(String::new()),
@@ -2381,11 +2406,11 @@ pub struct App {
     edit_cursor: Option<usize>,
     input_cursor: Option<usize>,
     special_picker: Option<usize>,
-    /// Buffer, caret (`char` index), formula ref mode — saved when entering the menu bar from Edit mode
+    /// Buffer, caret (`char` index), formula ref mode, ref token start char index — saved when entering the menu bar from Edit mode
     /// so Insert → Special Character can splice at the real caret.
-    pending_menu_edit: Option<(String, usize, Option<SheetCursor>)>,
+    pending_menu_edit: Option<(String, usize, Option<SheetCursor>, Option<usize>)>,
     /// Text and caret when opening the special-character picker (`formula_cursor` restores `=`-ref picks).
-    special_insert_snap: Option<(String, usize, Option<SheetCursor>)>,
+    special_insert_snap: Option<(String, usize, Option<SheetCursor>, Option<usize>)>,
     pending_format_target: Option<FormatTarget>,
     view_sheet_id: u32,
     persisted_view_sort_cols: HashMap<u32, Vec<SortSpec>>,
@@ -2400,6 +2425,31 @@ pub struct App {
 }
 
 impl App {
+    /// Character index of the first position after the expression (before `" -- "` label if present).
+    fn formula_buffer_expr_end_char_idx(buffer: &str) -> usize {
+        buffer.find(" -- ").map_or_else(|| buffer.chars().count(), |bi| buffer[..bi].chars().count())
+    }
+
+    fn splice_formula_ref_token(
+        buffer: &mut String,
+        ref_char_start: usize,
+        expr_end_char: usize,
+        new_ref: &str,
+    ) {
+        let n = buffer.chars().count();
+        let ref_char_start = ref_char_start.min(n);
+        let expr_end_char = expr_end_char.max(ref_char_start).min(n);
+        let chars: Vec<char> = buffer.chars().collect();
+        let mut out: String = chars[..ref_char_start].iter().collect();
+        out.push_str(new_ref);
+        out.extend(chars[expr_end_char..].iter());
+        *buffer = out;
+    }
+
+    fn char_resumes_formula_ref_picker(c: char) -> bool {
+        matches!(c, '+' | '-' | '*' | '/' | '^' | ',' | ';' | '(' | '>' | '<' | '&')
+    }
+
     fn insert_text_into_buffer(buffer: &mut String, cursor: &mut Option<usize>, text: &str) {
         let len = buffer.chars().count();
         let pos = cursor.get_or_insert(len);
@@ -3878,23 +3928,6 @@ impl App {
         let Some(mut pos) = rows.iter().position(|&r| r == self.cursor.row) else {
             return false;
         };
-        // #region agent log
-        debug_log_ndjson(
-            "H1",
-            "src/ui/mod.rs:move_cursor_row_through_view:pre_next_pos",
-            "sorted row move precompute",
-            format!(
-                "{{\"down\":{},\"cursor_row\":{},\"mr_before\":{},\"first_footer_before\":{},\"last_display_main\":{},\"rows_len\":{},\"pos\":{}}}",
-                down,
-                self.cursor.row,
-                mr,
-                first_footer,
-                last_display_main.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string()),
-                rows.len(),
-                pos
-            ),
-        );
-        // #endregion
         let next_pos = if down {
             if last_display_main == Some(self.cursor.row)
                 && trailing_blank_main_rows(&self.state) < NAV_BLANK_ROWS
@@ -3906,20 +3939,6 @@ impl App {
                     return false;
                 };
                 pos = new_pos;
-                // #region agent log
-                debug_log_ndjson(
-                    "H1",
-                    "src/ui/mod.rs:move_cursor_row_through_view:grow_main",
-                    "grow main row inside sorted move",
-                    format!(
-                        "{{\"cursor_row\":{},\"mr_after_growth\":{},\"rows_len_stale\":{},\"next_row_candidate\":{}}}",
-                        self.cursor.row,
-                        self.state.grid.main_rows(),
-                        rows.len(),
-                        rows.get(pos.saturating_add(1)).copied().unwrap_or(self.cursor.row)
-                    ),
-                );
-                // #endregion
             }
             if self.cursor.row >= first_footer {
                 let blank_row = self
@@ -3951,20 +3970,6 @@ impl App {
         self.state
             .grid
             .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
-        // #region agent log
-        debug_log_ndjson(
-            "H1",
-            "src/ui/mod.rs:move_cursor_row_through_view:post_apply",
-            "sorted row move applied",
-            format!(
-                "{{\"next_pos\":{},\"cursor_row_after\":{},\"mr_after\":{},\"first_footer_after\":{}}}",
-                next_pos,
-                self.cursor.row,
-                self.state.grid.main_rows(),
-                HEADER_ROWS + self.state.grid.main_rows()
-            ),
-        );
-        // #endregion
         true
     }
 
@@ -4714,7 +4719,7 @@ impl App {
         self.cursor.clamp(&self.state.grid);
         self.edit_target_addr = Some(addr);
         self.status.clear();
-        Some(self.start_edit_mode(buffer, None, false, false, None))
+        Some(self.start_edit_mode(buffer, None, None, false, false, None))
     }
 
     /// After edit-mode navigation, keep [`edit_target_addr`] aligned with [`SheetCursor`] so the
@@ -4791,29 +4796,6 @@ impl App {
                 self.edit_target_addr = Some(cur_addr);
             }
         }
-        // #region agent log
-        debug_log_ndjson(
-            "H2",
-            "src/ui/mod.rs:commit_edit_and_move_down:entry",
-            "commit move-down start",
-            format!(
-                "{{\"cursor_row\":{},\"cursor_col\":{},\"main_rows_before\":{},\"edit_target_present\":{},\"is_footer_before\":{},\"edit_target_kind\":\"{}\"}}",
-                self.cursor.row,
-                self.cursor.col,
-                self.state.grid.main_rows(),
-                self.edit_target_addr.is_some(),
-                self.cursor.row >= HEADER_ROWS + self.state.grid.main_rows(),
-                match self.edit_target_addr.as_ref() {
-                    Some(CellAddr::Header { .. }) => "header",
-                    Some(CellAddr::Main { .. }) => "main",
-                    Some(CellAddr::Footer { .. }) => "footer",
-                    Some(CellAddr::Left { .. }) => "left",
-                    Some(CellAddr::Right { .. }) => "right",
-                    None => "none",
-                }
-            ),
-        );
-        // #endregion
         self.commit_edit_buffer(buffer)?;
 
         if !self.move_cursor_row_through_view(true) {
@@ -4833,28 +4815,6 @@ impl App {
 
         let addr = self.cursor.to_addr(&self.state.grid);
         let cur = cell_display(&self.state.grid, &addr);
-        // #region agent log
-        debug_log_ndjson(
-            "H3",
-            "src/ui/mod.rs:commit_edit_and_move_down:post_move",
-            "post move cursor classification",
-            format!(
-                "{{\"cursor_row\":{},\"cursor_col\":{},\"main_rows_after\":{},\"first_footer\":{},\"is_footer_by_row\":{},\"addr_kind\":\"{}\"}}",
-                self.cursor.row,
-                self.cursor.col,
-                self.state.grid.main_rows(),
-                HEADER_ROWS + self.state.grid.main_rows(),
-                self.cursor.row >= HEADER_ROWS + self.state.grid.main_rows(),
-                match addr {
-                    CellAddr::Header { .. } => "header",
-                    CellAddr::Main { .. } => "main",
-                    CellAddr::Footer { .. } => "footer",
-                    CellAddr::Left { .. } => "left",
-                    CellAddr::Right { .. } => "right",
-                }
-            ),
-        );
-        // #endregion
         Ok(self.start_edit_mode(
             cur.clone(),
             if cur.trim() == "=" {
@@ -4862,6 +4822,7 @@ impl App {
             } else {
                 None
             },
+            None,
             false,
             false,
             None,
@@ -6435,7 +6396,7 @@ impl App {
         char_delay: std::time::Duration,
         confirm_delay: std::time::Duration,
     ) -> Result<(), RunError> {
-        self.mode = self.start_edit_mode(String::new(), None, false, false, None);
+        self.mode = self.start_edit_mode(String::new(), None, None, false, false, None);
         self.status = format!("Movie {}/{} edit", line_i + 1, line_n);
         if self.movie_draw_and_sleep(terminal, char_delay)? {
             return Err(io::Error::new(io::ErrorKind::Interrupted, "movie interrupted by user").into());
@@ -6443,7 +6404,7 @@ impl App {
         let mut typed = String::new();
         for ch in text.chars() {
             typed.push(ch);
-            self.mode = self.start_edit_mode(typed.clone(), None, false, false, None);
+            self.mode = self.start_edit_mode(typed.clone(), None, None, false, false, None);
             self.status = format!("Movie {}/{} typing: {}", line_i + 1, line_n, typed);
             if self.movie_draw_and_sleep(terminal, char_delay)? {
                 return Err(
@@ -6770,7 +6731,7 @@ impl App {
         choice_index: usize,
         special_char_pos: usize,
     ) -> Result<(), RunError> {
-        self.mode = self.start_edit_mode(String::new(), None, false, false, None);
+        self.mode = self.start_edit_mode(String::new(), None, None, false, false, None);
         self.status = format!("Movie {}/{} edit", line_i + 1, line_n);
         if self.movie_draw_and_sleep(terminal, char_delay)? {
             return Err(io::Error::new(io::ErrorKind::Interrupted, "movie interrupted by user").into());
@@ -6781,7 +6742,8 @@ impl App {
             if !shown_special_menu && char_i == special_char_pos {
                 // In movie replay we open menu mode directly; seed the suspended edit snapshot so
                 // formula-bar rendering in `Mode::Menu` can still show the in-progress buffer.
-                self.pending_menu_edit = Some((typed.clone(), typed.chars().count(), None));
+                self.pending_menu_edit =
+                    Some((typed.clone(), typed.chars().count(), None, None));
                 self.movie_show_menu(
                     terminal,
                     MenuSection::Insert,
@@ -6792,7 +6754,7 @@ impl App {
                     menu_hold,
                 )?;
                 // Keep formula/edit context visible while the picker is shown.
-                self.mode = self.start_edit_mode(typed.clone(), None, false, false, None);
+                self.mode = self.start_edit_mode(typed.clone(), None, None, false, false, None);
                 self.edit_cursor = Some(typed.chars().count());
                 self.movie_flash_special_character_picker(
                     terminal,
@@ -6802,7 +6764,7 @@ impl App {
                     menu_hold,
                 )?;
                 self.pending_menu_edit = None;
-                self.mode = self.start_edit_mode(typed.clone(), None, false, false, None);
+                self.mode = self.start_edit_mode(typed.clone(), None, None, false, false, None);
                 self.status = format!("Movie {}/{} typing: {}", line_i + 1, line_n, typed);
                 if self.movie_draw_and_sleep(terminal, char_delay)? {
                     return Err(
@@ -6812,7 +6774,7 @@ impl App {
                 shown_special_menu = true;
             }
             typed.push(ch);
-            self.mode = self.start_edit_mode(typed.clone(), None, false, false, None);
+            self.mode = self.start_edit_mode(typed.clone(), None, None, false, false, None);
             self.status = format!("Movie {}/{} typing: {}", line_i + 1, line_n, typed);
             if self.movie_draw_and_sleep(terminal, char_delay)? {
                 return Err(io::Error::new(io::ErrorKind::Interrupted, "movie interrupted by user").into());
@@ -7621,35 +7583,6 @@ impl App {
         // ── Formula bar ───────────────────────────────────────────────────────
         let addr = self.cursor.to_addr(grid);
         let edit_addr = self.edit_target_addr.clone().unwrap_or(addr.clone());
-        // #region agent log
-        debug_log_ndjson(
-            "H4",
-            "src/ui/mod.rs:draw:cursor_render_class",
-            "draw cursor class snapshot",
-            format!(
-                "{{\"cursor_row\":{},\"cursor_col\":{},\"main_rows\":{},\"first_footer\":{},\"row_looks_footer\":{},\"addr_kind\":\"{}\",\"edit_addr_kind\":\"{}\"}}",
-                self.cursor.row,
-                self.cursor.col,
-                grid.main_rows(),
-                HEADER_ROWS + grid.main_rows(),
-                self.cursor.row >= HEADER_ROWS + grid.main_rows(),
-                match addr {
-                    CellAddr::Header { .. } => "header",
-                    CellAddr::Main { .. } => "main",
-                    CellAddr::Footer { .. } => "footer",
-                    CellAddr::Left { .. } => "left",
-                    CellAddr::Right { .. } => "right",
-                },
-                match edit_addr {
-                    CellAddr::Header { .. } => "header",
-                    CellAddr::Main { .. } => "main",
-                    CellAddr::Footer { .. } => "footer",
-                    CellAddr::Left { .. } => "left",
-                    CellAddr::Right { .. } => "right",
-                }
-            ),
-        );
-        // #endregion
         let prompt_style = Style::default().fg(Color::White).bg(Color::DarkGray);
         let prompt_style_bold = prompt_style.add_modifier(Modifier::BOLD);
         let caret_style = Style::default()
@@ -7796,6 +7729,8 @@ impl App {
             lines.push(Line::from(spans));
         }
 
+        let header_grid_line_width = lines.first().map(|l| l.width()).unwrap_or(0);
+
         let hr = HEADER_ROWS;
         let mr = grid.main_rows();
         let lm = MARGIN_COLS;
@@ -7804,6 +7739,7 @@ impl App {
         let max_data_lines = inner_h.saturating_sub(1);
         let last_display_main_row = grid.sorted_main_rows().last().map(|row| hr + *row);
         for &r in row_ixs.iter().take(max_data_lines) {
+            let mut dbg_interior_gaps_skipped = 0usize;
             let active_row = r == self.cursor.row;
             let is_underlined_boundary_row =
                 (hr > 0 && r == hr - 1) || last_display_main_row == Some(r);
@@ -7844,6 +7780,8 @@ impl App {
                 && left_margin_agg.is_none()
                 && main_row_idx.is_some();
             let mut spill_remain = String::new();
+            // Width budget accumulated when suppressing interior gaps during spill.
+            let mut spill_suppressed_gap_budget = 0usize;
 
             for (i, &c) in col_ixs.iter().enumerate() {
                 let cur = SheetCursor { row: r, col: c };
@@ -7958,9 +7896,11 @@ impl App {
 
                 let disp =
                     if allow_text_spill && !spill_remain.is_empty() && formatted.trim().is_empty() {
-                        let (chunk, rest) = take_display_prefix(&spill_remain, cw);
+                        let widened = cw + spill_suppressed_gap_budget;
+                        let (chunk, rest) = take_display_prefix(&spill_remain, widened);
                         spill_remain = rest;
-                        align_cell_display(chunk, cw, Some(TextAlign::Left))
+                        spill_suppressed_gap_budget = 0;
+                        align_cell_display(chunk, widened, Some(TextAlign::Left))
                     } else {
                         if allow_text_spill && !spill_remain.is_empty() && !formatted.trim().is_empty()
                         {
@@ -8011,8 +7951,49 @@ impl App {
                         } else {
                             formatted.clone()
                         };
-                        align_cell_display(inner, cw, align)
+                        let widened = cw + spill_suppressed_gap_budget;
+                        spill_suppressed_gap_budget = 0;
+                        align_cell_display(inner, widened, align)
                     };
+                // #region agent log
+                if fw > cw && !allow_text_spill && spill_row && !is_agg_cell {
+                    let n = DEBUG_AGENT_H2_SAMPLES.fetch_add(1, Ordering::Relaxed);
+                    if n < 10 {
+                        let snip: String = formatted.chars().take(72).collect();
+                        debug_log_ndjson(
+                            "H2",
+                            "src/ui/mod.rs:draw_grid:blocked_spill",
+                            "fw>c but allow_text_spill false on spill_row",
+                            format!(
+                                "{{\"r\":{},\"c\":{},\"fw\":{},\"cw\":{},\"numeric_like\":{},\"align_is_right\":{},\"snippet\":\"{}\"}}",
+                                r,
+                                c,
+                                fw,
+                                cw,
+                                numeric_like,
+                                align == Some(TextAlign::Right),
+                                debug_json_escape(&snip),
+                            ),
+                        );
+                    }
+                }
+                let dw_disp = disp.width();
+                let expected_w = cw + spill_suppressed_gap_budget;
+                if dw_disp != expected_w {
+                    let n = DEBUG_AGENT_H3_SAMPLES.fetch_add(1, Ordering::Relaxed);
+                    if n < 14 {
+                        debug_log_ndjson(
+                            "H3",
+                            "src/ui/mod.rs:draw_grid:disp_width_ne_expected",
+                            "disp width differs from expected width with spill gap budget",
+                            format!(
+                                "{{\"r\":{},\"c\":{},\"cw\":{},\"expected_w\":{},\"disp_w\":{},\"fw\":{},\"allow_text_spill\":{}}}",
+                                r, c, cw, expected_w, dw_disp, fw, allow_text_spill,
+                            ),
+                        );
+                    }
+                }
+                // #endregion
                 let sel = self.anchor.is_some_and(|a| match self.selection_kind {
                     SelectionKind::Cells => {
                         let r0 = a.row.min(self.cursor.row);
@@ -8066,12 +8047,24 @@ impl App {
                     st = st.add_modifier(Modifier::UNDERLINED);
                 }
                 spans.push(Span::styled(disp, st));
-                if i + 1 < col_ixs.len() {
-                    // No gutter space before the next cell when overflowing text spills into blank
-                    // columns — avoids a gap like `s │ imple` that reads as two words.
-                    let suppress_plain_gap =
-                        allow_text_spill && !spill_remain.is_empty();
-                    if c == lm - 1 && lm > 0 && col_ixs.contains(&lm) {
+                let suppress_plain_gap = allow_text_spill && !spill_remain.is_empty();
+                match inter_column_trailing_after_data_cell(
+                    i,
+                    c,
+                    &col_ixs,
+                    lm,
+                    mc,
+                    show_right_divider,
+                    suppress_plain_gap,
+                ) {
+                    InterColumnTrailing::EndOfVisibleRow => {}
+                    InterColumnTrailing::SuppressedSpillInterior => {
+                        // #region agent log
+                        dbg_interior_gaps_skipped += 1;
+                        spill_suppressed_gap_budget += 1;
+                        // #endregion
+                    }
+                    InterColumnTrailing::PipeAndSpace => {
                         spans.push(Span::styled(
                             "│",
                             boundary_separator_style(is_underlined_boundary_row),
@@ -8080,16 +8073,8 @@ impl App {
                             " ",
                             boundary_gap_style(is_underlined_boundary_row),
                         ));
-                    } else if c == lm + mc - 1 && show_right_divider {
-                        spans.push(Span::styled(
-                            "│",
-                            boundary_separator_style(is_underlined_boundary_row),
-                        ));
-                        spans.push(Span::styled(
-                            " ",
-                            boundary_gap_style(is_underlined_boundary_row),
-                        ));
-                    } else if !suppress_plain_gap {
+                    }
+                    InterColumnTrailing::AsciiSpace => {
                         spans.push(Span::styled(
                             " ",
                             boundary_gap_style(is_underlined_boundary_row),
@@ -8097,7 +8082,41 @@ impl App {
                     }
                 }
             }
-            lines.push(Line::from(spans));
+            let data_grid_line = Line::from(spans);
+            // #region agent log
+            let data_line_w = data_grid_line.width();
+            if dbg_interior_gaps_skipped > 0 {
+                debug_log_ndjson(
+                    "H1",
+                    "src/ui/mod.rs:draw_grid:interior_gaps_suppressed",
+                    "suppress_plain_gap removed interior separator while spill_remain active",
+                    format!(
+                        "{{\"sheet_row\":{},\"skipped_interior_spaces\":{},\"header_line_width\":{},\"data_line_width\":{},\"inner_w_term\":{},\"spill_row\":{}}}",
+                        r,
+                        dbg_interior_gaps_skipped,
+                        header_grid_line_width,
+                        data_line_w,
+                        inner_w,
+                        spill_row,
+                    ),
+                );
+            }
+            if data_line_w != header_grid_line_width {
+                debug_log_ndjson(
+                    "H4",
+                    "src/ui/mod.rs:draw_grid:header_vs_data_width",
+                    "grid row Line.width differs from header",
+                    format!(
+                        "{{\"sheet_row\":{},\"header_w\":{},\"data_w\":{},\"skipped_interior\":{}}}",
+                        r,
+                        header_grid_line_width,
+                        data_line_w,
+                        dbg_interior_gaps_skipped,
+                    ),
+                );
+            }
+            // #endregion
+            lines.push(data_grid_line);
         }
 
         let n = lines.len().min(inner_h);
@@ -8701,9 +8720,9 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                 KeyCode::Esc => {
                     self.special_picker = None;
                     self.special_insert_snap = None;
-                    if let Some((buf, caret, fc)) = self.pending_menu_edit.take() {
+                    if let Some((buf, caret, fc, frs)) = self.pending_menu_edit.take() {
                         let c = caret.min(buf.chars().count());
-                        self.mode = self.start_edit_mode(buf, fc, false, false, None);
+                        self.mode = self.start_edit_mode(buf, fc, frs, false, false, None);
                         self.edit_cursor = Some(c);
                     }
                     return Ok(false);
@@ -8825,9 +8844,9 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
         if let Mode::Menu { stack } = &mut mode {
             match key.code {
                 KeyCode::Esc => {
-                    if let Some((buf, caret, fc)) = self.pending_menu_edit.take() {
+                    if let Some((buf, caret, fc, frs)) = self.pending_menu_edit.take() {
                         let c = caret.min(buf.chars().count());
-                        mode = self.start_edit_mode(buf, fc, false, false, None);
+                        mode = self.start_edit_mode(buf, fc, frs, false, false, None);
                         self.edit_cursor = Some(c);
                     } else {
                         mode = Mode::Normal;
@@ -9024,17 +9043,17 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                 match ch {
                     ';' if key.modifiers.contains(KeyModifiers::SHIFT) => {
                         let buffer = chrono::Local::now().format("%H:%M:%S").to_string();
-                        self.mode = self.start_edit_mode(buffer, None, false, false, None);
+                        self.mode = self.start_edit_mode(buffer, None, None, false, false, None);
                         return Ok(false);
                     }
                     ':' => {
                         let buffer = chrono::Local::now().format("%H:%M:%S").to_string();
-                        self.mode = self.start_edit_mode(buffer, None, false, false, None);
+                        self.mode = self.start_edit_mode(buffer, None, None, false, false, None);
                         return Ok(false);
                     }
                     ';' => {
                         let buffer = chrono::Local::now().format("%Y-%m-%d").to_string();
-                        self.mode = self.start_edit_mode(buffer, None, false, true, None);
+                        self.mode = self.start_edit_mode(buffer, None, None, false, true, None);
                         return Ok(false);
                     }
                     _ => {}
@@ -9058,6 +9077,7 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                             } else {
                                 None
                             },
+                            None,
                             false,
                             false,
                             None,
@@ -9078,6 +9098,7 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                             } else {
                                 None
                             },
+                            None,
                             false,
                             false,
                             None,
@@ -10195,6 +10216,7 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
             Mode::Edit {
                 buffer,
                 formula_cursor,
+                formula_ref_char_start,
                 fit_to_content_on_commit: _,
             } => match key.code {
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -10203,6 +10225,7 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                 }
                 KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     *formula_cursor = None;
+                    *formula_ref_char_start = None;
                     self.edit_special_palette = false;
                     let paste = read_clipboard().map_err(io::Error::other)?;
                     let text = if key.modifiers.contains(KeyModifiers::SHIFT) {
@@ -10217,11 +10240,13 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                     self.edit_special_palette = false;
                     let _ = copy_to_clipboard(buffer);
                     *formula_cursor = None;
+                    *formula_ref_char_start = None;
                     buffer.clear();
                     self.edit_cursor = Some(0);
                 }
                 KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     *formula_cursor = None;
+                    *formula_ref_char_start = None;
                     self.edit_special_palette = false;
                     let paste = read_clipboard().map_err(io::Error::other)?;
                     *buffer = paste;
@@ -10239,6 +10264,7 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                 {
                     self.edit_special_palette = false;
                     *formula_cursor = None;
+                    *formula_ref_char_start = None;
                     self.edit_cursor = Some(0);
                 }
                 KeyCode::End
@@ -10250,11 +10276,13 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                 {
                     self.edit_special_palette = false;
                     *formula_cursor = None;
+                    *formula_ref_char_start = None;
                     self.edit_cursor = Some(buffer.chars().count());
                 }
                 KeyCode::Delete if is_formula(buffer) => {
                     self.edit_special_palette = false;
                     *formula_cursor = None;
+                    *formula_ref_char_start = None;
                     let len = buffer.chars().count();
                     let pos = self.edit_cursor.unwrap_or(len).min(len);
                     if pos < len {
@@ -10267,6 +10295,7 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                 KeyCode::Delete => {
                     self.edit_special_palette = false;
                     *formula_cursor = None;
+                    *formula_ref_char_start = None;
                     buffer.clear();
                     self.edit_cursor = Some(0);
                     mode = self.commit_edit_buffer(buffer).map(|_| Mode::Normal)?;
@@ -10274,6 +10303,8 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                 KeyCode::Tab => {
                     let addr = self.cursor.to_addr(&self.state.grid);
                     if let Some(next) = cycle_special_value(buffer, special_value_choices(&addr)) {
+                        *formula_cursor = None;
+                        *formula_ref_char_start = None;
                         self.edit_cursor = Some(next.chars().count());
                         *buffer = next;
                     }
@@ -10284,7 +10315,7 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                     }
                 }
                 KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down
-                    if formula_cursor.is_some() =>
+                    if formula_cursor.is_some() && formula_ref_char_start.is_some() =>
                 {
                     let temp = formula_cursor.as_mut().unwrap();
                     match key.code {
@@ -10296,42 +10327,42 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                     }
                     temp.clamp(&self.state.grid);
                     let addr = temp.to_addr(&self.state.grid);
-                    *buffer = format!("={}", self.formula_ref_for_addr(&addr));
-                    // Keep typing after the inserted ref (otherwise `edit_cursor` stays at 1 from
-                    // `start_edit_mode` when the buffer was just `=`).
-                    self.edit_cursor = Some(buffer.chars().count());
+                    let new_ref = self.formula_ref_for_addr(&addr);
+                    let ref_start = formula_ref_char_start
+                        .as_ref()
+                        .copied()
+                        .expect("formula ref build");
+                    let expr_end = Self::formula_buffer_expr_end_char_idx(buffer);
+                    Self::splice_formula_ref_token(buffer, ref_start, expr_end, &new_ref);
+                    let new_expr_end = Self::formula_buffer_expr_end_char_idx(buffer);
+                    self.edit_cursor = Some(new_expr_end);
                 }
                 KeyCode::Left | KeyCode::Right => {
                     match Self::handle_text_input_key(buffer, &mut self.edit_cursor, key.code) {
                         TextInputAction::Handled => {}
                         TextInputAction::EdgeLeft => {
+                            // Discard in-progress edit (same as Esc): do not re-target the draft to
+                            // the neighbouring cell when moving the sheet cursor past the edit edge.
+                            self.remember_lost_edit(buffer);
+                            self.edit_cursor = None;
+                            self.edit_special_palette = false;
+                            *formula_cursor = None;
+                            *formula_ref_char_start = None;
+                            self.edit_target_addr = None;
+                            self.edit_range_addrs = None;
                             self.cursor.col = self.cursor.col.saturating_sub(1);
                             self.cursor.clamp(&self.state.grid);
                             self.state
                                 .grid
                                 .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
-                            self.edit_target_addr = Some(self.cursor.to_addr(&self.state.grid));
-                            // #region agent log
-                            debug_log_ndjson(
-                                "H5",
-                                "src/ui/mod.rs:Edit:EdgeLeft",
-                                "edit edge-left: sync edit target to cursor",
-                                format!(
-                                    "{{\"cursor_col\":{},\"edit_target_main_col\":{}}}",
-                                    self.cursor.col,
-                                    match self.edit_target_addr.as_ref() {
-                                        Some(CellAddr::Main { col, .. }) => *col as i64,
-                                        _ => -1,
-                                    }
-                                ),
-                            );
-                            // #endregion
+                            mode = Mode::Normal;
                         }
                         TextInputAction::EdgeRight => {
                             let raw = buffer.clone();
                             self.edit_cursor = None;
                             self.edit_special_palette = false;
                             *formula_cursor = None;
+                            *formula_ref_char_start = None;
                             self.commit_edit_buffer(&raw)?;
                             let lm = MARGIN_COLS;
                             let mc = self.state.grid.main_cols();
@@ -10370,6 +10401,7 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                         } else {
                             None
                         },
+                        None,
                         false,
                         false,
                         None,
@@ -10385,22 +10417,34 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                     self.edit_target_addr = None;
                     self.edit_range_addrs = None;
                     *formula_cursor = None;
+                    *formula_ref_char_start = None;
                     mode = Mode::Normal;
                 }
                 KeyCode::Char(c) => {
-                    *formula_cursor = None;
                     self.edit_special_palette = false;
                     let len = buffer.chars().count();
-                    let cursor = self.edit_cursor.get_or_insert(len);
-                    let pos = (*cursor).min(len);
+                    let cursor_ref = self.edit_cursor.get_or_insert(len);
+                    let pos = (*cursor_ref).min(len);
+                    let expr_end_before = Self::formula_buffer_expr_end_char_idx(buffer);
+                    let resume_ref = is_formula(buffer)
+                        && pos == expr_end_before
+                        && Self::char_resumes_formula_ref_picker(c);
                     let mut chars: Vec<char> = buffer.chars().collect();
                     chars.insert(pos, c);
                     *buffer = chars.into_iter().collect();
-                    *cursor = pos + 1;
+                    *cursor_ref = pos + 1;
+                    if resume_ref {
+                        *formula_cursor = Some(self.cursor);
+                        *formula_ref_char_start = Some(pos + 1);
+                    } else {
+                        *formula_cursor = None;
+                        *formula_ref_char_start = None;
+                    }
                 }
                 KeyCode::Backspace if is_formula(buffer) => {
                     self.edit_special_palette = false;
                     *formula_cursor = None;
+                    *formula_ref_char_start = None;
                     let len = buffer.chars().count();
                     let pos = self.edit_cursor.unwrap_or(len).min(len);
                     if pos > 0 {
@@ -10412,6 +10456,7 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                 }
                 KeyCode::Backspace => {
                     *formula_cursor = None;
+                    *formula_ref_char_start = None;
                     let len = buffer.chars().count();
                     if let Some(cursor) = self.edit_cursor.as_mut() {
                         if *cursor > 0 {
@@ -10451,6 +10496,7 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                             } else {
                                 None
                             },
+                            None,
                             false,
                             false,
                             type_targets,
@@ -10710,6 +10756,7 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                             } else {
                                 None
                             },
+                            None,
                             false,
                             false,
                             None,
@@ -10922,6 +10969,7 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                             } else {
                                 None
                             },
+                            None,
                             false,
                             false,
                             type_targets,
@@ -11116,8 +11164,12 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                 let formula = if matches!(&self.mode, Mode::Menu { .. }) {
                     self.pending_menu_edit
                         .as_ref()
-                        .map(|(buffer, _, _)| buffer.clone())
-                        .or_else(|| self.special_insert_snap.as_ref().map(|(buffer, _, _)| buffer.clone()))
+                        .map(|(buffer, _, _, _)| buffer.clone())
+                        .or_else(|| {
+                            self.special_insert_snap
+                                .as_ref()
+                                .map(|(buffer, _, _, _)| buffer.clone())
+                        })
                         .unwrap_or_else(|| formula_bar_value(grid, addr))
                 } else {
                     formula_bar_value(grid, addr)
@@ -11548,6 +11600,7 @@ mod tests {
         app.mode = Mode::Edit {
             buffer: "2".into(),
             formula_cursor: None,
+            formula_ref_char_start: None,
             fit_to_content_on_commit: false,
         };
 
@@ -11642,6 +11695,7 @@ mod tests {
         app.mode = Mode::Edit {
             buffer: "3".into(),
             formula_cursor: None,
+            formula_ref_char_start: None,
             fit_to_content_on_commit: false,
         };
 
@@ -11679,6 +11733,7 @@ mod tests {
         app.mode = Mode::Edit {
             buffer: "typed-in-A".into(),
             formula_cursor: None,
+            formula_ref_char_start: None,
             fit_to_content_on_commit: false,
         };
 
@@ -12232,6 +12287,7 @@ mod tests {
         app.mode = Mode::Edit {
             buffer: "ab".into(),
             formula_cursor: None,
+            formula_ref_char_start: None,
             fit_to_content_on_commit: false,
         };
         app.edit_cursor = Some(1);
@@ -12266,6 +12322,7 @@ mod tests {
         app.mode = Mode::Edit {
             buffer: "=Sin(".into(),
             formula_cursor: None,
+            formula_ref_char_start: None,
             fit_to_content_on_commit: false,
         };
         app.edit_cursor = Some("=Sin(".chars().count());
@@ -12294,6 +12351,7 @@ mod tests {
         app.mode = Mode::Edit {
             buffer: "ab".into(),
             formula_cursor: None,
+            formula_ref_char_start: None,
             fit_to_content_on_commit: false,
         };
         app.edit_cursor = Some(1);
@@ -12316,6 +12374,7 @@ mod tests {
         app.mode = Mode::Edit {
             buffer: "ab".into(),
             formula_cursor: None,
+            formula_ref_char_start: None,
             fit_to_content_on_commit: false,
         };
         app.edit_cursor = Some(1);
@@ -12443,6 +12502,7 @@ mod tests {
         app.mode = Mode::Edit {
             buffer: String::new(),
             formula_cursor: None,
+            formula_ref_char_start: None,
             fit_to_content_on_commit: false,
         };
 
@@ -12483,6 +12543,7 @@ mod tests {
         app.mode = Mode::Edit {
             buffer: "=A*2 -- POW2".into(),
             formula_cursor: None,
+            formula_ref_char_start: None,
             fit_to_content_on_commit: false,
         };
 
@@ -12552,6 +12613,7 @@ mod tests {
         app.mode = Mode::Edit {
             buffer: "=2*π".into(),
             formula_cursor: None,
+            formula_ref_char_start: None,
             fit_to_content_on_commit: false,
         };
         let backend = TestBackend::new(40, 8);
@@ -12569,6 +12631,7 @@ mod tests {
         app.mode = Mode::Edit {
             buffer: "=π".into(),
             formula_cursor: None,
+            formula_ref_char_start: None,
             fit_to_content_on_commit: false,
         };
         let backend = TestBackend::new(40, 8);
@@ -12602,6 +12665,7 @@ mod tests {
         app.mode = Mode::Edit {
             buffer: "=Sin(".into(),
             formula_cursor: None,
+            formula_ref_char_start: None,
             fit_to_content_on_commit: false,
         };
         app.edit_cursor = Some("=Sin(".chars().count());
@@ -12633,7 +12697,7 @@ mod tests {
             row: HEADER_ROWS,
             col: MARGIN_COLS,
         };
-        app.mode = app.start_edit_mode("draft".into(), None, false, false, None);
+        app.mode = app.start_edit_mode("draft".into(), None, None, false, false, None);
 
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()))
             .unwrap();
@@ -12674,7 +12738,7 @@ mod tests {
             row: HEADER_ROWS,
             col: MARGIN_COLS,
         };
-        app.mode = app.start_edit_mode("2024-01-02".into(), None, false, true, None);
+        app.mode = app.start_edit_mode("2024-01-02".into(), None, None, false, true, None);
         if let Mode::Edit { buffer, .. } = &app.mode {
             let raw = buffer.clone();
             app.commit_edit_buffer(&raw).unwrap();
@@ -12804,6 +12868,85 @@ mod tests {
         assert_eq!(truncate_with_ellipsis("abcdef", 1), "…");
         // display width, not char count: fullwidth letters are width 2 each
         assert_eq!(truncate_with_ellipsis("ＡＢＣＤＥＦ", 4), "Ａ…");
+    }
+
+    #[test]
+    fn inter_column_trailing_drops_interior_space_when_spill_suppressed() {
+        let lm = MARGIN_COLS;
+        let mc = 10;
+        let col_ixs = vec![lm - 1, lm, lm + 1];
+        assert_eq!(
+            inter_column_trailing_after_data_cell(1, lm, &col_ixs, lm, mc, true, true),
+            InterColumnTrailing::SuppressedSpillInterior,
+            "overflow continuation must omit ASCII gutter, not squeeze it into cell text"
+        );
+        // Not spilling across boundary → normal ASCII gutter between main columns.
+        assert_eq!(
+            inter_column_trailing_after_data_cell(1, lm, &col_ixs, lm, mc, true, false),
+            InterColumnTrailing::AsciiSpace,
+        );
+    }
+
+    #[test]
+    fn inter_column_trailing_left_ruler_uses_pipe_not_ascii_gutter_only() {
+        let lm = MARGIN_COLS;
+        let col_ixs = vec![lm - 1, lm];
+        assert_eq!(
+            inter_column_trailing_after_data_cell(0, lm - 1, &col_ixs, lm, 4, true, false),
+            InterColumnTrailing::PipeAndSpace,
+        );
+    }
+
+    #[test]
+    fn inter_column_trailing_end_of_viewport_row_emits_no_trailing_separator() {
+        let lm = MARGIN_COLS;
+        let col_ixs = vec![lm, lm + 1];
+        assert_eq!(
+            inter_column_trailing_after_data_cell(1, lm + 1, &col_ixs, lm, 4, false, false),
+            InterColumnTrailing::EndOfVisibleRow,
+        );
+    }
+
+    /// Light vertical LINE (Unicode); must not appear in spill padding from helpers alone.
+    const LIGHT_VERTICAL_BAR: char = '\u{2502}';
+
+    #[test]
+    fn take_display_prefix_never_introduces_vertical_bar() {
+        let s = "abcdef";
+        let (a, b) = take_display_prefix(s, 3);
+        assert!(!a.contains(LIGHT_VERTICAL_BAR));
+        assert!(!b.contains(LIGHT_VERTICAL_BAR));
+    }
+
+    #[test]
+    fn align_cell_display_left_never_inserts_vertical_bar_even_with_padding() {
+        let padded = align_cell_display("hi".into(), 8, Some(TextAlign::Left));
+        assert!(
+            !padded.contains(LIGHT_VERTICAL_BAR),
+            "padding must be ASCII/Unicode pad only: {padded:?}"
+        );
+    }
+
+    #[test]
+    fn simulated_spill_across_cells_has_no_vertical_bar_in_cell_buckets() {
+        let text = "The quick brown fox jumps over.";
+        let col_widths = [8usize, 8, 8];
+        let mut rest = text.to_string();
+        let mut segments = Vec::new();
+        for &cw in &col_widths {
+            if rest.is_empty() {
+                break;
+            }
+            let (pre, suf) = take_display_prefix(rest.trim_start(), cw);
+            rest = suf;
+            segments.push(align_cell_display(pre, cw, Some(TextAlign::Left)));
+        }
+        for seg in segments {
+            assert!(
+                !seg.contains(LIGHT_VERTICAL_BAR),
+                "bucket must not absorb column ruler: {seg:?}"
+            );
+        }
     }
 
     #[test]
@@ -13998,6 +14141,7 @@ mod tests {
         app.mode = Mode::Edit {
             buffer: "changed".into(),
             formula_cursor: None,
+            formula_ref_char_start: None,
             fit_to_content_on_commit: false,
         };
 
@@ -14038,12 +14182,88 @@ mod tests {
     }
 
     #[test]
+    fn formula_multi_arrow_ref_pick_does_not_replace_buffer_prefix() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(2, 3);
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS + 2,
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Char('='), KeyModifiers::empty()))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::empty()))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::empty()))
+            .unwrap();
+        match &app.mode {
+            Mode::Edit { buffer, .. } => assert_eq!(buffer, "=A1"),
+            other => panic!("expected Edit mode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn formula_plus_then_arrow_refs_append_second_cell() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 3);
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Char('='), KeyModifiers::empty()))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::empty()))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('+'), KeyModifiers::empty()))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::empty()))
+            .unwrap();
+        match &app.mode {
+            // After `+`, arrow ref mode re-seeds from the sheet cursor (still column A here).
+            Mode::Edit { buffer, .. } => assert_eq!(buffer, "=B1+B1"),
+            other => panic!("expected Edit mode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn formula_open_paren_at_expr_end_resumes_arrow_ref() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 2);
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS + 1,
+        };
+        app.mode = Mode::Edit {
+            buffer: "=SUM".into(),
+            formula_cursor: None,
+            formula_ref_char_start: None,
+            fit_to_content_on_commit: false,
+        };
+        app.edit_cursor = Some(4);
+        app.handle_key(KeyEvent::new(KeyCode::Char('('), KeyModifiers::empty()))
+            .unwrap();
+        assert!(matches!(
+            &app.mode,
+            Mode::Edit {
+                formula_cursor: Some(_),
+                ..
+            }
+        ));
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::empty()))
+            .unwrap();
+        match &app.mode {
+            Mode::Edit { buffer, .. } => assert_eq!(buffer, "=SUM(A1"),
+            other => panic!("expected Edit mode, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn formula_edit_delete_backspace_and_home_end_use_text_caret() {
         let mut app = App::new(None);
         app.state.grid.set_main_size(1, 1);
         app.mode = Mode::Edit {
             buffer: "=A1+B2".into(),
             formula_cursor: None,
+            formula_ref_char_start: None,
             fit_to_content_on_commit: false,
         };
 
@@ -14512,6 +14732,7 @@ mod tests {
         app.mode = Mode::Edit {
             buffer: "=".into(),
             formula_cursor: None,
+            formula_ref_char_start: None,
             fit_to_content_on_commit: false,
         };
 
@@ -14539,6 +14760,7 @@ mod tests {
         app.mode = Mode::Edit {
             buffer: String::new(),
             formula_cursor: None,
+            formula_ref_char_start: None,
             fit_to_content_on_commit: false,
         };
 
@@ -14718,6 +14940,7 @@ mod tests {
         app.mode = Mode::Edit {
             buffer: "Sheet2 value".into(),
             formula_cursor: None,
+            formula_ref_char_start: None,
             fit_to_content_on_commit: false,
         };
         app.cursor = SheetCursor {
@@ -14757,6 +14980,7 @@ mod tests {
         app.mode = Mode::Edit {
             buffer: "first".into(),
             formula_cursor: None,
+            formula_ref_char_start: None,
             fit_to_content_on_commit: false,
         };
 
@@ -14781,6 +15005,7 @@ mod tests {
         app.mode = Mode::Edit {
             buffer: "x".into(),
             formula_cursor: None,
+            formula_ref_char_start: None,
             fit_to_content_on_commit: false,
         };
 
@@ -14816,6 +15041,7 @@ mod tests {
         app.mode = Mode::Edit {
             buffer: "sheet1".into(),
             formula_cursor: None,
+            formula_ref_char_start: None,
             fit_to_content_on_commit: false,
         };
 
@@ -15047,6 +15273,7 @@ mod tests {
         app.mode = Mode::Edit {
             buffer: "hello".into(),
             formula_cursor: None,
+            formula_ref_char_start: None,
             fit_to_content_on_commit: false,
         };
 
@@ -15087,6 +15314,7 @@ mod tests {
         app.mode = Mode::Edit {
             buffer: "=A*0.1 -- TAX TAX".into(),
             formula_cursor: None,
+            formula_ref_char_start: None,
             fit_to_content_on_commit: false,
         };
         app.edit_target_addr = Some(CellAddr::Main { row: 0, col: 0 });
@@ -15119,6 +15347,7 @@ mod tests {
         app.mode = Mode::Edit {
             buffer: String::new(),
             formula_cursor: None,
+            formula_ref_char_start: None,
             fit_to_content_on_commit: false,
         };
         app.edit_target_addr = Some(CellAddr::Main { row: 0, col: 1 });
@@ -15210,6 +15439,7 @@ mod tests {
         app.mode = Mode::Edit {
             buffer: "+".into(),
             formula_cursor: None,
+            formula_ref_char_start: None,
             fit_to_content_on_commit: false,
         };
 
@@ -15237,6 +15467,7 @@ mod tests {
         app.mode = Mode::Edit {
             buffer: String::new(),
             formula_cursor: None,
+            formula_ref_char_start: None,
             fit_to_content_on_commit: false,
         };
 
@@ -15384,6 +15615,7 @@ mod tests {
         app.mode = Mode::Edit {
             buffer: "ab".into(),
             formula_cursor: None,
+            formula_ref_char_start: None,
             fit_to_content_on_commit: false,
         };
 
@@ -15403,6 +15635,7 @@ mod tests {
         app.mode = Mode::Edit {
             buffer: "ab".into(),
             formula_cursor: None,
+            formula_ref_char_start: None,
             fit_to_content_on_commit: false,
         };
 
@@ -16364,6 +16597,7 @@ mod tests {
         app.mode = Mode::Edit {
             buffer: "=".into(),
             formula_cursor: Some(app.cursor),
+            formula_ref_char_start: Some(1),
             fit_to_content_on_commit: false,
         };
 
@@ -17403,6 +17637,45 @@ fn truncate_with_ellipsis(text: &str, width: usize) -> String {
     }
     let (prefix, _) = text.unicode_truncate(keep);
     format!("{prefix}…")
+}
+
+/// Trailing content after a cell span in the sheet grid: **never** mixed into
+/// [`align_cell_display`] / spill text (regression guard).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InterColumnTrailing {
+    /// No next column in this viewport row.
+    EndOfVisibleRow,
+    /// Interior gutter omitted while overflow text continues into the next column.
+    SuppressedSpillInterior,
+    /// Left/right main-block ruler (`│` then gap).
+    PipeAndSpace,
+    /// Default single ASCII space between interior columns.
+    AsciiSpace,
+}
+
+fn inter_column_trailing_after_data_cell(
+    viewport_col_idx: usize,
+    sheet_col: usize,
+    col_ixs: &[usize],
+    lm: usize,
+    mc: usize,
+    show_right_divider: bool,
+    suppress_plain_gap: bool,
+) -> InterColumnTrailing {
+    if viewport_col_idx + 1 >= col_ixs.len() {
+        return InterColumnTrailing::EndOfVisibleRow;
+    }
+    if sheet_col == lm.saturating_sub(1) && lm > 0 && col_ixs.contains(&lm) {
+        return InterColumnTrailing::PipeAndSpace;
+    }
+    if sheet_col == lm + mc - 1 && show_right_divider {
+        return InterColumnTrailing::PipeAndSpace;
+    }
+    if suppress_plain_gap {
+        InterColumnTrailing::SuppressedSpillInterior
+    } else {
+        InterColumnTrailing::AsciiSpace
+    }
 }
 
 /// Prefix of `text` consuming at most `display_width` terminal columns (Unicode width-aware).

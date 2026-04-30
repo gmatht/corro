@@ -43,7 +43,7 @@ fn median_aggregate(mut xs: Vec<Number>) -> Option<Number> {
     }
 }
 
-fn collect_numbers(grid: &Grid, range: &MainRange) -> Vec<Number> {
+fn collect_numbers_summable(grid: &Grid, range: &MainRange) -> Vec<Number> {
     let mut v = Vec::new();
     if range.is_empty() {
         return v;
@@ -53,7 +53,7 @@ fn collect_numbers(grid: &Grid, range: &MainRange) -> Vec<Number> {
     for r in range.row_start..range.row_end {
         for c in range.col_start..range.col_end {
             let addr = CellAddr::Main { row: r, col: c };
-            if let Some(n) = formula::effective_numeric(grid, &addr, &mut visiting, &mut budget) {
+            if let Some(n) = formula::summable_numeric(grid, &addr, &mut visiting, &mut budget) {
                 v.push(n);
             }
         }
@@ -61,11 +61,37 @@ fn collect_numbers(grid: &Grid, range: &MainRange) -> Vec<Number> {
     v
 }
 
+fn count_numeric_cells(grid: &Grid, range: &MainRange) -> usize {
+    let mut n = 0usize;
+    if range.is_empty() {
+        return n;
+    }
+    let mut visiting = Vec::new();
+    let mut budget = formula::EVAL_BUDGET_AGG;
+    for r in range.row_start..range.row_end {
+        for c in range.col_start..range.col_end {
+            let addr = CellAddr::Main { row: r, col: c };
+            if formula::effective_numeric(grid, &addr, &mut visiting, &mut budget).is_some() {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
 /// Compute display string for an aggregate over `source` main cells.
 pub fn compute_aggregate(grid: &Grid, def: &AggregateDef) -> String {
-    let xs = collect_numbers(grid, &def.source);
     match def.func {
+        AggFunc::Count => {
+            let n = count_numeric_cells(grid, &def.source);
+            if n == 0 {
+                String::new()
+            } else {
+                format!("{}", n)
+            }
+        }
         AggFunc::Sum => {
+            let xs = collect_numbers_summable(grid, &def.source);
             if xs.is_empty() {
                 String::new()
             } else {
@@ -77,6 +103,7 @@ pub fn compute_aggregate(grid: &Grid, def: &AggregateDef) -> String {
             }
         }
         AggFunc::Mean => {
+            let xs = collect_numbers_summable(grid, &def.source);
             if xs.is_empty() {
                 String::new()
             } else {
@@ -88,26 +115,19 @@ pub fn compute_aggregate(grid: &Grid, def: &AggregateDef) -> String {
                 format_aggregate_number(&s)
             }
         }
-        AggFunc::Median => median_aggregate(xs)
+        AggFunc::Median => median_aggregate(collect_numbers_summable(grid, &def.source))
             .map(|m| format_aggregate_number(&m))
             .unwrap_or_default(),
-        AggFunc::Min => xs
+        AggFunc::Min => collect_numbers_summable(grid, &def.source)
             .into_iter()
             .min_by(|a, b| cmp_number_aggregate(a, b))
             .map(|n| format_aggregate_number(&n))
             .unwrap_or_default(),
-        AggFunc::Max => xs
+        AggFunc::Max => collect_numbers_summable(grid, &def.source)
             .into_iter()
             .max_by(|a, b| cmp_number_aggregate(a, b))
             .map(|n| format_aggregate_number(&n))
             .unwrap_or_default(),
-        AggFunc::Count => {
-            if xs.is_empty() {
-                String::new()
-            } else {
-                format!("{}", xs.len())
-            }
-        }
     }
 }
 

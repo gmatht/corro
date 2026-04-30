@@ -95,10 +95,34 @@ pub const EVAL_BUDGET_AGG: usize = 1_000_000;
 #[derive(Clone, Debug, PartialEq)]
 pub enum EvalResult {
     Number(Number),
+    /// Logical spreadsheet value (`TRUE` / `FALSE`): distinct runtime type from numbers.
+    Bool(bool),
     Text(String),
     Array(Vec<Vec<EvalResult>>),
     /// Display as `#msg` in the UI.
     Error(&'static str),
+}
+
+/// Exact `0` / `1` used when coercing booleans into numeric contexts (SUM, `+`, etc.).
+#[inline]
+pub(super) fn number_from_bool(b: bool) -> Number {
+    if b {
+        Number::one()
+    } else {
+        Number::exact_zero()
+    }
+}
+
+fn eval_plain_cell_raw(trimmed: &str) -> EvalResult {
+    if let Some(n) = parse_number_literal(trimmed) {
+        EvalResult::Number(n)
+    } else if trimmed.eq_ignore_ascii_case("true") {
+        EvalResult::Bool(true)
+    } else if trimmed.eq_ignore_ascii_case("false") {
+        EvalResult::Bool(false)
+    } else {
+        EvalResult::Text(trimmed.to_string())
+    }
 }
 
 impl EvalResult {
@@ -140,6 +164,12 @@ pub(crate) fn parse_numeric_or_date_literal(s: &str) -> Option<Number> {
 fn resolve_name(name: &str, bindings: &[(String, EvalResult)]) -> Option<EvalResult> {
     if let Some((_, value)) = bindings.iter().rev().find(|(n, _)| n == name) {
         return Some(value.clone());
+    }
+    if name.eq_ignore_ascii_case("true") {
+        return Some(EvalResult::Bool(true));
+    }
+    if name.eq_ignore_ascii_case("false") {
+        return Some(EvalResult::Bool(false));
     }
 
     match name {
@@ -205,6 +235,7 @@ fn render_ast(ast: &Ast) -> String {
         Ast::Mul(a, b) => format!("({}*{})", render_ast(a), render_ast(b)),
         Ast::Div(a, b) => format!("({}/{})", render_ast(a), render_ast(b)),
         Ast::Pow(a, b) => format!("({}^{})", render_ast(a), render_ast(b)),
+        Ast::Concat(a, b) => format!("({}&{})", render_ast(a), render_ast(b)),
         Ast::Call { name, args } => format!(
             "{}({})",
             name,
@@ -815,6 +846,20 @@ fn translate_ast_insert_main_rows(
                 translate_qualified_same_sheet_refs,
             )?),
         ),
+        Ast::Concat(a, b) => Ast::Concat(
+            Box::new(translate_ast_insert_main_rows(
+                a,
+                gap_start,
+                delta,
+                translate_qualified_same_sheet_refs,
+            )?),
+            Box::new(translate_ast_insert_main_rows(
+                b,
+                gap_start,
+                delta,
+                translate_qualified_same_sheet_refs,
+            )?),
+        ),
         Ast::Call { name, args } => Ast::Call {
             name: name.clone(),
             args: args
@@ -949,6 +994,22 @@ fn translate_ast_insert_main_cols(
             )?),
         ),
         Ast::Pow(a, b) => Ast::Pow(
+            Box::new(translate_ast_insert_main_cols(
+                a,
+                gap_start,
+                delta,
+                main_cols,
+                translate_qualified_same_sheet_refs,
+            )?),
+            Box::new(translate_ast_insert_main_cols(
+                b,
+                gap_start,
+                delta,
+                main_cols,
+                translate_qualified_same_sheet_refs,
+            )?),
+        ),
+        Ast::Concat(a, b) => Ast::Concat(
             Box::new(translate_ast_insert_main_cols(
                 a,
                 gap_start,
@@ -1134,6 +1195,10 @@ fn translate_ast_by_offset(ast: &Ast, row_delta: i32, col_delta: i32) -> Option<
             Box::new(translate_ast_by_offset(a, row_delta, col_delta)?),
             Box::new(translate_ast_by_offset(b, row_delta, col_delta)?),
         ),
+        Ast::Concat(a, b) => Ast::Concat(
+            Box::new(translate_ast_by_offset(a, row_delta, col_delta)?),
+            Box::new(translate_ast_by_offset(b, row_delta, col_delta)?),
+        ),
         Ast::Call { name, args } => Ast::Call {
             name: name.clone(),
             args: args
@@ -1198,6 +1263,10 @@ fn translate_ast(ast: &Ast, ctx: &FormulaCopyContext) -> Option<Ast> {
             Box::new(translate_ast(b, ctx)?),
         ),
         Ast::Pow(a, b) => Ast::Pow(
+            Box::new(translate_ast(a, ctx)?),
+            Box::new(translate_ast(b, ctx)?),
+        ),
+        Ast::Concat(a, b) => Ast::Concat(
             Box::new(translate_ast(a, ctx)?),
             Box::new(translate_ast(b, ctx)?),
         ),
@@ -1425,6 +1494,37 @@ pub fn effective_numeric(
             }
         }
         EvalResult::Text(s) => functions::parse_numeric_or_date_literal(&s),
+        EvalResult::Bool(_) => None,
+        _ => None,
+    }
+}
+
+/// Spreadsheet SUM-style numeric contribution: [`effective_numeric`] plus boolean values as exact `0`/`1`.
+pub fn summable_numeric(
+    grid: &Grid,
+    addr: &CellAddr,
+    visiting: &mut Vec<CellAddr>,
+    budget: &mut usize,
+) -> Option<Number> {
+    if let Some(n) = effective_numeric(grid, addr, visiting, budget) {
+        return Some(n);
+    }
+    let raw_owned = grid.get(addr);
+    let raw = raw_owned.as_deref().unwrap_or("");
+    let t = raw.trim();
+    let template_formula = templated_formula(grid, addr);
+    // Plain keywords (stored without `=`)
+    if template_formula.is_none() && !is_formula(raw) {
+        if t.eq_ignore_ascii_case("true") {
+            return Some(Number::one());
+        }
+        if t.eq_ignore_ascii_case("false") {
+            return Some(Number::exact_zero());
+        }
+        return None;
+    }
+    match eval_cell(grid, addr, visiting, budget).scalar_coerce() {
+        EvalResult::Bool(b) => Some(number_from_bool(b)),
         _ => None,
     }
 }
@@ -1491,11 +1591,7 @@ fn eval_cell_with_sheet(
         return EvalResult::Text(String::new());
     }
     if !t.starts_with('=') {
-        return if let Some(n) = parse_number_literal(t) {
-            EvalResult::Number(n)
-        } else {
-            EvalResult::Text(t.to_string())
-        };
+        return eval_plain_cell_raw(t);
     }
 
     // Check for circular reference across sheet-qualified visits using the
@@ -1642,11 +1738,7 @@ fn eval_cell_inner(
         return EvalResult::Text(String::new());
     }
     if !t.starts_with('=') {
-        return if let Some(n) = parse_number_literal(t) {
-            EvalResult::Number(n)
-        } else {
-            EvalResult::Text(t.to_string())
-        };
+        return eval_plain_cell_raw(t);
     }
 
     if let Some(expr) = control_formula_expr(grid, addr) {
@@ -1722,6 +1814,7 @@ enum Ast {
     Mul(Box<Ast>, Box<Ast>),
     Div(Box<Ast>, Box<Ast>),
     Pow(Box<Ast>, Box<Ast>),
+    Concat(Box<Ast>, Box<Ast>),
     Call {
         name: String,
         args: Vec<Ast>,
@@ -1750,7 +1843,23 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_expr(&mut self) -> Result<Ast, ()> {
-        self.parse_add_sub()
+        self.parse_concat()
+    }
+
+    /// Excel-style: `&` is looser than `+` / `-` (concat binds after add/sub).
+    fn parse_concat(&mut self) -> Result<Ast, ()> {
+        let mut left = self.parse_add_sub()?;
+        loop {
+            self.skip_ws();
+            if self.peek() == Some(b'&') {
+                self.i += 1;
+                let right = self.parse_add_sub()?;
+                left = Ast::Concat(Box::new(left), Box::new(right));
+            } else {
+                break;
+            }
+        }
+        Ok(left)
     }
 
     fn parse_add_sub(&mut self) -> Result<Ast, ()> {
@@ -2148,10 +2257,7 @@ fn eval_ast(
                     if raw.trim().starts_with('=') {
                         return EvalResult::Error("CIRC");
                     }
-                    if let Some(n) = parse_number_literal(raw) {
-                        return EvalResult::Number(n);
-                    }
-                    return EvalResult::Text(raw.to_string());
+                    return eval_plain_cell_raw(raw.trim());
                 }
                 return EvalResult::Error("CIRC");
             }
@@ -2175,8 +2281,11 @@ fn eval_ast(
             eval_cell_with_sheet(&sheet_grid, *sheet_id, addr, &mut sheet_bindings, budget, allow_templates)
         }
         Ast::Range { .. } => EvalResult::Error("RANGE"),
-        Ast::Neg(a) => match eval_ast(a, grid, visiting, bindings, budget, allow_templates) {
+        Ast::Neg(a) => match eval_ast(a, grid, visiting, bindings, budget, allow_templates)
+            .scalar_coerce()
+        {
             EvalResult::Number(n) => EvalResult::Number(n.neg()),
+            EvalResult::Bool(b) => EvalResult::Number(number_from_bool(b).neg()),
             e => e,
         },
         Ast::Add(a, b) => eval_binary_op(
@@ -2229,6 +2338,34 @@ fn eval_ast(
             allow_templates,
             BinaryOp::Pow,
         ),
+        Ast::Concat(a, b) => {
+            let ea = eval_ast(
+                a,
+                grid,
+                visiting,
+                bindings,
+                budget,
+                allow_templates,
+            )
+            .scalar_coerce();
+            let eb = eval_ast(
+                b,
+                grid,
+                visiting,
+                bindings,
+                budget,
+                allow_templates,
+            )
+            .scalar_coerce();
+            match (ea, eb) {
+                (EvalResult::Error(e), _) | (_, EvalResult::Error(e)) => EvalResult::Error(e),
+                (a, b) => {
+                    let mut s = eval_result_to_string(&a);
+                    s.push_str(&eval_result_to_string(&b));
+                    EvalResult::Text(s)
+                }
+            }
+        },
         Ast::Call { name, args } => functions::eval_builtin(
             name,
             args,
@@ -2243,6 +2380,7 @@ fn eval_ast(
 
 fn truthy(e: EvalResult) -> bool {
     match e.scalar_coerce() {
+        EvalResult::Bool(b) => b,
         EvalResult::Number(n) => !n.is_nan() && !n.is_zeroish(),
         EvalResult::Text(s) => functions::parse_numeric_or_date_literal(&s)
             .map(|v| !v.is_nan() && !v.is_zeroish())
@@ -2309,6 +2447,7 @@ fn eval_binary_op(
 pub(super) fn coerce_cell_number(e: EvalResult) -> Result<Number, EvalResult> {
     match e {
         EvalResult::Number(n) => Ok(n),
+        EvalResult::Bool(b) => Ok(number_from_bool(b)),
         EvalResult::Text(s) => {
             if let Some(n) = functions::parse_numeric_or_date_literal(&s) {
                 Ok(n)
@@ -2416,7 +2555,7 @@ fn eval_sum(
             locks_br: _,
         } => EvalResult::Number(sum_main_range(grid, r, visiting, budget)),
         Ast::Ref { addr, locks: _ } => {
-            let n = effective_numeric(grid, addr, visiting, budget);
+            let n = summable_numeric(grid, addr, visiting, budget);
             EvalResult::Number(n.unwrap_or_else(Number::exact_zero))
         }
         Ast::Call { .. }
@@ -2426,6 +2565,7 @@ fn eval_sum(
         | Ast::Mul(_, _)
         | Ast::Div(_, _)
         | Ast::Pow(_, _)
+        | Ast::Concat(_, _)
         | Ast::Text(_)
         | Ast::Name(_)
         | Ast::SheetRef { .. } => match eval_ast(
@@ -2438,16 +2578,10 @@ fn eval_sum(
         )
         .scalar_coerce()
         {
-            EvalResult::Number(n) => EvalResult::Number(n),
-            EvalResult::Text(s) => {
-                if let Some(n) = parse_number_literal(&s) {
-                    EvalResult::Number(n)
-                } else {
-                    EvalResult::Error("VALUE")
-                }
-            }
-            EvalResult::Error(e) => EvalResult::Error(e),
-            EvalResult::Array(_) => EvalResult::Error("CALC"),
+            e => match coerce_cell_number(e) {
+                Ok(n) => EvalResult::Number(n),
+                Err(err) => err,
+            },
         },
         Ast::Number(n) => EvalResult::Number(n.clone()),
     }
@@ -2466,7 +2600,7 @@ fn sum_main_range(
     for r in range.row_start..range.row_end {
         for c in range.col_start..range.col_end {
             let addr = CellAddr::Main { row: r, col: c };
-            let n = effective_numeric(grid, &addr, visiting, budget)
+            let n = summable_numeric(grid, &addr, visiting, budget)
                 .unwrap_or_else(Number::exact_zero);
             s = s.add(n);
         }
@@ -2541,6 +2675,8 @@ fn eval_result_to_string(result: &EvalResult) -> String {
                 format_number(n)
             }
         }
+        EvalResult::Bool(true) => "TRUE".to_string(),
+        EvalResult::Bool(false) => "FALSE".to_string(),
         EvalResult::Text(s) => s.clone(),
         EvalResult::Error(e) => format!("#{e}"),
         EvalResult::Array(rows) => rows
@@ -2600,7 +2736,12 @@ fn ast_references_all_empty(ast: &Ast, grid: &Grid, saw_ref: &mut bool) -> bool 
             all_empty
         }
         Ast::Neg(a) => ast_references_all_empty(a, grid, saw_ref),
-        Ast::Add(a, b) | Ast::Sub(a, b) | Ast::Mul(a, b) | Ast::Div(a, b) | Ast::Pow(a, b) => {
+        Ast::Add(a, b)
+        | Ast::Sub(a, b)
+        | Ast::Mul(a, b)
+        | Ast::Div(a, b)
+        | Ast::Pow(a, b)
+        | Ast::Concat(a, b) => {
             ast_references_all_empty(a, grid, saw_ref) && ast_references_all_empty(b, grid, saw_ref)
         }
         Ast::Call { args, .. } => args
@@ -2661,6 +2802,8 @@ pub fn cell_effective_display(grid: &Grid, addr: &CellAddr) -> String {
                 format_number(&n)
             }
         }
+        EvalResult::Bool(true) => "TRUE".to_string(),
+        EvalResult::Bool(false) => "FALSE".to_string(),
         EvalResult::Text(s) => s,
         EvalResult::Error(e) => format!("#{e}"),
         EvalResult::Array(rows) => rows
@@ -2793,6 +2936,42 @@ mod tests {
         match eval_cell(&g, &CellAddr::Main { row: 0, col: 0 }, &mut v, &mut b) {
             EvalResult::Number(n) => assert!((nf(&n) - 7.0).abs() < 1e-9),
             e => panic!("expected number {:?}", e),
+        }
+    }
+
+    #[test]
+    fn formula_amp_concat_coerces_numbers_to_text() {
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(1, 1));
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "=1&2".into());
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 0 }, &mut v, &mut b) {
+            EvalResult::Text(s) => assert_eq!(s, "12"),
+            e => panic!("expected text {:?}", e),
+        }
+    }
+
+    #[test]
+    fn formula_amp_concat_text_literal_and_number() {
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(1, 1));
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "=\"a\"&2".into());
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 0 }, &mut v, &mut b) {
+            EvalResult::Text(s) => assert_eq!(s, "a2"),
+            e => panic!("expected text {:?}", e),
+        }
+    }
+
+    #[test]
+    fn formula_amp_binds_looser_than_add() {
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(1, 1));
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "=1+2&3".into());
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 0 }, &mut v, &mut b) {
+            EvalResult::Text(s) => assert_eq!(s, "33"),
+            e => panic!("expected text {:?}", e),
         }
     }
 
@@ -3788,6 +3967,111 @@ mod tests {
         match eval_cell(&g, &CellAddr::Main { row: 0, col: 2 }, &mut v, &mut b) {
             EvalResult::Number(n) => assert!((nf(&n) - 1.0).abs() < 1e-9),
             e => panic!("expected 1 {:?}", e),
+        }
+    }
+
+    #[test]
+    fn true_false_typeof_and_if() {
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(6, 9));
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "=TRUE()".into());
+        g.set(&CellAddr::Main { row: 0, col: 1 }, "=FALSE()".into());
+        g.set(&CellAddr::Main { row: 0, col: 2 }, "TrUe".into());
+        // A5 stays blank for TYPEOF ref test
+        g.set(&CellAddr::Main { row: 0, col: 3 }, "=TYPEOF(A1)".into());
+        g.set(&CellAddr::Main { row: 0, col: 4 }, "=TYPEOF(B1)".into());
+        g.set(&CellAddr::Main { row: 0, col: 5 }, "=TYPEOF(C1)".into());
+        g.set(&CellAddr::Main { row: 0, col: 6 }, "=ISNUMBER(A1)".into());
+        g.set(&CellAddr::Main { row: 0, col: 7 }, "=ISTEXT(A1)".into());
+        g.set(&CellAddr::Main { row: 0, col: 8 }, "=IF(TRUE(),\"yes\",\"no\")".into());
+        g.set(&CellAddr::Main { row: 1, col: 0 }, "=TYPEOF(A5)".into());
+        g.set(&CellAddr::Main { row: 1, col: 1 }, "=TYPEOF(0)".into());
+        g.set(&CellAddr::Main { row: 1, col: 2 }, "=TYPEOF(PI())".into());
+        g.set(&CellAddr::Main { row: 1, col: 3 }, "=TYPEOF(\"x\")".into());
+        g.set(&CellAddr::Main { row: 1, col: 4 }, "=TYPEOF(i-i)".into());
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        assert!(
+            matches!(&eval_cell(&g, &CellAddr::Main { row: 0, col: 0 }, &mut v, &mut b), EvalResult::Bool(true)),
+            "TRUE()"
+        );
+        v.clear();
+        b = DEFAULT_BUDGET;
+        assert!(matches!(
+            &eval_cell(&g, &CellAddr::Main { row: 0, col: 1 }, &mut v, &mut b),
+            EvalResult::Bool(false)
+        ));
+        v.clear();
+        b = DEFAULT_BUDGET;
+        assert!(matches!(
+            &eval_cell(&g, &CellAddr::Main { row: 0, col: 2 }, &mut v, &mut b),
+            EvalResult::Bool(true)
+        ));
+        for col in [3u32, 4, 5] {
+            v.clear();
+            b = DEFAULT_BUDGET;
+            match eval_cell(&g, &CellAddr::Main { row: 0, col }, &mut v, &mut b) {
+                EvalResult::Text(s) => assert_eq!(s, "bool", "TYPEOF bool col {}", col),
+                e => panic!("expected text TYPEOF col {}: {:?}", col, e),
+            }
+        }
+        v.clear();
+        b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 6 }, &mut v, &mut b) {
+            EvalResult::Number(n) => assert!(nf(&n).abs() < 1e-9, "ISNUMBER(TRUE)"),
+            e => panic!("ISNUMBER {:?}", e),
+        }
+        v.clear();
+        b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 7 }, &mut v, &mut b) {
+            EvalResult::Number(n) => assert!(nf(&n).abs() < 1e-9, "ISTEXT(TRUE)"),
+            e => panic!("ISTEXT {:?}", e),
+        }
+        v.clear();
+        b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 0, col: 8 }, &mut v, &mut b) {
+            EvalResult::Text(s) => assert_eq!(s, "yes"),
+            e => panic!("IF(TRUE) {:?}", e),
+        }
+        for (col, want) in [
+            (0u32, "blank"),
+            (1, "exact"),
+            (2, "approx"),
+            (3, "text"),
+            (4, "complex"),
+        ] {
+            v.clear();
+            b = DEFAULT_BUDGET;
+            match eval_cell(&g, &CellAddr::Main { row: 1, col }, &mut v, &mut b) {
+                EvalResult::Text(s) => assert_eq!(s, want, "TYPEOF row1 col {}", col),
+                e => panic!("TYPEOF {:?}", e),
+            }
+        }
+    }
+
+    #[test]
+    fn sum_includes_boolean_cells_count_excludes_them() {
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(2, 4));
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "TRUE".into());
+        g.set(&CellAddr::Main { row: 1, col: 0 }, "=SUM(A1)".into());
+        g.set(&CellAddr::Main { row: 1, col: 1 }, "=COUNT(A1)".into());
+        g.set(&CellAddr::Main { row: 1, col: 2 }, "=COUNT(TRUE())".into());
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 1, col: 0 }, &mut v, &mut b) {
+            EvalResult::Number(n) => assert!((nf(&n) - 1.0).abs() < 1e-9),
+            e => panic!("SUM {:?}", e),
+        }
+        v.clear();
+        b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 1, col: 1 }, &mut v, &mut b) {
+            EvalResult::Number(n) => assert!(nf(&n).abs() < 1e-9),
+            e => panic!("COUNT range {:?}", e),
+        }
+        v.clear();
+        b = DEFAULT_BUDGET;
+        match eval_cell(&g, &CellAddr::Main { row: 1, col: 2 }, &mut v, &mut b) {
+            EvalResult::Number(n) => assert!(nf(&n).abs() < 1e-9),
+            e => panic!("COUNT TRUE {:?}", e),
         }
     }
 
