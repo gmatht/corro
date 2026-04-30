@@ -10411,11 +10411,13 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                 format!(" {addr_str}  "),
                 buffer,
                 self.edit_cursor.unwrap_or_else(|| buffer.chars().count()),
+                prompt_style,
                 prompt_style_bold,
                 caret_style,
+                prompt_style,
                 formula_edit_preview(grid, edit_addr, buffer),
             ))
-            .style(prompt_style_bold),
+            .style(prompt_style),
             Mode::OpenPath { buffer } => Paragraph::new(input_line(
                 " open: ".to_string(),
                 buffer,
@@ -10566,15 +10568,34 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
             Mode::About => Paragraph::new(" About - Up/Down scroll, Esc closes ")
                 .style(Style::default().fg(Color::White).bg(Color::Blue)),
             Mode::Menu { .. } | Mode::Normal | Mode::RevisionBrowse => {
-                let val = formula_bar_value(grid, addr);
+                let prompt_cyan = Style::default().fg(Color::Cyan);
+                let prompt_cyan_bold = prompt_cyan.add_modifier(Modifier::BOLD);
+                let formula = formula_bar_value(grid, addr);
                 let addr_str = addr_label(addr, grid.main_cols());
-                let base = format!(" {addr_str}  {val}");
-                let text = if self.status.is_empty() {
-                    base
+                let mut spans: Vec<Span<'static>> = vec![Span::styled(
+                    format!(" {addr_str}  "),
+                    prompt_cyan,
+                )];
+                let trimmed = formula.trim();
+                let is_formula_cell =
+                    !trimmed.is_empty() && trimmed.starts_with('=') && is_formula(trimmed);
+                if is_formula_cell {
+                    spans.push(Span::styled(formula.clone(), prompt_cyan_bold));
+                    let result_text = cell_effective_display(grid, addr);
+                    if !result_text.is_empty() && result_text.trim() != formula.trim() {
+                        spans.push(Span::styled(" ", prompt_cyan));
+                        spans.push(Span::styled(result_text, prompt_cyan));
+                    }
                 } else {
-                    format!("{base}   ·  {}", self.status)
-                };
-                Paragraph::new(text).style(Style::default().fg(Color::Cyan))
+                    spans.push(Span::styled(formula, prompt_cyan));
+                }
+                if !self.status.is_empty() {
+                    spans.push(Span::styled(
+                        format!("   ·  {}", self.status),
+                        prompt_cyan,
+                    ));
+                }
+                Paragraph::new(Line::from(spans))
             }
         }
     }
@@ -11757,7 +11778,7 @@ mod tests {
     }
 
     #[test]
-    fn formula_bar_shows_stored_formula_outside_edit_mode() {
+    fn formula_bar_shows_formula_and_result_outside_edit_mode() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
@@ -11782,7 +11803,10 @@ mod tests {
         };
 
         assert!(row(1).contains("=π"));
-        assert!(!row(1).contains("3.141"));
+        assert!(
+            row(1).contains("3.141"),
+            "formula bar should show evaluated result after formula in normal mode"
+        );
 
         app.state
             .grid
@@ -11798,7 +11822,10 @@ mod tests {
         };
 
         assert!(row(1).contains("=2*π"));
-        assert!(!row(1).contains("6.283"));
+        assert!(
+            row(1).contains("6.283"),
+            "formula bar should include numeric preview for =2*π outside edit mode"
+        );
 
         app.mode = Mode::Edit {
             buffer: "=2*π".into(),
@@ -15902,15 +15929,26 @@ fn input_line(
     text_style: Style,
     caret_style: Style,
 ) -> Line<'static> {
-    input_line_with_suffix(prefix, buffer, cursor, text_style, caret_style, None)
+    input_line_with_suffix(
+        prefix,
+        buffer,
+        cursor,
+        text_style,
+        text_style,
+        caret_style,
+        text_style,
+        None,
+    )
 }
 
 fn input_line_with_suffix(
     prefix: String,
     buffer: &str,
     cursor: usize,
-    text_style: Style,
+    prefix_style: Style,
+    formula_style: Style,
     caret_style: Style,
+    suffix_style: Style,
     suffix: Option<String>,
 ) -> Line<'static> {
     let chars: Vec<char> = buffer.chars().collect();
@@ -15918,12 +15956,12 @@ fn input_line_with_suffix(
     let before: String = chars[..cursor].iter().collect();
     let after: String = chars[cursor..].iter().collect();
 
-    let mut spans = Vec::with_capacity(4);
+    let mut spans = Vec::with_capacity(6);
     if !prefix.is_empty() {
-        spans.push(Span::styled(prefix, text_style));
+        spans.push(Span::styled(prefix, prefix_style));
     }
     if !before.is_empty() {
-        spans.push(Span::styled(before, text_style));
+        spans.push(Span::styled(before, formula_style));
     }
     if let Some(ch) = chars.get(cursor) {
         spans.push(Span::styled(ch.to_string(), caret_style));
@@ -15937,12 +15975,13 @@ fn input_line_with_suffix(
             after
         };
         if !tail.is_empty() {
-            spans.push(Span::styled(tail, text_style));
+            spans.push(Span::styled(tail, formula_style));
         }
     }
     if let Some(suffix) = suffix {
         if !suffix.is_empty() {
-            spans.push(Span::styled(suffix, text_style));
+            spans.push(Span::styled(" ", suffix_style));
+            spans.push(Span::styled(suffix, suffix_style));
         }
     }
 
