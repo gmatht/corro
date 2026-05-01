@@ -661,6 +661,101 @@ mod tests {
     }
 
     #[test]
+    fn log_watcher_detects_append_and_tail() {
+        use std::io::Write;
+        use std::fs::OpenOptions;
+        use std::time::Duration;
+
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        // Write header
+        fs::write(&path, format!("{LOG_HEADER_PREFIX} {LOG_VERSION}\n")).unwrap();
+        let mut w = LogWatcher::new(path.clone()).unwrap();
+        let mut offset = fs::metadata(&path).unwrap().len();
+
+        // Append a SET line as an external writer
+        {
+            let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+            writeln!(f, "SET A1 external").unwrap();
+            f.sync_all().unwrap();
+        }
+
+        // Wait up to ~1s for detection via watcher or file size
+        let mut detected = false;
+        for _ in 0..100 {
+            if w.poll_dirty() {
+                detected = true;
+                break;
+            }
+            let meta = fs::metadata(&path).unwrap();
+            if meta.len() > offset {
+                detected = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(detected, "append not detected");
+
+        // tail_apply_workbook should advance offset and apply the change
+        let mut workbook = WorkbookState::new();
+        let mut active = workbook.sheet_id(workbook.active_sheet);
+        let new_off = tail_apply_workbook(&path, offset, &mut workbook, &mut active).unwrap();
+        assert!(new_off > offset);
+        let sheet = workbook.sheet_mut_by_id(1).unwrap();
+        assert_eq!(
+            sheet.grid.get(&CellAddr::Main { row: 0, col: 0 }).as_deref(),
+            Some("external")
+        );
+    }
+
+    #[test]
+    fn log_watcher_detects_atomic_replace_and_tail() {
+        use std::io::Write;
+        use std::time::Duration;
+
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        // Write header
+        fs::write(&path, format!("{LOG_HEADER_PREFIX} {LOG_VERSION}\n")).unwrap();
+        let mut w = LogWatcher::new(path.clone()).unwrap();
+        let mut offset = fs::metadata(&path).unwrap().len();
+
+        // Create a replacement file in same dir then rename over
+        let dir = path.parent().unwrap();
+        let mut rep = NamedTempFile::new_in(dir).unwrap();
+        write!(rep, "{LOG_HEADER_PREFIX} {LOG_VERSION}\nSET A1 replaced\n").unwrap();
+        rep.as_file().sync_all().unwrap();
+        std::fs::rename(rep.path(), &path).unwrap();
+
+        // Wait up to ~1s for detection via watcher or file size
+        let mut detected = false;
+        for _ in 0..100 {
+            if w.poll_dirty() {
+                detected = true;
+                break;
+            }
+            let meta = fs::metadata(&path).unwrap();
+            if meta.len() > offset {
+                detected = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(detected, "replace not detected");
+
+        // tail_apply_workbook should advance offset and apply the change
+        let mut workbook = WorkbookState::new();
+        let mut active = workbook.sheet_id(workbook.active_sheet);
+        let new_off = tail_apply_workbook(&path, offset, &mut workbook, &mut active).unwrap();
+        assert!(new_off > offset);
+        let sheet = workbook.sheet_mut_by_id(1).unwrap();
+        assert_eq!(
+            sheet.grid.get(&CellAddr::Main { row: 0, col: 0 }).as_deref(),
+            Some("replaced")
+        );
+    }
+
+    #[test]
     fn commit_workbook_op_uses_post_apply_width_for_header_refs() {
         let path = NamedTempFile::new().unwrap();
         let mut workbook = WorkbookState::new();

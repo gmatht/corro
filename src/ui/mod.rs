@@ -3813,49 +3813,69 @@ impl App {
 
     fn sync_external(&mut self) -> Result<bool, IoError> {
         let mut changed = false;
-        if let Some(w) = &self.watcher {
-            if w.poll_dirty() {
-                if let Some(ref p) = self.path {
-                    match crate::io::tail_apply_workbook(
-                        p,
-                        self.offset,
-                        &mut self.workbook,
-                        &mut self.view_sheet_id,
-                    ) {
-                        Ok(new_off) => {
-                            self.offset = new_off;
-                            self.sync_active_sheet_cache();
-                            self.status = "External change applied".into();
-                            changed = true;
-                        }
-                        Err(_) => {
-                            let data = std::fs::read_to_string(p).map_err(IoError::Io)?;
-                            let mut workbook = WorkbookState::new();
-                            let mut active_sheet = workbook.sheet_id(workbook.active_sheet);
-                            for line in data.lines() {
-                                let t = line.trim();
-                                if t.is_empty() {
-                                    continue;
-                                }
-                                crate::ops::apply_log_line_to_workbook(
-                                    t,
-                                    &mut workbook,
-                                    &mut active_sheet,
-                                )?;
+
+        // If we have a path, determine whether we should tail the log.
+        // Prefer a watcher signal, but fall back to a file-size check when
+        // no notify event was delivered (or the watcher is absent).
+        if let Some(ref p) = self.path.clone() {
+            let mut should_tail = false;
+
+            if let Some(w) = &self.watcher {
+                if w.poll_dirty() {
+                    should_tail = true;
+                }
+            }
+
+            // Fallback: if the file grew beyond the known offset, tail it.
+            if !should_tail {
+                if let Ok(meta) = std::fs::metadata(p) {
+                    if meta.len() > self.offset {
+                        should_tail = true;
+                    }
+                }
+            }
+
+            if should_tail {
+                match crate::io::tail_apply_workbook(
+                    p,
+                    self.offset,
+                    &mut self.workbook,
+                    &mut self.view_sheet_id,
+                ) {
+                    Ok(new_off) => {
+                        self.offset = new_off;
+                        self.sync_active_sheet_cache();
+                        self.status = "External change applied".into();
+                        changed = true;
+                    }
+                    Err(_) => {
+                        let data = std::fs::read_to_string(p).map_err(IoError::Io)?;
+                        let mut workbook = WorkbookState::new();
+                        let mut active_sheet = workbook.sheet_id(workbook.active_sheet);
+                        for line in data.lines() {
+                            let t = line.trim();
+                            if t.is_empty() {
+                                continue;
                             }
-                            self.workbook = workbook;
-                            self.view_sheet_id = active_sheet;
-                            self.sync_active_sheet_cache();
-                            self.offset = data.len() as u64;
-                            self.ops_applied =
-                                data.lines().filter(|line| !line.trim().is_empty()).count();
-                            self.status = "File reset; full reload".into();
-                            changed = true;
+                            crate::ops::apply_log_line_to_workbook(
+                                t,
+                                &mut workbook,
+                                &mut active_sheet,
+                            )?;
                         }
+                        self.workbook = workbook;
+                        self.view_sheet_id = active_sheet;
+                        self.sync_active_sheet_cache();
+                        self.offset = data.len() as u64;
+                        self.ops_applied =
+                            data.lines().filter(|line| !line.trim().is_empty()).count();
+                        self.status = "File reset; full reload".into();
+                        changed = true;
                     }
                 }
             }
         }
+
         Ok(changed)
     }
 
@@ -7898,65 +7918,85 @@ impl App {
                 let allow_text_spill =
                     spill_row && !is_agg_cell && !numeric_like && align != Some(TextAlign::Right);
 
-                // (debug prints removed)
+                // Targeted debug: when a cell contains the CAUTION token print
+                // a concise snapshot of the rendering state to stderr so tests
+                // using `--nocapture` can reveal why spill/truncation decisions
+                // were made for that row. Keep this narrow and easy to remove.
+                // Debug prints removed to clean up test output.
 
-                let disp =
-                    if allow_text_spill && !spill_remain.is_empty() && formatted.trim().is_empty() {
-                        let widened = cw + spill_suppressed_gap_budget;
-                        let (chunk, rest) = take_display_prefix(&spill_remain, widened);
-                        spill_remain = rest;
-                        spill_suppressed_gap_budget = 0;
-                        align_cell_display(chunk, widened, Some(TextAlign::Left))
+                // Track the width actually used when aligning this cell.
+                // We only consume the spill_suppressed_gap_budget to widen the
+                // current cell when that cell is actively receiving spilled text
+                // (i.e. the current formatted string is empty and spill_remain is
+                // non-empty). For non-empty cells (including partially spilling
+                // cells where we intentionally show only the cw-wide prefix) we
+                // do not apply the suppressed-gap budget here; it remains for
+                // subsequent blank neighbor cells.
+                let mut used_widened = cw;
+                let disp = if allow_text_spill && !spill_remain.is_empty() && formatted.trim().is_empty() {
+                    let widened = cw + spill_suppressed_gap_budget;
+                    used_widened = widened;
+                    let (chunk, rest) = take_display_prefix(&spill_remain, widened);
+                    spill_remain = rest;
+                    // budget consumed by this blank cell
+                    spill_suppressed_gap_budget = 0;
+                    align_cell_display(chunk, widened, Some(TextAlign::Left))
+                } else {
+                    if allow_text_spill && !spill_remain.is_empty() && !formatted.trim().is_empty() {
+                        // Incoming spill collides with a non-empty cell: stop the
+                        // spill so we don't mix prose into existing content.
+                        spill_remain.clear();
+                    }
+                    if !spill_remain.is_empty() && is_agg_cell {
+                        spill_remain.clear();
+                    }
+                    let rational_hint = if matches!(
+                        cell_fmt.number,
+                        None | Some(NumberFormat::Rational | NumberFormat::DecimalGeneric)
+                    ) && would_ellipsis_hide_decimal_point(&formatted, cw)
+                    {
+                        let mut visiting = Vec::new();
+                        let mut budget = 10_000usize;
+                        effective_numeric(grid, &cell_addr, &mut visiting, &mut budget)
+                            .map(|n| n.to_f64())
+                            .filter(|v| v.is_finite())
                     } else {
-                        if allow_text_spill && !spill_remain.is_empty() && !formatted.trim().is_empty()
-                        {
-                            spill_remain.clear();
-                        }
-                        if !spill_remain.is_empty() && is_agg_cell {
-                            spill_remain.clear();
-                        }
-                        let rational_hint = if matches!(
-                            cell_fmt.number,
-                            None | Some(NumberFormat::Rational | NumberFormat::DecimalGeneric)
-                        )
-                            && would_ellipsis_hide_decimal_point(&formatted, cw)
-                        {
-                            let mut visiting = Vec::new();
-                            let mut budget = 10_000usize;
-                            effective_numeric(grid, &cell_addr, &mut visiting, &mut budget)
-                                .map(|n| n.to_f64())
-                                .filter(|v| v.is_finite())
-                        } else {
-                            None
-                        };
-                        let exp_preferred = if would_ellipsis_hide_decimal_point(&formatted, cw) {
-                            exponential_numeric_display_with_hint(&formatted, cw, rational_hint)
-                        } else {
-                            None
-                        };
-                        let inner: String = if allow_text_spill && fw > cw {
-                            // Allow partial spill: always display the cw-wide prefix in the
-                            // current cell and place the remainder into spill_remain so it
-                            // can flow into subsequent blank neighbor cells. Previously we
-                            // required the entire formatted string to fit into the blank
-                            // suffix (cw + extra) to enable spill; that prevented useful
-                            // partial spill when only a few characters overflowed.
-                            let (shown, rest) = take_display_prefix(&formatted, cw);
-                            spill_remain = rest;
-                            shown
-                        } else if fw > cw {
-                            spill_remain.clear();
-                            exp_preferred
-                                .or_else(|| shrink_numeric_display(&formatted, cw))
-                                .or_else(|| exponential_numeric_display(&formatted, cw))
-                                .unwrap_or_else(|| truncate_with_ellipsis(&formatted, cw))
-                        } else {
-                            formatted.clone()
-                        };
-                        let widened = cw + spill_suppressed_gap_budget;
-                        spill_suppressed_gap_budget = 0;
-                        align_cell_display(inner, widened, align)
+                        None
                     };
+                    let exp_preferred = if would_ellipsis_hide_decimal_point(&formatted, cw) {
+                        exponential_numeric_display_with_hint(&formatted, cw, rational_hint)
+                    } else {
+                        None
+                    };
+                    let inner: String = if allow_text_spill && fw > cw {
+                        // Allow partial spill: always display the cw-wide prefix in the
+                        // current cell and place the remainder into spill_remain so it
+                        // can flow into subsequent blank neighbor cells. Previously we
+                        // required the entire formatted string to fit into the blank
+                        // suffix (cw + extra) to enable spill; that prevented useful
+                        // partial spill when only a few characters overflowed.
+                        let (shown, rest) = take_display_prefix(&formatted, cw);
+                        spill_remain = rest;
+                        // Do NOT consume suppressed-gap budget here; the current
+                        // cell intentionally shows only cw chars. The budget is for
+                        // blank neighbors that continue the overflow.
+                        shown
+                    } else if fw > cw {
+                        spill_remain.clear();
+                        exp_preferred
+                            .or_else(|| shrink_numeric_display(&formatted, cw))
+                            .or_else(|| exponential_numeric_display(&formatted, cw))
+                            .unwrap_or_else(|| truncate_with_ellipsis(&formatted, cw))
+                    } else {
+                        formatted.clone()
+                    };
+                    // Only widen the current cell if we actually consumed the
+                    // suppressed-gap budget above. Otherwise keep cw and leave the
+                    // budget for future blank cells. `used_widened` is cw here.
+                    let widened = cw;
+                    used_widened = widened;
+                    align_cell_display(inner, widened, align)
+                };
                 // #region agent log
                 if fw > cw && !allow_text_spill && spill_row && !is_agg_cell {
                     let n = DEBUG_AGENT_H2_SAMPLES.fetch_add(1, Ordering::Relaxed);
@@ -7980,7 +8020,7 @@ impl App {
                     }
                 }
                 let dw_disp = disp.width();
-                let expected_w = cw + spill_suppressed_gap_budget;
+                let expected_w = used_widened;
                 if dw_disp != expected_w {
                     let n = DEBUG_AGENT_H3_SAMPLES.fetch_add(1, Ordering::Relaxed);
                     if n < 14 {
@@ -8039,6 +8079,7 @@ impl App {
                 } else {
                     Style::default()
                 };
+                // Debug dump removed to keep test output clean.
                 if is_agg_cell && !is_cur && !sel {
                     st = st.fg(Color::Cyan);
                     if footer_agg.is_some() {
