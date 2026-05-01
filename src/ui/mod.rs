@@ -4864,7 +4864,11 @@ impl App {
             self.state.grid.set_col_width(global_col, None);
             return;
         };
-        self.state.grid.set_col_width(global_col, Some(maxw));
+        // Cap per-column fit to the grid's max_col_width so a single very wide
+        // cell doesn't make the entire UI columns excessively wide now that
+        // overflow/spill is supported.
+        let capped = maxw.min(self.state.grid.max_col_width());
+        self.state.grid.set_col_width(global_col, Some(capped));
     }
 
     /// Width override for the draw pass: never wider than the share of
@@ -7894,6 +7898,8 @@ impl App {
                 let allow_text_spill =
                     spill_row && !is_agg_cell && !numeric_like && align != Some(TextAlign::Right);
 
+                // (debug prints removed)
+
                 let disp =
                     if allow_text_spill && !spill_remain.is_empty() && formatted.trim().is_empty() {
                         let widened = cw + spill_suppressed_gap_budget;
@@ -7929,19 +7935,15 @@ impl App {
                             None
                         };
                         let inner: String = if allow_text_spill && fw > cw {
-                            let extra = spill_blank_suffix_width(grid, r, &col_ixs, i);
-                            if fw <= cw + extra {
-                                let (shown, rest) = take_display_prefix(&formatted, cw);
-                                spill_remain = rest;
-                                shown
-                            } else {
-                                spill_remain.clear();
-                                exp_preferred
-                                    .clone()
-                                    .or_else(|| shrink_numeric_display(&formatted, cw))
-                                    .or_else(|| exponential_numeric_display(&formatted, cw))
-                                    .unwrap_or_else(|| truncate_with_ellipsis(&formatted, cw))
-                            }
+                            // Allow partial spill: always display the cw-wide prefix in the
+                            // current cell and place the remainder into spill_remain so it
+                            // can flow into subsequent blank neighbor cells. Previously we
+                            // required the entire formatted string to fit into the blank
+                            // suffix (cw + extra) to enable spill; that prevented useful
+                            // partial spill when only a few characters overflowed.
+                            let (shown, rest) = take_display_prefix(&formatted, cw);
+                            spill_remain = rest;
+                            shown
                         } else if fw > cw {
                             spill_remain.clear();
                             exp_preferred
@@ -10341,20 +10343,22 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                     match Self::handle_text_input_key(buffer, &mut self.edit_cursor, key.code) {
                         TextInputAction::Handled => {}
                         TextInputAction::EdgeLeft => {
-                            // Discard in-progress edit (same as Esc): do not re-target the draft to
-                            // the neighbouring cell when moving the sheet cursor past the edit edge.
+                            // Discard in-progress edit (same as Esc) but keep the edit target
+                            // aligned with the newly highlighted cell so subsequent operations
+                            // (or restores) target the cell the user navigated to.
                             self.remember_lost_edit(buffer);
                             self.edit_cursor = None;
                             self.edit_special_palette = false;
                             *formula_cursor = None;
                             *formula_ref_char_start = None;
-                            self.edit_target_addr = None;
-                            self.edit_range_addrs = None;
+                            // Move the visible cursor left and snap the edit target to that cell.
                             self.cursor.col = self.cursor.col.saturating_sub(1);
                             self.cursor.clamp(&self.state.grid);
                             self.state
                                 .grid
                                 .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
+                            self.edit_target_addr = Some(self.cursor.to_addr(&self.state.grid));
+                            self.edit_range_addrs = None;
                             mode = Mode::Normal;
                         }
                         TextInputAction::EdgeRight => {
@@ -12987,6 +12991,94 @@ mod tests {
         };
 
         assert!((0..buffer.area.height).any(|y| row(y).contains("TOTAL")));
+    }
+
+    #[test]
+    fn math_corro_spill_visual_inspect() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use std::path::Path;
+
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("math.corro");
+        if !path.exists() {
+            eprintln!("skip: math.corro fixture missing");
+            return;
+        }
+        let mut app = App::new(Some(path));
+        // Load initial workbook state from the .corro log
+        app.load_initial().unwrap();
+
+        // No forced global fit: allow default column widths (and spill) to demonstrate
+        // overflow behavior without making every column very wide.
+
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut whole = String::new();
+        for y in 0..buffer.area.height {
+            let row: String = (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect();
+            whole.push_str(&row);
+            whole.push('\n');
+        }
+
+        // Dump the rendered buffer for inspection and assert the CAUTION token appears.
+        eprintln!("--- math.corro render ---\n{}--- end render ---", whole);
+        assert!(whole.contains("CAUTION") || whole.contains("Caution") || whole.contains("CAUTION."));
+    }
+
+    #[test]
+    fn math_corro_spill_force_spill() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use std::path::Path;
+
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("math.corro");
+        if !path.exists() {
+            eprintln!("skip: math.corro fixture missing");
+            return;
+        }
+        let mut app = App::new(Some(path));
+        // Load initial workbook state from the .corro log
+        app.load_initial().unwrap();
+
+        // Force a narrow first data column and a wide second column so spill is possible.
+        let a_col = MARGIN_COLS; // global column for A
+        let b_col = MARGIN_COLS + 1; // global column for B
+        // Start with a sane fit then override widths.
+        app.state.grid.fit_column_to_content(a_col);
+        app.state.grid.fit_column_to_content(b_col);
+        app.state.grid.set_col_width(a_col, Some(4));
+        app.state.grid.set_col_width(b_col, Some(80));
+
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut rows: Vec<String> = Vec::new();
+        for y in 0..buffer.area.height {
+            let row: String = (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect();
+            rows.push(row);
+        }
+
+        // Find the rendered row containing the CAUTION token.
+        let idx = rows
+            .iter()
+            .position(|r| r.contains("CAUTION") || r.contains("Caution"));
+        assert!(idx.is_some(), "render did not contain CAUTION");
+        let row = &rows[idx.unwrap()];
+
+        // If the UI spilled the long prose across columns we expect there to be no
+        // truncation ellipsis on that row. Check for absence of the ellipsis character.
+        assert!(
+            !row.contains('…') && !row.contains("..."),
+            "expected spilled prose with no ellipsis, got: {}",
+            row
+        );
     }
 
     #[test]
