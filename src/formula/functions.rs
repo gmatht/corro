@@ -145,6 +145,7 @@ pub(crate) fn eval_builtin(
         "ISNUMBER" => eval_isnumber(&args, grid, visiting, bindings, budget, allow_templates),
         "ISTEXT" => eval_istext(&args, grid, visiting, bindings, budget, allow_templates),
         "ISBLANK" => eval_isblank(&args, grid, visiting, bindings, budget, allow_templates),
+        "TYPE" => eval_type(&args, grid, visiting, bindings, budget, allow_templates),
         "TYPEOF" => eval_typeof(&args, grid, visiting, bindings, budget, allow_templates),
         "ISERROR" => eval_iserror(&args, grid, visiting, bindings, budget, allow_templates),
         "ISNA" => eval_isna(&args, grid, visiting, bindings, budget, allow_templates),
@@ -2723,6 +2724,67 @@ fn eval_typeof(
         EvalResult::Text(_) => EvalResult::Text("text".into()),
         EvalResult::Error(_) => EvalResult::Text("error".into()),
         EvalResult::Array(_) => EvalResult::Text("array".into()),
+    }
+}
+
+fn eval_type(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    // LibreOffice TYPE compatibility: return numeric codes
+    // Number -> 1, Text -> 2, Logical -> 4, Formula -> 8, Error -> 16, Array -> 64
+    if args.len() != 1 {
+        return EvalResult::Error("ARGS");
+    }
+
+    // If the argument is an explicit range AST, it's an array
+    if matches!(args[0], Ast::Range { .. }) {
+        return EvalResult::Number(Number::from_i64(64));
+    }
+
+    // If the argument is a direct cell reference, prefer detecting a stored
+    // formula (leading '=' in the stored cell text) and return 8 in that case
+    match &args[0] {
+        Ast::Ref { addr, .. } => {
+            if let Some(raw) = grid.get(addr) {
+                if raw.trim().starts_with('=') {
+                    return EvalResult::Number(Number::from_i64(8));
+                }
+            }
+        }
+        Ast::SheetRef { sheet_id, addr, .. } => {
+            if let Some(sheet_grid) = super::workbook_lookup(*sheet_id) {
+                if let Some(raw) = sheet_grid.get(addr) {
+                    if raw.trim().starts_with('=') {
+                        return EvalResult::Number(Number::from_i64(8));
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    // Fall back to evaluating the argument and mapping the runtime type to
+    // the numeric code.
+    match eval_ast(
+        &args[0],
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+    )
+    .scalar_coerce()
+    {
+        EvalResult::Number(_) => EvalResult::Number(Number::from_i64(1)),
+        EvalResult::Text(_) => EvalResult::Number(Number::from_i64(2)),
+        EvalResult::Bool(_) => EvalResult::Number(Number::from_i64(4)),
+        EvalResult::Error(_) => EvalResult::Number(Number::from_i64(16)),
+        EvalResult::Array(_) => EvalResult::Number(Number::from_i64(64)),
     }
 }
 
