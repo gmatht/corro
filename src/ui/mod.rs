@@ -11,7 +11,7 @@ use crate::formula::{
 };
 use crate::grid::{
     CellAddr, CellFormat, FormatScope, GridBox as Grid, MainRange, MarginIndex, NumberFormat,
-    SortSpec, TextAlign, FOOTER_ROWS, HEADER_ROWS, MARGIN_COLS,
+    SortSpec, TextAlign, FOOTER_ROWS, HEADER_ROWS, MARGIN_COLS, DEFAULT_MAX_COL_WIDTH,
 };
 use crate::io::{
     commit_workbook_op, commit_workbook_set_column_format_batch, load_workbook_revisions_partial,
@@ -5915,7 +5915,7 @@ impl App {
                 buf.push_str(&line);
                 buf.push('\n');
             }
-            if sheet.state.grid.max_col_width() != 20 {
+            if sheet.state.grid.max_col_width() != DEFAULT_MAX_COL_WIDTH {
                 for line in (crate::ops::WorkbookOp::SheetOp {
                     sheet_id: sheet.id,
                     op: Op::SetMaxColWidth {
@@ -11151,7 +11151,7 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
             ))
             .style(prompt_style),
             Mode::SetMaxColWidth { buffer } => Paragraph::new(input_line(
-                " max col width (default=20): ".to_string(),
+                format!(" max col width (default={}: ", DEFAULT_MAX_COL_WIDTH),
                 buffer,
                 self.input_cursor.unwrap_or_else(|| buffer.chars().count()),
                 prompt_style,

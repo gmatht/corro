@@ -1642,7 +1642,7 @@ mod tests {
         }
 
         assert_eq!(sheet.grid.col_width(crate::grid::MARGIN_COLS), 4);
-        assert_eq!(sheet.grid.col_width(crate::grid::MARGIN_COLS + 1), 20);
+        assert_eq!(sheet.grid.col_width(crate::grid::MARGIN_COLS + 1), crate::grid::DEFAULT_MAX_COL_WIDTH);
     }
 
     #[test]

@@ -18,6 +18,9 @@ pub const MARGIN_COLS: usize = 26 * 27; // A..ZZ inclusive
 /// one place if needed.
 pub type MarginIndex = usize;
 
+/// Default maximum column display width when a column has content but no explicit override.
+pub const DEFAULT_MAX_COL_WIDTH: usize = 8;
+
 /// Logical cell address (stable across main resize where possible).
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -454,7 +457,7 @@ impl Grid {
             extent_main_cols: main_cols.max(1),
             left: HashMap::new(),
             right: HashMap::new(),
-            max_col_width: 20,
+            max_col_width: DEFAULT_MAX_COL_WIDTH,
             col_width_overrides: HashMap::new(),
             view_sort_cols: Vec::new(),
             col_all_formats: HashMap::new(),
@@ -1575,7 +1578,7 @@ mod tests {
             "abcdefghijklmnopqrstuvwx".into(),
         );
 
-        assert_eq!(g.col_width(MARGIN_COLS), 20);
+        assert_eq!(g.col_width(MARGIN_COLS), DEFAULT_MAX_COL_WIDTH);
         assert!(g.col_width(MARGIN_COLS + 1) >= 24);
     }
 
@@ -1586,7 +1589,7 @@ mod tests {
         assert_eq!(g.col_width(MARGIN_COLS), 4);
 
         g.set(&CellAddr::Main { row: 0, col: 0 }, "x".into());
-        assert_eq!(g.col_width(MARGIN_COLS), 20);
+        assert_eq!(g.col_width(MARGIN_COLS), DEFAULT_MAX_COL_WIDTH);
         assert_eq!(g.col_width(MARGIN_COLS + 1), 4);
 
         g.set_col_width(MARGIN_COLS + 1, Some(12));
