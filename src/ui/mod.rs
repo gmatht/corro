@@ -7903,7 +7903,12 @@ impl App {
                 //   still allow text spill.
                 // - `DecimalGeneric` on the column must not block spill for non-numeric cells (e.g.
                 //   notes beside numbers); only suppress when the cell actually has a numeric value.
-                let numeric_like = if formatted.trim().parse::<f64>().is_ok() {
+                let trimmed_formatted = formatted.trim();
+                // Treat complex-valued displays as numeric-like so they are
+                // shrunk/exponentiated instead of spilling into neighbor cells.
+                let numeric_like = if trimmed_formatted.parse::<f64>().is_ok() {
+                    true
+                } else if trimmed_formatted.ends_with('i') && parse_complex_display(trimmed_formatted).is_some() {
                     true
                 } else if matches!(cell_fmt.number, Some(NumberFormat::Rational)) {
                     true
