@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Run the newest target/*/corro if it is newer than all inputs under src/ and
 # ./Cargo.*; otherwise `cargo run --`. Forwards all arguments in either case.
+
+export RUSTC_WRAPPER=
+
 set -euo pipefail
 cd "$(dirname "$0")"
 
