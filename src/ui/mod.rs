@@ -312,6 +312,7 @@ enum MenuAction {
     Cut,
     Copy,
     Paste,
+    Extrapolate,
     Find,
     Replace,
     OpenFile,
@@ -366,7 +367,7 @@ struct MenuItem {
     target: MenuTarget,
 }
 
-const EDIT_MENU_ITEMS: [MenuItem; 5] = [
+const EDIT_MENU_ITEMS: [MenuItem; 6] = [
     MenuItem {
         shortcut: 'X',
         label: "Cut",
@@ -391,6 +392,11 @@ const EDIT_MENU_ITEMS: [MenuItem; 5] = [
         shortcut: 'R',
         label: "Replace",
         target: MenuTarget::Action(MenuAction::Replace),
+    },
+    MenuItem {
+        shortcut: 'E',
+        label: "Extrapolate",
+        target: MenuTarget::Action(MenuAction::Extrapolate),
     },
 ];
 
@@ -1063,6 +1069,11 @@ impl App {
             ),
             MenuAction::InsertHyperlink => {
                 self.start_edit_mode(self.menu_insert_hyperlink_seed(), None, false, false)
+            }
+            MenuAction::Extrapolate => {
+                // Placeholder: trigger extrapolation feature. For now, set status and return to Normal.
+                self.status = "Extrapolate invoked".into();
+                Mode::Normal
             }
             MenuAction::SortView => Mode::SortView {
                 buffer: self.start_input_mode(String::new()),
@@ -9176,6 +9187,28 @@ mod tests {
             }
             other => panic!("unexpected mode: {other:?}"),
         }
+    }
+
+    #[test]
+    fn edit_menu_includes_extrapolate_label() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(None);
+        app.mode = Mode::Menu {
+            stack: vec![MenuLevel {
+                section: MenuSection::Edit,
+                item: 0,
+            }],
+        };
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+
+        let buf = terminal.backend().buffer();
+        let visible: String = buf.content().iter().map(|c| c.symbol().to_string()).collect();
+        assert!(visible.contains("Extrapolate"), "Edit menu missing Extrapolate: {}", visible);
     }
 
     #[test]
