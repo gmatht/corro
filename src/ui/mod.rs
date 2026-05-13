@@ -29,7 +29,7 @@ use ratatui::widgets::{
     Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
 };
 use std::collections::{HashMap, HashSet};
-use std::io::{self, stdout, Write};
+use std::io::{self, stdout};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use thiserror::Error;
@@ -1644,6 +1644,60 @@ Quit\n\
     ) {
         f.render_widget(Clear, popup_area);
         f.render_stateful_widget(popup, popup_area, state);
+    }
+}
+
+#[cfg(test)]
+mod menu_tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    // Render the Edit menu popup headlessly and assert the label is present.
+    #[test]
+    fn edit_menu_contains_extrapolate() {
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+
+        // Create a minimal app and open the Edit menu
+        let mut app = App::new(None);
+        app.open_menu(MenuSection::Edit);
+
+        term.draw(|f| {
+            // Build the menu levels to render (top-level Edit popup only)
+            let stack = if let Mode::Menu { stack } = &app.mode {
+                stack.clone()
+            } else {
+                vec![]
+            };
+            let levels = App::menu_render_levels(&stack);
+
+            // Render only the first level (Edit popup)
+            if let Some(level) = levels.get(0) {
+                let section = level.section;
+                let items = menu_items(section);
+                let menu_title = menu_title(section);
+                let labels: Vec<String> = items
+                    .iter()
+                    .map(|mi| format!("{}·{}", mi.shortcut, mi.label))
+                    .collect();
+
+                // Build List widget and render it in the computed popup area
+                let list_items: Vec<ListItem> = labels.iter().map(|l| ListItem::new(l.as_str())).collect();
+                let mut state = ListState::default();
+                state.select(Some(level.item));
+                let list = List::new(list_items).block(Block::default().title(menu_title));
+                let area = menu_popup_area(f.area(), section, None);
+                f.render_widget(Clear, area);
+                f.render_stateful_widget(list, area, &mut state);
+            }
+        })
+        .unwrap();
+
+        // Inspect the buffer contents
+        let buf = term.backend().buffer();
+        let visible = buf.content().iter().map(|c| c.symbol().to_string()).collect::<String>();
+        assert!(visible.contains("Extrapolate"), "Edit menu missing Extrapolate: {}", visible);
     }
 }
 
@@ -7462,27 +7516,50 @@ impl App {
                 };
 
                 match evt {
-                    Event::Key(key) => {
-                        if key.kind == KeyEventKind::Release {
-                            continue;
-                        }
-                        let (key, arrow_steps) = if matches!(self.mode, Mode::Normal)
-                            && PlainArrowAxis::from_key_event(&key).is_some()
-                        {
-                            self.coalesce_buffered_plain_arrows(key)?
-                        } else {
-                            (key, 1usize)
-                        };
-                        if self.handle_key(key)? {
-                            break;
-                        }
-                        if arrow_steps > 1 {
-                            if let Some(ax) = PlainArrowAxis::from_key_event(&key) {
-                                self.apply_coalesced_plain_arrows_extra(ax, arrow_steps - 1);
-                            }
-                        }
-                        pending_redraw = true;
+                Event::Key(key) => {
+                    // If CORRO_KEY_LOG is set in the environment, log raw KeyEvent
+                    // information to /tmp/corro_keylog.txt. This is a lightweight
+                    // diagnostic aid to determine how the terminal reports
+                    // Shift+Arrow and other modified arrow keys.
+                    if std::env::var_os("CORRO_KEY_LOG").is_some() {
+                        let _ = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open("/tmp/corro_keylog.txt")
+                            .and_then(|mut f| {
+                                use std::io::Write;
+                                writeln!(
+                                    f,
+                                    "Event::Key: code={:?}, kind={:?}, modifiers={:?}",
+                                    key.code, key.kind, key.modifiers
+                                )
+                            });
                     }
+
+                    if key.kind == KeyEventKind::Release {
+                        continue;
+                    }
+
+                    let (key, arrow_steps) = if matches!(self.mode, Mode::Normal)
+                        && PlainArrowAxis::from_key_event(&key).is_some()
+                    {
+                        self.coalesce_buffered_plain_arrows(key)?
+                    } else {
+                        (key, 1usize)
+                    };
+
+                    if self.handle_key(key)? {
+                        break;
+                    }
+
+                    if arrow_steps > 1 {
+                        if let Some(ax) = PlainArrowAxis::from_key_event(&key) {
+                            self.apply_coalesced_plain_arrows_extra(ax, arrow_steps - 1);
+                        }
+                    }
+
+                    pending_redraw = true;
+                }
                     Event::Resize(_, _) => {
                         pending_redraw = true;
                     }
@@ -11689,6 +11766,34 @@ mod tests {
     }
 
     #[test]
+    fn edit_menu_includes_extrapolate_label() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(None);
+        app.mode = Mode::Menu {
+            stack: vec![MenuLevel {
+                section: MenuSection::Edit,
+                item: 0,
+            }],
+        };
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut visible = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                visible.push_str(buffer[(x, y)].symbol());
+            }
+            visible.push('\n');
+        }
+
+        assert!(visible.contains("Extrapolate"), "Edit menu missing Extrapolate: {}", visible);
+    }
+
+    #[test]
     fn preview_level_is_not_highlighted() {
         assert_eq!(App::menu_selected_index(0, 1, 2, 4), Some(2));
         assert_eq!(App::menu_selected_index(1, 1, 0, 4), None);
@@ -15167,28 +15272,6 @@ mod tests {
             }
             other => panic!("unexpected mode: {other:?}"),
         }
-    }
-
-    #[test]
-    fn edit_menu_includes_extrapolate_label() {
-        use ratatui::backend::TestBackend;
-        use ratatui::Terminal;
-
-        let mut app = App::new(None);
-        app.mode = Mode::Menu {
-            stack: vec![MenuLevel {
-                section: MenuSection::Edit,
-                item: 0,
-            }],
-        };
-
-        let backend = TestBackend::new(80, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| app.draw(f)).unwrap();
-
-        let buf = terminal.backend().buffer();
-        let visible: String = buf.content().iter().map(|c| c.symbol().to_string()).collect();
-        assert!(visible.contains("Extrapolate"), "Edit menu missing Extrapolate: {}", visible);
     }
 
     #[test]
