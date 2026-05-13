@@ -1,8 +1,11 @@
 use super::{
-    eval_ast, eval_binary, eval_cell_inner, eval_sum, parse_number_literal, Ast, EvalResult,
+    coerce_cell_number, eval_ast, eval_binary_float, eval_binary_float_with_complex_fallback,
+    eval_cell_inner, eval_sum, number_from_bool, parse_number_literal, Ast, EvalResult, Number,
 };
-use crate::grid::{CellAddr, Grid, MainRange};
+use crate::formula::number::{mod_trunc_toward_zero, round_rational_decimal_places};
+use crate::grid::{CellAddr, GridBox as Grid, MainRange};
 use chrono::{Datelike, Local, NaiveDate, NaiveDateTime, Timelike};
+use num_traits::Zero;
 use std::hash::{Hash, Hasher};
 
 pub(crate) fn eval_builtin(
@@ -61,30 +64,14 @@ pub(crate) fn eval_builtin(
             allow_templates,
             NumericAgg::Product,
         ),
-        "ABS" => eval_unary_numeric(
-            &args,
-            grid,
-            visiting,
-            bindings,
-            budget,
-            allow_templates,
-            f64::abs,
-        ),
+        "ABS" => eval_abs(&args, grid, visiting, bindings, budget, allow_templates),
         "ROUND" => eval_round(&args, grid, visiting, bindings, budget, allow_templates),
-        "MOD" => eval_binary_numeric(
-            &args,
-            grid,
-            visiting,
-            bindings,
-            budget,
-            allow_templates,
-            |x, y| x % y,
-        ),
+        "MOD" => eval_mod(&args, grid, visiting, bindings, budget, allow_templates),
         "POWER" => {
             if args.len() != 2 {
                 EvalResult::Error("ARGS")
             } else {
-                eval_binary(
+                eval_binary_float_with_complex_fallback(
                     &args[0],
                     &args[1],
                     grid,
@@ -92,11 +79,12 @@ pub(crate) fn eval_builtin(
                     bindings,
                     budget,
                     allow_templates,
-                    |x, y| x.powf(y),
+                    f64::powf,
+                    |x, y| x.powc(y),
                 )
             }
         }
-        "SQRT" => eval_unary_numeric(
+        "SQRT" => eval_unary_numeric_with_complex_fallback(
             &args,
             grid,
             visiting,
@@ -104,12 +92,27 @@ pub(crate) fn eval_builtin(
             budget,
             allow_templates,
             f64::sqrt,
+            num_complex::Complex64::sqrt,
         ),
         "PI" => {
             if !args.is_empty() {
                 EvalResult::Error("ARGS")
             } else {
-                EvalResult::Number(std::f64::consts::PI)
+                EvalResult::Number(Number::from_f64_unchecked(std::f64::consts::PI))
+            }
+        }
+        "TRUE" => {
+            if !args.is_empty() {
+                EvalResult::Error("ARGS")
+            } else {
+                EvalResult::Bool(true)
+            }
+        }
+        "FALSE" => {
+            if !args.is_empty() {
+                EvalResult::Error("ARGS")
+            } else {
+                EvalResult::Bool(false)
             }
         }
         "SIN" => eval_unary_numeric(
@@ -142,6 +145,8 @@ pub(crate) fn eval_builtin(
         "ISNUMBER" => eval_isnumber(&args, grid, visiting, bindings, budget, allow_templates),
         "ISTEXT" => eval_istext(&args, grid, visiting, bindings, budget, allow_templates),
         "ISBLANK" => eval_isblank(&args, grid, visiting, bindings, budget, allow_templates),
+        "TYPE" => eval_type(&args, grid, visiting, bindings, budget, allow_templates),
+        "TYPEOF" => eval_typeof(&args, grid, visiting, bindings, budget, allow_templates),
         "ISERROR" => eval_iserror(&args, grid, visiting, bindings, budget, allow_templates),
         "ISNA" => eval_isna(&args, grid, visiting, bindings, budget, allow_templates),
         "TODAY" => eval_today(&args),
@@ -219,6 +224,149 @@ enum NumericAgg {
     Product,
 }
 
+fn eval_abs(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    if args.len() != 1 {
+        return EvalResult::Error("ARGS");
+    }
+    let ea = eval_ast(
+        &args[0],
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+    )
+    .scalar_coerce();
+    match coerce_cell_number(ea) {
+        Ok(n) => EvalResult::Number(n.abs()),
+        Err(e) => e,
+    }
+}
+
+fn round_builtin_decimal_places(nd: &Number) -> Option<i32> {
+    let f = nd.to_f64();
+    if !f.is_finite() {
+        return None;
+    }
+    let p = f.round().clamp(-30.0, 30.0);
+    Some(p as i32)
+}
+
+fn eval_round(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    if args.len() != 2 {
+        return EvalResult::Error("ARGS");
+    }
+    let ea = eval_ast(
+        &args[0],
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+    )
+    .scalar_coerce();
+    let na = match coerce_cell_number(ea) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let eb = eval_ast(
+        &args[1],
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+    )
+    .scalar_coerce();
+    let digits_n = match coerce_cell_number(eb) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    if let Number::Exact(r) = &na {
+        if let Some(place) = round_builtin_decimal_places(&digits_n) {
+            return EvalResult::Number(Number::Exact(round_rational_decimal_places(r, place)));
+        }
+    }
+    let n = na.to_f64();
+    let digits = digits_n.to_f64();
+    let factor = 10f64.powf(digits);
+    EvalResult::Number(Number::from_f64_unchecked((n * factor).round() / factor))
+}
+
+fn eval_mod(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    if args.len() != 2 {
+        return EvalResult::Error("ARGS");
+    }
+    let ea = eval_ast(
+        &args[0],
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+    )
+    .scalar_coerce();
+    let na = match coerce_cell_number(ea) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let eb = eval_ast(
+        &args[1],
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+    )
+    .scalar_coerce();
+    let nb = match coerce_cell_number(eb) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    match (&na, &nb) {
+        (Number::Exact(a), Number::Exact(b)) => {
+            if b.is_zero() {
+                return EvalResult::Number(Number::from_f64_unchecked(f64::NAN));
+            }
+            if let Some(rem) = mod_trunc_toward_zero(a, b) {
+                return EvalResult::Number(Number::Exact(rem));
+            }
+            EvalResult::Number(Number::from_f64_unchecked(f64::NAN))
+        }
+        _ => eval_binary_float(
+            &args[0],
+            &args[1],
+            grid,
+            visiting,
+            bindings,
+            budget,
+            allow_templates,
+            std::ops::Rem::rem,
+        ),
+    }
+}
+
 fn eval_numeric_aggregate(
     args: &[Ast],
     grid: &Grid,
@@ -228,33 +376,42 @@ fn eval_numeric_aggregate(
     allow_templates: bool,
     kind: NumericAgg,
 ) -> EvalResult {
-    if args.len() != 1 {
+    if args.is_empty() {
         return EvalResult::Error("ARGS");
     }
-    let nums =
-        match collect_numeric_values(&args[0], grid, visiting, bindings, budget, allow_templates) {
-            Ok(nums) => nums,
+    let mut nums: Vec<Number> = Vec::new();
+    for a in args {
+        match collect_numeric_values(a, grid, visiting, bindings, budget, allow_templates) {
+            Ok(n) => nums.extend(n),
             Err(e) => return EvalResult::Error(e),
-        };
+        }
+    }
     match kind {
         NumericAgg::Average => {
             if nums.is_empty() {
                 EvalResult::Error("DIV0")
             } else {
-                EvalResult::Number(nums.iter().sum::<f64>() / nums.len() as f64)
+                let sum = nums
+                    .iter()
+                    .cloned()
+                    .fold(Number::exact_zero(), |a, b| a.add(b));
+                EvalResult::Number(sum.div(Number::from_i64(nums.len() as i64)))
             }
         }
         NumericAgg::Min => nums
             .into_iter()
-            .min_by(|a, b| a.partial_cmp(b).unwrap())
+            .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
             .map(EvalResult::Number)
-            .unwrap_or(EvalResult::Number(0.0)),
+            .unwrap_or(EvalResult::Number(Number::exact_zero())),
         NumericAgg::Max => nums
             .into_iter()
-            .max_by(|a, b| a.partial_cmp(b).unwrap())
+            .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
             .map(EvalResult::Number)
-            .unwrap_or(EvalResult::Number(0.0)),
-        NumericAgg::Product => EvalResult::Number(nums.into_iter().fold(1.0, |acc, n| acc * n)),
+            .unwrap_or(EvalResult::Number(Number::exact_zero())),
+        NumericAgg::Product => EvalResult::Number(
+            nums.into_iter()
+                .fold(Number::one(), |acc, n| acc.mul(n)),
+        ),
     }
 }
 
@@ -278,33 +435,38 @@ fn eval_unary_numeric(
         budget,
         allow_templates,
     )) {
-        Some(n) => EvalResult::Number(f(n)),
+        Some(n) => EvalResult::Number(Number::from_f64_unchecked(f(n))),
         None => EvalResult::Error("VALUE"),
     }
 }
 
-fn eval_binary_numeric(
+fn eval_unary_numeric_with_complex_fallback(
     args: &[Ast],
     grid: &Grid,
     visiting: &mut Vec<CellAddr>,
     bindings: &mut Vec<(String, EvalResult)>,
     budget: &mut usize,
     allow_templates: bool,
-    f: fn(f64, f64) -> f64,
+    real: fn(f64) -> f64,
+    complex: fn(num_complex::Complex64) -> num_complex::Complex64,
 ) -> EvalResult {
-    if args.len() != 2 {
+    if args.len() != 1 {
         return EvalResult::Error("ARGS");
     }
-    eval_binary(
+    let evaluated = eval_ast(
         &args[0],
-        &args[1],
         grid,
         visiting,
         bindings,
         budget,
         allow_templates,
-        f,
     )
+    .scalar_coerce();
+    let number = match coerce_cell_number(evaluated) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    EvalResult::Number(number.apply_unary_f64_with_complex_fallback(real, complex))
 }
 
 pub(crate) fn parse_date_serial_literal(s: &str) -> Option<f64> {
@@ -322,45 +484,8 @@ pub(crate) fn parse_date_serial_literal(s: &str) -> Option<f64> {
     NaiveDate::from_ymd_opt(year, month, day).map(date_to_serial)
 }
 
-pub(crate) fn parse_numeric_or_date_literal(s: &str) -> Option<f64> {
-    parse_number_literal(s).or_else(|| parse_date_serial_literal(s))
-}
-
-fn eval_round(
-    args: &[Ast],
-    grid: &Grid,
-    visiting: &mut Vec<CellAddr>,
-    bindings: &mut Vec<(String, EvalResult)>,
-    budget: &mut usize,
-    allow_templates: bool,
-) -> EvalResult {
-    if args.len() != 2 {
-        return EvalResult::Error("ARGS");
-    }
-    let n = match numeric_value(eval_ast(
-        &args[0],
-        grid,
-        visiting,
-        bindings,
-        budget,
-        allow_templates,
-    )) {
-        Some(n) => n,
-        None => return EvalResult::Error("VALUE"),
-    };
-    let digits = match numeric_value(eval_ast(
-        &args[1],
-        grid,
-        visiting,
-        bindings,
-        budget,
-        allow_templates,
-    )) {
-        Some(n) => n,
-        None => return EvalResult::Error("VALUE"),
-    };
-    let factor = 10f64.powf(digits);
-    EvalResult::Number((n * factor).round() / factor)
+pub(crate) fn parse_numeric_or_date_literal(s: &str) -> Option<Number> {
+    parse_number_literal(s).or_else(|| parse_date_serial_literal(s).map(Number::approx))
 }
 
 fn eval_trim(
@@ -376,6 +501,8 @@ fn eval_trim(
     }
     match eval_ast(&args[0], grid, visiting, bindings, budget, allow_templates).scalar_coerce() {
         EvalResult::Number(n) => EvalResult::Text(trim_spaces(&format!("{n}"))),
+        EvalResult::Bool(true) => EvalResult::Text("TRUE".into()),
+        EvalResult::Bool(false) => EvalResult::Text("FALSE".into()),
         EvalResult::Text(s) => EvalResult::Text(trim_spaces(&s)),
         EvalResult::Error(e) => EvalResult::Error(e),
         EvalResult::Array(_) => EvalResult::Error("CALC"),
@@ -597,7 +724,7 @@ fn eval_find(
     };
     let start = start.min(hay.len());
     match hay[start..].find(&needle) {
-        Some(pos) => EvalResult::Number((start + pos + 1) as f64),
+        Some(pos) => EvalResult::Number(Number::from_i64((start + pos + 1) as i64)),
         None => EvalResult::Error("VALUE"),
     }
 }
@@ -638,7 +765,7 @@ fn eval_search(
     };
     let start = start.min(hay.len());
     match hay[start..].find(&needle) {
-        Some(pos) => EvalResult::Number((start + pos + 1) as f64),
+        Some(pos) => EvalResult::Number(Number::from_i64((start + pos + 1) as i64)),
         None => EvalResult::Error("VALUE"),
     }
 }
@@ -658,6 +785,7 @@ fn eval_text(
         .scalar_coerce()
     {
         EvalResult::Number(n) => n,
+        EvalResult::Bool(b) => number_from_bool(b),
         EvalResult::Text(s) => match parse_numeric_or_date_literal(&s) {
             Some(n) => n,
             None => return EvalResult::Text(s),
@@ -669,11 +797,12 @@ fn eval_text(
         Ok(s) => s,
         Err(e) => return EvalResult::Error(e),
     };
+    let vf = value.to_f64();
     if let Some(decimals) = fmt.strip_prefix("0.") {
         let digits = decimals.len();
-        EvalResult::Text(format!("{:.*}", digits, value))
+        EvalResult::Text(format!("{:.*}", digits, vf))
     } else if fmt == "0" {
-        EvalResult::Text(format!("{}", value.round() as i64))
+        EvalResult::Text(format!("{}", vf.round() as i64))
     } else {
         EvalResult::Text(value.to_string())
     }
@@ -684,7 +813,7 @@ fn eval_today(args: &[Ast]) -> EvalResult {
         return EvalResult::Error("ARGS");
     }
     let now = Local::now().date_naive();
-    EvalResult::Number(date_to_serial(now))
+    EvalResult::Number(Number::approx(date_to_serial(now)))
 }
 
 fn eval_now(args: &[Ast]) -> EvalResult {
@@ -692,7 +821,7 @@ fn eval_now(args: &[Ast]) -> EvalResult {
         return EvalResult::Error("ARGS");
     }
     let now = Local::now().naive_local();
-    EvalResult::Number(datetime_to_serial(now))
+    EvalResult::Number(Number::approx(datetime_to_serial(now)))
 }
 
 fn eval_date(
@@ -740,7 +869,7 @@ fn eval_date(
         None => return EvalResult::Error("VALUE"),
     };
     match NaiveDate::from_ymd_opt(year, month, day) {
-        Some(d) => EvalResult::Number(date_to_serial(d)),
+        Some(d) => EvalResult::Number(Number::approx(date_to_serial(d))),
         None => EvalResult::Error("VALUE"),
     }
 }
@@ -916,7 +1045,7 @@ fn eval_int(
         budget,
         allow_templates,
     )) {
-        Some(n) => EvalResult::Number(n.floor()),
+        Some(n) => EvalResult::Number(Number::from_f64_unchecked(n.floor())),
         None => EvalResult::Error("VALUE"),
     }
 }
@@ -954,7 +1083,9 @@ fn eval_ceiling(
         Some(v) if v != 0.0 => v,
         _ => return EvalResult::Error("VALUE"),
     };
-    EvalResult::Number((n / significance).ceil() * significance)
+    EvalResult::Number(Number::from_f64_unchecked(
+        (n / significance).ceil() * significance,
+    ))
 }
 
 fn eval_floor(
@@ -990,7 +1121,9 @@ fn eval_floor(
         Some(v) if v != 0.0 => v,
         _ => return EvalResult::Error("VALUE"),
     };
-    EvalResult::Number((n / significance).floor() * significance)
+    EvalResult::Number(Number::from_f64_unchecked(
+        (n / significance).floor() * significance,
+    ))
 }
 
 fn eval_rand(
@@ -1004,12 +1137,12 @@ fn eval_rand(
     if !args.is_empty() {
         return EvalResult::Error("ARGS");
     }
-    EvalResult::Number(deterministic_rand(
+    EvalResult::Number(Number::from_f64_unchecked(deterministic_rand(
         grid,
         current_addr_hash(visiting),
         None,
         None,
-    ))
+    )))
 }
 
 fn eval_randbetween(
@@ -1055,7 +1188,7 @@ fn eval_randbetween(
         Some(high as u64),
     );
     let span = (high - low + 1) as f64;
-    EvalResult::Number(low as f64 + (n * span).floor())
+    EvalResult::Number(Number::from_f64_unchecked(low as f64 + (n * span).floor()))
 }
 
 fn date_component<F>(
@@ -1085,7 +1218,7 @@ where
         None => return EvalResult::Error("VALUE"),
     };
     match serial_to_datetime(serial) {
-        Some(dt) => EvalResult::Number(f(&dt)),
+        Some(dt) => EvalResult::Number(Number::from_f64_unchecked(f(&dt))),
         None => EvalResult::Error("VALUE"),
     }
 }
@@ -1146,7 +1279,7 @@ fn round_with_mode(
     let factor = 10f64.powf(digits);
     let scaled = n * factor;
     let rounded = if up { scaled.ceil() } else { scaled.floor() };
-    EvalResult::Number(rounded / factor)
+    EvalResult::Number(Number::from_f64_unchecked(rounded / factor))
 }
 
 fn date_to_serial(date: NaiveDate) -> f64 {
@@ -1179,7 +1312,7 @@ fn current_addr_hash(visiting: &[CellAddr]) -> Option<u64> {
 
 fn deterministic_rand(grid: &Grid, c: Option<u64>, a: Option<u64>, b: Option<u64>) -> f64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    Hash::hash(&grid.volatile_seed, &mut hasher);
+    Hash::hash(&grid.volatile_seed(), &mut hasher);
     Hash::hash(&c, &mut hasher);
     Hash::hash(&a, &mut hasher);
     Hash::hash(&b, &mut hasher);
@@ -1197,6 +1330,8 @@ fn eval_text_arg(
 ) -> Result<String, &'static str> {
     match eval_ast(ast, grid, visiting, bindings, budget, allow_templates).scalar_coerce() {
         EvalResult::Number(n) => Ok(n.to_string()),
+        EvalResult::Bool(true) => Ok("TRUE".into()),
+        EvalResult::Bool(false) => Ok("FALSE".into()),
         EvalResult::Text(s) => Ok(s),
         EvalResult::Error(e) => Err(e),
         EvalResult::Array(_) => Err("CALC"),
@@ -1224,7 +1359,7 @@ fn eval_sumproduct(
     let rows = matrices[0].len();
     let cols = matrices[0].first().map(|r| r.len()).unwrap_or(0);
     if rows == 0 || cols == 0 {
-        return EvalResult::Number(0.0);
+        return EvalResult::Number(Number::exact_zero());
     }
     if matrices
         .iter()
@@ -1232,13 +1367,14 @@ fn eval_sumproduct(
     {
         return EvalResult::Error("ARGS");
     }
-    let mut sum = 0.0;
+    let mut sum = Number::exact_zero();
     for r in 0..rows {
         for c in 0..cols {
-            let mut prod = 1.0;
+            let mut prod = Number::one();
             for m in &matrices {
                 let v = match m[r][c].clone().scalar_coerce() {
                     EvalResult::Number(n) => n,
+                    EvalResult::Bool(b) => number_from_bool(b),
                     EvalResult::Text(s) => match parse_number_literal(&s) {
                         Some(n) => n,
                         None => return EvalResult::Error("VALUE"),
@@ -1246,9 +1382,9 @@ fn eval_sumproduct(
                     EvalResult::Error(e) => return EvalResult::Error(e),
                     EvalResult::Array(_) => return EvalResult::Error("CALC"),
                 };
-                prod *= v;
+                prod = prod.mul(v);
             }
-            sum += prod;
+            sum = sum.add(prod);
         }
     }
     EvalResult::Number(sum)
@@ -1325,8 +1461,15 @@ fn eval_len(
         return EvalResult::Error("ARGS");
     }
     match eval_ast(&args[0], grid, visiting, bindings, budget, allow_templates).scalar_coerce() {
-        EvalResult::Text(s) => EvalResult::Number(s.chars().count() as f64),
-        EvalResult::Number(n) => EvalResult::Number(format!("{n}").chars().count() as f64),
+        EvalResult::Text(s) => {
+            EvalResult::Number(Number::from_i64(s.chars().count() as i64))
+        }
+        EvalResult::Bool(b) => EvalResult::Number(Number::from_i64(
+            (if b { "TRUE" } else { "FALSE" }).chars().count() as i64,
+        )),
+        EvalResult::Number(n) => EvalResult::Number(Number::from_i64(
+            format!("{n}").chars().count() as i64,
+        )),
         EvalResult::Error(e) => EvalResult::Error(e),
         EvalResult::Array(_) => EvalResult::Error("CALC"),
     }
@@ -1348,6 +1491,8 @@ fn eval_left(
     {
         EvalResult::Text(s) => s,
         EvalResult::Number(n) => n.to_string(),
+        EvalResult::Bool(true) => "TRUE".into(),
+        EvalResult::Bool(false) => "FALSE".into(),
         EvalResult::Error(e) => return EvalResult::Error(e),
         EvalResult::Array(_) => return EvalResult::Error("CALC"),
     };
@@ -1385,6 +1530,8 @@ fn eval_right(
     {
         EvalResult::Text(s) => s,
         EvalResult::Number(n) => n.to_string(),
+        EvalResult::Bool(true) => "TRUE".into(),
+        EvalResult::Bool(false) => "FALSE".into(),
         EvalResult::Error(e) => return EvalResult::Error(e),
         EvalResult::Array(_) => return EvalResult::Error("CALC"),
     };
@@ -1424,6 +1571,8 @@ fn eval_mid(
     {
         EvalResult::Text(s) => s,
         EvalResult::Number(n) => n.to_string(),
+        EvalResult::Bool(true) => "TRUE".into(),
+        EvalResult::Bool(false) => "FALSE".into(),
         EvalResult::Error(e) => return EvalResult::Error(e),
         EvalResult::Array(_) => return EvalResult::Error("CALC"),
     };
@@ -1466,6 +1615,8 @@ fn eval_concat(
     for arg in args {
         match eval_ast(arg, grid, visiting, bindings, budget, allow_templates).scalar_coerce() {
             EvalResult::Number(n) => out.push_str(&n.to_string()),
+            EvalResult::Bool(true) => out.push_str("TRUE"),
+            EvalResult::Bool(false) => out.push_str("FALSE"),
             EvalResult::Text(s) => out.push_str(&s),
             EvalResult::Error(e) => return EvalResult::Error(e),
             EvalResult::Array(_) => return EvalResult::Error("CALC"),
@@ -1490,6 +1641,8 @@ fn eval_textjoin(
     {
         EvalResult::Text(s) => s,
         EvalResult::Number(n) => n.to_string(),
+        EvalResult::Bool(true) => "TRUE".into(),
+        EvalResult::Bool(false) => "FALSE".into(),
         EvalResult::Error(e) => return EvalResult::Error(e),
         EvalResult::Array(_) => return EvalResult::Error("CALC"),
     };
@@ -1499,6 +1652,8 @@ fn eval_textjoin(
             eval_ast(arg, grid, visiting, bindings, budget, allow_templates).scalar_coerce();
         match value {
             EvalResult::Number(n) => parts.push(n.to_string()),
+            EvalResult::Bool(true) => parts.push("TRUE".into()),
+            EvalResult::Bool(false) => parts.push("FALSE".into()),
             EvalResult::Text(s) => {
                 if !s.is_empty() {
                     parts.push(s);
@@ -1522,20 +1677,18 @@ fn eval_not(
     if args.len() != 1 {
         return EvalResult::Error("ARGS");
     }
-    EvalResult::Number(
-        if super::truthy(eval_ast(
-            &args[0],
-            grid,
-            visiting,
-            bindings,
-            budget,
-            allow_templates,
-        )) {
-            0.0
-        } else {
-            1.0
-        },
-    )
+    EvalResult::Number(if super::truthy(eval_ast(
+        &args[0],
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+    )) {
+        Number::exact_zero()
+    } else {
+        Number::one()
+    })
 }
 
 fn eval_and(
@@ -1555,10 +1708,10 @@ fn eval_and(
             budget,
             allow_templates,
         )) {
-            return EvalResult::Number(0.0);
+            return EvalResult::Number(Number::exact_zero());
         }
     }
-    EvalResult::Number(1.0)
+    EvalResult::Number(Number::one())
 }
 
 fn eval_or(
@@ -1578,10 +1731,10 @@ fn eval_or(
             budget,
             allow_templates,
         )) {
-            return EvalResult::Number(1.0);
+            return EvalResult::Number(Number::one());
         }
     }
-    EvalResult::Number(0.0)
+    EvalResult::Number(Number::exact_zero())
 }
 
 fn eval_match(
@@ -1615,6 +1768,7 @@ fn eval_match(
         .scalar_coerce()
     {
         EvalResult::Number(n) => LookupValue::Number(n),
+        EvalResult::Bool(b) => LookupValue::Number(number_from_bool(b)),
         EvalResult::Text(s) => parse_number_literal(&s)
             .map(LookupValue::Number)
             .unwrap_or(LookupValue::Text(s)),
@@ -1631,6 +1785,7 @@ fn eval_match(
         for cell in row {
             let candidate = match cell.scalar_coerce() {
                 EvalResult::Number(n) => LookupValue::Number(n),
+                EvalResult::Bool(b) => LookupValue::Number(number_from_bool(b)),
                 EvalResult::Text(s) => parse_number_literal(&s)
                     .map(LookupValue::Number)
                     .unwrap_or(LookupValue::Text(s)),
@@ -1644,7 +1799,7 @@ fn eval_match(
                 }
             };
             if candidate == lookup_value {
-                return EvalResult::Number(idx as f64);
+                return EvalResult::Number(Number::from_i64(idx as i64));
             }
             idx += 1;
         }
@@ -1667,6 +1822,7 @@ fn eval_xmatch(
         .scalar_coerce()
     {
         EvalResult::Number(n) => LookupValue::Number(n),
+        EvalResult::Bool(b) => LookupValue::Number(number_from_bool(b)),
         EvalResult::Text(s) => parse_number_literal(&s)
             .map(LookupValue::Number)
             .unwrap_or(LookupValue::Text(s)),
@@ -1719,6 +1875,7 @@ fn eval_xmatch(
         for (i, cell) in flat.iter().enumerate() {
             let candidate = match cell.clone() {
                 EvalResult::Number(n) => LookupValue::Number(n),
+                EvalResult::Bool(b) => LookupValue::Number(number_from_bool(b)),
                 EvalResult::Text(s) => parse_number_literal(&s)
                     .map(LookupValue::Number)
                     .unwrap_or(LookupValue::Text(s)),
@@ -1726,13 +1883,14 @@ fn eval_xmatch(
                 EvalResult::Array(_) => continue,
             };
             if candidate == lookup_value {
-                return EvalResult::Number((i + 1) as f64);
+                return EvalResult::Number(Number::from_i64((i + 1) as i64));
             }
         }
     } else {
         for (i, cell) in flat.iter().enumerate().rev() {
             let candidate = match cell.clone() {
                 EvalResult::Number(n) => LookupValue::Number(n),
+                EvalResult::Bool(b) => LookupValue::Number(number_from_bool(b)),
                 EvalResult::Text(s) => parse_number_literal(&s)
                     .map(LookupValue::Number)
                     .unwrap_or(LookupValue::Text(s)),
@@ -1740,7 +1898,7 @@ fn eval_xmatch(
                 EvalResult::Array(_) => continue,
             };
             if candidate == lookup_value {
-                return EvalResult::Number((i + 1) as f64);
+                return EvalResult::Number(Number::from_i64((i + 1) as i64));
             }
         }
     }
@@ -1845,7 +2003,7 @@ fn eval_countifs(
             }
         }
     }
-    EvalResult::Number(count as f64)
+    EvalResult::Number(Number::from_i64(count as i64))
 }
 
 fn eval_sumifs(
@@ -1879,7 +2037,7 @@ fn eval_sumifs(
     }) {
         return EvalResult::Error("ARGS");
     }
-    let mut sum = 0.0;
+    let mut sum = Number::exact_zero();
     for dr in 0..range_height(&sum_range) {
         for dc in 0..range_width(&sum_range) {
             let mut ok = true;
@@ -1898,8 +2056,8 @@ fn eval_sumifs(
                     row: sum_range.row_start + dr,
                     col: sum_range.col_start + dc,
                 };
-                if let Some(n) = super::effective_numeric(grid, &addr, visiting, budget) {
-                    sum += n;
+                if let Some(n) = super::summable_numeric(grid, &addr, visiting, budget) {
+                    sum = sum.add(n);
                 }
             }
         }
@@ -1967,7 +2125,7 @@ fn eval_averageifs(
             if count == 0 {
                 EvalResult::Error("DIV0")
             } else {
-                EvalResult::Number(sum / count as f64)
+                EvalResult::Number(sum.div(Number::from_i64(count as i64)))
             }
         }
         other => other,
@@ -2040,12 +2198,16 @@ fn eval_sort(
     if matrix.is_empty() || key_col >= matrix[0].len() {
         return EvalResult::Error("REF");
     }
+    // Stable sort: apply ascending/descending in the comparator — do not sort then reverse(),
+    // which would reverse relative order among ties.
     matrix.sort_by(|a, b| {
-        compare_eval_cells(&a[key_col], &b[key_col]).then(std::cmp::Ordering::Equal)
+        let ord = compare_eval_cells(&a[key_col], &b[key_col]);
+        if sort_order < 0 {
+            ord.reverse()
+        } else {
+            ord
+        }
     });
-    if sort_order < 0 {
-        matrix.reverse();
-    }
     if by_col {
         transpose_matrix(&mut matrix);
     }
@@ -2175,7 +2337,11 @@ fn collect_matrix_values(
     allow_templates: bool,
 ) -> Result<Vec<Vec<EvalResult>>, &'static str> {
     match arg {
-        Ast::Range(r) => {
+        Ast::Range {
+            range: r,
+            locks_tl: _,
+            locks_br: _,
+        } => {
             let mut out = Vec::new();
             for row in r.row_start..r.row_end {
                 let mut out_row = Vec::new();
@@ -2190,7 +2356,7 @@ fn collect_matrix_values(
             }
             Ok(out)
         }
-        Ast::Ref(addr) => Ok(vec![vec![eval_cell_inner(
+        Ast::Ref { addr, .. } => Ok(vec![vec![eval_cell_inner(
             grid,
             addr,
             visiting,
@@ -2437,19 +2603,6 @@ fn resolve_index(idx: isize, len: usize) -> Option<usize> {
     }
 }
 
-fn text_from_result(result: EvalResult) -> Option<String> {
-    match result {
-        EvalResult::Number(n) => Some(n.to_string()),
-        EvalResult::Text(s) => Some(s),
-        EvalResult::Error(_) => None,
-        EvalResult::Array(rows) => rows
-            .into_iter()
-            .next()
-            .and_then(|row| row.into_iter().next())
-            .and_then(text_from_result),
-    }
-}
-
 fn eval_count(
     args: &[Ast],
     grid: &Grid,
@@ -2462,7 +2615,7 @@ fn eval_count(
         return EvalResult::Error("ARGS");
     }
     match count_numeric_values(&args[0], grid, visiting, bindings, budget, allow_templates) {
-        Ok(n) => EvalResult::Number(n as f64),
+        Ok(n) => EvalResult::Number(Number::from_i64(n as i64)),
         Err(e) => EvalResult::Error(e),
     }
 }
@@ -2479,7 +2632,7 @@ fn eval_counta(
         return EvalResult::Error("ARGS");
     }
     match count_nonempty_values(&args[0], grid, visiting, bindings, budget, allow_templates) {
-        Ok(n) => EvalResult::Number(n as f64),
+        Ok(n) => EvalResult::Number(Number::from_i64(n as i64)),
         Err(e) => EvalResult::Error(e),
     }
 }
@@ -2496,15 +2649,23 @@ fn eval_countblank(
         return EvalResult::Error("ARGS");
     }
     let count = match &args[0] {
-        Ast::Range(r) => count_blank_range(grid, r, visiting, budget, allow_templates),
-        Ast::Ref(addr) => usize::from(cell_is_blank_for_count(
+        Ast::Range {
+            range: r,
+            locks_tl: _,
+            locks_br: _,
+        } => count_blank_range(grid, r, visiting, budget, allow_templates),
+        Ast::Ref { addr, .. } => usize::from(cell_is_blank_for_count(
             grid,
             addr,
             visiting,
             budget,
             allow_templates,
         )),
-        Ast::SheetRef { sheet_id, addr } => {
+        Ast::SheetRef {
+            sheet_id,
+            addr,
+            locks: _,
+        } => {
             let Some(sheet_grid) = super::workbook_lookup(*sheet_id) else {
                 return EvalResult::Error("SHEET");
             };
@@ -2521,7 +2682,110 @@ fn eval_countblank(
             EvalResult::Text(s) if s.is_empty()
         )),
     };
-    EvalResult::Number(count as f64)
+    EvalResult::Number(Number::from_i64(count as i64))
+}
+
+fn eval_typeof(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    if args.len() != 1 {
+        return EvalResult::Error("ARGS");
+    }
+    if matches_blank_ref(
+        &args[0],
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+    ) {
+        return EvalResult::Text("blank".into());
+    }
+    match eval_ast(
+        &args[0],
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+    )
+    .scalar_coerce()
+    {
+        EvalResult::Bool(_) => EvalResult::Text("bool".into()),
+        EvalResult::Number(Number::Exact(_)) => EvalResult::Text("exact".into()),
+        EvalResult::Number(Number::Approx(_)) => EvalResult::Text("approx".into()),
+        EvalResult::Number(Number::Complex(_)) => EvalResult::Text("complex".into()),
+        EvalResult::Text(s) if s.is_empty() => EvalResult::Text("blank".into()),
+        EvalResult::Text(_) => EvalResult::Text("text".into()),
+        EvalResult::Error(_) => EvalResult::Text("error".into()),
+        EvalResult::Array(_) => EvalResult::Text("array".into()),
+    }
+}
+
+fn eval_type(
+    args: &[Ast],
+    grid: &Grid,
+    visiting: &mut Vec<CellAddr>,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    // LibreOffice TYPE compatibility: return numeric codes
+    // Number -> 1, Text -> 2, Logical -> 4, Formula -> 8, Error -> 16, Array -> 64
+    if args.len() != 1 {
+        return EvalResult::Error("ARGS");
+    }
+
+    // If the argument is an explicit range AST, it's an array
+    if matches!(args[0], Ast::Range { .. }) {
+        return EvalResult::Number(Number::from_i64(64));
+    }
+
+    // If the argument is a direct cell reference, prefer detecting a stored
+    // formula (leading '=' in the stored cell text) and return 8 in that case
+    match &args[0] {
+        Ast::Ref { addr, .. } => {
+            if let Some(raw) = grid.get(addr) {
+                if raw.trim().starts_with('=') {
+                    return EvalResult::Number(Number::from_i64(8));
+                }
+            }
+        }
+        Ast::SheetRef { sheet_id, addr, .. } => {
+            if let Some(sheet_grid) = super::workbook_lookup(*sheet_id) {
+                if let Some(raw) = sheet_grid.get(addr) {
+                    if raw.trim().starts_with('=') {
+                        return EvalResult::Number(Number::from_i64(8));
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    // Fall back to evaluating the argument and mapping the runtime type to
+    // the numeric code.
+    match eval_ast(
+        &args[0],
+        grid,
+        visiting,
+        bindings,
+        budget,
+        allow_templates,
+    )
+    .scalar_coerce()
+    {
+        EvalResult::Number(_) => EvalResult::Number(Number::from_i64(1)),
+        EvalResult::Text(_) => EvalResult::Number(Number::from_i64(2)),
+        EvalResult::Bool(_) => EvalResult::Number(Number::from_i64(4)),
+        EvalResult::Error(_) => EvalResult::Number(Number::from_i64(16)),
+        EvalResult::Array(_) => EvalResult::Number(Number::from_i64(64)),
+    }
 }
 
 fn eval_isnumber(
@@ -2573,13 +2837,12 @@ fn eval_isblank(
     if args.len() != 1 {
         return EvalResult::Error("ARGS");
     }
-    EvalResult::Number(
-        if matches_blank_ref(&args[0], grid, visiting, bindings, budget, allow_templates) {
-            1.0
-        } else {
-            0.0
-        },
-    )
+    EvalResult::Number(if matches_blank_ref(&args[0], grid, visiting, bindings, budget, allow_templates)
+    {
+        Number::one()
+    } else {
+        Number::exact_zero()
+    })
 }
 
 fn eval_iserror(
@@ -2635,14 +2898,15 @@ where
     if args.len() != 1 {
         return EvalResult::Error("ARGS");
     }
-    EvalResult::Number(pred(eval_ast(
+    let p = pred(eval_ast(
         &args[0],
         grid,
         visiting,
         bindings,
         budget,
         allow_templates,
-    )) as u8 as f64)
+    ));
+    EvalResult::Number(Number::from_i64(if p { 1 } else { 0 }))
 }
 
 fn matches_blank_ref(
@@ -2654,8 +2918,12 @@ fn matches_blank_ref(
     allow_templates: bool,
 ) -> bool {
     match ast {
-        Ast::Ref(addr) => cell_is_blank_raw(grid, addr),
-        Ast::SheetRef { sheet_id, addr } => {
+        Ast::Ref { addr, .. } => cell_is_blank_raw(grid, addr),
+        Ast::SheetRef {
+            sheet_id,
+            addr,
+            locks: _,
+        } => {
             let Some(sheet_grid) = super::workbook_lookup(*sheet_id) else {
                 return false;
             };
@@ -2747,7 +3015,7 @@ fn eval_countif(
             }
         }
     }
-    EvalResult::Number(count as f64)
+    EvalResult::Number(Number::from_i64(count as i64))
 }
 
 fn eval_sumif(
@@ -2784,7 +3052,7 @@ fn eval_sumif(
     if criteria_rows != sum_rows || criteria_cols != sum_cols {
         return EvalResult::Error("ARGS");
     }
-    let mut sum = 0.0;
+    let mut sum = Number::exact_zero();
     for dr in 0..criteria_rows {
         for dc in 0..criteria_cols {
             let crit_addr = CellAddr::Main {
@@ -2803,8 +3071,8 @@ fn eval_sumif(
                     row: sum_range.row_start + dr,
                     col: sum_range.col_start + dc,
                 };
-                if let Some(n) = super::effective_numeric(grid, &sum_addr, visiting, budget) {
-                    sum += n;
+                if let Some(n) = super::summable_numeric(grid, &sum_addr, visiting, budget) {
+                    sum = sum.add(n);
                 }
             }
         }
@@ -2819,26 +3087,31 @@ fn collect_numeric_values(
     bindings: &mut Vec<(String, EvalResult)>,
     budget: &mut usize,
     allow_templates: bool,
-) -> Result<Vec<f64>, &'static str> {
+) -> Result<Vec<Number>, &'static str> {
     match arg {
-        Ast::Range(r) => {
+        Ast::Range {
+            range: r,
+            locks_tl: _,
+            locks_br: _,
+        } => {
             let mut out = Vec::new();
             for row in r.row_start..r.row_end {
                 for col in r.col_start..r.col_end {
                     let addr = CellAddr::Main { row, col };
-                    if let Some(n) = super::effective_numeric(grid, &addr, visiting, budget) {
+                    if let Some(n) = super::summable_numeric(grid, &addr, visiting, budget) {
                         out.push(n);
                     }
                 }
             }
             Ok(out)
         }
-        Ast::Ref(addr) => Ok(super::effective_numeric(grid, addr, visiting, budget)
+        Ast::Ref { addr, .. } => Ok(super::summable_numeric(grid, addr, visiting, budget)
             .into_iter()
             .collect()),
         _ => match eval_ast(arg, grid, visiting, bindings, budget, allow_templates).scalar_coerce()
         {
             EvalResult::Number(n) => Ok(vec![n]),
+            EvalResult::Bool(b) => Ok(vec![number_from_bool(b)]),
             EvalResult::Text(s) => Ok(parse_number_literal(&s).into_iter().collect()),
             EvalResult::Error(e) => Err(e),
             EvalResult::Array(_) => Err("CALC"),
@@ -2852,8 +3125,9 @@ fn trim_spaces(s: &str) -> String {
 
 fn numeric_value(result: EvalResult) -> Option<f64> {
     match result {
-        EvalResult::Number(n) => Some(n),
-        EvalResult::Text(s) => parse_numeric_or_date_literal(&s),
+        EvalResult::Number(n) => Some(n.to_f64()),
+        EvalResult::Bool(b) => Some(if b { 1.0 } else { 0.0 }),
+        EvalResult::Text(s) => parse_numeric_or_date_literal(&s).map(|n| n.to_f64()),
         EvalResult::Error(_) => None,
         EvalResult::Array(_) => None,
     }
@@ -2861,7 +3135,7 @@ fn numeric_value(result: EvalResult) -> Option<f64> {
 
 fn as_main_range(ast: &Ast) -> Option<MainRange> {
     match ast {
-        Ast::Range(r) => Some(r.clone()),
+        Ast::Range { range, .. } => Some(range.clone()),
         _ => None,
     }
 }
@@ -2875,7 +3149,11 @@ fn count_numeric_values(
     allow_templates: bool,
 ) -> Result<usize, &'static str> {
     match arg {
-        Ast::Range(r) => {
+        Ast::Range {
+            range: r,
+            locks_tl: _,
+            locks_br: _,
+        } => {
             let mut n = 0usize;
             for row in r.row_start..r.row_end {
                 for col in r.col_start..r.col_end {
@@ -2887,7 +3165,7 @@ fn count_numeric_values(
             }
             Ok(n)
         }
-        Ast::Ref(addr) => Ok(
+        Ast::Ref { addr, .. } => Ok(
             if super::effective_numeric(grid, addr, visiting, budget).is_some() {
                 1
             } else {
@@ -2897,6 +3175,7 @@ fn count_numeric_values(
         _ => match eval_ast(arg, grid, visiting, bindings, budget, allow_templates).scalar_coerce()
         {
             EvalResult::Number(n) => Ok((!n.is_nan()) as usize),
+            EvalResult::Bool(_) => Ok(0),
             EvalResult::Text(s) => Ok(parse_number_literal(&s).is_some() as usize),
             EvalResult::Error(e) => Err(e),
             EvalResult::Array(_) => Err("CALC"),
@@ -2913,7 +3192,11 @@ fn count_nonempty_values(
     allow_templates: bool,
 ) -> Result<usize, &'static str> {
     match arg {
-        Ast::Range(r) => {
+        Ast::Range {
+            range: r,
+            locks_tl: _,
+            locks_br: _,
+        } => {
             let mut n = 0usize;
             for row in r.row_start..r.row_end {
                 for col in r.col_start..r.col_end {
@@ -2925,10 +3208,11 @@ fn count_nonempty_values(
             }
             Ok(n)
         }
-        Ast::Ref(addr) => Ok(grid.get(addr).map(|s| !s.is_empty()).unwrap_or(false) as usize),
+        Ast::Ref { addr, .. } => Ok(grid.get(addr).map(|s| !s.is_empty()).unwrap_or(false) as usize),
         _ => match eval_ast(arg, grid, visiting, bindings, budget, allow_templates).scalar_coerce()
         {
             EvalResult::Number(_) => Ok(1),
+            EvalResult::Bool(_) => Ok(1),
             EvalResult::Text(s) => Ok((!s.is_empty()) as usize),
             EvalResult::Error(e) => Err(e),
             EvalResult::Array(_) => Err("CALC"),
@@ -2985,6 +3269,8 @@ fn criteria_from_ast(
     let raw = match eval_ast(ast, grid, visiting, bindings, budget, allow_templates).scalar_coerce()
     {
         EvalResult::Number(n) => n.to_string(),
+        EvalResult::Bool(true) => "TRUE".into(),
+        EvalResult::Bool(false) => "FALSE".into(),
         EvalResult::Text(s) => s,
         EvalResult::Error(e) => return Err(e),
         EvalResult::Array(_) => return Err("CALC"),
@@ -3007,7 +3293,7 @@ fn criteria_from_ast(
     };
     Ok(Criteria {
         op,
-        numeric: parse_number_literal(rest),
+        numeric: parse_number_literal(rest).map(|n| n.to_f64()),
         value: rest.to_string(),
     })
 }
@@ -3022,12 +3308,23 @@ fn criteria_matches(
 ) -> bool {
     match eval_cell_inner(grid, addr, visiting, budget, allow_templates).scalar_coerce() {
         EvalResult::Number(n) => match criteria.numeric {
-            Some(target) => compare_f64(criteria.op, n, target),
+            Some(target) => compare_f64(criteria.op, n.to_f64(), target),
             None => compare_str(criteria.op, &n.to_string(), &criteria.value),
         },
+        EvalResult::Bool(b) => {
+            let n = number_from_bool(b);
+            match criteria.numeric {
+                Some(target) => compare_f64(criteria.op, n.to_f64(), target),
+                None => compare_str(
+                    criteria.op,
+                    if b { "TRUE" } else { "FALSE" },
+                    &criteria.value,
+                ),
+            }
+        }
         EvalResult::Text(s) => match criteria.numeric {
             Some(target) => parse_number_literal(&s)
-                .map(|n| compare_f64(criteria.op, n, target))
+                .map(|num| compare_f64(criteria.op, num.to_f64(), target))
                 .unwrap_or(false),
             None => compare_str(criteria.op, &s, &criteria.value),
         },
@@ -3038,7 +3335,7 @@ fn criteria_matches(
 
 #[derive(Clone, Debug, PartialEq)]
 enum LookupValue {
-    Number(f64),
+    Number(Number),
     Text(String),
 }
 
@@ -3057,6 +3354,7 @@ fn eval_lookup(
         .scalar_coerce()
     {
         EvalResult::Number(n) => LookupValue::Number(n),
+        EvalResult::Bool(b) => LookupValue::Number(number_from_bool(b)),
         EvalResult::Text(s) => parse_number_literal(&s)
             .map(LookupValue::Number)
             .unwrap_or(LookupValue::Text(s)),
@@ -3107,6 +3405,7 @@ fn eval_lookup(
             .scalar_coerce()
         {
             EvalResult::Number(n) => LookupValue::Number(n),
+            EvalResult::Bool(b) => LookupValue::Number(number_from_bool(b)),
             EvalResult::Text(s) => parse_number_literal(&s)
                 .map(LookupValue::Number)
                 .unwrap_or(LookupValue::Text(s)),
@@ -3146,6 +3445,7 @@ fn eval_vlookup(
         .scalar_coerce()
     {
         EvalResult::Number(n) => LookupValue::Number(n),
+        EvalResult::Bool(b) => LookupValue::Number(number_from_bool(b)),
         EvalResult::Text(s) => parse_number_literal(&s)
             .map(LookupValue::Number)
             .unwrap_or(LookupValue::Text(s)),
@@ -3156,10 +3456,24 @@ fn eval_vlookup(
         return EvalResult::Error("RANGE");
     };
     let col_index = match eval_ast(&args[2], grid, visiting, bindings, budget, allow_templates) {
-        EvalResult::Number(n) if n.is_finite() && n >= 1.0 && n.fract() == 0.0 => n as u32,
+        EvalResult::Number(n) => {
+            let nf = n.to_f64();
+            if nf.is_finite() && nf >= 1.0 && nf.fract() == 0.0 {
+                nf as u32
+            } else {
+                return EvalResult::Error("VALUE");
+            }
+        }
         EvalResult::Text(s) => match parse_number_literal(&s) {
-            Some(n) if n.is_finite() && n >= 1.0 && n.fract() == 0.0 => n as u32,
-            _ => return EvalResult::Error("VALUE"),
+            Some(n) => {
+                let nf = n.to_f64();
+                if nf.is_finite() && nf >= 1.0 && nf.fract() == 0.0 {
+                    nf as u32
+                } else {
+                    return EvalResult::Error("VALUE");
+                }
+            }
+            None => return EvalResult::Error("VALUE"),
         },
         EvalResult::Error(e) => return EvalResult::Error(e),
         _ => return EvalResult::Error("VALUE"),
@@ -3178,6 +3492,7 @@ fn eval_vlookup(
             .scalar_coerce()
         {
             EvalResult::Number(n) => LookupValue::Number(n),
+            EvalResult::Bool(b) => LookupValue::Number(number_from_bool(b)),
             EvalResult::Text(s) => parse_number_literal(&s)
                 .map(LookupValue::Number)
                 .unwrap_or(LookupValue::Text(s)),
@@ -3210,6 +3525,7 @@ fn eval_xlookup(
         .scalar_coerce()
     {
         EvalResult::Number(n) => LookupValue::Number(n),
+        EvalResult::Bool(b) => LookupValue::Number(number_from_bool(b)),
         EvalResult::Text(s) => parse_number_literal(&s)
             .map(LookupValue::Number)
             .unwrap_or(LookupValue::Text(s)),
@@ -3268,6 +3584,7 @@ fn eval_xlookup(
             .scalar_coerce()
         {
             EvalResult::Number(n) => LookupValue::Number(n),
+            EvalResult::Bool(b) => LookupValue::Number(number_from_bool(b)),
             EvalResult::Text(s) => parse_number_literal(&s)
                 .map(LookupValue::Number)
                 .unwrap_or(LookupValue::Text(s)),
@@ -3427,7 +3744,7 @@ fn eval_sortby(
     if args.len() < 3 || args.len().is_multiple_of(2) {
         return EvalResult::Error("ARGS");
     }
-    let mut matrix =
+    let matrix =
         match collect_matrix_values(&args[0], grid, visiting, bindings, budget, allow_templates) {
             Ok(m) => m,
             Err(e) => return EvalResult::Error(e),
@@ -3494,13 +3811,13 @@ fn eval_sequence(
     let rows = match eval_ast(&args[0], grid, visiting, bindings, budget, allow_templates)
         .scalar_coerce()
     {
-        EvalResult::Number(n) if n.is_finite() && n >= 0.0 => n as usize,
+        EvalResult::Number(n) if n.is_finite() && n.to_f64() >= 0.0 => n.to_f64() as usize,
         _ => return EvalResult::Error("VALUE"),
     };
     let cols = if args.len() >= 2 {
         match eval_ast(&args[1], grid, visiting, bindings, budget, allow_templates).scalar_coerce()
         {
-            EvalResult::Number(n) if n.is_finite() && n >= 0.0 => n as usize,
+            EvalResult::Number(n) if n.is_finite() && n.to_f64() >= 0.0 => n.to_f64() as usize,
             _ => return EvalResult::Error("VALUE"),
         }
     } else {
@@ -3513,7 +3830,7 @@ fn eval_sequence(
             _ => return EvalResult::Error("VALUE"),
         }
     } else {
-        1.0
+        Number::one()
     };
     let step = if args.len() >= 4 {
         match eval_ast(&args[3], grid, visiting, bindings, budget, allow_templates).scalar_coerce()
@@ -3522,13 +3839,16 @@ fn eval_sequence(
             _ => return EvalResult::Error("VALUE"),
         }
     } else {
-        1.0
+        Number::one()
     };
     let mut out = Vec::with_capacity(rows);
     for r in 0..rows {
         let mut row = Vec::with_capacity(cols);
         for c in 0..cols {
-            row.push(EvalResult::Number(start + step * (r * cols + c) as f64));
+            let k = Number::from_i64((r * cols + c) as i64);
+            row.push(EvalResult::Number(
+                start.clone().add(step.clone().mul(k)),
+            ));
         }
         out.push(row);
     }
@@ -3608,7 +3928,11 @@ fn collect_array_values(
     allow_templates: bool,
 ) -> Result<Vec<EvalResult>, &'static str> {
     match arg {
-        Ast::Range(r) => {
+        Ast::Range {
+            range: r,
+            locks_tl: _,
+            locks_br: _,
+        } => {
             let mut out = Vec::new();
             for row in r.row_start..r.row_end {
                 for col in r.col_start..r.col_end {
@@ -3624,7 +3948,7 @@ fn collect_array_values(
             }
             Ok(out)
         }
-        Ast::Ref(addr) => Ok(vec![eval_cell_inner(
+        Ast::Ref { addr, .. } => Ok(vec![eval_cell_inner(
             grid,
             addr,
             visiting,
@@ -3645,6 +3969,8 @@ fn collect_array_values(
 fn eval_result_to_key(result: &EvalResult) -> String {
     match result {
         EvalResult::Number(n) => n.to_string(),
+        EvalResult::Bool(true) => "TRUE".into(),
+        EvalResult::Bool(false) => "FALSE".into(),
         EvalResult::Text(s) => s.clone(),
         EvalResult::Error(e) => format!("#{e}"),
         EvalResult::Array(rows) => rows

@@ -3,26 +3,34 @@ members = ["balance-core"]
 
 [package]
 name = "corro"
-version = "0.1.0"
+version = "0.5.0"
 edition = "2021"
+default-run = "corro"
 
 [dependencies]
 ratatui = "0.29"
+unicode-width = "0.2.0"
+unicode-truncate = "1"
 crossterm = "0.28"
 serde = { version = "1", features = ["derive"] }
 notify = "7"
 thiserror = "2"
-zip = { version = "0.6", default-features = false }
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 quick-xml = "0.37"
 balance-core = { path = "balance-core" }
+num-bigint = "0.4"
+num-rational = { version = "0.4", default-features = false, features = ["std", "num-bigint"] }
+num-traits = "0.2"
+num-complex = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
 
 [profile.release]
 opt-level = "z"
-lto = "fat" 
+lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true

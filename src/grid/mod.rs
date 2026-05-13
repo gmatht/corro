@@ -1,39 +1,49 @@
-//! Five-region sheet layout: headers ~A–~Z, footers _A–_Z, margins <0–<9 and >0–>9, and main data.
+//! Five-region sheet layout: headers `~N`, footers `_N`, margins, and main data.
 //! Main and margin cells use sparse storage for unbounded logical size.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-pub const HEADER_ROWS: usize = 26;
-pub const FOOTER_ROWS: usize = 26;
-pub const MARGIN_COLS: usize = 10;
+use crate::formula::{parse_numeric_or_date_literal, Number};
+
+pub const HEADER_ROWS: usize = 999_999_999;
+pub const FOOTER_ROWS: usize = 999_999_999;
+/// Number of margin columns on each side. Expanded to support multi-letter
+/// mirror names (e.g. A..ZZ). Use usize for indexes.
+pub const MARGIN_COLS: usize = 26 * 27; // A..ZZ inclusive
+
+/// Type alias for margin column indices to make it easy to widen the type in
+/// one place if needed.
+pub type MarginIndex = usize;
+
+/// Default maximum column display width when a column has content but no explicit override.
+pub const DEFAULT_MAX_COL_WIDTH: usize = 8;
 
 /// Logical cell address (stable across main resize where possible).
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CellAddr {
-    /// `~` row: `row` 0 = ~A … 25 = ~Z; `col` is global column index.
-    Header { row: u8, col: u32 },
+    /// `~` row: `row` 0 = the top header row; `col` is global column index.
+    Header { row: u32, col: u32 },
     /// `_` row: same indexing as headers.
-    Footer { row: u8, col: u32 },
+    Footer { row: u32, col: u32 },
     /// Main grid.
     Main { row: u32, col: u32 },
-    /// Left margin `<0`..`<9`: `col` 0–9, `row` is main row index.
-    Left { col: u8, row: u32 },
-    /// Right margin `>0`..`>9`.
-    Right { col: u8, row: u32 },
+    /// Left margin: `col` is a MarginIndex (usize), `row` is main row index.
+    Left { col: MarginIndex, row: u32 },
+    /// Right margin: `col` is a MarginIndex (usize).
+    Right { col: MarginIndex, row: u32 },
 }
 
 impl fmt::Display for CellAddr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             CellAddr::Header { row, col } => {
-                write!(f, "~{}(col {})", header_label(*row), col)
+                write!(f, "~{}(col {})", HEADER_ROWS as u32 - row, col)
             }
-            CellAddr::Footer { row, col } => {
-                write!(f, "_{}(col {})", header_label(*row), col)
-            }
+            CellAddr::Footer { row, col } => write!(f, "_{}(col {})", row + 1, col),
             CellAddr::Main { row, col } => write!(f, "({}, {})", row, col),
             CellAddr::Left { col, row } => write!(f, "<{}>({})", col, row),
             CellAddr::Right { col, row } => write!(f, ">{}>({})", col, row),
@@ -41,8 +51,309 @@ impl fmt::Display for CellAddr {
     }
 }
 
-fn header_label(row: u8) -> char {
-    (b'A' + row.min(25)) as char
+// Abstraction trait for Grid implementations.
+// Methods return owned Strings where necessary to keep the trait object-safe.
+pub trait GridImpl {
+    // Basic size/query
+    fn main_rows(&self) -> usize;
+    fn main_cols(&self) -> usize;
+    fn total_cols(&self) -> usize;
+    fn total_logical_rows(&self) -> usize;
+
+    // Cell access (owned returns keep the trait object-safe)
+    fn get_owned(&self, addr: &CellAddr) -> Option<String>;
+    fn text(&self, addr: &CellAddr) -> String;
+    fn set_owned(&mut self, addr: &CellAddr, value: String);
+    fn set(&mut self, addr: &CellAddr, value: String);
+
+    // Layout / extent
+    fn set_main_size(&mut self, main_rows: usize, main_cols: usize);
+    fn ensure_extent_for_cursor(&mut self, row: usize, col: usize) -> bool;
+    fn grow_main_row_at_bottom(&mut self);
+    fn grow_main_col_at_right(&mut self);
+    fn move_main_rows(&mut self, from: usize, count: usize, to: usize);
+    fn move_main_cols(&mut self, from: usize, count: usize, to: usize);
+
+    // Column sizing and widths
+    fn max_col_width(&self) -> usize;
+    fn col_width(&self, global_col: usize) -> usize;
+    fn get_col_width_override(&self, global_col: usize) -> Option<usize>;
+    fn content_width_for_column(&self, global_col: usize) -> Option<usize>;
+    fn set_max_col_width(&mut self, width: usize);
+    fn set_col_width(&mut self, global_col: usize, width: Option<usize>);
+    fn auto_fit_column(&mut self, global_col: usize);
+    fn fit_column_to_content(&mut self, global_col: usize);
+    fn col_width_overrides(&self) -> Vec<(usize, usize)>;
+
+    // Clear main and margin cells (used by callers that need a fresh grid).
+    fn clear_cells(&mut self);
+
+    // Replace the entire set of column width overrides.
+    fn set_col_width_overrides(&mut self, overrides: Vec<(usize, usize)>);
+
+    // Formatting
+    fn set_view_sort_cols(&mut self, cols: Vec<SortSpec>);
+    fn view_sort_cols(&self) -> Vec<SortSpec>;
+    fn sorted_main_rows(&self) -> Vec<usize>;
+    fn set_column_format(&mut self, scope: FormatScope, col: usize, format: CellFormat);
+    fn set_cell_format(&mut self, addr: CellAddr, format: CellFormat);
+    fn format_for_addr(&self, addr: &CellAddr) -> CellFormat;
+    fn format_for_global_col(&self, scope: FormatScope, col: usize) -> CellFormat;
+    fn col_all_formats(&self) -> Vec<(usize, CellFormat)>;
+    fn col_data_formats(&self) -> Vec<(usize, CellFormat)>;
+    fn col_special_formats(&self) -> Vec<(usize, CellFormat)>;
+    fn cell_formats(&self) -> Vec<(CellAddr, CellFormat)>;
+
+    // Spills / volatile
+    fn clear_spills(&mut self);
+    fn set_spill_value(&mut self, addr: CellAddr, value: String);
+    fn set_spill_error(&mut self, addr: CellAddr, err: &'static str);
+    fn spill_error(&self, addr: &CellAddr) -> Option<&'static str>;
+    // Return current spill follower mappings (addr -> value).
+    fn spill_followers(&self) -> Vec<(CellAddr, String)>;
+    // Return current spill error mappings (addr -> static error tag).
+    fn spill_errors(&self) -> Vec<(CellAddr, &'static str)>;
+    fn bump_volatile_seed(&mut self);
+    fn volatile_seed(&self) -> u64;
+    fn set_volatile_seed(&mut self, seed: u64);
+
+    /// False after [`crate::formula::refresh_spills`] runs; callers set dirty on grid mutations / volatile bumps.
+    fn spills_refresh_dirty(&self) -> bool;
+    fn note_spills_refreshed(&mut self);
+    fn mark_spills_stale(&mut self);
+
+    // Logical content queries
+    fn logical_row_has_content(&self, r: usize) -> bool;
+    fn logical_col_has_content(&self, c: usize) -> bool;
+
+    // Iteration
+    fn iter_nonempty(&self) -> Box<dyn Iterator<Item = (CellAddr, String)> + '_>;
+
+    // Clone trait-object helper
+    fn clone_box(&self) -> Box<dyn GridImpl>;
+}
+
+/// A boxed handle to an abstract Grid implementation.
+static GRIDBOX_NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+pub struct GridBox {
+    pub inner: Box<dyn GridImpl>,
+    id: u64,
+}
+
+impl GridBox {
+    pub fn new<G: GridImpl + 'static>(g: G) -> Self {
+        Self { inner: Box::new(g), id: GRIDBOX_NEXT_ID.fetch_add(1, Ordering::Relaxed) }
+    }
+
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub fn main_rows(&self) -> usize {
+        self.inner.main_rows()
+    }
+
+    pub fn main_cols(&self) -> usize {
+        self.inner.main_cols()
+    }
+
+    pub fn total_cols(&self) -> usize {
+        self.inner.total_cols()
+    }
+
+    pub fn total_logical_rows(&self) -> usize {
+        self.inner.total_logical_rows()
+    }
+
+    pub fn get_owned(&self, addr: &CellAddr) -> Option<String> {
+        self.inner.get_owned(addr)
+    }
+
+    /// Convenience owned-get that mirrors the old Grid::get (returns owned String)
+    pub fn get(&self, addr: &CellAddr) -> Option<String> {
+        self.inner.get_owned(addr)
+    }
+
+    pub fn text(&self, addr: &CellAddr) -> String {
+        self.inner.text(addr)
+    }
+
+    pub fn set_owned(&mut self, addr: &CellAddr, value: String) {
+        self.inner.set_owned(addr, value)
+    }
+
+    pub fn set(&mut self, addr: &CellAddr, value: String) {
+        self.inner.set(addr, value)
+    }
+
+    pub fn set_main_size(&mut self, r: usize, c: usize) {
+        self.inner.set_main_size(r, c)
+    }
+
+    pub fn ensure_extent_for_cursor(&mut self, row: usize, col: usize) -> bool {
+        self.inner.ensure_extent_for_cursor(row, col)
+    }
+
+    pub fn grow_main_row_at_bottom(&mut self) {
+        self.inner.grow_main_row_at_bottom()
+    }
+
+    pub fn grow_main_col_at_right(&mut self) {
+        self.inner.grow_main_col_at_right()
+    }
+
+    pub fn move_main_rows(&mut self, from: usize, count: usize, to: usize) {
+        self.inner.move_main_rows(from, count, to)
+    }
+
+    pub fn move_main_cols(&mut self, from: usize, count: usize, to: usize) {
+        self.inner.move_main_cols(from, count, to)
+    }
+
+    pub fn bump_volatile_seed(&mut self) {
+        self.inner.bump_volatile_seed()
+    }
+
+    pub(crate) fn spills_refresh_dirty(&self) -> bool {
+        self.inner.spills_refresh_dirty()
+    }
+
+    pub(crate) fn note_spills_refreshed(&mut self) {
+        self.inner.note_spills_refreshed()
+    }
+
+    pub fn volatile_seed(&self) -> u64 {
+        self.inner.volatile_seed()
+    }
+
+    pub fn set_volatile_seed(&mut self, seed: u64) {
+        self.inner.set_volatile_seed(seed)
+    }
+
+    pub fn spill_followers(&self) -> Vec<(CellAddr, String)> {
+        self.inner.spill_followers()
+    }
+
+    pub fn spill_errors(&self) -> Vec<(CellAddr, &'static str)> {
+        self.inner.spill_errors()
+    }
+
+    pub fn max_col_width(&self) -> usize {
+        self.inner.max_col_width()
+    }
+
+    pub fn col_width(&self, global_col: usize) -> usize {
+        self.inner.col_width(global_col)
+    }
+
+    pub fn get_col_width_override(&self, global_col: usize) -> Option<usize> {
+        self.inner.get_col_width_override(global_col)
+    }
+
+    pub fn content_width_for_column(&self, global_col: usize) -> Option<usize> {
+        self.inner.content_width_for_column(global_col)
+    }
+
+    pub fn set_max_col_width(&mut self, width: usize) {
+        self.inner.set_max_col_width(width)
+    }
+
+    pub fn set_col_width(&mut self, global_col: usize, width: Option<usize>) {
+        self.inner.set_col_width(global_col, width)
+    }
+
+    pub fn auto_fit_column(&mut self, global_col: usize) {
+        self.inner.auto_fit_column(global_col)
+    }
+
+    pub fn fit_column_to_content(&mut self, global_col: usize) {
+        self.inner.fit_column_to_content(global_col)
+    }
+
+    pub fn col_width_overrides(&self) -> Vec<(usize, usize)> {
+        self.inner.col_width_overrides()
+    }
+
+    pub fn clear_cells(&mut self) {
+        self.inner.clear_cells()
+    }
+
+    pub fn set_col_width_overrides(&mut self, overrides: Vec<(usize, usize)>) {
+        self.inner.set_col_width_overrides(overrides)
+    }
+
+    pub fn set_view_sort_cols(&mut self, cols: Vec<SortSpec>) {
+        self.inner.set_view_sort_cols(cols)
+    }
+
+    pub fn view_sort_cols(&self) -> Vec<SortSpec> {
+        self.inner.view_sort_cols()
+    }
+
+    pub fn sorted_main_rows(&self) -> Vec<usize> {
+        self.inner.sorted_main_rows()
+    }
+
+    pub fn set_column_format(&mut self, scope: FormatScope, col: usize, format: CellFormat) {
+        self.inner.set_column_format(scope, col, format)
+    }
+
+    pub fn set_cell_format(&mut self, addr: CellAddr, format: CellFormat) {
+        self.inner.set_cell_format(addr, format)
+    }
+
+    pub fn format_for_addr(&self, addr: &CellAddr) -> CellFormat {
+        self.inner.format_for_addr(addr)
+    }
+
+    pub fn format_for_global_col(&self, scope: FormatScope, col: usize) -> CellFormat {
+        self.inner.format_for_global_col(scope, col)
+    }
+
+    pub fn clear_spills(&mut self) {
+        self.inner.clear_spills()
+    }
+
+    pub fn set_spill_value(&mut self, addr: CellAddr, value: String) {
+        self.inner.set_spill_value(addr, value)
+    }
+
+    pub fn set_spill_error(&mut self, addr: CellAddr, err: &'static str) {
+        self.inner.set_spill_error(addr, err)
+    }
+
+    pub fn spill_error(&self, addr: &CellAddr) -> Option<&'static str> {
+        self.inner.spill_error(addr)
+    }
+
+    pub fn logical_row_has_content(&self, r: usize) -> bool {
+        self.inner.logical_row_has_content(r)
+    }
+
+    pub fn logical_col_has_content(&self, c: usize) -> bool {
+        self.inner.logical_col_has_content(c)
+    }
+
+    pub fn col_all_formats(&self) -> Vec<(usize, CellFormat)> {
+        self.inner.col_all_formats()
+    }
+
+    pub fn col_data_formats(&self) -> Vec<(usize, CellFormat)> {
+        self.inner.col_data_formats()
+    }
+
+    pub fn col_special_formats(&self) -> Vec<(usize, CellFormat)> {
+        self.inner.col_special_formats()
+    }
+
+    pub fn cell_formats(&self) -> Vec<(CellAddr, CellFormat)> {
+        self.inner.cell_formats()
+    }
+
+    pub fn iter_nonempty(&self) -> Box<dyn Iterator<Item = (CellAddr, String)> + '_> {
+        self.inner.iter_nonempty()
+    }
 }
 
 /// Inclusive-exclusive range in the **main** region (for aggregates).
@@ -68,8 +379,12 @@ pub struct SortSpec {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum NumberFormat {
+    /// Generic decimal display (may switch to scientific notation for extreme magnitudes).
+    DecimalGeneric,
     Currency { decimals: usize },
     Fixed { decimals: usize },
+    /// Prefer exact rationals when the cell value has one; approximate values use decimal display.
+    Rational,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -93,18 +408,18 @@ pub enum FormatScope {
     Special,
 }
 
-/// Full sheet: dense header/footer; sparse main + left/right margins (infinite logical extent).
-#[derive(Clone, Debug)]
+/// Full sheet with sparse storage for each editable region.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Grid {
     /// Main cells; absent key = empty.
     pub main_cells: HashMap<(u32, u32), String>,
     /// Logical main size: at least 1×1; grows with data/cursor.
     pub extent_main_rows: u32,
     pub extent_main_cols: u32,
-    /// Left margin: (main_row, margin_col 0–9).
-    pub left: HashMap<(u32, u8), String>,
-    /// Right margin: (main_row, margin_col 0–9).
-    pub right: HashMap<(u32, u8), String>,
+    /// Left margin: (main_row, margin_col).
+    pub left: HashMap<(u32, MarginIndex), String>,
+    /// Right margin: (main_row, margin_col).
+    pub right: HashMap<(u32, MarginIndex), String>,
     /// Default display width cap for columns.
     pub max_col_width: usize,
     /// Optional per-global-column display width overrides.
@@ -119,11 +434,13 @@ pub struct Grid {
     pub col_special_formats: HashMap<usize, CellFormat>,
     /// Exact-cell overrides used for Cell/Selection formatting.
     pub cell_formats: HashMap<CellAddr, CellFormat>,
-    pub header: Vec<Vec<String>>,
-    pub footer: Vec<Vec<String>>,
+    pub header: HashMap<(u32, u32), String>,
+    pub footer: HashMap<(u32, u32), String>,
     pub(crate) spill_followers: HashMap<CellAddr, String>,
     pub(crate) spill_errors: HashMap<CellAddr, &'static str>,
     pub(crate) volatile_seed: u64,
+    /// When false, [`crate::formula::refresh_spills`] is a cheap no-op (spill maps unchanged).
+    pub(crate) spills_dirty: bool,
 }
 
 impl Default for Grid {
@@ -134,33 +451,33 @@ impl Default for Grid {
 
 impl Grid {
     pub fn new(main_rows: u32, main_cols: u32) -> Self {
-        let mut g = Grid {
+        let g = Grid {
             main_cells: HashMap::new(),
             extent_main_rows: main_rows.max(1),
             extent_main_cols: main_cols.max(1),
             left: HashMap::new(),
             right: HashMap::new(),
-            max_col_width: 20,
+            max_col_width: DEFAULT_MAX_COL_WIDTH,
             col_width_overrides: HashMap::new(),
             view_sort_cols: Vec::new(),
             col_all_formats: HashMap::new(),
             col_data_formats: HashMap::new(),
             col_special_formats: HashMap::new(),
             cell_formats: HashMap::new(),
-            header: Vec::new(),
-            footer: Vec::new(),
+            header: HashMap::new(),
+            footer: HashMap::new(),
             spill_followers: HashMap::new(),
             spill_errors: HashMap::new(),
             volatile_seed: 0,
+            spills_dirty: true,
         };
-        g.resize_header_footer_width();
         g
     }
 
     /// One new main row at the bottom (cursor moving down from the last main row).
     pub fn grow_main_row_at_bottom(&mut self) {
         self.extent_main_rows = self.extent_main_rows.saturating_add(1);
-        self.resize_header_footer_width();
+        self.mark_spills_stale();
     }
 
     /// One new main column at the right (cursor moving right from the last sheet column).
@@ -170,7 +487,7 @@ impl Grid {
         self.remap_main_col_layout_for_resize(old_main_cols, new_main_cols);
         self.remap_formats_for_resize(old_main_cols, new_main_cols);
         self.extent_main_cols = new_main_cols as u32;
-        self.resize_header_footer_width();
+        self.mark_spills_stale();
     }
 
     /// Back-compat: logical main row count.
@@ -233,7 +550,7 @@ impl Grid {
             }
         }
         if grown {
-            self.resize_header_footer_width();
+            self.mark_spills_stale();
         }
         grown
     }
@@ -241,10 +558,8 @@ impl Grid {
     pub fn logical_row_has_content(&self, r: usize) -> bool {
         let hr = HEADER_ROWS;
         if r < hr {
-            return self
-                .header
-                .get(r)
-                .is_some_and(|row| row.iter().any(|s| !s.is_empty()));
+            let row = r as u32;
+            return self.header.keys().any(|&(stored_row, _)| stored_row == row);
         }
         if r < hr + self.extent_main_rows as usize {
             let mr = r - hr;
@@ -254,9 +569,8 @@ impl Grid {
                 || self.right.keys().any(|(row, _)| *row == mru);
         }
         let fr = r - hr - self.extent_main_rows as usize;
-        self.footer
-            .get(fr)
-            .is_some_and(|row| row.iter().any(|s| !s.is_empty()))
+        let fr = fr as u32;
+        self.footer.keys().any(|&(stored_row, _)| stored_row == fr)
     }
 
     pub fn logical_col_has_content(&self, c: usize) -> bool {
@@ -264,42 +578,37 @@ impl Grid {
         if c >= tc {
             return false;
         }
-        for r in 0..HEADER_ROWS {
-            if self.header[r].get(c).is_some_and(|s| !s.is_empty()) {
-                return true;
-            }
+        let c_u32 = c as u32;
+        if self.header.keys().any(|&(_, col)| col == c_u32) {
+            return true;
         }
         let m = MARGIN_COLS;
         let me = m + self.extent_main_cols as usize;
-        if c < m {
-            return self.left.keys().any(|(_, mc)| *mc as usize == c);
-        }
-        if c < me {
+        let data_region_has_content = if c < m {
+            self.left.keys().any(|(_, mc)| *mc == c)
+        } else if c < me {
             let mc = (c - m) as u32;
-            return self.main_cells.keys().any(|(_, col)| *col == mc);
+            self.main_cells.keys().any(|(_, col)| *col == mc)
+        } else if c < me + MARGIN_COLS {
+            let mc = c - me;
+            self.right.keys().any(|(_, rc)| *rc == mc)
+        } else {
+            false
+        };
+        if data_region_has_content {
+            return true;
         }
-        if c < me + MARGIN_COLS {
-            let mc = (c - me) as u8;
-            return self.right.keys().any(|(_, rc)| *rc == mc);
-        }
-        for fr in 0..FOOTER_ROWS {
-            if self.footer[fr].get(c).is_some_and(|s| !s.is_empty()) {
-                return true;
-            }
-        }
-        false
+        self.footer.keys().any(|&(_, col)| col == c_u32)
     }
 
     fn resize_header_footer_width(&mut self) {
-        let w = self.total_cols();
-        self.header.resize(HEADER_ROWS, Vec::new());
-        for row in &mut self.header {
-            row.resize(w, String::new());
-        }
-        self.footer.resize(FOOTER_ROWS, Vec::new());
-        for row in &mut self.footer {
-            row.resize(w, String::new());
-        }
+        let total_cols = self.total_cols() as u32;
+        self.header.retain(|&(row, col), value| {
+            row < HEADER_ROWS as u32 && col < total_cols && !value.is_empty()
+        });
+        self.footer.retain(|&(row, col), value| {
+            row < FOOTER_ROWS as u32 && col < total_cols && !value.is_empty()
+        });
     }
 
     pub fn set_main_size(&mut self, main_rows: usize, main_cols: usize) {
@@ -314,14 +623,18 @@ impl Grid {
         self.left.retain(|&(r, _), _| r < self.extent_main_rows);
         self.right.retain(|&(r, _), _| r < self.extent_main_rows);
         self.resize_header_footer_width();
+        self.mark_spills_stale();
     }
 
     pub fn col_width(&self, global_col: usize) -> usize {
-        self.col_width_overrides
-            .get(&global_col)
-            .copied()
-            .unwrap_or(self.max_col_width)
-            .max(1)
+        if let Some(width) = self.col_width_overrides.get(&global_col).copied() {
+            return width.max(1);
+        }
+        if self.logical_col_has_content(global_col) {
+            self.max_col_width.max(1)
+        } else {
+            4
+        }
     }
 
     pub fn set_max_col_width(&mut self, width: usize) {
@@ -344,25 +657,22 @@ impl Grid {
         let mut saw_content = false;
         let main_cols = self.main_cols();
 
-        for r in 0..HEADER_ROWS {
-            if let Some(val) = self.header.get(r).and_then(|row| row.get(global_col)) {
-                if !val.is_empty() {
-                    saw_content = true;
-                    maxw = maxw.max(val.chars().count() + 1);
-                }
+        let global_col_u32 = global_col as u32;
+        for (&(_, col), val) in &self.header {
+            if col == global_col_u32 {
+                saw_content = true;
+                maxw = maxw.max(val.chars().count() + 1);
             }
         }
-        for r in 0..FOOTER_ROWS {
-            if let Some(val) = self.footer.get(r).and_then(|row| row.get(global_col)) {
-                if !val.is_empty() {
-                    saw_content = true;
-                    maxw = maxw.max(val.chars().count() + 1);
-                }
+        for (&(_, col), val) in &self.footer {
+            if col == global_col_u32 {
+                saw_content = true;
+                maxw = maxw.max(val.chars().count() + 1);
             }
         }
         for r in 0..self.extent_main_rows as usize {
             if global_col < MARGIN_COLS {
-                if let Some(val) = self.left.get(&(r as u32, global_col as u8)) {
+                if let Some(val) = self.left.get(&(r as u32, global_col as usize)) {
                     if !val.is_empty() {
                         saw_content = true;
                         maxw = maxw.max(val.chars().count() + 1);
@@ -378,7 +688,7 @@ impl Grid {
                 }
             } else {
                 let rc = global_col - MARGIN_COLS - main_cols;
-                if let Some(val) = self.right.get(&(r as u32, rc as u8)) {
+                if let Some(val) = self.right.get(&(r as u32, rc as usize)) {
                     if !val.is_empty() {
                         saw_content = true;
                         maxw = maxw.max(val.chars().count() + 1);
@@ -412,8 +722,11 @@ impl Grid {
             return;
         }
 
-        let old_total = MARGIN_COLS + old_main_cols + MARGIN_COLS;
-        let new_total = MARGIN_COLS + new_main_cols + MARGIN_COLS;
+        // Body cells (left / main / right) live in a split that moves when the main block grows;
+        // header and footer are keyed by absolute global full-logical columns (see
+        // `place_full_logical_cell` for `row < HEADER_ROWS`), so we must not shift them on resize —
+        // otherwise a marginal cell at `gc=703` would slide to `703 + delta` when a later `set_main_size`
+        // widens the main area (e.g. ODS TsvParity re-import of N>2 rows).
         let old_right_start = MARGIN_COLS + old_main_cols;
         let new_right_start = MARGIN_COLS + new_main_cols;
 
@@ -432,34 +745,6 @@ impl Grid {
                 let right_idx = col - old_right_start;
                 Some(new_right_start + right_idx)
             }
-        }
-
-        for row in &mut self.header {
-            let old_row = std::mem::take(row);
-            let mut new_row = vec![String::new(); new_total];
-            for (col, value) in old_row.into_iter().enumerate().take(old_total) {
-                let new_col = remap_col(col, new_main_cols, old_right_start, new_right_start);
-                if let Some(new_col) = new_col {
-                    if new_col < new_total {
-                        new_row[new_col] = value;
-                    }
-                }
-            }
-            *row = new_row;
-        }
-
-        for row in &mut self.footer {
-            let old_row = std::mem::take(row);
-            let mut new_row = vec![String::new(); new_total];
-            for (col, value) in old_row.into_iter().enumerate().take(old_total) {
-                let new_col = remap_col(col, new_main_cols, old_right_start, new_right_start);
-                if let Some(new_col) = new_col {
-                    if new_col < new_total {
-                        new_row[new_col] = value;
-                    }
-                }
-            }
-            *row = new_row;
         }
 
         let mut remapped = HashMap::new();
@@ -657,22 +942,8 @@ impl Grid {
             return Some(v.as_str());
         }
         match addr {
-            CellAddr::Header { row, col } => {
-                let r = *row as usize;
-                let c = *col as usize;
-                self.header
-                    .get(r)
-                    .and_then(|row| row.get(c))
-                    .map(|s| s.as_str())
-            }
-            CellAddr::Footer { row, col } => {
-                let r = *row as usize;
-                let c = *col as usize;
-                self.footer
-                    .get(r)
-                    .and_then(|row| row.get(c))
-                    .map(|s| s.as_str())
-            }
+            CellAddr::Header { row, col } => self.header.get(&(*row, *col)).map(|s| s.as_str()),
+            CellAddr::Footer { row, col } => self.footer.get(&(*row, *col)).map(|s| s.as_str()),
             CellAddr::Main { row, col } => self.main_cells.get(&(*row, *col)).map(|s| s.as_str()),
             CellAddr::Left { col, row } => self.left.get(&(*row, *col)).map(|s| s.as_str()),
             CellAddr::Right { col, row } => self.right.get(&(*row, *col)).map(|s| s.as_str()),
@@ -686,33 +957,25 @@ impl Grid {
     pub fn set(&mut self, addr: &CellAddr, value: String) {
         match addr {
             CellAddr::Header { row, col } => {
-                let r = *row as usize;
                 let c = *col as usize;
-                if r < HEADER_ROWS && c < self.total_cols() {
-                    if c >= MARGIN_COLS {
-                        let required_main_cols = c - MARGIN_COLS + 1;
-                        if required_main_cols > self.extent_main_cols as usize {
-                            self.extent_main_cols = required_main_cols as u32;
-                            self.resize_header_footer_width();
-                        }
+                if (*row as usize) < HEADER_ROWS && c < self.total_cols() {
+                    if value.is_empty() {
+                        self.header.remove(&(*row, *col));
+                    } else {
+                        self.header.insert((*row, *col), value);
+                        self.auto_fit_column(c);
                     }
-                    self.header[r][c] = value;
-                    self.auto_fit_column(c);
                 }
             }
             CellAddr::Footer { row, col } => {
-                let r = *row as usize;
                 let c = *col as usize;
-                if r < FOOTER_ROWS && c < self.total_cols() {
-                    if c >= MARGIN_COLS {
-                        let required_main_cols = c - MARGIN_COLS + 1;
-                        if required_main_cols > self.extent_main_cols as usize {
-                            self.extent_main_cols = required_main_cols as u32;
-                            self.resize_header_footer_width();
-                        }
+                if (*row as usize) < FOOTER_ROWS && c < self.total_cols() {
+                    if value.is_empty() {
+                        self.footer.remove(&(*row, *col));
+                    } else {
+                        self.footer.insert((*row, *col), value);
+                        self.auto_fit_column(c);
                     }
-                    self.footer[r][c] = value;
-                    self.auto_fit_column(c);
                 }
             }
             CellAddr::Main { row, col } => {
@@ -731,13 +994,13 @@ impl Grid {
             CellAddr::Left { col, row } => {
                 let mc = *col;
                 let r = *row;
-                if (mc as usize) < MARGIN_COLS {
+                if mc < MARGIN_COLS {
                     if value.is_empty() {
                         self.left.remove(&(r, mc));
                     } else {
                         self.extent_main_rows = self.extent_main_rows.max(r + 1);
                         self.left.insert((r, mc), value);
-                        self.auto_fit_column(mc as usize);
+                        self.auto_fit_column(mc);
                         self.resize_header_footer_width();
                     }
                 }
@@ -745,20 +1008,19 @@ impl Grid {
             CellAddr::Right { col, row } => {
                 let mc = *col;
                 let r = *row;
-                if (mc as usize) < MARGIN_COLS {
+                if mc < MARGIN_COLS {
                     if value.is_empty() {
                         self.right.remove(&(r, mc));
                     } else {
                         self.extent_main_rows = self.extent_main_rows.max(r + 1);
                         self.right.insert((r, mc), value);
-                        self.auto_fit_column(
-                            MARGIN_COLS + self.extent_main_cols as usize + mc as usize,
-                        );
+                        self.auto_fit_column(MARGIN_COLS + self.extent_main_cols as usize + mc);
                         self.resize_header_footer_width();
                     }
                 }
             }
         }
+        self.mark_spills_stale();
     }
 
     pub(crate) fn clear_spills(&mut self) {
@@ -776,6 +1038,17 @@ impl Grid {
 
     pub(crate) fn bump_volatile_seed(&mut self) {
         self.volatile_seed = self.volatile_seed.wrapping_add(1);
+        self.mark_spills_stale();
+    }
+
+    #[inline]
+    pub(crate) fn mark_spills_stale(&mut self) {
+        self.spills_dirty = true;
+    }
+
+    #[inline]
+    pub(crate) fn note_spills_refreshed(&mut self) {
+        self.spills_dirty = false;
     }
 
     pub fn move_main_rows(&mut self, from: usize, count: usize, to: usize) {
@@ -805,7 +1078,7 @@ impl Grid {
 
         let mut new_left = HashMap::new();
         for (new_pos, &old_r) in order.iter().enumerate() {
-            for mc in 0..MARGIN_COLS as u8 {
+            for mc in 0..MARGIN_COLS as usize {
                 if let Some(v) = self.left.get(&(old_r, mc)).cloned() {
                     new_left.insert((new_pos as u32, mc), v);
                 }
@@ -815,7 +1088,7 @@ impl Grid {
 
         let mut new_right = HashMap::new();
         for (new_pos, &old_r) in order.iter().enumerate() {
-            for mc in 0..MARGIN_COLS as u8 {
+            for mc in 0..MARGIN_COLS as usize {
                 if let Some(v) = self.right.get(&(old_r, mc)).cloned() {
                     new_right.insert((new_pos as u32, mc), v);
                 }
@@ -824,6 +1097,7 @@ impl Grid {
         self.right = new_right;
 
         self.extent_main_rows = order.len() as u32;
+        self.mark_spills_stale();
     }
 
     pub fn move_main_cols(&mut self, from: usize, count: usize, to: usize) {
@@ -850,25 +1124,311 @@ impl Grid {
         }
         self.main_cells = new_main;
 
-        let g_from = MARGIN_COLS + from;
-        let insert_global = MARGIN_COLS + insert_at;
+        fn remap_sparse_main_cols(
+            cells: &mut HashMap<(u32, u32), String>,
+            order: &[u32],
+            old_main_cols: usize,
+        ) {
+            let mut old_to_new = vec![0usize; old_main_cols];
+            for (new_pos, &old_pos) in order.iter().enumerate() {
+                old_to_new[old_pos as usize] = new_pos;
+            }
 
-        for row in &mut self.header {
-            if g_from + count <= row.len() && insert_global + count <= row.len() {
-                let block: Vec<String> = row.drain(g_from..g_from + count).collect();
-                row.splice(insert_global..insert_global, block);
+            let mut remapped = HashMap::new();
+            for ((row, col), value) in cells.drain() {
+                let col_usize = col as usize;
+                let new_col = if col_usize < MARGIN_COLS || col_usize >= MARGIN_COLS + old_main_cols
+                {
+                    col_usize
+                } else {
+                    MARGIN_COLS + old_to_new[col_usize - MARGIN_COLS]
+                };
+                remapped.insert((row, new_col as u32), value);
             }
+            *cells = remapped;
         }
-        for row in &mut self.footer {
-            if g_from + count <= row.len() && insert_global + count <= row.len() {
-                let block: Vec<String> = row.drain(g_from..g_from + count).collect();
-                row.splice(insert_global..insert_global, block);
-            }
-        }
+
+        remap_sparse_main_cols(&mut self.header, &order, ec);
+        remap_sparse_main_cols(&mut self.footer, &order, ec);
 
         self.remap_main_col_width_overrides_for_order(&order);
 
         self.extent_main_cols = order.len() as u32;
+        self.mark_spills_stale();
+    }
+}
+
+// Implement GridImpl for the existing Grid so we can use Grid via GridBox.
+impl GridImpl for Grid {
+    fn main_rows(&self) -> usize {
+        self.main_rows()
+    }
+
+    fn main_cols(&self) -> usize {
+        self.main_cols()
+    }
+
+    fn total_cols(&self) -> usize {
+        self.total_cols()
+    }
+
+    fn get_owned(&self, addr: &CellAddr) -> Option<String> {
+        self.get(addr).map(|s| s.to_string())
+    }
+
+    fn set_owned(&mut self, addr: &CellAddr, value: String) {
+        self.set(addr, value)
+    }
+
+    fn set_main_size(&mut self, main_rows: usize, main_cols: usize) {
+        self.set_main_size(main_rows, main_cols)
+    }
+
+    fn bump_volatile_seed(&mut self) {
+        self.bump_volatile_seed()
+    }
+
+    fn spills_refresh_dirty(&self) -> bool {
+        self.spills_dirty
+    }
+
+    fn note_spills_refreshed(&mut self) {
+        Grid::note_spills_refreshed(self)
+    }
+
+    fn mark_spills_stale(&mut self) {
+        Grid::mark_spills_stale(self)
+    }
+
+    fn iter_nonempty(&self) -> Box<dyn Iterator<Item = (CellAddr, String)> + '_> {
+        // Build a vec of non-empty cells across regions and return an iterator.
+        let mut v: Vec<(CellAddr, String)> = Vec::new();
+        for (&(r, c), val) in &self.header {
+            v.push((CellAddr::Header { row: r, col: c }, val.clone()));
+        }
+        for (&(r, c), val) in &self.footer {
+            v.push((CellAddr::Footer { row: r, col: c }, val.clone()));
+        }
+        for (&(r, c), val) in &self.main_cells {
+            v.push((CellAddr::Main { row: r, col: c }, val.clone()));
+        }
+        for (&(r, mc), val) in &self.left {
+            v.push((CellAddr::Left { col: mc, row: r }, val.clone()));
+        }
+        for (&(r, mc), val) in &self.right {
+            v.push((CellAddr::Right { col: mc, row: r }, val.clone()));
+        }
+        Box::new(v.into_iter())
+    }
+
+    fn total_logical_rows(&self) -> usize {
+        self.total_logical_rows()
+    }
+
+    fn text(&self, addr: &CellAddr) -> String {
+        self.get(addr).unwrap_or("").to_string()
+    }
+
+    fn set(&mut self, addr: &CellAddr, value: String) {
+        self.set(addr, value)
+    }
+
+    fn ensure_extent_for_cursor(&mut self, row: usize, col: usize) -> bool {
+        self.ensure_extent_for_cursor(row, col)
+    }
+
+    fn grow_main_row_at_bottom(&mut self) {
+        self.grow_main_row_at_bottom()
+    }
+
+    fn grow_main_col_at_right(&mut self) {
+        self.grow_main_col_at_right()
+    }
+
+    fn move_main_rows(&mut self, from: usize, count: usize, to: usize) {
+        self.move_main_rows(from, count, to)
+    }
+
+    fn move_main_cols(&mut self, from: usize, count: usize, to: usize) {
+        self.move_main_cols(from, count, to)
+    }
+
+    fn max_col_width(&self) -> usize {
+        self.max_col_width
+    }
+
+    fn col_width(&self, global_col: usize) -> usize {
+        self.col_width(global_col)
+    }
+
+    fn get_col_width_override(&self, global_col: usize) -> Option<usize> {
+        self.col_width_overrides.get(&global_col).copied()
+    }
+
+    fn content_width_for_column(&self, global_col: usize) -> Option<usize> {
+        self.content_width_for_column(global_col)
+    }
+
+    fn set_max_col_width(&mut self, width: usize) {
+        self.set_max_col_width(width)
+    }
+
+    fn set_col_width(&mut self, global_col: usize, width: Option<usize>) {
+        self.set_col_width(global_col, width)
+    }
+
+    fn auto_fit_column(&mut self, global_col: usize) {
+        self.auto_fit_column(global_col)
+    }
+
+    fn fit_column_to_content(&mut self, global_col: usize) {
+        self.fit_column_to_content(global_col)
+    }
+
+    fn col_width_overrides(&self) -> Vec<(usize, usize)> {
+        self.col_width_overrides
+            .iter()
+            .map(|(&c, &w)| (c, w))
+            .collect()
+    }
+
+    fn set_view_sort_cols(&mut self, cols: Vec<SortSpec>) {
+        self.set_view_sort_cols(cols)
+    }
+
+    fn view_sort_cols(&self) -> Vec<SortSpec> {
+        self.view_sort_cols.clone()
+    }
+
+    fn sorted_main_rows(&self) -> Vec<usize> {
+        self.sorted_main_rows()
+    }
+
+    fn set_column_format(&mut self, scope: FormatScope, col: usize, format: CellFormat) {
+        self.set_column_format(scope, col, format)
+    }
+
+    fn set_cell_format(&mut self, addr: CellAddr, format: CellFormat) {
+        self.set_cell_format(addr, format)
+    }
+
+    fn format_for_addr(&self, addr: &CellAddr) -> CellFormat {
+        self.format_for_addr(addr)
+    }
+
+    fn format_for_global_col(&self, scope: FormatScope, col: usize) -> CellFormat {
+        self.format_for_global_col(scope, col)
+    }
+
+    fn col_all_formats(&self) -> Vec<(usize, CellFormat)> {
+        self.col_all_formats.iter().map(|(&c, &f)| (c, f)).collect()
+    }
+
+    fn col_data_formats(&self) -> Vec<(usize, CellFormat)> {
+        self.col_data_formats
+            .iter()
+            .map(|(&c, &f)| (c, f))
+            .collect()
+    }
+
+    fn col_special_formats(&self) -> Vec<(usize, CellFormat)> {
+        self.col_special_formats
+            .iter()
+            .map(|(&c, &f)| (c, f))
+            .collect()
+    }
+
+    fn cell_formats(&self) -> Vec<(CellAddr, CellFormat)> {
+        self.cell_formats
+            .iter()
+            .map(|(k, &v)| (k.clone(), v))
+            .collect()
+    }
+
+    fn clear_spills(&mut self) {
+        self.clear_spills()
+    }
+
+    fn spill_followers(&self) -> Vec<(CellAddr, String)> {
+        self.spill_followers
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
+    fn spill_errors(&self) -> Vec<(CellAddr, &'static str)> {
+        self.spill_errors
+            .iter()
+            .map(|(k, &v)| (k.clone(), v))
+            .collect()
+    }
+
+    fn clear_cells(&mut self) {
+        self.main_cells.clear();
+        self.left.clear();
+        self.right.clear();
+        self.mark_spills_stale()
+    }
+
+    fn set_col_width_overrides(&mut self, overrides: Vec<(usize, usize)>) {
+        self.col_width_overrides = overrides.into_iter().collect();
+    }
+
+    fn set_spill_value(&mut self, addr: CellAddr, value: String) {
+        self.set_spill_value(addr, value)
+    }
+
+    fn set_spill_error(&mut self, addr: CellAddr, err: &'static str) {
+        self.set_spill_error(addr, err)
+    }
+
+    fn spill_error(&self, addr: &CellAddr) -> Option<&'static str> {
+        self.spill_error(addr)
+    }
+
+    fn volatile_seed(&self) -> u64 {
+        self.volatile_seed
+    }
+
+    fn set_volatile_seed(&mut self, seed: u64) {
+        self.volatile_seed = seed;
+        self.mark_spills_stale();
+    }
+
+    fn logical_row_has_content(&self, r: usize) -> bool {
+        self.logical_row_has_content(r)
+    }
+
+    fn logical_col_has_content(&self, c: usize) -> bool {
+        self.logical_col_has_content(c)
+    }
+
+    fn clone_box(&self) -> Box<dyn GridImpl> {
+        Box::new(self.clone())
+    }
+}
+
+impl From<Grid> for GridBox {
+    fn from(g: Grid) -> Self {
+        GridBox::new(g)
+    }
+}
+
+impl Clone for GridBox {
+    fn clone(&self) -> Self {
+        GridBox { inner: self.inner.clone_box(), id: self.id }
+    }
+}
+
+impl std::fmt::Debug for GridBox {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GridBox").finish()
+    }
+}
+
+impl Default for GridBox {
+    fn default() -> Self {
+        GridBox::new(Grid::new(1, 1))
     }
 }
 
@@ -876,16 +1436,14 @@ impl Grid {
 enum SortKey<'a> {
     Blank,
     Text(&'a str),
-    Number(f64),
+    Number(Number),
 }
-
-impl<'a> Eq for SortKey<'a> {}
 
 fn sort_key(value: &str) -> SortKey<'_> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         SortKey::Blank
-    } else if let Ok(n) = trimmed.parse::<f64>() {
+    } else if let Some(n) = parse_numeric_or_date_literal(trimmed) {
         SortKey::Number(n)
     } else {
         SortKey::Text(trimmed)
@@ -998,6 +1556,20 @@ mod tests {
     }
 
     #[test]
+    fn view_sort_is_stable_for_equal_keys() {
+        let mut g = Grid::new(3, 2);
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "x".into());
+        g.set(&CellAddr::Main { row: 1, col: 0 }, "y".into());
+        g.set(&CellAddr::Main { row: 2, col: 0 }, "x".into());
+        g.set_view_sort_cols(vec![SortSpec {
+            col: MARGIN_COLS,
+            desc: false,
+        }]);
+        // Ties on "x": rows 0 and 2 stay in original order (0 before 2).
+        assert_eq!(g.sorted_main_rows(), vec![0, 2, 1]);
+    }
+
+    #[test]
     fn auto_fit_only_grows_touched_column() {
         let mut g = Grid::new(1, 2);
         g.set(&CellAddr::Main { row: 0, col: 0 }, "short".into());
@@ -1006,8 +1578,22 @@ mod tests {
             "abcdefghijklmnopqrstuvwx".into(),
         );
 
-        assert_eq!(g.col_width(MARGIN_COLS), 20);
+        assert_eq!(g.col_width(MARGIN_COLS), DEFAULT_MAX_COL_WIDTH);
         assert!(g.col_width(MARGIN_COLS + 1) >= 24);
+    }
+
+    #[test]
+    fn empty_columns_use_compact_display_width() {
+        let mut g = Grid::new(1, 2);
+
+        assert_eq!(g.col_width(MARGIN_COLS), 4);
+
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "x".into());
+        assert_eq!(g.col_width(MARGIN_COLS), DEFAULT_MAX_COL_WIDTH);
+        assert_eq!(g.col_width(MARGIN_COLS + 1), 4);
+
+        g.set_col_width(MARGIN_COLS + 1, Some(12));
+        assert_eq!(g.col_width(MARGIN_COLS + 1), 12);
     }
 
     #[test]
@@ -1017,7 +1603,7 @@ mod tests {
 
         g.grow_main_col_at_right();
 
-        assert_eq!(g.col_width(MARGIN_COLS + 1), 20);
+        assert_eq!(g.col_width(MARGIN_COLS + 1), 4);
         assert_eq!(g.col_width(MARGIN_COLS + 2), 24);
     }
 
@@ -1028,8 +1614,34 @@ mod tests {
 
         g.move_main_cols(1, 1, 3);
 
-        assert_eq!(g.col_width(MARGIN_COLS + 1), 20);
+        assert_eq!(g.col_width(MARGIN_COLS + 1), 4);
         assert_eq!(g.col_width(MARGIN_COLS + 2), 24);
+    }
+
+    #[test]
+    fn header_footer_rows_are_sparse_at_high_limits() {
+        let mut g = Grid::new(1, 1);
+        let header = CellAddr::Header {
+            row: 0,
+            col: MARGIN_COLS as u32,
+        };
+        let footer = CellAddr::Footer {
+            row: (FOOTER_ROWS - 1) as u32,
+            col: MARGIN_COLS as u32,
+        };
+
+        g.set(&header, "top".into());
+        g.set(&footer, "bottom".into());
+
+        assert_eq!(g.header.len(), 1);
+        assert_eq!(g.footer.len(), 1);
+        assert_eq!(g.get(&header), Some("top"));
+        assert_eq!(g.get(&footer), Some("bottom"));
+        assert!(g.logical_row_has_content(0));
+        assert!(g.logical_row_has_content(HEADER_ROWS + g.main_rows() + FOOTER_ROWS - 1));
+
+        g.set(&header, String::new());
+        assert!(g.header.is_empty());
     }
 
     #[test]

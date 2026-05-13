@@ -37,8 +37,8 @@ SET B2
 SET B3 
 SET B4 
 SET B5 :q
-SET M~1 TOTAL
-SET J_2 TOTAL
+SET M~1 =TOTAL
+SET J_2 =TOTAL
 SET J_3 MAX
 SET N~1 MAX
 SET A8 afsfadsfadsfdsfdsfadfafd
