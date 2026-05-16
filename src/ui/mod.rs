@@ -8414,7 +8414,16 @@ impl App {
                 let mut st = if is_cur {
                     Style::default().bg(Color::DarkGray)
                 } else if sel {
-                    Style::default().bg(Color::Blue)
+                    // In Extrapolate mode we want the extrapolation target
+                    // (selected-but-empty cells) to be visually distinct from
+                    // the selection seed. Use reverse-video for those target
+                    // cells while keeping the existing blue background for
+                    // normal selections.
+                    if matches!(self.mode, Mode::Extrapolate) && formatted.trim().is_empty() {
+                        Style::default().add_modifier(Modifier::REVERSED)
+                    } else {
+                        Style::default().bg(Color::Blue)
+                    }
                 } else if let Some(bc) = border_color {
                     Style::default().fg(bc)
                 } else {
