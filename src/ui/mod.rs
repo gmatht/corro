@@ -292,6 +292,8 @@ enum Mode {
     QuitPrompt,
     /// No `.corro` on disk (e.g. opened from ODS/TSV/CSV); user should save to `.corro` or discard.
     QuitImportPrompt,
+    /// Interactive extrapolation: arrow keys extend the selection, Enter extrapolates, Esc cancels.
+    Extrapolate,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1344,9 +1346,16 @@ impl App {
                 self.start_edit_mode(self.menu_insert_hyperlink_seed(), None, None, false, false, None)
             }
             MenuAction::Extrapolate => {
-                // Placeholder: trigger extrapolation feature. For now, set status and return to Normal.
-                self.status = "Extrapolate invoked".into();
-                Mode::Normal
+                if self.anchor.is_none() {
+                    self.anchor = Some(self.cursor);
+                }
+                if self.current_selection_range().is_some() {
+                    self.status = "Use arrows to extend selection, Enter to extrapolate, Esc to cancel".into();
+                    Mode::Extrapolate
+                } else {
+                    self.status = "Select cells with a pattern first, then Extrapolate".into();
+                    Mode::Normal
+                }
             }
             MenuAction::SortView => Mode::SortView {
                 buffer: self.start_input_mode(String::new()),
@@ -3572,6 +3581,149 @@ impl App {
                 self.infer_fill_value(&seed, (row - end_row) as i32, FillDirection::Down)?;
             cells.push((CellAddr::Main { row, col: main_col }, value));
         }
+        if cells.is_empty() {
+            None
+        } else {
+            Some(Op::FillRange { cells })
+        }
+    }
+
+    fn extrapolate_selection(&self) -> Option<Op> {
+        if self.selection_kind != SelectionKind::Cells {
+            return None;
+        }
+        let (rows, cols) = self.current_selection_range()?;
+        let mut cells = Vec::new();
+        let mut filled: HashSet<(u32, u32)> = HashSet::new();
+        let main_cols = self.state.grid.main_cols() as u32;
+        let main_rows = self.state.grid.main_rows() as u32;
+
+        for &r in &rows {
+            if r < HEADER_ROWS {
+                continue;
+            }
+            let main_row = (r - HEADER_ROWS) as u32;
+            if main_row >= main_rows {
+                continue;
+            }
+            let mut seed = Vec::new();
+            let mut last_seed_col: Option<u32> = None;
+            for &c in &cols {
+                if c < MARGIN_COLS {
+                    continue;
+                }
+                let main_col = (c - MARGIN_COLS) as u32;
+                if main_col >= main_cols {
+                    continue;
+                }
+                let addr = CellAddr::Main {
+                    row: main_row,
+                    col: main_col,
+                };
+                if let Some(v) = self.state.grid.get(&addr) {
+                    if !v.is_empty() {
+                        seed.push(v.to_string());
+                        last_seed_col = Some(main_col);
+                    }
+                }
+            }
+            if seed.len() >= 2 {
+                if let Some(last_col) = last_seed_col {
+                    for &c in &cols {
+                        let main_col = (c - MARGIN_COLS) as u32;
+                        if main_col <= last_col || main_col >= main_cols {
+                            continue;
+                        }
+                        let addr = CellAddr::Main {
+                            row: main_row,
+                            col: main_col,
+                        };
+                        if filled.contains(&(main_row, main_col)) {
+                            continue;
+                        }
+                        if self
+                            .state
+                            .grid
+                            .get(&addr)
+                            .map_or(true, |v| v.is_empty())
+                        {
+                            if let Some(value) = self.infer_fill_value(
+                                &seed,
+                                (main_col - last_col) as i32,
+                                FillDirection::Right,
+                            ) {
+                                filled.insert((main_row, main_col));
+                                cells.push((addr, value));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for &c in &cols {
+            if c < MARGIN_COLS {
+                continue;
+            }
+            let main_col = (c - MARGIN_COLS) as u32;
+            if main_col >= main_cols {
+                continue;
+            }
+            let mut seed = Vec::new();
+            let mut last_seed_row: Option<u32> = None;
+            for &r in &rows {
+                if r < HEADER_ROWS {
+                    continue;
+                }
+                let main_row = (r - HEADER_ROWS) as u32;
+                if main_row >= main_rows {
+                    continue;
+                }
+                let addr = CellAddr::Main {
+                    row: main_row,
+                    col: main_col,
+                };
+                if let Some(v) = self.state.grid.get(&addr) {
+                    if !v.is_empty() {
+                        seed.push(v.to_string());
+                        last_seed_row = Some(main_row);
+                    }
+                }
+            }
+            if seed.len() >= 2 {
+                if let Some(last_row) = last_seed_row {
+                    for &r in &rows {
+                        let main_row = (r - HEADER_ROWS) as u32;
+                        if main_row <= last_row || main_row >= main_rows {
+                            continue;
+                        }
+                        let addr = CellAddr::Main {
+                            row: main_row,
+                            col: main_col,
+                        };
+                        if filled.contains(&(main_row, main_col)) {
+                            continue;
+                        }
+                        if self
+                            .state
+                            .grid
+                            .get(&addr)
+                            .map_or(true, |v| v.is_empty())
+                        {
+                            if let Some(value) = self.infer_fill_value(
+                                &seed,
+                                (main_row - last_row) as i32,
+                                FillDirection::Down,
+                            ) {
+                                filled.insert((main_row, main_col));
+                                cells.push((addr, value));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         if cells.is_empty() {
             None
         } else {
@@ -8647,6 +8799,9 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                 "  Tab/Shift+Tab·move focus   Enter/Space·select   Esc·cancel".into()
             }
             Mode::FormatDecimals { .. } => "  type decimals   Enter·apply   Esc·cancel".into(),
+            Mode::Extrapolate => {
+                "  arrows·extend selection   Enter·extrapolate   Esc·cancel".into()
+            }
             Mode::QuitPrompt => "  Q·quit   B·back   Esc·cancel".into(),
             Mode::QuitImportPrompt => "  S·save as .corro   D·discard   B·back".into(),
             Mode::Help => "  up/down·scroll   Esc·close   ?·help   A·about".into(),
@@ -10288,6 +10443,77 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                 }
                 _ => {}
             },
+            Mode::Extrapolate => match key.code {
+                KeyCode::Enter => {
+                    if let Some(op) = self.extrapolate_selection() {
+                        self.push_inverse_op(&op);
+                        if let Some(ref p) = self.path.clone() {
+                            let mut active_sheet = self.view_sheet_id;
+                            let _ = commit_workbook_op(
+                                p,
+                                &mut self.offset,
+                                &mut self.workbook,
+                                &mut active_sheet,
+                                &crate::ops::WorkbookOp::SheetOp {
+                                    sheet_id: self.view_sheet_id,
+                                    op,
+                                },
+                            );
+                            self.sync_active_sheet_cache();
+                        } else {
+                            op.apply(&mut self.state);
+                        }
+                        self.status = "Extrapolated selection".into();
+                    } else {
+                        self.status = "Select cells with a pattern, then Extrapolate".into();
+                    }
+                    self.anchor = None;
+                    mode = Mode::Normal;
+                }
+                KeyCode::Esc => {
+                    self.anchor = None;
+                    mode = Mode::Normal;
+                }
+                KeyCode::Left => {
+                    if self.anchor.is_none() {
+                        self.anchor = Some(self.cursor);
+                    }
+                    if self.cursor.col > 0 {
+                        self.cursor.col = self.cursor.col.saturating_sub(1);
+                    }
+                    self.cursor.clamp(&self.state.grid);
+                }
+                KeyCode::Right => {
+                    if self.anchor.is_none() {
+                        self.anchor = Some(self.cursor);
+                    }
+                    self.cursor.col = self.cursor.col.saturating_add(1);
+                    self.cursor.clamp(&self.state.grid);
+                    self.state
+                        .grid
+                        .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
+                }
+                KeyCode::Up => {
+                    if self.anchor.is_none() {
+                        self.anchor = Some(self.cursor);
+                    }
+                    if self.cursor.row > 0 {
+                        self.cursor.row = self.cursor.row.saturating_sub(1);
+                    }
+                    self.cursor.clamp(&self.state.grid);
+                }
+                KeyCode::Down => {
+                    if self.anchor.is_none() {
+                        self.anchor = Some(self.cursor);
+                    }
+                    self.cursor.row = self.cursor.row.saturating_add(1);
+                    self.cursor.clamp(&self.state.grid);
+                    self.state
+                        .grid
+                        .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
+                }
+                _ => {}
+            },
             Mode::OpenPath { buffer } => match key.code {
                 KeyCode::Enter => match parse_open_path_request(buffer) {
                     Err(OpenPathError::Empty) => {
@@ -11444,7 +11670,7 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                 .style(Style::default().fg(Color::White).bg(Color::Blue)),
             Mode::About => Paragraph::new(" About - Up/Down scroll, Esc closes ")
                 .style(Style::default().fg(Color::White).bg(Color::Blue)),
-            Mode::Menu { .. } | Mode::Normal | Mode::RevisionBrowse => {
+            Mode::Extrapolate | Mode::Menu { .. } | Mode::Normal | Mode::RevisionBrowse => {
                 let prompt_cyan = Style::default().fg(Color::Cyan);
                 let prompt_cyan_bold = prompt_cyan.add_modifier(Modifier::BOLD);
                 let formula = if matches!(&self.mode, Mode::Menu { .. }) {

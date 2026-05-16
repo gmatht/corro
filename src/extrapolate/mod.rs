@@ -102,3 +102,39 @@ pub fn commit_from_preview(cells: Vec<PreviewCell>) -> crate::ops::Op {
     let mapped: Vec<(CellAddr, String)> = cells.into_iter().map(|p| (p.addr, p.value)).collect();
     crate::ops::Op::FillRange { cells: mapped }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::grid::{Grid, GridBox, CellAddr, MainRange};
+
+    #[test]
+    fn generate_preview_translates_single_formula() {
+        let mut gb = GridBox::from(Grid::new(4, 1));
+        gb.set(&CellAddr::Main { row: 0, col: 0 }, "=A1".into());
+
+        let source = MainRange { row_start: 0, row_end: 1, col_start: 0, col_end: 1 };
+        let target = MainRange { row_start: 1, row_end: 3, col_start: 0, col_end: 1 };
+
+        let out = generate_preview(&gb, &source, &target);
+        assert_eq!(out.len(), 2);
+        assert!(out.contains(&PreviewCell { addr: CellAddr::Main { row: 1, col: 0 }, value: "=A2".into() }));
+        assert!(out.contains(&PreviewCell { addr: CellAddr::Main { row: 2, col: 0 }, value: "=A3".into() }));
+    }
+
+    #[test]
+    fn generate_preview_repeats_last_nonempty() {
+        let mut gb = GridBox::from(Grid::new(4, 2));
+        gb.set(&CellAddr::Main { row: 0, col: 0 }, "one".into());
+
+        let source = MainRange { row_start: 0, row_end: 1, col_start: 0, col_end: 2 };
+        let target = MainRange { row_start: 1, row_end: 3, col_start: 0, col_end: 2 };
+
+        let out = generate_preview(&gb, &source, &target);
+        // 2 rows * 2 cols
+        assert_eq!(out.len(), 4);
+        for pc in out {
+            assert_eq!(pc.value, "one");
+        }
+    }
+}
