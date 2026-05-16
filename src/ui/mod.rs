@@ -1346,16 +1346,16 @@ impl App {
                 self.start_edit_mode(self.menu_insert_hyperlink_seed(), None, None, false, false, None)
             }
             MenuAction::Extrapolate => {
+                // If there is no selection anchor, treat the current cell as
+                // the extrapolate source (single-cell seed) so the user can
+                // move the cursor/extend selection and press Enter to apply.
                 if self.anchor.is_none() {
                     self.anchor = Some(self.cursor);
                 }
-                if self.current_selection_range().is_some() {
-                    self.status = "Use arrows to extend selection, Enter to extrapolate, Esc to cancel".into();
-                    Mode::Extrapolate
-                } else {
-                    self.status = "Select cells with a pattern first, then Extrapolate".into();
-                    Mode::Normal
-                }
+                // Enter extrapolate mode even when there is only a single
+                // selected cell (or when there was no prior selection).
+                self.status = "Use arrows to extend selection, Enter to extrapolate, Esc to cancel".into();
+                Mode::Extrapolate
             }
             MenuAction::SortView => Mode::SortView {
                 buffer: self.start_input_mode(String::new()),
@@ -3627,7 +3627,9 @@ impl App {
                     }
                 }
             }
-            if seed.len() >= 2 {
+            // Allow a single-cell seed: when there is no multi-cell selection
+            // treat the current cell as the extrapolate source (copy/fill behavior).
+            if seed.len() >= 1 {
                 if let Some(last_col) = last_seed_col {
                     for &c in &cols {
                         let main_col = (c - MARGIN_COLS) as u32;
@@ -3690,7 +3692,9 @@ impl App {
                     }
                 }
             }
-            if seed.len() >= 2 {
+            // Allow a single-cell seed: when there is no multi-cell selection
+            // treat the current cell as the extrapolate source (copy/fill behavior).
+            if seed.len() >= 1 {
                 if let Some(last_row) = last_seed_row {
                     for &r in &rows {
                         let main_row = (r - HEADER_ROWS) as u32;
