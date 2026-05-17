@@ -163,22 +163,70 @@ fn infer_named_sequence_fill(seed: &[String], offset_from_last: i32) -> Option<S
     const MONTHS: [&str; 12] = [
         "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC",
     ];
+    // Preserve case style: infer the next token in the named sequence but
+    // render it using the same case pattern as the original seed values.
     let normalized: Vec<String> = seed.iter().map(|v| v.trim().to_ascii_uppercase()).collect();
-    let last = normalized.last()?.as_str();
+    let last_norm = normalized.last()?.as_str();
+    let original_last = seed.last()?.trim();
+
+    // Helper: apply the case pattern from `original` to the `token` (both
+    // expected to be ASCII month/week tokens). Prefer simple rules for common
+    // cases: all-upper, all-lower, Title case, otherwise fall back to
+    // per-character mapping.
+    fn apply_case_pattern(original: &str, token: &str) -> String {
+        // If original is all-uppercase (or has no letters), return token as-is.
+        if original.chars().all(|c| !c.is_alphabetic() || c.is_uppercase()) {
+            return token.to_string();
+        }
+        // All-lower
+        if original.chars().all(|c| !c.is_alphabetic() || c.is_lowercase()) {
+            return token.to_ascii_lowercase();
+        }
+        // Title-case: first uppercase, rest lowercase
+        let mut chars: Vec<char> = original.chars().collect();
+        if !chars.is_empty()
+            && chars[0].is_uppercase()
+            && chars.iter().skip(1).all(|c| !c.is_alphabetic() || c.is_lowercase())
+        {
+            let mut out = String::new();
+            let mut iter = token.chars();
+            if let Some(first) = iter.next() {
+                out.extend(first.to_uppercase());
+            }
+            for ch in iter {
+                out.extend(ch.to_lowercase());
+            }
+            return out;
+        }
+        // Fallback: per-character mapping (zip). If original is shorter, use
+        // original's casing for the corresponding prefix, then lowercase the
+        // remainder.
+        let mut out = String::new();
+        for (o, t) in original.chars().zip(token.chars()) {
+            if o.is_lowercase() {
+                out.extend(t.to_lowercase());
+            } else {
+                out.extend(t.to_uppercase());
+            }
+        }
+        // If token has more chars than original, append the rest in lowercase.
+        if token.chars().count() > original.chars().count() {
+            for t in token.chars().skip(original.chars().count()) {
+                out.extend(t.to_lowercase());
+            }
+        }
+        out
+    }
+
     if normalized.iter().all(|v| WEEKDAYS.contains(&v.as_str())) {
-        let idx = WEEKDAYS.iter().position(|&v| v == last)?;
-        return Some(
-            WEEKDAYS
-                [(idx as i32 + offset_from_last).rem_euclid(WEEKDAYS.len() as i32) as usize]
-                .to_string(),
-        );
+        let idx = WEEKDAYS.iter().position(|&v| v == last_norm)?;
+        let tok = WEEKDAYS[(idx as i32 + offset_from_last).rem_euclid(WEEKDAYS.len() as i32) as usize];
+        return Some(apply_case_pattern(original_last, tok));
     }
     if normalized.iter().all(|v| MONTHS.contains(&v.as_str())) {
-        let idx = MONTHS.iter().position(|&v| v == last)?;
-        return Some(
-            MONTHS[(idx as i32 + offset_from_last).rem_euclid(MONTHS.len() as i32) as usize]
-                .to_string(),
-        );
+        let idx = MONTHS.iter().position(|&v| v == last_norm)?;
+        let tok = MONTHS[(idx as i32 + offset_from_last).rem_euclid(MONTHS.len() as i32) as usize];
+        return Some(apply_case_pattern(original_last, tok));
     }
     None
 }

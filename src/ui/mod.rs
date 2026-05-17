@@ -12632,14 +12632,14 @@ mod tests {
                 .grid
                 .get(&CellAddr::Main { row: 2, col: 0 })
                 .as_deref(),
-            Some("WED")
+            Some("wed")
         );
         assert_eq!(
             app.state
                 .grid
                 .get(&CellAddr::Main { row: 3, col: 0 })
                 .as_deref(),
-            Some("THU")
+            Some("thu")
         );
     }
 
