@@ -7723,12 +7723,55 @@ impl App {
         trim_visible_cols_to_width(&self.state.grid, &mut col_ixs, self.cursor.col, data_width);
 
         // Materialize grid after we finish possibly mutating column widths.
-        let grid = &self.state.grid;
+        // Allow a transient preview grid when in Edit or Extrapolate mode so we
+        // can render a live preview without mutating state. When showing an
+        // extrapolation preview also capture the set of target addresses so we
+        // can visually distinguish previewed (non-committed) cells while
+        // rendering.
+        let base_grid = &self.state.grid;
+        let mut preview_grid: Option<Grid> = None;
+        let mut previewed_addrs: Option<HashSet<CellAddr>> = None;
+        if let Mode::Edit { buffer, .. } = &self.mode {
+            // Preview the edit buffer in-place like addr_at does.
+            let mut g = self.state.grid.clone();
+            if let Some(ref addrs) = self.edit_range_addrs {
+                let anchor = self
+                    .edit_target_addr
+                    .as_ref()
+                    .filter(|e| addrs.iter().any(|a| a == *e))
+                    .or_else(|| addrs.first())
+                    .expect("multi-edit addresses");
+                for a in addrs {
+                    g.set(a, Self::formula_text_for_range_cell(anchor, a, buffer));
+                }
+            } else {
+                let addr = self.cursor.to_addr(&self.state.grid);
+                g.set(&addr, buffer.clone());
+            }
+            preview_grid = Some(g);
+        } else if matches!(self.mode, Mode::Extrapolate) {
+            // Show extrapolation preview: compute candidate fills and overlay
+            // them into a cloned grid so the user can see predicted values.
+            // Also record the addresses we wrote so rendering can highlight
+            // previewed (non-committed) cells specially.
+            if let Some(Op::FillRange { cells }) = self.extrapolate_selection() {
+                let mut g = self.state.grid.clone();
+                let mut s: HashSet<CellAddr> = HashSet::new();
+                for (addr, value) in cells.iter() {
+                    g.set(addr, value.clone());
+                    s.insert(addr.clone());
+                }
+                preview_grid = Some(g);
+                previewed_addrs = Some(s);
+            }
+        }
+
+        let grid = preview_grid.as_ref().unwrap_or(base_grid);
         let title_str = {
             let raw = format!(
                 " corro  {}r × {}c  ops {}",
-                grid.main_rows(),
-                grid.main_cols(),
+                base_grid.main_rows(),
+                base_grid.main_cols(),
                 self.ops_applied
             );
             let max_w = (grid_area.width.saturating_sub(4) as usize).max(8);
@@ -8351,6 +8394,20 @@ impl App {
                 } else {
                     Style::default()
                 };
+                // If this cell is part of a transient extrapolation preview
+                // (written into a cloned preview grid), make it visually
+                // distinct so the user knows the values are not committed.
+                if matches!(self.mode, Mode::Extrapolate) {
+                    if let Some(ref s) = previewed_addrs {
+                        let cur_addr = SheetCursor { row: r, col: c }.to_addr(grid);
+                        if s.contains(&cur_addr) {
+                            // Use dim + italic-like emphasis if available; keep
+                            // the existing foreground/background but add a DIM
+                            // modifier so the preview is subtly different.
+                            st = st.add_modifier(Modifier::DIM);
+                        }
+                    }
+                }
                 // Debug dump removed to keep test output clean.
                 if is_agg_cell && !is_cur && !sel {
                     st = st.fg(Color::Cyan);
