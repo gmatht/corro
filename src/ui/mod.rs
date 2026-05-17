@@ -966,6 +966,23 @@ fn menu_popup_area(area: Rect, section: MenuSection, parent: Option<(Rect, usize
 }
 
 impl App {
+    /// Forward to the centralized extrapolation logic.
+    ///
+    /// The UI historically called `self.infer_fill_value(...)`; the real implementation
+    /// lives in `crate::extrapolate::infer_fill_value`. Keep a small forwarding wrapper
+    /// so existing call sites continue to compile while the logic remains centralized.
+    fn infer_fill_value(
+        &self,
+        seed: &[String],
+        offset_from_last: i32,
+        direction: FillDirection,
+    ) -> Option<String> {
+        let dir = match direction {
+            FillDirection::Right => crate::extrapolate::FillDirection::Right,
+            FillDirection::Down => crate::extrapolate::FillDirection::Down,
+        };
+        crate::extrapolate::infer_fill_value(seed, offset_from_last, dir)
+    }
     /// Captures Edit buffer / caret before replacing [`Self::mode`] with the menu bar.
     ///
     /// `from_mode` must be the logical UI mode **before** the menu opens. In [`Self::handle_key`],
@@ -3649,10 +3666,10 @@ impl App {
                             .get(&addr)
                             .map_or(true, |v| v.is_empty())
                         {
-                            if let Some(value) = self.infer_fill_value(
+                            if let Some(value) = crate::extrapolate::infer_fill_value(
                                 &seed,
                                 (main_col - last_col) as i32,
-                                FillDirection::Right,
+                                crate::extrapolate::FillDirection::Right,
                             ) {
                                 filled.insert((main_row, main_col));
                                 cells.push((addr, value));
@@ -3714,10 +3731,10 @@ impl App {
                             .get(&addr)
                             .map_or(true, |v| v.is_empty())
                         {
-                            if let Some(value) = self.infer_fill_value(
+                            if let Some(value) = crate::extrapolate::infer_fill_value(
                                 &seed,
                                 (main_row - last_row) as i32,
-                                FillDirection::Down,
+                                crate::extrapolate::FillDirection::Down,
                             ) {
                                 filled.insert((main_row, main_col));
                                 cells.push((addr, value));
@@ -3735,106 +3752,7 @@ impl App {
         }
     }
 
-    fn infer_fill_value(
-        &self,
-        seed: &[String],
-        offset_from_last: i32,
-        direction: FillDirection,
-    ) -> Option<String> {
-        let last = seed.last()?.clone();
-        if is_formula(&last) {
-            let (row_delta, col_delta) = match direction {
-                FillDirection::Right => (0, offset_from_last),
-                FillDirection::Down => (offset_from_last, 0),
-            };
-            if let Some(translated) = translate_formula_text_by_offset(&last, row_delta, col_delta)
-            {
-                return Some(translated);
-            }
-        }
-        if let Some(v) = Self::infer_numeric_fill(seed, offset_from_last) {
-            return Some(v);
-        }
-        if let Some(v) = Self::infer_named_sequence_fill(seed, offset_from_last) {
-            return Some(v);
-        }
-        if let Some(v) = Self::infer_suffix_fill(seed, offset_from_last) {
-            return Some(v);
-        }
-        Some(last)
-    }
-
-    fn infer_numeric_fill(seed: &[String], offset_from_last: i32) -> Option<String> {
-        if !seed.iter().all(|v| v.trim().parse::<f64>().is_ok()) {
-            return None;
-        }
-        let last = seed.last()?.trim().parse::<f64>().ok()?;
-        let prev = if seed.len() >= 2 {
-            seed[seed.len() - 2].trim().parse::<f64>().ok()?
-        } else {
-            last
-        };
-        let step = last - prev;
-        Some(format!("{}", last + step * offset_from_last as f64))
-    }
-
-    fn infer_named_sequence_fill(seed: &[String], offset_from_last: i32) -> Option<String> {
-        const WEEKDAYS: [&str; 7] = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"];
-        const MONTHS: [&str; 12] = [
-            "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC",
-        ];
-        let normalized: Vec<String> = seed.iter().map(|v| v.trim().to_ascii_uppercase()).collect();
-        let last = normalized.last()?.as_str();
-        if normalized.iter().all(|v| WEEKDAYS.contains(&v.as_str())) {
-            let idx = WEEKDAYS.iter().position(|&v| v == last)?;
-            return Some(
-                WEEKDAYS
-                    [(idx as i32 + offset_from_last).rem_euclid(WEEKDAYS.len() as i32) as usize]
-                    .to_string(),
-            );
-        }
-        if normalized.iter().all(|v| MONTHS.contains(&v.as_str())) {
-            let idx = MONTHS.iter().position(|&v| v == last)?;
-            return Some(
-                MONTHS[(idx as i32 + offset_from_last).rem_euclid(MONTHS.len() as i32) as usize]
-                    .to_string(),
-            );
-        }
-        None
-    }
-
-    fn infer_suffix_fill(seed: &[String], offset_from_last: i32) -> Option<String> {
-        let last = seed.last()?.trim();
-        let (prefix, digits) = Self::split_trailing_digits(last)?;
-        if seed
-            .iter()
-            .any(|v| Self::split_trailing_digits(v.trim()).is_none_or(|(p, _)| p != prefix))
-        {
-            return None;
-        }
-        let width = digits.len();
-        let last_num = digits.parse::<i64>().ok()?;
-        let prev_num = if seed.len() >= 2 {
-            let (_, prev_digits) = Self::split_trailing_digits(seed[seed.len() - 2].trim())?;
-            prev_digits.parse::<i64>().ok()?
-        } else {
-            last_num
-        };
-        let next = last_num + (last_num - prev_num) * offset_from_last as i64;
-        Some(format!("{prefix}{next:0width$}"))
-    }
-
-    fn split_trailing_digits(s: &str) -> Option<(&str, &str)> {
-        let bytes = s.as_bytes();
-        let mut i = bytes.len();
-        while i > 0 && bytes[i - 1].is_ascii_digit() {
-            i -= 1;
-        }
-        if i == bytes.len() {
-            return None;
-        }
-        Some((&s[..i], &s[i..]))
-    }
+    // infer_fill_value and helpers moved to crate::extrapolate to centralize logic.
 
     /// Sheet layout address for a visible `(row, col)` without using edit-mode buffer preview.
     fn cell_addr_for_position(&self, row: usize, col: usize) -> Option<CellAddr> {
@@ -8002,7 +7920,7 @@ impl App {
         let max_data_lines = inner_h.saturating_sub(1);
         let last_display_main_row = grid.sorted_main_rows().last().map(|row| hr + *row);
         for &r in row_ixs.iter().take(max_data_lines) {
-            let mut dbg_interior_gaps_skipped = 0usize;
+            let mut _dbg_interior_gaps_skipped = 0usize;
             let active_row = r == self.cursor.row;
             let is_underlined_boundary_row =
                 (hr > 0 && r == hr - 1) || last_display_main_row == Some(r);
@@ -8470,7 +8388,7 @@ impl App {
                     InterColumnTrailing::EndOfVisibleRow => {}
                     InterColumnTrailing::SuppressedSpillInterior => {
                         // #region agent log
-                        dbg_interior_gaps_skipped += 1;
+                        _dbg_interior_gaps_skipped += 1;
                         spill_suppressed_gap_budget += 1;
                         // #endregion
                     }
@@ -10491,16 +10409,24 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                     if self.anchor.is_none() {
                         self.anchor = Some(self.cursor);
                     }
-                    if self.cursor.col > 0 {
-                        self.cursor.col = self.cursor.col.saturating_sub(1);
-                    }
-                    self.cursor.clamp(&self.state.grid);
+                    self.move_cursor_one_col_horizontal(false);
                 }
                 KeyCode::Right => {
                     if self.anchor.is_none() {
                         self.anchor = Some(self.cursor);
                     }
-                    self.cursor.col = self.cursor.col.saturating_add(1);
+                    // If at the rightmost main column, grow the main area so the
+                    // extrapolation target becomes visible instead of being
+                    // clamped to the existing NAV_BLANK_COLS policy.
+                    let lm = MARGIN_COLS;
+                    let mc = self.state.grid.main_cols();
+                    let right_limit = lm + mc.saturating_sub(1);
+                    if self.cursor.col < right_limit {
+                        self.cursor.col = self.cursor.col.saturating_add(1);
+                    } else {
+                        self.state.grid.grow_main_col_at_right();
+                        self.cursor.col = self.cursor.col.saturating_add(1);
+                    }
                     self.cursor.clamp(&self.state.grid);
                     self.state
                         .grid
@@ -10510,16 +10436,24 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                     if self.anchor.is_none() {
                         self.anchor = Some(self.cursor);
                     }
-                    if self.cursor.row > 0 {
-                        self.cursor.row = self.cursor.row.saturating_sub(1);
-                    }
-                    self.cursor.clamp(&self.state.grid);
+                    self.move_cursor_one_row_vertical(false);
                 }
                 KeyCode::Down => {
                     if self.anchor.is_none() {
                         self.anchor = Some(self.cursor);
                     }
-                    self.cursor.row = self.cursor.row.saturating_add(1);
+                    // If at the bottom main row, grow the main area so the
+                    // extrapolation target becomes visible instead of being
+                    // clamped to the existing NAV_BLANK_ROWS policy.
+                    let hr = HEADER_ROWS;
+                    let mr = self.state.grid.main_rows();
+                    let bottom_main = hr + mr.saturating_sub(1);
+                    if self.cursor.row < bottom_main {
+                        self.cursor.row = self.cursor.row.saturating_add(1);
+                    } else {
+                        self.state.grid.grow_main_row_at_bottom();
+                        self.cursor.row = self.cursor.row.saturating_add(1);
+                    }
                     self.cursor.clamp(&self.state.grid);
                     self.state
                         .grid
@@ -10860,6 +10794,84 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                     let new_expr_end = Self::formula_buffer_expr_end_char_idx(buffer);
                     self.edit_cursor = Some(new_expr_end);
                 }
+                // When editing, Shift+Arrow should start a cell selection and behave
+                // like it does in Normal mode. Handle Shift+Arrow here before the
+                // text-editing Left/Right branch so Shift doesn't get consumed as a
+                // plain text navigation key.
+                KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down
+                    if key.modifiers.contains(KeyModifiers::SHIFT) =>
+                {
+                    let ctrl_or_cmd = key.modifiers.contains(KeyModifiers::CONTROL)
+                        || key.modifiers.contains(KeyModifiers::SUPER);
+                    match key.code {
+                        KeyCode::Left if ctrl_or_cmd => {
+                            let _ = self.extend_selection_to_edge(SelectionEdgeDirection::Left);
+                        }
+                        KeyCode::Right if ctrl_or_cmd => {
+                            let _ = self.extend_selection_to_edge(SelectionEdgeDirection::Right);
+                        }
+                        KeyCode::Up if ctrl_or_cmd => {
+                            let _ = self.extend_selection_to_edge(SelectionEdgeDirection::Up);
+                        }
+                        KeyCode::Down if ctrl_or_cmd => {
+                            let _ = self.extend_selection_to_edge(SelectionEdgeDirection::Down);
+                        }
+                        KeyCode::Left => {
+                            let left = MARGIN_COLS;
+                            if self.cursor.col > left {
+                                if self.anchor.is_none() {
+                                    self.anchor = Some(self.cursor);
+                                }
+                                self.cursor.col = self.cursor.col.saturating_sub(1);
+                                self.cursor.clamp(&self.state.grid);
+                            }
+                        }
+                        KeyCode::Right => {
+                            let lm = MARGIN_COLS;
+                            let mc = self.state.grid.main_cols();
+                            let right_limit = lm + mc.saturating_sub(1);
+                            if self.anchor.is_none() {
+                                self.anchor = Some(self.cursor);
+                            }
+                            if self.cursor.col < right_limit {
+                                self.cursor.col = self.cursor.col.saturating_add(1);
+                            } else {
+                                self.state.grid.grow_main_col_at_right();
+                                self.cursor.col = self.cursor.col.saturating_add(1);
+                            }
+                            self.cursor.clamp(&self.state.grid);
+                            self.state.grid.ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
+                        }
+                        KeyCode::Up => {
+                            let top_main = HEADER_ROWS;
+                            if self.cursor.row > top_main {
+                                if self.anchor.is_none() {
+                                    self.anchor = Some(self.cursor);
+                                }
+                                self.cursor.row = self.cursor.row.saturating_sub(1);
+                                self.cursor.clamp(&self.state.grid);
+                            }
+                        }
+                        KeyCode::Down => {
+                            let hr = HEADER_ROWS;
+                            let mr = self.state.grid.main_rows();
+                            let bottom_main = hr + mr.saturating_sub(1);
+                            if self.anchor.is_none() {
+                                self.anchor = Some(self.cursor);
+                            }
+                            if self.cursor.row < bottom_main {
+                                self.cursor.row = self.cursor.row.saturating_add(1);
+                            } else {
+                                self.state.grid.grow_main_row_at_bottom();
+                                self.cursor.row = self.cursor.row.saturating_add(1);
+                            }
+                            self.cursor.clamp(&self.state.grid);
+                            self.state.grid.ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
+                        }
+                        _ => {}
+                    }
+                }
+
                 KeyCode::Left | KeyCode::Right => {
                     match Self::handle_text_input_key(buffer, &mut self.edit_cursor, key.code) {
                         TextInputAction::Handled => {}
@@ -11172,6 +11184,24 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                 let ctrl_or_cmd = key.modifiers.contains(KeyModifiers::CONTROL)
                     || key.modifiers.contains(KeyModifiers::SUPER);
 
+                // If we're in Edit mode and the user presses Shift+Arrow, start a
+                // cell selection so Shift+Arrow behaves like it does in Normal
+                // mode. This is a minimal change: set an anchor and selection
+                // kind here and let the existing Shift+Arrow handlers move the
+                // cursor.
+                if matches!(mode, Mode::Edit { .. })
+                    && key.modifiers.contains(KeyModifiers::SHIFT)
+                    && matches!(
+                        key.code,
+                        KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down
+                    )
+                {
+                    if self.anchor.is_none() {
+                        self.anchor = Some(self.cursor);
+                    }
+                    self.selection_kind = SelectionKind::Cells;
+                }
+
                 match key.code {
                     KeyCode::Esc => {
                         if self.anchor.is_some() {
@@ -11218,7 +11248,10 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                         let _ = self.extend_selection_to_edge(SelectionEdgeDirection::Down);
                     }
                     KeyCode::Left if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                        if self.cursor.col > 0 {
+                        // When extending a selection, stay within the main data
+                        // area (do not move into left/right margins).
+                        let left = MARGIN_COLS;
+                        if self.cursor.col > left {
                             if self.anchor.is_none() {
                                 self.anchor = Some(self.cursor);
                             }
@@ -11227,37 +11260,53 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                         }
                     }
                     KeyCode::Right if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                        // Extend selection to the right but keep within main cols.
+                        let lm = MARGIN_COLS;
+                        let mc = self.state.grid.main_cols();
+                        let right_limit = lm + mc.saturating_sub(1);
                         if self.anchor.is_none() {
                             self.anchor = Some(self.cursor);
                         }
-                        self.cursor.col = self.cursor.col.saturating_add(1);
+                        // Allow selection expansion beyond the current main area by
+                        // growing the main columns when at the right edge.
+                        if self.cursor.col < right_limit {
+                            self.cursor.col = self.cursor.col.saturating_add(1);
+                        } else {
+                            self.state.grid.grow_main_col_at_right();
+                            self.cursor.col = self.cursor.col.saturating_add(1);
+                        }
                         self.cursor.clamp(&self.state.grid);
-                        self.state
-                            .grid
-                            .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
+                        self.state.grid.ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
                     }
                     KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                        if self.cursor.row > 0 {
+                        // Extend selection up but remain inside main rows (no header).
+                        let top_main = HEADER_ROWS;
+                        if self.cursor.row > top_main {
                             if self.anchor.is_none() {
                                 self.anchor = Some(self.cursor);
                             }
-                            if !self.move_cursor_row_through_view(false) {
-                                self.cursor.row = self.cursor.row.saturating_sub(1);
-                                self.cursor.clamp(&self.state.grid);
-                            }
+                            self.cursor.row = self.cursor.row.saturating_sub(1);
+                            self.cursor.clamp(&self.state.grid);
                         }
                     }
                     KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                        // Extend selection down but remain inside main rows (no footer).
+                        let hr = HEADER_ROWS;
+                        let mr = self.state.grid.main_rows();
+                        let bottom_main = hr + mr.saturating_sub(1);
                         if self.anchor.is_none() {
                             self.anchor = Some(self.cursor);
                         }
-                        if !self.move_cursor_row_through_view(true) {
+                        // Allow selection expansion beyond the current main area by
+                        // growing the main rows when at the bottom edge.
+                        if self.cursor.row < bottom_main {
                             self.cursor.row = self.cursor.row.saturating_add(1);
-                            self.cursor.clamp(&self.state.grid);
-                            self.state
-                                .grid
-                                .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
+                        } else {
+                            self.state.grid.grow_main_row_at_bottom();
+                            self.cursor.row = self.cursor.row.saturating_add(1);
                         }
+                        self.cursor.clamp(&self.state.grid);
+                        self.state.grid.ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
                     }
                     KeyCode::Char('o') => {
                         self.edit_special_palette = false;
@@ -12225,6 +12274,31 @@ mod tests {
             app.cursor.to_addr(&app.state.grid),
             CellAddr::Footer { .. }
         ));
+    }
+
+    #[test]
+    fn shift_arrow_in_edit_starts_selection() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(3, 3);
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS + 1,
+        };
+        app.anchor = None;
+        app.selection_kind = SelectionKind::Cells;
+        app.mode = Mode::Edit {
+            buffer: "".into(),
+            formula_cursor: None,
+            formula_ref_char_start: None,
+            fit_to_content_on_commit: false,
+        };
+
+        // Press Shift+Right: expecting selection to start (anchor set)
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT))
+            .unwrap();
+
+        assert!(app.anchor.is_some(), "anchor not set by Shift+Arrow in Edit mode");
+        assert_eq!(app.selection_kind, SelectionKind::Cells);
     }
 
     #[test]
@@ -14749,6 +14823,44 @@ mod tests {
             ),
             "]ZZ1"
         );
+    }
+
+    #[test]
+    fn extrapolate_right_grows_main_cols() {
+        let mut app = App::new(None);
+        // ensure small main area
+        app.state.grid.set_main_size(1, 1);
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS + app.state.grid.main_cols().saturating_sub(1),
+        };
+        // Enter extrapolate mode (menu action would set anchor if none)
+        app.anchor = Some(app.cursor);
+        app.mode = Mode::Extrapolate;
+
+        // Simulate Right key press
+        let key = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        let _ = app.handle_key(key).unwrap();
+
+        // main cols should have grown by at least 1
+        assert!(app.state.grid.main_cols() >= 2, "main_cols: {}", app.state.grid.main_cols());
+    }
+
+    #[test]
+    fn extrapolate_down_grows_main_rows() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 1);
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS + app.state.grid.main_rows().saturating_sub(1),
+            col: MARGIN_COLS,
+        };
+        app.anchor = Some(app.cursor);
+        app.mode = Mode::Extrapolate;
+
+        let key = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        let _ = app.handle_key(key).unwrap();
+
+        assert!(app.state.grid.main_rows() >= 2, "main_rows: {}", app.state.grid.main_rows());
     }
 
     #[test]
