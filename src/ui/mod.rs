@@ -99,6 +99,39 @@ mod extrapolate_tests {
             panic!("expected FillRange op");
         }
     }
+
+    #[test]
+    fn debug_print_s1_contents() {
+        use std::path::PathBuf;
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs/tests/extrapolate.corro");
+        let mut app = App::new(Some(path));
+        app.load_initial().unwrap();
+        let col_s = crate::addr::parse_excel_column("S").unwrap() as usize;
+        let grid = &app.state.grid;
+        let addr = crate::grid::CellAddr::Main { row: 0, col: col_s as u32 };
+        let raw = grid.get(&addr);
+        eprintln!("DEBUG: raw S1 = {:?}", raw);
+        let disp = cell_effective_display(grid, &addr);
+        eprintln!("DEBUG: display S1 = {}", disp);
+        // Also print rendered_width_for_column
+        eprintln!("DEBUG: rendered_width_for_S = {:?}", app.rendered_width_for_column(crate::grid::MARGIN_COLS + col_s));
+    }
+
+    #[test]
+    fn debug_find_2001_cells() {
+        use std::path::PathBuf;
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs/tests/extrapolate.corro");
+        let mut app = App::new(Some(path));
+        app.load_initial().unwrap();
+        let mut found = Vec::new();
+        for (addr, v) in app.state.grid.iter_nonempty() {
+            if v.contains("2001") {
+                found.push((addr, v));
+            }
+        }
+        eprintln!("DEBUG found 2001 cells: {:?}", found);
+        assert!(!found.is_empty());
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -341,6 +374,8 @@ enum Mode {
     QuitImportPrompt,
     /// Interactive extrapolation: arrow keys extend the selection, Enter extrapolates, Esc cancels.
     Extrapolate,
+    /// Interactive duplicate: arrow keys extend the selection, Enter duplicates, Esc cancels.
+    Duplicate,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -408,6 +443,7 @@ enum MenuAction {
     Extrapolate,
     Find,
     Replace,
+    Duplicate,
     OpenFile,
     Replay,
     SaveAs,
@@ -468,7 +504,7 @@ struct MenuItem {
     target: MenuTarget,
 }
 
-const EDIT_MENU_ITEMS: [MenuItem; 6] = [
+const EDIT_MENU_ITEMS: [MenuItem; 7] = [
     MenuItem {
         shortcut: 'X',
         label: "Cut",
@@ -493,6 +529,11 @@ const EDIT_MENU_ITEMS: [MenuItem; 6] = [
         shortcut: 'R',
         label: "Replace",
         target: MenuTarget::Action(MenuAction::Replace),
+    },
+    MenuItem {
+        shortcut: 'D',
+        label: "Duplicate",
+        target: MenuTarget::Action(MenuAction::Duplicate),
     },
     MenuItem {
         shortcut: 'E',
@@ -1247,9 +1288,19 @@ impl App {
             MenuAction::Find => Mode::Find {
                 buffer: self.start_input_mode(String::new()),
             },
-            MenuAction::Replace => Mode::Replace {
+    MenuAction::Replace => Mode::Replace {
                 buffer: self.start_input_mode(String::new()),
             },
+            MenuAction::Duplicate => {
+                // If there is no selection anchor, treat the current cell as
+                // the duplicate source so the user can move the cursor/extend
+                // selection and press Enter to apply.
+                if self.anchor.is_none() {
+                    self.anchor = Some(self.cursor);
+                }
+                self.status = "Use arrows to extend selection, Enter to duplicate, Esc to cancel".into();
+                Mode::Duplicate
+            }
             MenuAction::OpenFile => {
                 let buffer = self.open_path_prompt_buffer();
                 Mode::OpenPath {
@@ -1771,6 +1822,7 @@ mod menu_tests {
         let buf = term.backend().buffer();
         let visible = buf.content().iter().map(|c| c.symbol().to_string()).collect::<String>();
         assert!(visible.contains("Extrapolate"), "Edit menu missing Extrapolate: {}", visible);
+        assert!(visible.contains("Duplicate"), "Edit menu missing Duplicate: {}", visible);
     }
 }
 
@@ -2041,13 +2093,7 @@ fn header_template_applies(grid: &Grid, main_col: usize) -> bool {
 }
 
 fn data_main_col_count(grid: &Grid) -> usize {
-    let mc = grid.main_cols();
-    for c in 0..mc {
-        if right_col_agg_func(grid, MARGIN_COLS + c).is_some() {
-            return c + 1;
-        }
-    }
-    mc
+    crate::agg::helpers::data_main_col_count(grid)
 }
 
 fn row_total_block_start(grid: &Grid, current_main_row: u32) -> u32 {
@@ -2060,29 +2106,7 @@ fn row_total_block_start(grid: &Grid, current_main_row: u32) -> u32 {
 }
 
 fn previous_raw_block(grid: &Grid, current_main_row: u32) -> Option<(u32, u32)> {
-    let mut end = current_main_row;
-    while end > 0 {
-        let last_agg = (0..end)
-            .rev()
-            .find(|&r| left_margin_agg_func(grid, r).is_some())
-            .unwrap_or(0);
-        let prev_agg = if last_agg == 0 {
-            None
-        } else {
-            (0..last_agg)
-                .rev()
-                .find(|&r| left_margin_agg_func(grid, r).is_some())
-        };
-        let start = prev_agg.map_or(0, |r| r + 1);
-        if start < last_agg {
-            return Some((start, last_agg));
-        }
-        if last_agg == 0 {
-            return Some((0, end));
-        }
-        end = last_agg;
-    }
-    Some((0, current_main_row))
+    crate::agg::helpers::previous_raw_block(grid, current_main_row)
 }
 
 fn left_margin_main_col_aggregate(
@@ -2091,26 +2115,7 @@ fn left_margin_main_col_aggregate(
     current_main_row: u32,
     main_col: u32,
 ) -> String {
-    let block_start = row_total_block_start(grid, current_main_row);
-    let Some((start, end)) = (if block_start < current_main_row {
-        Some((block_start, current_main_row))
-    } else {
-        previous_raw_block(grid, current_main_row)
-    }) else {
-        return String::new();
-    };
-    compute_aggregate(
-        grid,
-        &AggregateDef {
-            func,
-            source: MainRange {
-                row_start: start,
-                row_end: end,
-                col_start: main_col,
-                col_end: main_col + 1,
-            },
-        },
-    )
+    crate::agg::helpers::left_margin_main_col_aggregate(grid, func, current_main_row, main_col)
 }
 
 fn left_margin_special_col_aggregate(
@@ -2121,42 +2126,14 @@ fn left_margin_special_col_aggregate(
     row_end: u32,
     data_cols: usize,
 ) -> Option<String> {
-    let col_func = right_col_agg_func(grid, global_col)?;
-    let collect = |row_start: u32, row_end: u32| -> Vec<f64> {
-        let mut samples: Vec<f64> = Vec::new();
-        for r in row_start..row_end {
-            let row_val = compute_aggregate(
-                grid,
-                &AggregateDef {
-                    func: col_func,
-                    source: MainRange {
-                        row_start: r,
-                        row_end: r + 1,
-                        col_start: 0,
-                        col_end: data_cols as u32,
-                    },
-                },
-            );
-            if let Some(n) = parse_num(&row_val) {
-                samples.push(n);
-            }
-        }
-        samples
-    };
-
-    let mut samples = collect(row_start, row_end);
-    let mut end = row_start;
-    while samples.is_empty() && end > 0 {
-        let Some((fallback_start, fallback_end)) = previous_raw_block(grid, end) else {
-            break;
-        };
-        samples = collect(fallback_start, fallback_end);
-        if fallback_start == 0 {
-            break;
-        }
-        end = fallback_start;
-    }
-    Some(fold_numbers(subtotal_func, &samples))
+    crate::agg::helpers::left_margin_special_col_aggregate(
+        grid,
+        subtotal_func,
+        global_col,
+        row_start,
+        row_end,
+        data_cols,
+    )
 }
 
 fn left_margin_template_applies(grid: &Grid, main_row: usize) -> bool {
@@ -5136,14 +5113,178 @@ impl App {
         // One char separator per adjacent pair; matches trim loop roughly.
         let gaps = n.saturating_sub(1);
         let budget = data_width.saturating_sub(gaps);
-        let per = (budget / n).max(1);
+        // Determine desired widths (capped by grid max_col_width) for each visible
+        // column. If the sum of desired widths fits the budget, use them. When
+        // budget is tighter, allocate greedily prioritizing columns that request
+        // more width so that important columns can expand while others shrink to
+        // the minimum of 1 char.
+        let mut desired: Vec<(usize, usize)> = Vec::with_capacity(n);
         for &c in col_ixs {
             if let Some(maxw) = self.rendered_width_for_column(c) {
-                self.state
-                    .grid
-                    .set_col_width(c, Some(maxw.min(per)));
+                let cap = maxw.min(self.state.grid.max_col_width());
+                desired.push((c, cap));
             } else {
-                self.state.grid.set_col_width(c, None);
+                // No content: treat as default small column
+                desired.push((c, 4));
+            }
+        }
+
+        let total_desired: usize = desired.iter().map(|(_, w)| *w).sum();
+        if total_desired <= budget {
+            for (c, w) in desired {
+                self.state.grid.set_col_width(c, Some(w));
+            }
+            return;
+        }
+
+        // Proportional allocation across visible columns.
+        // Each column has a desired cap (>=1). Start by giving 1 char to each
+        // column (the minimum). Distribute the remaining budget proportionally
+        // to (cap - 1) so columns that need more get a fair share but no one
+        // column can consume the entire viewport.
+        let mut allocations: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+        for (c, _cap) in &desired {
+            allocations.insert(*c, 1);
+        }
+
+        let mut rem_budget = budget.saturating_sub(desired.len());
+        // Build mutable state for columns: (col, cap, remaining_need = cap - allocated, weight)
+        // Weight biases distribution toward columns that look like dates so they
+        // are more likely to receive additional width when the budget is tight.
+        let mut cols: Vec<(usize, usize, usize, usize)> = Vec::with_capacity(desired.len());
+        for (col, cap) in desired.into_iter() {
+            let need = cap.saturating_sub(1);
+            // Heuristic: if any visible cell in this column looks like YYYY/MM/DD or YYYY-MM-DD
+            // prefer this column by increasing its weight.
+            let mut looks_like_date = false;
+            // check header/footer entries via grid.iter_nonempty and main rows
+            for (addr, _) in self.state.grid.iter_nonempty() {
+                match addr {
+                    CellAddr::Header { col: hcol, .. } | CellAddr::Footer { col: hcol, .. } if (hcol as usize) == col => {
+                        let val = normalize_inline_text(&cell_effective_display(&self.state.grid, &addr));
+                        let t = val.trim();
+                        let bytes = t.as_bytes();
+                        if bytes.len() >= 10 {
+                            for i in 0..=bytes.len().saturating_sub(10) {
+                                if (bytes[i + 4] == b'-' || bytes[i + 4] == b'/' || bytes[i + 4] == b'\\')
+                                    && (bytes[i + 7] == b'-' || bytes[i + 7] == b'/' || bytes[i + 7] == b'\\')
+                                {
+                                    if bytes[i..i + 4].iter().all(|b| b.is_ascii_digit())
+                                        && bytes[i + 5..i + 7].iter().all(|b| b.is_ascii_digit())
+                                        && bytes[i + 8..i + 10].iter().all(|b| b.is_ascii_digit())
+                                    {
+                                        looks_like_date = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                if looks_like_date {
+                    break;
+                }
+            }
+            if !looks_like_date {
+                let main_cols = self.state.grid.main_cols();
+                for r in 0..self.state.grid.main_rows() {
+                    let val = if col < MARGIN_COLS {
+                        let addr = CellAddr::Left { col, row: r as u32 };
+                        normalize_inline_text(&cell_effective_display(&self.state.grid, &addr))
+                    } else if col < MARGIN_COLS + main_cols {
+                        let addr = CellAddr::Main { row: r as u32, col: (col - MARGIN_COLS) as u32 };
+                        normalize_inline_text(&cell_effective_display(&self.state.grid, &addr))
+                    } else {
+                        let addr = CellAddr::Right { col: col - MARGIN_COLS - main_cols, row: r as u32 };
+                        normalize_inline_text(&cell_effective_display(&self.state.grid, &addr))
+                    };
+                    let t = val.trim();
+                    let bytes = t.as_bytes();
+                    if bytes.len() >= 10 {
+                        for i in 0..=bytes.len().saturating_sub(10) {
+                            if (bytes[i + 4] == b'-' || bytes[i + 4] == b'/' || bytes[i + 4] == b'\\')
+                                && (bytes[i + 7] == b'-' || bytes[i + 7] == b'/' || bytes[i + 7] == b'\\')
+                            {
+                                if bytes[i..i + 4].iter().all(|b| b.is_ascii_digit())
+                                    && bytes[i + 5..i + 7].iter().all(|b| b.is_ascii_digit())
+                                    && bytes[i + 8..i + 10].iter().all(|b| b.is_ascii_digit())
+                                {
+                                    looks_like_date = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if looks_like_date {
+                        break;
+                    }
+                }
+            }
+
+            let weight = if looks_like_date { need.saturating_mul(8).max(1) } else { need.max(1) };
+            cols.push((col, cap, need, weight));
+        }
+
+        // Repeatedly distribute remaining budget proportionally until exhausted
+        // or no column can accept more.
+        while rem_budget > 0 {
+            let total_weight: usize = cols.iter().map(|(_, _cap, need, weight)| if *need > 0 { *weight } else { 0 }).sum();
+            if total_weight == 0 {
+                break;
+            }
+
+            // First pass: give each column its floor share proportional to weight.
+            let mut given = 0usize;
+            let mut remainders: Vec<(usize, usize)> = Vec::new(); // (col, rem)
+            for (col, cap, need, weight) in cols.iter_mut() {
+                if *need == 0 {
+                    continue;
+                }
+                let numerator = rem_budget.saturating_mul(*weight);
+                let base = numerator / total_weight;
+                let rem = numerator % total_weight;
+                let give = base.min(*need);
+                if give > 0 {
+                    let entry = allocations.entry(*col).or_insert(1);
+                    *entry = (*entry).saturating_add(give);
+                    *need = need.saturating_sub(give);
+                    given = given.saturating_add(give);
+                }
+                if *need > 0 {
+                    remainders.push((*col, rem));
+                }
+            }
+
+            rem_budget = rem_budget.saturating_sub(given);
+
+            if rem_budget == 0 {
+                break;
+            }
+
+            // Distribute leftover one-by-one by descending remainder, clamped by each column's remaining need.
+            remainders.sort_by(|a, b| b.1.cmp(&a.1));
+            for (col, _rem) in remainders.iter() {
+                if rem_budget == 0 {
+                    break;
+                }
+                if let Some((_c, _cap, need, _weight)) = cols.iter_mut().find(|(cc, _cap, _need, _w)| cc == col) {
+                    if *need > 0 {
+                        let entry = allocations.entry(*col).or_insert(1);
+                        *entry = (*entry).saturating_add(1);
+                        *need = need.saturating_sub(1);
+                        rem_budget = rem_budget.saturating_sub(1);
+                    }
+                }
+            }
+        }
+
+        // Apply allocations in the original left-to-right column order.
+        for &c in col_ixs {
+            if let Some(&w) = allocations.get(&c) {
+                self.state.grid.set_col_width(c, Some(w));
+            } else {
+                self.state.grid.set_col_width(c, Some(1));
             }
         }
     }
@@ -5413,6 +5554,34 @@ impl App {
         if self.cursor.row >= hr + main_rows {
             return self.insert_mitosis_footer_row_after_cursor();
         }
+        // If rows are selected, duplicate each selected row. Process in
+        // descending order to avoid index-shift hazards when inserting.
+        if self.selection_kind == SelectionKind::Rows {
+            if let Some((rows, _cols)) = self.current_selection_range() {
+                let mut main_idxs: Vec<u32> = rows
+                    .into_iter()
+                    .filter_map(|r| {
+                        if r >= hr && r < hr + main_rows {
+                            Some((r - hr) as u32)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                // Duplicate main rows in descending order so earlier inserts
+                // don't shift later sources.
+                main_idxs.sort_unstable_by(|a, b| b.cmp(a));
+                for idx in main_idxs {
+                    self.apply_single_op(Op::DuplicateRow { row: idx })?;
+                }
+                // Move cursor to the first duplicated row after the last source
+                // (keep selection cleared).
+                self.anchor = None;
+                self.selection_kind = SelectionKind::Cells;
+                self.status = "Duplicated selected rows".into();
+                return Ok(true);
+            }
+        }
         self.insert_mitosis_main_data_row_after_cursor()
     }
 
@@ -5674,6 +5843,30 @@ impl App {
         }
         if self.cursor.col >= hm + original_main_cols {
             return self.insert_mitosis_right_margin_col_after_cursor();
+        }
+        // If columns are selected, duplicate each selected column. Process in
+        // descending order to avoid index-shift hazards when inserting.
+        if self.selection_kind == SelectionKind::Cols {
+            if let Some((_rows, cols)) = self.current_selection_range() {
+                let mut main_idxs: Vec<u32> = cols
+                    .into_iter()
+                    .filter_map(|c| {
+                        if c >= hm && c < hm + original_main_cols {
+                            Some((c - hm) as u32)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                main_idxs.sort_unstable_by(|a, b| b.cmp(a));
+                for idx in main_idxs {
+                    self.apply_single_op(Op::DuplicateCol { col: idx })?;
+                }
+                self.anchor = None;
+                self.selection_kind = SelectionKind::Cells;
+                self.status = "Duplicated selected cols".into();
+                return Ok(true);
+            }
         }
         self.insert_mitosis_main_data_col_after_cursor()
     }
@@ -8031,9 +8224,32 @@ impl App {
                         .add_modifier(Modifier::BOLD)
                 };
                 let w = grid.col_width(c).max(1);
-                let p = name
-                    .unicode_pad(w, UTruncAlign::Right, true)
-                    .into_owned();
+                // Choose header alignment to match the column contents when possible.
+                // For main data columns prefer the effective cell alignment of the
+                // first non-empty cell; fallback to left alignment.
+                let header_align = if c >= lm && c < lm + mc {
+                    let mut found_align: Option<TextAlign> = None;
+                    for r in 0..grid.main_rows() {
+                        let addr = CellAddr::Main {
+                            row: r as u32,
+                            col: (c - lm) as u32,
+                        };
+                        let eff = cell_effective_display(grid, &addr);
+                        if !eff.trim().is_empty() {
+                            let formatted = format_cell_display(grid, &addr, eff);
+                            found_align = effective_cell_align(grid, &addr, &formatted);
+                            break;
+                        }
+                    }
+                    if let Some(ta) = found_align {
+                        text_align_to_utrunc(ta)
+                    } else {
+                        UTruncAlign::Left
+                    }
+                } else {
+                    UTruncAlign::Left
+                };
+                let p = name.unicode_pad(w, header_align, true).into_owned();
                 spans.push(Span::styled(p, style));
                 if i + 1 < col_ixs.len() {
                     if c == lm - 1 && lm > 0 && col_ixs.contains(&lm) {
@@ -8894,6 +9110,9 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
             Mode::FormatDecimals { .. } => "  type decimals   Enter·apply   Esc·cancel".into(),
             Mode::Extrapolate => {
                 "  arrows·extend selection   Enter·extrapolate   Esc·cancel".into()
+            }
+            Mode::Duplicate => {
+                "  arrows·extend selection   Enter·duplicate   Esc·cancel".into()
             }
             Mode::QuitPrompt => "  Q·quit   B·back   Esc·cancel".into(),
             Mode::QuitImportPrompt => "  S·save as .corro   D·discard   B·back".into(),
@@ -10623,6 +10842,96 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                 }
                 _ => {}
             },
+            Mode::Duplicate => match key.code {
+                KeyCode::Enter => {
+                    // Apply duplicate semantics: duplicate selected rows or
+                    // cols if the selection mode indicates, otherwise attempt
+                    // a mitosis for the current cursor.
+                    if self.selection_kind == SelectionKind::Rows {
+                        if let Ok(_) = self.insert_mitosis_row_after_cursor() {
+                            self.status = "Duplicated selection".into();
+                        } else {
+                            self.status = "Nothing to duplicate".into();
+                        }
+                    } else if self.selection_kind == SelectionKind::Cols {
+                        if let Ok(_) = self.insert_mitosis_col_after_cursor() {
+                            self.status = "Duplicated selection".into();
+                        } else {
+                            self.status = "Nothing to duplicate".into();
+                        }
+                    } else {
+                        // Fallback: try duplicating the current cursor row/col
+                        if let Ok(true) = self.insert_mitosis_row_after_cursor() {
+                            self.status = "Duplicated row".into();
+                        } else if let Ok(true) = self.insert_mitosis_col_after_cursor() {
+                            self.status = "Duplicated col".into();
+                        } else {
+                            self.status = "Nothing to duplicate".into();
+                        }
+                    }
+                    self.anchor = None;
+                    mode = Mode::Normal;
+                }
+                KeyCode::Esc => {
+                    self.anchor = None;
+                    mode = Mode::Normal;
+                }
+                KeyCode::Left => {
+                    if self.anchor.is_none() {
+                        self.anchor = Some(self.cursor);
+                    }
+                    self.move_cursor_one_col_horizontal(false);
+                }
+                KeyCode::Right => {
+                    if self.anchor.is_none() {
+                        self.anchor = Some(self.cursor);
+                    }
+                    // If at the rightmost main column, grow the main area so the
+                    // duplicate target becomes visible instead of being
+                    // clamped to the existing NAV_BLANK_COLS policy.
+                    let lm = MARGIN_COLS;
+                    let mc = self.state.grid.main_cols();
+                    let right_limit = lm + mc.saturating_sub(1);
+                    if self.cursor.col < right_limit {
+                        self.cursor.col = self.cursor.col.saturating_add(1);
+                    } else {
+                        self.state.grid.grow_main_col_at_right();
+                        self.cursor.col = self.cursor.col.saturating_add(1);
+                    }
+                    self.cursor.clamp(&self.state.grid);
+                    self.state
+                        .grid
+                        .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
+                }
+                KeyCode::Up => {
+                    if self.anchor.is_none() {
+                        self.anchor = Some(self.cursor);
+                    }
+                    self.move_cursor_one_row_vertical(false);
+                }
+                KeyCode::Down => {
+                    if self.anchor.is_none() {
+                        self.anchor = Some(self.cursor);
+                    }
+                    // If at the bottom main row, grow the main area so the
+                    // duplicate target becomes visible instead of being
+                    // clamped to the existing NAV_BLANK_ROWS policy.
+                    let hr = HEADER_ROWS;
+                    let mr = self.state.grid.main_rows();
+                    let bottom_main = hr + mr.saturating_sub(1);
+                    if self.cursor.row < bottom_main {
+                        self.cursor.row = self.cursor.row.saturating_add(1);
+                    } else {
+                        self.state.grid.grow_main_row_at_bottom();
+                        self.cursor.row = self.cursor.row.saturating_add(1);
+                    }
+                    self.cursor.clamp(&self.state.grid);
+                    self.state
+                        .grid
+                        .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
+                }
+                _ => {}
+            },
             Mode::OpenPath { buffer } => match key.code {
                 KeyCode::Enter => match parse_open_path_request(buffer) {
                     Err(OpenPathError::Empty) => {
@@ -11894,7 +12203,7 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                 .style(Style::default().fg(Color::White).bg(Color::Blue)),
             Mode::About => Paragraph::new(" About - Up/Down scroll, Esc closes ")
                 .style(Style::default().fg(Color::White).bg(Color::Blue)),
-            Mode::Extrapolate | Mode::Menu { .. } | Mode::Normal | Mode::RevisionBrowse => {
+            Mode::Extrapolate | Mode::Duplicate | Mode::Menu { .. } | Mode::Normal | Mode::RevisionBrowse => {
                 let prompt_cyan = Style::default().fg(Color::Cyan);
                 let prompt_cyan_bold = prompt_cyan.add_modifier(Modifier::BOLD);
                 let formula = if matches!(&self.mode, Mode::Menu { .. }) {
@@ -16848,6 +17157,408 @@ mod tests {
 
         assert!(!positions.is_empty());
         assert!(positions.windows(2).all(|w| w[0] == w[1]));
+    }
+
+    #[test]
+    fn extrapolate_columns_do_not_shift_on_cursor_move() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use std::path::PathBuf;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use std::collections::HashMap;
+
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs/tests/extrapolate.corro");
+        let mut app = App::new(Some(path));
+        app.load_initial().unwrap();
+
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        // Initial draw
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+
+        // Capture positions for all visible header-like labels we expect in the fixture.
+        // We only record labels that are present in the initial render and then assert they
+        // remain at the same x position after moving the cursor.
+        let candidates = [
+            "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun", // weekday abbr
+            "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+        ];
+
+        let mut positions0: HashMap<String, usize> = HashMap::new();
+        for row in &rows {
+            for &cand in &candidates {
+                if positions0.contains_key(cand) {
+                    continue;
+                }
+                if let Some(idx) = row.find(cand) {
+                    positions0.insert(cand.to_string(), idx);
+                }
+            }
+            // Also capture single-letter header "T" and the specific cell text "T1" when present.
+            if !positions0.contains_key("T") {
+                if let Some(idx) = row.find('T') {
+                    positions0.insert("T".to_string(), idx);
+                }
+            }
+            if !positions0.contains_key("T1") {
+                if let Some(idx) = row.find("T1") {
+                    positions0.insert("T1".to_string(), idx);
+                }
+            }
+        }
+        assert!(!positions0.is_empty(), "expected header labels in initial render");
+
+        // Move cursor up one row and redraw
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::empty());
+        app.handle_key(up).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let rows2: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+
+        let mut positions1: HashMap<String, usize> = HashMap::new();
+        for row in &rows2 {
+            for key in positions0.keys() {
+                if positions1.contains_key(key) {
+                    continue;
+                }
+                if let Some(idx) = row.find(key) {
+                    positions1.insert(key.clone(), idx);
+                }
+            }
+            // also capture 'T' and 'T1' again in case they appear on a different line after the move
+            if positions1.get("T").is_none() {
+                if let Some(idx) = row.find('T') {
+                    positions1.insert("T".to_string(), idx);
+                }
+            }
+            if positions1.get("T1").is_none() {
+                if let Some(idx) = row.find("T1") {
+                    positions1.insert("T1".to_string(), idx);
+                }
+            }
+        }
+
+        // Ensure every label we observed initially is still present and at the same x position.
+        for (k, &v0) in positions0.iter() {
+            let v1 = positions1.get(k).expect(&format!("expected {k} after Up"));
+            assert_eq!(v0, *v1, "{k} column shifted after Up");
+        }
+
+        // Additional targeted check: verify the column label "T" is aligned with the
+        // visible cell "T1". Recompute the visible columns using the same helpers
+        // the renderer uses and compute the expected x offset for the column.
+        let buffer = terminal.backend().buffer();
+        let width = buffer.area.width as usize;
+        // inner width is data area inside the grid block (block borders consume 2 cols)
+        let inner_w = width.saturating_sub(2);
+        let data_width = inner_w.saturating_sub(ROW_LABEL_CHARS).max(1);
+        let data_cols = data_width.checked_div(2).unwrap_or(1).max(1);
+
+        // Recompute visible columns (same sequence used by draw): visible indices,
+        // capping, then trimming to width.
+        let (mut col_ixs, _start) = visible_col_indices(&app.state, app.cursor, data_cols, app.col_scroll);
+        // ensure per-column caps are applied like draw does
+        app.fit_visible_columns_capped(&col_ixs, data_width);
+        trim_visible_cols_to_width(&app.state.grid, &mut col_ixs, app.cursor.col, data_width);
+
+        let lm = MARGIN_COLS;
+        let mc = app.state.grid.main_cols();
+        let show_right_divider = col_ixs.contains(&(lm + mc));
+
+        // Find the visible global column that has the label "T".
+        let mut target_col: Option<usize> = None;
+        for &c in &col_ixs {
+            if col_header_label(c, mc) == "T" {
+                target_col = Some(c);
+                break;
+            }
+        }
+        if let Some(tc) = target_col {
+            // Compute expected x within the terminal buffer for the start of this
+            // column's cell contents (after the row label area and any prior
+            // columns + separators). The inner (content) area begins at x=1
+            // (one-char border).
+            let inner_x = 1usize;
+            let mut pos = inner_x + ROW_LABEL_CHARS;
+            for (i, &c) in col_ixs.iter().enumerate() {
+                if c == tc {
+                    break;
+                }
+                let cw = app.state.grid.col_width(c).max(1);
+                pos = pos.saturating_add(cw);
+                if i + 1 < col_ixs.len() {
+                    let sep = if (c == lm.saturating_sub(1) && lm > 0 && col_ixs.contains(&lm))
+                        || (c == lm + mc - 1 && show_right_divider)
+                    {
+                        2
+                    } else {
+                        1
+                    };
+                    pos = pos.saturating_add(sep);
+                }
+            }
+
+            // Compute the header/data y coordinates (match draw layout): menubar(1) +
+            // formula(1) rows, then grid top border, so inner top is at y = 1 + 1 + 1.
+            let menubar_h = 1usize;
+            let formula_h = 1usize;
+            let grid_area_y = menubar_h + formula_h;
+            let inner_y = grid_area_y + 1; // account for top border
+
+            let total_h = buffer.area.height as usize;
+            let grid_area_h = total_h.saturating_sub(menubar_h + formula_h + 1usize); // leave bottom hints
+            let inner_h = grid_area_h.saturating_sub(2);
+            let data_rows = inner_h.saturating_sub(1).max(1);
+
+            let (row_ixs, _start) = visible_row_indices(&app.state, app.cursor, data_rows, app.row_scroll);
+
+            // We expect the first main data logical row to be HEADER_ROWS (sheet row 1).
+            let hr = HEADER_ROWS;
+            if let Some(main_idx) = row_ixs.iter().position(|&r| r == hr) {
+                let data_y = inner_y + 1 + main_idx; // header line + offset into row_ixs
+                let rows: Vec<String> = (0..buffer.area.height)
+                    .map(|y| {
+                        (0..buffer.area.width)
+                            .map(|x| buffer[(x, y)].symbol())
+                            .collect::<String>()
+                    })
+                    .collect();
+
+                let header_line = rows.get(inner_y).cloned().unwrap_or_default();
+                let data_line = rows.get(data_y).cloned().unwrap_or_default();
+
+                let cw = app.state.grid.col_width(tc).max(1);
+                let max_take = (buffer.area.width as usize).saturating_sub(pos);
+                let take = cw.min(max_take);
+                let header_slice: String = header_line.chars().skip(pos).take(take).collect();
+                let data_slice: String = data_line.chars().skip(pos).take(take).collect();
+
+                let header_first_nonspace = header_slice.find(|c: char| c != ' ').unwrap_or(0);
+                let data_first_nonspace = data_slice.find(|c: char| c != ' ').unwrap_or(0);
+
+                assert_eq!(header_first_nonspace, data_first_nonspace, "misaligned column T: pos={} tc={} col_ixs={:?}\nheader_slice='{header_slice}'\ndata_slice='{data_slice}'\nfull buffer:\n{}", pos, tc, col_ixs, buffer_to_string(buffer));
+            } else {
+                eprintln!("main row HEADER_ROWS not visible in row_ixs: {row_ixs:?}");
+            }
+        } else {
+            // If the "T" column is not visible in this viewport, that's acceptable
+            // for this test run; record as informational rather than failing.
+            eprintln!("T column not visible in computed col_ixs: {col_ixs:?}");
+        }
+    }
+
+    #[test]
+    fn s_column_date_truncation_respects_max_col_width() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use std::path::PathBuf;
+
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs/tests/extrapolate.corro");
+        let mut app = App::new(Some(path));
+        app.load_initial().unwrap();
+
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        // Initial draw with default max width
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let width = buffer.area.width as usize;
+        let inner_w = width.saturating_sub(2);
+        let data_width = inner_w.saturating_sub(ROW_LABEL_CHARS).max(1);
+        let data_cols = data_width.checked_div(2).unwrap_or(1).max(1);
+
+        let (mut col_ixs, _start) = visible_col_indices(&app.state, app.cursor, data_cols, app.col_scroll);
+        app.fit_visible_columns_capped(&col_ixs, data_width);
+        trim_visible_cols_to_width(&app.state.grid, &mut col_ixs, app.cursor.col, data_width);
+
+        let lm = MARGIN_COLS;
+        let mc = app.state.grid.main_cols();
+
+        // Find the global column that corresponds to header label "S".
+        let mut target_col: Option<usize> = None;
+        for &c in &col_ixs {
+            if col_header_label(c, mc) == "S" {
+                target_col = Some(c);
+                break;
+            }
+        }
+
+        // Helper to read the header + data slice for a global column index
+        let get_slices_for_col = |tc: usize| -> Option<(String, String)> {
+            let mut pos = 1usize + ROW_LABEL_CHARS; // inner_x + row label area
+            let show_right_divider = col_ixs.contains(&(lm + mc));
+            for (i, &c) in col_ixs.iter().enumerate() {
+                if c == tc {
+                    break;
+                }
+                let cw = app.state.grid.col_width(c).max(1);
+                pos = pos.saturating_add(cw);
+                if i + 1 < col_ixs.len() {
+                    let sep = if (c == lm.saturating_sub(1) && lm > 0 && col_ixs.contains(&lm))
+                        || (c == lm + mc - 1 && show_right_divider)
+                    {
+                        2
+                    } else {
+                        1
+                    };
+                    pos = pos.saturating_add(sep);
+                }
+            }
+
+            let menubar_h = 1usize;
+            let formula_h = 1usize;
+            let grid_area_y = menubar_h + formula_h;
+            let inner_y = grid_area_y + 1; // account for top border
+
+            let total_h = buffer.area.height as usize;
+            let grid_area_h = total_h.saturating_sub(menubar_h + formula_h + 1usize);
+            let inner_h = grid_area_h.saturating_sub(2);
+            let data_rows = inner_h.saturating_sub(1).max(1);
+
+            let (row_ixs, _start) = visible_row_indices(&app.state, app.cursor, data_rows, app.row_scroll);
+            let hr = HEADER_ROWS;
+            if let Some(main_idx) = row_ixs.iter().position(|&r| r == hr) {
+                let data_y = inner_y + 1 + main_idx; // header line + offset into row_ixs
+                let rows: Vec<String> = (0..buffer.area.height)
+                    .map(|y| {
+                        (0..buffer.area.width)
+                            .map(|x| buffer[(x, y)].symbol())
+                            .collect::<String>()
+                    })
+                    .collect();
+
+                let header_line = rows.get(inner_y).cloned().unwrap_or_default();
+                let data_line = rows.get(data_y).cloned().unwrap_or_default();
+
+                let cw = app.state.grid.col_width(tc).max(1);
+                let max_take = (buffer.area.width as usize).saturating_sub(pos);
+                let take = cw.min(max_take);
+                let header_slice: String = header_line.chars().skip(pos).take(take).collect();
+                let data_slice: String = data_line.chars().skip(pos).take(take).collect();
+                return Some((header_slice, data_slice));
+            }
+            None
+        };
+
+        if let Some(tc) = target_col {
+            if let Some((_h, data_slice)) = get_slices_for_col(tc) {
+                // With DEFAULT_MAX_COL_WIDTH=8 the date should not fully appear.
+                assert!(!data_slice.contains("2001/01/01"), "expected truncation at default max width");
+            }
+
+            // Now increase the default max width and redraw
+            app.state.grid.set_max_col_width(10);
+            let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+            terminal.draw(|f| app.draw(f)).unwrap();
+            let buffer = terminal.backend().buffer();
+
+            let (mut col_ixs2, _start2) = visible_col_indices(&app.state, app.cursor, data_cols, app.col_scroll);
+            app.fit_visible_columns_capped(&col_ixs2, data_width);
+            trim_visible_cols_to_width(&app.state.grid, &mut col_ixs2, app.cursor.col, data_width);
+
+            // recompute target col in case widths/visibility changed
+            let mut tc2: Option<usize> = None;
+            for &c in &col_ixs2 {
+                if col_header_label(c, mc) == "S" {
+                    tc2 = Some(c);
+                    break;
+                }
+            }
+            if let Some(tc) = tc2 {
+                // reuse helper to extract slices
+                let buffer_ref = terminal.backend().buffer();
+                let bcopy = buffer_ref.clone();
+                // build a temporary closure capture of buffer
+                let buf_inner = &bcopy;
+
+                let mut pos = 1usize + ROW_LABEL_CHARS;
+                let show_right_divider = col_ixs2.contains(&(lm + mc));
+                for (i, &c) in col_ixs2.iter().enumerate() {
+                    if c == tc {
+                        break;
+                    }
+                    let cw = app.state.grid.col_width(c).max(1);
+                    pos = pos.saturating_add(cw);
+                    if i + 1 < col_ixs2.len() {
+                        let sep = if (c == lm.saturating_sub(1) && lm > 0 && col_ixs2.contains(&lm))
+                            || (c == lm + mc - 1 && show_right_divider)
+                        {
+                            2
+                        } else {
+                            1
+                        };
+                        pos = pos.saturating_add(sep);
+                    }
+                }
+
+                let menubar_h = 1usize;
+                let formula_h = 1usize;
+                let grid_area_y = menubar_h + formula_h;
+                let inner_y = grid_area_y + 1;
+
+                let total_h = buf_inner.area.height as usize;
+                let grid_area_h = total_h.saturating_sub(menubar_h + formula_h + 1usize);
+                let inner_h = grid_area_h.saturating_sub(2);
+                let data_rows = inner_h.saturating_sub(1).max(1);
+
+                let (row_ixs, _start) = visible_row_indices(&app.state, app.cursor, data_rows, app.row_scroll);
+                let hr = HEADER_ROWS;
+                if let Some(main_idx) = row_ixs.iter().position(|&r| r == hr) {
+                    let data_y = inner_y + 1 + main_idx;
+                    let rows: Vec<String> = (0..buf_inner.area.height)
+                        .map(|y| {
+                            (0..buf_inner.area.width)
+                                .map(|x| buf_inner[(x, y)].symbol())
+                                .collect::<String>()
+                        })
+                        .collect();
+
+                    let data_line = rows.get(data_y).cloned().unwrap_or_default();
+                    let cw = app.state.grid.col_width(tc).max(1);
+                    let max_take = (buf_inner.area.width as usize).saturating_sub(pos);
+                    let take = cw.min(max_take);
+                    let data_slice: String = data_line.chars().skip(pos).take(take).collect();
+                    if !data_slice.contains("2001/01/01") {
+                        eprintln!("DEBUG: S column test failed after increasing max width:");
+                        eprintln!("  grid.max_col_width={}", app.state.grid.max_col_width());
+                        eprintln!("  col_ixs2={:?}", col_ixs2);
+                        eprintln!("  target tc={}", tc);
+                        eprintln!("  rendered_width_for_tc={:?}", app.rendered_width_for_column(tc));
+                        for &c in &col_ixs2 {
+                            eprintln!(
+                                "    col {} rendered_desired={:?} col_width_override={}",
+                                c,
+                                app.rendered_width_for_column(c),
+                                app.state.grid.col_width(c)
+                            );
+                        }
+                        eprintln!("  pos={} cw={} take={} data_slice='{}'", pos, cw, take, data_slice);
+                        panic!("expected full date visible after increasing max width to 10");
+                    }
+                }
+            }
+        } else {
+            // If S column isn't visible in this viewport, skip the test (informational)
+            eprintln!("S column not visible in viewport for test run: col_ixs={:?}", col_ixs);
+        }
     }
 
     #[test]

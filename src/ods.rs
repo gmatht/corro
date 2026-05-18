@@ -1127,53 +1127,11 @@ fn left_margin_agg_func(grid: &Grid, main_row: u32) -> Option<crate::ops::AggFun
 }
 
 fn data_main_col_count(grid: &Grid) -> usize {
-    let mut c = grid.main_cols();
-    while c > 0 {
-        let has = (0..grid.main_rows()).any(|r| {
-            !grid
-                .text(&CellAddr::Main {
-                    row: r as u32,
-                    col: (c - 1) as u32,
-                })
-                .trim()
-                .is_empty()
-        });
-        if has {
-            break;
-        }
-        c -= 1;
-    }
-    c.max(1)
+    crate::agg::helpers::data_main_col_count(grid)
 }
 
 fn previous_raw_block(grid: &Grid, current_main_row: u32) -> Option<(u32, u32)> {
-    if current_main_row == 0 {
-        return None;
-    }
-    let mut end = current_main_row;
-    while end > 0 {
-        let row = end - 1;
-        if left_margin_agg_func(grid, row).is_some() {
-            end = row;
-        } else {
-            break;
-        }
-    }
-    if end == 0 {
-        return None;
-    }
-    let mut start = 0u32;
-    for r in (0..end).rev() {
-        if left_margin_agg_func(grid, r).is_some() {
-            start = r + 1;
-            break;
-        }
-    }
-    if start < end {
-        Some((start, end))
-    } else {
-        None
-    }
+    crate::agg::helpers::previous_raw_block(grid, current_main_row)
 }
 
 fn left_margin_main_col_aggregate(
@@ -1182,20 +1140,7 @@ fn left_margin_main_col_aggregate(
     main_row: u32,
     main_col: u32,
 ) -> String {
-    let row_start = row_total_block_start(grid, main_row);
-    let row_end = main_row;
-    crate::agg::compute_aggregate(
-        grid,
-        &crate::ops::AggregateDef {
-            func: subtotal_func,
-            source: crate::grid::MainRange {
-                row_start,
-                row_end,
-                col_start: main_col,
-                col_end: main_col + 1,
-            },
-        },
-    )
+    crate::agg::helpers::left_margin_main_col_aggregate(grid, subtotal_func, main_row, main_col)
 }
 
 fn left_margin_special_col_aggregate(
@@ -1206,26 +1151,14 @@ fn left_margin_special_col_aggregate(
     row_end: u32,
     data_cols: usize,
 ) -> Option<String> {
-    let row_func = right_col_agg_func(grid, global_col)?;
-    let mut samples: Vec<f64> = Vec::new();
-    for r in row_start..row_end {
-        let row_val = crate::agg::compute_aggregate(
-            grid,
-            &crate::ops::AggregateDef {
-                func: row_func,
-                source: crate::grid::MainRange {
-                    row_start: r,
-                    row_end: r + 1,
-                    col_start: 0,
-                    col_end: data_cols as u32,
-                },
-            },
-        );
-        if let Some(n) = parse_num(&row_val) {
-            samples.push(n);
-        }
-    }
-    Some(fold_numbers(subtotal_func, &samples))
+    crate::agg::helpers::left_margin_special_col_aggregate(
+        grid,
+        subtotal_func,
+        global_col,
+        row_start,
+        row_end,
+        data_cols,
+    )
 }
 
 fn footer_special_col_aggregate(

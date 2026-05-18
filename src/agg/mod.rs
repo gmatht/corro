@@ -4,6 +4,8 @@ use crate::formula::{self, Number};
 use crate::grid::{CellAddr, GridBox as Grid, MainRange};
 use crate::ops::{AggFunc, AggregateDef};
 
+pub mod helpers;
+
 /// Formatting for margin aggregates when only an [`f64`] is available (`Number::Approx` path).
 fn format_aggregate_approx(value: f64) -> String {
     if !value.is_finite() {
