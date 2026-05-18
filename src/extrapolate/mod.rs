@@ -159,21 +159,65 @@ fn infer_numeric_fill(seed: &[String], offset_from_last: i32) -> Option<String> 
 }
 
 fn infer_named_sequence_fill(seed: &[String], offset_from_last: i32) -> Option<String> {
-    const WEEKDAYS: [&str; 7] = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"];
-    const MONTHS: [&str; 12] = [
+    // Accept both 3-letter abbreviations and full names for weekdays/months.
+    const WEEKDAYS_ABBR: [&str; 7] = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"];
+    const WEEKDAYS_FULL: [&str; 7] = [
+        "MONDAY",
+        "TUESDAY",
+        "WEDNESDAY",
+        "THURSDAY",
+        "FRIDAY",
+        "SATURDAY",
+        "SUNDAY",
+    ];
+    const MONTHS_ABBR: [&str; 12] = [
         "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC",
     ];
-    // Preserve case style: infer the next token in the named sequence but
-    // render it using the same case pattern as the original seed values.
-    let normalized: Vec<String> = seed.iter().map(|v| v.trim().to_ascii_uppercase()).collect();
-    let last_norm = normalized.last()?.as_str();
+    const MONTHS_FULL: [&str; 12] = [
+        "JANUARY",
+        "FEBRUARY",
+        "MARCH",
+        "APRIL",
+        "MAY",
+        "JUNE",
+        "JULY",
+        "AUGUST",
+        "SEPTEMBER",
+        "OCTOBER",
+        "NOVEMBER",
+        "DECEMBER",
+    ];
+
+    // Normalize to uppercase letters-only (remove punctuation) for matching.
+    let normalized_alpha: Vec<String> = seed
+        .iter()
+        .map(|v| v.trim().chars().filter(|c| c.is_alphabetic()).collect::<String>().to_ascii_uppercase())
+        .collect();
+    let last_norm = normalized_alpha.last()?.as_str();
     let original_last = seed.last()?.trim();
 
-    // Helper: apply the case pattern from `original` to the `token` (both
-    // expected to be ASCII month/week tokens). Prefer simple rules for common
-    // cases: all-upper, all-lower, Title case, otherwise fall back to
-    // per-character mapping.
+    // Split trailing non-alpha suffix (eg. punctuation) so we can re-append it
+    // to the inferred token and preserve punctuation like "Feb." -> "Mar.".
+    fn split_trailing_non_alpha(s: &str) -> (&str, &str) {
+        let mut last_alpha_end: Option<usize> = None;
+        for (i, ch) in s.char_indices() {
+            if ch.is_alphabetic() {
+                last_alpha_end = Some(i + ch.len_utf8());
+            }
+        }
+        match last_alpha_end {
+            None => ("", s),
+            Some(pos) => (&s[..pos], &s[pos..]),
+        }
+    }
+
+    let (original_core, original_suffix) = split_trailing_non_alpha(original_last);
+
+    // Helper to apply the original case pattern to the canonical token.
     fn apply_case_pattern(original: &str, token: &str) -> String {
+        if original.is_empty() {
+            return token.to_string();
+        }
         // If original is all-uppercase (or has no letters), return token as-is.
         if original.chars().all(|c| !c.is_alphabetic() || c.is_uppercase()) {
             return token.to_string();
@@ -218,17 +262,92 @@ fn infer_named_sequence_fill(seed: &[String], offset_from_last: i32) -> Option<S
         out
     }
 
-    if normalized.iter().all(|v| WEEKDAYS.contains(&v.as_str())) {
-        let idx = WEEKDAYS.iter().position(|&v| v == last_norm)?;
-        let tok = WEEKDAYS[(idx as i32 + offset_from_last).rem_euclid(WEEKDAYS.len() as i32) as usize];
-        return Some(apply_case_pattern(original_last, tok));
+    // Classification helpers for tokens (full vs abbr for months/weekdays).
+    fn is_weekday_full(s: &str) -> bool {
+        WEEKDAYS_FULL.contains(&s)
     }
-    if normalized.iter().all(|v| MONTHS.contains(&v.as_str())) {
-        let idx = MONTHS.iter().position(|&v| v == last_norm)?;
-        let tok = MONTHS[(idx as i32 + offset_from_last).rem_euclid(MONTHS.len() as i32) as usize];
-        return Some(apply_case_pattern(original_last, tok));
+    fn is_weekday_abbr(s: &str) -> bool {
+        let first3: String = s.chars().take(3).collect();
+        WEEKDAYS_ABBR.contains(&first3.as_str())
     }
-    None
+    fn is_month_full(s: &str) -> bool {
+        MONTHS_FULL.contains(&s)
+    }
+    fn is_month_abbr(s: &str) -> bool {
+        let first3: String = s.chars().take(3).collect();
+        MONTHS_ABBR.contains(&first3.as_str())
+    }
+
+    enum SeqKind {
+        WeekdayAbbr,
+        WeekdayFull,
+        MonthAbbr,
+        MonthFull,
+    }
+
+    let mut kind: Option<SeqKind> = None;
+    // Prefer full names over abbreviations when both match (e.g. "January"
+    // starts with "JAN" but is the full month name). Check full forms first.
+    // All tokens classified as weekday full?
+    if normalized_alpha.iter().all(|v| is_weekday_full(v)) {
+        kind = Some(SeqKind::WeekdayFull);
+    }
+    // All tokens classified as weekday abbr?
+    if kind.is_none() && normalized_alpha.iter().all(|v| is_weekday_abbr(v)) {
+        kind = Some(SeqKind::WeekdayAbbr);
+    }
+    // All tokens classified as month full?
+    if kind.is_none() && normalized_alpha.iter().all(|v| is_month_full(v)) {
+        kind = Some(SeqKind::MonthFull);
+    }
+    // All tokens classified as month abbr?
+    if kind.is_none() && normalized_alpha.iter().all(|v| is_month_abbr(v)) {
+        kind = Some(SeqKind::MonthAbbr);
+    }
+    // If mixed, fall back to using the last token's classification if possible.
+    if kind.is_none() {
+        // Prefer full forms when a token could be both (e.g. "JANUARY")
+        if is_weekday_full(last_norm) {
+            kind = Some(SeqKind::WeekdayFull);
+        } else if is_weekday_abbr(last_norm) {
+            kind = Some(SeqKind::WeekdayAbbr);
+        } else if is_month_full(last_norm) {
+            kind = Some(SeqKind::MonthFull);
+        } else if is_month_abbr(last_norm) {
+            kind = Some(SeqKind::MonthAbbr);
+        }
+    }
+
+    match kind {
+        Some(SeqKind::WeekdayAbbr) => {
+            // find index by matching first3 of last_norm to abbr list
+            let last3: String = last_norm.chars().take(3).collect();
+            let idx = WEEKDAYS_ABBR.iter().position(|&v| v == last3)?;
+            let tok = WEEKDAYS_ABBR[(idx as i32 + offset_from_last).rem_euclid(WEEKDAYS_ABBR.len() as i32) as usize];
+            let core = apply_case_pattern(original_core, tok);
+            return Some(format!("{}{}", core, original_suffix));
+        }
+        Some(SeqKind::WeekdayFull) => {
+            let idx = WEEKDAYS_FULL.iter().position(|&v| v == last_norm)?;
+            let tok = WEEKDAYS_FULL[(idx as i32 + offset_from_last).rem_euclid(WEEKDAYS_FULL.len() as i32) as usize];
+            let core = apply_case_pattern(original_core, tok);
+            return Some(format!("{}{}", core, original_suffix));
+        }
+        Some(SeqKind::MonthAbbr) => {
+            let last3: String = last_norm.chars().take(3).collect();
+            let idx = MONTHS_ABBR.iter().position(|&v| v == last3)?;
+            let tok = MONTHS_ABBR[(idx as i32 + offset_from_last).rem_euclid(MONTHS_ABBR.len() as i32) as usize];
+            let core = apply_case_pattern(original_core, tok);
+            return Some(format!("{}{}", core, original_suffix));
+        }
+        Some(SeqKind::MonthFull) => {
+            let idx = MONTHS_FULL.iter().position(|&v| v == last_norm)?;
+            let tok = MONTHS_FULL[(idx as i32 + offset_from_last).rem_euclid(MONTHS_FULL.len() as i32) as usize];
+            let core = apply_case_pattern(original_core, tok);
+            return Some(format!("{}{}", core, original_suffix));
+        }
+        None => None,
+    }
 }
 
 fn infer_suffix_fill(seed: &[String], offset_from_last: i32) -> Option<String> {
@@ -272,10 +391,45 @@ pub fn commit_from_preview(cells: Vec<PreviewCell>) -> crate::ops::Op {
     crate::ops::Op::FillRange { cells: mapped }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::grid::{Grid, GridBox, CellAddr, MainRange};
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::grid::{Grid, GridBox, CellAddr, MainRange};
+
+        #[test]
+        fn named_sequence_month_full_forward() {
+            let seed = vec!["January".to_string()];
+            let out = infer_named_sequence_fill(&seed, 1).expect("should infer");
+            assert_eq!(out, "February");
+        }
+
+        #[test]
+        fn named_sequence_month_abbr_forward() {
+            let seed = vec!["Jan".to_string()];
+            let out = infer_named_sequence_fill(&seed, 1).expect("should infer");
+            assert_eq!(out, "Feb");
+        }
+
+        #[test]
+        fn named_sequence_weekday_full_backward() {
+            let seed = vec!["Monday".to_string()];
+            let out = infer_named_sequence_fill(&seed, -1).expect("should infer");
+            assert_eq!(out, "Sunday");
+        }
+
+        #[test]
+        fn named_sequence_weekday_abbr_backward() {
+            let seed = vec!["Mon".to_string()];
+            let out = infer_named_sequence_fill(&seed, -1).expect("should infer");
+            assert_eq!(out, "Sun");
+        }
+
+        #[test]
+        fn named_sequence_preserves_suffix() {
+            let seed = vec!["Jan.".to_string()];
+            let out = infer_named_sequence_fill(&seed, 1).expect("should infer");
+            assert_eq!(out, "Feb.");
+        }
 
     #[test]
     fn generate_preview_translates_single_formula() {

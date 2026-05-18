@@ -54,6 +54,53 @@ enum SelectionKind {
     Cols,
 }
 
+#[cfg(test)]
+mod extrapolate_tests {
+    use super::*;
+
+    #[test]
+    fn extrapolate_fill_col_pattern_no_panic() {
+        // Build an App with a small main grid and two seeded cells in the same
+        // main-column. The selection covers those two cells; calling
+        // `fill_col_pattern` should not panic and should return a FillRange
+        // op when there are target rows to fill.
+        let mut app = App::new(None);
+        // Make the main grid reasonably small but > 2 so fill targets exist.
+        app.state.grid.set_main_size(6, 2);
+
+        // Seed values in main column 0, rows 0 and 1.
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "1".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 1, col: 0 }, "2".into());
+
+        // Selection: cover the two seeded main rows in column 0.
+        app.selection_kind = SelectionKind::Cells;
+        app.anchor = Some(SheetCursor { row: HEADER_ROWS, col: MARGIN_COLS });
+        app.cursor = SheetCursor { row: HEADER_ROWS + 1, col: MARGIN_COLS };
+
+        // Should not panic and should produce an Op (at least one target row).
+        let op = app.fill_col_pattern();
+        assert!(op.is_some());
+        if let Some(Op::FillRange { cells }) = op {
+            // Expect at least one filled cell beyond the seeded rows.
+            assert!(!cells.is_empty());
+            // All filled cells should be in column 0.
+            for (addr, _) in cells {
+                if let CellAddr::Main { col, .. } = addr {
+                    assert_eq!(col, 0);
+                } else {
+                    panic!("expected main cell addresses");
+                }
+            }
+        } else {
+            panic!("expected FillRange op");
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SelectionEdgeDirection {
     Left,
@@ -3561,7 +3608,7 @@ impl App {
         let mut cells = Vec::new();
         for col in (end_col + 1)..self.state.grid.main_cols() as u32 {
             let value =
-                self.infer_fill_value(&seed, (col - end_col) as i32, FillDirection::Right)?;
+                self.infer_fill_value(&seed, col as i32 - end_col as i32, FillDirection::Right)?;
             cells.push((CellAddr::Main { row: main_row, col }, value));
         }
         if cells.is_empty() {
@@ -3595,7 +3642,7 @@ impl App {
         let mut cells = Vec::new();
         for row in (end_row + 1)..self.state.grid.main_rows() as u32 {
             let value =
-                self.infer_fill_value(&seed, (row - end_row) as i32, FillDirection::Down)?;
+                self.infer_fill_value(&seed, row as i32 - end_row as i32, FillDirection::Down)?;
             cells.push((CellAddr::Main { row, col: main_col }, value));
         }
         if cells.is_empty() {
@@ -3649,6 +3696,9 @@ impl App {
             if seed.len() >= 1 {
                 if let Some(last_col) = last_seed_col {
                     for &c in &cols {
+                        if c < MARGIN_COLS {
+                            continue;
+                        }
                         let main_col = (c - MARGIN_COLS) as u32;
                         if main_col <= last_col || main_col >= main_cols {
                             continue;
@@ -3668,8 +3718,8 @@ impl App {
                         {
                             if let Some(value) = crate::extrapolate::infer_fill_value(
                                 &seed,
-                                (main_col - last_col) as i32,
-                                crate::extrapolate::FillDirection::Right,
+                            main_col as i32 - last_col as i32,
+                            crate::extrapolate::FillDirection::Right,
                             ) {
                                 filled.insert((main_row, main_col));
                                 cells.push((addr, value));
@@ -3714,6 +3764,9 @@ impl App {
             if seed.len() >= 1 {
                 if let Some(last_row) = last_seed_row {
                     for &r in &rows {
+                        if r < HEADER_ROWS {
+                            continue;
+                        }
                         let main_row = (r - HEADER_ROWS) as u32;
                         if main_row <= last_row || main_row >= main_rows {
                             continue;
@@ -3733,7 +3786,7 @@ impl App {
                         {
                             if let Some(value) = crate::extrapolate::infer_fill_value(
                                 &seed,
-                                (main_row - last_row) as i32,
+                                main_row as i32 - last_row as i32,
                                 crate::extrapolate::FillDirection::Down,
                             ) {
                                 filled.insert((main_row, main_col));
@@ -4492,6 +4545,8 @@ impl App {
         }
         Ok(())
     }
+
+    
 
     /// Hint when the footer/left row key column suggests an aggregate directive but typing `TOTAL`,
     /// `=TOTAL`, `=MIN`, … is ambiguous versus spreadsheet formulas (`=MIN(...)`, …).
