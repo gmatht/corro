@@ -118,24 +118,45 @@ pub fn generate_preview(
             return out;
         }
     }
+    // Fallback: attempt to infer a fill (numeric, named-sequence, suffix)
+    // using the non-empty present source values as the seed. If inference
+    // doesn't produce a value for a target cell, fall back to repeating the
+    // last non-empty source value.
+    let seeds: Vec<String> = src_values
+        .iter()
+        .filter_map(|opt| opt.as_ref().and_then(|s| (!s.is_empty()).then_some(s.clone())))
+        .collect();
+    if seeds.is_empty() {
+        return out; // nothing to fill
+    }
 
-    // Fallback: repeat last non-empty present source value across target.
-    // If there is no non-empty present source value, return an empty preview
-    // (do not fill with empty strings).
-    let last_opt: Option<String> = src_values
-        .into_iter()
-        .rev()
-        .find_map(|opt| opt.and_then(|s| (!s.is_empty()).then_some(s)));
-    let last = match last_opt {
-        Some(v) => v,
-        None => return out, // empty
+    // Find the last non-empty present source index so we can compute offsets
+    // relative to it when extrapolating (supports backward fills).
+    let last_present_idx_opt = src_values
+        .iter()
+        .rposition(|opt| opt.as_ref().map_or(false, |s| !s.is_empty()));
+    let last_present_idx = match last_present_idx_opt {
+        Some(i) => i,
+        None => return out,
     };
+    let src_cols = (source.col_end - source.col_start) as usize;
+    let last_row = source.row_start + (last_present_idx / src_cols) as u32;
+    let last_col = source.col_start + (last_present_idx % src_cols) as u32;
+
+    // Decide whether this is a vertical or horizontal fill. For simplicity
+    // prefer vertical when the target rows differ from the source rows.
+    let vertical = (target.row_start != source.row_start) || (target.row_end != source.row_end);
+
     for r in target.row_start..target.row_end {
         for c in target.col_start..target.col_end {
-            out.push(PreviewCell {
-                addr: CellAddr::Main { row: r, col: c },
-                value: last.clone(),
-            });
+            let offset = if vertical {
+                r as i32 - last_row as i32
+            } else {
+                c as i32 - last_col as i32
+            };
+            let inferred = infer_fill_value(&seeds, offset, if vertical { FillDirection::Down } else { FillDirection::Right });
+            let value = inferred.unwrap_or_else(|| seeds.last().cloned().unwrap_or_default());
+            out.push(PreviewCell { addr: CellAddr::Main { row: r, col: c }, value });
         }
     }
     out
@@ -466,12 +487,32 @@ pub fn commit_from_preview(cells: Vec<PreviewCell>) -> crate::ops::Op {
             assert_eq!(out, "friday");
         }
 
-        #[test]
-        fn named_sequence_weekday_full_backward() {
-            let seed = vec!["Monday".to_string()];
-            let out = infer_named_sequence_fill(&seed, -1).expect("should infer");
-            assert_eq!(out, "Sunday");
-        }
+    #[test]
+    fn named_sequence_weekday_full_backward() {
+        let seed = vec!["Monday".to_string()];
+        let out = infer_named_sequence_fill(&seed, -1).expect("should infer");
+        assert_eq!(out, "Sunday");
+    }
+
+    #[test]
+    fn generate_preview_backwards_weekday_not_working_yet() {
+        // This test demonstrates a failing case: dragging "Monday" upwards
+        // (target above source) should fill "Sunday" but the existing
+        // preview generation didn't compute offsets relative to the last
+        // present cell, so it failed. We add the test first to observe the
+        // failing behavior, then fix generate_preview to make it pass.
+        let mut gb = GridBox::from(Grid::new(4, 1));
+        gb.set(&CellAddr::Main { row: 1, col: 0 }, "Monday".into());
+
+        // source is row 1..2, target is row 0..1 (above source)
+        let source = MainRange { row_start: 1, row_end: 2, col_start: 0, col_end: 1 };
+        let target = MainRange { row_start: 0, row_end: 1, col_start: 0, col_end: 1 };
+
+        let out = generate_preview(&gb, &source, &target);
+        assert_eq!(out.len(), 1);
+        // Expect Sunday in the cell above Monday
+        assert_eq!(out[0].value, "Sunday");
+    }
 
         #[test]
         fn named_sequence_weekday_abbr_backward() {

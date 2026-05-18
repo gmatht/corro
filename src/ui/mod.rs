@@ -3695,12 +3695,45 @@ impl App {
             // treat the current cell as the extrapolate source (copy/fill behavior).
             if seed.len() >= 1 {
                 if let Some(last_col) = last_seed_col {
+                    // Determine the first seeded column for this row so we can
+                    // support extrapolating both to the right and to the left of
+                    // the seeded range.
+                    let first_seed_col = seed.iter().enumerate().find_map(|(i, _)| {
+                        // find the i-th seeded column by scanning cols again
+                        // (cols are in UI global-order). This is a bit awkward
+                        // but keeps the logic local to this loop.
+                        None::<u32>
+                    });
+                    // A simpler approach: recompute first_seed_col by scanning cols
+                    let mut first_seed_col: Option<u32> = None;
                     for &c in &cols {
                         if c < MARGIN_COLS {
                             continue;
                         }
                         let main_col = (c - MARGIN_COLS) as u32;
-                        if main_col <= last_col || main_col >= main_cols {
+                        if main_col >= main_cols {
+                            continue;
+                        }
+                        let addr = CellAddr::Main { row: main_row, col: main_col };
+                        if let Some(v) = self.state.grid.get(&addr) {
+                            if !v.is_empty() {
+                                first_seed_col = Some(main_col);
+                                break;
+                            }
+                        }
+                    }
+                    let first_col = first_seed_col.unwrap_or(last_col);
+
+                    for &c in &cols {
+                        if c < MARGIN_COLS {
+                            continue;
+                        }
+                        let main_col = (c - MARGIN_COLS) as u32;
+                        if main_col >= main_cols {
+                            continue;
+                        }
+                        // Skip columns that are inside the seeded range.
+                        if main_col >= first_col && main_col <= last_col {
                             continue;
                         }
                         let addr = CellAddr::Main {
@@ -3710,16 +3743,12 @@ impl App {
                         if filled.contains(&(main_row, main_col)) {
                             continue;
                         }
-                        if self
-                            .state
-                            .grid
-                            .get(&addr)
-                            .map_or(true, |v| v.is_empty())
-                        {
+                        if self.state.grid.get(&addr).map_or(true, |v| v.is_empty()) {
+                            let offset = main_col as i32 - last_col as i32;
                             if let Some(value) = crate::extrapolate::infer_fill_value(
                                 &seed,
-                            main_col as i32 - last_col as i32,
-                            crate::extrapolate::FillDirection::Right,
+                                offset,
+                                crate::extrapolate::FillDirection::Right,
                             ) {
                                 filled.insert((main_row, main_col));
                                 cells.push((addr, value));
@@ -3763,12 +3792,37 @@ impl App {
             // treat the current cell as the extrapolate source (copy/fill behavior).
             if seed.len() >= 1 {
                 if let Some(last_row) = last_seed_row {
+                    // Determine first seeded row for this column to allow
+                    // backward extrapolation above the seeded range.
+                    let mut first_seed_row: Option<u32> = None;
                     for &r in &rows {
                         if r < HEADER_ROWS {
                             continue;
                         }
                         let main_row = (r - HEADER_ROWS) as u32;
-                        if main_row <= last_row || main_row >= main_rows {
+                        if main_row >= main_rows {
+                            continue;
+                        }
+                        let addr = CellAddr::Main { row: main_row, col: main_col };
+                        if let Some(v) = self.state.grid.get(&addr) {
+                            if !v.is_empty() {
+                                first_seed_row = Some(main_row);
+                                break;
+                            }
+                        }
+                    }
+                    let first_row = first_seed_row.unwrap_or(last_row);
+
+                    for &r in &rows {
+                        if r < HEADER_ROWS {
+                            continue;
+                        }
+                        let main_row = (r - HEADER_ROWS) as u32;
+                        if main_row >= main_rows {
+                            continue;
+                        }
+                        // Skip rows inside the seeded span
+                        if main_row >= first_row && main_row <= last_row {
                             continue;
                         }
                         let addr = CellAddr::Main {
@@ -3778,15 +3832,11 @@ impl App {
                         if filled.contains(&(main_row, main_col)) {
                             continue;
                         }
-                        if self
-                            .state
-                            .grid
-                            .get(&addr)
-                            .map_or(true, |v| v.is_empty())
-                        {
+                        if self.state.grid.get(&addr).map_or(true, |v| v.is_empty()) {
+                            let offset = main_row as i32 - last_row as i32;
                             if let Some(value) = crate::extrapolate::infer_fill_value(
                                 &seed,
-                                main_row as i32 - last_row as i32,
+                                offset,
                                 crate::extrapolate::FillDirection::Down,
                             ) {
                                 filled.insert((main_row, main_col));
