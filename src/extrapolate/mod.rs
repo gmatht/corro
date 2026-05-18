@@ -411,6 +411,62 @@ pub fn commit_from_preview(cells: Vec<PreviewCell>) -> crate::ops::Op {
         }
 
         #[test]
+        fn named_sequence_month_abbr_uppercase_forward() {
+            let seed = vec!["JAN".to_string()];
+            let out = infer_named_sequence_fill(&seed, 1).expect("should infer");
+            assert_eq!(out, "FEB");
+        }
+
+        #[test]
+        fn named_sequence_month_abbr_lowercase_forward() {
+            let seed = vec!["jan".to_string()];
+            let out = infer_named_sequence_fill(&seed, 1).expect("should infer");
+            assert_eq!(out, "feb");
+        }
+
+        #[test]
+        fn named_sequence_month_full_uppercase_forward() {
+            let seed = vec!["JUNE".to_string()];
+            let out = infer_named_sequence_fill(&seed, 1).expect("should infer");
+            assert_eq!(out, "JULY");
+        }
+
+        #[test]
+        fn named_sequence_month_full_titlecase_forward() {
+            let seed = vec!["June".to_string()];
+            let out = infer_named_sequence_fill(&seed, 1).expect("should infer");
+            assert_eq!(out, "July");
+        }
+
+        #[test]
+        fn named_sequence_month_full_lowercase_forward() {
+            let seed = vec!["june".to_string()];
+            let out = infer_named_sequence_fill(&seed, 1).expect("should infer");
+            assert_eq!(out, "july");
+        }
+
+        #[test]
+        fn named_sequence_weekday_full_uppercase_forward() {
+            let seed = vec!["THURSDAY".to_string()];
+            let out = infer_named_sequence_fill(&seed, 1).expect("should infer");
+            assert_eq!(out, "FRIDAY");
+        }
+
+        #[test]
+        fn named_sequence_weekday_full_titlecase_forward() {
+            let seed = vec!["Thursday".to_string()];
+            let out = infer_named_sequence_fill(&seed, 1).expect("should infer");
+            assert_eq!(out, "Friday");
+        }
+
+        #[test]
+        fn named_sequence_weekday_full_lowercase_forward() {
+            let seed = vec!["thursday".to_string()];
+            let out = infer_named_sequence_fill(&seed, 1).expect("should infer");
+            assert_eq!(out, "friday");
+        }
+
+        #[test]
         fn named_sequence_weekday_full_backward() {
             let seed = vec!["Monday".to_string()];
             let out = infer_named_sequence_fill(&seed, -1).expect("should infer");
