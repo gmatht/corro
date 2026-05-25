@@ -12816,6 +12816,177 @@ mod tests {
     }
 
     #[test]
+    fn ui_undo_redo_duplicate_row_roundtrip() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(4, 1);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 1, col: 0 }, "X".into());
+
+        // Apply duplicate row (0-based): duplicates row 1 into row 2.
+        app.apply_single_op(Op::DuplicateRow { row: 1 }).unwrap();
+        assert_eq!(app.state.grid.get(&CellAddr::Main { row: 2, col: 0 }).as_deref(), Some("X"));
+        assert!(!app.op_history.is_empty());
+
+        // Simulate UI undo: pop inverse, compute redo, apply undo, push redo.
+        if let Some(undo_op) = app.op_history.pop() {
+            let redo_op = app.state.reverse_op(&undo_op);
+            assert!(app.apply_op_without_history(undo_op).is_ok());
+            if let Some(r) = redo_op {
+                app.redo_history.push(r);
+            }
+        } else {
+            panic!("expected inverse op")
+        }
+
+        // The duplicated row should be removed.
+        assert_eq!(app.state.grid.get(&CellAddr::Main { row: 2, col: 0 }), None);
+
+        // Redo the duplicate via redo_history.
+        if let Some(redo_op) = app.redo_history.pop() {
+            let undo_op = app.state.reverse_op(&redo_op);
+            assert!(app.apply_op_without_history(redo_op).is_ok());
+            if let Some(u) = undo_op {
+                app.op_history.push(u);
+            }
+        } else {
+            panic!("expected redo op")
+        }
+
+        // The duplicated row should be back.
+        assert_eq!(app.state.grid.get(&CellAddr::Main { row: 2, col: 0 }).as_deref(), Some("X"));
+    }
+
+    #[test]
+    fn ui_undo_redo_duplicate_row_range_roundtrip() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(6, 1);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 1, col: 0 }, "A".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 2, col: 0 }, "B".into());
+
+        // Duplicate rows 1..2 -> insert at 3..4
+        app.apply_single_op(Op::DuplicateRowRange { row_start: 1, row_end: 2 }).unwrap();
+        assert_eq!(app.state.grid.get(&CellAddr::Main { row: 3, col: 0 }).as_deref(), Some("A"));
+        assert_eq!(app.state.grid.get(&CellAddr::Main { row: 4, col: 0 }).as_deref(), Some("B"));
+
+        // Undo via UI flow
+        if let Some(undo_op) = app.op_history.pop() {
+            let redo_op = app.state.reverse_op(&undo_op);
+            assert!(app.apply_op_without_history(undo_op).is_ok());
+            if let Some(r) = redo_op {
+                app.redo_history.push(r);
+            }
+        } else {
+            panic!("expected inverse op")
+        }
+
+        assert_eq!(app.state.grid.get(&CellAddr::Main { row: 3, col: 0 }), None);
+        assert_eq!(app.state.grid.get(&CellAddr::Main { row: 4, col: 0 }), None);
+
+        // Redo
+        if let Some(redo_op) = app.redo_history.pop() {
+            let undo_op = app.state.reverse_op(&redo_op);
+            assert!(app.apply_op_without_history(redo_op).is_ok());
+            if let Some(u) = undo_op {
+                app.op_history.push(u);
+            }
+        } else {
+            panic!("expected redo op")
+        }
+
+        assert_eq!(app.state.grid.get(&CellAddr::Main { row: 3, col: 0 }).as_deref(), Some("A"));
+        assert_eq!(app.state.grid.get(&CellAddr::Main { row: 4, col: 0 }).as_deref(), Some("B"));
+    }
+
+    #[test]
+    fn ui_undo_redo_duplicate_col_roundtrip() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 4);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 1 }, "C".into());
+
+        // Duplicate column 1 -> inserts at column 2
+        app.apply_single_op(Op::DuplicateCol { col: 1 }).unwrap();
+        assert_eq!(app.state.grid.get(&CellAddr::Main { row: 0, col: 2 }).as_deref(), Some("C"));
+
+        // Undo
+        if let Some(undo_op) = app.op_history.pop() {
+            let redo_op = app.state.reverse_op(&undo_op);
+            assert!(app.apply_op_without_history(undo_op).is_ok());
+            if let Some(r) = redo_op {
+                app.redo_history.push(r);
+            }
+        } else {
+            panic!("expected inverse op")
+        }
+
+        assert_eq!(app.state.grid.get(&CellAddr::Main { row: 0, col: 2 }), None);
+
+        // Redo
+        if let Some(redo_op) = app.redo_history.pop() {
+            let undo_op = app.state.reverse_op(&redo_op);
+            assert!(app.apply_op_without_history(redo_op).is_ok());
+            if let Some(u) = undo_op {
+                app.op_history.push(u);
+            }
+        } else {
+            panic!("expected redo op")
+        }
+
+        assert_eq!(app.state.grid.get(&CellAddr::Main { row: 0, col: 2 }).as_deref(), Some("C"));
+    }
+
+    #[test]
+    fn ui_undo_redo_duplicate_col_range_roundtrip() {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 6);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 1 }, "L".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 2 }, "M".into());
+
+        // Duplicate cols 1..2 -> insert at 3..4
+        app.apply_single_op(Op::DuplicateColRange { col_start: 1, col_end: 2 }).unwrap();
+        assert_eq!(app.state.grid.get(&CellAddr::Main { row: 0, col: 3 }).as_deref(), Some("L"));
+        assert_eq!(app.state.grid.get(&CellAddr::Main { row: 0, col: 4 }).as_deref(), Some("M"));
+
+        // Undo
+        if let Some(undo_op) = app.op_history.pop() {
+            let redo_op = app.state.reverse_op(&undo_op);
+            assert!(app.apply_op_without_history(undo_op).is_ok());
+            if let Some(r) = redo_op {
+                app.redo_history.push(r);
+            }
+        } else {
+            panic!("expected inverse op")
+        }
+
+        assert_eq!(app.state.grid.get(&CellAddr::Main { row: 0, col: 3 }), None);
+        assert_eq!(app.state.grid.get(&CellAddr::Main { row: 0, col: 4 }), None);
+
+        // Redo
+        if let Some(redo_op) = app.redo_history.pop() {
+            let undo_op = app.state.reverse_op(&redo_op);
+            assert!(app.apply_op_without_history(redo_op).is_ok());
+            if let Some(u) = undo_op {
+                app.op_history.push(u);
+            }
+        } else {
+            panic!("expected redo op")
+        }
+
+        assert_eq!(app.state.grid.get(&CellAddr::Main { row: 0, col: 3 }).as_deref(), Some("L"));
+        assert_eq!(app.state.grid.get(&CellAddr::Main { row: 0, col: 4 }).as_deref(), Some("M"));
+    }
+
+    #[test]
     fn right_enters_nested_width_submenu() {
         let mut app = App::new(None);
         app.mode = Mode::Menu {

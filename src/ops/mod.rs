@@ -264,6 +264,13 @@ pub enum Op {
         row_start: u32,
         row_end: u32,
     },
+    /// Delete an inclusive contiguous range of main rows. This shrinks the
+    /// main-band by the given inclusive range. The on-disk form mirrors
+    /// DUPLICATE_ROW notation (1-based inclusive).
+    DeleteRowRange {
+        row_start: u32,
+        row_end: u32,
+    },
     /// Duplicate a main-data column into the column to the right (insert-style).
     DuplicateCol {
         col: u32,
@@ -271,6 +278,13 @@ pub enum Op {
     /// Duplicate a contiguous range of main-data columns (inclusive).
     /// The on-disk form uses Excel-style names and is inclusive (e.g. "DUPLICATE_COL A:C").
     DuplicateColRange {
+        col_start: u32,
+        col_end: u32,
+    },
+    /// Delete an inclusive contiguous range of main columns. This shrinks the
+    /// main-band by the given inclusive range. The on-disk form mirrors
+    /// DUPLICATE_COL notation (Excel-style letters, inclusive).
+    DeleteColRange {
         col_start: u32,
         col_end: u32,
     },
@@ -629,6 +643,40 @@ impl Op {
                 }
                 state.grid.bump_volatile_seed();
             }
+            // No-op for Undo here; it's handled in UI layer by applying the
+            // inverse op popped from history.
+            Op::DeleteRowRange { row_start, row_end } => {
+                // Delete inclusive [row_start..=row_end]
+                let start = *row_start as usize;
+                let end = *row_end as usize;
+                if end < start {
+                    return;
+                }
+                let original_main_rows = state.grid.main_rows();
+                if start >= original_main_rows {
+                    return;
+                }
+                let count = end.saturating_sub(start).saturating_add(1);
+                // Build new main/left/right maps by removing the range.
+                // Use move_main_rows to perform the reorder when possible: we
+                // move rows after the deleted span upward by `count` and then
+                // shrink main size.
+                let after = start + count;
+                if after < original_main_rows {
+                    state
+                        .grid
+                        .move_main_rows(after, original_main_rows - after, start);
+                }
+                // Shrink main size
+                let mc = state.grid.main_cols();
+                state
+                    .grid
+                    .set_main_size(original_main_rows.saturating_sub(count), mc);
+                // Repair formulas: deleting rows doesn't require the same style
+                // of repair as insertion; formulas that referenced moved rows
+                // were adjusted by move_main_rows already. Bump volatile seed.
+                state.grid.bump_volatile_seed();
+            }
             Op::DuplicateCol { col } => {
                 let source_col = *col as usize;
                 let original_main_cols = state.grid.main_cols();
@@ -808,6 +856,30 @@ impl Op {
                 for (addr, value) in header_footer_cells {
                     state.grid.set(&addr, value);
                 }
+                state.grid.bump_volatile_seed();
+            }
+            Op::DeleteColRange { col_start, col_end } => {
+                // Delete inclusive [col_start..=col_end]
+                let start = *col_start as usize;
+                let end = *col_end as usize;
+                if end < start {
+                    return;
+                }
+                let original_main_cols = state.grid.main_cols();
+                if start >= original_main_cols {
+                    return;
+                }
+                let count = end.saturating_sub(start).saturating_add(1);
+                let after = start + count;
+                if after < original_main_cols {
+                    state
+                        .grid
+                        .move_main_cols(after, original_main_cols - after, start);
+                }
+                let mr = state.grid.main_rows();
+                state
+                    .grid
+                    .set_main_size(mr, original_main_cols.saturating_sub(count));
                 state.grid.bump_volatile_seed();
             }
             Op::FillRange { cells } => {
@@ -1102,6 +1174,48 @@ fn parse_op_text(line: &str) -> Option<Op> {
             let col = parse_excel_column(col_tok)?;
             Some(Op::DuplicateCol { col })
         }
+        "DELETE_ROW" => {
+            // 1-based inclusive N or N:M
+            let tok = parts.next()?;
+            if parts.next().is_some() {
+                return None;
+            }
+            if let Some((a, b)) = tok.split_once(':') {
+                let a1 = a.parse::<u32>().ok()?;
+                let b1 = b.parse::<u32>().ok()?;
+                if a1 == 0 || b1 == 0 {
+                    return None;
+                }
+                return Some(Op::DeleteRowRange {
+                    row_start: a1.saturating_sub(1),
+                    row_end: b1.saturating_sub(1),
+                });
+            }
+            let a1 = tok.parse::<u32>().ok()?;
+            if a1 == 0 {
+                return None;
+            }
+            return Some(Op::DeleteRowRange {
+                row_start: a1.saturating_sub(1),
+                row_end: a1.saturating_sub(1),
+            });
+        }
+        "DELETE_COL" => {
+            let col_tok = parts.next()?;
+            if parts.next().is_some() {
+                return None;
+            }
+            if let Some((a, b)) = col_tok.split_once(':') {
+                let a_col = parse_excel_column(a)?;
+                let b_col = parse_excel_column(b)?;
+                return Some(Op::DeleteColRange {
+                    col_start: a_col,
+                    col_end: b_col,
+                });
+            }
+            let col = parse_excel_column(col_tok)?;
+            Some(Op::DeleteColRange { col_start: col, col_end: col })
+        }
         "SIZE" => {
             let rows = parts.next()?.parse::<u32>().ok()?;
             let cols = parts.next()?.parse::<u32>().ok()?;
@@ -1215,10 +1329,22 @@ impl Op {
                     row_end.saturating_add(1)
                 )
             }
+            Op::DeleteRowRange { row_start, row_end } => {
+                format!(
+                    "DELETE_ROW {}:{}",
+                    row_start.saturating_add(1),
+                    row_end.saturating_add(1)
+                )
+            }
             Op::DuplicateColRange { col_start, col_end } => {
                 let a = crate::addr::excel_column_name(*col_start as usize);
                 let b = crate::addr::excel_column_name(*col_end as usize);
                 format!("DUPLICATE_COL {a}:{b}")
+            }
+            Op::DeleteColRange { col_start, col_end } => {
+                let a = crate::addr::excel_column_name(*col_start as usize);
+                let b = crate::addr::excel_column_name(*col_end as usize);
+                format!("DELETE_COL {a}:{b}")
             }
             Op::SetMainSize {
                 main_rows,
@@ -1870,10 +1996,105 @@ impl SheetState {
                     to: *from,
                 })
             }
-            Op::DuplicateRow { .. } => None,
-            Op::DuplicateCol { .. } => None,
-            Op::DuplicateRowRange { .. } => None,
-            Op::DuplicateColRange { .. } => None,
+            Op::DuplicateRow { row } => {
+                let r = *row as usize;
+                let mr = self.grid.main_rows();
+                if r >= mr {
+                    return None;
+                }
+                let dest = (r + 1) as u32;
+                Some(Op::DeleteRowRange {
+                    row_start: dest,
+                    row_end: dest,
+                })
+            }
+            Op::DuplicateCol { col } => {
+                let c = *col as usize;
+                let mc = self.grid.main_cols();
+                if c >= mc {
+                    return None;
+                }
+                let dest = (c + 1) as u32;
+                Some(Op::DeleteColRange {
+                    col_start: dest,
+                    col_end: dest,
+                })
+            }
+            Op::DuplicateRowRange { row_start, row_end } => {
+                let start = *row_start as usize;
+                let end = *row_end as usize;
+                if end < start {
+                    return None;
+                }
+                let mr = self.grid.main_rows();
+                if start >= mr {
+                    return None;
+                }
+                let count = end.saturating_sub(start).saturating_add(1) as u32;
+                let dest = (end + 1) as u32;
+                Some(Op::DeleteRowRange {
+                    row_start: dest,
+                    row_end: dest.saturating_add(count).saturating_sub(1),
+                })
+            }
+            Op::DuplicateColRange { col_start, col_end } => {
+                let start = *col_start as usize;
+                let end = *col_end as usize;
+                if end < start {
+                    return None;
+                }
+                let mc = self.grid.main_cols();
+                if start >= mc {
+                    return None;
+                }
+                let count = end.saturating_sub(start).saturating_add(1) as u32;
+                let dest = (end + 1) as u32;
+                Some(Op::DeleteColRange {
+                    col_start: dest,
+                    col_end: dest.saturating_add(count).saturating_sub(1),
+                })
+            }
+            Op::DeleteRowRange { row_start, row_end } => {
+                // If this delete represents the removal of rows that were
+                // previously inserted by a duplicate, we can recreate the
+                // original duplicate as the redo. The deleted span is
+                // inclusive [row_start..=row_end]; its length is `count` and
+                // the duplicated source sits immediately above the deleted
+                // block at [row_start-count .. row_start-1]. Return a
+                // DuplicateRowRange for that source when it's in-range.
+                let start = *row_start as usize;
+                let end = *row_end as usize;
+                if end < start {
+                    return None;
+                }
+                let count = end.saturating_sub(start).saturating_add(1);
+                if start < count {
+                    return None;
+                }
+                let src_start = start.saturating_sub(count) as u32;
+                let src_end = start.saturating_sub(1) as u32;
+                Some(Op::DuplicateRowRange {
+                    row_start: src_start,
+                    row_end: src_end,
+                })
+            }
+            Op::DeleteColRange { col_start, col_end } => {
+                let start = *col_start as usize;
+                let end = *col_end as usize;
+                if end < start {
+                    return None;
+                }
+                let count = end.saturating_sub(start).saturating_add(1);
+                if start < count {
+                    return None;
+                }
+                let src_start = start.saturating_sub(count) as u32;
+                let src_end = start.saturating_sub(1) as u32;
+                Some(Op::DuplicateColRange {
+                    col_start: src_start,
+                    col_end: src_end,
+                })
+            }
             Op::FillRange { cells } => Some(Op::FillRange {
                 cells: cells
                     .iter()
