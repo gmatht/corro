@@ -523,8 +523,11 @@ impl Op {
                     );
                 }
                 let er = state.grid.main_rows();
-                let remainder =
-                    er.saturating_sub(dest_row).saturating_sub(original_main_rows - dest_row);
+                let remainder = if dest_row < original_main_rows {
+                    er.saturating_sub(dest_row).saturating_sub(original_main_rows - dest_row)
+                } else {
+                    0
+                };
                 if remainder > 0 {
                     crate::formula::repair_all_formulas_after_main_row_insert(
                         &mut state.grid,
@@ -554,12 +557,16 @@ impl Op {
                     return;
                 }
                 let original_main_rows = state.grid.main_rows();
+                // If the requested start is beyond current rows there's nothing
+                // to duplicate from. If the end extends past the current extent
+                // we still duplicate the requested span treating missing source
+                // rows as empty — this mirrors user expectations when a log
+                // references a larger range than the current sheet.
                 if start >= original_main_rows {
                     return;
                 }
-                let end = end.min(original_main_rows - 1);
                 let count = end.saturating_sub(start).saturating_add(1);
-                // Collect cells to copy
+                // Collect cells to copy (only existing cells are captured)
                 let mut copied_cells = Vec::new();
                 for r in start..=end {
                     for c in 0..state.grid.main_cols() {
@@ -682,8 +689,11 @@ impl Op {
                     );
                 }
                 let mc = state.grid.main_cols();
-                let remainder =
-                    mc.saturating_sub(dest_col).saturating_sub(original_main_cols - dest_col);
+                let remainder = if dest_col < original_main_cols {
+                    mc.saturating_sub(dest_col).saturating_sub(original_main_cols - dest_col)
+                } else {
+                    0
+                };
                 if remainder > 0 {
                     crate::formula::repair_all_formulas_after_main_col_insert(
                         &mut state.grid,
@@ -713,13 +723,17 @@ impl Op {
                     return;
                 }
                 let original_main_cols = state.grid.main_cols();
+                // If the requested start is beyond current cols there's nothing
+                // to duplicate from. However if the end extends beyond the
+                // current extent we still duplicate the requested span and
+                // treat missing source columns as blank (so e.g. "A:B" will
+                // duplicate A even when B was previously absent).
                 if start >= original_main_cols {
                     return;
                 }
-                let end = end.min(original_main_cols - 1);
                 let count = end.saturating_sub(start).saturating_add(1);
 
-                // Collect main cells to copy
+                // Collect main cells to copy (only existing cells are captured)
                 let mut copied_cells = Vec::new();
                 for r in 0..state.grid.main_rows() {
                     for c in start..=end {
@@ -766,7 +780,11 @@ impl Op {
 
                 // Repair formulas for inserted cols
                 let mc = state.grid.main_cols();
-                let remainder = mc.saturating_sub(dest).saturating_sub(original_main_cols - dest);
+                let remainder = if dest < original_main_cols {
+                    mc.saturating_sub(dest).saturating_sub(original_main_cols - dest)
+                } else {
+                    0
+                };
                 if remainder > 0 {
                     crate::formula::repair_all_formulas_after_main_col_insert(
                         &mut state.grid,

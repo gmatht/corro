@@ -872,6 +872,29 @@ mod tests {
     }
 
     #[test]
+    fn replay_duplicate_col_doc_has_a_in_a1_and_c1() {
+        let path = docs_test_path("duplicate_col.corro");
+        let mut workbook = WorkbookState::new();
+        let mut active_sheet = workbook.sheet_id(workbook.active_sheet);
+        let (_off, _n) = load_workbook_revisions(&path, usize::MAX, &mut workbook, &mut active_sheet).unwrap();
+        let sheet = workbook.sheet_mut_by_id(1).unwrap();
+        assert_eq!(
+            sheet
+                .grid
+                .get(&CellAddr::Main { row: 0, col: 0 })
+                .as_deref(),
+            Some("A")
+        );
+        assert_eq!(
+            sheet
+                .grid
+                .get(&CellAddr::Main { row: 0, col: 2 })
+                .as_deref(),
+            Some("A")
+        );
+    }
+
+    #[test]
     fn load_workbook_revisions_partial_reports_bad_line() {
         let tmp = NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), "CORRO_LOG 1\nSET A1 1\nBAD LINE\nSET A2 2\n").unwrap();
