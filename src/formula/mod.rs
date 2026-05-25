@@ -2789,12 +2789,12 @@ pub fn cell_effective_display(grid: &Grid, addr: &CellAddr) -> String {
     let raw = raw_owned.as_deref().unwrap_or("");
     let template_formula = templated_formula(grid, addr);
     if template_formula.is_none() && !is_formula(raw) {
-        // Normalize plain numeric/date literals for display. This makes
-        // effective display stable across import/export round-trips which may
-        // change stored textual formatting (e.g. "0.00" -> "0"). If the
-        // cell looks like a number/date, format it using the canonical
-        // evaluator formatter; otherwise show the raw text unchanged.
-        if let Some(n) = functions::parse_numeric_or_date_literal(raw) {
+        // Normalize plain numeric literals for display. Preserve date-like
+        // textual forms (e.g. "2001/01/01") so the UI shows the original
+        // human-entered text instead of the internal numeric serial. Date
+        // literals are still recognized by the evaluator; this only affects
+        // how plain text cells are rendered.
+        if let Some(n) = parse_number_literal(raw) {
             return format_number(&n);
         }
         return raw.to_string();

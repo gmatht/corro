@@ -5236,11 +5236,38 @@ impl App {
             // Defer cap selection until after `looks_like_date` is computed below.
             // Heuristic: prefer date-like columns by increasing weight.
             let mut looks_like_date = false;
+
+            // First, inspect header/footer raw stored text (prefer raw non-formula
+            // parsing so user-entered date-like strings like "2001/01/01" are
+            // recognized as dates for layout while still rendering the raw text).
             for (addr, _) in self.state.grid.iter_nonempty() {
                 match addr {
                     CellAddr::Header { col: hcol, .. } | CellAddr::Footer { col: hcol, .. }
                         if (hcol as usize) == col =>
                     {
+                        if let Some(raw) = self.state.grid.get(&addr) {
+                            let t = raw.trim();
+                            if !is_formula(t) {
+                                if crate::formula::parse_numeric_or_date_literal(t).is_some() {
+                                    looks_like_date = true;
+                                    #[cfg(test)]
+                                    {
+                                        if col == 720 || col == 721 {
+                                            eprintln!(
+                                                "DEBUG: fit_visible_columns_capped: date-like header/footer detected col={} addr={:?} val='{}' (parsed) ",
+                                                col,
+                                                addr,
+                                                t,
+                                            );
+                                        }
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+
+                        // Fallback: examine the displayed/evaluated text for
+                        // date-like patterns (covers formula outputs).
                         let val = normalize_inline_text(&cell_effective_display(&self.state.grid, &addr));
                         let t = val.trim();
                         let bytes = t.as_bytes();
@@ -5256,8 +5283,6 @@ impl App {
                                         looks_like_date = true;
                                         #[cfg(test)]
                                         {
-                                            // Log which header/footer cell triggered the
-                                            // heuristic for this global column.
                                             if col == 720 || col == 721 {
                                                 eprintln!(
                                                     "DEBUG: fit_visible_columns_capped: date-like header/footer detected col={} addr={:?} val='{}' match_i={} ",
@@ -5280,9 +5305,48 @@ impl App {
                     break;
                 }
             }
+
             if !looks_like_date {
                 let main_cols = self.state.grid.main_cols();
                 for r in 0..self.state.grid.main_rows() {
+                    // Prefer parsing the stored raw text for date-like literals
+                    // when the cell is not a formula.
+                    let (addr, raw_val) = if col < MARGIN_COLS {
+                        (CellAddr::Left { col, row: r as u32 }, self.state.grid.get(&CellAddr::Left { col, row: r as u32 }))
+                    } else if col < MARGIN_COLS + main_cols {
+                        (
+                            CellAddr::Main { row: r as u32, col: (col - MARGIN_COLS) as u32 },
+                            self.state.grid.get(&CellAddr::Main { row: r as u32, col: (col - MARGIN_COLS) as u32 }),
+                        )
+                    } else {
+                        (
+                            CellAddr::Right { col: col - MARGIN_COLS - main_cols, row: r as u32 },
+                            self.state.grid.get(&CellAddr::Right { col: col - MARGIN_COLS - main_cols, row: r as u32 }),
+                        )
+                    };
+
+                    if let Some(raw) = raw_val {
+                        let t = raw.trim();
+                        if !is_formula(t) {
+                            if crate::formula::parse_numeric_or_date_literal(t).is_some() {
+                                looks_like_date = true;
+                                #[cfg(test)]
+                                {
+                                    if col == 720 || col == 721 {
+                                        eprintln!(
+                                            "DEBUG: fit_visible_columns_capped: date-like main-cell detected col={} row={} raw='{}' (parsed)",
+                                            col,
+                                            r,
+                                            t,
+                                        );
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+
+                    // Fallback: examine displayed/evaluated text for date-like patterns
                     let val = if col < MARGIN_COLS {
                         let addr = CellAddr::Left { col, row: r as u32 };
                         normalize_inline_text(&cell_effective_display(&self.state.grid, &addr))
@@ -5307,8 +5371,6 @@ impl App {
                                     looks_like_date = true;
                                     #[cfg(test)]
                                     {
-                                        // Log which main-band cell (row) triggered the
-                                        // heuristic for this global column.
                                         if col == 720 || col == 721 {
                                             eprintln!(
                                                 "DEBUG: fit_visible_columns_capped: date-like main-cell detected col={} row={} val='{}' match_i={} ",
@@ -5329,6 +5391,7 @@ impl App {
                     }
                 }
             }
+
             // Now choose cap_used depending on whether the column looks like a date.
             let cap_used = if looks_like_date { self.state.grid.max_col_width() } else { cap };
             let need = cap_used.saturating_sub(1);
@@ -5510,17 +5573,32 @@ impl App {
         let mut saw_content = false;
         let main_cols = self.state.grid.main_cols();
 
+        // Inspect header/footer cells: prefer using numeric formatting for
+        // stored non-formula date/numeric literals so column-width decisions
+        // match the numeric serial representation while the UI still renders
+        // the original literal text.
         for (addr, _) in self.state.grid.iter_nonempty() {
             match addr {
                 CellAddr::Header { col, .. } | CellAddr::Footer { col, .. }
                     if col as usize == global_col =>
                 {
-                    let val =
-                        normalize_inline_text(&cell_effective_display(&self.state.grid, &addr));
+                    let mut measured = None;
+                    if let Some(raw) = self.state.grid.get(&addr) {
+                        let t = raw.trim();
+                        if !is_formula(t) {
+                            if let Some(n) = crate::formula::parse_numeric_or_date_literal(t) {
+                                let s = format_number_cell_display(&n);
+                                if !s.is_empty() {
+                                    measured = Some(s);
+                                }
+                            }
+                        }
+                    }
+                    // Fallback to the displayed/evaluated text.
+                    let val = measured.unwrap_or_else(|| normalize_inline_text(&cell_effective_display(&self.state.grid, &addr)));
                     if !val.is_empty() {
                         saw_content = true;
                         maxw = maxw.max(val.width() + 1);
-                        // Test-only: print which header/footer cells contributed
                         #[cfg(test)]
                         if global_col == 720 || global_col == 721 {
                             eprintln!(
@@ -5536,13 +5614,27 @@ impl App {
                 _ => {}
             }
         }
+
+        // Inspect main / margin cells.
         for r in 0..self.state.grid.main_rows() {
             if global_col < MARGIN_COLS {
                 let addr = CellAddr::Left {
                     col: global_col,
                     row: r as u32,
                 };
-                let val = normalize_inline_text(&cell_effective_display(&self.state.grid, &addr));
+                let mut measured = None;
+                if let Some(raw) = self.state.grid.get(&addr) {
+                    let t = raw.trim();
+                    if !is_formula(t) {
+                        if let Some(n) = crate::formula::parse_numeric_or_date_literal(t) {
+                            let s = format_number_cell_display(&n);
+                            if !s.is_empty() {
+                                measured = Some(s);
+                            }
+                        }
+                    }
+                }
+                let val = measured.unwrap_or_else(|| normalize_inline_text(&cell_effective_display(&self.state.grid, &addr)));
                 if !val.is_empty() {
                     saw_content = true;
                     maxw = maxw.max(val.width() + 1);
@@ -5552,7 +5644,19 @@ impl App {
                     row: r as u32,
                     col: (global_col - MARGIN_COLS) as u32,
                 };
-                let val = normalize_inline_text(&cell_effective_display(&self.state.grid, &addr));
+                let mut measured = None;
+                if let Some(raw) = self.state.grid.get(&addr) {
+                    let t = raw.trim();
+                    if !is_formula(t) {
+                        if let Some(n) = crate::formula::parse_numeric_or_date_literal(t) {
+                            let s = format_number_cell_display(&n);
+                            if !s.is_empty() {
+                                measured = Some(s);
+                            }
+                        }
+                    }
+                }
+                let val = measured.unwrap_or_else(|| normalize_inline_text(&cell_effective_display(&self.state.grid, &addr)));
                 if !val.is_empty() {
                     saw_content = true;
                     maxw = maxw.max(val.width() + 1);
@@ -5562,7 +5666,19 @@ impl App {
                     col: (global_col - MARGIN_COLS - main_cols),
                     row: r as u32,
                 };
-                let val = normalize_inline_text(&cell_effective_display(&self.state.grid, &addr));
+                let mut measured = None;
+                if let Some(raw) = self.state.grid.get(&addr) {
+                    let t = raw.trim();
+                    if !is_formula(t) {
+                        if let Some(n) = crate::formula::parse_numeric_or_date_literal(t) {
+                            let s = format_number_cell_display(&n);
+                            if !s.is_empty() {
+                                measured = Some(s);
+                            }
+                        }
+                    }
+                }
+                let val = measured.unwrap_or_else(|| normalize_inline_text(&cell_effective_display(&self.state.grid, &addr)));
                 if !val.is_empty() {
                     saw_content = true;
                     maxw = maxw.max(val.width() + 1);
@@ -19055,7 +19171,7 @@ mod tests {
         app.insert_mitosis_main_data_row_after_cursor().unwrap();
 
         let log = std::fs::read_to_string(tmp.path()).unwrap();
-        assert!(log.contains("DUPLICATE_ROW 0"), "{log}");
+        assert!(log.contains("DUPLICATE_ROW 1"), "{log}");
     }
 
     #[test]
@@ -19077,7 +19193,7 @@ mod tests {
         app.insert_mitosis_main_data_col_after_cursor().unwrap();
 
         let log = std::fs::read_to_string(tmp.path()).unwrap();
-        assert!(log.contains("DUPLICATE_COL 0"), "{log}");
+        assert!(log.contains("DUPLICATE_COL A"), "{log}");
     }
 
     #[test]
@@ -19545,6 +19661,28 @@ fn normalize_inline_text(text: &str) -> String {
 fn format_cell_display_decimal_generic(grid: &Grid, addr: &CellAddr, raw: String) -> String {
     let mut visiting = Vec::new();
     let mut budget = 10_000usize;
+    // Preserve user-entered date-like textual forms for plain (non-formula)
+    // cells: when the stored value is a raw date string (e.g. "2001/01/01"),
+    // prefer showing that literal in the UI instead of the internal numeric
+    // serial. This keeps the human-entered form visible while allowing the
+    // layout heuristics elsewhere to treat the value as numeric for sizing.
+    {
+        let t = raw.trim();
+        let stored_raw_owned = grid.get(addr);
+        let stored_raw = stored_raw_owned.as_deref().unwrap_or("");
+        // Only preserve for plain non-formula stored text and non-templated cells.
+        if crate::formula::export_templated_formula(grid, addr).is_none() && !is_formula(stored_raw) {
+            // If parsing as a numeric-or-date literal succeeds but parsing as a
+            // plain numeric literal does not, it implies the input was a
+            // date-like textual form (e.g. "2001/01/01"). Preserve the raw
+            // literal in that case so the UI shows the user-entered date.
+            if crate::formula::parse_numeric_or_date_literal(t).is_some()
+                && crate::formula::parse_number_literal(t).is_none()
+            {
+                return raw;
+            }
+        }
+    }
     if let Some(n) = effective_numeric(grid, addr, &mut visiting, &mut budget) {
         if matches!(n, crate::formula::number::Number::Complex(_)) {
             return format_number_cell_display(&n);

@@ -258,9 +258,21 @@ pub enum Op {
     DuplicateRow {
         row: u32,
     },
+    /// Duplicate a contiguous range of main-data rows (inclusive).
+    /// The on-disk form is 1-based inclusive (e.g. "DUPLICATE_ROW 3:5").
+    DuplicateRowRange {
+        row_start: u32,
+        row_end: u32,
+    },
     /// Duplicate a main-data column into the column to the right (insert-style).
     DuplicateCol {
         col: u32,
+    },
+    /// Duplicate a contiguous range of main-data columns (inclusive).
+    /// The on-disk form uses Excel-style names and is inclusive (e.g. "DUPLICATE_COL A:C").
+    DuplicateColRange {
+        col_start: u32,
+        col_end: u32,
     },
     FillRange {
         cells: Vec<(CellAddr, String)>,
@@ -533,6 +545,83 @@ impl Op {
                 }
                 state.grid.bump_volatile_seed();
             }
+            Op::DuplicateRowRange { row_start, row_end } => {
+                // Duplicate an inclusive range of main rows, inserting the
+                // duplicated block immediately below the range.
+                let start = *row_start as usize;
+                let end = *row_end as usize; // inclusive
+                if end < start {
+                    return;
+                }
+                let original_main_rows = state.grid.main_rows();
+                if start >= original_main_rows {
+                    return;
+                }
+                let end = end.min(original_main_rows - 1);
+                let count = end.saturating_sub(start).saturating_add(1);
+                // Collect cells to copy
+                let mut copied_cells = Vec::new();
+                for r in start..=end {
+                    for c in 0..state.grid.main_cols() {
+                        let src = CellAddr::Main { row: r as u32, col: c as u32 };
+                        if let Some(v) = state.grid.get(&src) {
+                            copied_cells.push((
+                                CellAddr::Main { row: (r + count) as u32, col: c as u32 },
+                                v.to_string(),
+                            ));
+                        }
+                    }
+                    for col in 0..MARGIN_COLS {
+                        let src_left = CellAddr::Left { col, row: r as u32 };
+                        if let Some(v) = state.grid.get(&src_left) {
+                            copied_cells.push((
+                                CellAddr::Left { col, row: (r + count) as u32 },
+                                v.to_string(),
+                            ));
+                        }
+                        let src_right = CellAddr::Right { col, row: r as u32 };
+                        if let Some(v) = state.grid.get(&src_right) {
+                            copied_cells.push((
+                                CellAddr::Right { col, row: (r + count) as u32 },
+                                v.to_string(),
+                            ));
+                        }
+                    }
+                }
+
+                // Grow the grid and move rows below the insertion point down.
+                let mc = state.grid.main_cols();
+                state.grid.set_main_size(original_main_rows.saturating_add(count), mc);
+                let dest = end + 1;
+                if dest < original_main_rows {
+                    state.grid.move_main_rows(dest, original_main_rows - dest, original_main_rows + count);
+                }
+
+                // Repair formulas for inserted rows
+                let er = state.grid.main_rows();
+                let remainder = er.saturating_sub(dest).saturating_sub(original_main_rows - dest);
+                if remainder > 0 {
+                    crate::formula::repair_all_formulas_after_main_row_insert(
+                        &mut state.grid,
+                        mc,
+                        dest as u32,
+                        remainder as u32,
+                        None,
+                    );
+                }
+
+                // Paste copied cells with relative formula translation
+                for (addr, value) in copied_cells {
+                    let pasted = if is_formula_text(&value) {
+                        crate::formula::translate_formula_text_by_offset(&value, count as i32, 0)
+                            .unwrap_or_else(|| value.clone())
+                    } else {
+                        value.clone()
+                    };
+                    state.grid.set(&addr, pasted);
+                }
+                state.grid.bump_volatile_seed();
+            }
             Op::DuplicateCol { col } => {
                 let source_col = *col as usize;
                 let original_main_cols = state.grid.main_cols();
@@ -612,6 +701,94 @@ impl Op {
                         value.clone()
                     };
                     state.grid.set(&addr, pasted);
+                }
+                state.grid.bump_volatile_seed();
+            }
+            Op::DuplicateColRange { col_start, col_end } => {
+                // Duplicate an inclusive contiguous range of main columns,
+                // inserting the duplicated block immediately to the right.
+                let start = *col_start as usize;
+                let end = *col_end as usize; // inclusive
+                if end < start {
+                    return;
+                }
+                let original_main_cols = state.grid.main_cols();
+                if start >= original_main_cols {
+                    return;
+                }
+                let end = end.min(original_main_cols - 1);
+                let count = end.saturating_sub(start).saturating_add(1);
+
+                // Collect main cells to copy
+                let mut copied_cells = Vec::new();
+                for r in 0..state.grid.main_rows() {
+                    for c in start..=end {
+                        let src = CellAddr::Main { row: r as u32, col: c as u32 };
+                        if let Some(v) = state.grid.get(&src) {
+                            copied_cells.push((
+                                CellAddr::Main { row: r as u32, col: (c + count) as u32 },
+                                v.to_string(),
+                            ));
+                        }
+                    }
+                }
+
+                // Copy header/footer cells for the global columns
+                let source_global_start = MARGIN_COLS + start;
+                let mut header_footer_cells = Vec::new();
+                for (addr, value) in state.grid.iter_nonempty() {
+                    match addr {
+                        CellAddr::Header { row, col } if (col as usize) >= source_global_start && (col as usize) <= source_global_start + (end - start) => {
+                            let offset = (col as usize) - source_global_start;
+                            header_footer_cells.push((
+                                CellAddr::Header { row, col: (source_global_start + offset + count) as u32 },
+                                value,
+                            ));
+                        }
+                        CellAddr::Footer { row, col } if (col as usize) >= source_global_start && (col as usize) <= source_global_start + (end - start) => {
+                            let offset = (col as usize) - source_global_start;
+                            header_footer_cells.push((
+                                CellAddr::Footer { row, col: (source_global_start + offset + count) as u32 },
+                                value,
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Grow grid and move columns to make space
+                let mr = state.grid.main_rows();
+                state.grid.set_main_size(mr, original_main_cols.saturating_add(count));
+                let dest = end + 1;
+                if dest < original_main_cols {
+                    state.grid.move_main_cols(dest, original_main_cols - dest, original_main_cols + count);
+                }
+
+                // Repair formulas for inserted cols
+                let mc = state.grid.main_cols();
+                let remainder = mc.saturating_sub(dest).saturating_sub(original_main_cols - dest);
+                if remainder > 0 {
+                    crate::formula::repair_all_formulas_after_main_col_insert(
+                        &mut state.grid,
+                        mc,
+                        dest as u32,
+                        remainder as u32,
+                        None,
+                    );
+                }
+
+                // Paste copied cells with formula translation
+                for (addr, value) in copied_cells {
+                    let pasted = if is_formula_text(&value) {
+                        crate::formula::translate_formula_text_by_offset(&value, 0, count as i32)
+                            .unwrap_or_else(|| value.clone())
+                    } else {
+                        value.clone()
+                    };
+                    state.grid.set(&addr, pasted);
+                }
+                for (addr, value) in header_footer_cells {
+                    state.grid.set(&addr, value);
                 }
                 state.grid.bump_volatile_seed();
             }
@@ -860,14 +1037,29 @@ fn parse_op_text(line: &str) -> Option<Op> {
             }
         }
         "DUPLICATE_ROW" => {
-            // On-disk logs use 1-based row numbers for human readability. Convert
+            // On-disk logs use 1-based row numbers for human readability.
+            // Support single row ("N") or inclusive range ("N:M"). Convert
             // to 0-based internal representation.
             let tok = parts.next()?;
-            let row_one_based = tok.parse::<u32>().ok()?;
-            if row_one_based == 0 {
+            if parts.next().is_some() {
                 return None;
             }
-            if parts.next().is_some() {
+            if let Some((a, b)) = tok.split_once(':') {
+                let a1 = a.parse::<u32>().ok()?;
+                let b1 = b.parse::<u32>().ok()?;
+                if a1 == 0 || b1 == 0 {
+                    return None;
+                }
+                // convert to 0-based inclusive
+                let start = a1.saturating_sub(1);
+                let end = b1.saturating_sub(1);
+                return Some(Op::DuplicateRowRange {
+                    row_start: start,
+                    row_end: end,
+                });
+            }
+            let row_one_based = tok.parse::<u32>().ok()?;
+            if row_one_based == 0 {
                 return None;
             }
             Some(Op::DuplicateRow {
@@ -876,9 +1068,18 @@ fn parse_op_text(line: &str) -> Option<Op> {
         }
         "DUPLICATE_COL" => {
             // Accept Excel-style column names (A..ZZZ) for main columns.
+            // Support single column ("A") or inclusive range ("A:C").
             let col_tok = parts.next()?;
             if parts.next().is_some() {
                 return None;
+            }
+            if let Some((a, b)) = col_tok.split_once(':') {
+                let a_col = parse_excel_column(a)?;
+                let b_col = parse_excel_column(b)?;
+                return Some(Op::DuplicateColRange {
+                    col_start: a_col,
+                    col_end: b_col,
+                });
             }
             let col = parse_excel_column(col_tok)?;
             Some(Op::DuplicateCol { col })
@@ -988,6 +1189,18 @@ impl Op {
                 // Emit Excel-style column names (A, B, C...) for main columns.
                 let name = crate::addr::excel_column_name(*col as usize);
                 format!("DUPLICATE_COL {name}")
+            }
+            Op::DuplicateRowRange { row_start, row_end } => {
+                format!(
+                    "DUPLICATE_ROW {}:{}",
+                    row_start.saturating_add(1),
+                    row_end.saturating_add(1)
+                )
+            }
+            Op::DuplicateColRange { col_start, col_end } => {
+                let a = crate::addr::excel_column_name(*col_start as usize);
+                let b = crate::addr::excel_column_name(*col_end as usize);
+                format!("DUPLICATE_COL {a}:{b}")
             }
             Op::SetMainSize {
                 main_rows,
@@ -1641,6 +1854,8 @@ impl SheetState {
             }
             Op::DuplicateRow { .. } => None,
             Op::DuplicateCol { .. } => None,
+            Op::DuplicateRowRange { .. } => None,
+            Op::DuplicateColRange { .. } => None,
             Op::FillRange { cells } => Some(Op::FillRange {
                 cells: cells
                     .iter()
