@@ -471,21 +471,64 @@ fn eval_unary_numeric_with_complex_fallback(
 
 pub(crate) fn parse_date_serial_literal(s: &str) -> Option<f64> {
     let t = s.trim();
+    #[cfg(test)]
+    {
+        // Narrow test-only logging to likely date-like inputs to avoid noisy output.
+        if t.contains("2001/01/01") || t.contains("2001-01-01") || t.contains('/') {
+            eprintln!("DEBUG parse_date_serial_literal called: raw={:?} trimmed={:?}", s, t);
+        }
+    }
     if t.len() != 10 {
+        #[cfg(test)]
+        {
+            if t.contains("2001/01/01") || t.contains("2001-01-01") || t.contains('/') {
+                eprintln!("DEBUG parse_date_serial_literal: length mismatch: {}", t.len());
+            }
+        }
         return None;
     }
     let bytes = t.as_bytes();
-    if bytes[4] != b'-' || bytes[7] != b'-' {
+    // Accept common separators '-', '/', and '\\' between components so inputs
+    // like "2001/01/01" (found in fixtures) are recognized as date literals.
+    let is_sep = |b: u8| b == b'-' || b == b'/' || b == b'\\';
+    if !is_sep(bytes[4]) || !is_sep(bytes[7]) {
+        #[cfg(test)]
+        {
+            if t.contains("2001/01/01") || t.contains("2001-01-01") || t.contains('/') {
+                eprintln!("DEBUG parse_date_serial_literal: separator mismatch: {:?}", t);
+            }
+        }
         return None;
     }
     let year = t[0..4].parse::<i32>().ok()?;
     let month = t[5..7].parse::<u32>().ok()?;
     let day = t[8..10].parse::<u32>().ok()?;
-    NaiveDate::from_ymd_opt(year, month, day).map(date_to_serial)
+    let res = NaiveDate::from_ymd_opt(year, month, day).map(date_to_serial);
+    #[cfg(test)]
+    {
+        if t.contains("2001/01/01") || t.contains("2001-01-01") || t.contains('/') {
+            eprintln!("DEBUG parse_date_serial_literal: parsed {}-{}-{} => {:?}", year, month, day, res);
+        }
+    }
+    res
 }
 
 pub(crate) fn parse_numeric_or_date_literal(s: &str) -> Option<Number> {
-    parse_number_literal(s).or_else(|| parse_date_serial_literal(s).map(Number::approx))
+    #[cfg(test)]
+    {
+        // Log only likely candidates to keep test output focused.
+        if s.contains("2001/01/01") || s.contains("2001-01-01") || s.contains('/') {
+            eprintln!("DEBUG parse_numeric_or_date_literal called: {:?}", s);
+        }
+    }
+    let n = parse_number_literal(s).or_else(|| parse_date_serial_literal(s).map(Number::approx));
+    #[cfg(test)]
+    {
+        if s.contains("2001/01/01") || s.contains("2001-01-01") || s.contains('/') {
+            eprintln!("DEBUG parse_numeric_or_date_literal result for {:?}: {:?}", s, n.as_ref().map(|x| x.to_f64()));
+        }
+    }
+    n
 }
 
 fn eval_trim(

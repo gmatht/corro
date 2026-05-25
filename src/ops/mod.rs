@@ -1,4 +1,11 @@
 //! Append-only log operations and replay onto [`SheetState`].
+//!
+//! NOTE: The on-disk text log uses human-friendly notation where possible.
+//! - DUPLICATE_ROW uses 1-based row numbers (DUPLICATE_ROW 4 duplicates the 4th
+//!   main row, not row index 3).
+//! - DUPLICATE_COL uses Excel-style column names (DUPLICATE_COL A duplicates the
+//!   first main column). This keeps log files readable and consistent with the
+//!   address syntax used elsewhere in the file format.
 
 use crate::addr::{
     parse_cell_ref_at, parse_excel_column, parse_main_range_at, parse_sheet_id_prefix_at,
@@ -853,17 +860,27 @@ fn parse_op_text(line: &str) -> Option<Op> {
             }
         }
         "DUPLICATE_ROW" => {
-            let row = parts.next()?.parse::<u32>().ok()?;
+            // On-disk logs use 1-based row numbers for human readability. Convert
+            // to 0-based internal representation.
+            let tok = parts.next()?;
+            let row_one_based = tok.parse::<u32>().ok()?;
+            if row_one_based == 0 {
+                return None;
+            }
             if parts.next().is_some() {
                 return None;
             }
-            Some(Op::DuplicateRow { row })
+            Some(Op::DuplicateRow {
+                row: row_one_based.saturating_sub(1),
+            })
         }
         "DUPLICATE_COL" => {
-            let col = parts.next()?.parse::<u32>().ok()?;
+            // Accept Excel-style column names (A..ZZZ) for main columns.
+            let col_tok = parts.next()?;
             if parts.next().is_some() {
                 return None;
             }
+            let col = parse_excel_column(col_tok)?;
             Some(Op::DuplicateCol { col })
         }
         "SIZE" => {
@@ -963,8 +980,15 @@ impl Op {
             }
             Op::MoveRowRange { from, count, to } => format!("MOVE ROW {from} {count} {to}"),
             Op::MoveColRange { from, count, to } => format!("MOVE COL {from} {count} {to}"),
-            Op::DuplicateRow { row } => format!("DUPLICATE_ROW {row}"),
-            Op::DuplicateCol { col } => format!("DUPLICATE_COL {col}"),
+            Op::DuplicateRow { row } => {
+                // Emit 1-based row numbers in the on-disk log for readability.
+                format!("DUPLICATE_ROW {}", row.saturating_add(1))
+            }
+            Op::DuplicateCol { col } => {
+                // Emit Excel-style column names (A, B, C...) for main columns.
+                let name = crate::addr::excel_column_name(*col as usize);
+                format!("DUPLICATE_COL {name}")
+            }
             Op::SetMainSize {
                 main_rows,
                 main_cols,
@@ -2281,7 +2305,8 @@ mod tests {
     fn duplicate_row_round_trips_through_log_line() {
         let op = Op::DuplicateRow { row: 3 };
         let line = op.to_log_line(0);
-        assert_eq!(line, "DUPLICATE_ROW 3");
+        // On-disk format uses 1-based row numbers.
+        assert_eq!(line, "DUPLICATE_ROW 4");
         assert_eq!(parse_op_line(&line), Some(op));
     }
 
@@ -2333,7 +2358,8 @@ mod tests {
     fn duplicate_col_round_trips_through_log_line() {
         let op = Op::DuplicateCol { col: 2 };
         let line = op.to_log_line(0);
-        assert_eq!(line, "DUPLICATE_COL 2");
+        // On-disk format uses Excel-style column names (A=0, B=1, ...).
+        assert_eq!(line, "DUPLICATE_COL C");
         assert_eq!(parse_op_line(&line), Some(op));
     }
 

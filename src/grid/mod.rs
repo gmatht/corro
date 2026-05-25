@@ -627,27 +627,61 @@ impl Grid {
     }
 
     pub fn col_width(&self, global_col: usize) -> usize {
-        if let Some(width) = self.col_width_overrides.get(&global_col).copied() {
-            return width.max(1);
-        }
-        if self.logical_col_has_content(global_col) {
+        let width = if let Some(w) = self.col_width_overrides.get(&global_col).copied() {
+            w.max(1)
+        } else if self.logical_col_has_content(global_col) {
             self.max_col_width.max(1)
         } else {
             4
+        };
+
+        // Test-only diagnostics to trace unexpected width changes for problematic columns.
+        #[cfg(test)]
+        {
+            // Narrow the noise: only log the target columns (720/721) or when an override exists.
+            if global_col == 720 || global_col == 721 || self.col_width_overrides.contains_key(&global_col) {
+                eprintln!(
+                    "DEBUG: Grid::col_width read col={} -> {} (max_col_width={} override={:?})",
+                    global_col,
+                    width,
+                    self.max_col_width,
+                    self.col_width_overrides.get(&global_col).copied()
+                );
+            }
         }
+
+        width
     }
 
     pub fn set_max_col_width(&mut self, width: usize) {
-        self.max_col_width = width.max(1);
+        let w = width.max(1);
+        self.max_col_width = w;
+        #[cfg(test)]
+        {
+            eprintln!("DEBUG: Grid::set_max_col_width -> {}", w);
+        }
     }
 
     pub fn set_col_width(&mut self, global_col: usize, width: Option<usize>) {
         match width {
             Some(w) => {
-                self.col_width_overrides.insert(global_col, w.max(1));
+                let w2 = w.max(1);
+                self.col_width_overrides.insert(global_col, w2);
+                #[cfg(test)]
+                {
+                    if global_col == 720 || global_col == 721 {
+                        eprintln!("DEBUG: Grid::set_col_width set col={} -> {}", global_col, w2);
+                    }
+                }
             }
             None => {
                 self.col_width_overrides.remove(&global_col);
+                #[cfg(test)]
+                {
+                    if global_col == 720 || global_col == 721 {
+                        eprintln!("DEBUG: Grid::set_col_width remove override col={}", global_col);
+                    }
+                }
             }
         }
     }

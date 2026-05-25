@@ -158,7 +158,20 @@ pub(crate) fn parse_number_literal(s: &str) -> Option<Number> {
 }
 
 pub(crate) fn parse_numeric_or_date_literal(s: &str) -> Option<Number> {
-    functions::parse_numeric_or_date_literal(s)
+    #[cfg(test)]
+    {
+        if s.contains("2001/01/01") || s.contains("2001-01-01") || s.contains('/') {
+            eprintln!("DEBUG wrapper parse_numeric_or_date_literal called: {:?}", s);
+        }
+    }
+    let res = functions::parse_numeric_or_date_literal(s);
+    #[cfg(test)]
+    {
+        if s.contains("2001/01/01") || s.contains("2001-01-01") || s.contains('/') {
+            eprintln!("DEBUG wrapper parse_numeric_or_date_literal result: {:?}", res.as_ref().map(|n| n.to_f64()));
+        }
+    }
+    res
 }
 
 fn resolve_name(name: &str, bindings: &[(String, EvalResult)]) -> Option<EvalResult> {
