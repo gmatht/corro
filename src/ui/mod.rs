@@ -8384,30 +8384,11 @@ impl App {
         let data_width = inner_w.saturating_sub(ROW_LABEL_CHARS).max(1);
         let data_cols = data_width.checked_div(2).unwrap_or(1).max(1);
 
-        // Determine visible rows/cols first so we can adjust widths for the
-        // visible columns before taking an immutable borrow of grid.
-
-        let (row_ixs, next_row_scroll) =
-            visible_row_indices(&self.state, self.cursor, data_rows, self.row_scroll);
-        let (mut col_ixs, next_col_scroll) =
-            visible_col_indices(&self.state, self.cursor, data_cols, self.col_scroll);
-        // visible indices computed
-        self.row_scroll = next_row_scroll;
-        self.col_scroll = next_col_scroll;
-
-        // Shrink visible columns: cap width so every visible index can share
-        // the row body (avoids unbounded autofill from one long cell, then
-        // trim_visible_cols_to_width eating columns to the left of the cursor).
-        self.fit_visible_columns_capped(&col_ixs, data_width);
-        trim_visible_cols_to_width(&self.state.grid, &mut col_ixs, self.cursor.col, data_width);
-
-        // Materialize grid after we finish possibly mutating column widths.
         // Allow a transient preview grid when in Edit or Extrapolate mode so we
         // can render a live preview without mutating state. When showing an
         // extrapolation preview also capture the set of target addresses so we
         // can visually distinguish previewed (non-committed) cells while
         // rendering.
-        let base_grid = &self.state.grid;
         let mut preview_grid: Option<Grid> = None;
         let mut previewed_addrs: Option<HashSet<CellAddr>> = None;
         if let Mode::Edit { buffer, .. } = &self.mode {
@@ -8445,12 +8426,24 @@ impl App {
             }
         }
 
-        let grid = preview_grid.as_ref().unwrap_or(base_grid);
+        let grid = preview_grid.as_ref().unwrap_or(&self.state.grid);
+
+        // Determine visible rows/cols from stable sheet state, then trim the
+        // viewport against the existing stored widths. Cursor movement should
+        // change which columns are visible, not dynamically refit widths.
+        let (row_ixs, next_row_scroll) =
+            visible_row_indices(&self.state, self.cursor, data_rows, self.row_scroll);
+        let (mut col_ixs, next_col_scroll) =
+            visible_col_indices(&self.state, self.cursor, data_cols, self.col_scroll);
+        self.row_scroll = next_row_scroll;
+        self.col_scroll = next_col_scroll;
+
+        trim_visible_cols_to_width(grid, &mut col_ixs, self.cursor.col, data_width);
         let title_str = {
             let raw = format!(
                 " corro  {}r × {}c  ops {}",
-                base_grid.main_rows(),
-                base_grid.main_cols(),
+                self.state.grid.main_rows(),
+                self.state.grid.main_cols(),
                 self.ops_applied
             );
             let max_w = (grid_area.width.saturating_sub(4) as usize).max(8);
@@ -14919,6 +14912,76 @@ mod tests {
 
         assert!(moved >= initial);
         assert!(moved <= initial + 1);
+    }
+
+    #[test]
+    fn moving_cursor_does_not_persist_fitted_column_widths() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use std::path::PathBuf;
+
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs/tests/date.corro");
+        let mut app = App::new(Some(path));
+        app.load_initial().unwrap();
+
+        let initial_width = app.state.grid.col_width(MARGIN_COLS);
+        let initial_overrides = app.state.grid.col_width_overrides();
+
+        let backend = TestBackend::new(70, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::empty()))
+            .unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+
+        assert_eq!(app.state.grid.col_width(MARGIN_COLS), initial_width);
+        assert_eq!(app.state.grid.col_width_overrides(), initial_overrides);
+    }
+
+    #[test]
+    fn moving_right_scrolls_date_viewport_without_squeezing_columns() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use std::path::PathBuf;
+
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs/tests/date.corro");
+        let mut app = App::new(Some(path));
+        app.load_initial().unwrap();
+
+        let backend = TestBackend::new(18, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        let first = rows.join("\n");
+
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::empty()))
+            .unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        let second = rows.join("\n");
+
+        assert!(first.contains("2001/01/01"), "initial viewport should show full date: {first}");
+        assert!(!first.contains("AFTER_DATE"), "initial viewport should not squeeze in B: {first}");
+        assert!(second.contains("AFTER_DATE"), "moving right should reveal column B by scrolling: {second}");
+        assert_eq!(app.state.grid.col_width(MARGIN_COLS), 10);
     }
 
     #[test]
