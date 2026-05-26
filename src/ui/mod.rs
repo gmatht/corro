@@ -6198,8 +6198,34 @@ impl App {
         if self.cursor.col >= hm + original_main_cols {
             return self.insert_mitosis_right_margin_col_after_cursor();
         }
-        // If columns are selected, duplicate each selected column. Process in
+        // If a rectangular main-range selection exists (SelectionKind::Cells
+        // and selection covers only main rows/cols) or the selection kind is
+        // explicitly Columns, duplicate each selected main column. Process in
         // descending order to avoid index-shift hazards when inserting.
+        if let Some(range) = self.selection_main_range() {
+            // range.col_start..range.col_end (end is exclusive). When a
+            // contiguous rectangular main-range is selected (e.g. A:C),
+            // duplicate the entire span with a single DUPLICATE_COL A:C
+            // command so the log records one op instead of per-column ops.
+            let start = range.col_start;
+            let end_excl = range.col_end;
+            if end_excl > start {
+                let end_incl = end_excl - 1;
+                if start == end_incl {
+                    self.apply_single_op(Op::DuplicateCol { col: start })?;
+                } else {
+                    self.apply_single_op(Op::DuplicateColRange {
+                        col_start: start,
+                        col_end: end_incl,
+                    })?;
+                }
+                self.anchor = None;
+                self.selection_kind = SelectionKind::Cells;
+                self.status = "Duplicated selected cols".into();
+                return Ok(true);
+            }
+        }
+
         if self.selection_kind == SelectionKind::Cols {
             if let Some((_rows, cols)) = self.current_selection_range() {
                 let mut main_idxs: Vec<u32> = cols
@@ -6212,14 +6238,19 @@ impl App {
                         }
                     })
                     .collect();
-                main_idxs.sort_unstable_by(|a, b| b.cmp(a));
-                for idx in main_idxs {
-                    self.apply_single_op(Op::DuplicateCol { col: idx })?;
+                if !main_idxs.is_empty() {
+                    main_idxs.sort_unstable();
+                    let start = *main_idxs.first().unwrap();
+                    let end = *main_idxs.last().unwrap();
+                    self.apply_single_op(Op::DuplicateColRange {
+                        col_start: start,
+                        col_end: end,
+                    })?;
+                    self.anchor = None;
+                    self.selection_kind = SelectionKind::Cells;
+                    self.status = "Duplicated selected cols".into();
+                    return Ok(true);
                 }
-                self.anchor = None;
-                self.selection_kind = SelectionKind::Cells;
-                self.status = "Duplicated selected cols".into();
-                return Ok(true);
             }
         }
         self.insert_mitosis_main_data_col_after_cursor()

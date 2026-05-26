@@ -780,6 +780,7 @@ impl Op {
                     return;
                 }
                 let count = end.saturating_sub(start).saturating_add(1);
+                eprintln!("[DEBUG apply] DuplicateColRange start={} end={} count={} original_main_cols={}", start, end, count, original_main_cols);
 
                 // Collect main cells to copy (only existing cells are captured)
                 let mut copied_cells = Vec::new();
@@ -821,6 +822,7 @@ impl Op {
                 // Grow grid and move columns to make space
                 let mr = state.grid.main_rows();
                 state.grid.set_main_size(mr, original_main_cols.saturating_add(count));
+                eprintln!("[DEBUG apply] after set_main_size main_cols={}", state.grid.main_cols());
                 let dest = end + 1;
                 if dest < original_main_cols {
                     state.grid.move_main_cols(dest, original_main_cols - dest, original_main_cols + count);
@@ -1166,13 +1168,17 @@ fn parse_op_text(line: &str) -> Option<Op> {
             if let Some((a, b)) = col_tok.split_once(':') {
                 let a_col = parse_excel_column(a)?;
                 let b_col = parse_excel_column(b)?;
-                return Some(Op::DuplicateColRange {
+                let op = Op::DuplicateColRange {
                     col_start: a_col,
                     col_end: b_col,
-                });
+                };
+                eprintln!("[DEBUG parse_op_text] parsed: DUPLICATE_COL range {a}:{b} -> {:?}", op);
+                return Some(op);
             }
             let col = parse_excel_column(col_tok)?;
-            Some(Op::DuplicateCol { col })
+            let op = Op::DuplicateCol { col };
+            eprintln!("[DEBUG parse_op_text] parsed: DUPLICATE_COL single {col_tok} -> {:?}", op);
+            Some(op)
         }
         "DELETE_ROW" => {
             // 1-based inclusive N or N:M
@@ -1959,12 +1965,21 @@ pub fn apply_workbook_op(
             *active_sheet = id;
             Ok(())
         }
-        WorkbookOp::SheetOp { sheet_id, op } => {
-            let sheet = workbook
-                .sheet_mut_by_id(sheet_id)
-                .ok_or_else(|| bad("unknown sheet id"))?;
+            WorkbookOp::SheetOp { sheet_id, op } => {
+                let sheet = workbook
+                    .sheet_mut_by_id(sheet_id)
+                    .ok_or_else(|| bad("unknown sheet id"))?;
             op.apply(sheet);
             sheet.grid.bump_volatile_seed();
+            // Debug: print a small snapshot of the main-row 0 after each sheet op
+            // to help trace replay issues in tests.
+            if sheet.grid.main_rows() > 0 {
+                let mut row_vals = Vec::new();
+                for c in 0..sheet.grid.main_cols() {
+                    row_vals.push(sheet.grid.get(&CellAddr::Main { row: 0, col: c as u32 }).unwrap_or_default());
+                }
+                eprintln!("[REPLAY DEBUG] sheet_id={} main_cols={} row0={:?}", sheet_id, sheet.grid.main_cols(), row_vals);
+            }
             Ok(())
         }
     }
