@@ -17,7 +17,9 @@ use crate::io::{
     commit_workbook_op, commit_workbook_set_column_format_batch, load_workbook_revisions_partial,
     IoError, LogWatcher, PartialReplay,
 };
-use crate::ops::{AggFunc, AggregateDef, Op, SheetState, WorkbookState};
+use crate::ops::{
+    AggFunc, AggregateDef, LinkedSource, Op, SheetState, WorkbookState,
+};
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
@@ -31,7 +33,7 @@ use ratatui::widgets::{
 use std::collections::{HashMap, HashSet};
 use std::io::{self, stdout};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use thiserror::Error;
 use unicode_truncate::{Alignment as UTruncAlign, UnicodeTruncateStr};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -2527,6 +2529,7 @@ pub struct App {
     clipboard_snapshot: Option<(MainRange, String)>,
     /// Event read during arrow coalescing that must be handled before the next `poll`.
     pending_event: Option<Event>,
+    linked_source_mtimes: HashMap<PathBuf, SystemTime>,
 }
 
 impl App {
@@ -2569,6 +2572,61 @@ impl App {
 
     pub fn new(path: Option<PathBuf>) -> Self {
         Self::new_with_revision_limit(path, None)
+    }
+
+    pub fn new_with_paths(paths: Vec<PathBuf>) -> Self {
+        let mut app = Self::new(paths.first().cloned());
+        if paths.len() <= 1 {
+            return app;
+        }
+        let all_tabular = paths.iter().all(|path| {
+            matches!(
+                path.extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "csv" | "tsv"
+            )
+        });
+        if all_tabular {
+            app.path = None;
+            app.import_source = None;
+            app.source_path = None;
+            app.workbook = WorkbookState {
+                sheets: Vec::new(),
+                active_sheet: 0,
+                next_sheet_id: 1,
+            };
+            for path in paths {
+                let Some(source) = Self::linked_source_from_path(&path) else {
+                    continue;
+                };
+                let title = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("Sheet")
+                    .to_string();
+                let state = crate::ops::load_linked_sheet_state(&source)
+                    .unwrap_or_else(|_| SheetState::new(1, 1));
+                let id = app.workbook.next_sheet_id;
+                app.workbook.next_sheet_id += 1;
+                app.workbook.sheets.push(crate::ops::SheetRecord {
+                    id,
+                    title,
+                    state,
+                    linked_source: Some(source),
+                });
+            }
+            if app.workbook.sheets.is_empty() {
+                app.workbook = WorkbookState::new();
+            }
+            app.view_sheet_id = app.workbook.sheet_id(app.workbook.active_sheet);
+            app.sync_active_sheet_cache();
+            app.fit_active_sheet_after_load();
+        }
+        app
     }
 
     pub fn new_with_revision_limit(path: Option<PathBuf>, revision_limit: Option<usize>) -> Self {
@@ -2623,6 +2681,7 @@ impl App {
             pending_fit_to_content_on_commit: false,
             clipboard_snapshot: None,
             pending_event: None,
+            linked_source_mtimes: HashMap::new(),
         }
     }
 
@@ -2685,7 +2744,7 @@ impl App {
         if let Some(p) = &self.path {
             return Self::to_corro_path(p).to_string_lossy().into_owned();
         }
-        if let Some(p) = &self.import_source {
+        if let Some(p) = self.preferred_import_source_path() {
             return Self::to_corro_path(p).to_string_lossy().into_owned();
         }
         String::new()
@@ -2693,7 +2752,7 @@ impl App {
 
     /// Default filename for export: same basename as `path` or `import_source` with the target extension (`file.corro` → `file.ods`). Empty when there is no path (blank still means clipboard where the prompt says so).
     fn suggested_export_save_path(&self, extension: &str) -> String {
-        if let Some(p) = self.path.as_ref().or(self.import_source.as_ref()) {
+        if let Some(p) = self.preferred_import_source_path() {
             return p.with_extension(extension).to_string_lossy().into_owned();
         }
         String::new()
@@ -2809,6 +2868,7 @@ impl App {
                 id,
                 title,
                 state: source.state.clone(),
+                linked_source: source.linked_source.clone(),
             });
         }
         self.view_sheet_id = id;
@@ -3108,6 +3168,139 @@ impl App {
         }
     }
 
+    fn linked_source_from_path(path: &Path) -> Option<LinkedSource> {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let kind = match ext.as_str() {
+            "csv" => crate::ops::LinkedSourceKind::Csv,
+            "tsv" => crate::ops::LinkedSourceKind::Tsv,
+            "ods" => crate::ops::LinkedSourceKind::Ods,
+            _ => return None,
+        };
+        Some(LinkedSource {
+            path: path.to_path_buf(),
+            kind,
+            ods_sheet_name: None,
+        })
+    }
+
+    fn fit_active_sheet_after_load(&mut self) {
+        for c in 0..self.state.grid.main_cols() {
+            self.fit_column_to_rendered_content(MARGIN_COLS + c);
+        }
+    }
+
+    fn load_linked_workbook_from_source(&mut self, source: LinkedSource) -> Result<(), IoError> {
+        match source.kind {
+            crate::ops::LinkedSourceKind::Ods => {
+                let mut workbook = crate::ods::import_ods_workbook(&source.path)
+                    .map_err(|e| IoError::Io(std::io::Error::other(e.to_string())))?;
+                for sheet in &mut workbook.sheets {
+                    sheet.linked_source = Some(LinkedSource {
+                        path: source.path.clone(),
+                        kind: crate::ops::LinkedSourceKind::Ods,
+                        ods_sheet_name: Some(sheet.title.clone()),
+                    });
+                }
+                self.workbook = workbook;
+                self.view_sheet_id = self.workbook.sheet_id(self.workbook.active_sheet);
+                self.sync_active_sheet_cache();
+            }
+            _ => {
+                let state = crate::ops::load_linked_sheet_state(&source).map_err(IoError::Io)?;
+                self.workbook = WorkbookState::new();
+                self.workbook.sheets[0].state = state;
+                self.workbook.sheets[0].linked_source = Some(source);
+                self.view_sheet_id = self.workbook.sheet_id(self.workbook.active_sheet);
+                self.sync_active_sheet_cache();
+            }
+        }
+        self.persisted_view_sort_cols.clear();
+        self.path = None;
+        self.import_source = Some(
+            self.workbook
+                .sheets
+                .first()
+                .and_then(|sheet| sheet.linked_source.as_ref())
+                .map(|source| source.path.clone())
+                .unwrap_or_default(),
+        );
+        self.source_path = None;
+        self.revision_limit = None;
+        self.watcher = None;
+        self.fit_active_sheet_after_load();
+        self.refresh_linked_source_mtimes();
+        Ok(())
+    }
+
+    fn preferred_import_source_path(&self) -> Option<&Path> {
+        self.path
+            .as_deref()
+            .or(self.import_source.as_deref())
+            .or_else(|| {
+                self.workbook
+                    .sheets
+                    .iter()
+                    .find_map(|sheet| sheet.linked_source.as_ref().map(|source| source.path.as_path()))
+            })
+    }
+
+    fn linked_sheet_base_state(source: &LinkedSource) -> Option<SheetState> {
+        crate::ops::load_linked_sheet_state(source).ok()
+    }
+
+    fn refresh_linked_source_mtimes(&mut self) {
+        self.linked_source_mtimes.clear();
+        for sheet in &self.workbook.sheets {
+            if let Some(source) = &sheet.linked_source {
+                if let Ok(meta) = std::fs::metadata(&source.path) {
+                    if let Ok(modified) = meta.modified() {
+                        self.linked_source_mtimes
+                            .insert(source.path.clone(), modified);
+                    }
+                }
+            }
+        }
+    }
+
+    fn linked_sources_changed(&self) -> bool {
+        for sheet in &self.workbook.sheets {
+            let Some(source) = &sheet.linked_source else {
+                continue;
+            };
+            let Ok(meta) = std::fs::metadata(&source.path) else {
+                continue;
+            };
+            let Ok(modified) = meta.modified() else {
+                continue;
+            };
+            match self.linked_source_mtimes.get(&source.path) {
+                Some(prev) if *prev >= modified => {}
+                _ => return true,
+            }
+        }
+        false
+    }
+
+    fn reload_workbook_from_log_path(&mut self, path: &Path) -> Result<(), IoError> {
+        let data = std::fs::read_to_string(path).map_err(IoError::Io)?;
+        let mut workbook = WorkbookState::new();
+        let mut active_sheet = workbook.sheet_id(workbook.active_sheet);
+        let (_, replay) = load_workbook_revisions_partial(path, usize::MAX, &mut workbook, &mut active_sheet)?;
+        self.workbook = workbook;
+        self.view_sheet_id = active_sheet;
+        self.sync_active_sheet_cache();
+        self.sync_persisted_sort_cache_from_workbook();
+        self.fit_active_sheet_after_load();
+        self.offset = data.len() as u64;
+        self.ops_applied = replay.op_count;
+        self.refresh_linked_source_mtimes();
+        Ok(())
+    }
+
     fn reload_revision_browse(&mut self) -> Result<(), IoError> {
         let Some(path) = self.source_path.clone() else {
             return Ok(());
@@ -3259,67 +3452,25 @@ impl App {
                         self.source_path = None;
                         self.revision_limit = None;
                         self.watcher = Some(LogWatcher::new(p.clone())?);
+                        self.refresh_linked_source_mtimes();
                         self.status = Self::replay_status("Loaded workbook", p, &replay);
                         self.cursor.clamp(&self.state.grid);
                         return Ok(());
                     }
-                    "tsv" => {
-                        let data = std::fs::read_to_string(p).map_err(|e| IoError::Io(e))?;
-                        crate::io::import_tsv(&data, &mut self.state);
-                        self.commit_active_sheet_cache();
-                        self.path = None;
-                        self.import_source = Some(p.clone());
-                        self.source_path = None;
-                        self.revision_limit = None;
-                        self.watcher = None;
-                        for c in 0..self.state.grid.main_cols() {
-                            self.fit_column_to_rendered_content(MARGIN_COLS + c);
-                        }
-                        self.status = format!(
-                            "Imported TSV (not saved) — use Save as a .corro file: {}",
-                            p.display()
-                        );
-                    }
-                    "ods" => match crate::ods::import_ods_workbook(p) {
-                        Ok(workbook) => {
-                            self.workbook = workbook;
-                            self.sync_active_sheet_cache();
-                            self.persisted_view_sort_cols.clear();
-                            self.path = None;
-                            self.import_source = Some(p.clone());
-                            self.source_path = None;
-                            self.revision_limit = None;
-                            self.watcher = None;
-                            for c in 0..self.state.grid.main_cols() {
-                                self.state.grid.fit_column_to_content(MARGIN_COLS + c);
+                    "tsv" | "ods" | "csv" => {
+                        if let Some(source) = Self::linked_source_from_path(p) {
+                            match self.load_linked_workbook_from_source(source) {
+                                Ok(()) => {
+                                    self.status = format!("Linked external source {}", p.display());
+                                    self.cursor.clamp(&self.state.grid);
+                                    return Ok(());
+                                }
+                                Err(err) => {
+                                    self.status = format!("Failed to load {}: {err}", p.display());
+                                    return Ok(());
+                                }
                             }
-                            self.status = format!(
-                                "Imported ODS (not saved) — use Save as a .corro file: {}",
-                                p.display()
-                            );
-                            return Ok(());
                         }
-                        Err(e) => {
-                            self.status = format!("Failed to import ODS: {e}");
-                            return Ok(());
-                        }
-                    },
-                    "csv" => {
-                        let data = std::fs::read_to_string(p).map_err(|e| IoError::Io(e))?;
-                        crate::io::import_csv(&data, &mut self.state);
-                        self.commit_active_sheet_cache();
-                        self.path = None;
-                        self.import_source = Some(p.clone());
-                        self.source_path = None;
-                        self.revision_limit = None;
-                        self.watcher = None;
-                        for c in 0..self.state.grid.main_cols() {
-                            self.state.grid.auto_fit_column(MARGIN_COLS + c);
-                        }
-                        self.status = format!(
-                            "Imported CSV (not saved) — use Save as a .corro file: {}",
-                            p.display()
-                        );
                     }
                     _ => {
                         if browsing {
@@ -4022,6 +4173,14 @@ impl App {
 
     fn sync_external(&mut self) -> Result<bool, IoError> {
         let mut changed = false;
+
+        if self.path.is_some() && self.linked_sources_changed() {
+            if let Some(path) = self.path.clone() {
+                self.reload_workbook_from_log_path(&path)?;
+                self.status = "Linked source change applied".into();
+                changed = true;
+            }
+        }
 
         // If we have a path, determine whether we should tail the log.
         // Prefer a watcher signal, but fall back to a file-size check when
@@ -6685,27 +6844,68 @@ impl App {
                 buf.push_str(&line);
                 buf.push('\n');
             }
-            for row in 0..sheet.state.grid.main_rows() {
-                for col in 0..sheet.state.grid.main_cols() {
-                    let addr = CellAddr::Main {
-                        row: row as u32,
-                        col: col as u32,
-                    };
-                    if let Some(value) = sheet.state.grid.get(&addr) {
-                        if !value.is_empty() {
-                            for line in (crate::ops::WorkbookOp::SheetOp {
-                                sheet_id: sheet.id,
-                                op: Op::SetCell {
-                                    addr: addr.clone(),
-                                    value: value.to_string(),
-                                },
-                            })
-                            .to_log_lines_with_policy(
-                                sheet.state.grid.main_cols(),
-                                omit_sheet1_prefix,
-                            ) {
-                                buf.push_str(&line);
-                                buf.push('\n');
+            let linked_base = if let Some(source) = &sheet.linked_source {
+                for line in (crate::ops::WorkbookOp::LinkSheet {
+                    id: sheet.id,
+                    source: source.clone(),
+                })
+                .to_log_lines_with_policy(sheet.state.grid.main_cols(), omit_sheet1_prefix)
+                {
+                    buf.push_str(&line);
+                    buf.push('\n');
+                }
+                Self::linked_sheet_base_state(source)
+            } else {
+                None
+            };
+            let mut base_values = std::collections::HashMap::new();
+            let mut addrs = std::collections::HashSet::new();
+            if let Some(base) = &linked_base {
+                for (addr, value) in base.grid.iter_nonempty() {
+                    if matches!(addr, CellAddr::Main { .. }) {
+                        addrs.insert(addr.clone());
+                        base_values.insert(addr, value);
+                    }
+                }
+            }
+            for (addr, value) in sheet.state.grid.iter_nonempty() {
+                if matches!(addr, CellAddr::Main { .. }) {
+                    addrs.insert(addr.clone());
+                    if linked_base.is_none() || base_values.get(&addr) != Some(&value) {
+                        for line in (crate::ops::WorkbookOp::SheetOp {
+                            sheet_id: sheet.id,
+                            op: Op::SetCell {
+                                addr: addr.clone(),
+                                value,
+                            },
+                        })
+                        .to_log_lines_with_policy(sheet.state.grid.main_cols(), omit_sheet1_prefix)
+                        {
+                            buf.push_str(&line);
+                            buf.push('\n');
+                        }
+                    }
+                }
+            }
+            if linked_base.is_some() {
+                for addr in addrs {
+                    if let CellAddr::Main { .. } = addr {
+                        if !sheet.state.grid.get(&addr).is_some_and(|v| !v.is_empty()) {
+                            if base_values.get(&addr).is_some_and(|v| !v.is_empty()) {
+                                for line in (crate::ops::WorkbookOp::SheetOp {
+                                    sheet_id: sheet.id,
+                                    op: Op::SetCell {
+                                        addr: addr.clone(),
+                                        value: String::new(),
+                                    },
+                                })
+                                .to_log_lines_with_policy(
+                                    sheet.state.grid.main_cols(),
+                                    omit_sheet1_prefix,
+                                ) {
+                                    buf.push_str(&line);
+                                    buf.push('\n');
+                                }
                             }
                         }
                     }
@@ -6834,6 +7034,7 @@ impl App {
         if self.watcher.is_none() {
             self.watcher = Some(LogWatcher::new(path).map_err(IoError::from)?);
         }
+        self.refresh_linked_source_mtimes();
         Ok(())
     }
 
@@ -7668,6 +7869,13 @@ impl App {
             Err(_) => return Ok(false),
         };
         match op {
+            crate::ops::WorkbookOp::LinkSheet { .. } => {
+                crate::ops::apply_workbook_op(&mut self.workbook, active_sheet, op)
+                    .map_err(IoError::from)?;
+                self.view_sheet_id = *active_sheet;
+                self.sync_active_sheet_cache();
+                return Ok(true);
+            }
             crate::ops::WorkbookOp::SheetOp { sheet_id, op } => {
                 self.movie_focus_sheet(sheet_id);
                 match op {
@@ -11335,61 +11543,24 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                                 .unwrap_or("")
                                 .to_lowercase();
                             match ext.as_str() {
-                                "tsv" => {
-                                    self.workbook = WorkbookState::new();
-                                    self.state = SheetState::new(1, 1);
-                                    self.view_sheet_id = 1;
-                                    if let Ok(data) = std::fs::read_to_string(&path) {
-                                        crate::io::import_tsv(&data, &mut self.state);
-                                    }
-                                    self.commit_active_sheet_cache();
-                                    self.path = None;
-                                    self.import_source = Some(path.clone());
-                                    self.watcher = None;
-                                    self.status = format!(
-                                        "Imported TSV (not saved) — save as .corro: {}",
-                                        path.display()
-                                    );
-                                }
-                                "csv" => {
-                                    self.workbook = WorkbookState::new();
-                                    self.state = SheetState::new(1, 1);
-                                    self.view_sheet_id = 1;
-                                    if let Ok(data) = std::fs::read_to_string(&path) {
-                                        crate::io::import_csv(&data, &mut self.state);
-                                    }
-                                    self.commit_active_sheet_cache();
-                                    self.path = None;
-                                    self.import_source = Some(path.clone());
-                                    self.watcher = None;
-                                    self.status = format!(
-                                        "Imported CSV (not saved) — save as .corro: {}",
-                                        path.display()
-                                    );
-                                }
-                                "ods" => match crate::ods::import_ods_workbook(&path) {
-                                    Ok(workbook) => {
-                                        self.workbook = workbook;
-                                        self.view_sheet_id = self.workbook.sheet_id(0);
-                                        self.sync_active_sheet_cache();
-                                        self.persisted_view_sort_cols.clear();
-                                        for c in 0..self.state.grid.main_cols() {
-                                            self.state
-                                                .grid
-                                                .fit_column_to_content(MARGIN_COLS + c);
+                                "tsv" | "csv" | "ods" => {
+                                    if let Some(source) = Self::linked_source_from_path(&path) {
+                                        match self.load_linked_workbook_from_source(source) {
+                                            Ok(()) => {
+                                                self.status = format!(
+                                                    "Linked external source {}",
+                                                    path.display()
+                                                );
+                                            }
+                                            Err(err) => {
+                                                self.status = format!(
+                                                    "Failed to load {}: {err}",
+                                                    path.display()
+                                                );
+                                            }
                                         }
-                                        self.path = None;
-                                        self.import_source = Some(path.clone());
-                                        self.watcher = None;
-                                        self.status = format!(
-                                            "Imported ODS (not saved) — save as .corro: {}",
-                                            path.display()
-                                        );
                                     }
-                                    Err(e) => {
-                                        self.status = format!("Failed to import ODS: {e}");
-                                    }
-                                },
+                                }
                                 "corro" | _ => {
                                     self.workbook = WorkbookState::new();
                                     self.state = SheetState::new(1, 1);
@@ -16248,6 +16419,23 @@ mod tests {
     }
 
     #[test]
+    fn new_with_paths_builds_multi_sheet_linked_tabular_workbook() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.csv");
+        let b = dir.path().join("b.tsv");
+        std::fs::write(&a, "name,value\nalpha,1\n").unwrap();
+        std::fs::write(&b, "name	value\nbeta	2\n").unwrap();
+
+        let app = App::new_with_paths(vec![a.clone(), b.clone()]);
+
+        assert_eq!(app.workbook.sheet_count(), 2);
+        assert_eq!(app.workbook.sheets[0].title, "a");
+        assert_eq!(app.workbook.sheets[1].title, "b");
+        assert_eq!(app.workbook.sheets[0].linked_source.as_ref().map(|s| &s.path), Some(&a));
+        assert_eq!(app.workbook.sheets[1].linked_source.as_ref().map(|s| &s.path), Some(&b));
+    }
+
+    #[test]
     fn file_menu_includes_replay() {
         let items = menu_items(MenuSection::File);
         assert!(items.iter().any(|item| item.label == "Replay"));
@@ -19473,6 +19661,67 @@ mod tests {
                 .format_for_addr(&CellAddr::Main { row: 0, col: 0 })
                 .align,
             Some(TextAlign::Center)
+        );
+    }
+
+    #[test]
+    fn save_and_reload_preserve_linked_csv_sheet() {
+        let dir = tempfile::tempdir().unwrap();
+        let csv = dir.path().join("linked.csv");
+        let corro = dir.path().join("linked.corro");
+        std::fs::write(&csv, "name,value\nalpha,1\n").unwrap();
+
+        let mut app = App::new(Some(csv.clone()));
+        app.load_initial().unwrap();
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 1 }, "7".into());
+        app.save_to_path(&corro).unwrap();
+
+        let data = std::fs::read_to_string(&corro).unwrap();
+        assert!(data.contains("LINK CSV"));
+
+        let mut reloaded = App::new(Some(corro.clone()));
+        reloaded.load_initial().unwrap();
+
+        assert_eq!(
+            reloaded.workbook.sheets[0]
+                .linked_source
+                .as_ref()
+                .map(|s| s.path.clone()),
+            Some(csv)
+        );
+        assert_eq!(
+            reloaded
+                .state
+                .grid
+                .get(&CellAddr::Main { row: 0, col: 1 })
+                .as_deref(),
+            Some("7")
+        );
+    }
+
+    #[test]
+    fn sync_external_rebuilds_when_linked_csv_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let csv = dir.path().join("linked.csv");
+        let corro = dir.path().join("linked.corro");
+        std::fs::write(&csv, "name,value\nalpha,1\n").unwrap();
+
+        let mut app = App::new(Some(csv.clone()));
+        app.load_initial().unwrap();
+        app.save_to_path(&corro).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&csv, "name,value\nalpha,9\n").unwrap();
+
+        assert!(app.sync_external().unwrap());
+        assert_eq!(
+            app.state
+                .grid
+                .get(&CellAddr::Main { row: 0, col: 1 })
+                .as_deref(),
+            Some("9")
         );
     }
 

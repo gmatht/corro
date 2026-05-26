@@ -254,6 +254,7 @@ pub fn load_workbook_snapshot(path: &Path) -> Result<WorkbookSnapshot, IoError> 
                     id,
                     title,
                     state: SheetState::new(1, 1),
+                    linked_source: None,
                 });
             }
             Some("VOLATILE_SEED") => {
@@ -993,11 +994,13 @@ mod tests {
                     id: 1,
                     title: "Sheet1".into(),
                     state: SheetState::new(1, 1),
+                    linked_source: None,
                 },
                 SheetRecord {
                     id: 2,
                     title: "Sheet2".into(),
                     state: SheetState::new(1, 1),
+                    linked_source: None,
                 },
             ],
         };

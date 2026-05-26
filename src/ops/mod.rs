@@ -13,7 +13,7 @@ use crate::addr::{
 use crate::grid::{CellAddr, CellFormat, FormatScope, MainRange, SortSpec, MARGIN_COLS};
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AggFunc {
@@ -112,6 +112,21 @@ pub struct SheetRecord {
     pub id: u32,
     pub title: String,
     pub state: SheetState,
+    pub linked_source: Option<LinkedSource>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LinkedSourceKind {
+    Csv,
+    Tsv,
+    Ods,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LinkedSource {
+    pub path: PathBuf,
+    pub kind: LinkedSourceKind,
+    pub ods_sheet_name: Option<String>,
 }
 
 impl WorkbookState {
@@ -121,6 +136,7 @@ impl WorkbookState {
                 id: 1,
                 title: "Sheet1".into(),
                 state: SheetState::new(1, 1),
+                linked_source: None,
             }],
             active_sheet: 0,
             next_sheet_id: 2,
@@ -141,6 +157,7 @@ impl WorkbookState {
                 id: 1,
                 title: "Sheet1".into(),
                 state: SheetState::new(1, 1),
+                linked_source: None,
             });
             self.active_sheet = 0;
             self.next_sheet_id = 2;
@@ -167,7 +184,12 @@ impl WorkbookState {
     pub fn add_sheet(&mut self, title: String, state: SheetState) -> usize {
         let id = self.next_sheet_id;
         self.next_sheet_id += 1;
-        self.sheets.push(SheetRecord { id, title, state });
+        self.sheets.push(SheetRecord {
+            id,
+            title,
+            state,
+            linked_source: None,
+        });
         self.sheets.len() - 1
     }
 
@@ -339,6 +361,10 @@ pub enum WorkbookOp {
         id: u32,
         title: String,
     },
+    LinkSheet {
+        id: u32,
+        source: LinkedSource,
+    },
     CopySheet {
         source_id: u32,
         id: u32,
@@ -376,6 +402,72 @@ pub const LOG_HEADER_PREFIX: &str = "CORRO_LOG";
 
 fn sheet_prefix(sheet_id: u32) -> String {
     format!("${sheet_id}:")
+}
+
+fn linked_source_kind_text(kind: &LinkedSourceKind) -> &'static str {
+    match kind {
+        LinkedSourceKind::Csv => "CSV",
+        LinkedSourceKind::Tsv => "TSV",
+        LinkedSourceKind::Ods => "ODS",
+    }
+}
+
+fn parse_linked_source_kind(kind: &str) -> Option<LinkedSourceKind> {
+    match kind {
+        "CSV" => Some(LinkedSourceKind::Csv),
+        "TSV" => Some(LinkedSourceKind::Tsv),
+        "ODS" => Some(LinkedSourceKind::Ods),
+        _ => None,
+    }
+}
+
+pub fn load_linked_sheet_state(source: &LinkedSource) -> Result<SheetState, std::io::Error> {
+    match source.kind {
+        LinkedSourceKind::Csv => {
+            let data = std::fs::read_to_string(&source.path)?;
+            let mut state = SheetState::new(1, 1);
+            crate::io::import_csv(&data, &mut state);
+            Ok(state)
+        }
+        LinkedSourceKind::Tsv => {
+            let data = std::fs::read_to_string(&source.path)?;
+            let mut state = SheetState::new(1, 1);
+            crate::io::import_tsv(&data, &mut state);
+            Ok(state)
+        }
+        LinkedSourceKind::Ods => {
+            let workbook = crate::ods::import_ods_workbook(&source.path)
+                .map_err(|err| std::io::Error::other(err.to_string()))?;
+            if let Some(sheet_name) = &source.ods_sheet_name {
+                workbook
+                    .sheets
+                    .iter()
+                    .find(|sheet| sheet.title == *sheet_name)
+                    .map(|sheet| sheet.state.clone())
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            format!(
+                                "ODS sheet '{}' not found in {}",
+                                sheet_name,
+                                source.path.display()
+                            ),
+                        )
+                    })
+            } else {
+                workbook
+                    .sheets
+                    .first()
+                    .map(|sheet| sheet.state.clone())
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("ODS workbook has no sheets: {}", source.path.display()),
+                        )
+                    })
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1502,6 +1594,18 @@ impl WorkbookOp {
     pub fn to_log_line(&self, main_cols: usize) -> String {
         match self {
             WorkbookOp::NewSheet { id, title } => format!("${id}:NEW_SHEET {title}"),
+            WorkbookOp::LinkSheet { id, source } => {
+                let path = source.path.to_string_lossy();
+                match &source.ods_sheet_name {
+                    Some(sheet_name) => format!(
+                        "${id}:LINK {} {} {}",
+                        linked_source_kind_text(&source.kind),
+                        path,
+                        sheet_name
+                    ),
+                    None => format!("${id}:LINK {} {}", linked_source_kind_text(&source.kind), path),
+                }
+            }
             WorkbookOp::CopySheet {
                 source_id,
                 id,
@@ -1725,6 +1829,22 @@ pub fn parse_workbook_line(line: &str) -> Result<WorkbookOp, std::io::Error> {
                 title,
             })
         }
+        "LINK" => {
+            let kind = parts.next().ok_or_else(|| bad("bad link line"))?;
+            let path = parts.next().ok_or_else(|| bad("bad link line"))?;
+            let ods_sheet_name = {
+                let rest = parts.collect::<Vec<_>>().join(" ");
+                if rest.is_empty() { None } else { Some(rest) }
+            };
+            Ok(WorkbookOp::LinkSheet {
+                id: sheet_id,
+                source: LinkedSource {
+                    path: PathBuf::from(path),
+                    kind: parse_linked_source_kind(kind).ok_or_else(|| bad("bad link line"))?,
+                    ods_sheet_name,
+                },
+            })
+        }
         "COPY_SHEET" => {
             let source_id = parts
                 .next()
@@ -1855,8 +1975,19 @@ pub fn apply_workbook_op(
                     id,
                     title,
                     state: SheetState::new(1, 1),
+                    linked_source: None,
                 });
             }
+            Ok(())
+        }
+        WorkbookOp::LinkSheet { id, source } => {
+            let sheet = workbook
+                .sheets
+                .iter_mut()
+                .find(|s| s.id == id)
+                .ok_or_else(|| bad("unknown sheet id"))?;
+            sheet.state = load_linked_sheet_state(&source)?;
+            sheet.linked_source = Some(source);
             Ok(())
         }
         WorkbookOp::CopySheet {
@@ -1873,11 +2004,13 @@ pub fn apply_workbook_op(
             if let Some(idx) = workbook.sheet_index_by_id(id) {
                 workbook.sheets[idx].title = title;
                 workbook.sheets[idx].state = source.state.clone();
+                workbook.sheets[idx].linked_source = source.linked_source.clone();
             } else {
                 workbook.add_sheet_record(SheetRecord {
                     id,
                     title,
                     state: source.state,
+                    linked_source: source.linked_source,
                 });
             }
             workbook.active_sheet = workbook
@@ -1951,6 +2084,7 @@ pub fn apply_workbook_op(
                     id,
                     title: plan.target_title.clone(),
                     state: target_state.clone(),
+                    linked_source: None,
                 });
             }
             let sheet = workbook
@@ -1960,16 +2094,17 @@ pub fn apply_workbook_op(
                 .ok_or_else(|| bad("unknown sheet id"))?;
             sheet.title = plan.target_title;
             sheet.state = target_state;
+            sheet.linked_source = None;
             workbook.active_sheet = workbook
                 .sheet_index_by_id(id)
                 .unwrap_or(workbook.active_sheet);
             *active_sheet = id;
             Ok(())
         }
-            WorkbookOp::SheetOp { sheet_id, op } => {
-                let sheet = workbook
-                    .sheet_mut_by_id(sheet_id)
-                    .ok_or_else(|| bad("unknown sheet id"))?;
+        WorkbookOp::SheetOp { sheet_id, op } => {
+            let sheet = workbook
+                .sheet_mut_by_id(sheet_id)
+                .ok_or_else(|| bad("unknown sheet id"))?;
             op.apply(sheet);
             sheet.grid.bump_volatile_seed();
             // Debug: print a small snapshot of the main-row 0 after each sheet op

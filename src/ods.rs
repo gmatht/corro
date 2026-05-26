@@ -1598,6 +1598,7 @@ fn parse_ods_content_with_layout(
                         id: workbook.next_sheet_id,
                         title,
                         state: SheetState::new(1, 1),
+                        linked_source: None,
                     });
                     workbook.next_sheet_id += 1;
                     row_idx = 0;

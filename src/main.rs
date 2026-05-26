@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 struct Args {
     revision: Option<RevisionMode>,
-    file: Option<PathBuf>,
+    files: Vec<PathBuf>,
     export: Option<PathBuf>,
     movie: bool,
     movie_typing_cps: f64,
@@ -29,7 +29,6 @@ fn cli_option_suggestion(arg: &str) -> Option<&'static str> {
 
 fn parse_args() -> Result<Args, String> {
     let mut revision = None;
-    let mut file = None;
     let mut export = None;
     let mut movie = false;
     let mut movie_typing_cps = 22.0f64;
@@ -109,16 +108,11 @@ fn parse_args() -> Result<Args, String> {
         }
     }
 
-    if positional.len() > 1 {
-        return Err("too many positional arguments".into());
-    }
-    if let Some(path) = positional.pop() {
-        file = Some(PathBuf::from(path));
-    }
+    let files = positional.into_iter().map(PathBuf::from).collect();
 
     Ok(Args {
         revision,
-        file,
+        files,
         export,
         movie,
         movie_typing_cps,
@@ -147,12 +141,15 @@ fn try_main() -> Result<(), corro::ui::RunError> {
         return Ok(());
     }
     if let Some(export_path) = args.export {
-        let Some(input_path) = args.file else {
+        let Some(input_path) = args.files.first() else {
             return Err(std::io::Error::other(
                 "--export requires an input file argument",
             )
             .into());
         };
+        if args.files.len() > 1 {
+            return Err(std::io::Error::other("--export accepts exactly one input file").into());
+        }
         let workbook = load_workbook_for_export(&input_path).map_err(std::io::Error::other)?;
         export_workbook_to_path(&workbook, &export_path).map_err(std::io::Error::other)?;
         return Ok(());
@@ -160,11 +157,17 @@ fn try_main() -> Result<(), corro::ui::RunError> {
     if args.movie && args.revision.is_some() {
         return Err(std::io::Error::other("--movie cannot be combined with --revision").into());
     }
+    if args.revision.is_some() && args.files.len() > 1 {
+        return Err(std::io::Error::other("--revision accepts exactly one input file").into());
+    }
+    if args.movie && args.files.len() > 1 {
+        return Err(std::io::Error::other("--movie accepts exactly one input file").into());
+    }
     let mut app = match args.revision {
-        None => App::new(args.file),
-        Some(RevisionMode::Browse) => App::new_with_revision_browser(args.file),
+        None => App::new_with_paths(args.files),
+        Some(RevisionMode::Browse) => App::new_with_revision_browser(args.files.first().cloned()),
         Some(RevisionMode::Limit(revision)) => {
-            App::new_with_revision_limit(args.file, Some(revision))
+            App::new_with_revision_limit(args.files.first().cloned(), Some(revision))
         }
     };
     if args.movie {
@@ -185,7 +188,7 @@ fn cli_help_text() -> String {
         "corro {}\n\
 \n\
 USAGE:\n\
-  corro [OPTIONS] [FILE]\n\
+  corro [OPTIONS] [FILE ...]\n\
 \n\
 OPTIONS:\n\
   -h, -?, --help            Show help\n\
@@ -198,7 +201,7 @@ OPTIONS:\n\
   --movie-menu-hold-ms <N>  Hold menu/dialog moments in movie mode (default: 1200)\n\
 \n\
 ARGS:\n\
-  FILE                      Input file (.corro, .ods, .tsv, .csv)\n",
+  FILE                      Input file(s) (.corro, .ods, .tsv, .csv)\n",
         env!("CARGO_PKG_VERSION")
     )
 }
@@ -310,20 +313,14 @@ mod tests {
     fn parses_revision_limit() {
         let args = parse_args_from(["corro", "--revision", "2", "docs/test/main.corro"]);
         assert!(matches!(args.revision, Some(RevisionMode::Limit(2))));
-        assert_eq!(
-            args.file.as_deref(),
-            Some(std::path::Path::new("docs/test/main.corro"))
-        );
+        assert_eq!(args.files, vec![PathBuf::from("docs/test/main.corro")]);
     }
 
     #[test]
     fn parses_browse_mode() {
         let args = parse_args_from(["corro", "-r", "docs/test/main.corro"]);
         assert!(matches!(args.revision, Some(RevisionMode::Browse)));
-        assert_eq!(
-            args.file.as_deref(),
-            Some(std::path::Path::new("docs/test/main.corro"))
-        );
+        assert_eq!(args.files, vec![PathBuf::from("docs/test/main.corro")]);
     }
 
     fn parse_args_from<I, S>(iter: I) -> Args
@@ -334,7 +331,6 @@ mod tests {
         let mut it = iter.into_iter();
         let _program = it.next();
         let mut revision = None;
-        let mut file = None;
         let mut export = None;
         let mut movie = false;
         let mut movie_typing_cps = 22.0f64;
@@ -394,13 +390,11 @@ mod tests {
             }
         }
 
-        if let Some(path) = positional.pop() {
-            file = Some(PathBuf::from(path));
-        }
+        let files = positional.into_iter().map(PathBuf::from).collect();
 
         Args {
             revision,
-            file,
+            files,
             export,
             movie,
             movie_typing_cps,
@@ -418,10 +412,13 @@ mod tests {
             args.export.as_deref(),
             Some(std::path::Path::new("out.ods"))
         );
-        assert_eq!(
-            args.file.as_deref(),
-            Some(std::path::Path::new("docs/test/main.corro"))
-        );
+        assert_eq!(args.files, vec![PathBuf::from("docs/test/main.corro")]);
+    }
+
+    #[test]
+    fn parses_multiple_tabular_inputs() {
+        let args = parse_args_from(["corro", "a.csv", "b.tsv"]);
+        assert_eq!(args.files, vec![PathBuf::from("a.csv"), PathBuf::from("b.tsv")]);
     }
 
     #[test]
