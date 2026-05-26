@@ -36,7 +36,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use thiserror::Error;
 use unicode_truncate::{Alignment as UTruncAlign, UnicodeTruncateStr};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthStr;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthChar;
 
 /// Width of the row-label gutter (`]A~1`, `A1`, `A_1`).
 const ROW_LABEL_CHARS: usize = 5;
@@ -200,25 +202,6 @@ fn parse_open_path_request(raw: &str) -> Result<OpenPathRequest, OpenPathError> 
     }
 
     Ok(OpenPathRequest::Plain(PathBuf::from(t)))
-}
-
-/// Detect significant leading marker tokens commonly used to highlight
-/// attention-worthy prose (examples in fixtures: leading '^' or '<-').
-/// This avoids hardcoding literal attention tokens in non-test code.
-fn has_leading_significant_token(s: &str) -> bool {
-    let t = s.trim_start();
-    if t.is_empty() {
-        return false;
-    }
-    // Leading caret marker: "^ ..."
-    if t.starts_with('^') {
-        return true;
-    }
-    // Leading arrow marker: "<- ..."
-    if t.starts_with("<-") {
-        return true;
-    }
-    false
 }
 
 #[derive(Debug, Error)]
@@ -8851,13 +8834,6 @@ impl App {
             lines.push(Line::from(spans));
         }
 
-            // Use the actual inner width for row layout decisions rather than
-            // the header line's measured width. The header spans may not
-            // consume the full inner width (e.g. short header labels), but
-            // data rows should be allowed to use the whole available width
-            // so spilled prose can flow to the visible edge of the grid.
-            let header_grid_line_width = inner_w;
-
         let hr = HEADER_ROWS;
         let mr = grid.main_rows();
         let lm = MARGIN_COLS;
@@ -8866,7 +8842,6 @@ impl App {
         let max_data_lines = inner_h.saturating_sub(1);
         let last_display_main_row = grid.sorted_main_rows().last().map(|row| hr + *row);
         for &r in row_ixs.iter().take(max_data_lines) {
-            let mut _dbg_interior_gaps_skipped = 0usize;
             let active_row = r == self.cursor.row;
             let is_underlined_boundary_row =
                 (hr > 0 && r == hr - 1) || last_display_main_row == Some(r);
@@ -8886,28 +8861,8 @@ impl App {
                 row_label_style = row_label_style.add_modifier(Modifier::UNDERLINED);
             }
             let label_str = format!("{:>4} ", sheet_row_label(r, grid.main_rows()));
-            // Build a raw list of (text, style) so we can mutate the final
-            // content span if needed to absorb leftover spill_remain. Convert
-            // to ratatui::Span only once the row is finalised.
+            // Every row uses the same column widths and separators as the header.
             let mut spans_raw: Vec<(String, Style)> = vec![(label_str.clone(), row_label_style)];
-            // Track mapping from visible columns to the index in `spans_raw`
-            // where that column's content span was pushed. This lets us
-            // reassign spilled text between columns after the row is built
-            // (used to ensure long prose at the end of the grid isn't
-            // silently truncated).
-            let mut col_content_span_pos: Vec<usize> = Vec::new();
-            // Preserve the original formatted string for each content column
-            // so we can attempt to recover/append significant leading markers
-            // if the rendered spans end up dropping them.
-            let mut content_col_formatted: Vec<String> = Vec::new();
-            // If a cell containing a significant leading marker token is
-            // encountered record which content-column index it corresponds
-            // to so we can prefer moving subsequent spilled pieces into that
-            // column.
-            let mut lead_marker_content_col_idx: Option<usize> = None;
-            // Track rendered width of the spans built so far so we can compute
-            // the remaining space for the final visible column.
-            let mut spans_width = label_str.width();
             let footer_agg = if r >= hr + mr {
                 footer_row_agg_func(grid, r - hr - mr)
             } else {
@@ -8921,15 +8876,10 @@ impl App {
 
             let left_margin_agg = main_row_idx.and_then(|mri| left_margin_agg_func(grid, mri));
             let left_margin_block_start = main_row_idx.map(|mri| row_total_block_start(grid, mri));
-            // Rows with footer aggregates / left TOTAL rows keep per-cell truncation (no visual spill).
-            let spill_row = footer_agg.is_none()
-                && left_margin_agg.is_none()
-                && main_row_idx.is_some();
-            let mut spill_remain = String::new();
-            // Width budget accumulated when suppressing interior gaps during spill.
-            let mut spill_suppressed_gap_budget = 0usize;
 
-            for (i, &c) in col_ixs.iter().enumerate() {
+            let mut i = 0usize;
+            while i < col_ixs.len() {
+                let c = col_ixs[i];
                 let cur = SheetCursor { row: r, col: c };
                 let cell_addr = cur.to_addr(grid);
                 let right_col_agg = right_col_agg_func(grid, c);
@@ -9016,235 +8966,192 @@ impl App {
                     cell_effective_display(grid, &cell_addr)
                 };
                 let cw = grid.col_width(c).max(1);
+                let formatted = format_cell_display(grid, &cell_addr, text.clone());
+                let align = effective_cell_align(grid, &cell_addr, &formatted);
+                let fw = formatted.width();
+
+                // Decide whether spill-over across adjacent empty columns is allowed.
+                let allow_spill = fw > cw
+                    && (align.is_none() || align == Some(TextAlign::Left))
+                    && !is_agg_cell;
+
+                if allow_spill {
+                    // Build list of included columns and trailing widths (separator/gap)
+                    // We allow spilling across separators; their widths become available
+                    // space for the spilled prefix and will be suppressed in output.
+                    let mut included: Vec<(usize, usize)> = Vec::new();
+                    let mut total = 0usize;
+                    // Start with the current column content width.
+                    included.push((i, 0));
+                    total = total.saturating_add(cw);
+                    let mut j = i + 1;
+                    while j < col_ixs.len() {
+                        // trailing after the previous column (j-1)
+                        let prev_vp = j - 1;
+                        let prev_sheet_col = col_ixs[prev_vp];
+                        let trailing = inter_column_trailing_after_data_cell(prev_vp, prev_sheet_col, &col_ixs, lm, mc, show_right_divider);
+                        let trailing_width = match trailing {
+                            InterColumnTrailing::EndOfVisibleRow => 0usize,
+                            InterColumnTrailing::AsciiSpace => 1usize,
+                            InterColumnTrailing::PipeAndSpace => 2usize,
+                        };
+                        // Attach trailing width to the last included column and account for it.
+                        if let Some(last) = included.last_mut() {
+                            last.1 = last.1.saturating_add(trailing_width);
+                            total = total.saturating_add(trailing_width);
+                        }
+
+                        let c_next = col_ixs[j];
+                        let next_addr = SheetCursor { row: r, col: c_next }.to_addr(grid);
+                        // If next column has content, do not include its content area, but we
+                        // have already included the separator before it and we must stop.
+                        if !cell_effective_display(grid, &next_addr).trim().is_empty() {
+                            break;
+                        }
+                        // Next column is empty: include its content area and continue.
+                        let cw_next = grid.col_width(c_next).max(1);
+                        included.push((j, 0));
+                        total = total.saturating_add(cw_next);
+                        j += 1;
+                    }
+
+                    // Allow the spill to extend into the remaining free space to the
+                    // right of the grid (to the viewport edge) by adding that
+                    // right-side gap into the trailing width of the last bucket when
+                    // the last included bucket reaches the final visible column.
+                    let mut used_space = 0usize;
+                    for (vp, &sheet_col) in col_ixs.iter().enumerate() {
+                        used_space = used_space.saturating_add(grid.col_width(sheet_col).max(1));
+                        if vp + 1 < col_ixs.len() {
+                            let t = inter_column_trailing_after_data_cell(vp, sheet_col, &col_ixs, lm, mc, show_right_divider);
+                            let tw = match t {
+                                InterColumnTrailing::EndOfVisibleRow => 0usize,
+                                InterColumnTrailing::AsciiSpace => 1usize,
+                                InterColumnTrailing::PipeAndSpace => 2usize,
+                            };
+                            used_space = used_space.saturating_add(tw);
+                        }
+                    }
+                    let right_gap = data_width.saturating_sub(used_space);
+                    // Debug trace was added temporarily to inspect failing C3
+                    // cases during development. Remove in committed code.
+                    if let Some((last_vp, last_tr)) = included.last_mut() {
+                        if *last_vp == col_ixs.len().saturating_sub(1) && right_gap > 0 {
+                            *last_tr = last_tr.saturating_add(right_gap);
+                            total = total.saturating_add(right_gap);
+                        }
+                    }
+
+                    // Only proceed if there is actually extra available space beyond the
+                    // current column width (so last-column-only spills into the
+                    // right-side gap are permitted).
+                    if total > cw {
+                        // We have room to spill into columns i..(j-1) inclusive.
+                        let (pre_total, suf_total) = take_display_prefix(&formatted, total);
+                        let mut rest_owned = pre_total;
+
+                        // Compute source-cell style (apply to all spilled visuals).
+                        let sel_src = self.anchor.is_some_and(|a| match self.selection_kind {
+                            SelectionKind::Cells => {
+                                let r0 = a.row.min(self.cursor.row);
+                                let r1 = a.row.max(self.cursor.row);
+                                let c0 = a.col.min(self.cursor.col);
+                                let c1 = a.col.max(self.cursor.col);
+                                r >= r0 && r <= r1 && c >= c0 && c <= c1
+                            }
+                            SelectionKind::Rows => {
+                                let r0 = a.row.min(self.cursor.row);
+                                let r1 = a.row.max(self.cursor.row);
+                                r >= r0 && r <= r1
+                            }
+                            SelectionKind::Cols => {
+                                let c0 = a.col.min(self.cursor.col);
+                                let c1 = a.col.max(self.cursor.col);
+                                c >= c0 && c <= c1
+                            }
+                        });
+                        let is_cur_src = r == self.cursor.row && c == self.cursor.col;
+                        let mut st_src = if is_cur_src {
+                            Style::default().bg(Color::DarkGray)
+                        } else if sel_src {
+                            if matches!(self.mode, Mode::Extrapolate) && formatted.trim().is_empty() {
+                                Style::default().add_modifier(Modifier::REVERSED)
+                            } else {
+                                Style::default().bg(Color::Blue)
+                            }
+                        } else {
+                            Style::default()
+                        };
+                        if matches!(self.mode, Mode::Extrapolate) {
+                            if let Some(ref s) = previewed_addrs {
+                                let src_addr = SheetCursor { row: r, col: c }.to_addr(grid);
+                                if s.contains(&src_addr) {
+                                    st_src = st_src.add_modifier(Modifier::DIM);
+                                }
+                            }
+                        }
+                        if is_underlined_boundary_row {
+                            st_src = st_src.add_modifier(Modifier::UNDERLINED);
+                        }
+
+                        // Render each included column as a combined content+trailing bucket
+                        for (idx, trailing_w) in included.iter() {
+                            let c_k = col_ixs[*idx];
+                            let cw_k = grid.col_width(c_k).max(1);
+                            let chunk_w = cw_k.saturating_add(*trailing_w);
+                            let (pre_chunk, rem) = take_display_prefix(&rest_owned, chunk_w);
+                            rest_owned = rem;
+
+                            // Split the chunk into content and trailing parts by display width.
+                            let (content_part, trailing_part) = take_display_prefix(&pre_chunk, cw_k);
+                            // For the last visible spilled bucket that still has text remaining,
+                            // indicate truncation inside the content area.
+                            let is_last = idx == &included.last().unwrap().0;
+                            let content_display = if is_last && !suf_total.is_empty() {
+                                truncate_with_ellipsis(&content_part, cw_k)
+                            } else {
+                                content_part
+                            };
+                            let content_padded = align_cell_display(content_display, cw_k, align);
+                            let trailing_padded = if *trailing_w == 0 {
+                                String::new()
+                            } else {
+                                align_cell_display(trailing_part, *trailing_w, Some(TextAlign::Left))
+                            };
+
+                            let disp_k = format!("{}{}", content_padded, trailing_padded);
+                            spans_raw.push((disp_k, st_src));
+                        }
+
+                        i = j;
+                        continue;
+                    }
+                }
+
+                // Fallback single-column behaviour (no spill or not allowed)
+                let cw = grid.col_width(c).max(1);
                 let formatted = format_cell_display(grid, &cell_addr, text);
-                // Preserve any leading markers (e.g. '^ ') in the visible
-                // formatted string; do not alter the input here.
                 let align = effective_cell_align(grid, &cell_addr, &formatted);
                 let fw = formatted.width();
                 let cell_fmt = grid.format_for_addr(&cell_addr);
-                // Numeric-like cells do not spill into neighbors.
-                // - `number: None` uses decimal-generic *display* via `format_cell_display` but must
-                //   still allow text spill.
-                // - `DecimalGeneric` on the column must not block spill for non-numeric cells (e.g.
-                //   notes beside numbers); only suppress when the cell actually has a numeric value.
-                let trimmed_formatted = formatted.trim();
-                // Treat complex-valued displays as numeric-like so they are
-                // shrunk/exponentiated instead of spilling into neighbor cells.
-                let numeric_like = if trimmed_formatted.parse::<f64>().is_ok() {
-                    true
-                } else if trimmed_formatted.ends_with('i') && parse_complex_display(trimmed_formatted).is_some() {
-                    true
-                } else if matches!(cell_fmt.number, Some(NumberFormat::Rational)) {
-                    true
-                } else if matches!(cell_fmt.number, Some(NumberFormat::DecimalGeneric)) {
-                    let mut spill_visiting = Vec::new();
-                    let mut spill_budget = 10_000usize;
-                    effective_numeric(grid, &cell_addr, &mut spill_visiting, &mut spill_budget)
-                        .is_some()
+                let rational_hint = if matches!(cell_fmt.number, None | Some(NumberFormat::Rational | NumberFormat::DecimalGeneric)) && would_ellipsis_hide_decimal_point(&formatted, cw) {
+                    let mut visiting = Vec::new();
+                    let mut budget = 10_000usize;
+                    effective_numeric(grid, &cell_addr, &mut visiting, &mut budget).map(|n| n.to_f64()).filter(|v| v.is_finite())
                 } else {
-                    false
+                    None
                 };
-                let allow_text_spill =
-                    spill_row && !is_agg_cell && !numeric_like && align != Some(TextAlign::Right);
-
-                // Diagnostic logging removed.
-
-                // Track the width actually used when aligning this cell.
-                // We only consume the spill_suppressed_gap_budget to widen the
-                // current cell when that cell is actively receiving spilled text
-                // (i.e. the current formatted string is empty and spill_remain is
-                // non-empty). For non-empty cells (including partially spilling
-                // cells where we intentionally show only the cw-wide prefix) we
-                // do not apply the suppressed-gap budget here; it remains for
-                // subsequent blank neighbor cells.
-                    let mut used_widened = cw;
-                    let disp = if allow_text_spill && !spill_remain.is_empty() && formatted.trim().is_empty() {
-                    // Blank cell continuing a spill: allow the final visible
-                    // column to expand into any remaining header width so the
-                    // overflowed prose is not silently truncated at the end of
-                    // the grid.
-                    let widened = if i + 1 == col_ixs.len() {
-                        // remaining space in the full header/data line
-                        header_grid_line_width.saturating_sub(spans_width).max(1)
-                    } else {
-                        cw + spill_suppressed_gap_budget
-                    };
-                    used_widened = widened;
-                    let (chunk, rest) = take_display_prefix(&spill_remain, widened);
-                    spill_remain = rest;
-                    // budget consumed by this blank cell
-                    spill_suppressed_gap_budget = 0;
-                    align_cell_display(chunk, widened, Some(TextAlign::Left))
+                let exp_preferred = if would_ellipsis_hide_decimal_point(&formatted, cw) {
+                    exponential_numeric_display_with_hint(&formatted, cw, rational_hint)
                 } else {
-                    if allow_text_spill && !spill_remain.is_empty() && !formatted.trim().is_empty() {
-                        // Incoming spill collides with a non-empty cell: stop the
-                        // spill so we don't mix prose into existing content.
-                        spill_remain.clear();
-                    }
-                    if !spill_remain.is_empty() && is_agg_cell {
-                        spill_remain.clear();
-                    }
-                    let rational_hint = if matches!(
-                        cell_fmt.number,
-                        None | Some(NumberFormat::Rational | NumberFormat::DecimalGeneric)
-                    ) && would_ellipsis_hide_decimal_point(&formatted, cw)
-                    {
-                        let mut visiting = Vec::new();
-                        let mut budget = 10_000usize;
-                        effective_numeric(grid, &cell_addr, &mut visiting, &mut budget)
-                            .map(|n| n.to_f64())
-                            .filter(|v| v.is_finite())
-                    } else {
-                        None
-                    };
-                    let exp_preferred = if would_ellipsis_hide_decimal_point(&formatted, cw) {
-                        exponential_numeric_display_with_hint(&formatted, cw, rational_hint)
-                    } else {
-                        None
-                    };
-                    let inner: String = if allow_text_spill && fw > cw {
-                        // If this is the final visible column, prefer to display
-                        // the full formatted string when there is remaining space
-                        // in the row instead of forcing a cw-wide prefix and
-                        // losing the tail.
-                        if i + 1 == col_ixs.len() {
-                            let remaining = header_grid_line_width.saturating_sub(spans_width);
-                        // For the final visible column prefer to render as much of
-                        // the formatted text as will fit in the remaining row
-                        // width instead of limiting to `cw` and leaving an
-                        // unrendered spill_remain with no consumers.
-                        if remaining > 0 {
-                            let (shown, _rest) = take_display_prefix(&formatted, remaining);
-                            used_widened = remaining.max(1);
-                            // No further columns will render spill, so clear it.
-                            spill_remain.clear();
-                            shown
-                        } else {
-                            let (shown, rest) = take_display_prefix(&formatted, cw);
-                            spill_remain = rest;
-                            shown
-                        }
-                    } else {
-                            // Allow partial spill: normally display the cw-wide prefix in the
-                            // current cell and place the remainder into spill_remain so it
-                            // can flow into subsequent blank neighbor cells. However, if
-                            // future visible neighbors do not have capacity to consume the
-                            // remainder, prefer to expand into the remaining row width so
-                            // the prose tail is visible instead of being silently dropped.
-                            let spill_needed = formatted.width().saturating_sub(cw);
-                            // Compute an approximate future blank capacity in subsequent
-                            // visible columns (only consider blank-looking cells).
-                            let mut future_capacity = 0usize;
-                            for j in (i + 1)..col_ixs.len() {
-                                let col_j = col_ixs[j];
-                                let addr_j = SheetCursor { row: r, col: col_j }.to_addr(grid);
-                                let val_j = cell_effective_display(grid, &addr_j);
-                                if val_j.trim().is_empty() {
-                                    // Column width available for spill (approx).
-                                    future_capacity += grid.col_width(col_j).max(1);
-                                    // Account for at least one separator between columns.
-                                    future_capacity = future_capacity.saturating_add(1);
-                                } else {
-                                    break;
-                                }
-                            }
-                            if future_capacity >= spill_needed {
-                                let (shown, rest) = take_display_prefix(&formatted, cw);
-                                spill_remain = rest;
-                                shown
-                            } else {
-                                // Diagnostic logging removed.
-                                // Not enough future blank capacity to hold the full
-                                // formatted text. Compute the total remaining width
-                                // for this row (including this cell and future
-                                // blank neighbors). If the full formatted string
-                                // won't fit, prefer to show the trailing portion
-                                // (suffix) that will fit into the available row
-                                // width so the prose tail is not silently lost.
-                                let mut total_remaining = header_grid_line_width.saturating_sub(spans_width);
-                                // If the formatted text contains a significant token
-                                // (for example, an attention marker) and we're just
-                                // short of room, try trimming trailing spaces
-                                // from the last non-boundary span to free space so the
-                                // full trailing prose can be preserved instead of
-                                // dropping its leading character.
-                                if has_leading_significant_token(&formatted)
-                                    && total_remaining < formatted.width()
-                                {
-                                    if let Some(pos) = spans_raw
-                                        .iter()
-                                        .rposition(|(s, _)| !(s == " " || s == "│" || s.trim().is_empty()))
-                                    {
-                                        let target = &mut spans_raw[pos].0;
-                                        let old_target_w = target.width();
-                                        let trimmed_end = target.trim_end().to_string();
-                                        let trimmed_w = trimmed_end.width();
-                                        let freed = old_target_w.saturating_sub(trimmed_w);
-                                        if freed > 0 && total_remaining + freed >= formatted.width() {
-                                            *target = trimmed_end;
-                                            spans_width = spans_width.saturating_sub(freed);
-                                            total_remaining = total_remaining.saturating_add(freed);
-                                            // removed debug marker trim logging
-                                        }
-                                    }
-                                }
-                                if total_remaining > 0 && formatted.width() > total_remaining {
-                                    // We don't have room for the full formatted string.
-                                    // For most content prefer to show the trailing
-                                    // portion (suffix) that fits so prose tails are
-                                    // preserved. However, when the formatted value
-                                    // begins with a significant leading marker (eg
-                                    // '^' or '<-') prefer to preserve that leading
-                                    // marker by showing the prefix that fits into
-                                    // the available row width instead of the
-                                    // suffix.
-                                    if has_leading_significant_token(&formatted) {
-                                        // Show the leftmost portion that fits into the
-                                        // total remaining row width so the leading
-                                        // marker remains visible.
-                                        let (prefix, _rest_after_prefix) =
-                                            take_display_prefix(&formatted, total_remaining);
-                                        let (shown, rest_prefix) = take_display_prefix(&prefix, cw);
-                                        spill_remain = rest_prefix;
-                                        shown
-                                    } else {
-                                        // Show the trailing portion that fits and split
-                                        // it across the current cell and following
-                                        // blanks so the tail remains visible.
-                                        let (suffix, _prefix_rest) =
-                                            take_display_suffix(&formatted, total_remaining);
-                                        let (shown, rest_suffix) = take_display_prefix(&suffix, cw);
-                                        spill_remain = rest_suffix;
-                                        shown
-                                    }
-                                } else {
-                                    // Fall back to showing a cw-wide prefix in the
-                                    // current cell and leaving the rest for the
-                                    // following blanks.
-                                    let (shown, rest) = take_display_prefix(&formatted, cw);
-                                    spill_remain = rest;
-                                    shown
-                                }
-                            }
-                        }
-                    } else if fw > cw {
-                        spill_remain.clear();
-                        exp_preferred
-                            .or_else(|| shrink_numeric_display(&formatted, cw))
-                            .or_else(|| exponential_numeric_display(&formatted, cw))
-                            .unwrap_or_else(|| truncate_with_ellipsis(&formatted, cw))
-                    } else {
-                        formatted.clone()
-                    };
-                    // Only widen the current cell if we actually consumed the
-                    // suppressed-gap budget above or if we intentionally used a
-                    // larger width for the final visible column. Otherwise keep cw
-                    // and leave the budget for future blank cells.
-                    let widened = used_widened.max(cw);
-                    used_widened = widened;
-                    align_cell_display(inner, widened, align)
+                    None
                 };
-                // Diagnostic logging removed.
+                let inner = if fw > cw {
+                    exp_preferred.or_else(|| shrink_numeric_display(&formatted, cw)).or_else(|| exponential_numeric_display(&formatted, cw)).unwrap_or_else(|| truncate_with_ellipsis(&formatted, cw))
+                } else {
+                    formatted.clone()
+                };
+                let disp = align_cell_display(inner, cw, align);
                 let sel = self.anchor.is_some_and(|a| match self.selection_kind {
                     SelectionKind::Cells => {
                         let r0 = a.row.min(self.cursor.row);
@@ -9268,25 +9175,14 @@ impl App {
 
                 let is_left_border = c == lm - 1 && c >= col_ixs.first().copied().unwrap_or(0);
                 let is_right_border = c == lm + mc && col_ixs.contains(&(lm + mc));
-                let is_header_border =
-                    r == hr - 1 && r >= row_ixs.first().copied().unwrap_or(0) && hr > 0;
+                let is_header_border = r == hr - 1 && r >= row_ixs.first().copied().unwrap_or(0) && hr > 0;
                 let is_footer_border = last_display_main_row == Some(r);
 
-                let border_color =
-                    if is_left_border || is_right_border || is_header_border || is_footer_border {
-                        Some(Color::DarkGray)
-                    } else {
-                        None
-                    };
+                let border_color = if is_left_border || is_right_border || is_header_border || is_footer_border { Some(Color::DarkGray) } else { None };
 
                 let mut st = if is_cur {
                     Style::default().bg(Color::DarkGray)
                 } else if sel {
-                    // In Extrapolate mode we want the extrapolation target
-                    // (selected-but-empty cells) to be visually distinct from
-                    // the selection seed. Use reverse-video for those target
-                    // cells while keeping the existing blue background for
-                    // normal selections.
                     if matches!(self.mode, Mode::Extrapolate) && formatted.trim().is_empty() {
                         Style::default().add_modifier(Modifier::REVERSED)
                     } else {
@@ -9297,21 +9193,14 @@ impl App {
                 } else {
                     Style::default()
                 };
-                // If this cell is part of a transient extrapolation preview
-                // (written into a cloned preview grid), make it visually
-                // distinct so the user knows the values are not committed.
                 if matches!(self.mode, Mode::Extrapolate) {
                     if let Some(ref s) = previewed_addrs {
                         let cur_addr = SheetCursor { row: r, col: c }.to_addr(grid);
                         if s.contains(&cur_addr) {
-                            // Use dim + italic-like emphasis if available; keep
-                            // the existing foreground/background but add a DIM
-                            // modifier so the preview is subtly different.
                             st = st.add_modifier(Modifier::DIM);
                         }
                     }
                 }
-                // Debug dump removed to keep test output clean.
                 if is_agg_cell && !is_cur && !sel {
                     st = st.fg(Color::Cyan);
                     if footer_agg.is_some() {
@@ -9321,122 +9210,20 @@ impl App {
                 if is_underlined_boundary_row {
                     st = st.add_modifier(Modifier::UNDERLINED);
                 }
-                    let disp_pos = spans_raw.len();
-                    spans_raw.push((disp.clone(), st));
-                    col_content_span_pos.push(disp_pos);
-                    // Record the original formatted string for this content
-                    // column so we can restore significant tokens later if
-                    // needed.
-                    content_col_formatted.push(formatted.clone());
-                    // If this cell contains a significant leading marker token
-                    // remember its content-column index (so we can consolidate
-                    // spilled text back into it if needed).
-                    if has_leading_significant_token(&formatted) {
-                        lead_marker_content_col_idx = Some(col_content_span_pos.len() - 1);
-                    }
-                    spans_width += disp.width();
-                let suppress_plain_gap = allow_text_spill && !spill_remain.is_empty();
-                match inter_column_trailing_after_data_cell(
-                    i,
-                    c,
-                    &col_ixs,
-                    lm,
-                    mc,
-                    show_right_divider,
-                    suppress_plain_gap,
-                ) {
+                spans_raw.push((disp.clone(), st));
+                match inter_column_trailing_after_data_cell(i, c, &col_ixs, lm, mc, show_right_divider) {
                     InterColumnTrailing::EndOfVisibleRow => {}
-                    InterColumnTrailing::SuppressedSpillInterior => {
-                        // #region agent log
-                        _dbg_interior_gaps_skipped += 1;
-                        spill_suppressed_gap_budget += 1;
-                        // #endregion
-                    }
                     InterColumnTrailing::PipeAndSpace => {
                         spans_raw.push(("│".to_string(), boundary_separator_style(is_underlined_boundary_row)));
-                        spans_width += "│".width();
                         spans_raw.push((" ".to_string(), boundary_gap_style(is_underlined_boundary_row)));
-                        spans_width += " ".width();
                     }
                     InterColumnTrailing::AsciiSpace => {
                         spans_raw.push((" ".to_string(), boundary_gap_style(is_underlined_boundary_row)));
-                        spans_width += " ".width();
                     }
                 }
+                i += 1;
             }
-            // If there is still spill remaining after consuming visible
-            // neighbor cells, try to append as much of the spill as will fit
-            // in the row into the last content span. We first trim trailing
-            // spaces from the target span (this frees budget) and then append
-            // as much of `spill_remain` as will fit without exceeding the
-            // header width.
-            if !spill_remain.is_empty() {
-                // Find the last non-boundary span to append into.
-                if let Some(pos) = spans_raw
-                    .iter()
-                    .rposition(|(s, _)| !(s == " " || s == "│" || s.trim().is_empty()))
-                {
-                    // If we previously recorded which content column held a
-                    // significant leading marker, try to reclaim space from
-                    // subsequent blank content columns by shrinking them to a
-                    // minimal visual width. This frees space we can append
-                    // into the target so the prose tail is more likely to fit.
-                    if let Some(cidx) = lead_marker_content_col_idx {
-                        // iterate through visible content columns after the
-                        // caution column and shrink empty ones to a single
-                        // visible column character where possible.
-                        for shrink_idx in (cidx + 1)..col_content_span_pos.len() {
-                            let span_pos = col_content_span_pos[shrink_idx];
-                            if span_pos >= spans_raw.len() {
-                                continue;
-                            }
-                            let text = &spans_raw[span_pos].0;
-                            if text.trim().is_empty() {
-                                let old_w = text.width();
-                                if old_w > 1 {
-                                    spans_raw[span_pos].0 = " ".repeat(1);
-                                    spans_width = spans_width.saturating_sub(old_w.saturating_sub(1));
-                                }
-                            }
-                        }
-                    }
-
-                    // Trim trailing spaces from the target before appending.
-                    let target = &mut spans_raw[pos].0;
-                    let old_target_w = target.width();
-                    let trimmed_end = target.trim_end().to_string();
-                    let trimmed_w = trimmed_end.width();
-                    let freed = old_target_w.saturating_sub(trimmed_w);
-
-                    // Compute current spans width after trimming the target
-                    // (we haven't mutated `spans_width` by trimming yet).
-                    let current_spans_w = spans_width.saturating_sub(freed);
-
-                    let extra = header_grid_line_width.saturating_sub(current_spans_w);
-                    if extra > 0 {
-                        let (take, _rest) = take_display_prefix(&spill_remain, extra);
-                        if !take.is_empty() {
-                            // Apply the trimmed target and appended text.
-                            target.clear();
-                            target.push_str(&trimmed_end);
-                            target.push_str(&take);
-                            // Update spans_width to reflect the trimmed target
-                            // plus the appended text.
-                            spans_width = current_spans_w + take.width();
-                            // We don't strictly need the remainder after test; drop it.
-                            // spill_remain = _rest; // optional
-                        }
-                    }
-                }
-            }
-
-            // Marker injection fallback removed (debug-only feature)
-
             // Convert raw spans to ratatui Spans for rendering.
-            // Targeted debug: if this row contains a leading marker token print
-            // the assembled spans and spill state so tests using `--nocapture`
-            // can inspect why truncation occurred.
-            // Diagnostic logging removed.
             let spans: Vec<Span> = spans_raw
                 .into_iter()
                 .map(|(text, style)| Span::styled(text, style))
@@ -14546,7 +14333,7 @@ mod tests {
     }
 
     #[test]
-    fn inserted_date_fits_column_exactly() {
+    fn inserted_date_fits_rendered_literal() {
         let mut app = App::new(None);
         app.cursor = SheetCursor {
             row: HEADER_ROWS,
@@ -14559,8 +14346,8 @@ mod tests {
         } else {
             panic!("expected edit mode");
         }
-        // Column width follows rendered display of the committed value (not raw ISO length).
-        assert_eq!(app.state.grid.col_width(MARGIN_COLS), 6);
+        // Plain date text is rendered as the literal the user typed.
+        assert_eq!(app.state.grid.col_width(MARGIN_COLS), 10);
     }
 
     #[test]
@@ -14697,19 +14484,14 @@ mod tests {
     }
 
     #[test]
-    fn inter_column_trailing_drops_interior_space_when_spill_suppressed() {
+    fn inter_column_trailing_keeps_interior_space_between_columns() {
         let lm = MARGIN_COLS;
         let mc = 10;
         let col_ixs = vec![lm - 1, lm, lm + 1];
         assert_eq!(
-            inter_column_trailing_after_data_cell(1, lm, &col_ixs, lm, mc, true, true),
-            InterColumnTrailing::SuppressedSpillInterior,
-            "overflow continuation must omit ASCII gutter, not squeeze it into cell text"
-        );
-        // Not spilling across boundary → normal ASCII gutter between main columns.
-        assert_eq!(
-            inter_column_trailing_after_data_cell(1, lm, &col_ixs, lm, mc, true, false),
+            inter_column_trailing_after_data_cell(1, lm, &col_ixs, lm, mc, true),
             InterColumnTrailing::AsciiSpace,
+            "interior main columns must keep a fixed gutter so later cells stay aligned"
         );
     }
 
@@ -14718,7 +14500,7 @@ mod tests {
         let lm = MARGIN_COLS;
         let col_ixs = vec![lm - 1, lm];
         assert_eq!(
-            inter_column_trailing_after_data_cell(0, lm - 1, &col_ixs, lm, 4, true, false),
+            inter_column_trailing_after_data_cell(0, lm - 1, &col_ixs, lm, 4, true),
             InterColumnTrailing::PipeAndSpace,
         );
     }
@@ -14728,8 +14510,51 @@ mod tests {
         let lm = MARGIN_COLS;
         let col_ixs = vec![lm, lm + 1];
         assert_eq!(
-            inter_column_trailing_after_data_cell(1, lm + 1, &col_ixs, lm, 4, false, false),
+            inter_column_trailing_after_data_cell(1, lm + 1, &col_ixs, lm, 4, false),
             InterColumnTrailing::EndOfVisibleRow,
+        );
+    }
+
+    #[test]
+    fn long_text_does_not_shift_later_cells_in_same_row() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 4);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "abcdefghijklmnopqrstuvwxyz".into());
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 3 }, "DVAL".into());
+        for c in 0..4 {
+            app.state.grid.set_col_width(MARGIN_COLS + c, Some(4));
+        }
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        };
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 10)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect()
+            })
+            .collect();
+
+        let header_line = rows.get(3).expect("grid header row");
+        let data_line = rows.get(4).expect("first grid data row");
+        let header_x = header_line[..header_line.find('D').expect(header_line)].width();
+        let data_x = data_line[..data_line.find("DVAL").expect(data_line)].width();
+
+        assert_eq!(
+            header_x, data_x,
+            "long text in A must truncate inside A, not move D: \n{header_line}\n{data_line}"
         );
     }
 
@@ -20465,7 +20290,7 @@ fn effective_cell_align(grid: &Grid, addr: &CellAddr, formatted: &str) -> Option
         return Some(TextAlign::Right);
     }
     // Decimal-generic columns mix numbers and labels: only right-align when this cell is numeric,
-    // so prose can stay left-aligned and spill into blank neighbors (see `allow_text_spill`).
+    // so prose stays left-aligned while truncating inside its own cell.
     match fmt.number {
         Some(NumberFormat::DecimalGeneric) => {
             let mut visiting = Vec::new();
@@ -20504,8 +20329,6 @@ fn truncate_with_ellipsis(text: &str, width: usize) -> String {
 enum InterColumnTrailing {
     /// No next column in this viewport row.
     EndOfVisibleRow,
-    /// Interior gutter omitted while overflow text continues into the next column.
-    SuppressedSpillInterior,
     /// Left/right main-block ruler (`│` then gap).
     PipeAndSpace,
     /// Default single ASCII space between interior columns.
@@ -20519,7 +20342,6 @@ fn inter_column_trailing_after_data_cell(
     lm: usize,
     mc: usize,
     show_right_divider: bool,
-    suppress_plain_gap: bool,
 ) -> InterColumnTrailing {
     if viewport_col_idx + 1 >= col_ixs.len() {
         return InterColumnTrailing::EndOfVisibleRow;
@@ -20530,68 +20352,28 @@ fn inter_column_trailing_after_data_cell(
     if sheet_col == lm + mc - 1 && show_right_divider {
         return InterColumnTrailing::PipeAndSpace;
     }
-    if suppress_plain_gap {
-        InterColumnTrailing::SuppressedSpillInterior
-    } else {
-        InterColumnTrailing::AsciiSpace
-    }
+    InterColumnTrailing::AsciiSpace
 }
 
 /// Prefix of `text` consuming at most `display_width` terminal columns (Unicode width-aware).
 fn take_display_prefix(text: &str, display_width: usize) -> (String, String) {
+    use unicode_segmentation::UnicodeSegmentation;
+
     if display_width == 0 || text.is_empty() {
         return (String::new(), text.to_string());
     }
     let mut acc = 0usize;
     let mut end = 0usize;
-    for ch in text.chars() {
-        let wch = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if acc + wch > display_width {
+    for g in text.graphemes(true) {
+        let w = unicode_width::UnicodeWidthStr::width(g);
+        if acc + w > display_width {
             break;
         }
-        acc += wch;
-        end += ch.len_utf8();
+        acc += w;
+        end += g.len();
     }
     let (pre, suf) = text.split_at(end);
     (pre.to_string(), suf.to_string())
-}
-
-/// Suffix of `text` consuming at most `display_width` terminal columns
-/// (Unicode width-aware). Returns (suffix, prefix_rest).
-fn take_display_suffix(text: &str, display_width: usize) -> (String, String) {
-    if display_width == 0 || text.is_empty() {
-        return (String::new(), text.to_string());
-    }
-    let mut acc = 0usize;
-    let mut start = text.len();
-    for ch in text.chars().rev() {
-        let wch = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if acc + wch > display_width {
-            break;
-        }
-        acc += wch;
-        start -= ch.len_utf8();
-    }
-    let (pre, suf) = text.split_at(start);
-    (suf.to_string(), pre.to_string())
-}
-
-/// Sum [`Grid::col_width`] for consecutive blank-looking cells (`cell_effective_display` empty).
-fn spill_blank_suffix_width(grid: &Grid, sheet_row: usize, col_ixs: &[usize], start_idx: usize) -> usize {
-    let mut extra = 0usize;
-    for j in start_idx + 1..col_ixs.len() {
-        let addr = SheetCursor {
-            row: sheet_row,
-            col: col_ixs[j],
-        }
-        .to_addr(grid);
-        let t = cell_effective_display(grid, &addr);
-        if !t.trim().is_empty() {
-            break;
-        }
-        extra += grid.col_width(col_ixs[j]).max(1);
-    }
-    extra
 }
 
 fn shrink_numeric_display(text: &str, width: usize) -> Option<String> {
@@ -20643,27 +20425,6 @@ fn shrink_numeric_display(text: &str, width: usize) -> Option<String> {
             }
         }
     }
-    
-    /// Suffix of `text` consuming at most `display_width` terminal columns
-    /// (Unicode width-aware). Returns (suffix, prefix_rest).
-    fn take_display_suffix(text: &str, display_width: usize) -> (String, String) {
-        if display_width == 0 || text.is_empty() {
-            return (String::new(), text.to_string());
-        }
-        let mut acc = 0usize;
-        let mut start = text.len();
-        for ch in text.chars().rev() {
-            let wch = UnicodeWidthChar::width(ch).unwrap_or(0);
-            if acc + wch > display_width {
-                break;
-            }
-            acc += wch;
-            start -= ch.len_utf8();
-        }
-        let (pre, suf) = text.split_at(start);
-        (suf.to_string(), pre.to_string())
-    }
-
     let mut s = trimmed.to_string();
     if s.parse::<f64>().is_err() || !s.contains('.') {
         return None;
