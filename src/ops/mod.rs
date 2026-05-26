@@ -1173,12 +1173,12 @@ fn parse_op_text(line: &str) -> Option<Op> {
                     col_start: a_col,
                     col_end: b_col,
                 };
-                eprintln!("[DEBUG parse_op_text] parsed: DUPLICATE_COL range {a}:{b} -> {:?}", op);
+                // debug parse logging removed
                 return Some(op);
             }
             let col = parse_excel_column(col_tok)?;
             let op = Op::DuplicateCol { col };
-            eprintln!("[DEBUG parse_op_text] parsed: DUPLICATE_COL single {col_tok} -> {:?}", op);
+            // debug parse logging removed
             Some(op)
         }
         "DELETE_ROW" => {
@@ -1979,7 +1979,7 @@ pub fn apply_workbook_op(
                 for c in 0..sheet.grid.main_cols() {
                     row_vals.push(sheet.grid.get(&CellAddr::Main { row: 0, col: c as u32 }).unwrap_or_default());
                 }
-                eprintln!("[REPLAY DEBUG] sheet_id={} main_cols={} row0={:?}", sheet_id, sheet.grid.main_cols(), row_vals);
+                // replay debug logging removed
             }
             Ok(())
         }

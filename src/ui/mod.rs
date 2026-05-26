@@ -5584,15 +5584,7 @@ impl App {
                 {
                     let mut measured = None;
                     if let Some(raw) = self.state.grid.get(&addr) {
-                        let t = raw.trim();
-                        if !is_formula(t) {
-                            if let Some(n) = crate::formula::parse_numeric_or_date_literal(t) {
-                                let s = format_number_cell_display(&n);
-                                if !s.is_empty() {
-                                    measured = Some(s);
-                                }
-                            }
-                        }
+                        measured = measured_width_text_for_stored_literal(&raw);
                     }
                     // Fallback to the displayed/evaluated text.
                     let val = measured.unwrap_or_else(|| normalize_inline_text(&cell_effective_display(&self.state.grid, &addr)));
@@ -5624,15 +5616,7 @@ impl App {
                 };
                 let mut measured = None;
                 if let Some(raw) = self.state.grid.get(&addr) {
-                    let t = raw.trim();
-                    if !is_formula(t) {
-                        if let Some(n) = crate::formula::parse_numeric_or_date_literal(t) {
-                            let s = format_number_cell_display(&n);
-                            if !s.is_empty() {
-                                measured = Some(s);
-                            }
-                        }
-                    }
+                    measured = measured_width_text_for_stored_literal(&raw);
                 }
                 let val = measured.unwrap_or_else(|| normalize_inline_text(&cell_effective_display(&self.state.grid, &addr)));
                 if !val.is_empty() {
@@ -5646,15 +5630,7 @@ impl App {
                 };
                 let mut measured = None;
                 if let Some(raw) = self.state.grid.get(&addr) {
-                    let t = raw.trim();
-                    if !is_formula(t) {
-                        if let Some(n) = crate::formula::parse_numeric_or_date_literal(t) {
-                            let s = format_number_cell_display(&n);
-                            if !s.is_empty() {
-                                measured = Some(s);
-                            }
-                        }
-                    }
+                    measured = measured_width_text_for_stored_literal(&raw);
                 }
                 let val = measured.unwrap_or_else(|| normalize_inline_text(&cell_effective_display(&self.state.grid, &addr)));
                 if !val.is_empty() {
@@ -5668,15 +5644,7 @@ impl App {
                 };
                 let mut measured = None;
                 if let Some(raw) = self.state.grid.get(&addr) {
-                    let t = raw.trim();
-                    if !is_formula(t) {
-                        if let Some(n) = crate::formula::parse_numeric_or_date_literal(t) {
-                            let s = format_number_cell_display(&n);
-                            if !s.is_empty() {
-                                measured = Some(s);
-                            }
-                        }
-                    }
+                    measured = measured_width_text_for_stored_literal(&raw);
                 }
                 let val = measured.unwrap_or_else(|| normalize_inline_text(&cell_effective_display(&self.state.grid, &addr)));
                 if !val.is_empty() {
@@ -14720,6 +14688,17 @@ mod tests {
     }
 
     #[test]
+    fn date_corro_load_initial_keeps_full_date_width() {
+        use std::path::PathBuf;
+
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs/tests/date.corro");
+        let mut app = App::new(Some(path));
+        app.load_initial().unwrap();
+
+        assert_eq!(app.state.grid.col_width(MARGIN_COLS), 10);
+    }
+
+    #[test]
     fn math_corro_spill_force_spill() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
@@ -18154,16 +18133,7 @@ mod tests {
                     }
                 }
 
-                // With DEFAULT_MAX_COL_WIDTH=8 the date should not fully appear.
-                assert!(!data_slice.contains("2001/01/01"), "expected truncation at default max width");
             }
-
-            // Now increase the default max width and redraw. Sweep the cursor
-            // across all non-blank global columns until we find a viewport where
-            // the S column shows the full date. This simulates the user moving
-            // the cursor through the non-blank cells as requested.
-            app.state.grid.set_max_col_width(10);
-            let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
 
             // Collect non-blank global columns from the grid.
             let mut nonblank_cols_set: std::collections::HashSet<usize> = std::collections::HashSet::new();
@@ -18188,7 +18158,99 @@ mod tests {
             sweep_cols.sort();
 
             let mut found_full = false;
-            for sweep_col in sweep_cols {
+            for &sweep_col in &sweep_cols {
+                app.cursor.col = sweep_col;
+                terminal.draw(|f| app.draw(f)).unwrap();
+
+                let buffer_ref = terminal.backend().buffer();
+                let bcopy = buffer_ref.clone();
+                let buf_inner = &bcopy;
+
+                let (mut col_ixs2, _start2) =
+                    visible_col_indices(&app.state, app.cursor, data_cols, app.col_scroll);
+                app.fit_visible_columns_capped(&col_ixs2, data_width);
+                trim_visible_cols_to_width(&app.state.grid, &mut col_ixs2, app.cursor.col, data_width);
+
+                let mut tc2: Option<usize> = None;
+                if let Some(orig_tc) = target_col {
+                    if col_ixs2.contains(&orig_tc) {
+                        tc2 = Some(orig_tc);
+                    }
+                }
+                if tc2.is_none() {
+                    for &c in &col_ixs2 {
+                        if col_header_label(c, mc) == "S" {
+                            tc2 = Some(c);
+                            break;
+                        }
+                    }
+                }
+                if let Some(tc) = tc2 {
+                    let mut pos = 1usize + ROW_LABEL_CHARS;
+                    let show_right_divider = col_ixs2.contains(&(lm + mc));
+                    for (i, &c) in col_ixs2.iter().enumerate() {
+                        if c == tc {
+                            break;
+                        }
+                        let cw = app.state.grid.col_width(c).max(1);
+                        pos = pos.saturating_add(cw);
+                        if i + 1 < col_ixs2.len() {
+                            let sep = if (c == lm.saturating_sub(1) && lm > 0 && col_ixs2.contains(&lm))
+                                || (c == lm + mc - 1 && show_right_divider)
+                            {
+                                2
+                            } else {
+                                1
+                            };
+                            pos = pos.saturating_add(sep);
+                        }
+                    }
+
+                    let menubar_h = 1usize;
+                    let formula_h = 1usize;
+                    let grid_area_y = menubar_h + formula_h;
+                    let inner_y = grid_area_y + 1;
+
+                    let total_h = buf_inner.area.height as usize;
+                    let grid_area_h = total_h.saturating_sub(menubar_h + formula_h + 1usize);
+                    let inner_h = grid_area_h.saturating_sub(2);
+                    let data_rows = inner_h.saturating_sub(1).max(1);
+
+                    let (row_ixs, _start) = visible_row_indices(&app.state, app.cursor, data_rows, app.row_scroll);
+                    let hr = HEADER_ROWS;
+                    if let Some(main_idx) = row_ixs.iter().position(|&r| r == hr) {
+                        let data_y = inner_y + 1 + main_idx;
+                        let rows: Vec<String> = (0..buf_inner.area.height)
+                            .map(|y| {
+                                (0..buf_inner.area.width)
+                                    .map(|x| buf_inner[(x, y)].symbol())
+                                    .collect::<String>()
+                            })
+                            .collect();
+
+                        let data_line = rows.get(data_y).cloned().unwrap_or_default();
+                        let cw = app.state.grid.col_width(tc).max(1);
+                        let max_take = (buf_inner.area.width as usize).saturating_sub(pos);
+                        let take = cw.min(max_take);
+                        let data_slice: String = data_line.chars().skip(pos).take(take).collect();
+                        if data_slice.contains("2001/01/01") {
+                            found_full = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            assert!(found_full, "expected full date visible at default max width 10");
+
+            // Lower the max width and redraw. Sweep the cursor across all
+            // non-blank global columns until we find a viewport where the S
+            // column truncates the date. This preserves truncation coverage
+            // now that the default width fits the full value.
+            app.state.grid.set_max_col_width(8);
+            let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+
+            let mut found_truncated = false;
+            for &sweep_col in &sweep_cols {
                 // Move cursor and redraw
                 app.cursor.col = sweep_col;
                 terminal.draw(|f| app.draw(f)).unwrap();
@@ -18282,7 +18344,7 @@ mod tests {
                         {
                             // If this is the original target column that contained
                             // the date literal, log the slices to understand why
-                            // the date isn't visible even after increasing max width.
+                            // the date isn't visible/truncated at the narrowed width.
                             if let Some(orig_tc) = target_col {
                                 if orig_tc == tc {
                                     eprintln!(
@@ -18297,14 +18359,17 @@ mod tests {
                                 }
                             }
                         }
-                        if data_slice.contains("2001/01/01") {
-                            found_full = true;
+                        if !data_slice.contains("2001/01/01") {
+                            found_truncated = true;
                             break;
                         }
                     }
                 }
             }
-            assert!(found_full, "expected full date visible after increasing max width to 10");
+            assert!(
+                found_truncated,
+                "expected date truncation after lowering max width to 8"
+            );
         } else {
             // If S column isn't visible in this viewport, skip the test (informational)
             eprintln!("S column not visible in viewport for test run: col_ixs={:?}", col_ixs);
@@ -19883,6 +19948,24 @@ pub(crate) fn tsv_effective_unformatted_string(grid: &Grid, r: usize, c: usize) 
 
 fn normalize_inline_text(text: &str) -> String {
     text.replace('\n', "¶")
+}
+
+fn measured_width_text_for_stored_literal(raw: &str) -> Option<String> {
+    let t = raw.trim();
+    if is_formula(t) {
+        return None;
+    }
+    let parsed = crate::formula::parse_numeric_or_date_literal(t)?;
+    if crate::formula::parse_number_literal(t).is_some() {
+        let s = format_number_cell_display(&parsed);
+        if s.is_empty() {
+            None
+        } else {
+            Some(s)
+        }
+    } else {
+        Some(t.to_string())
+    }
 }
 
 /// Decimal / generic display: plain decimals for human-scale magnitudes; scientific only when

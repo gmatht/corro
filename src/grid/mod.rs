@@ -19,7 +19,7 @@ pub const MARGIN_COLS: usize = 26 * 27; // A..ZZ inclusive
 pub type MarginIndex = usize;
 
 /// Default maximum column display width when a column has content but no explicit override.
-pub const DEFAULT_MAX_COL_WIDTH: usize = 8;
+pub const DEFAULT_MAX_COL_WIDTH: usize = 10;
 
 /// Logical cell address (stable across main resize where possible).
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
