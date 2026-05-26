@@ -17831,6 +17831,12 @@ mod tests {
     }
 
     #[test]
+    fn shrink_numeric_display_preserves_scientific_exponent() {
+        let shrunk = shrink_numeric_display("1.23456789e10", 8).expect("scientific shrink");
+        assert_eq!(shrunk, "1.234e10");
+    }
+
+    #[test]
     fn fixed_format_uses_scientific_before_infinity_for_large_finite_values() {
         let mut grid = crate::grid::GridBox::from(crate::grid::Grid::new(1, 1));
         let addr = CellAddr::Main { row: 0, col: 0 };
@@ -20608,6 +20614,34 @@ fn shrink_numeric_display(text: &str, width: usize) -> Option<String> {
             }
         }
         return None;
+    }
+
+    if let Some(exp_idx) = trimmed.find(['e', 'E']) {
+        let (mantissa, exponent) = trimmed.split_at(exp_idx);
+        if exponent.len() >= 2 && mantissa.parse::<f64>().is_ok() {
+            let exponent_width = exponent.width();
+            if exponent_width >= width {
+                return None;
+            }
+            let mut mantissa = mantissa.to_string();
+            while format!("{mantissa}{exponent}").width() > width {
+                if let Some(dot_idx) = mantissa.find('.') {
+                    let fractional_len = mantissa[dot_idx + 1..].chars().count();
+                    if fractional_len > 0 {
+                        mantissa.pop();
+                        if mantissa.ends_with('.') {
+                            mantissa.pop();
+                        }
+                        continue;
+                    }
+                }
+                break;
+            }
+            let candidate = format!("{mantissa}{exponent}");
+            if candidate.width() <= width {
+                return Some(candidate);
+            }
+        }
     }
     
     /// Suffix of `text` consuming at most `display_width` terminal columns
