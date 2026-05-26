@@ -5908,8 +5908,34 @@ impl App {
         if self.cursor.row >= hr + main_rows {
             return self.insert_mitosis_footer_row_after_cursor();
         }
-        // If rows are selected, duplicate each selected row. Process in
-        // descending order to avoid index-shift hazards when inserting.
+        // If a rectangular main-range selection exists (SelectionKind::Cells
+        // and selection covers only main rows/cols) duplicate the whole span
+        // as a single op. This mirrors the column behaviour and ensures the
+        // log records a single DUPLICATE_ROW range line when appropriate.
+        if let Some(range) = self.selection_main_range() {
+            // range.row_start..range.row_end (end is exclusive)
+            let start = range.row_start;
+            let end_excl = range.row_end;
+            if end_excl > start {
+                let end_incl = end_excl - 1;
+                if start == end_incl {
+                    self.apply_single_op(Op::DuplicateRow { row: start })?;
+                } else {
+                    self.apply_single_op(Op::DuplicateRowRange {
+                        row_start: start,
+                        row_end: end_incl,
+                    })?;
+                }
+                self.anchor = None;
+                self.selection_kind = SelectionKind::Cells;
+                self.status = "Duplicated selected rows".into();
+                return Ok(true);
+            }
+        }
+
+        // If rows are selected (SelectionKind::Rows), map to a contiguous
+        // inclusive range and issue a single DuplicateRowRange op (or
+        // DuplicateRow for a single row). This matches the columns logic.
         if self.selection_kind == SelectionKind::Rows {
             if let Some((rows, _cols)) = self.current_selection_range() {
                 let mut main_idxs: Vec<u32> = rows
@@ -5922,18 +5948,20 @@ impl App {
                         }
                     })
                     .collect();
-                // Duplicate main rows in descending order so earlier inserts
-                // don't shift later sources.
-                main_idxs.sort_unstable_by(|a, b| b.cmp(a));
-                for idx in main_idxs {
-                    self.apply_single_op(Op::DuplicateRow { row: idx })?;
+                if !main_idxs.is_empty() {
+                    main_idxs.sort_unstable();
+                    let start = *main_idxs.first().unwrap();
+                    let end = *main_idxs.last().unwrap();
+                    if start == end {
+                        self.apply_single_op(Op::DuplicateRow { row: start })?;
+                    } else {
+                        self.apply_single_op(Op::DuplicateRowRange { row_start: start, row_end: end })?;
+                    }
+                    self.anchor = None;
+                    self.selection_kind = SelectionKind::Cells;
+                    self.status = "Duplicated selected rows".into();
+                    return Ok(true);
                 }
-                // Move cursor to the first duplicated row after the last source
-                // (keep selection cleared).
-                self.anchor = None;
-                self.selection_kind = SelectionKind::Cells;
-                self.status = "Duplicated selected rows".into();
-                return Ok(true);
             }
         }
         self.insert_mitosis_main_data_row_after_cursor()

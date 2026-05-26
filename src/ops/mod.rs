@@ -780,7 +780,8 @@ impl Op {
                     return;
                 }
                 let count = end.saturating_sub(start).saturating_add(1);
-                eprintln!("[DEBUG apply] DuplicateColRange start={} end={} count={} original_main_cols={}", start, end, count, original_main_cols);
+                // Debug logging removed: tests expect clean output. Keep the
+                // logic unchanged.
 
                 // Collect main cells to copy (only existing cells are captured)
                 let mut copied_cells = Vec::new();
@@ -822,7 +823,7 @@ impl Op {
                 // Grow grid and move columns to make space
                 let mr = state.grid.main_rows();
                 state.grid.set_main_size(mr, original_main_cols.saturating_add(count));
-                eprintln!("[DEBUG apply] after set_main_size main_cols={}", state.grid.main_cols());
+                // silence debug output
                 let dest = end + 1;
                 if dest < original_main_cols {
                     state.grid.move_main_cols(dest, original_main_cols - dest, original_main_cols + count);
