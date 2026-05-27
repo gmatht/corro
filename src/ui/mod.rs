@@ -7236,6 +7236,13 @@ impl App {
         }
 
         if let Some(ref p) = self.path.clone() {
+            // Ensure the in-memory active sheet cache is persisted into
+            // `self.workbook` so commit_workbook_op can observe the current
+            // main_cols when serializing addresses. This prevents stale
+            // workbook.sheets values from producing gutter/header addresses
+            // (e.g. `]A~6`) when the UI's grid has already grown.
+            self.commit_active_sheet_cache();
+
             let mut active_sheet = self.view_sheet_id;
             commit_workbook_op(
                 p,
@@ -7247,6 +7254,24 @@ impl App {
                     op,
                 },
             )?;
+            #[cfg(debug_assertions)]
+            {
+                // In debug builds, also emit a trace showing the main_cols
+                // chosen for serialization and the in-memory grid main_cols so
+                // we can correlate the UI and workbook snapshots when
+                // diagnosing address-serialization mismatches.
+                crate::debug_log::log(&format!(
+                    "DEBUG apply_op_without_history: view_sheet_id={} ui_main_cols={} workbook_main_cols={}",
+                    self.view_sheet_id,
+                    self.state.grid.main_cols(),
+                    self.workbook
+                        .sheets
+                        .iter()
+                        .find(|s| s.id == self.view_sheet_id)
+                        .map(|s| s.state.grid.main_cols())
+                        .unwrap_or(0)
+                ));
+            }
             self.ops_applied = self.ops_applied.saturating_add(1);
             self.sync_active_sheet_cache();
             self.start_log_watcher_if_needed()?;
