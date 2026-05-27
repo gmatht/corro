@@ -2581,6 +2581,16 @@ fn read_clipboard() -> Result<String, String> {
         /// restoring the terminal. This lets the TUI exit silently but still
         /// surface the created filename to the user on stdout/stderr.
         exit_message: Option<String>,
+        /// Armed after the first Esc press when an auto-created unsaved file is
+        /// present; a second Esc will exit immediately. This avoids showing the
+        /// QuitPrompt UI while still letting the user quickly quit.
+        pending_quit_esc: bool,
+        /// When `pending_quit_esc` is set, record the time it was armed so we
+        /// can require a second Esc within a short window.
+        pending_quit_esc_since: Option<std::time::Instant>,
+        /// Preserve the previous status so we can restore it if the quick-quit
+        /// is cancelled or expires.
+        pending_quit_prev_status: Option<String>,
     }
 
 impl App {
@@ -2693,7 +2703,7 @@ impl App {
             env::var("CORRO_AUTO_UNSAVED").map(|v| v != "0").unwrap_or(true)
         };
 
-        App {
+        let mut app = App {
             path,
             import_source: None,
             source_path,
@@ -2743,7 +2753,45 @@ impl App {
             unsaved_file: None,
             unsaved_auto_create: auto_create,
             exit_message: None,
+            pending_quit_esc: false,
+            pending_quit_esc_since: None,
+            pending_quit_prev_status: None,
+        };
+
+        // If there is an existing unsaved .corro in the per-user unsaved dir,
+        // bind to the most-recent one so the quick-quit / exit hint flows will
+        // treat the app as owning an untitled on-disk file. Ignore errors and
+        // be conservative: only bind when we have no explicit path yet and
+        // auto-create is enabled.
+        if app.path.is_none() && app.unsaved_auto_create {
+            let dir = Self::default_unsaved_dir();
+            if let Ok(rd) = std::fs::read_dir(&dir) {
+                let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+                for e in rd.filter_map(|r| r.ok()) {
+                    let p = e.path();
+                    if p.extension()
+                        .and_then(|s| s.to_str())
+                        .map_or(false, |ext| ext.eq_ignore_ascii_case("corro"))
+                    {
+                        if let Ok(meta) = e.metadata() {
+                            if let Ok(mtime) = meta.modified() {
+                                match &newest {
+                                    Some((t, _)) if *t >= mtime => {}
+                                    _ => newest = Some((mtime, p)),
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some((_, pth)) = newest {
+                    app.unsaved_file = Some(pth.clone());
+                    app.path = Some(pth.clone());
+                    app.exit_message = None;
+                    app.status = format!("Resumed unsaved file: {}", pth.display());
+                }
+            }
         }
+        app
     }
 
     pub fn new_with_revision_browser(path: Option<PathBuf>) -> Self {
@@ -8647,6 +8695,21 @@ impl App {
                     last_paint = Instant::now();
                 }
 
+                // Auto-expire the transient quick-quit hint after the allowed
+                // window so the subtle status does not persist indefinitely.
+                if self.pending_quit_esc {
+                    if let Some(armed) = self.pending_quit_esc_since {
+                        if armed.elapsed() > std::time::Duration::from_secs(2) {
+                            self.pending_quit_esc = false;
+                            self.pending_quit_esc_since = None;
+                            if let Some(prev) = self.pending_quit_prev_status.take() {
+                                self.status = prev;
+                            }
+                            pending_redraw = true;
+                        }
+                    }
+                }
+
                 let evt = if let Some(e) = self.pending_event.take() {
                     e
                 } else if !event::poll(Duration::from_millis(200))? {
@@ -11301,10 +11364,40 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                     self.mode = mode;
                     return Ok(true);
                 }
-                KeyCode::Char('b') | KeyCode::Char('B') => mode = Mode::Normal,
+                KeyCode::Char('b') | KeyCode::Char('B') => {
+                    // If the QuitPrompt was reached via the quick-quit Esc
+                    // flow, clear the pending flag when backing out.
+                    self.pending_quit_esc = false;
+                    self.pending_quit_esc_since = None;
+                    if let Some(prev) = self.pending_quit_prev_status.take() {
+                        self.status = prev;
+                    }
+                    mode = Mode::Normal;
+                }
                 KeyCode::Esc => {
-                    self.mode = mode;
-                    return Ok(true);
+                    // If quick-quit is armed and the second Esc is within the
+                    // allowed window, exit immediately. Otherwise fall back to
+                    // the normal QuitPrompt behaviour.
+                    if self.pending_quit_esc {
+                        let armed = self.pending_quit_esc_since.unwrap_or_else(std::time::Instant::now);
+                        if armed.elapsed() <= std::time::Duration::from_secs(2) {
+                            self.mode = mode;
+                            return Ok(true);
+                        } else {
+                            // expired: clear pending state and treat this as a
+                            // regular Esc (which quits when prompted).
+                            self.pending_quit_esc = false;
+                            self.pending_quit_esc_since = None;
+                            if let Some(prev) = self.pending_quit_prev_status.take() {
+                                self.status = prev;
+                            }
+                            self.mode = mode;
+                            return Ok(true);
+                        }
+                    } else {
+                        self.mode = mode;
+                        return Ok(true);
+                    }
                 }
                 _ => {}
             },
@@ -11319,6 +11412,12 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                     return Ok(true);
                 }
                 KeyCode::Char('b') | KeyCode::Char('B') | KeyCode::Esc => {
+                    // Clear any pending quick-quit when backing out.
+                    self.pending_quit_esc = false;
+                    self.pending_quit_esc_since = None;
+                    if let Some(prev) = self.pending_quit_prev_status.take() {
+                        self.status = prev;
+                    }
                     mode = Mode::Normal;
                 }
                 _ => {}
@@ -12015,16 +12114,56 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
             },
             Mode::Normal => {
                 // If the user presses Esc while in Normal mode and we have an
-                // auto-created unsaved on-disk file bound to `self.path`, treat
-                // this as the first Esc of an "Esc Esc to quit" gesture by
-                // opening the quit prompt. The second Esc (handled by
-                // Mode::QuitPrompt) will then exit immediately. This lets the
-                // user quickly quit without going through a Save/Discard prompt
-                // while still preserving Esc as a no-op in other situations.
+                // auto-created unsaved on-disk file bound to `self.path`, arm a
+                // quick-quit state. The first Esc sets `pending_quit_esc=true`
+                // and shows no intrusive prompt; the second Esc then exits
+                // immediately. This avoids modal prompting while still making
+                // quick quit discoverable.
                 if key.code == KeyCode::Esc {
                     if let (Some(p), Some(uns)) = (self.path.clone(), self.unsaved_file.clone()) {
                         if p == uns {
-                            mode = Mode::QuitPrompt;
+                            // If quick-quit is already armed, a second Esc within the
+                            // allowed window should exit immediately without showing
+                            // the QuitPrompt. If the window expired, clear the
+                            // pending state and fall through to arm again.
+                            if self.pending_quit_esc {
+                                if let Some(armed) = self.pending_quit_esc_since {
+                                    if armed.elapsed() <= std::time::Duration::from_secs(2) {
+                                        // Exit immediately and record the final hint so
+                                        // the caller can print it after restoring the
+                                        // terminal.
+                                        self.exit_message = Some(format!(
+                                            "Unsaved file created at {}",
+                                            p.display()
+                                        ));
+                                        self.mode = mode;
+                                        return Ok(true);
+                                    } else {
+                                        // expired: clear pending and restore status
+                                        self.pending_quit_esc = false;
+                                        self.pending_quit_esc_since = None;
+                                        if let Some(prev) = self.pending_quit_prev_status.take() {
+                                            self.status = prev;
+                                        }
+                                    }
+                                } else {
+                                    // No timestamp recorded; clear to be safe.
+                                    self.pending_quit_esc = false;
+                                    self.pending_quit_esc_since = None;
+                                    if let Some(prev) = self.pending_quit_prev_status.take() {
+                                        self.status = prev;
+                                    }
+                                }
+                            }
+
+                            // Arm quick-quit, start a 2s timer, and show a subtle
+                            // status hint. Save previous status to restore later.
+                            if !self.pending_quit_esc {
+                                self.pending_quit_prev_status = Some(self.status.clone());
+                                self.status = "Press Esc again within 2s to quit without saving".into();
+                                self.pending_quit_esc = true;
+                                self.pending_quit_esc_since = Some(std::time::Instant::now());
+                            }
                             self.mode = mode;
                             return Ok(false);
                         }
@@ -20941,6 +21080,50 @@ fn unsaved_header_and_op_committed_on_first_edit() {
     );
 
     // Restore environment
+    if let Some(v) = prev_test_dir {
+        env::set_var("CORRO_UNSAVED_TEST_DIR", v);
+    } else {
+        env::remove_var("CORRO_UNSAVED_TEST_DIR");
+    }
+    if let Some(v) = prev_auto {
+        env::set_var("CORRO_AUTO_UNSAVED_TEST", v);
+    } else {
+        env::remove_var("CORRO_AUTO_UNSAVED_TEST");
+    }
+}
+
+#[test]
+fn quick_quit_esc_exits_with_unsaved_auto_file() {
+    use tempfile::tempdir;
+    use std::env;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let tmp = tempdir().unwrap();
+    let tmp_path = tmp.path().to_path_buf();
+
+    let prev_test_dir = env::var_os("CORRO_UNSAVED_TEST_DIR");
+    let prev_auto = env::var_os("CORRO_AUTO_UNSAVED_TEST");
+    let expected_dir = tmp_path.join("corro/unsaved");
+    env::set_var("CORRO_UNSAVED_TEST_DIR", expected_dir.to_string_lossy().to_string());
+    env::set_var("CORRO_AUTO_UNSAVED_TEST", "1");
+
+    let mut app = App::new(None);
+    app.unsaved_auto_create = true;
+
+    let p = app.ensure_unsaved_file().expect("should create unsaved file");
+    assert!(p.exists());
+    assert_eq!(app.path.as_ref().unwrap(), &p);
+
+    // First Esc: arm quick-quit
+    let first = app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty())).unwrap();
+    assert!(!first, "first Esc should not exit");
+    assert!(app.pending_quit_esc, "quick-quit should be armed");
+
+    // Second Esc: should exit
+    let second = app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty())).unwrap();
+    assert!(second, "second Esc should exit immediately");
+
+    // Restore env
     if let Some(v) = prev_test_dir {
         env::set_var("CORRO_UNSAVED_TEST_DIR", v);
     } else {
