@@ -7375,11 +7375,40 @@ impl App {
             let cand = dir.join(&name);
             match OpenOptions::new().create_new(true).write(true).open(&cand) {
                 Ok(_) => {
-                    // Bind to app state so subsequent commit flows use this path.
+                    // When creating an untitled on-disk .corro from a linked
+                    // external source, record the log header and LINK entries
+                    // so a full reload of the file reconstructs the linked
+                    // relationship and base state. Write the header + any
+                    // per-sheet LINK lines now so later tail/reload paths
+                    // won't discard the external base when replaying only
+                    // the on-disk log.
+                    let mut initial = String::new();
+                    initial.push_str(&format!("{} {}\n", crate::ops::LOG_HEADER_PREFIX, crate::ops::LOG_VERSION));
+                    for sheet in &self.workbook.sheets {
+                        if let Some(source) = &sheet.linked_source {
+                            let wbo = crate::ops::WorkbookOp::LinkSheet {
+                                id: sheet.id,
+                                source: source.clone(),
+                            };
+                            // to_log_line doesn't meaningfully depend on the
+                            // main_cols for LINK entries, but the method
+                            // requires a usize parameter.
+                            initial.push_str(&wbo.to_log_line(sheet.state.grid.main_cols()));
+                            initial.push('\n');
+                        }
+                    }
+                    // Write header + LINK lines to the newly-created file and
+                    // bind to app state so subsequent commit flows use this path.
+                    std::fs::write(&cand, initial.as_bytes())
+                        .map_err(|e| RunError::Io(crate::io::IoError::Io(e)))?;
                     self.unsaved_file = Some(cand.clone());
                     self.path = Some(cand.clone());
                     self.exit_message = None; // clear any prior exit hint
                     self.status = format!("Created unsaved file: {}", cand.display());
+                    // Record current on-disk offset so future tail operations
+                    // start after the header/LINKs we just wrote.
+                    let meta = std::fs::metadata(&cand).map_err(|e| RunError::Io(crate::io::IoError::Io(e)))?;
+                    self.offset = meta.len();
                     return Ok(cand);
                 }
                 Err(e) => {
@@ -19925,6 +19954,57 @@ mod tests {
                 .as_deref(),
             Some("9")
         );
+    }
+
+    #[test]
+    fn linked_tsv_not_removed_on_edit() {
+        use tempfile::tempdir;
+        use std::env;
+        use std::fs;
+
+        // Create a temporary dir and a linked TSV file inside it.
+        let tmp = tempdir().unwrap();
+        let tmp_path = tmp.path().to_path_buf();
+        let tsv = tmp.path().join("tmp.tsv");
+        let data = "name\tvalue\nalpha\t1\n";
+        fs::write(&tsv, data).unwrap();
+
+        // Isolate unsaved-file creation to this tempdir.
+        let prev_test_dir = env::var_os("CORRO_UNSAVED_TEST_DIR");
+        let prev_auto = env::var_os("CORRO_AUTO_UNSAVED_TEST");
+        let expected_dir = tmp_path.join("corro/unsaved");
+        env::set_var("CORRO_UNSAVED_TEST_DIR", expected_dir.to_string_lossy().to_string());
+        env::set_var("CORRO_AUTO_UNSAVED_TEST", "1");
+
+        let mut app = App::new(Some(tsv.clone()));
+        app.load_initial().unwrap();
+        // Tests default to not auto-creating unsaved files; enable for this instance.
+        app.unsaved_auto_create = true;
+
+        // Perform an edit which should cause an untitled .corro to be created and
+        // written to — it must not remove or overwrite the original linked TSV.
+        app.apply_single_op(crate::ops::Op::SetCell {
+            addr: crate::grid::CellAddr::Main { row: 0, col: 0 },
+            value: "x".into(),
+        })
+        .unwrap();
+
+        // The original linked TSV must still exist and retain its contents.
+        assert!(tsv.exists(), "linked TSV should still exist after editing");
+        let on_disk = fs::read_to_string(&tsv).unwrap();
+        assert_eq!(on_disk, data);
+
+        // Restore environment
+        if let Some(v) = prev_test_dir {
+            env::set_var("CORRO_UNSAVED_TEST_DIR", v);
+        } else {
+            env::remove_var("CORRO_UNSAVED_TEST_DIR");
+        }
+        if let Some(v) = prev_auto {
+            env::set_var("CORRO_AUTO_UNSAVED_TEST", v);
+        } else {
+            env::remove_var("CORRO_AUTO_UNSAVED_TEST");
+        }
     }
 
     #[test]
