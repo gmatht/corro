@@ -686,17 +686,19 @@ impl Grid {
         };
 
         // Test-only diagnostics to trace unexpected width changes for problematic columns.
+        // Test-mode diagnostics should write to the debug log instead of
+        // stderr in the TUI. Use crate::debug_log::log so the text ends up in
+        // CORRO_DEBUG_LOG or the standard debug path.
         #[cfg(test)]
         {
-            // Narrow the noise: only log the target columns (720/721) or when an override exists.
             if global_col == 720 || global_col == 721 || self.col_width_overrides.contains_key(&global_col) {
-                eprintln!(
+                crate::debug_log::log(&format!(
                     "DEBUG: Grid::col_width read col={} -> {} (max_col_width={} override={:?})",
                     global_col,
                     width,
                     self.max_col_width,
                     self.col_width_overrides.get(&global_col).copied()
-                );
+                ));
             }
         }
 
@@ -708,7 +710,7 @@ impl Grid {
         self.max_col_width = w;
         #[cfg(test)]
         {
-            eprintln!("DEBUG: Grid::set_max_col_width -> {}", w);
+            crate::debug_log::log(&format!("DEBUG: Grid::set_max_col_width -> {}", w));
         }
     }
 
@@ -720,7 +722,7 @@ impl Grid {
                 #[cfg(test)]
                 {
                     if global_col == 720 || global_col == 721 {
-                        eprintln!("DEBUG: Grid::set_col_width set col={} -> {}", global_col, w2);
+                        crate::debug_log::log(&format!("DEBUG: Grid::set_col_width set col={} -> {}", global_col, w2));
                     }
                 }
             }
@@ -729,7 +731,7 @@ impl Grid {
                 #[cfg(test)]
                 {
                     if global_col == 720 || global_col == 721 {
-                        eprintln!("DEBUG: Grid::set_col_width remove override col={}", global_col);
+                        crate::debug_log::log(&format!("DEBUG: Grid::set_col_width remove override col={}", global_col));
                     }
                 }
             }

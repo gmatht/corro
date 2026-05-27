@@ -336,29 +336,45 @@ pub fn commit_workbook_op(
         _ => preview.active_sheet().grid.main_cols(),
     };
 
-    let mut main_cols = preview_main_cols;
-    if let WorkbookOp::SheetOp {
-        sheet_id: _,
-        op: inner_op,
-    } = op
+    // Use the pre-apply main_cols (when available) for textual serialization.
+    // This keeps addresses stable and matches the user's mental model: if the
+    // cursor/selection referred to D1 before the operation, the committed log
+    // line should use the same D1 label. Avoid heuristics that inspect the
+    // preview (post-apply) state and mutate the chosen `main_cols` which
+    // produced incorrect gutter/header addresses in practice.
+    let main_cols = pre_main_cols.unwrap_or(preview_main_cols);
+    let omit_sheet1_prefix = workbook.sheet_count() == 1;
+    // Debug: show the lines we will append when running in debug builds.
+    #[cfg(debug_assertions)]
     {
-        if let Op::SetCell { addr, .. } = inner_op {
-            match addr {
-                crate::grid::CellAddr::Header { col, .. }
-                | crate::grid::CellAddr::Footer { col, .. } => {
-                    if let Some(pre) = pre_main_cols {
-                        if preview_main_cols > pre && (*col as usize) >= crate::grid::MARGIN_COLS {
-                            main_cols = preview_main_cols.saturating_sub(1);
-                        }
-                    }
-                }
-                _ => {}
-            }
+        // In debug builds write the same diagnostic traces to the debug log
+        // via stderr (which the binary redirects to CORRO_DEBUG_LOG or the
+        // XDG state debug.log path on startup). Avoid writing debug text to
+        // the TUI: stderr is redirected to a file at process start.
+        // Write contextual debug lines to the debug log
+        crate::debug_log::log(&format!(
+            "DEBUG commit_workbook_op: pre_main_cols={:?} preview_main_cols={} chosen_main_cols={} omit_sheet1_prefix={}",
+            pre_main_cols, preview_main_cols, main_cols, omit_sheet1_prefix
+        ));
+        if let WorkbookOp::SheetOp { sheet_id, op: inner_op } = op {
+            crate::debug_log::log(&format!(
+                "DEBUG commit_workbook_op: sheet_id={} inner_op={:?}",
+                sheet_id, inner_op
+            ));
+        }
+        for line in op.to_log_lines_with_policy(main_cols, omit_sheet1_prefix) {
+            crate::debug_log::log(&format!(
+                "DEBUG commit_workbook_op append: workbook_op={:?} -> line={}",
+                op, line
+            ));
+            append_line(path, &line)?;
         }
     }
-    let omit_sheet1_prefix = workbook.sheet_count() == 1;
-    for line in op.to_log_lines_with_policy(main_cols, omit_sheet1_prefix) {
-        append_line(path, &line)?;
+    #[cfg(not(debug_assertions))]
+    {
+        for line in op.to_log_lines_with_policy(main_cols, omit_sheet1_prefix) {
+            append_line(path, &line)?;
+        }
     }
     *offset = tail_apply_workbook(path, *offset, workbook, active_sheet)?;
     Ok(())

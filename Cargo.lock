@@ -132,6 +132,7 @@ dependencies = [
  "balance-core",
  "chrono",
  "crossterm",
+ "libc",
  "notify",
  "num-bigint",
  "num-complex",

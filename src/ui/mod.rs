@@ -116,11 +116,17 @@ mod extrapolate_tests {
         let grid = &app.state.grid;
         let addr = crate::grid::CellAddr::Main { row: 0, col: col_s as u32 };
         let raw = grid.get(&addr);
-        eprintln!("DEBUG: raw S1 = {:?}", raw);
-        let disp = cell_effective_display(grid, &addr);
-        eprintln!("DEBUG: display S1 = {}", disp);
-        // Also print rendered_width_for_column
-        eprintln!("DEBUG: rendered_width_for_S = {:?}", app.rendered_width_for_column(crate::grid::MARGIN_COLS + col_s));
+        #[cfg(test)]
+        {
+            crate::debug_log::log(&format!("DEBUG: raw S1 = {:?}", raw));
+            let disp = cell_effective_display(grid, &addr);
+            crate::debug_log::log(&format!("DEBUG: display S1 = {}", disp));
+            // Also print rendered_width_for_column
+            crate::debug_log::log(&format!(
+                "DEBUG: rendered_width_for_S = {:?}",
+                app.rendered_width_for_column(crate::grid::MARGIN_COLS + col_s)
+            ));
+        }
     }
 
     #[test]
@@ -135,7 +141,8 @@ mod extrapolate_tests {
                 found.push((addr, v));
             }
         }
-        eprintln!("DEBUG found 2001 cells: {:?}", found);
+        #[cfg(test)]
+        crate::debug_log::log(&format!("DEBUG found 2001 cells: {:?}", found));
         assert!(!found.is_empty());
     }
 }
@@ -4721,6 +4728,15 @@ impl App {
         let range = self.edit_range_addrs.take();
         let explicit_addr = parse_cell_shorthand(buffer, self.state.grid.main_cols());
 
+        // Debug: trace edit commits to help diagnose mis-parsed gutter addresses
+        #[cfg(debug_assertions)]
+        {
+            crate::debug_log::log(&format!(
+                "DEBUG commit_edit_buffer: buffer={:?} explicit_addr={:?} edit_target_addr={:?} edit_range_addrs={:?}",
+                buffer, explicit_addr, self.edit_target_addr, range
+            ));
+        }
+
         if let Some(ref addrs) = range {
             if addrs.len() > 1 && explicit_addr.is_none() {
                 let value = buffer.to_string();
@@ -5668,7 +5684,7 @@ impl App {
                 .iter()
                 .map(|(c, cap, need, weight)| (*c, col_header_label(*c, mc), *cap, *need, *weight))
                 .collect();
-            eprintln!("fit_visible_columns_capped window cols diag: {:?}", diag);
+            crate::debug_log::log(&format!("fit_visible_columns_capped window cols diag: {:?}", diag));
         }
 
         // Give the pivot column first priority: satisfy its need (up to cap)
@@ -5679,8 +5695,8 @@ impl App {
         #[cfg(test)]
         {
             let window_cols: Vec<usize> = desired[left..=right].iter().map(|(c, _)| *c).collect();
-            eprintln!("fit_visible_columns_capped (pre): data_width={} budget={} pivot_ix={} pivot_col={} window_left={} window_right={} window_cols={:?} rem_budget={} cols={:?} col_ixs={:?}",
-                data_width, budget, pivot_ix, pivot_col, left, right, window_cols, rem_budget, cols, col_ixs);
+            crate::debug_log::log(&format!("fit_visible_columns_capped (pre): data_width={} budget={} pivot_ix={} pivot_col={} window_left={} window_right={} window_cols={:?} rem_budget={} cols={:?} col_ixs={:?}",
+                data_width, budget, pivot_ix, pivot_col, left, right, window_cols, rem_budget, cols, col_ixs));
         }
         if rem_budget > 0 {
             if let Some(pos) = cols.iter().position(|(col, _cap, _need, _weight)| *col == pivot_col) {
@@ -5751,8 +5767,8 @@ impl App {
         {
             let pivot_col = desired[pivot_ix].0;
             let window_cols: Vec<usize> = desired[left..=right].iter().map(|(c, _)| *c).collect();
-            eprintln!("fit_visible_columns_capped: data_width={} budget={} pivot_ix={} pivot_col={} window_left={} window_right={} window_cols={:?} allocations={:?} col_ixs={:?}",
-                data_width, budget, pivot_ix, pivot_col, left, right, window_cols, allocations, col_ixs);
+            crate::debug_log::log(&format!("fit_visible_columns_capped: data_width={} budget={} pivot_ix={} pivot_col={} window_left={} window_right={} window_cols={:?} allocations={:?} col_ixs={:?}",
+                data_width, budget, pivot_ix, pivot_col, left, right, window_cols, allocations, col_ixs));
 
             // Also show allocations mapped to header labels for easier test inspection.
             let mc = self.state.grid.main_cols();
@@ -5760,7 +5776,7 @@ impl App {
                 .iter()
                 .map(|(c, w)| (*c, col_header_label(*c, mc), *w))
                 .collect();
-            eprintln!("fit_visible_columns_capped allocations mapped: {:?}", alloc_mapped);
+            crate::debug_log::log(&format!("fit_visible_columns_capped allocations mapped: {:?}", alloc_mapped));
         }
 
         // Apply allocations in the original left-to-right column order.
@@ -5771,10 +5787,10 @@ impl App {
             // test log output stays small.
             if col_ixs.contains(&720) || col_ixs.contains(&721) {
                 let before_overrides = self.state.grid.col_width_overrides();
-                eprintln!(
+                crate::debug_log::log(&format!(
                     "DEBUG: fit_visible_columns_capped before_overrides: {:?}",
                     before_overrides
-                );
+                ));
             }
         }
         for &c in col_ixs {
@@ -5782,15 +5798,15 @@ impl App {
             {
                 if c == 720 || c == 721 {
                     if let Some(&w) = allocations.get(&c) {
-                        eprintln!(
+                        crate::debug_log::log(&format!(
                             "DEBUG: fit_visible_columns_capped applying set_col_width col={} width={}",
                             c, w
-                        );
+                        ));
                     } else {
-                        eprintln!(
+                        crate::debug_log::log(&format!(
                             "DEBUG: fit_visible_columns_capped applying set_col_width col={} width=1",
                             c
-                        );
+                        ));
                     }
                 }
             }
@@ -5804,10 +5820,10 @@ impl App {
         {
             if col_ixs.contains(&720) || col_ixs.contains(&721) {
                 let after_overrides = self.state.grid.col_width_overrides();
-                eprintln!(
+                crate::debug_log::log(&format!(
                     "DEBUG: fit_visible_columns_capped after_overrides: {:?}",
                     after_overrides
-                );
+                ));
             }
         }
         // Test-only: after applying allocations, print resulting per-column widths
@@ -5822,7 +5838,7 @@ impl App {
                     .iter()
                     .map(|&c| (c, col_header_label(c, mc), self.state.grid.col_width(c)))
                     .collect();
-                eprintln!("DEBUG: fit_visible_columns_capped post-apply col widths: {:?}", mapped);
+                crate::debug_log::log(&format!("DEBUG: fit_visible_columns_capped post-apply col widths: {:?}", mapped));
             }
         }
     }
@@ -5952,6 +5968,17 @@ impl App {
         self.push_inverse_op(&op);
         if let Some(ref p) = self.path.clone() {
             let mut active_sheet = self.view_sheet_id;
+            #[cfg(debug_assertions)]
+            {
+                // Trace the high-level op chosen for commit so we can correlate
+                // the in-memory Op/CellAddr with the serialized log line that
+                // commit_workbook_op emits. This is debug-only to avoid
+                // polluting release output / the TUI.
+            crate::debug_log::log(&format!(
+                "DEBUG apply_op_without_history: committing op={:?} view_sheet_id={} edit_target_addr={:?} cursor={:?}",
+                op, self.view_sheet_id, self.edit_target_addr, self.cursor
+            ));
+            }
             commit_workbook_op(
                 p,
                 &mut self.offset,
@@ -21071,7 +21098,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 }
 
 #[test]
-fn unsaved_file_created_on_first_edit() {
+    fn unsaved_file_created_on_first_edit() {
     use tempfile::tempdir;
     use std::env;
 
@@ -21099,6 +21126,53 @@ fn unsaved_file_created_on_first_edit() {
     // robust to the directory layout used by default_unsaved_dir().
     let expected_dir = tmp_path.join("corro/unsaved");
     assert!(p.ancestors().any(|a| a == expected_dir.as_path()), "unsaved file should be in tmpdir: {}", p.display());
+
+    // Restore environment
+    if let Some(v) = prev_test_dir {
+        env::set_var("CORRO_UNSAVED_TEST_DIR", v);
+    } else {
+        env::remove_var("CORRO_UNSAVED_TEST_DIR");
+    }
+    if let Some(v) = prev_auto {
+        env::set_var("CORRO_AUTO_UNSAVED_TEST", v);
+    } else {
+        env::remove_var("CORRO_AUTO_UNSAVED_TEST");
+    }
+}
+
+#[test]
+fn ensure_unsaved_file_writes_header_and_link_lines() {
+    use tempfile::tempdir;
+    use std::env;
+    use std::fs;
+
+    // Prepare a temporary directory to house the linked TSV and the
+    // unsaved per-user directory so the created file is isolated.
+    let tmp = tempdir().unwrap();
+    let tmp_path = tmp.path().to_path_buf();
+
+    // Create a linked TSV file and an App opened from it.
+    let tsv = tmp.path().join("linked.tsv");
+    let data = "name\tvalue\nalpha\t1\n";
+    fs::write(&tsv, data).unwrap();
+
+    // Ensure ensure_unsaved_file writes into our isolated unsaved dir.
+    let prev_test_dir = env::var_os("CORRO_UNSAVED_TEST_DIR");
+    let prev_auto = env::var_os("CORRO_AUTO_UNSAVED_TEST");
+    let expected_dir = tmp_path.join("corro/unsaved");
+    env::set_var("CORRO_UNSAVED_TEST_DIR", expected_dir.to_string_lossy().to_string());
+    env::set_var("CORRO_AUTO_UNSAVED_TEST", "1");
+
+    let mut app = App::new(Some(tsv.clone()));
+    app.load_initial().unwrap();
+    app.unsaved_auto_create = true;
+
+    let p = app.ensure_unsaved_file().expect("should create unsaved file");
+    let contents = fs::read_to_string(&p).unwrap();
+    assert!(contents.contains(&format!("{} {}", crate::ops::LOG_HEADER_PREFIX, crate::ops::LOG_VERSION)));
+    // When the app was opened from a linked TSV, there should be a LINK line
+    // referencing that TSV path in the created .corro.
+    assert!(contents.contains("LINK TSV"));
 
     // Restore environment
     if let Some(v) = prev_test_dir {

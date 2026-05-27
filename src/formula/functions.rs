@@ -475,14 +475,14 @@ pub(crate) fn parse_date_serial_literal(s: &str) -> Option<f64> {
     {
         // Narrow test-only logging to likely date-like inputs to avoid noisy output.
         if t.contains("2001/01/01") || t.contains("2001-01-01") || t.contains('/') {
-            eprintln!("DEBUG parse_date_serial_literal called: raw={:?} trimmed={:?}", s, t);
+            crate::debug_log::log(&format!("DEBUG parse_date_serial_literal called: raw={:?} trimmed={:?}", s, t));
         }
     }
     if t.len() != 10 {
         #[cfg(test)]
         {
             if t.contains("2001/01/01") || t.contains("2001-01-01") || t.contains('/') {
-                eprintln!("DEBUG parse_date_serial_literal: length mismatch: {}", t.len());
+                crate::debug_log::log(&format!("DEBUG parse_date_serial_literal: length mismatch: {}", t.len()));
             }
         }
         return None;
@@ -495,7 +495,7 @@ pub(crate) fn parse_date_serial_literal(s: &str) -> Option<f64> {
         #[cfg(test)]
         {
             if t.contains("2001/01/01") || t.contains("2001-01-01") || t.contains('/') {
-                eprintln!("DEBUG parse_date_serial_literal: separator mismatch: {:?}", t);
+                crate::debug_log::log(&format!("DEBUG parse_date_serial_literal: separator mismatch: {:?}", t));
             }
         }
         return None;
@@ -507,7 +507,7 @@ pub(crate) fn parse_date_serial_literal(s: &str) -> Option<f64> {
     #[cfg(test)]
     {
         if t.contains("2001/01/01") || t.contains("2001-01-01") || t.contains('/') {
-            eprintln!("DEBUG parse_date_serial_literal: parsed {}-{}-{} => {:?}", year, month, day, res);
+            crate::debug_log::log(&format!("DEBUG parse_date_serial_literal: parsed {}-{}-{} => {:?}", year, month, day, res));
         }
     }
     res
@@ -518,14 +518,14 @@ pub(crate) fn parse_numeric_or_date_literal(s: &str) -> Option<Number> {
     {
         // Log only likely candidates to keep test output focused.
         if s.contains("2001/01/01") || s.contains("2001-01-01") || s.contains('/') {
-            eprintln!("DEBUG parse_numeric_or_date_literal called: {:?}", s);
+            crate::debug_log::log(&format!("DEBUG parse_numeric_or_date_literal called: {:?}", s));
         }
     }
     let n = parse_number_literal(s).or_else(|| parse_date_serial_literal(s).map(Number::approx));
     #[cfg(test)]
     {
         if s.contains("2001/01/01") || s.contains("2001-01-01") || s.contains('/') {
-            eprintln!("DEBUG parse_numeric_or_date_literal result for {:?}: {:?}", s, n.as_ref().map(|x| x.to_f64()));
+            crate::debug_log::log(&format!("DEBUG parse_numeric_or_date_literal result for {:?}: {:?}", s, n.as_ref().map(|x| x.to_f64())));
         }
     }
     n

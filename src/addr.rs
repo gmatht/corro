@@ -379,6 +379,8 @@ pub fn parse_cell_ref_at(s: &str, main_cols: usize) -> Option<(CellAddr, A1RefLo
 }
 
 pub fn cell_ref_text(addr: &CellAddr, main_cols: usize) -> String {
+    // Keep this function quiet in normal operation; debug traces should go
+    // to the configured debug log via stderr redirection in main.
     match addr {
         CellAddr::Header { row, col } => {
             let row = HEADER_ROWS - *row as usize;

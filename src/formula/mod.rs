@@ -161,14 +161,14 @@ pub(crate) fn parse_numeric_or_date_literal(s: &str) -> Option<Number> {
     #[cfg(test)]
     {
         if s.contains("2001/01/01") || s.contains("2001-01-01") || s.contains('/') {
-            eprintln!("DEBUG wrapper parse_numeric_or_date_literal called: {:?}", s);
+            crate::debug_log::log(&format!("DEBUG wrapper parse_numeric_or_date_literal called: {:?}", s));
         }
     }
     let res = functions::parse_numeric_or_date_literal(s);
     #[cfg(test)]
     {
         if s.contains("2001/01/01") || s.contains("2001-01-01") || s.contains('/') {
-            eprintln!("DEBUG wrapper parse_numeric_or_date_literal result: {:?}", res.as_ref().map(|n| n.to_f64()));
+            crate::debug_log::log(&format!("DEBUG wrapper parse_numeric_or_date_literal result: {:?}", res.as_ref().map(|n| n.to_f64())));
         }
     }
     res

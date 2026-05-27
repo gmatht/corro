@@ -141,17 +141,33 @@ fn main() {
         if let Ok(xdg) = std::env::var("XDG_STATE_HOME") {
             let mut dir = std::path::PathBuf::from(xdg);
             dir.push("corro");
-            if std::fs::create_dir_all(&dir).is_ok() {
+                if std::fs::create_dir_all(&dir).is_ok() {
                 let path = dir.join("last-exit-hint");
-                let _ = std::fs::write(path, msg);
+                let _ = std::fs::write(path, &msg);
             }
         } else if let Ok(home) = std::env::var("HOME") {
             let mut dir = std::path::PathBuf::from(home);
             dir.push(".corro");
             if std::fs::create_dir_all(&dir).is_ok() {
                 let path = dir.join("last-exit-hint");
-                let _ = std::fs::write(path, msg);
+                let _ = std::fs::write(path, &msg);
             }
+        }
+
+        // Also write an exit hint to the debug log if possible. Prefer
+        // CORRO_DEBUG_LOG, otherwise XDG_STATE_HOME/corro/debug.log or
+        // ~/.corro/debug.log. Ignore errors; this is best-effort only.
+        if let Some(path) = std::env::var("CORRO_DEBUG_LOG").ok().or_else(|| {
+            std::env::var("XDG_STATE_HOME").ok().map(|xdg| format!("{}/corro/debug.log", xdg))
+        }).or_else(|| std::env::var("HOME").ok().map(|h| format!("{}/.corro/debug.log", h))) {
+            let p = std::path::PathBuf::from(path);
+            if let Some(dir) = p.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = std::fs::OpenOptions::new().create(true).append(true).open(&p).and_then(|mut f| {
+                use std::io::Write as _;
+                writeln!(f, "{}", msg)
+            });
         }
     }
     if let Err(e) = res {
@@ -166,6 +182,41 @@ fn try_main() -> (Result<(), corro::ui::RunError>, Option<String>) {
         Ok(a) => a,
         Err(s) => return (Err(std::io::Error::other(s).into()), None),
     };
+
+    // Redirect stderr to a per-user debug log so debug traces do not
+    // interleave with the TUI. Prefer CORRO_DEBUG_LOG if set; otherwise
+    // use XDG_STATE_HOME/corro/debug.log or ~/.corro/debug.log. Attempt to
+    // open/create the log and duplicate it onto STDERR so existing
+    // eprintln! calls go to the file on Unix platforms. Ignore errors.
+    if let Some(path) = std::env::var("CORRO_DEBUG_LOG").ok().or_else(|| {
+        std::env::var("XDG_STATE_HOME").ok().map(|xdg| format!("{}/corro/debug.log", xdg))
+    }).or_else(|| std::env::var("HOME").ok().map(|h| format!("{}/.corro/debug.log", h))) {
+        let p = std::path::PathBuf::from(path);
+        if let Some(dir) = p.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Ok(f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
+            #[cfg(unix)]
+            {
+                use std::os::unix::io::AsRawFd;
+                // Duplicate the debug file onto STDERR_FILENO so existing
+                // eprintln! calls write to the file.
+                unsafe {
+                    libc::dup2(f.as_raw_fd(), libc::STDERR_FILENO);
+                }
+                // Prevent the File's Drop from closing the fd we just
+                // duplicated; leak it intentionally until process exit.
+                let _ = Box::leak(Box::new(f));
+            }
+            #[cfg(not(unix))]
+            {
+                // On non-Unix platforms, just keep the file open but do not
+                // attempt to replace STDERR; callers may still see eprintln
+                // output on the terminal.
+                let _ = f;
+            }
+        }
+    }
     if args.show_help {
         println!("{}", cli_help_text());
         return (Ok(()), None);
