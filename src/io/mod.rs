@@ -496,17 +496,41 @@ fn import_delimited(data: &str, state: &mut SheetState, delim: char) {
         return;
     }
 
-    let first_all_numeric = rows.first().map_or(true, |r| {
-        r.iter().all(|cell| {
-            let t = cell.trim();
-            t.is_empty() || t.parse::<f64>().is_ok()
-        })
+    // Heuristic to decide whether the first row is a header row.
+    // Prefer a header when the first row looks non-numeric and the following
+    // rows contain mostly non-string (numeric) values. This preserves the
+    // historical behavior (treat first row as header when it contains text)
+    // but avoids false positives by checking subsequent rows for numeric data.
+    let first_row = rows.first().unwrap();
+    let first_row_all_non_numeric = first_row.iter().all(|cell| {
+        let t = cell.trim();
+        // Treat empty as non-numeric (could be a header placeholder).
+        t.is_empty() || t.parse::<f64>().is_err()
     });
 
-    let (header_row, data_rows) = if first_all_numeric || rows.len() <= 1 {
+    // Inspect a sample of subsequent rows to see if they contain numeric data.
+    // If any non-empty value in the sample parses as a number, prefer treating
+    // the first row as a header.
+    let mut subsequent_has_numeric = false;
+    for row in rows.iter().skip(1).take(8) {
+        for cell in row.iter() {
+            let t = cell.trim();
+            if !t.is_empty() && t.parse::<f64>().is_ok() {
+                subsequent_has_numeric = true;
+                break;
+            }
+        }
+        if subsequent_has_numeric {
+            break;
+        }
+    }
+
+    let (header_row, data_rows) = if rows.len() <= 1 {
         (None, &rows[..])
-    } else {
+    } else if first_row_all_non_numeric && subsequent_has_numeric {
         (Some(&rows[0]), &rows[1..])
+    } else {
+        (None, &rows[..])
     };
 
     let mc = max_cols as u32;
@@ -1060,6 +1084,30 @@ mod tests {
                 .get(&CellAddr::Main { row: 1, col: 1 })
                 .as_deref(),
             Some("25")
+        );
+    }
+
+    #[test]
+    fn import_tsv_no_header_when_followups_all_strings() {
+        let mut state = SheetState::new(1, 1);
+        // First row looks textual but subsequent rows are also textual -> treat as data
+        import_tsv("a\tb\nc\td\n", &mut state);
+        assert_eq!(state.grid.main_rows(), 2);
+        assert_eq!(state.grid.main_cols(), 2);
+        assert_eq!(
+            state
+                .grid
+                .get(&CellAddr::Main { row: 0, col: 0 })
+                .as_deref(),
+            Some("a")
+        );
+        // No header cell should have been stored for the leftmost main column
+        use crate::grid::HEADER_ROWS;
+        assert_eq!(
+            state
+                .grid
+                .get(&CellAddr::Header { row: (HEADER_ROWS - 1) as u32, col: crate::grid::MARGIN_COLS as u32 }),
+            None
         );
     }
 

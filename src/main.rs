@@ -124,44 +124,98 @@ fn parse_args() -> Result<Args, String> {
 }
 
 fn main() {
-    if let Err(e) = try_main() {
+    let (res, exit_message) = try_main();
+    if let Some(msg) = exit_message {
+        // Print to both stderr and stdout and flush so the message is
+        // visible after the TUI restores the terminal. Also write a
+        // fallback file under XDG_STATE_HOME/corro/last-exit-hint or
+        // ~/.corro/last-exit-hint so the message can be discovered when
+        // terminal output is unreliable.
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), "{}", msg);
+        let _ = writeln!(std::io::stdout(), "{}", msg);
+        let _ = std::io::stderr().flush();
+        let _ = std::io::stdout().flush();
+
+        // Fallback file write.
+        if let Ok(xdg) = std::env::var("XDG_STATE_HOME") {
+            let mut dir = std::path::PathBuf::from(xdg);
+            dir.push("corro");
+            if std::fs::create_dir_all(&dir).is_ok() {
+                let path = dir.join("last-exit-hint");
+                let _ = std::fs::write(path, msg);
+            }
+        } else if let Ok(home) = std::env::var("HOME") {
+            let mut dir = std::path::PathBuf::from(home);
+            dir.push(".corro");
+            if std::fs::create_dir_all(&dir).is_ok() {
+                let path = dir.join("last-exit-hint");
+                let _ = std::fs::write(path, msg);
+            }
+        }
+    }
+    if let Err(e) = res {
         eprintln!("{e}");
         std::process::exit(1);
     }
 }
 
-fn try_main() -> Result<(), corro::ui::RunError> {
-    let args = parse_args().map_err(std::io::Error::other)?;
+fn try_main() -> (Result<(), corro::ui::RunError>, Option<String>) {
+    // Parse args; return early with no exit message on CLI errors/help/version.
+    let args = match parse_args() {
+        Ok(a) => a,
+        Err(s) => return (Err(std::io::Error::other(s).into()), None),
+    };
     if args.show_help {
         println!("{}", cli_help_text());
-        return Ok(());
+        return (Ok(()), None);
     }
     if args.show_version {
         println!("corro {}", env!("CARGO_PKG_VERSION"));
-        return Ok(());
+        return (Ok(()), None);
     }
     if let Some(export_path) = args.export {
-        let Some(input_path) = args.files.first() else {
-            return Err(std::io::Error::other(
-                "--export requires an input file argument",
-            )
-            .into());
+        let input_path = match args.files.first() {
+            Some(p) => p.clone(),
+            None => {
+                return (
+                    Err(std::io::Error::other("--export requires an input file argument").into()),
+                    None,
+                )
+            }
         };
         if args.files.len() > 1 {
-            return Err(std::io::Error::other("--export accepts exactly one input file").into());
+            return (
+                Err(std::io::Error::other("--export accepts exactly one input file").into()),
+                None,
+            );
         }
-        let workbook = load_workbook_for_export(&input_path).map_err(std::io::Error::other)?;
-        export_workbook_to_path(&workbook, &export_path).map_err(std::io::Error::other)?;
-        return Ok(());
+        let workbook = match load_workbook_for_export(&input_path) {
+            Ok(w) => w,
+            Err(e) => return (Err(std::io::Error::other(e).into()), None),
+        };
+        if let Err(e) = export_workbook_to_path(&workbook, &export_path) {
+            return (Err(std::io::Error::other(e).into()), None);
+        }
+        return (Ok(()), None);
     }
     if args.movie && args.revision.is_some() {
-        return Err(std::io::Error::other("--movie cannot be combined with --revision").into());
+        return (
+            Err(std::io::Error::other("--movie cannot be combined with --revision").into()),
+            None,
+        );
     }
     if args.revision.is_some() && args.files.len() > 1 {
-        return Err(std::io::Error::other("--revision accepts exactly one input file").into());
+        return (
+            Err(std::io::Error::other("--revision accepts exactly one input file").into()),
+            None,
+        );
     }
     if args.movie && args.files.len() > 1 {
-        return Err(std::io::Error::other("--movie accepts exactly one input file").into());
+        return (
+            Err(std::io::Error::other("--movie accepts exactly one input file").into()),
+            None,
+        );
     }
     let mut app = match args.revision {
         None => App::new_with_paths(args.files),
@@ -170,17 +224,20 @@ fn try_main() -> Result<(), corro::ui::RunError> {
             App::new_with_revision_limit(args.files.first().cloned(), Some(revision))
         }
     };
-    if args.movie {
+    let res = if args.movie {
         app.run_movie(corro::ui::MovieReplayOptions {
             typing_cps: args.movie_typing_cps,
             confirm_delay_ms: args.movie_confirm_ms,
             menu_hold_ms: args.movie_menu_hold_ms,
-        })?;
+        })
     } else {
-        app.load_initial()?;
-        app.run()?;
-    }
-    Ok(())
+        match app.load_initial() {
+            Ok(()) => app.run(),
+            Err(e) => Err(e.into()),
+        }
+    };
+    let exit_msg = app.take_final_exit_hint();
+    (res, exit_msg)
 }
 
 fn cli_help_text() -> String {

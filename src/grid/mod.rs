@@ -611,6 +611,56 @@ impl Grid {
         });
     }
 
+    /// Shrink main extents silently to the largest stored content.
+    ///
+    /// This is an in-memory maintenance operation only: it reduces
+    /// `extent_main_rows`/`extent_main_cols` when trailing main rows/cols are
+    /// empty, but does NOT remap or prune header/footer or column-format maps
+    /// and does NOT emit any SetMainSize op. Returns true if either extent
+    /// was reduced.
+    fn shrink_to_content(&mut self) -> bool {
+        // Compute new main cols from stored main_cells only (ignore header/footer
+        // and width/format override maps).
+        let mut max_col_plus1: u32 = 0;
+        for (&(_r, c), _) in &self.main_cells {
+            max_col_plus1 = max_col_plus1.max(c.saturating_add(1));
+        }
+        if max_col_plus1 == 0 {
+            max_col_plus1 = 1; // always at least 1
+        }
+
+        // Compute new main rows from main, left and right stored cells.
+        let mut max_row_plus1: u32 = 0;
+        for (&(r, _), _) in &self.main_cells {
+            max_row_plus1 = max_row_plus1.max(r.saturating_add(1));
+        }
+        for (&(r, _), _) in &self.left {
+            max_row_plus1 = max_row_plus1.max(r.saturating_add(1));
+        }
+        for (&(r, _), _) in &self.right {
+            max_row_plus1 = max_row_plus1.max(r.saturating_add(1));
+        }
+        if max_row_plus1 == 0 {
+            max_row_plus1 = 1;
+        }
+
+        let mut changed = false;
+        if max_col_plus1 < self.extent_main_cols {
+            self.extent_main_cols = max_col_plus1;
+            changed = true;
+        }
+        if max_row_plus1 < self.extent_main_rows {
+            self.extent_main_rows = max_row_plus1;
+            changed = true;
+        }
+
+        if changed {
+            // Notify any cached spill/volatile logic that layout changed.
+            self.mark_spills_stale();
+        }
+        changed
+    }
+
     pub fn set_main_size(&mut self, main_rows: usize, main_cols: usize) {
         let old_main_cols = self.extent_main_cols as usize;
         let new_main_cols = main_cols.max(1);
@@ -992,7 +1042,11 @@ impl Grid {
         match addr {
             CellAddr::Header { row, col } => {
                 let c = *col as usize;
-                if (*row as usize) < HEADER_ROWS && c < self.total_cols() {
+                // Allow header cells to be stored regardless of the current
+                // sheet extent. Header/footer cells are absolute global
+                // columns and should not be silently dropped when the main
+                // region is narrower at the time the SET arrives.
+                if (*row as usize) < HEADER_ROWS {
                     if value.is_empty() {
                         self.header.remove(&(*row, *col));
                     } else {
@@ -1003,7 +1057,10 @@ impl Grid {
             }
             CellAddr::Footer { row, col } => {
                 let c = *col as usize;
-                if (*row as usize) < FOOTER_ROWS && c < self.total_cols() {
+                // As with headers, accept footer cells independent of the
+                // current total_cols; do not drop them just because the
+                // main region is presently narrow.
+                if (*row as usize) < FOOTER_ROWS {
                     if value.is_empty() {
                         self.footer.remove(&(*row, *col));
                     } else {
@@ -1016,7 +1073,11 @@ impl Grid {
                 let r = *row;
                 let c = *col;
                 if value.is_empty() {
-                    self.main_cells.remove(&(r, c));
+                    // Only shrink when an actual stored main cell was removed.
+                    if self.main_cells.remove(&(r, c)).is_some() {
+                        // Silent in-memory shrink (no SetMainSize op emitted).
+                        let _ = self.shrink_to_content();
+                    }
                 } else {
                     self.extent_main_rows = self.extent_main_rows.max(r + 1);
                     self.extent_main_cols = self.extent_main_cols.max(c + 1);
@@ -1030,7 +1091,10 @@ impl Grid {
                 let r = *row;
                 if mc < MARGIN_COLS {
                     if value.is_empty() {
-                        self.left.remove(&(r, mc));
+                        // Shrink only if a stored left-margin cell was removed.
+                        if self.left.remove(&(r, mc)).is_some() {
+                            let _ = self.shrink_to_content();
+                        }
                     } else {
                         self.extent_main_rows = self.extent_main_rows.max(r + 1);
                         self.left.insert((r, mc), value);
@@ -1044,7 +1108,10 @@ impl Grid {
                 let r = *row;
                 if mc < MARGIN_COLS {
                     if value.is_empty() {
-                        self.right.remove(&(r, mc));
+                        // Shrink only if a stored right-margin cell was removed.
+                        if self.right.remove(&(r, mc)).is_some() {
+                            let _ = self.shrink_to_content();
+                        }
                     } else {
                         self.extent_main_rows = self.extent_main_rows.max(r + 1);
                         self.right.insert((r, mc), value);
@@ -1708,5 +1775,66 @@ mod tests {
         let fmt = g.format_for_addr(&CellAddr::Main { row: 0, col: 0 });
         assert_eq!(fmt.number, Some(NumberFormat::Fixed { decimals: 2 }));
         assert_eq!(fmt.align, Some(TextAlign::Center));
+    }
+
+    #[test]
+    fn silent_shrink_columns_and_preserve_formats() {
+        let mut g = Grid::new(2, 3);
+        // Populate main cells across cols 0..3
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "a".into());
+        g.set(&CellAddr::Main { row: 0, col: 1 }, "b".into());
+        g.set(&CellAddr::Main { row: 0, col: 2 }, "c".into());
+
+        // Set column formats and header/footer at a column beyond current main cols
+        let high_col = MARGIN_COLS + 10;
+        g.set_column_format(FormatScope::All, high_col, CellFormat { number: None, align: Some(TextAlign::Right) });
+        g.set(&CellAddr::Header { row: 0, col: high_col as u32 }, "hdr".into());
+
+        // Remove last main column cell and expect silent shrink
+        g.set(&CellAddr::Main { row: 0, col: 2 }, String::new());
+
+        // extent_main_cols should now be 2 (cols 0..1) after shrink
+        assert_eq!(g.main_cols(), 2);
+
+        // Column format and header must still be present (not pruned by silent shrink)
+        assert_eq!(g.col_all_formats.get(&high_col).is_some(), true);
+        assert_eq!(g.header.get(&(0u32, high_col as u32)).is_some(), true);
+    }
+
+    #[test]
+    fn silent_shrink_rows_and_preserve_formats() {
+        let mut g = Grid::new(4, 2);
+        // Fill main rows 0..4 in col 0
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "r0".into());
+        g.set(&CellAddr::Main { row: 1, col: 0 }, "r1".into());
+        g.set(&CellAddr::Main { row: 2, col: 0 }, "r2".into());
+        g.set(&CellAddr::Main { row: 3, col: 0 }, "r3".into());
+
+        // Place a left-margin cell on row 1 and a right-margin cell on row 3
+        g.set(&CellAddr::Left { col: 1, row: 1 }, "L".into());
+        g.set(&CellAddr::Right { col: 2, row: 3 }, "R".into());
+
+        // Remove bottom-most main row cell -> should shrink rows only if no margin forces retention
+        g.set(&CellAddr::Main { row: 3, col: 0 }, String::new());
+
+        // Since right margin exists on row 3, extent_main_rows should still include row 3 (no shrink below 4)
+        assert_eq!(g.main_rows(), 4);
+
+        // Remove right-margin cell and then remove main row; expect shrink now
+        g.set(&CellAddr::Right { col: 2, row: 3 }, String::new());
+        g.set(&CellAddr::Main { row: 3, col: 0 }, String::new());
+        // Now there is no content in row 3; shrink should reduce main rows to 3
+        assert_eq!(g.main_rows(), 3);
+    }
+
+    #[test]
+    fn no_shrink_on_header_footer_removal() {
+        let mut g = Grid::new(2, 2);
+        let high_col = MARGIN_COLS + 5;
+        g.set(&CellAddr::Header { row: 0, col: high_col as u32 }, "h".into());
+        let old_rows = g.main_rows();
+        g.set(&CellAddr::Header { row: 0, col: high_col as u32 }, String::new());
+        // Removing header should not change main extents
+        assert_eq!(g.main_rows(), old_rows);
     }
 }

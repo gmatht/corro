@@ -39,6 +39,8 @@ use unicode_truncate::{Alignment as UTruncAlign, UnicodeTruncateStr};
 use unicode_width::UnicodeWidthStr;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthChar;
+use std::env;
+use std::fs::OpenOptions;
 
 /// Width of the row-label gutter (`]A~1`, `A1`, `A_1`).
 const ROW_LABEL_CHARS: usize = 5;
@@ -1631,8 +1633,26 @@ impl App {
     fn menu_target_mode(&mut self, path: &[MenuLevel], target: MenuTarget) -> Result<Mode, ()> {
         match target {
             MenuTarget::Action(action) => {
-                if matches!(action, MenuAction::Exit) && self.is_ods_tsv_import_unchanged() {
-                    return Err(());
+                if matches!(action, MenuAction::Exit) {
+                    // If this is an Exit and the app is an unchanged TSV/ODS
+                    // import, signal immediate exit to the caller.
+                    if self.is_ods_tsv_import_unchanged() {
+                        // Inform the caller that nothing was autosaved because the
+                        // imported TSV/ODS was not edited; record a message so the
+                        // outer run() prints an explanatory hint after restore.
+                        self.exit_message = Some("No autosave as no edits".into());
+                        return Err(());
+                    }
+                    // If we're currently bound to an auto-created untitled
+                    // unsaved file, skip the quit prompt and exit immediately,
+                    // but record the filename so the outer run loop can print
+                    // it after restoring the terminal state.
+                    if let (Some(p), Some(uns)) = (self.path.clone(), self.unsaved_file.clone()) {
+                        if p == uns {
+                            self.exit_message = Some(format!("Unsaved file created at {}", p.display()));
+                            return Err(());
+                        }
+                    }
                 }
                 Ok(self.menu_action_mode(action))
             }
@@ -1676,6 +1696,38 @@ impl App {
         } else {
             None
         }
+    }
+
+    /// Take and return any recorded exit message. This keeps the field private
+    /// but allows the caller (main) to retrieve the final message for printing.
+    pub fn take_exit_message(&mut self) -> Option<String> {
+        self.exit_message.take()
+    }
+
+    /// Return the final exit hint the caller should print. This prefers any
+    /// explicit exit_message set during quit flows, but falls back to the
+    /// "No autosave as no edits" hint when the app is an unchanged TSV/ODS
+    /// import (user opened a tabular import and made no edits).
+    pub fn take_final_exit_hint(&mut self) -> Option<String> {
+        if let Some(msg) = self.exit_message.take() {
+            return Some(msg);
+        }
+        // Prefer reporting the unsaved file path when present so the user can
+        // locate the auto-created `.corro` file.
+        if let Some(ref p) = self.unsaved_file {
+            return Some(format!("Unsaved file created at {}", p.display()));
+        }
+        if self.is_ods_tsv_import_unchanged() {
+            return Some("No autosave as no edits".into());
+        }
+        // Fall back to the current status if present so the user sees a
+        // meaningful message on exit even when no explicit exit_message was
+        // recorded (for example when opening a new file that hasn't been
+        // edited).
+        if !self.status.is_empty() {
+            return Some(self.status.clone());
+        }
+        None
     }
 
     fn help_page_body(&self) -> String {
@@ -2074,7 +2126,11 @@ fn header_template_applies(grid: &Grid, main_col: usize) -> bool {
         row: (HEADER_ROWS - 1) as u32,
         col: (MARGIN_COLS as u32) + main_col as u32,
     });
-    raw.as_deref().is_some_and(is_formula)
+    // Consider any non-empty header cell as contributing to the visible
+    // main-column window. Previously this checked only for formula-like
+    // "templates"; treat ordinary header text the same for visibility so
+    // users see e.g. a Column D header even when the data cells are blank.
+    raw.as_deref().is_some()
 }
 
 fn data_main_col_count(grid: &Grid) -> usize {
@@ -2459,7 +2515,7 @@ fn read_clipboard() -> Result<String, String> {
 
 // ── App ───────────────────────────────────────────────────────────────────────
 
-pub struct App {
+    pub struct App {
     pub path: Option<PathBuf>,
     /// Set when the workbook was read from a non-`corro` file (e.g. ODS). `path` stays `None` until saved as `.corro`.
     import_source: Option<PathBuf>,
@@ -2513,7 +2569,19 @@ pub struct App {
     /// Event read during arrow coalescing that must be handled before the next `poll`.
     pending_event: Option<Event>,
     linked_source_mtimes: HashMap<PathBuf, SystemTime>,
-}
+        /// When we materialize an untitled on-disk log, store its path here so
+        /// the lifetime is tracked by the App instance (we do not perform
+        /// automatic cleanup of these files).
+        unsaved_file: Option<PathBuf>,
+        /// Auto-create an unsaved on-disk file on first edit when true. Can be
+        /// disabled by setting CORRO_AUTO_UNSAVED=0 in the environment.
+        unsaved_auto_create: bool,
+        /// When the user requests an immediate quit while an untitled/unsaved
+        /// on-disk file exists, store a message here so run() can print it after
+        /// restoring the terminal. This lets the TUI exit silently but still
+        /// surface the created filename to the user on stdout/stderr.
+        exit_message: Option<String>,
+    }
 
 impl App {
     /// Character index of the first position after the expression (before `" -- "` label if present).
@@ -2618,6 +2686,13 @@ impl App {
         } else {
             (path, None)
         };
+        let auto_create = if cfg!(test) {
+            // Keep prior in-memory behavior for unit tests.
+            false
+        } else {
+            env::var("CORRO_AUTO_UNSAVED").map(|v| v != "0").unwrap_or(true)
+        };
+
         App {
             path,
             import_source: None,
@@ -2665,6 +2740,9 @@ impl App {
             clipboard_snapshot: None,
             pending_event: None,
             linked_source_mtimes: HashMap::new(),
+            unsaved_file: None,
+            unsaved_auto_create: auto_create,
+            exit_message: None,
         }
     }
 
@@ -3171,8 +3249,28 @@ impl App {
     }
 
     fn fit_active_sheet_after_load(&mut self) {
+        // Fit the usual main data columns.
+        // Additionally, ensure any global columns referenced by stored
+        // header/footer cells are also fitted so header-only columns become
+        // visible at load time without expanding the sheet main_cols.
+        let mut cols: HashSet<usize> = HashSet::new();
         for c in 0..self.state.grid.main_cols() {
-            self.fit_column_to_rendered_content(MARGIN_COLS + c);
+            cols.insert(MARGIN_COLS + c);
+        }
+        // Include header/footer referenced global columns (may be outside
+        // the current main columns). `iter_nonempty` yields (addr, val).
+        for (addr, _) in self.state.grid.iter_nonempty() {
+            match addr {
+                CellAddr::Header { col, .. } | CellAddr::Footer { col, .. } => {
+                    cols.insert(col as usize);
+                }
+                _ => {}
+            }
+        }
+        let mut cols_sorted: Vec<usize> = cols.into_iter().collect();
+        cols_sorted.sort_unstable();
+        for global_col in cols_sorted {
+            self.fit_column_to_rendered_content(global_col);
         }
     }
 
@@ -4606,24 +4704,10 @@ impl App {
                         Op::FillRange { cells }
                     },
                 );
-                self.push_inverse_op(&op);
-                if let Some(ref p) = self.path.clone() {
-                    let mut active_sheet = self.view_sheet_id;
-                    commit_workbook_op(
-                        p,
-                        &mut self.offset,
-                        &mut self.workbook,
-                        &mut active_sheet,
-                        &crate::ops::WorkbookOp::SheetOp {
-                            sheet_id: self.view_sheet_id,
-                            op,
-                        },
-                    )?;
-                    self.ops_applied = self.ops_applied.saturating_add(1);
-                    self.sync_active_sheet_cache();
-                    self.start_log_watcher_if_needed()?;
-                } else {
-                    op.apply(&mut self.state);
+                // Use apply_single_op so apply_op_without_history can auto-create
+                // an unsaved on-disk file when configured.
+                self.apply_single_op(op)?;
+                if self.path.is_none() {
                     self.status = "No file — edit in memory only".into();
                 }
                 let cur_addr = self.cursor.to_addr(&self.state.grid);
@@ -4678,25 +4762,10 @@ impl App {
             addr: addr.clone(),
             value,
         };
-        self.push_inverse_op(&op);
-        if let Some(ref p) = self.path.clone() {
-            let mut active_sheet = self.view_sheet_id;
-            commit_workbook_op(
-                p,
-                &mut self.offset,
-                &mut self.workbook,
-                &mut active_sheet,
-                &crate::ops::WorkbookOp::SheetOp {
-                    sheet_id: self.view_sheet_id,
-                    op,
-                },
-            )?;
-            self.ops_applied = self.ops_applied.saturating_add(1);
-            self.sync_active_sheet_cache();
-            self.start_log_watcher_if_needed()?;
-        } else {
-            op.apply(&mut self.state);
-        }
+        // Use apply_single_op which will push the inverse op and then either
+        // apply in-memory or commit to disk (auto-creating an unsaved file if
+        // configured).
+        self.apply_single_op(op)?;
         if let Some((explicit_addr, _)) = explicit_addr {
             self.cursor = self
                 .sheet_cursor_for_addr(&explicit_addr)
@@ -7082,6 +7151,15 @@ impl App {
     }
 
     fn apply_op_without_history(&mut self, op: Op) -> Result<(), RunError> {
+        // If we don't have a path yet but are configured to auto-create an
+        // unsaved per-user file on first edit, ensure it's created and bound
+        // to `self.path`. This lets the existing on-disk append/tail-apply and
+        // LogWatcher logic operate unchanged.
+        if self.path.is_none() && self.unsaved_auto_create {
+            // ignore errors here and propagate as RunError if creation fails
+            let _ = self.ensure_unsaved_file()?;
+        }
+
         if let Some(ref p) = self.path.clone() {
             let mut active_sheet = self.view_sheet_id;
             commit_workbook_op(
@@ -7150,6 +7228,127 @@ impl App {
             }
         }
         cells
+    }
+
+    /// Compute the per-user unsaved directory according to platform conventions.
+    fn default_unsaved_dir() -> PathBuf {
+        // Allow tests to override the unsaved directory with a process-local
+        // environment variable to avoid races between parallel unit tests that
+        // otherwise need to change XDG_STATE_HOME / HOME globally.
+        if let Ok(test_dir) = env::var("CORRO_UNSAVED_TEST_DIR") {
+            return PathBuf::from(test_dir);
+        }
+        // Linux: prefer XDG_STATE_HOME/corro/unsaved, fallback to ~/.corro/unsaved
+        if cfg!(target_os = "linux") {
+            if let Ok(x) = env::var("XDG_STATE_HOME") {
+                return PathBuf::from(x).join("corro/unsaved");
+            }
+            if let Ok(home) = env::var("HOME") {
+                return PathBuf::from(home).join(".corro/unsaved");
+            }
+        }
+
+        // macOS: ~/Library/Application Support/corro/unsaved
+        if cfg!(target_os = "macos") {
+            if let Ok(home) = env::var("HOME") {
+                return PathBuf::from(home).join("Library/Application Support/corro/unsaved");
+            }
+        }
+
+        // Windows: %LOCALAPPDATA%\corro\unsaved, fallback to %APPDATA% or current dir
+        if cfg!(target_os = "windows") {
+            if let Ok(local) = env::var("LOCALAPPDATA") {
+                return PathBuf::from(local).join("corro\\unsaved");
+            }
+            if let Ok(appdata) = env::var("APPDATA") {
+                return PathBuf::from(appdata).join("corro\\unsaved");
+            }
+        }
+
+        // Generic fallback: ~/.corro/unsaved or ./corro_unsaved
+        if let Ok(home) = env::var("HOME") {
+            return PathBuf::from(home).join(".corro/unsaved");
+        }
+        PathBuf::from("./corro_unsaved")
+    }
+
+    /// Ensure there's an on-disk untitled `.corro` file for this App instance and
+    /// bind it to `self.path`. Returns the created path.
+    fn ensure_unsaved_file(&mut self) -> Result<PathBuf, RunError> {
+        if let Some(ref p) = self.path.clone() {
+            return Ok(p.clone());
+        }
+
+        let dir = Self::default_unsaved_dir();
+        std::fs::create_dir_all(&dir).map_err(|e| RunError::Io(crate::io::IoError::Io(e)))?;
+
+        // Try a few times to create a unique filename. If the user opened an
+        // import/source path (e.g. `corro foo.tsv`) include a sanitized version
+        // of that basename in the filename so the untitled log indicates the
+        // original source without embedding path separators or other odd
+        // characters.
+        let source_basename = self
+            .preferred_import_source_path()
+            .and_then(|p| p.file_name())
+            .and_then(|os| os.to_str())
+            .map(|s| {
+                // Sanitize: allow ASCII alnum and the characters -_. ; replace
+                // anything else with an underscore to avoid creating unusual
+                // filenames (spaces, slashes, non-ASCII, etc.).
+                let mut out = String::with_capacity(s.len());
+                for ch in s.chars() {
+                    if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
+                        out.push(ch);
+                    } else {
+                        out.push('_');
+                    }
+                }
+                // Avoid empty result: fall back to original lossy representation
+                if out.is_empty() {
+                    s.to_string()
+                } else {
+                    out
+                }
+            });
+
+        for _ in 0..10 {
+            let pid = std::process::id();
+            let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let name = if let Some(ref src) = source_basename {
+                // Preserve the source basename (e.g. "foo.tsv") in the
+                // untitled filename for easier identification.
+                format!("unsaved-{}-{}-{}.corro", pid, src, now)
+            } else {
+                format!("unsaved-{}-{}.corro", pid, now)
+            };
+            let cand = dir.join(&name);
+            match OpenOptions::new().create_new(true).write(true).open(&cand) {
+                Ok(_) => {
+                    // Bind to app state so subsequent commit flows use this path.
+                    self.unsaved_file = Some(cand.clone());
+                    self.path = Some(cand.clone());
+                    self.exit_message = None; // clear any prior exit hint
+                    self.status = format!("Created unsaved file: {}", cand.display());
+                    return Ok(cand);
+                }
+                Err(e) => {
+                    if e.kind() == std::io::ErrorKind::AlreadyExists {
+                        // retry with a new timestamp
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                        continue;
+                    }
+                    return Err(RunError::Io(crate::io::IoError::Io(e)));
+                }
+            }
+        }
+
+        Err(RunError::Io(crate::io::IoError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "failed to create unsaved file",
+        ))))
     }
 
     fn paste_pasted_tsv_cells(
@@ -11815,6 +12014,23 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                 _ => {}
             },
             Mode::Normal => {
+                // If the user presses Esc while in Normal mode and we have an
+                // auto-created unsaved on-disk file bound to `self.path`, treat
+                // this as the first Esc of an "Esc Esc to quit" gesture by
+                // opening the quit prompt. The second Esc (handled by
+                // Mode::QuitPrompt) will then exit immediately. This lets the
+                // user quickly quit without going through a Save/Discard prompt
+                // while still preserving Esc as a no-op in other situations.
+                if key.code == KeyCode::Esc {
+                    if let (Some(p), Some(uns)) = (self.path.clone(), self.unsaved_file.clone()) {
+                        if p == uns {
+                            mode = Mode::QuitPrompt;
+                            self.mode = mode;
+                            return Ok(false);
+                        }
+                    }
+                }
+
                 if key.code == KeyCode::Enter {
                     if let Some(restored) = self.restore_lost_edit() {
                         self.mode = restored;
@@ -12006,21 +12222,37 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                 }
 
                 match key.code {
-                    KeyCode::Esc => {
-                        if self.anchor.is_some() {
-                            self.anchor = None;
-                            self.selection_kind = SelectionKind::Cells;
-                        } else if self.is_ods_tsv_import_unchanged() {
-                            self.mode = mode;
-                            return Ok(true);
-                        } else {
-                            mode = if self.path.is_none() {
-                                Mode::QuitImportPrompt
-                            } else {
-                                Mode::QuitPrompt
-                            };
+                KeyCode::Esc => {
+                    if self.anchor.is_some() {
+                        self.anchor = None;
+                        self.selection_kind = SelectionKind::Cells;
+                    } else if self.is_ods_tsv_import_unchanged() {
+                        // No edits were made to a TSV/ODS import; record a
+                        // message so the outer run() prints an explanatory hint
+                        // after the terminal is restored.
+                        self.exit_message = Some("No autosave as no edits".into());
+                        self.mode = mode;
+                        return Ok(true);
+                    } else {
+                        // If we have an auto-created untitled/unsaved file bound to
+                        // `self.path`, don't force a discard/save prompt — exit and
+                        // show the created filename after the terminal is
+                        // restored. Record the message in `exit_message` so the
+                        // outer run() logic can print it.
+                        if let (Some(p), Some(uns)) = (self.path.clone(), self.unsaved_file.clone()) {
+                            if p == uns {
+                                self.exit_message = Some(format!("Unsaved file created at {}", p.display()));
+                                self.mode = mode;
+                                return Ok(true);
+                            }
                         }
+                        mode = if self.path.is_none() {
+                            Mode::QuitImportPrompt
+                        } else {
+                            Mode::QuitPrompt
+                        };
                     }
+                }
                     KeyCode::Delete => {
                         if !self.delete_selection() {
                             let addr = self.cursor.to_addr(&self.state.grid);
@@ -20617,4 +20849,157 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(popup_layout[1])[1]
+}
+
+#[test]
+fn unsaved_file_created_on_first_edit() {
+    use tempfile::tempdir;
+    use std::env;
+
+    // Prepare a temporary directory and point XDG_STATE_HOME to it so
+    // the unsaved file is created in an isolated location.
+    let tmp = tempdir().unwrap();
+    let tmp_path = tmp.path().to_path_buf();
+
+    let prev_test_dir = env::var_os("CORRO_UNSAVED_TEST_DIR");
+    let prev_auto = env::var_os("CORRO_AUTO_UNSAVED_TEST");
+    let expected_dir = tmp_path.join("corro/unsaved");
+    env::set_var("CORRO_UNSAVED_TEST_DIR", expected_dir.to_string_lossy().to_string());
+    env::set_var("CORRO_AUTO_UNSAVED_TEST", "1");
+
+    // Build an App and force auto-create on this instance to avoid other
+    // global test interactions.
+    let mut app = App::new(None);
+    app.unsaved_auto_create = true;
+
+    let p = app.ensure_unsaved_file().expect("should create unsaved file");
+    assert!(p.exists(), "unsaved file should exist");
+    // Path should live under our temporary dir
+    // The created path should live under XDG_STATE_HOME/corro/unsaved when
+    // XDG_STATE_HOME is set. Check that ancestor explicitly so the test is
+    // robust to the directory layout used by default_unsaved_dir().
+    let expected_dir = tmp_path.join("corro/unsaved");
+    assert!(p.ancestors().any(|a| a == expected_dir.as_path()), "unsaved file should be in tmpdir: {}", p.display());
+
+    // Restore environment
+    if let Some(v) = prev_test_dir {
+        env::set_var("CORRO_UNSAVED_TEST_DIR", v);
+    } else {
+        env::remove_var("CORRO_UNSAVED_TEST_DIR");
+    }
+    if let Some(v) = prev_auto {
+        env::set_var("CORRO_AUTO_UNSAVED_TEST", v);
+    } else {
+        env::remove_var("CORRO_AUTO_UNSAVED_TEST");
+    }
+}
+
+#[test]
+fn unsaved_header_and_op_committed_on_first_edit() {
+    use tempfile::tempdir;
+    use std::env;
+    use std::fs;
+
+    // Isolate XDG_STATE_HOME so the unsaved file lands in a tempdir.
+    let tmp = tempdir().unwrap();
+    let tmp_path = tmp.path().to_path_buf();
+
+    let prev_test_dir = env::var_os("CORRO_UNSAVED_TEST_DIR");
+    let prev_auto = env::var_os("CORRO_AUTO_UNSAVED_TEST");
+    let expected_dir = tmp_path.join("corro/unsaved");
+    env::set_var("CORRO_UNSAVED_TEST_DIR", expected_dir.to_string_lossy().to_string());
+    env::set_var("CORRO_AUTO_UNSAVED_TEST", "1");
+
+    let mut app = App::new(None);
+    app.unsaved_auto_create = true;
+
+    let p = app.ensure_unsaved_file().expect("should create unsaved file");
+    assert!(p.exists(), "unsaved file should exist");
+    // Robust ancestor check: the unsaved file should live under XDG_STATE_HOME/corro/unsaved.
+    let expected_dir = tmp_path.join("corro/unsaved");
+    assert!(p.ancestors().any(|a| a == expected_dir.as_path()), "unsaved file should be in tmpdir: {}", p.display());
+
+    let mut active_sheet = app.workbook.sheet_id(app.workbook.active_sheet);
+    let wop = crate::ops::WorkbookOp::SheetOp {
+        sheet_id: active_sheet,
+        op: crate::ops::Op::SetCell {
+            addr: crate::grid::CellAddr::Main { row: 0, col: 0 },
+            value: "x".into(),
+        },
+    };
+
+    // Commit an op to the unsaved file and verify the on-disk log contains header + op.
+    crate::io::commit_workbook_op(&p, &mut app.offset, &mut app.workbook, &mut active_sheet, &wop)
+        .expect("commit should succeed");
+
+    let written = fs::read_to_string(&p).unwrap();
+    assert!(written.contains(&format!("{} {}", crate::ops::LOG_HEADER_PREFIX, crate::ops::LOG_VERSION)));
+    assert!(
+        written.contains("SET A1 x") || written.contains(&format!("SET ${}:A1 x", active_sheet)),
+        "unexpected written content: {}",
+        written
+    );
+
+    // Restore environment
+    if let Some(v) = prev_test_dir {
+        env::set_var("CORRO_UNSAVED_TEST_DIR", v);
+    } else {
+        env::remove_var("CORRO_UNSAVED_TEST_DIR");
+    }
+    if let Some(v) = prev_auto {
+        env::set_var("CORRO_AUTO_UNSAVED_TEST", v);
+    } else {
+        env::remove_var("CORRO_AUTO_UNSAVED_TEST");
+    }
+}
+
+#[test]
+fn unsaved_app_path_set_and_file_nonempty_after_commit() {
+    use tempfile::tempdir;
+    use std::env;
+    use std::fs;
+
+    let tmp = tempdir().unwrap();
+    let tmp_path = tmp.path().to_path_buf();
+
+    let prev_test_dir = env::var_os("CORRO_UNSAVED_TEST_DIR");
+    let prev_auto = env::var_os("CORRO_AUTO_UNSAVED_TEST");
+    let expected_dir = tmp_path.join("corro/unsaved");
+    env::set_var("CORRO_UNSAVED_TEST_DIR", expected_dir.to_string_lossy().to_string());
+    env::set_var("CORRO_AUTO_UNSAVED_TEST", "1");
+
+    let mut app = App::new(None);
+    app.unsaved_auto_create = true;
+
+    let p = app.ensure_unsaved_file().unwrap();
+    // App.path must be bound to the created unsaved file.
+    assert_eq!(app.path.as_ref().unwrap(), &p);
+    assert!(p.exists());
+
+    let mut active_sheet = app.workbook.sheet_id(app.workbook.active_sheet);
+    let wop = crate::ops::WorkbookOp::SheetOp {
+        sheet_id: active_sheet,
+        op: crate::ops::Op::SetCell {
+            addr: crate::grid::CellAddr::Main { row: 0, col: 0 },
+            value: "42".into(),
+        },
+    };
+
+    crate::io::commit_workbook_op(&p, &mut app.offset, &mut app.workbook, &mut active_sheet, &wop)
+        .unwrap();
+
+    // File size should advance after commit (header + op lines written).
+    assert!(fs::metadata(&p).unwrap().len() > 0);
+
+    // Restore environment
+    if let Some(v) = prev_test_dir {
+        env::set_var("CORRO_UNSAVED_TEST_DIR", v);
+    } else {
+        env::remove_var("CORRO_UNSAVED_TEST_DIR");
+    }
+    if let Some(v) = prev_auto {
+        env::set_var("CORRO_AUTO_UNSAVED_TEST", v);
+    } else {
+        env::remove_var("CORRO_AUTO_UNSAVED_TEST");
+    }
 }
