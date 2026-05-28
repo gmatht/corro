@@ -1442,8 +1442,41 @@ fn templated_formula(grid: &Grid, addr: &CellAddr) -> Option<String> {
         row: (HEADER_ROWS - 1) as u32,
         col: (MARGIN_COLS as u32) + *col,
     };
-    if let Some(expr) = control_formula_expr(grid, &header_addr) {
-        return Some(format!("={}", rewrite_header_template(&expr, *row)));
+    // Avoid treating margin-aggregate directives (e.g. `=TOTAL`, `==SUM`) as
+    // header templates. If the raw header text is an aggregate key, skip
+    // templating here so aggregate semantics remain intact.
+    if let Some(raw) = grid.get(&header_addr) {
+        if crate::ops::margin_key_agg_func(&raw).is_none() {
+            if let Some(expr) = control_formula_expr(grid, &header_addr) {
+                return Some(format!("={}", rewrite_header_template(&expr, *row)));
+            }
+        }
+    }
+
+    // Also support header templates placed in the right margin. A right-margin
+    // header cell immediately to the right of the main block (]A) maps to the
+    // last main column, the next (]B) to the second-last, etc. This lets users
+    // put a control formula like `=B` in a right-margin header (e.g. `]A~1`) and
+    // have it act as a per-row template for the corresponding main column.
+    let mc = grid.main_cols() as u32;
+    if mc > 0 {
+        // col is the 0-based main-column index; compute the right-margin index
+        // that sits adjacent to that main column.
+        if *col <= mc.saturating_sub(1) {
+            let rmi = mc.saturating_sub(1).saturating_sub(*col);
+            let right_header_col = (MARGIN_COLS as u32) + mc + rmi;
+            let right_header_addr = CellAddr::Header {
+                row: (HEADER_ROWS - 1) as u32,
+                col: right_header_col,
+            };
+            if let Some(raw) = grid.get(&right_header_addr) {
+                if crate::ops::margin_key_agg_func(&raw).is_none() {
+                    if let Some(expr) = control_formula_expr(grid, &right_header_addr) {
+                        return Some(format!("={}", rewrite_header_template(&expr, *row)));
+                    }
+                }
+            }
+        }
     }
 
     let left_addr = CellAddr::Left {
@@ -3180,6 +3213,41 @@ mod tests {
             translate_formula_text("=$A$1+B2", &ctx).expect("translate"),
             "=($A$1+B1)"
         );
+    }
+
+    #[test]
+    fn right_margin_header_template_applies_to_adjacent_main_col() {
+        // Create a grid with multiple main columns so right-margin headers exist.
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(2, 3));
+        let mc = g.main_cols();
+        // Right-margin column immediately to the right of main block (]A)
+        let right_a = (MARGIN_COLS + mc) as u32;
+        let header_addr_a = CellAddr::Header {
+            row: (HEADER_ROWS - 1) as u32,
+            col: right_a,
+        };
+        g.set(&header_addr_a, "=B".into());
+
+        // The ]A header maps to the last main column (mc-1). For main row 0,
+        // the templated formula should become "=B1".
+        let main_addr = CellAddr::Main {
+            row: 0,
+            col: (mc - 1) as u32,
+        };
+        assert_eq!(templated_formula(&g, &main_addr), Some("=B1".into()));
+
+        // ]B (next right-margin) maps to second-last main column.
+        let right_b = (MARGIN_COLS + mc + 1) as u32;
+        let header_addr_b = CellAddr::Header {
+            row: (HEADER_ROWS - 1) as u32,
+            col: right_b,
+        };
+        g.set(&header_addr_b, "=C".into());
+        let main_addr_b = CellAddr::Main {
+            row: 0,
+            col: (mc - 2) as u32,
+        };
+        assert_eq!(templated_formula(&g, &main_addr_b), Some("=C1".into()));
     }
 
     #[test]

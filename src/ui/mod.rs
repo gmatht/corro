@@ -4,6 +4,7 @@ use crate::addr::{self, parse_cell_ref_at, parse_sheet_id_prefix_at};
 use crate::agg::{cell_display, compute_aggregate};
 use crate::balance::{self, BalanceDirection};
 use crate::export;
+mod debug_instrumentation;
 use crate::formula::translate_formula_text_by_offset;
 use crate::formula::{
     cell_effective_display, effective_numeric, exact_decimal_generic_scientific,
@@ -3482,8 +3483,43 @@ impl App {
     fn commit_active_sheet_cache(&mut self) {
         self.workbook.ensure_active_sheet();
         if let Some(idx) = self.workbook.sheet_index_by_id(self.view_sheet_id) {
+            // Debug instrumentation: log the workbook's stored main_cols before
+            // and after we replace the sheet state so we can detect races where
+            // the UI's in-memory grid differs from the persisted workbook
+            // snapshot used for serialization.
+            #[cfg(debug_assertions)]
+            {
+                let before = self.workbook.sheets[idx].state.grid.main_cols();
+                let after = self.state.grid.main_cols();
+                let msg = format!(
+                    "DEBUG commit_active_sheet_cache: sheet_id={} before_main_cols={} after_main_cols={}",
+                    self.view_sheet_id, before, after
+                );
+                crate::debug_log::log(&msg);
+                eprintln!("{}", msg);
+            }
             self.workbook.active_sheet = idx;
             self.workbook.sheets[idx].state = self.state.clone();
+        } else {
+            // If we couldn't find a matching sheet id, emit a debug trace with
+            // the current workbook sheet ids so we can correlate why the
+            // in-memory view_sheet_id does not map to a persisted sheet.
+            #[cfg(debug_assertions)]
+            {
+                let ids: Vec<String> = self
+                    .workbook
+                    .sheets
+                    .iter()
+                    .map(|s| format!("id={} main_cols={}", s.id, s.state.grid.main_cols()))
+                    .collect();
+                let msg = format!(
+                    "DEBUG commit_active_sheet_cache: sheet_index_by_id({}) not found; workbook_sheets=[{}]",
+                    self.view_sheet_id,
+                    ids.join(", ")
+                );
+                crate::debug_log::log(&msg);
+                eprintln!("{}", msg);
+            }
         }
     }
 
@@ -4731,10 +4767,15 @@ impl App {
         // Debug: trace edit commits to help diagnose mis-parsed gutter addresses
         #[cfg(debug_assertions)]
         {
-            crate::debug_log::log(&format!(
+            let dbg = format!(
                 "DEBUG commit_edit_buffer: buffer={:?} explicit_addr={:?} edit_target_addr={:?} edit_range_addrs={:?}",
                 buffer, explicit_addr, self.edit_target_addr, range
-            ));
+            );
+            // Write to the debug log (if configured) and also print to stderr so
+            // test runs with --nocapture show the trace without relying on
+            // external files.
+            crate::debug_log::log(&dbg);
+            eprintln!("{}", dbg);
         }
 
         if let Some(ref addrs) = range {
@@ -4826,10 +4867,86 @@ impl App {
             addr: addr.clone(),
             value,
         };
+        // Emit a debug trace for SetCell construction so we can correlate
+        // the UI's addr/main_cols with the workbook snapshot used when
+        // serializing the committed line.
+        #[cfg(debug_assertions)]
+        {
+            // Emit pre/post sync diagnostics so we can see whether the
+            // active-sheet cache sync actually updated the workbook snapshot
+            // visible here. This helps narrow whether the mismatch between
+            // UI main_cols and workbook main_cols is due to a missed sync or
+            // some other clone/visibility issue.
+            let pre_ui_mc = self.state.grid.main_cols();
+            let pre_wb_ids: Vec<String> = self
+                .workbook
+                .sheets
+                .iter()
+                .map(|s| format!("id={} main_cols={}", s.id, s.state.grid.main_cols()))
+                .collect();
+            let pre_idx = self.workbook.sheet_index_by_id(self.view_sheet_id);
+            let pre_msg = format!(
+                "DEBUG SetCell pre-sync: view_sheet_id={} workbook_active_index={} workbook_sheets=[{}] ui_main_cols={}",
+                self.view_sheet_id,
+                self.workbook.active_sheet,
+                pre_wb_ids.join(", "),
+                pre_ui_mc
+            );
+            crate::debug_log::log(&pre_msg);
+            eprintln!("{}", pre_msg);
+
+            // Sync the active sheet cache into the workbook so commit-time
+            // serialization can observe the UI's current dimensions.
+            self.commit_active_sheet_cache();
+
+            let dbg_addr = addr.clone();
+            let dbg_ui_mc = self.state.grid.main_cols();
+            let dbg_wb_mc = self
+                .workbook
+                .sheets
+                .iter()
+                .find(|s| s.id == self.view_sheet_id)
+                .map(|s| s.state.grid.main_cols())
+                .unwrap_or(0);
+            let post_wb_ids: Vec<String> = self
+                .workbook
+                .sheets
+                .iter()
+                .map(|s| format!("id={} main_cols={}", s.id, s.state.grid.main_cols()))
+                .collect();
+            let post_msg = format!(
+                "DEBUG SetCell post-sync: view_sheet_id={} workbook_active_index={} workbook_sheets=[{}] ui_main_cols={} workbook_main_cols={}",
+                self.view_sheet_id,
+                self.workbook.active_sheet,
+                post_wb_ids.join(", "),
+                dbg_ui_mc,
+                dbg_wb_mc
+            );
+            crate::debug_log::log(&post_msg);
+            eprintln!("{}", post_msg);
+            debug_instrumentation::trace_setcell_construction(&addr, dbg_ui_mc, dbg_wb_mc);
+        }
         // Use apply_single_op which will push the inverse op and then either
         // apply in-memory or commit to disk (auto-creating an unsaved file if
         // configured).
         self.apply_single_op(op)?;
+        #[cfg(debug_assertions)]
+        {
+            let msg = format!(
+                "DEBUG commit_edit_buffer after apply_single_op: path={:?} unsaved_file={:?} view_sheet_id={} workbook_sheets=[{}]",
+                self.path,
+                self.unsaved_file,
+                self.view_sheet_id,
+                self.workbook
+                    .sheets
+                    .iter()
+                    .map(|s| format!("id={} main_cols={}", s.id, s.state.grid.main_cols()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            crate::debug_log::log(&msg);
+            eprintln!("{}", msg);
+        }
         if let Some((explicit_addr, _)) = explicit_addr {
             self.cursor = self
                 .sheet_cursor_for_addr(&explicit_addr)
@@ -7230,12 +7347,33 @@ impl App {
         // unsaved per-user file on first edit, ensure it's created and bound
         // to `self.path`. This lets the existing on-disk append/tail-apply and
         // LogWatcher logic operate unchanged.
+        #[cfg(debug_assertions)]
+        {
+            let msg = format!(
+                "DEBUG apply_op_without_history entry: path={:?} unsaved_auto_create={}",
+                self.path, self.unsaved_auto_create
+            );
+            crate::debug_log::log(&msg);
+            eprintln!("{}", msg);
+        }
         if self.path.is_none() && self.unsaved_auto_create {
             // ignore errors here and propagate as RunError if creation fails
             let _ = self.ensure_unsaved_file()?;
+            #[cfg(debug_assertions)]
+            {
+                let msg = format!("DEBUG ensure_unsaved_file set path={:?}", self.path);
+                crate::debug_log::log(&msg);
+                eprintln!("{}", msg);
+            }
         }
 
         if let Some(ref p) = self.path.clone() {
+            #[cfg(debug_assertions)]
+            {
+                let msg = format!("DEBUG apply_op_without_history: committing to path={:?}", p);
+                crate::debug_log::log(&msg);
+                eprintln!("{}", msg);
+            }
             // Ensure the in-memory active sheet cache is persisted into
             // `self.workbook` so commit_workbook_op can observe the current
             // main_cols when serializing addresses. This prevents stale
@@ -7256,21 +7394,35 @@ impl App {
             )?;
             #[cfg(debug_assertions)]
             {
-                // In debug builds, also emit a trace showing the main_cols
-                // chosen for serialization and the in-memory grid main_cols so
-                // we can correlate the UI and workbook snapshots when
-                // diagnosing address-serialization mismatches.
-                crate::debug_log::log(&format!(
+                // Emit the same diagnostic both to the configured debug log and
+                // to stderr so test runs with --nocapture show the trace.
+                let wb_mc = self
+                    .workbook
+                    .sheets
+                    .iter()
+                    .find(|s| s.id == self.view_sheet_id)
+                    .map(|s| s.state.grid.main_cols())
+                    .unwrap_or(0);
+                let msg = format!(
                     "DEBUG apply_op_without_history: view_sheet_id={} ui_main_cols={} workbook_main_cols={}",
                     self.view_sheet_id,
                     self.state.grid.main_cols(),
-                    self.workbook
-                        .sheets
-                        .iter()
-                        .find(|s| s.id == self.view_sheet_id)
-                        .map(|s| s.state.grid.main_cols())
-                        .unwrap_or(0)
-                ));
+                    wb_mc
+                );
+                crate::debug_log::log(&msg);
+                eprintln!("{}", msg);
+                // Also print the list of sheets and their main_cols to help
+                // diagnose which workbook record (if any) is out-of-sync.
+                for s in &self.workbook.sheets {
+                    let s_msg = format!(
+                        "DEBUG workbook sheet: id={} title={} main_cols={}",
+                        s.id,
+                        s.title,
+                        s.state.grid.main_cols()
+                    );
+                    crate::debug_log::log(&s_msg);
+                    eprintln!("{}", s_msg);
+                }
             }
             self.ops_applied = self.ops_applied.saturating_add(1);
             self.sync_active_sheet_cache();
@@ -7425,8 +7577,17 @@ impl App {
                 format!("unsaved-{}-{}.corro", pid, now)
             };
             let cand = dir.join(&name);
-            match OpenOptions::new().create_new(true).write(true).open(&cand) {
-                Ok(_) => {
+                    match OpenOptions::new().create_new(true).write(true).open(&cand) {
+                        Ok(_) => {
+                            #[cfg(debug_assertions)]
+                            {
+                                let msg = format!(
+                                    "DEBUG ensure_unsaved_file: creating unsaved file candidate={}",
+                                    cand.display()
+                                );
+                                crate::debug_log::log(&msg);
+                                eprintln!("{}", msg);
+                            }
                     // When creating an untitled on-disk .corro from a linked
                     // external source, record the log header and LINK entries
                     // so a full reload of the file reconstructs the linked
@@ -7453,6 +7614,12 @@ impl App {
                     // bind to app state so subsequent commit flows use this path.
                     std::fs::write(&cand, initial.as_bytes())
                         .map_err(|e| RunError::Io(crate::io::IoError::Io(e)))?;
+                    #[cfg(debug_assertions)]
+                    {
+                        let msg = format!("DEBUG ensure_unsaved_file: wrote header to {:?}", cand);
+                        crate::debug_log::log(&msg);
+                        eprintln!("{}", msg);
+                    }
                     self.unsaved_file = Some(cand.clone());
                     self.path = Some(cand.clone());
                     self.exit_message = None; // clear any prior exit hint
@@ -13330,6 +13497,130 @@ mod tests {
 
         assert_eq!(app.state.grid.get(&CellAddr::Main { row: 3, col: 0 }).as_deref(), Some("A"));
         assert_eq!(app.state.grid.get(&CellAddr::Main { row: 4, col: 0 }).as_deref(), Some("B"));
+    }
+
+    #[test]
+    fn edit_right_margin_header_commits_to_header() {
+        // Simulate editing the bottom header row in the right margin (]A) and
+        // ensure the committed value lands in the header cell, not in a main
+        // column.
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(2, 3);
+        let mc = app.state.grid.main_cols();
+        let right_a_global = MARGIN_COLS + mc; // global column index for ]A
+
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS - 1,
+            col: right_a_global,
+        };
+
+        // Commit as if the user edited the cell and typed `=B`.
+        app.commit_edit_buffer("=B").unwrap();
+
+        let header_addr = CellAddr::Header {
+            row: (HEADER_ROWS - 1) as u32,
+            col: right_a_global as u32,
+        };
+        assert_eq!(app.state.grid.get(&header_addr).as_deref(), Some("=B"));
+
+        // The last main column should remain empty (we didn't write to main).
+        let main_addr = CellAddr::Main { row: 0, col: (mc - 1) as u32 };
+        assert_eq!(app.state.grid.get(&main_addr).as_deref().unwrap_or(""), "");
+    }
+
+    #[test]
+    fn ui_edit_right_margin_header_via_start_edit_mode_commits_to_header() {
+        // This test reproduces the UI flow where the cursor highlights a
+        // right-margin header cell, edit mode is started (so edit_target_addr
+        // is set), the user types `=B`, and commits. The final SetCell should
+        // target the header cell (not a main column cell).
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(2, 3);
+        let mc = app.state.grid.main_cols();
+        let right_a_global = MARGIN_COLS + mc; // global column for ]A
+
+        // Place the cursor on the bottom header row at the right-margin column
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS - 1,
+            col: right_a_global,
+        };
+
+        // Start edit mode as the UI would when typing into the highlighted
+        // header cell (this sets edit_target_addr based on the cursor).
+        app.mode = app.start_edit_mode(String::new(), None, None, false, false, None);
+        // Sanity: edit_target_addr should match the header cell.
+        let expected_header_addr = CellAddr::Header {
+            row: (HEADER_ROWS - 1) as u32,
+            col: right_a_global as u32,
+        };
+        assert_eq!(app.edit_target_addr, Some(expected_header_addr.clone()));
+
+        // Commit the edit buffer like the user typed `=B`.
+        app.commit_edit_buffer("=B").unwrap();
+
+        // Check the header cell stored the value.
+        assert_eq!(app.state.grid.get(&expected_header_addr).as_deref(), Some("=B"));
+
+        // Ensure no main-column cell (the adjacent last main col) got the value.
+        let last_main_addr = CellAddr::Main { row: 0, col: (mc - 1) as u32 };
+        assert_ne!(app.state.grid.get(&last_main_addr).as_deref(), Some("=B"));
+    }
+
+    #[test]
+    fn repro_open_tsv_then_navigate_and_edit_right_margin_header() {
+        // Simulate the user sequence: open a TSV, move Up into the header band,
+        // navigate Right until the first right-margin header (]A~1), start
+        // edit mode and commit `=B`. Ensure the header cell is written, not a
+        // main-column cell.
+        // Ensure debug logging inside the test process goes to a known file so
+        // instrumentation in commit_edit_buffer / commit_workbook_op can be
+        // observed during test runs.
+        let _ = std::env::set_var("CORRO_DEBUG_LOG", "/tmp/corro-debug.log");
+
+        let tmpdir = tempfile::tempdir().unwrap();
+        let tsv = tmpdir.path().join("tmp.tsv");
+        // Create a small TSV with 4 main columns so the right-margin is reachable
+        // by a few Right key presses.
+        std::fs::write(&tsv, "a\tb\tc\td\n1\t2\t3\t4\n").unwrap();
+
+        let mut app = App::new(Some(tsv.clone()));
+        // Create an on-disk unsaved file for this test so commit_workbook_op
+        // is exercised and we can capture the append/serialization debug
+        // traces. Use a temp dir to avoid polluting global state.
+        let _ = std::env::set_var(
+            "CORRO_UNSAVED_TEST_DIR",
+            tmpdir.path().to_string_lossy().as_ref(),
+        );
+        app.unsaved_auto_create = true;
+        app.load_initial().unwrap();
+
+        // Move into the header band.
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::empty())).unwrap();
+
+        let mc = app.state.grid.main_cols();
+        let target_global = MARGIN_COLS + mc; // first right-margin global column (]A)
+
+        // Press Right until we reach the right-margin header column.
+        while app.cursor.col < target_global {
+            app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::empty())).unwrap();
+        }
+
+        // Sanity: cursor should be on the bottom header row
+        assert_eq!(app.cursor.row, HEADER_ROWS - 1);
+
+        // Start edit mode on the highlighted header and commit `=B`.
+        app.mode = app.start_edit_mode(String::new(), None, None, false, false, None);
+        app.commit_edit_buffer("=B").unwrap();
+
+        let header_addr = CellAddr::Header {
+            row: (HEADER_ROWS - 1) as u32,
+            col: target_global as u32,
+        };
+        assert_eq!(app.state.grid.get(&header_addr).as_deref(), Some("=B"));
+
+        // Ensure we didn't accidentally write into the adjacent last main column.
+        let last_main_addr = CellAddr::Main { row: 0, col: (mc - 1) as u32 };
+        assert_ne!(app.state.grid.get(&last_main_addr).as_deref(), Some("=B"));
     }
 
     #[test]

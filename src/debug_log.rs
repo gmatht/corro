@@ -20,3 +20,23 @@ pub fn log(msg: &str) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn debug_log_writes_when_env_set() {
+        let path = "/tmp/corro-debug.log";
+        // Clean up any existing file; ignore errors
+        let _ = fs::remove_file(path);
+        // Ensure the env var is set for this test process
+        std::env::set_var("CORRO_DEBUG_LOG", path);
+        log("TEST debug log entry");
+        let content = fs::read_to_string(path).expect("debug log file was not created");
+        assert!(content.contains("TEST debug log entry"));
+        // Cleanup
+        let _ = fs::remove_file(path);
+    }
+}

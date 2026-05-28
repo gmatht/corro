@@ -664,6 +664,19 @@ impl Grid {
     pub fn set_main_size(&mut self, main_rows: usize, main_cols: usize) {
         let old_main_cols = self.extent_main_cols as usize;
         let new_main_cols = main_cols.max(1);
+
+        // Debug: surface main-cols resize events in tests (and when CORRO_DEBUG_LOG is enabled).
+        // Use crate::debug_log::log plus stderr so --nocapture test runs show the same traces.
+        #[cfg(debug_assertions)]
+        {
+            let pre = format!(
+                "DEBUG Grid::set_main_size: called main_rows={} main_cols={} old_main_cols={}",
+                main_rows, main_cols, old_main_cols
+            );
+            crate::debug_log::log(&pre);
+            eprintln!("{}", pre);
+        }
+
         self.remap_main_col_layout_for_resize(old_main_cols, new_main_cols);
         self.remap_formats_for_resize(old_main_cols, new_main_cols);
         self.extent_main_rows = main_rows.max(1) as u32;
@@ -674,6 +687,16 @@ impl Grid {
         self.right.retain(|&(r, _), _| r < self.extent_main_rows);
         self.resize_header_footer_width();
         self.mark_spills_stale();
+
+        #[cfg(debug_assertions)]
+        {
+            let post = format!(
+                "DEBUG Grid::set_main_size: finished old_main_cols={} new_main_cols={} extent_main_cols={}",
+                old_main_cols, new_main_cols, self.extent_main_cols
+            );
+            crate::debug_log::log(&post);
+            eprintln!("{}", post);
+        }
     }
 
     pub fn col_width(&self, global_col: usize) -> usize {

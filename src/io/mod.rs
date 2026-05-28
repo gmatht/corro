@@ -345,34 +345,42 @@ pub fn commit_workbook_op(
     let main_cols = pre_main_cols.unwrap_or(preview_main_cols);
     let omit_sheet1_prefix = workbook.sheet_count() == 1;
     // Debug: show the lines we will append when running in debug builds.
-    #[cfg(debug_assertions)]
-    {
-        // In debug builds write the same diagnostic traces to the debug log
-        // via stderr (which the binary redirects to CORRO_DEBUG_LOG or the
-        // XDG state debug.log path on startup). Avoid writing debug text to
-        // the TUI: stderr is redirected to a file at process start.
-        // Write contextual debug lines to the debug log
-        crate::debug_log::log(&format!(
-            "DEBUG commit_workbook_op: pre_main_cols={:?} preview_main_cols={} chosen_main_cols={} omit_sheet1_prefix={}",
-            pre_main_cols, preview_main_cols, main_cols, omit_sheet1_prefix
-        ));
-        if let WorkbookOp::SheetOp { sheet_id, op: inner_op } = op {
-            crate::debug_log::log(&format!(
-                "DEBUG commit_workbook_op: sheet_id={} inner_op={:?}",
-                sheet_id, inner_op
-            ));
+        #[cfg(debug_assertions)]
+        {
+            // In debug builds write the same diagnostic traces to both the debug
+            // log (configurable via CORRO_DEBUG_LOG) and to stderr so tests run
+            // with --nocapture show the same information. This helps correlate
+            // the UI state with what gets serialized to disk.
+            let pre = format!(
+                "DEBUG commit_workbook_op: pre_main_cols={:?} preview_main_cols={} chosen_main_cols={} omit_sheet1_prefix={}",
+                pre_main_cols, preview_main_cols, main_cols, omit_sheet1_prefix
+            );
+            crate::debug_log::log(&pre);
+            eprintln!("{}", pre);
+            if let WorkbookOp::SheetOp { sheet_id, op: inner_op } = op {
+                let inner = format!("DEBUG commit_workbook_op: sheet_id={} inner_op={:?}", sheet_id, inner_op);
+                crate::debug_log::log(&inner);
+                eprintln!("{}", inner);
+            }
+            for line in op.to_log_lines_with_policy(main_cols, omit_sheet1_prefix) {
+                let append_msg = format!("DEBUG commit_workbook_op append: workbook_op={:?} -> line={}", op, line);
+                crate::debug_log::log(&append_msg);
+                eprintln!("{}", append_msg);
+                append_line(path, &line)?;
+            }
         }
-        for line in op.to_log_lines_with_policy(main_cols, omit_sheet1_prefix) {
-            crate::debug_log::log(&format!(
-                "DEBUG commit_workbook_op append: workbook_op={:?} -> line={}",
-                op, line
-            ));
-            append_line(path, &line)?;
-        }
-    }
     #[cfg(not(debug_assertions))]
     {
         for line in op.to_log_lines_with_policy(main_cols, omit_sheet1_prefix) {
+            #[cfg(debug_assertions)]
+            {
+                let append_msg = format!(
+                    "DEBUG commit_workbook_op append (non-debug-branch): workbook_op={:?} -> line={}",
+                    op, line
+                );
+                crate::debug_log::log(&append_msg);
+                eprintln!("{}", append_msg);
+            }
             append_line(path, &line)?;
         }
     }
