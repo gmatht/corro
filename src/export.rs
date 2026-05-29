@@ -1074,28 +1074,91 @@ fn delimited_table_col_span_and_rows(
     let total_rows = hr + mr + fr;
 
     let (col_start, mut col_end) = if include_margins {
+        // Preserve ascii_col_bounds when including margins: allow left-margin,
+        // main block, and any right-margin columns that contain content. The
+        // ascii_col_bounds helper already trims leading/trailing empty margin
+        // columns; do not override its result here.
         ascii_col_bounds(grid)
     } else {
         (lm, lm + mc)
     };
-    if include_margins {
-        col_end = col_end.max(lm + mc);
-    }
     let main_spans = main_row_index_bounds_for_export(grid);
-    let rows: Vec<usize> = row_order(grid, total_rows)
-        .into_iter()
-        .filter(|&r| {
-            if grid.logical_row_has_content(r) {
-                return true;
-            }
-            if let Some((mmin, mmax)) = main_spans {
-                if r >= hr + mmin && r <= hr + mmax {
-                    return true;
+
+    // For delimited export we prefer rows that matter to the main data block and
+    // file consumers: header rows, main rows that have main/right content, and
+    // explicit footer rows. Rows that only contain left-margin labels (annotations)
+    // are UI-only and historically not included in TSV/CSV output; filter them
+    // out here while still preserving contiguous main ranges when `main_spans`
+    // forces them to exist.
+    let mut rows: Vec<usize> = Vec::new();
+    for r in row_order(grid, total_rows) {
+        let mut include = false;
+        if r < hr {
+            // header band: include if any header cell exists for this logical row
+            for (addr, _) in grid.iter_nonempty() {
+                match addr {
+                    CellAddr::Header { row, .. } if row as usize == r => {
+                        include = true;
+                        break;
+                    }
+                    _ => {}
                 }
             }
-            false
-        })
-        .collect();
+        } else if r < hr + mr {
+            // main band: include if any Main or Right cell exists for this main row
+            let main_row = (r - hr) as u32;
+            for (addr, _) in grid.iter_nonempty() {
+                match addr {
+                    CellAddr::Main { row, .. } if row == main_row => {
+                        include = true;
+                        break;
+                    }
+                    CellAddr::Right { row, .. } if row == main_row => {
+                        include = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            // If not present but the main spans force inclusion, include it.
+            if !include {
+                if let Some((mmin, mmax)) = main_spans {
+                    let mr_idx = r - hr;
+                    if mr_idx >= mmin && mr_idx <= mmax {
+                        include = true;
+                    }
+                }
+            }
+            // Include left-margin *aggregate* rows even when they have no Main/Right
+            // cells: a left-margin cell like `=TOTAL` marks a subtotal row that must
+            // appear in delimited Generic exports. Detect that via the ODS helper
+            // that recognizes margin aggregate labels.
+            if !include {
+                let left_raw = grid.text(&CellAddr::Left {
+                    col: MARGIN_COLS - 1,
+                    row: main_row,
+                });
+                if crate::ods::subtotal_code_for_label(&left_raw).is_some() {
+                    include = true;
+                }
+            }
+        } else {
+            // footer band: include if any Footer cell exists for this footer row
+            let fr_idx = (r - hr - mr) as u32;
+            for (addr, _) in grid.iter_nonempty() {
+                match addr {
+                    CellAddr::Footer { row, .. } if row == fr_idx => {
+                        include = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if include {
+            rows.push(r);
+        }
+    }
     (col_start, col_end, rows)
 }
 
@@ -1373,9 +1436,12 @@ fn main_row_index_bounds_for_export(grid: &Grid) -> Option<(usize, usize)> {
     let mut set = HashSet::new();
     for (addr, _) in grid.iter_nonempty() {
         match addr {
-            CellAddr::Main { row, .. }
-            | CellAddr::Left { row, .. }
-            | CellAddr::Right { row, .. } => {
+            // Only consider main-block and right-margin cells when deciding the
+            // contiguous main-row span for exports. Left-margin-only entries are
+            // labels/annotations and should not by themselves extend the exported
+            // main-row range (they remain visible in exported rows when paired
+            // with main/right content via the filter below).
+            CellAddr::Main { row, .. } | CellAddr::Right { row, .. } => {
                 set.insert(row as usize);
             }
             _ => {}
@@ -1528,6 +1594,10 @@ mod tests {
         let mut current = String::new();
         let mut in_quotes = false;
         let mut chars = line.chars().peekable();
+        // Only treat double-quotes as quoting syntax for CSV (comma) output.
+        // For other delimiters (e.g. TSV) quotes are literal characters and
+        // should not change parsing behavior.
+        let use_quotes = delim == ',';
 
         while let Some(ch) = chars.next() {
             if in_quotes {
@@ -1541,7 +1611,7 @@ mod tests {
                 } else {
                     current.push(ch);
                 }
-            } else if ch == '"' {
+            } else if use_quotes && ch == '"' {
                 in_quotes = true;
             } else if ch == delim {
                 fields.push(current.clone());

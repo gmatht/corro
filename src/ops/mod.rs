@@ -127,6 +127,7 @@ pub struct LinkedSource {
     pub path: PathBuf,
     pub kind: LinkedSourceKind,
     pub ods_sheet_name: Option<String>,
+    pub corrotitle: Option<String>,
 }
 
 impl WorkbookState {
@@ -468,6 +469,18 @@ pub fn load_linked_sheet_state(source: &LinkedSource) -> Result<SheetState, std:
             }
         }
     }
+}
+
+// Derive a sensible Corro sheet title from a linked source when the
+// persisted LINK entry doesn't include an explicit Corro title.
+pub fn derive_title_from_source(src: &LinkedSource) -> String {
+    if let Some(ref s) = src.ods_sheet_name {
+        return s.clone();
+    }
+    if let Some(stem) = src.path.file_stem().and_then(|s| s.to_str()) {
+        return stem.to_string();
+    }
+    "Sheet1".to_string()
 }
 
 #[derive(Clone, Debug)]
@@ -1596,14 +1609,15 @@ impl WorkbookOp {
             WorkbookOp::NewSheet { id, title } => format!("${id}:NEW_SHEET {title}"),
             WorkbookOp::LinkSheet { id, source } => {
                 let path = source.path.to_string_lossy();
-                match &source.ods_sheet_name {
-                    Some(sheet_name) => format!(
-                        "${id}:LINK {} {} {}",
-                        linked_source_kind_text(&source.kind),
-                        path,
-                        sheet_name
-                    ),
-                    None => format!("${id}:LINK {} {}", linked_source_kind_text(&source.kind), path),
+                let kind_text = linked_source_kind_text(&source.kind);
+                match (&source.ods_sheet_name, &source.corrotitle) {
+                    (Some(sheet_name), Some(ct)) =>
+                        format!("${id}:LINK {} {} {} | {}", kind_text, path, sheet_name, ct),
+                    (Some(sheet_name), None) =>
+                        format!("${id}:LINK {} {} {}", kind_text, path, sheet_name),
+                    (None, Some(ct)) =>
+                        format!("${id}:LINK {} {} | {}", kind_text, path, ct),
+                    (None, None) => format!("${id}:LINK {} {}", kind_text, path),
                 }
             }
             WorkbookOp::CopySheet {
@@ -1832,9 +1846,22 @@ pub fn parse_workbook_line(line: &str) -> Result<WorkbookOp, std::io::Error> {
         "LINK" => {
             let kind = parts.next().ok_or_else(|| bad("bad link line"))?;
             let path = parts.next().ok_or_else(|| bad("bad link line"))?;
-            let ods_sheet_name = {
-                let rest = parts.collect::<Vec<_>>().join(" ");
-                if rest.is_empty() { None } else { Some(rest) }
+            // The remainder may be either the old optional ODS sheet name or
+            // a new form that includes a ` | ` separator to carry the Corro
+            // sheet title: "[ODS_SHEET] | Corro Title". Accept both forms
+            // with a single parsing path.
+            let raw_rest = parts.collect::<Vec<_>>().join(" ");
+            let rest = raw_rest.trim();
+            let (ods_sheet_name, corrotitle) = if rest.is_empty() {
+                (None, None)
+            } else if let Some((left, right)) = rest.split_once(" | ") {
+                let left = left.trim();
+                let right = right.trim();
+                let ods = if left.is_empty() { None } else { Some(left.to_string()) };
+                let ct = if right.is_empty() { None } else { Some(right.to_string()) };
+                (ods, ct)
+            } else {
+                (Some(rest.to_string()), None)
             };
             Ok(WorkbookOp::LinkSheet {
                 id: sheet_id,
@@ -1842,6 +1869,7 @@ pub fn parse_workbook_line(line: &str) -> Result<WorkbookOp, std::io::Error> {
                     path: PathBuf::from(path),
                     kind: parse_linked_source_kind(kind).ok_or_else(|| bad("bad link line"))?,
                     ods_sheet_name,
+                    corrotitle,
                 },
             })
         }
@@ -1980,16 +2008,21 @@ pub fn apply_workbook_op(
             }
             Ok(())
         }
-        WorkbookOp::LinkSheet { id, source } => {
-            let sheet = workbook
-                .sheets
-                .iter_mut()
-                .find(|s| s.id == id)
-                .ok_or_else(|| bad("unknown sheet id"))?;
-            sheet.state = load_linked_sheet_state(&source)?;
-            sheet.linked_source = Some(source);
-            Ok(())
-        }
+            WorkbookOp::LinkSheet { id, source } => {
+                let sheet = workbook
+                    .sheets
+                    .iter_mut()
+                    .find(|s| s.id == id)
+                    .ok_or_else(|| bad("unknown sheet id"))?;
+                sheet.state = load_linked_sheet_state(&source)?;
+                sheet.linked_source = Some(source.clone());
+                // Set the visible Corro sheet title: prefer an explicit
+                // corrotitle from the LINK entry, otherwise derive one from
+                // the linked source (ODS sheet name or file stem).
+                let derived = derive_title_from_source(&source);
+                sheet.title = source.corrotitle.clone().unwrap_or(derived);
+                Ok(())
+            }
         WorkbookOp::CopySheet {
             source_id,
             id,
@@ -2573,21 +2606,71 @@ fn parse_format_text(text: &str) -> Result<CellFormat, std::io::Error> {
 pub fn append_op(path: &Path, op: &Op, main_cols: usize) -> std::io::Result<()> {
     let mut f = OpenOptions::new().create(true).append(true).open(path)?;
     let line = op.to_log_line(main_cols);
-    if line.is_empty() {
-    } else {
+
+    // Debug: record the serialized op (preview) so test runs and local
+    // manual reproductions can correlate in-memory ops with on-disk writes.
+    #[cfg(debug_assertions)]
+    {
+        let preview = if line.len() > 200 {
+            format!("{}...[{} bytes]", &line[..200], line.len())
+        } else {
+            line.clone()
+        };
+        let msg = format!(
+            "DEBUG append_op: path={} main_cols={} line_len={} line_preview={}",
+            path.display(), main_cols, line.len(), preview
+        );
+        crate::debug_log::log(&msg);
+        eprintln!("{}", msg);
+    }
+
+    if !line.is_empty() {
         for l in line.split('\n') {
             writeln!(f, "{l}")?;
         }
     }
     f.sync_all()?;
+
+    #[cfg(debug_assertions)]
+    {
+        let msg = format!("DEBUG append_op: path={} sync_all_done", path.display());
+        crate::debug_log::log(&msg);
+        eprintln!("{}", msg);
+    }
+
     Ok(())
 }
 
 /// Append a plain-text log line.
 pub fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
+    #[cfg(debug_assertions)]
+    {
+        let preview = if line.len() > 200 {
+            format!("{}...[{} bytes]", &line[..200], line.len())
+        } else {
+            line.to_string()
+        };
+        let msg = format!(
+            "DEBUG append_line: path={} line_len={} line_preview={}",
+            path.display(),
+            line.len(),
+            preview
+        );
+        crate::debug_log::log(&msg);
+        eprintln!("{}", msg);
+    }
+
     let mut f = OpenOptions::new().create(true).append(true).open(path)?;
     writeln!(f, "{line}")?;
     f.sync_all()?;
+
+    #[cfg(debug_assertions)]
+    {
+        let msg = format!("DEBUG append_line: path={} sync_all_done", path.display());
+        crate::debug_log::log(&msg);
+        eprintln!("{}", msg);
+    }
+
     Ok(())
 }
 

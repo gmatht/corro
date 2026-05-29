@@ -3301,6 +3301,7 @@ impl App {
             path: path.to_path_buf(),
             kind,
             ods_sheet_name: None,
+            corrotitle: None,
         })
     }
 
@@ -3340,6 +3341,7 @@ impl App {
                         path: source.path.clone(),
                         kind: crate::ops::LinkedSourceKind::Ods,
                         ods_sheet_name: Some(sheet.title.clone()),
+                        corrotitle: None,
                     });
                 }
                 self.workbook = workbook;
@@ -4569,6 +4571,21 @@ impl App {
 
     /// One horizontal column step (matches plain Left/Right in normal mode).
     fn move_cursor_one_col_horizontal(&mut self, right: bool) {
+        #[cfg(debug_assertions)]
+        {
+            let pre_addr = self.cursor.to_addr(&self.state.grid);
+            let pre_mc = self.state.grid.main_cols();
+            let msg = format!(
+                "DEBUG move_cursor_one_col_horizontal pre: right={} cursor={:?} addr={} ui_main_cols={}",
+                right,
+                self.cursor,
+                addr_label(&pre_addr, pre_mc),
+                pre_mc
+            );
+            crate::debug_log::log(&msg);
+            eprintln!("{}", msg);
+        }
+
         if right {
             let lm = MARGIN_COLS;
             let mc = self.state.grid.main_cols();
@@ -4585,6 +4602,21 @@ impl App {
         self.state
             .grid
             .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
+
+        #[cfg(debug_assertions)]
+        {
+            let post_addr = self.cursor.to_addr(&self.state.grid);
+            let post_mc = self.state.grid.main_cols();
+            let msg = format!(
+                "DEBUG move_cursor_one_col_horizontal post: right={} cursor={:?} addr={} ui_main_cols={}",
+                right,
+                self.cursor,
+                addr_label(&post_addr, post_mc),
+                post_mc
+            );
+            crate::debug_log::log(&msg);
+            eprintln!("{}", msg);
+        }
     }
 
     fn move_cursor_horizontal_steps(&mut self, steps: usize, right: bool) {
@@ -7069,8 +7101,164 @@ impl App {
     }
 
     fn save_to_path(&mut self, path: &Path) -> Result<(), RunError> {
+        use std::io;
+
         self.commit_active_sheet_cache();
         let path = Self::to_corro_path(path);
+
+        // Fast-path: if we have an on-disk unsaved file under the per-user
+        // unsaved dir and it already contains a "clean" CORRO_LOG (no
+        // synthetic SIZE/COL_WIDTH/FORMAT ops), try to atomically move it to
+        // the requested destination. This preserves the exact user-visible
+        // log the app already built and is cheap/atomic on the same FS.
+        // TODO: Consider removing the separate Workbook-style/"true" save
+        // support altogether and always persist the compact CORRO log.
+        if let Some(cur) = self.path.clone() {
+            // Only consider fast-path for files we created in the unsaved dir.
+            let unsaved_dir = Self::default_unsaved_dir();
+            if cur.exists() && cur.ancestors().any(|a| a == unsaved_dir.as_path()) {
+                // Read and coalesce CONTINUE_LINE entries (same logic as
+                // io::collect_workbook_log_lines) so we can parse logical lines.
+                if let Ok(data) = std::fs::read_to_string(&cur) {
+                    let mut logical_lines: Vec<String> = Vec::new();
+                    let mut orphan_continue = false;
+                    for raw in data.lines() {
+                        let trimmed = raw.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        if let Some(rest) = trimmed.strip_prefix("CONTINUE_LINE") {
+                            let payload = rest.strip_prefix(' ').unwrap_or(rest);
+                            if let Some(prev) = logical_lines.last_mut() {
+                                prev.push('\n');
+                                prev.push_str(payload);
+                            } else {
+                                orphan_continue = true;
+                                break;
+                            }
+                        } else {
+                            logical_lines.push(trimmed.to_string());
+                        }
+                    }
+                    if !orphan_continue {
+                        // Parse each logical workbook line and reject if it
+                        // contains any synthetic ops we don't want to preserve
+                        // as part of the fast-path move.
+                        let mut clean = true;
+                        for line in &logical_lines {
+                            match crate::ops::parse_workbook_line(line) {
+                                Ok(wop) => match wop {
+                                    crate::ops::WorkbookOp::SheetOp { op, .. } => match op {
+                                        Op::SetMainSize { .. }
+                                        | Op::SetColWidth { .. }
+                                        | Op::SetMaxColWidth { .. }
+                                        | Op::SetColumnFormat { .. }
+                                        | Op::SetAllColumnFormat { .. }
+                                        | Op::SetCellFormat { .. } => {
+                                            clean = false;
+                                            break;
+                                        }
+                                        _ => {}
+                                    },
+                                    _ => {}
+                                },
+                                Err(_) => {
+                                    clean = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if clean {
+                            // Ensure destination directory exists.
+                            if let Some(parent) = path.parent() {
+                                std::fs::create_dir_all(parent)
+                                    .map_err(|e| RunError::Io(crate::io::IoError::Io(e)))?;
+                            }
+                            // Try an atomic rename first; fall back to copy+rename
+                            // on cross-device errors.
+                            match std::fs::rename(&cur, &path) {
+                                Ok(()) => {
+                                    self.path = Some(path.clone());
+                                    self.import_source = None;
+                                    self.source_path = None;
+                                    self.revision_limit = None;
+                                    self.status = format!("Saved {}", path.display());
+                                    // Refresh watcher bound to the new path.
+                                    self.watcher = Some(LogWatcher::new(path.clone()).map_err(IoError::from)?);
+                                    self.refresh_linked_source_mtimes();
+                                    let meta = std::fs::metadata(&path)
+                                        .map_err(|e| RunError::Io(crate::io::IoError::Io(e)))?;
+                                    self.offset = meta.len();
+                                    return Ok(());
+                                }
+                                Err(e) => {
+                                    // Cross-device rename yields EXDEV on Unix: fall back
+                                    // to copy+rename in that case. Use raw OS error
+                                    // inspection for portability.
+                                        if e.raw_os_error() == Some(libc::EXDEV) {
+                                            // Cross-device: copy to temp in dest dir then rename.
+                                            let pid = std::process::id();
+                                            let now = std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .map(|d| d.as_nanos())
+                                                .unwrap_or(0);
+                                            let tmp = path
+                                                .parent()
+                                                .unwrap_or_else(|| Path::new("."))
+                                                .join(format!(".corro_save_tmp_{}_{}.corro", pid, now));
+                                            #[cfg(debug_assertions)]
+                                            {
+                                                let msg = format!(
+                                                    "DEBUG save_to_path EXDEV: copying cur={} to tmp={} path={}",
+                                                    cur.display(), tmp.display(), path.display()
+                                                );
+                                                crate::debug_log::log(&msg);
+                                                eprintln!("{}", msg);
+                                            }
+                                            std::fs::copy(&cur, &tmp)
+                                                .map_err(|e| RunError::Io(crate::io::IoError::Io(e)))?;
+                                            #[cfg(debug_assertions)]
+                                            {
+                                                if let Ok(s) = std::fs::read_to_string(&tmp) {
+                                                    let preview = if s.len() > 400 { format!("{}...[{} bytes]", &s[..400], s.len()) } else { s };
+                                                    let msg = format!("DEBUG save_to_path EXDEV: tmp_preview={}...", preview.replace('\n', "\\n"));
+                                                    crate::debug_log::log(&msg);
+                                                    eprintln!("{}", msg);
+                                                }
+                                            }
+                                        if path.exists() {
+                                            std::fs::remove_file(&path)
+                                                .map_err(|e| RunError::Io(crate::io::IoError::Io(e)))?;
+                                        }
+                                        std::fs::rename(&tmp, &path)
+                                            .map_err(|e| RunError::Io(crate::io::IoError::Io(e)))?;
+                                        // Optionally remove original unsaved file; keep it if removal fails.
+                                        let _ = std::fs::remove_file(&cur);
+                                        self.path = Some(path.clone());
+                                        self.import_source = None;
+                                        self.source_path = None;
+                                        self.revision_limit = None;
+                                        self.status = format!("Saved {}", path.display());
+                                        self.watcher = Some(LogWatcher::new(path.clone()).map_err(IoError::from)?);
+                                        self.refresh_linked_source_mtimes();
+                                        let meta = std::fs::metadata(&path)
+                                            .map_err(|e| RunError::Io(crate::io::IoError::Io(e)))?;
+                                        self.offset = meta.len();
+                                        return Ok(());
+                                    }
+                                    // Otherwise fall through to the filtered-reserialize fallback
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fallback: build a compact CORRO log that contains only real user
+        // ops (NewSheet / LinkSheet and main-region SETs including explicit
+        // clears). Omit synthetic SIZE, COL_WIDTH, MAX_COL_WIDTH, FORMAT
+        // entries which are typically produced by UI maintenance.
         let mut buf = String::new();
         buf.push_str(&format!(
             "{} {}\n",
@@ -7079,27 +7267,66 @@ impl App {
         ));
         let omit_sheet1_prefix = self.workbook.sheet_count() == 1;
         for sheet in &self.workbook.sheets {
-            for line in (crate::ops::WorkbookOp::NewSheet {
-                id: sheet.id,
-                title: sheet.title.clone(),
-            })
-            .to_log_lines_with_policy(sheet.state.grid.main_cols(), omit_sheet1_prefix)
-            {
-                buf.push_str(&line);
-                buf.push('\n');
-            }
+            // For linked sheets we prefer to encode the UI-visible title in
+            // the LINK entry and omit a separate NEW_SHEET line. This keeps
+            // the log compact and avoids duplicate title storage. Compute
+            // `linked_base` for later comparison of base values.
             let linked_base = if let Some(source) = &sheet.linked_source {
-                for line in (crate::ops::WorkbookOp::LinkSheet {
+                // If the title contains the pipe separator we fallback to
+                // emitting a NEW_SHEET line to avoid ambiguity.
+                if sheet.title.contains(" | ") {
+                    for line in (crate::ops::WorkbookOp::NewSheet {
+                        id: sheet.id,
+                        title: sheet.title.clone(),
+                    })
+                    .to_log_lines_with_policy(sheet.state.grid.main_cols(), omit_sheet1_prefix)
+                    {
+                        buf.push_str(&line);
+                        buf.push('\n');
+                    }
+                    // Emit LINK without corrotitle in the fallback case.
+                    for line in (crate::ops::WorkbookOp::LinkSheet {
+                        id: sheet.id,
+                        source: source.clone(),
+                    })
+                    .to_log_lines_with_policy(sheet.state.grid.main_cols(), omit_sheet1_prefix)
+                    {
+                        buf.push_str(&line);
+                        buf.push('\n');
+                    }
+                } else {
+                    // Normal case: write LINK with an embedded corrotitle if
+                    // the sheet title differs from the derived title.
+                    let derived = crate::ops::derive_title_from_source(source);
+                    let mut src_for_write = source.clone();
+                    // If the sheet title equals the derived title then omit
+                    // the corrotitle to keep the LINK compact.
+                    if sheet.title != derived {
+                        src_for_write.corrotitle = Some(sheet.title.clone());
+                    } else {
+                        src_for_write.corrotitle = None;
+                    }
+                    for line in (crate::ops::WorkbookOp::LinkSheet {
+                        id: sheet.id,
+                        source: src_for_write,
+                    })
+                    .to_log_lines_with_policy(sheet.state.grid.main_cols(), omit_sheet1_prefix)
+                    {
+                        buf.push_str(&line);
+                        buf.push('\n');
+                    }
+                }
+                Self::linked_sheet_base_state(source)
+            } else {
+                for line in (crate::ops::WorkbookOp::NewSheet {
                     id: sheet.id,
-                    source: source.clone(),
+                    title: sheet.title.clone(),
                 })
                 .to_log_lines_with_policy(sheet.state.grid.main_cols(), omit_sheet1_prefix)
                 {
                     buf.push_str(&line);
                     buf.push('\n');
                 }
-                Self::linked_sheet_base_state(source)
-            } else {
                 None
             };
             let mut base_values = std::collections::HashMap::new();
@@ -7155,121 +7382,133 @@ impl App {
                     }
                 }
             }
-            for line in (crate::ops::WorkbookOp::SheetOp {
-                sheet_id: sheet.id,
-                op: Op::SetMainSize {
-                    main_rows: sheet.state.grid.main_rows() as u32,
-                    main_cols: sheet.state.grid.main_cols() as u32,
-                },
-            })
-            .to_log_lines_with_policy(sheet.state.grid.main_cols(), omit_sheet1_prefix)
-            {
-                buf.push_str(&line);
-                buf.push('\n');
-            }
-            if sheet.state.grid.max_col_width() != DEFAULT_MAX_COL_WIDTH {
-                for line in (crate::ops::WorkbookOp::SheetOp {
-                    sheet_id: sheet.id,
-                    op: Op::SetMaxColWidth {
-                        width: sheet.state.grid.max_col_width(),
-                    },
-                })
-                .to_log_lines_with_policy(sheet.state.grid.main_cols(), omit_sheet1_prefix)
-                {
-                    buf.push_str(&line);
-                    buf.push('\n');
+        }
+
+            for sheet in &self.workbook.sheets {
+                // Persist per-sheet view-sort cols that the user requested to keep
+                // across saves. Use the persisted_view_sort_cols cache so we don't
+                // accidentally persist transient UI sort state.
+                if let Some(cols) = self.persisted_view_sort_cols.get(&sheet.id) {
+                    if !cols.is_empty() {
+                        for line in (crate::ops::WorkbookOp::SheetOp {
+                            sheet_id: sheet.id,
+                            op: Op::SetViewSortCols { cols: cols.clone() },
+                        })
+                        .to_log_lines_with_policy(sheet.state.grid.main_cols(), omit_sheet1_prefix)
+                        {
+                            buf.push_str(&line);
+                            buf.push('\n');
+                        }
+                    }
+                }
+
+                // Persist explicit column formats the user set. Iterate the three
+                // scoped maps (All, Data, Special) and emit FORMAT COL entries for
+                // each stored override.
+                for (col, format) in sheet.state.grid.col_all_formats() {
+                    for line in (crate::ops::WorkbookOp::SheetOp {
+                        sheet_id: sheet.id,
+                        op: Op::SetColumnFormat {
+                            scope: FormatScope::All,
+                            col,
+                            format,
+                        },
+                    })
+                    .to_log_lines_with_policy(sheet.state.grid.main_cols(), omit_sheet1_prefix)
+                    {
+                        buf.push_str(&line);
+                        buf.push('\n');
+                    }
+                }
+                for (col, format) in sheet.state.grid.col_data_formats() {
+                    for line in (crate::ops::WorkbookOp::SheetOp {
+                        sheet_id: sheet.id,
+                        op: Op::SetColumnFormat {
+                            scope: FormatScope::Data,
+                            col,
+                            format,
+                        },
+                    })
+                    .to_log_lines_with_policy(sheet.state.grid.main_cols(), omit_sheet1_prefix)
+                    {
+                        buf.push_str(&line);
+                        buf.push('\n');
+                    }
+                }
+                for (col, format) in sheet.state.grid.col_special_formats() {
+                    for line in (crate::ops::WorkbookOp::SheetOp {
+                        sheet_id: sheet.id,
+                        op: Op::SetColumnFormat {
+                            scope: FormatScope::Special,
+                            col,
+                            format,
+                        },
+                    })
+                    .to_log_lines_with_policy(sheet.state.grid.main_cols(), omit_sheet1_prefix)
+                    {
+                        buf.push_str(&line);
+                        buf.push('\n');
+                    }
+                }
+
+                // Persist any exact-cell formats applied by the user.
+                for (addr, format) in sheet.state.grid.cell_formats() {
+                    for line in (crate::ops::WorkbookOp::SheetOp {
+                        sheet_id: sheet.id,
+                        op: Op::SetCellFormat {
+                            addr: addr.clone(),
+                            format,
+                        },
+                    })
+                    .to_log_lines_with_policy(sheet.state.grid.main_cols(), omit_sheet1_prefix)
+                    {
+                        buf.push_str(&line);
+                        buf.push('\n');
+                    }
                 }
             }
-            for (col, width) in sheet.state.grid.col_width_overrides() {
-                for line in (crate::ops::WorkbookOp::SheetOp {
-                    sheet_id: sheet.id,
-                    op: Op::SetColWidth {
-                        col,
-                        width: Some(width),
-                    },
-                })
-                .to_log_lines_with_policy(sheet.state.grid.main_cols(), omit_sheet1_prefix)
-                {
-                    buf.push_str(&line);
-                    buf.push('\n');
-                }
-            }
-            if let Some(cols) = self
-                .persisted_view_sort_cols
-                .get(&sheet.id)
-                .filter(|cols| !cols.is_empty())
-            {
-                for line in (crate::ops::WorkbookOp::SheetOp {
-                    sheet_id: sheet.id,
-                    op: Op::SetViewSortCols { cols: cols.clone() },
-                })
-                .to_log_lines_with_policy(sheet.state.grid.main_cols(), omit_sheet1_prefix)
-                {
-                    buf.push_str(&line);
-                    buf.push('\n');
-                }
-            }
-            for (col, format) in sheet.state.grid.col_all_formats() {
-                for line in (crate::ops::WorkbookOp::SheetOp {
-                    sheet_id: sheet.id,
-                    op: Op::SetColumnFormat {
-                        scope: FormatScope::All,
-                        col: col,
-                        format: format,
-                    },
-                })
-                .to_log_lines_with_policy(sheet.state.grid.main_cols(), omit_sheet1_prefix)
-                {
-                    buf.push_str(&line);
-                    buf.push('\n');
-                }
-            }
-            for (col, format) in sheet.state.grid.col_data_formats() {
-                for line in (crate::ops::WorkbookOp::SheetOp {
-                    sheet_id: sheet.id,
-                    op: Op::SetColumnFormat {
-                        scope: FormatScope::Data,
-                        col: col,
-                        format: format,
-                    },
-                })
-                .to_log_lines_with_policy(sheet.state.grid.main_cols(), omit_sheet1_prefix)
-                {
-                    buf.push_str(&line);
-                    buf.push('\n');
-                }
-            }
-            for (col, format) in sheet.state.grid.col_special_formats() {
-                for line in (crate::ops::WorkbookOp::SheetOp {
-                    sheet_id: sheet.id,
-                    op: Op::SetColumnFormat {
-                        scope: FormatScope::Special,
-                        col: col,
-                        format: format,
-                    },
-                })
-                .to_log_lines_with_policy(sheet.state.grid.main_cols(), omit_sheet1_prefix)
-                {
-                    buf.push_str(&line);
-                    buf.push('\n');
-                }
-            }
-            for (addr, format) in sheet.state.grid.cell_formats() {
-                for line in (crate::ops::WorkbookOp::SheetOp {
-                    sheet_id: sheet.id,
-                    op: Op::SetCellFormat {
-                        addr: addr,
-                        format: format,
-                    },
-                })
-                .to_log_lines_with_policy(sheet.state.grid.main_cols(), omit_sheet1_prefix)
-                {
-                    buf.push_str(&line);
-                    buf.push('\n');
-                }
+
+        // Write to a temporary file next to the destination and atomically
+        // rename over the target. This mirrors save semantics used elsewhere.
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| RunError::Io(crate::io::IoError::Io(e)))?;
+        }
+        let pid = std::process::id();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp = path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(format!(".corro_save_tmp_{}_{}.corro", pid, now));
+        #[cfg(debug_assertions)]
+        {
+            let msg = format!(
+                "DEBUG save_to_path: writing tmp={} path={} bytes={}",
+                tmp.display(),
+                path.display(),
+                buf.len()
+            );
+            crate::debug_log::log(&msg);
+            eprintln!("{}", msg);
+        }
+        std::fs::write(&tmp, buf.as_bytes()).map_err(|e| RunError::Io(crate::io::IoError::Io(e)))?;
+        #[cfg(debug_assertions)]
+        {
+            // Read back the first few bytes for an additional verification trace.
+            if let Ok(s) = std::fs::read_to_string(&tmp) {
+                let preview = if s.len() > 400 { format!("{}...[{} bytes]", &s[..400], s.len()) } else { s };
+                let msg = format!("DEBUG save_to_path: tmp_preview={}...", preview.replace('\n', "\\n"));
+                crate::debug_log::log(&msg);
+                eprintln!("{}", msg);
             }
         }
-        std::fs::write(&path, buf)?;
+        if path.exists() {
+            std::fs::remove_file(&path).map_err(|e| RunError::Io(crate::io::IoError::Io(e)))?;
+        }
+        std::fs::rename(&tmp, &path).map_err(|e| RunError::Io(crate::io::IoError::Io(e)))?;
+
         self.path = Some(path.clone());
         self.import_source = None;
         self.source_path = None;
@@ -7382,6 +7621,8 @@ impl App {
             self.commit_active_sheet_cache();
 
             let mut active_sheet = self.view_sheet_id;
+            // Commit and instrument via debug traces inside commit_workbook_op
+            // and append_line/append_op paths. The call itself is unchanged.
             commit_workbook_op(
                 p,
                 &mut self.offset,
@@ -7599,6 +7840,10 @@ impl App {
                     initial.push_str(&format!("{} {}\n", crate::ops::LOG_HEADER_PREFIX, crate::ops::LOG_VERSION));
                     for sheet in &self.workbook.sheets {
                         if let Some(source) = &sheet.linked_source {
+                            // Ensure the LINK we write to the initial unsaved
+                            // file includes any corrotitle the in-memory LinkedSource
+                            // may hold (keeps initial header consistent with later
+                            // compact saves).
                             let wbo = crate::ops::WorkbookOp::LinkSheet {
                                 id: sheet.id,
                                 source: source.clone(),
@@ -12245,6 +12490,14 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                         }
                         TextInputAction::EdgeRight => {
                             let raw = buffer.clone();
+                            // Remember whether we were editing a main-region cell so
+                            // growth only occurs for main edits (editing headers/footers
+                            // shouldn't grow the main area).
+                            let was_edit_target_main = self
+                                .edit_target_addr
+                                .as_ref()
+                                .map(|a| matches!(a, CellAddr::Main { .. }))
+                                .unwrap_or(false);
                             self.edit_cursor = None;
                             self.edit_special_palette = false;
                             *formula_cursor = None;
@@ -12252,8 +12505,13 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                             self.commit_edit_buffer(&raw)?;
                             let lm = MARGIN_COLS;
                             let mc = self.state.grid.main_cols();
-                            if self.cursor.col == lm + mc.saturating_sub(1)
-                                && trailing_blank_main_cols(&self.state) < NAV_BLANK_COLS
+                            // Grow the main area when the user advances Right out of
+                            // the rightmost main column after committing a non-empty
+                            // edit, or when the trailing-blank policy allows growth.
+                            if was_edit_target_main
+                                && self.cursor.col == lm + mc.saturating_sub(1)
+                                && (!raw.trim().is_empty()
+                                    || trailing_blank_main_cols(&self.state) < NAV_BLANK_COLS)
                             {
                                 self.state.grid.grow_main_col_at_right();
                             }
@@ -13567,6 +13825,57 @@ mod tests {
     }
 
     #[test]
+    fn repro_right_from_header_d_moves_to_e() {
+        // Place the cursor on D~1 (bottom header row for column D) and press
+        // Right. The cursor should move to the adjacent header column E, not
+        // jump into the right margins.
+        let mut app = App::new(None);
+        // Ensure there are enough main columns for D/E to exist and not be the
+        // rightmost column.
+        app.state.grid.set_main_size(1, 8);
+
+        let d_main = crate::addr::parse_excel_column("D").unwrap() as usize;
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS - 1,
+            col: MARGIN_COLS + d_main,
+        };
+
+        // Sanity check: starting address is the D header.
+        assert_eq!(app.cursor.to_addr(&app.state.grid), CellAddr::Header { row: (HEADER_ROWS - 1) as u32, col: (MARGIN_COLS + d_main) as u32 });
+
+        // Simulate Right arrow
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::empty())).unwrap();
+
+        let addr = app.cursor.to_addr(&app.state.grid);
+        // Expect header E (~1 at next main column)
+        let expected_col = (MARGIN_COLS + d_main + 1) as u32;
+        assert_eq!(addr, CellAddr::Header { row: (HEADER_ROWS - 1) as u32, col: expected_col });
+    }
+
+    #[test]
+    fn repro_right_from_header_d_remains_e_after_delay() {
+        // Ensure the cursor stays on E after a short delay (no background
+        // task should move it into the margins).
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 8);
+
+        let d_main = crate::addr::parse_excel_column("D").unwrap() as usize;
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS - 1,
+            col: MARGIN_COLS + d_main,
+        };
+
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::empty())).unwrap();
+
+        // Wait one second as requested and re-check the cursor address.
+        std::thread::sleep(std::time::Duration::from_secs(1));
+
+        let addr = app.cursor.to_addr(&app.state.grid);
+        let expected_col = (MARGIN_COLS + d_main + 1) as u32;
+        assert_eq!(addr, CellAddr::Header { row: (HEADER_ROWS - 1) as u32, col: expected_col });
+    }
+
+    #[test]
     fn repro_open_tsv_then_navigate_and_edit_right_margin_header() {
         // Simulate the user sequence: open a TSV, move Up into the header band,
         // navigate Right until the first right-margin header (]A~1), start
@@ -13621,6 +13930,69 @@ mod tests {
         // Ensure we didn't accidentally write into the adjacent last main column.
         let last_main_addr = CellAddr::Main { row: 0, col: (mc - 1) as u32 };
         assert_ne!(app.state.grid.get(&last_main_addr).as_deref(), Some("=B"));
+    }
+
+    #[test]
+    fn repro_cannot_move_right_of_d_in_tmp_tsv() {
+        // Create a small TSV with 4 main columns (A..D) and verify that when
+        // opening the TSV and moving into the header band we can move Right
+        // from the D header into the next header/column. This reproduces the
+        // user-reported case where Right was blocked at D when loading a TSV.
+        let tmpdir = tempfile::tempdir().unwrap();
+        let tsv = tmpdir.path().join("tmp.tsv");
+        std::fs::write(&tsv, "a\tb\tc\td\n1\t2\t3\t4\n").unwrap();
+
+        let mut app = App::new(Some(tsv.clone()));
+        app.load_initial().unwrap();
+
+        // Move into the header band and place the cursor on the D header.
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::empty())).unwrap();
+        let d_main = crate::addr::parse_excel_column("D").unwrap() as usize;
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS - 1,
+            col: MARGIN_COLS + d_main,
+        };
+
+        // Press Right once and expect the cursor to move to the next global
+        // column (the E header / next main column or newly-grown main col).
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::empty())).unwrap();
+        let addr = app.cursor.to_addr(&app.state.grid);
+        let expected_col = (MARGIN_COLS + d_main + 1) as u32;
+        assert_eq!(addr, CellAddr::Header { row: (HEADER_ROWS - 1) as u32, col: expected_col });
+    }
+
+    #[test]
+    fn repro_edit_right_from_blank_main_allocates_main_col() {
+        // Start with a single main column (blank). Simulate typing into the
+        // only main cell and then pressing Right. The UI should commit the
+        // edit and move into a main column (growing main_cols) instead of
+        // jumping into the right margin.
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 1);
+
+        // Place cursor on the single main cell (top main row, main col 0).
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        };
+
+        // Start typing: this should start Edit mode.
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::empty())).unwrap();
+
+        // Now press Right: this should commit and advance into another main
+        // column (growing main cols) rather than into the right margin.
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::empty())).unwrap();
+
+        // After the sequence the cursor's address should be a Main cell
+        // (not a Header/Footer/Left/Right address).
+        let addr = app.cursor.to_addr(&app.state.grid);
+        match addr {
+            CellAddr::Main { .. } => {}
+            other => panic!("expected main addr after edit+Right, got: {:?}", other),
+        }
+
+        // And the grid should have expanded to include at least two main cols.
+        assert!(app.state.grid.main_cols() >= 2, "main_cols did not grow");
     }
 
     #[test]
@@ -20336,6 +20708,60 @@ mod tests {
         assert!(tsv.exists(), "linked TSV should still exist after editing");
         let on_disk = fs::read_to_string(&tsv).unwrap();
         assert_eq!(on_disk, data);
+
+        // Restore environment
+        if let Some(v) = prev_test_dir {
+            env::set_var("CORRO_UNSAVED_TEST_DIR", v);
+        } else {
+            env::remove_var("CORRO_UNSAVED_TEST_DIR");
+        }
+        if let Some(v) = prev_auto {
+            env::set_var("CORRO_AUTO_UNSAVED_TEST", v);
+        } else {
+            env::remove_var("CORRO_AUTO_UNSAVED_TEST");
+        }
+    }
+
+    #[test]
+    fn linked_tsv_edits_persist_on_save() {
+        use tempfile::tempdir;
+        use std::env;
+        use std::fs;
+
+        // Create a temporary dir and a linked TSV file inside it.
+        let tmp = tempdir().unwrap();
+        let tsv = tmp.path().join("tmp.tsv");
+        let corro = tmp.path().join("saved.corro");
+        let data = "name\tvalue\nalpha\t1\n";
+        fs::write(&tsv, data).unwrap();
+
+        // Isolate unsaved-file creation to this tempdir.
+        let prev_test_dir = env::var_os("CORRO_UNSAVED_TEST_DIR");
+        let prev_auto = env::var_os("CORRO_AUTO_UNSAVED_TEST");
+        let expected_dir = tmp.path().join("corro/unsaved");
+        env::set_var("CORRO_UNSAVED_TEST_DIR", expected_dir.to_string_lossy().to_string());
+        env::set_var("CORRO_AUTO_UNSAVED_TEST", "1");
+
+        let mut app = App::new(Some(tsv.clone()));
+        app.load_initial().unwrap();
+        // Enable auto-create to get an on-disk unsaved .corro when editing.
+        app.unsaved_auto_create = true;
+
+        // Edit a main cell (B1) and commit.
+        app.apply_single_op(crate::ops::Op::SetCell {
+            addr: crate::grid::CellAddr::Main { row: 0, col: 1 },
+            value: "7".into(),
+        })
+        .unwrap();
+
+        app.save_to_path(&corro).unwrap();
+
+        let on_disk = fs::read_to_string(&corro).unwrap();
+        assert!(
+            on_disk.contains("SET B1 7") || on_disk.contains("SET $1:B1 7"),
+            "saved .corro did not contain committed edit: {}",
+            on_disk
+        );
 
         // Restore environment
         if let Some(v) = prev_test_dir {
