@@ -7111,154 +7111,69 @@ impl App {
         let path = Self::to_corro_path(path);
 
         // Fast-path: if we have an on-disk unsaved file under the per-user
-        // unsaved dir and it already contains a "clean" CORRO_LOG (no
-        // synthetic SIZE/COL_WIDTH/FORMAT ops), try to atomically move it to
-        // the requested destination. This preserves the exact user-visible
-        // log the app already built and is cheap/atomic on the same FS.
-        // TODO: Consider removing the separate Workbook-style/"true" save
-        // support altogether and always persist the compact CORRO log.
-        if let Some(cur) = self.path.clone() {
-            // Only consider fast-path for files we created in the unsaved dir.
-            let unsaved_dir = Self::default_unsaved_dir();
-            if cur.exists() && cur.ancestors().any(|a| a == unsaved_dir.as_path()) {
-                // Read and coalesce CONTINUE_LINE entries (same logic as
-                // io::collect_workbook_log_lines) so we can parse logical lines.
-                if let Ok(data) = std::fs::read_to_string(&cur) {
-                    let mut logical_lines: Vec<String> = Vec::new();
-                    let mut orphan_continue = false;
-                    for raw in data.lines() {
-                        let trimmed = raw.trim();
-                        if trimmed.is_empty() {
-                            continue;
+        // unsaved dir, simply move/copy it to the destination. The unsaved
+        // log is the authoritative state; skip any "clean" check.
+        let unsaved_dir = Self::default_unsaved_dir();
+        let cur = self
+            .path
+            .clone()
+            .or_else(|| self.unsaved_file.clone())
+            .filter(|p| p.exists() && p.ancestors().any(|a| a == unsaved_dir.as_path()));
+        if let Some(cur) = cur {
+            // Ensure destination directory exists.
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| RunError::Io(crate::io::IoError::Io(e)))?;
+            }
+            // Try an atomic rename first; fall back to copy+rename
+            // on cross-device errors.
+            match std::fs::rename(&cur, &path) {
+                Ok(()) => {
+                    self.path = Some(path.clone());
+                    self.import_source = None;
+                    self.source_path = None;
+                    self.revision_limit = None;
+                    self.unsaved_file = None;
+                    self.status = format!("Saved {}", path.display());
+                    self.watcher = Some(LogWatcher::new(path.clone()).map_err(IoError::from)?);
+                    self.refresh_linked_source_mtimes();
+                    let meta = std::fs::metadata(&path)
+                        .map_err(|e| RunError::Io(crate::io::IoError::Io(e)))?;
+                    self.offset = meta.len();
+                    return Ok(());
+                }
+                Err(e) => {
+                    if e.raw_os_error() == Some(libc::EXDEV) {
+                        let pid = std::process::id();
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_nanos())
+                            .unwrap_or(0);
+                        let tmp = path
+                            .parent()
+                            .unwrap_or_else(|| Path::new("."))
+                            .join(format!(".corro_save_tmp_{}_{}.corro", pid, now));
+                        std::fs::copy(&cur, &tmp)
+                            .map_err(|e| RunError::Io(crate::io::IoError::Io(e)))?;
+                        if path.exists() {
+                            std::fs::remove_file(&path)
+                                .map_err(|e| RunError::Io(crate::io::IoError::Io(e)))?;
                         }
-                        if let Some(rest) = trimmed.strip_prefix("CONTINUE_LINE") {
-                            let payload = rest.strip_prefix(' ').unwrap_or(rest);
-                            if let Some(prev) = logical_lines.last_mut() {
-                                prev.push('\n');
-                                prev.push_str(payload);
-                            } else {
-                                orphan_continue = true;
-                                break;
-                            }
-                        } else {
-                            logical_lines.push(trimmed.to_string());
-                        }
-                    }
-                    if !orphan_continue {
-                        // Parse each logical workbook line and reject if it
-                        // contains any synthetic ops we don't want to preserve
-                        // as part of the fast-path move.
-                        let mut clean = true;
-                        for line in &logical_lines {
-                            match crate::ops::parse_workbook_line(line) {
-                                Ok(wop) => match wop {
-                                    crate::ops::WorkbookOp::SheetOp { op, .. } => match op {
-                                        Op::SetMainSize { .. }
-                                        | Op::SetColWidth { .. }
-                                        | Op::SetMaxColWidth { .. }
-                                        | Op::SetColumnFormat { .. }
-                                        | Op::SetAllColumnFormat { .. }
-                                        | Op::SetCellFormat { .. } => {
-                                            clean = false;
-                                            break;
-                                        }
-                                        _ => {}
-                                    },
-                                    _ => {}
-                                },
-                                Err(_) => {
-                                    clean = false;
-                                    break;
-                                }
-                            }
-                        }
-                        if clean {
-                            // Ensure destination directory exists.
-                            if let Some(parent) = path.parent() {
-                                std::fs::create_dir_all(parent)
-                                    .map_err(|e| RunError::Io(crate::io::IoError::Io(e)))?;
-                            }
-                            // Try an atomic rename first; fall back to copy+rename
-                            // on cross-device errors.
-                            match std::fs::rename(&cur, &path) {
-                                Ok(()) => {
-                                    self.path = Some(path.clone());
-                                    self.import_source = None;
-                                    self.source_path = None;
-                                    self.revision_limit = None;
-                                    // Clear unsaved_file flag now that the user has
-                                    // explicitly saved the document to a final path.
-                                    self.unsaved_file = None;
-                                    self.status = format!("Saved {}", path.display());
-                                    // Refresh watcher bound to the new path.
-                                    self.watcher = Some(LogWatcher::new(path.clone()).map_err(IoError::from)?);
-                                    self.refresh_linked_source_mtimes();
-                                    let meta = std::fs::metadata(&path)
-                                        .map_err(|e| RunError::Io(crate::io::IoError::Io(e)))?;
-                                    self.offset = meta.len();
-                                    return Ok(());
-                                }
-                                Err(e) => {
-                                    // Cross-device rename yields EXDEV on Unix: fall back
-                                    // to copy+rename in that case. Use raw OS error
-                                    // inspection for portability.
-                                        if e.raw_os_error() == Some(libc::EXDEV) {
-                                            // Cross-device: copy to temp in dest dir then rename.
-                                            let pid = std::process::id();
-                                            let now = std::time::SystemTime::now()
-                                                .duration_since(std::time::UNIX_EPOCH)
-                                                .map(|d| d.as_nanos())
-                                                .unwrap_or(0);
-                                            let tmp = path
-                                                .parent()
-                                                .unwrap_or_else(|| Path::new("."))
-                                                .join(format!(".corro_save_tmp_{}_{}.corro", pid, now));
-                                            #[cfg(debug_assertions)]
-                                            {
-                                                let msg = format!(
-                                                    "DEBUG save_to_path EXDEV: copying cur={} to tmp={} path={}",
-                                                    cur.display(), tmp.display(), path.display()
-                                                );
-                                                crate::debug_log::log(&msg);
-                                                eprintln!("{}", msg);
-                                            }
-                                            std::fs::copy(&cur, &tmp)
-                                                .map_err(|e| RunError::Io(crate::io::IoError::Io(e)))?;
-                                            #[cfg(debug_assertions)]
-                                            {
-                                                if let Ok(s) = std::fs::read_to_string(&tmp) {
-                                                    let preview = if s.len() > 400 { format!("{}...[{} bytes]", &s[..400], s.len()) } else { s };
-                                                    let msg = format!("DEBUG save_to_path EXDEV: tmp_preview={}...", preview.replace('\n', "\\n"));
-                                                    crate::debug_log::log(&msg);
-                                                    eprintln!("{}", msg);
-                                                }
-                                            }
-                                        if path.exists() {
-                                            std::fs::remove_file(&path)
-                                                .map_err(|e| RunError::Io(crate::io::IoError::Io(e)))?;
-                                        }
-                                        std::fs::rename(&tmp, &path)
-                                            .map_err(|e| RunError::Io(crate::io::IoError::Io(e)))?;
-                                        // Optionally remove original unsaved file; keep it if removal fails.
-                                        let _ = std::fs::remove_file(&cur);
-                                        self.path = Some(path.clone());
-                                        self.import_source = None;
-                                        self.source_path = None;
-                                        self.revision_limit = None;
-                                        // Clear unsaved_file flag after successful cross-device copy
-                                        self.unsaved_file = None;
-                                        self.status = format!("Saved {}", path.display());
-                                        self.watcher = Some(LogWatcher::new(path.clone()).map_err(IoError::from)?);
-                                        self.refresh_linked_source_mtimes();
-                                        let meta = std::fs::metadata(&path)
-                                            .map_err(|e| RunError::Io(crate::io::IoError::Io(e)))?;
-                                        self.offset = meta.len();
-                                        return Ok(());
-                                    }
-                                    // Otherwise fall through to the filtered-reserialize fallback
-                                }
-                            }
-                        }
+                        std::fs::rename(&tmp, &path)
+                            .map_err(|e| RunError::Io(crate::io::IoError::Io(e)))?;
+                        let _ = std::fs::remove_file(&cur);
+                        self.path = Some(path.clone());
+                        self.import_source = None;
+                        self.source_path = None;
+                        self.revision_limit = None;
+                        self.unsaved_file = None;
+                        self.status = format!("Saved {}", path.display());
+                        self.watcher = Some(LogWatcher::new(path.clone()).map_err(IoError::from)?);
+                        self.refresh_linked_source_mtimes();
+                        let meta = std::fs::metadata(&path)
+                            .map_err(|e| RunError::Io(crate::io::IoError::Io(e)))?;
+                        self.offset = meta.len();
+                        return Ok(());
                     }
                 }
             }
