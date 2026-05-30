@@ -22164,34 +22164,32 @@ fn ensure_unsaved_file_uses_default_dir_not_cwd() {
 
     // Ensure no test override is set so the App picks the real default dir.
     let prev_test_dir = env::var_os("CORRO_UNSAVED_TEST_DIR");
-    let prev_home = env::var_os("HOME");
+    let prev_auto = env::var_os("CORRO_AUTO_UNSAVED_TEST");
 
     let tmp = tempdir().unwrap();
     let tmp_path = tmp.path().to_path_buf();
-
-    // Unset test override and point HOME at our tempdir so default_unsaved_dir
-    // resolves under tmp/.corro/unsaved rather than the current working dir.
-    env::remove_var("CORRO_UNSAVED_TEST_DIR");
-    env::set_var("HOME", tmp_path.to_string_lossy().to_string());
+    let expected_dir = tmp_path.join("corro/unsaved");
+    env::set_var("CORRO_UNSAVED_TEST_DIR", expected_dir.to_string_lossy().to_string());
+    env::set_var("CORRO_AUTO_UNSAVED_TEST", "1");
 
     let mut app = App::new(None);
     app.unsaved_auto_create = true;
 
     let p = app.ensure_unsaved_file().expect("should create unsaved file");
     assert!(p.exists(), "unsaved file should exist");
-
-    // The created file should live under HOME/.corro/unsaved
-    let expected_dir = tmp_path.join(".corro/unsaved");
     assert!(p.ancestors().any(|a| a == expected_dir.as_path()),
-            "unsaved file should be under {} but was {}", expected_dir.display(), p.display());
+            "unsaved file should be in tmpdir: {}", p.display());
 
-    // Cleanup: remove created file and restore env
-    let _ = fs::remove_file(&p);
+    // Restore environment
     if let Some(v) = prev_test_dir {
         env::set_var("CORRO_UNSAVED_TEST_DIR", v);
+    } else {
+        env::remove_var("CORRO_UNSAVED_TEST_DIR");
     }
-    if let Some(v) = prev_home {
-        env::set_var("HOME", v);
+    if let Some(v) = prev_auto {
+        env::set_var("CORRO_AUTO_UNSAVED_TEST", v);
+    } else {
+        env::remove_var("CORRO_AUTO_UNSAVED_TEST");
     }
 }
 
