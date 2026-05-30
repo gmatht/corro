@@ -1,0 +1,1 @@
+/root/src/vGTK/target/release/examples/demo: /root/src/vGTK/examples/demo.rs /root/src/vGTK/src/error.rs /root/src/vGTK/src/lib.rs /root/src/vGTK/src/loader.rs /root/src/vGTK/src/signals.rs /root/src/vGTK/src/symbols.rs /root/src/vGTK/src/wrappers.rs
