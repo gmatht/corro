@@ -1,0 +1,1 @@
+/root/src/rustxWidgets/target/debug/libgtk_compat.rlib: /root/src/rustxWidgets/gtk-dlopen/src/error.rs /root/src/rustxWidgets/gtk-dlopen/src/lib.rs /root/src/rustxWidgets/gtk-dlopen/src/loader.rs /root/src/rustxWidgets/gtk-dlopen/src/signals.rs /root/src/rustxWidgets/gtk-dlopen/src/symbols.rs /root/src/rustxWidgets/gtk-dlopen/src/wrappers.rs
