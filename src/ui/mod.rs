@@ -2766,39 +2766,8 @@ impl App {
             pending_quit_prev_status: None,
         };
 
-        // If there is an existing unsaved .corro in the per-user unsaved dir,
-        // bind to the most-recent one so the quick-quit / exit hint flows will
-        // treat the app as owning an untitled on-disk file. Ignore errors and
-        // be conservative: only bind when we have no explicit path yet and
-        // auto-create is enabled.
-        if app.path.is_none() && app.unsaved_auto_create {
-            let dir = Self::default_unsaved_dir();
-            if let Ok(rd) = std::fs::read_dir(&dir) {
-                let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
-                for e in rd.filter_map(|r| r.ok()) {
-                    let p = e.path();
-                    if p.extension()
-                        .and_then(|s| s.to_str())
-                        .map_or(false, |ext| ext.eq_ignore_ascii_case("corro"))
-                    {
-                        if let Ok(meta) = e.metadata() {
-                            if let Ok(mtime) = meta.modified() {
-                                match &newest {
-                                    Some((t, _)) if *t >= mtime => {}
-                                    _ => newest = Some((mtime, p)),
-                                }
-                            }
-                        }
-                    }
-                }
-                if let Some((_, pth)) = newest {
-                    app.unsaved_file = Some(pth.clone());
-                    app.path = Some(pth.clone());
-                    app.exit_message = None;
-                    app.status = format!("Resumed unsaved file: {}", pth.display());
-                }
-            }
-        }
+        // Note: explicit resume-on-start behavior was removed from startup.
+        // Use `resume_unsaved()` to bind to an existing per-user unsaved file.
         app
     }
 
@@ -2858,13 +2827,46 @@ impl App {
 
     /// Default path for Save / Save as when there is no `.corro` `path` yet.
     fn suggested_corro_save_path(&self) -> String {
+        // If we already have a path, return only the filename
         if let Some(p) = &self.path {
-            return Self::to_corro_path(p).to_string_lossy().into_owned();
+            return Self::to_corro_path(p)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| Self::to_corro_path(p).to_string_lossy().into_owned());
         }
-        if let Some(p) = self.preferred_import_source_path() {
-            return Self::to_corro_path(p).to_string_lossy().into_owned();
+
+        // Candidate directory: test override -> per-user default.
+        // Do not fall back to the current working directory: creating
+        // untitled files in the process cwd is surprising and pollutes the
+        // user's working tree.
+        let candidate_dir = std::env::var("CORRO_UNSAVED_TEST_DIR")
+            .ok()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| Self::default_unsaved_dir());
+
+        // Base name: from source stem if available, else "untitled"
+        let base = self
+            .preferred_import_source_path()
+            .and_then(|p| p.file_stem())
+            .and_then(|os| os.to_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "untitled".to_string());
+
+        // Return first non-existing candidate: base.corro, base_1.corro, ...
+        for i in 0..1000 {
+            let name = if i == 0 {
+                format!("{}.corro", base)
+            } else {
+                format!("{}_{}.corro", base, i)
+            };
+            if !candidate_dir.join(&name).exists() {
+                return name;
+            }
         }
-        String::new()
+
+        format!("{}.corro", base)
     }
 
     /// Default filename for export: same basename as `path` or `import_source` with the target extension (`file.corro` → `file.ods`). Empty when there is no path (blank still means clipboard where the prompt says so).
@@ -3623,6 +3625,9 @@ impl App {
                         self.ops_applied = replay.op_count;
                         self.import_source = None;
                         self.path = Some(p.clone());
+                        // Clear any previously auto-created unsaved-file marker when
+                        // binding to an explicit file loaded from disk.
+                        self.unsaved_file = None;
                         self.source_path = None;
                         self.revision_limit = None;
                         self.watcher = Some(LogWatcher::new(p.clone())?);
@@ -3702,6 +3707,9 @@ impl App {
                         } else {
                             self.source_path = None;
                             self.path = Some(p.clone());
+                            // Clear any previously auto-created unsaved file flag
+                            // now that the app is bound to a real .corro path.
+                            self.unsaved_file = None;
                             self.watcher = Some(LogWatcher::new(p.clone())?);
                             self.status = Self::replay_status("Loaded", p, &replay);
                         }
@@ -4295,26 +4303,9 @@ impl App {
         if cells.is_empty() {
             return false;
         }
-        let op = Op::FillRange {
-            cells: cells.clone(),
-        };
-        self.push_inverse_op(&op);
-        if let Some(ref p) = self.path.clone() {
-            let mut active_sheet = self.view_sheet_id;
-            let _ = commit_workbook_op(
-                p,
-                &mut self.offset,
-                &mut self.workbook,
-                &mut active_sheet,
-                &crate::ops::WorkbookOp::SheetOp {
-                    sheet_id: self.view_sheet_id,
-                    op,
-                },
-            );
-            self.sync_active_sheet_cache();
-        } else {
-            op.apply(&mut self.state);
-        }
+        let op = Op::FillRange { cells: cells.clone() };
+        // Centralized UI application will record undo and persist when bound.
+        let _ = self.apply_single_op(op);
         for (addr, _) in cells {
             if let CellAddr::Main { col, .. } = addr {
                 self.state.grid.auto_fit_column(MARGIN_COLS + col as usize);
@@ -4592,6 +4583,19 @@ impl App {
             if self.cursor.col == lm + mc.saturating_sub(1)
                 && trailing_blank_main_cols(&self.state) < NAV_BLANK_COLS
             {
+                #[cfg(debug_assertions)]
+                {
+                    let dbg = format!(
+                        "DEBUG move_cursor_one_col_horizontal: triggering grow_main_col_at_right pre_cursor_col={} lm={} ui_main_cols={} trailing_blank_main_cols={} NAV_BLANK_COLS={}",
+                        self.cursor.col,
+                        lm,
+                        mc,
+                        trailing_blank_main_cols(&self.state),
+                        NAV_BLANK_COLS
+                    );
+                    crate::debug_log::log(&dbg);
+                    eprintln!("{}", dbg);
+                }
                 self.state.grid.grow_main_col_at_right();
             }
             self.cursor.col = self.cursor.col.saturating_add(1);
@@ -7182,6 +7186,9 @@ impl App {
                                     self.import_source = None;
                                     self.source_path = None;
                                     self.revision_limit = None;
+                                    // Clear unsaved_file flag now that the user has
+                                    // explicitly saved the document to a final path.
+                                    self.unsaved_file = None;
                                     self.status = format!("Saved {}", path.display());
                                     // Refresh watcher bound to the new path.
                                     self.watcher = Some(LogWatcher::new(path.clone()).map_err(IoError::from)?);
@@ -7238,6 +7245,8 @@ impl App {
                                         self.import_source = None;
                                         self.source_path = None;
                                         self.revision_limit = None;
+                                        // Clear unsaved_file flag after successful cross-device copy
+                                        self.unsaved_file = None;
                                         self.status = format!("Saved {}", path.display());
                                         self.watcher = Some(LogWatcher::new(path.clone()).map_err(IoError::from)?);
                                         self.refresh_linked_source_mtimes();
@@ -7513,6 +7522,8 @@ impl App {
         self.import_source = None;
         self.source_path = None;
         self.revision_limit = None;
+        // Clear unsaved_file flag on successful explicit save.
+        self.unsaved_file = None;
         self.status = format!("Saved {}", path.display());
         if self.watcher.is_none() {
             self.watcher = Some(LogWatcher::new(path).map_err(IoError::from)?);
@@ -7577,15 +7588,89 @@ impl App {
     }
 
     fn apply_single_op(&mut self, op: Op) -> Result<(), RunError> {
+        // Centralize the common UI-path for user-visible ops: record the
+        // inverse (undo) and persist when we have a bound path, otherwise
+        // apply in-memory. Keep `apply_op_without_history` for undo/redo and
+        // other callers that intentionally bypass history creation.
+        self.apply_user_op(op)
+    }
+
+    /// Apply an operation that represents an explicit user action.
+    ///
+    /// This central helper records the inverse op for undo, ensures an
+    /// unsaved file is created when configured, commits to the on-disk log
+    /// when `self.path` is present, and applies in-memory otherwise.
+    fn apply_user_op(&mut self, op: Op) -> Result<(), RunError> {
+        // If we don't have a path yet but are configured to auto-create an
+        // unsaved per-user file on first edit, ensure it's created and bound
+        // to `self.path` so existing append/tail-apply and watcher logic
+        // behave unchanged.
+        if self.path.is_none() && self.unsaved_auto_create {
+            // Propagate errors as RunError
+            let _ = self.ensure_unsaved_file()?;
+        }
+
+        // Record inverse op for undo history (user-facing).
         self.push_inverse_op(&op);
-        self.apply_op_without_history(op)
+
+        if let Some(ref p) = self.path.clone() {
+            // Persist: ensure the active sheet cache is up-to-date so
+            // serialized addresses use the UI's current grid size.
+            self.commit_active_sheet_cache();
+            let mut active_sheet = self.view_sheet_id;
+
+            // Build a workbook-op wrapper using a clone of the op so we can
+            // pass an owned value to the commit call while retaining `op`
+            // for any further local logic (not strictly necessary here).
+            let wbo = crate::ops::WorkbookOp::SheetOp {
+                sheet_id: self.view_sheet_id,
+                op: op.clone(),
+            };
+
+            // Commit to disk and advance the tail-apply offset.
+            crate::io::commit_workbook_op(
+                p,
+                &mut self.offset,
+                &mut self.workbook,
+                &mut active_sheet,
+                &wbo,
+            )?;
+
+            // Bookkeeping after successful persist.
+            self.ops_applied = self.ops_applied.saturating_add(1);
+            self.sync_active_sheet_cache();
+            self.start_log_watcher_if_needed()?;
+        } else {
+            // In-memory apply only.
+            op.apply(&mut self.state);
+        }
+
+        Ok(())
+    }
+
+    /// Apply a UI-maintenance operation in-memory only.
+    ///
+    /// Maintenance ops are layout/render-only changes (auto-fit, auto-grow,
+    /// transient SIZE/COL_WIDTH/MAX_COL_WIDTH/FORMAT adjustments) and should
+    /// not be persisted nor added to undo history. This helper applies the
+    /// op to the in-memory state and bumps the volatile seed to indicate a
+    /// UI refresh where appropriate.
+    fn apply_ui_maint_op(&mut self, op: Op) {
+        // Do not call push_inverse_op: maintenance ops are not user-facing
+        // undo steps.
+        op.apply(&mut self.state);
+        // Some maintenance ops affect rendering; ensure volatile seed
+        // advances so any watchers of that value react.
+        self.state.grid.bump_volatile_seed();
     }
 
     fn apply_op_without_history(&mut self, op: Op) -> Result<(), RunError> {
-        // If we don't have a path yet but are configured to auto-create an
-        // unsaved per-user file on first edit, ensure it's created and bound
-        // to `self.path`. This lets the existing on-disk append/tail-apply and
-        // LogWatcher logic operate unchanged.
+        // apply_op_without_history: apply an operation but do not record an
+        // inverse in the UI history (used for undo/redo application). The
+        // operation itself should still be persisted when the app is bound
+        // to a path so the on-disk log reflects the current user-visible
+        // state.
+
         #[cfg(debug_assertions)]
         {
             let msg = format!(
@@ -7596,14 +7681,8 @@ impl App {
             eprintln!("{}", msg);
         }
         if self.path.is_none() && self.unsaved_auto_create {
-            // ignore errors here and propagate as RunError if creation fails
+            // Propagate errors as RunError
             let _ = self.ensure_unsaved_file()?;
-            #[cfg(debug_assertions)]
-            {
-                let msg = format!("DEBUG ensure_unsaved_file set path={:?}", self.path);
-                crate::debug_log::log(&msg);
-                eprintln!("{}", msg);
-            }
         }
 
         if let Some(ref p) = self.path.clone() {
@@ -7613,16 +7692,13 @@ impl App {
                 crate::debug_log::log(&msg);
                 eprintln!("{}", msg);
             }
+
             // Ensure the in-memory active sheet cache is persisted into
             // `self.workbook` so commit_workbook_op can observe the current
-            // main_cols when serializing addresses. This prevents stale
-            // workbook.sheets values from producing gutter/header addresses
-            // (e.g. `]A~6`) when the UI's grid has already grown.
+            // main_cols when serializing addresses.
             self.commit_active_sheet_cache();
 
             let mut active_sheet = self.view_sheet_id;
-            // Commit and instrument via debug traces inside commit_workbook_op
-            // and append_line/append_op paths. The call itself is unchanged.
             commit_workbook_op(
                 p,
                 &mut self.offset,
@@ -7633,10 +7709,9 @@ impl App {
                     op,
                 },
             )?;
+
             #[cfg(debug_assertions)]
             {
-                // Emit the same diagnostic both to the configured debug log and
-                // to stderr so test runs with --nocapture show the trace.
                 let wb_mc = self
                     .workbook
                     .sheets
@@ -7652,8 +7727,6 @@ impl App {
                 );
                 crate::debug_log::log(&msg);
                 eprintln!("{}", msg);
-                // Also print the list of sheets and their main_cols to help
-                // diagnose which workbook record (if any) is out-of-sync.
                 for s in &self.workbook.sheets {
                     let s_msg = format!(
                         "DEBUG workbook sheet: id={} title={} main_cols={}",
@@ -7665,6 +7738,7 @@ impl App {
                     eprintln!("{}", s_msg);
                 }
             }
+
             self.ops_applied = self.ops_applied.saturating_add(1);
             self.sync_active_sheet_cache();
             self.start_log_watcher_if_needed()?;
@@ -7762,7 +7836,43 @@ impl App {
         if let Ok(home) = env::var("HOME") {
             return PathBuf::from(home).join(".corro/unsaved");
         }
-        PathBuf::from("./corro_unsaved")
+        // As a last resort, prefer the system temporary directory over
+        // the current working directory to avoid polluting the user's
+        // working tree (e.g. repository root) with untitled files.
+        std::env::temp_dir().join("corro/unsaved")
+    }
+
+    /// Explicit resume scan to bind to most-recent unsaved file in per-user unsaved dir.
+    /// This was the previous startup behavior but is now only run on demand.
+    pub fn resume_unsaved(&mut self) {
+        if self.path.is_none() && self.unsaved_auto_create {
+            let dir = Self::default_unsaved_dir();
+            if let Ok(rd) = std::fs::read_dir(&dir) {
+                let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+                for e in rd.filter_map(|r| r.ok()) {
+                    let p = e.path();
+                    if p.extension()
+                        .and_then(|s| s.to_str())
+                        .map_or(false, |ext| ext.eq_ignore_ascii_case("corro"))
+                    {
+                        if let Ok(meta) = e.metadata() {
+                            if let Ok(mtime) = meta.modified() {
+                                match &newest {
+                                    Some((t, _)) if *t >= mtime => {}
+                                    _ => newest = Some((mtime, p)),
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some((_, pth)) = newest {
+                    self.unsaved_file = Some(pth.clone());
+                    self.path = Some(pth.clone());
+                    self.exit_message = None;
+                    self.status = format!("Resumed unsaved file: {}", pth.display());
+                }
+            }
+        }
     }
 
     /// Ensure there's an on-disk untitled `.corro` file for this App instance and
@@ -7772,6 +7882,97 @@ impl App {
             return Ok(p.clone());
         }
 
+        // Candidate directory: test override -> per-user default.
+        // Do not fall back to the current working directory: creating
+        // untitled files in the process cwd is surprising and pollutes the
+        // user's working tree.
+        let candidate_dir = std::env::var("CORRO_UNSAVED_TEST_DIR")
+            .ok()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| Self::default_unsaved_dir());
+
+        // Base name: from source stem if available, else "untitled"
+        let base = self
+            .preferred_import_source_path()
+            .and_then(|p| p.file_stem())
+            .and_then(|os| os.to_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "untitled".to_string());
+
+        // Try to create base-first filenames in candidate_dir
+        if std::fs::create_dir_all(&candidate_dir).is_ok() {
+            for i in 0..1000 {
+                let name = if i == 0 {
+                    format!("{}.corro", base)
+                } else {
+                    format!("{}_{}.corro", base, i)
+                };
+                let cand = candidate_dir.join(&name);
+                match OpenOptions::new().create_new(true).write(true).open(&cand) {
+                    Ok(_) => {
+                        #[cfg(debug_assertions)]
+                        {
+                            let msg = format!(
+                                "DEBUG ensure_unsaved_file: creating unsaved file candidate={}",
+                                cand.display()
+                            );
+                            crate::debug_log::log(&msg);
+                            eprintln!("{}", msg);
+                        }
+
+                        // When creating an untitled on-disk .corro from a linked
+                        // external source, record the log header and LINK entries
+                        // so a full reload of the file reconstructs the linked
+                        // relationship and base state. Write the header + any
+                        // per-sheet LINK lines now so later tail/reload paths
+                        // won't discard the external base when replaying only
+                        // the on-disk log.
+                        let mut initial = String::new();
+                        initial.push_str(&format!(
+                            "{} {}\n",
+                            crate::ops::LOG_HEADER_PREFIX,
+                            crate::ops::LOG_VERSION
+                        ));
+                        for sheet in &self.workbook.sheets {
+                            if let Some(source) = &sheet.linked_source {
+                                let wbo = crate::ops::WorkbookOp::LinkSheet {
+                                    id: sheet.id,
+                                    source: source.clone(),
+                                };
+                                initial.push_str(&wbo.to_log_line(sheet.state.grid.main_cols()));
+                                initial.push('\n');
+                            }
+                        }
+                        std::fs::write(&cand, initial.as_bytes())
+                            .map_err(|e| RunError::Io(crate::io::IoError::Io(e)))?;
+                        #[cfg(debug_assertions)]
+                        {
+                            let msg = format!("DEBUG ensure_unsaved_file: wrote header to {:?}", cand);
+                            crate::debug_log::log(&msg);
+                            eprintln!("{}", msg);
+                        }
+                        self.unsaved_file = Some(cand.clone());
+                        self.path = Some(cand.clone());
+                        self.exit_message = None; // clear any prior exit hint
+                        self.status = format!("Created unsaved file: {}", cand.display());
+                        let meta = std::fs::metadata(&cand).map_err(|e| RunError::Io(crate::io::IoError::Io(e)))?;
+                        self.offset = meta.len();
+                        return Ok(cand);
+                    }
+                    Err(e) => {
+                        if e.kind() == std::io::ErrorKind::AlreadyExists {
+                            // try next candidate
+                            continue;
+                        }
+                        // On other errors (permission), break to fallback
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Fallback to previous per-user unsaved dir behavior
         let dir = Self::default_unsaved_dir();
         std::fs::create_dir_all(&dir).map_err(|e| RunError::Io(crate::io::IoError::Io(e)))?;
 
@@ -7818,17 +8019,17 @@ impl App {
                 format!("unsaved-{}-{}.corro", pid, now)
             };
             let cand = dir.join(&name);
-                    match OpenOptions::new().create_new(true).write(true).open(&cand) {
-                        Ok(_) => {
-                            #[cfg(debug_assertions)]
-                            {
-                                let msg = format!(
-                                    "DEBUG ensure_unsaved_file: creating unsaved file candidate={}",
-                                    cand.display()
-                                );
-                                crate::debug_log::log(&msg);
-                                eprintln!("{}", msg);
-                            }
+            match OpenOptions::new().create_new(true).write(true).open(&cand) {
+                Ok(_) => {
+                    #[cfg(debug_assertions)]
+                    {
+                        let msg = format!(
+                            "DEBUG ensure_unsaved_file: creating unsaved file candidate={}",
+                            cand.display()
+                        );
+                        crate::debug_log::log(&msg);
+                        eprintln!("{}", msg);
+                    }
                     // When creating an untitled on-disk .corro from a linked
                     // external source, record the log header and LINK entries
                     // so a full reload of the file reconstructs the linked
@@ -11918,23 +12119,9 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
             Mode::Extrapolate => match key.code {
                 KeyCode::Enter => {
                     if let Some(op) = self.extrapolate_selection() {
-                        self.push_inverse_op(&op);
-                        if let Some(ref p) = self.path.clone() {
-                            let mut active_sheet = self.view_sheet_id;
-                            let _ = commit_workbook_op(
-                                p,
-                                &mut self.offset,
-                                &mut self.workbook,
-                                &mut active_sheet,
-                                &crate::ops::WorkbookOp::SheetOp {
-                                    sheet_id: self.view_sheet_id,
-                                    op,
-                                },
-                            );
-                            self.sync_active_sheet_cache();
-                        } else {
-                            op.apply(&mut self.state);
-                        }
+                        // Use centralized helper to record inverse op and persist
+                        // when `self.path` is present.
+                        let _ = self.apply_single_op(op);
                         self.status = "Extrapolated selection".into();
                     } else {
                         self.status = "Select cells with a pattern, then Extrapolate".into();
@@ -12498,6 +12685,21 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                                 .as_ref()
                                 .map(|a| matches!(a, CellAddr::Main { .. }))
                                 .unwrap_or(false);
+                            #[cfg(debug_assertions)]
+                            {
+                                let dbg = format!(
+                                    "DEBUG EdgeRight commit: was_edit_target_main={} edit_target_addr={:?} cursor={:?} raw={:?} ui_main_cols={} trailing_blank_main_cols={} NAV_BLANK_COLS={}",
+                                    was_edit_target_main,
+                                    self.edit_target_addr,
+                                    self.cursor,
+                                    raw,
+                                    self.state.grid.main_cols(),
+                                    trailing_blank_main_cols(&self.state),
+                                    NAV_BLANK_COLS
+                                );
+                                crate::debug_log::log(&dbg);
+                                eprintln!("{}", dbg);
+                            }
                             self.edit_cursor = None;
                             self.edit_special_palette = false;
                             *formula_cursor = None;
@@ -12783,25 +12985,8 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                     match key.code {
                         KeyCode::Char('d') | KeyCode::Char('D') => {
                             if let Some(op) = self.fill_row_pattern() {
-                                self.push_inverse_op(&op);
-                                if let Some(ref p) = self.path.clone() {
-                                    let mut active_sheet = self.view_sheet_id;
-                                    commit_workbook_op(
-                                        p,
-                                        &mut self.offset,
-                                        &mut self.workbook,
-                                        &mut active_sheet,
-                                        &crate::ops::WorkbookOp::SheetOp {
-                                            sheet_id: self.view_sheet_id,
-                                            op: op.clone(),
-                                        },
-                                    )?;
-                                    self.ops_applied = self.ops_applied.saturating_add(1);
-                                    self.sync_active_sheet_cache();
-                                    self.start_log_watcher_if_needed()?;
-                                } else {
-                                    op.apply(&mut self.state);
-                                }
+                                // Centralized apply: records inverse and persists when bound.
+                                self.apply_single_op(op.clone())?;
                                 self.status = "Filled row pattern".into();
                             } else {
                                 self.status =
@@ -12813,25 +12998,8 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                         }
                         KeyCode::Char('r') | KeyCode::Char('R') => {
                             if let Some(op) = self.fill_col_pattern() {
-                                self.push_inverse_op(&op);
-                                if let Some(ref p) = self.path.clone() {
-                                    let mut active_sheet = self.view_sheet_id;
-                                    commit_workbook_op(
-                                        p,
-                                        &mut self.offset,
-                                        &mut self.workbook,
-                                        &mut active_sheet,
-                                        &crate::ops::WorkbookOp::SheetOp {
-                                            sheet_id: self.view_sheet_id,
-                                            op: op.clone(),
-                                        },
-                                    )?;
-                                    self.ops_applied = self.ops_applied.saturating_add(1);
-                                    self.sync_active_sheet_cache();
-                                    self.start_log_watcher_if_needed()?;
-                                } else {
-                                    op.apply(&mut self.state);
-                                }
+                                // Centralized apply: records inverse and persists when bound.
+                                self.apply_single_op(op.clone())?;
                                 self.status = "Filled column pattern".into();
                             } else {
                                 self.status =
@@ -21985,6 +22153,45 @@ fn unsaved_header_and_op_committed_on_first_edit() {
         env::set_var("CORRO_AUTO_UNSAVED_TEST", v);
     } else {
         env::remove_var("CORRO_AUTO_UNSAVED_TEST");
+    }
+}
+
+#[test]
+fn ensure_unsaved_file_uses_default_dir_not_cwd() {
+    use tempfile::tempdir;
+    use std::env;
+    use std::fs;
+
+    // Ensure no test override is set so the App picks the real default dir.
+    let prev_test_dir = env::var_os("CORRO_UNSAVED_TEST_DIR");
+    let prev_home = env::var_os("HOME");
+
+    let tmp = tempdir().unwrap();
+    let tmp_path = tmp.path().to_path_buf();
+
+    // Unset test override and point HOME at our tempdir so default_unsaved_dir
+    // resolves under tmp/.corro/unsaved rather than the current working dir.
+    env::remove_var("CORRO_UNSAVED_TEST_DIR");
+    env::set_var("HOME", tmp_path.to_string_lossy().to_string());
+
+    let mut app = App::new(None);
+    app.unsaved_auto_create = true;
+
+    let p = app.ensure_unsaved_file().expect("should create unsaved file");
+    assert!(p.exists(), "unsaved file should exist");
+
+    // The created file should live under HOME/.corro/unsaved
+    let expected_dir = tmp_path.join(".corro/unsaved");
+    assert!(p.ancestors().any(|a| a == expected_dir.as_path()),
+            "unsaved file should be under {} but was {}", expected_dir.display(), p.display());
+
+    // Cleanup: remove created file and restore env
+    let _ = fs::remove_file(&p);
+    if let Some(v) = prev_test_dir {
+        env::set_var("CORRO_UNSAVED_TEST_DIR", v);
+    }
+    if let Some(v) = prev_home {
+        env::set_var("HOME", v);
     }
 }
 

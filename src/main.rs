@@ -13,6 +13,7 @@ struct Args {
     movie_menu_hold_ms: u64,
     show_help: bool,
     show_version: bool,
+    debug_no_number: bool,
 }
 
 enum RevisionMode {
@@ -36,6 +37,7 @@ fn parse_args() -> Result<Args, String> {
     let mut movie_menu_hold_ms = 1200u64;
     let mut show_help = false;
     let mut show_version = false;
+    let mut debug_no_number = false;
     let mut positional = Vec::new();
     let mut it = std::env::args().skip(1).peekable();
 
@@ -96,6 +98,14 @@ fn parse_args() -> Result<Args, String> {
                 };
                 movie_menu_hold_ms = value;
             }
+            "--debug-no-number" => {
+                // When set, emit a backtrace and panic if a SET line with a
+                // purely numeric value is about to be appended. The runtime
+                // detection reads CORRO_DEBUG_NO_NUMBER which we set in
+                // try_main after parsing (so the rest of the program can
+                // observe it as an env var).
+                debug_no_number = true;
+            }
             _ if arg.starts_with('-') => {
                 if let Some(suggested) = cli_option_suggestion(&arg) {
                     return Err(format!(
@@ -120,6 +130,7 @@ fn parse_args() -> Result<Args, String> {
         movie_menu_hold_ms,
         show_help,
         show_version,
+        debug_no_number,
     })
 }
 
@@ -216,6 +227,12 @@ fn try_main() -> (Result<(), corro::ui::RunError>, Option<String>) {
                 let _ = f;
             }
         }
+    }
+    // If requested via CLI, expose the debug-no-number flag as an env var so
+    // debug instrumentation in other modules can observe it without changing
+    // many function signatures.
+    if args.debug_no_number {
+        let _ = std::env::set_var("CORRO_DEBUG_NO_NUMBER", "1");
     }
     if args.show_help {
         println!("{}", cli_help_text());
@@ -510,6 +527,7 @@ mod tests {
             movie_menu_hold_ms,
             show_help,
             show_version,
+            debug_no_number: false,
         }
     }
 

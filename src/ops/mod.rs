@@ -1399,7 +1399,7 @@ pub fn parse_op_line(line: &str) -> Option<Op> {
 
 impl Op {
     pub fn to_log_line(&self, main_cols: usize) -> String {
-        match self {
+        let line = match self {
             Op::SetCell { addr, value } => format!("SET {} {}", addr_text(addr, main_cols), value),
             Op::FillRange { cells } => format!(
                 "FILL {}",
@@ -1499,21 +1499,22 @@ impl Op {
             }
             Op::SetAllColumnFormatRestore { per_col } => {
                 if per_col.is_empty() {
-                    return String::new();
+                    String::new()
+                } else {
+                    per_col
+                        .iter()
+                        .enumerate()
+                        .map(|(col, f)| {
+                            Op::SetColumnFormat {
+                                scope: FormatScope::All,
+                                col,
+                                format: *f,
+                            }
+                            .to_log_line(main_cols)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
                 }
-                per_col
-                    .iter()
-                    .enumerate()
-                    .map(|(col, f)| {
-                        Op::SetColumnFormat {
-                            scope: FormatScope::All,
-                            col,
-                            format: *f,
-                        }
-                        .to_log_line(main_cols)
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
             }
             Op::SetCellFormat { addr, format } => {
                 format!(
@@ -1528,7 +1529,73 @@ impl Op {
                 // encoding when used in logs elsewhere.
                 format!("SET {} {}", cref.to_log_text(main_cols), value)
             }
+        };
+
+    #[cfg(debug_assertions)]
+    {
+        let preview = if line.len() > 200 {
+            format!("{}...[{} bytes]", &line[..200], line.len())
+        } else {
+            line.clone()
+        };
+        let msg = format!(
+            "DEBUG to_log_line: main_cols={} line_len={} line_preview={}",
+            main_cols,
+            line.len(),
+            preview
+        );
+        crate::debug_log::log(&msg);
+        eprintln!("{}", msg);
+
+        let raw_bytes = line.as_bytes();
+        let hex_preview: String = raw_bytes
+            .iter()
+            .take(256)
+            .map(|b| format!("{:02X}", b))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let raw_msg = format!(
+            "DEBUG to_log_line raw_bytes: len={} hex_preview={}",
+            raw_bytes.len(),
+            hex_preview
+        );
+        crate::debug_log::log(&raw_msg);
+        eprintln!("{}", raw_msg);
+        // Additional debug-only safety: if the user requested --debug-no-number
+        // we observe the presence of the environment variable to trigger a
+        // panic when a SET line contains a bare numeric value. This is a
+        // conservative check: treat the token after the address as numeric if
+        // it matches an optional leading sign and digits (integer) or a
+        // floating point form. We purposely keep this here at the serialization
+        // boundary so we catch the exact string about to be written.
+        if std::env::var("CORRO_DEBUG_NO_NUMBER").ok().as_deref() == Some("1") {
+            // Only inspect simple SET lines (not CONTINUE_LINE or others).
+            if line.starts_with("SET ") {
+                // Find the value token: split once after first two whitespace
+                // delimited fields: SET [addr] [value...]
+                let mut parts = line.split_whitespace();
+                let _ = parts.next(); // SET
+                let _addr = parts.next();
+                if let Some(val) = parts.next() {
+                    // Numeric detection: allow optional leading +/-, digits,
+                    // optional decimal point and fraction, optional exponent.
+                    let num_like = val.parse::<f64>().is_ok();
+                    if num_like {
+                        let bt = std::backtrace::Backtrace::force_capture();
+                        let msg = format!(
+                            "DEBUG --debug-no-number triggered: about to append SET with numeric value `{}`; backtrace:\n{:?}",
+                            val, bt
+                        );
+                        crate::debug_log::log(&msg);
+                        eprintln!("{}", msg);
+                        panic!("--debug-no-number: SET with numeric output detected: {}", val);
+                    }
+                }
+            }
         }
+    }
+
+        line
     }
 }
 
@@ -2658,6 +2725,25 @@ pub fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
         );
         crate::debug_log::log(&msg);
         eprintln!("{}", msg);
+        // Also log the raw bytes (hex preview) so we can correlate any
+        // observed on-disk corruption with the exact payload handed to the
+        // writer. Keep this limited to debug builds to avoid runtime overhead
+        // in release.
+        let raw_bytes = line.as_bytes();
+        let hex_preview: String = raw_bytes
+            .iter()
+            .take(256)
+            .map(|b| format!("{:02X}", b))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let raw_msg = format!(
+            "DEBUG append_line raw_bytes: path={} len={} hex_preview={}",
+            path.display(),
+            raw_bytes.len(),
+            hex_preview
+        );
+        crate::debug_log::log(&raw_msg);
+        eprintln!("{}", raw_msg);
     }
 
     let mut f = OpenOptions::new().create(true).append(true).open(path)?;

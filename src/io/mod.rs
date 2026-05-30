@@ -367,6 +367,24 @@ pub fn commit_workbook_op(
             let append_msg = format!("DEBUG commit_workbook_op append: workbook_op={:?} -> line={}", op, line);
             crate::debug_log::log(&append_msg);
             eprintln!("{}", append_msg);
+            // Additional instrumentation: log the raw bytes that will be written
+            // to disk so we can correlate any mangled numeric values with the
+            // exact payload passed to append_line.
+            let raw_bytes = line.as_bytes();
+            let hex_preview: String = raw_bytes
+                .iter()
+                .take(256)
+                .map(|b| format!("{:02X}", b))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let raw_msg = format!(
+                "DEBUG commit_workbook_op raw_bytes: path={} len={} hex_preview={}",
+                path.display(),
+                raw_bytes.len(),
+                hex_preview
+            );
+            crate::debug_log::log(&raw_msg);
+            eprintln!("{}", raw_msg);
         }
         append_line(path, &line)?;
     }
