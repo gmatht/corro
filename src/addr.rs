@@ -1,6 +1,6 @@
 //! Shared cell-address parsing (Excel columns, global column suffixes, single-cell refs).
 
-use crate::grid::{CellAddr, HEADER_ROWS};
+use crate::grid::{CellAddr, ColumnAddr, HEADER_ROWS};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct LogicalRow(pub usize);
@@ -90,6 +90,7 @@ pub fn sheet_cursor_to_addr(
     main_rows: MainRows,
     main_cols: MainCols,
 ) -> CellAddr {
+    use crate::grid::ColumnAddr;
     let logical_row = logical_row.0;
     let global_col = global_col.0;
     let main_rows = main_rows.0;
@@ -98,7 +99,7 @@ pub fn sheet_cursor_to_addr(
     if logical_row < hr {
         CellAddr::Header {
             row: logical_row as u32,
-            col: global_col as u32,
+            col: ColumnAddr::from_global(global_col, main_cols),
         }
     } else if logical_row < hr + main_rows {
         let main_row = logical_row - hr;
@@ -121,7 +122,7 @@ pub fn sheet_cursor_to_addr(
     } else {
         CellAddr::Footer {
             row: (logical_row - hr - main_rows) as u32,
-            col: global_col as u32,
+            col: ColumnAddr::from_global(global_col, main_cols),
         }
     }
 }
@@ -135,10 +136,12 @@ pub fn addr_to_sheet_cursor(
     let main_rows = main_rows.0;
     let main_cols = main_cols.0;
     let row_col = match addr {
-        CellAddr::Header { row, col } => (LogicalRow(*row as usize), GlobalCol(*col as usize)),
+        CellAddr::Header { row, col } => {
+            (LogicalRow(*row as usize), GlobalCol(col.to_global(main_cols)))
+        }
         CellAddr::Footer { row, col } => (
             LogicalRow(crate::grid::HEADER_ROWS + main_rows + *row as usize),
-            GlobalCol(*col as usize),
+            GlobalCol(col.to_global(main_cols)),
         ),
         CellAddr::Main { row, col } => (
             LogicalRow(crate::grid::HEADER_ROWS + *row as usize),
@@ -320,11 +323,11 @@ pub fn parse_cell_ref_at(s: &str, main_cols: usize) -> Option<(CellAddr, A1RefLo
             (row_num - 1) as u32
         };
         let col = match prefix {
-            Some(true) => parse_mirror_margin_column_name(col_name, true)? as u32,
+            Some(true) => ColumnAddr::Left(parse_mirror_margin_column_name(col_name, true)?),
             Some(false) => parse_mirror_margin_column_name(col_name, false)
-                .map(|c| (crate::grid::MARGIN_COLS + main_cols + c as usize) as u32)
-                .or_else(|| Some(parse_excel_column(col_name)?))?,
-            None => crate::grid::MARGIN_COLS as u32 + parse_excel_column(col_name)?,
+                .map(ColumnAddr::Right)
+                .or_else(|| Some(ColumnAddr::Main(parse_excel_column(col_name)?)))?,
+            None => ColumnAddr::Main(parse_excel_column(col_name)?),
         };
         let addr = if marker == b'~' {
             CellAddr::Header { row, col }
@@ -384,46 +387,30 @@ pub fn cell_ref_text(addr: &CellAddr, main_cols: usize) -> String {
     match addr {
         CellAddr::Header { row, col } => {
             let row = HEADER_ROWS - *row as usize;
-            if (*col as usize) < crate::grid::MARGIN_COLS {
-                format!(
-                    "[{}~{}",
-                    mirror_margin_column_name(*col as usize, true),
-                    row
-                )
-            } else if (*col as usize) < crate::grid::MARGIN_COLS + main_cols {
-                format!(
-                    "{}~{}",
-                    excel_column_name(*col as usize - crate::grid::MARGIN_COLS),
-                    row
-                )
-            } else {
-                format!(
-                    "]{}~{}",
-                    mirror_margin_column_name(
-                        *col as usize - crate::grid::MARGIN_COLS - main_cols,
-                        false
-                    ),
-                    row
-                )
+            match col {
+                ColumnAddr::Left(idx) => {
+                    format!("[{}~{}", mirror_margin_column_name(*idx, true), row)
+                }
+                ColumnAddr::Main(idx) => {
+                    format!("{}~{}", excel_column_name(*idx as usize), row)
+                }
+                ColumnAddr::Right(idx) => {
+                    format!("]{}~{}", mirror_margin_column_name(*idx, false), row)
+                }
             }
         }
         CellAddr::Footer { row, col } => {
             let row = *row as usize + 1;
-            if (*col as usize) < crate::grid::MARGIN_COLS {
-                format!("[{}_{row}", mirror_margin_column_name(*col as usize, true))
-            } else if (*col as usize) < crate::grid::MARGIN_COLS + main_cols {
-                format!(
-                    "{}_{row}",
-                    excel_column_name(*col as usize - crate::grid::MARGIN_COLS)
-                )
-            } else {
-                format!(
-                    "]{}_{row}",
-                    mirror_margin_column_name(
-                        *col as usize - crate::grid::MARGIN_COLS - main_cols,
-                        false
-                    )
-                )
+            match col {
+                ColumnAddr::Left(idx) => {
+                    format!("[{}_{row}", mirror_margin_column_name(*idx, true))
+                }
+                ColumnAddr::Main(idx) => {
+                    format!("{}_{row}", excel_column_name(*idx as usize))
+                }
+                ColumnAddr::Right(idx) => {
+                    format!("]{}_{row}", mirror_margin_column_name(*idx, false))
+                }
             }
         }
         CellAddr::Main { row, col } => format!("{}{}", excel_column_name(*col as usize), row + 1),
@@ -611,40 +598,40 @@ mod tests {
             parse_cell_ref_at("A_3", 4).unwrap().0,
             CellAddr::Footer {
                 row: 2,
-                col: crate::grid::MARGIN_COLS as u32
+                col: crate::grid::ColumnAddr::Main(0)
             }
         );
         assert_eq!(
             parse_cell_ref_at("[A_3", 4).unwrap().0,
             CellAddr::Footer {
                 row: 2,
-                col: (crate::grid::MARGIN_COLS - 1) as u32
+                col: ColumnAddr::Left(701)
             }
         );
         assert_eq!(
-            parse_cell_ref_at("]A~3", 4).unwrap().0,
-            CellAddr::Header {
-                row: (crate::grid::HEADER_ROWS - 3) as u32,
-                col: (crate::grid::MARGIN_COLS + 4) as u32
-            }
+parse_cell_ref_at("]A~3", 4).unwrap().0,
+                    CellAddr::Header {
+                        row: (HEADER_ROWS - 3) as u32,
+                        col: crate::grid::ColumnAddr::from_global((crate::grid::MARGIN_COLS + 4) as usize, 4)
+                    }
         );
     }
 
     #[test]
     fn parses_boundary_header_footer_rows() {
         assert_eq!(
-            parse_cell_ref_at("A~999999999", 1).unwrap().0,
-            CellAddr::Header {
-                row: 0,
-                col: crate::grid::MARGIN_COLS as u32
-            }
+parse_cell_ref_at("A~999999999", 1).unwrap().0,
+                    CellAddr::Header {
+                        row: 0,
+                        col: crate::grid::ColumnAddr::Main(0)
+                    }
         );
         assert_eq!(
-            parse_cell_ref_at("A_999999999", 1).unwrap().0,
-            CellAddr::Footer {
-                row: 999_999_998,
-                col: crate::grid::MARGIN_COLS as u32
-            }
+parse_cell_ref_at("A_999999999", 1).unwrap().0,
+                    CellAddr::Footer {
+                        row: 999_999_998,
+                        col: crate::grid::ColumnAddr::Main(0)
+                    }
         );
         assert!(parse_cell_ref_at("A~1000000000", 1).is_none());
         assert!(parse_cell_ref_at("A_1000000000", 1).is_none());
@@ -682,7 +669,7 @@ mod tests {
         let addrs = [
             CellAddr::Header {
                 row: 0,
-                col: crate::grid::MARGIN_COLS as u32,
+                col: crate::grid::ColumnAddr::Left(0),
             },
             CellAddr::Left {
                 col: crate::grid::MARGIN_COLS - 1,
@@ -692,7 +679,7 @@ mod tests {
             CellAddr::Right { col: 0, row: 2 },
             CellAddr::Footer {
                 row: 0,
-                col: (crate::grid::MARGIN_COLS + 1) as u32,
+                col: crate::grid::ColumnAddr::Right(0),
             },
         ];
         for addr in addrs {

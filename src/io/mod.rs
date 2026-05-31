@@ -1,6 +1,6 @@
 //! Append-only log I/O, file watching, and tabular import for multi-instance sync.
 
-use crate::grid::CellAddr;
+use crate::grid::{CellAddr, ColumnAddr};
 use crate::ops::{
     append_line, apply_line, apply_log_line_to_workbook, apply_workbook_op, Op, SheetState,
     WorkbookOp, WorkbookSnapshot, WorkbookState, LOG_HEADER_PREFIX, LOG_VERSION,
@@ -585,13 +585,13 @@ fn import_delimited(data: &str, state: &mut SheetState, delim: char) {
         for (ci, val) in hdr.iter().enumerate() {
             if !val.is_empty() {
                 let global_col = crate::grid::MARGIN_COLS as u32 + ci as u32;
-                state.grid.set(
-                    &CellAddr::Header {
-                        row: header_idx,
-                        col: global_col,
-                    },
-                    val.clone(),
-                );
+state.grid.set(
+                     &CellAddr::Header {
+                         row: header_idx,
+                         col: ColumnAddr::from_global(global_col as usize, mc as usize),
+                     },
+                     val.clone(),
+                 );
             }
         }
     }
@@ -683,7 +683,7 @@ impl LogWatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::grid::CellAddr;
+use crate::grid::{CellAddr, ColumnAddr};
     use std::path::PathBuf;
 
     fn docs_test_path(name: &str) -> PathBuf {
@@ -831,10 +831,10 @@ mod tests {
         let op = WorkbookOp::SheetOp {
             sheet_id,
             op: Op::SetCell {
-                addr: CellAddr::Header {
-                    row: (crate::grid::HEADER_ROWS - 1) as u32,
-                    col: (crate::grid::MARGIN_COLS + 1) as u32,
-                },
+addr: CellAddr::Header {
+                        row: (crate::grid::HEADER_ROWS - 1) as u32,
+                        col: ColumnAddr::Right(0),
+                    },
                 value: "x".into(),
             },
         };
@@ -1146,7 +1146,7 @@ mod tests {
         assert_eq!(
             state
                 .grid
-                .get(&CellAddr::Header { row: (HEADER_ROWS - 1) as u32, col: crate::grid::MARGIN_COLS as u32 }),
+                .get(&CellAddr::Header { row: (HEADER_ROWS - 1) as u32, col: ColumnAddr::Main(0) }),
             None
         );
     }

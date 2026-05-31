@@ -1,4 +1,4 @@
-use corro::grid::{CellAddr, GridBox as Grid, HEADER_ROWS, MARGIN_COLS};
+use corro::grid::{CellAddr, ColumnAddr, GridBox as Grid, HEADER_ROWS, MARGIN_COLS};
 use corro::formula;
 
 #[test]
@@ -9,7 +9,7 @@ fn parse_and_write_right_margin_header_addr() {
     let right_a_global = MARGIN_COLS + mc; // global column index of ]A
     let header_addr = CellAddr::Header {
         row: (HEADER_ROWS - 1) as u32,
-        col: right_a_global as u32,
+        col: ColumnAddr::Right(0),
     };
     g.set(&header_addr, "=B".into());
     assert_eq!(g.get(&header_addr).as_deref(), Some("=B"));

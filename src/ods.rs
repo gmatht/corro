@@ -3,7 +3,7 @@
 use crate::addr::excel_column_name;
 use crate::export::{self, DelimitedExportOptions, ExportContent};
 use crate::formula::{cell_effective_display, is_formula, rebase_interop_formula_row_col};
-use crate::grid::{CellAddr, CellFormat, GridBox as Grid, NumberFormat, TextAlign, HEADER_ROWS, MARGIN_COLS};
+use crate::grid::{CellAddr, ColumnAddr, CellFormat, GridBox as Grid, NumberFormat, TextAlign, HEADER_ROWS, MARGIN_COLS};
 use crate::ops::{SheetRecord, SheetState, WorkbookSnapshot, WorkbookState};
 use quick_xml::events::Event;
 use quick_xml::Reader;
@@ -1092,7 +1092,7 @@ fn fold_numbers(func: crate::ops::AggFunc, xs: &[f64]) -> String {
 }
 
 fn footer_row_agg_func(grid: &Grid, footer_row_idx: usize) -> Option<crate::ops::AggFunc> {
-    let key_col = (MARGIN_COLS - 1) as u32;
+    let key_col = ColumnAddr::Left(MARGIN_COLS - 1);
     let val = grid.get(&CellAddr::Footer {
         row: footer_row_idx as u32,
         col: key_col,
@@ -1104,7 +1104,7 @@ fn right_col_agg_func(grid: &Grid, global_col: usize) -> Option<crate::ops::AggF
     let mut labels: Vec<(u32, String)> = grid
         .iter_nonempty()
         .filter_map(|(addr, val)| match addr {
-            CellAddr::Header { row, col } if col as usize == global_col => Some((row, val)),
+            CellAddr::Header { row, col } if col.to_global(grid.main_cols()) == global_col => Some((row, val)),
             _ => None,
         })
         .collect();
@@ -1288,7 +1288,7 @@ fn ods_cell_addr(grid: &Grid, logical_row: usize, global_col: usize) -> CellAddr
     if logical_row < hr {
         CellAddr::Header {
             row: logical_row as u32,
-            col: global_col as u32,
+            col: ColumnAddr::from_global(global_col, mc),
         }
     } else if logical_row < hr + mr {
         let main_row = (logical_row - hr) as u32;
@@ -1311,7 +1311,7 @@ fn ods_cell_addr(grid: &Grid, logical_row: usize, global_col: usize) -> CellAddr
     } else {
         CellAddr::Footer {
             row: (logical_row - hr - mr) as u32,
-            col: global_col as u32,
+            col: ColumnAddr::from_global(global_col, mc),
         }
     }
 }
@@ -1356,7 +1356,7 @@ pub fn cell_export_value_string(
 fn header_formula_or_value(grid: &Grid, row: usize, global_col: usize, main_cols: usize) -> String {
     let base = grid.text(&CellAddr::Header {
         row: row as u32,
-        col: global_col as u32,
+        col: ColumnAddr::from_global(global_col, main_cols),
     });
     if global_col < MARGIN_COLS || global_col >= MARGIN_COLS + main_cols {
         return base;
@@ -1425,7 +1425,7 @@ fn footer_formula_or_value(
 ) -> String {
     let raw = grid.text(&CellAddr::Footer {
         row: footer_row as u32,
-        col: global_col as u32,
+        col: ColumnAddr::from_global(global_col, main_cols),
     });
     if let Some(code) = subtotal_code_for_label(&raw) {
         return format!(
@@ -1744,7 +1744,7 @@ fn full_logical_addr(state: &SheetState, row: usize, col: usize) -> CellAddr {
     if row < HEADER_ROWS {
         CellAddr::Header {
             row: row as u32,
-            col: col as u32,
+            col: ColumnAddr::from_global(col, state.grid.main_cols()),
         }
     } else if row < HEADER_ROWS + state.grid.main_rows() {
         let mr = row - HEADER_ROWS;
@@ -1768,7 +1768,7 @@ fn full_logical_addr(state: &SheetState, row: usize, col: usize) -> CellAddr {
         let fr = row - HEADER_ROWS - state.grid.main_rows();
         CellAddr::Footer {
             row: fr as u32,
-            col: col as u32,
+            col: ColumnAddr::from_global(col, state.grid.main_cols()),
         }
     }
 }
@@ -1799,7 +1799,7 @@ fn place_full_logical_cell(
         let value_trim = value.trim();
         if value_trim.starts_with('=') && crate::formula::split_labeled_formula(value_trim).is_some() {
             let cell = if let Some((dr, dc)) = tsv_ods_deltas {
-                rebase_interop_formula_row_col(value_trim, -dr, -dc)
+                crate::formula::rebase_interop_formula_row_col(value_trim, -dr, -dc, state.grid.main_cols())
             } else {
                 value_trim.to_string()
             };
@@ -1808,7 +1808,7 @@ fn place_full_logical_cell(
         }
         let body = ods_openformula_body_to_cell_text(f);
         let cell = if let Some((dr, dc)) = tsv_ods_deltas {
-            rebase_interop_formula_row_col(&format!("={body}"), -dr, -dc)
+            crate::formula::rebase_interop_formula_row_col(&format!("={body}"), -dr, -dc, state.grid.main_cols())
         } else {
             format!("={body}")
         };
@@ -1835,23 +1835,31 @@ fn set_ods_cell_tsv_parity(
     if value.is_empty() && formula.is_none() {
         return;
     }
+    let need_for_gc = if gc < MARGIN_COLS {
+        1
+    } else {
+        (gc - MARGIN_COLS + 1).max(1)
+    };
+    let main_cols = state
+        .grid
+        .main_cols()
+        .max(export_main_cols.unwrap_or(0))
+        .max(need_for_gc);
     if lr >= HEADER_ROWS {
         let mri = lr - HEADER_ROWS;
         let row_need = mri + 1;
         // Never shrink: `set_main_size` truncates to smaller main_cols and can wipe the entire
         // first main row (B..) while processing A of row 2, if we used only (gc - M + 1) for A.
-        let need_for_gc = if gc < MARGIN_COLS {
-            1
-        } else {
-            (gc - MARGIN_COLS + 1).max(1)
-        };
-        let main_cols = state
-            .grid
-            .main_cols()
-            .max(export_main_cols.unwrap_or(0))
-            .max(need_for_gc);
         state.grid.set_main_size(
             state.grid.main_rows().max(row_need),
+            main_cols,
+        );
+    } else {
+        // For header rows, grow main_cols so that `from_global` used
+        // by `place_full_logical_cell` produces the correct ColumnAddr
+        // variant (Main instead of Right) for header cells.
+        state.grid.set_main_size(
+            state.grid.main_rows(),
             main_cols,
         );
     }
@@ -2171,7 +2179,7 @@ mod tests {
             Some("b2")
         );
         assert_eq!(s.grid.main_cols(), 2);
-        assert!(s.grid.get(&CellAddr::Footer { row: 0, col: 0 }).is_none());
+        assert!(s.grid.get(&CellAddr::Footer { row: 0, col: ColumnAddr::Main(0) }).is_none());
     }
 
     #[test]
@@ -2210,13 +2218,21 @@ mod tests {
         use crate::grid::HEADER_ROWS;
 
         let m = MARGIN_COLS;
-        let mut grid = crate::grid::Grid::new(1, 2);
-        grid.set(
-            &CellAddr::Header {
-                row: (HEADER_ROWS - 1) as u32,
-                col: MARGIN_COLS as u32 + 1,
+let mut grid = crate::grid::Grid::new(1, 2);
+grid.set(
+            &CellAddr::Footer {
+                row: 0,
+                col: ColumnAddr::Left(1),
             },
-            "MAX".into(),
+            "=TOTAL".into(),
+        );
+        grid.set_column_format(
+            crate::grid::FormatScope::Data,
+            (crate::grid::MARGIN_COLS - 1) as usize,
+            CellFormat {
+                number: Option::None,
+                align: None,
+            },
         );
         grid.set(&CellAddr::Main { row: 0, col: 0 }, "3".into());
         grid.set(
@@ -2276,7 +2292,7 @@ mod tests {
         grid.set(
             &CellAddr::Header {
                 row: 0,
-                col: MARGIN_COLS as u32,
+                col: ColumnAddr::Main(0),
             },
             "=TOTAL".into(),
         );
@@ -2293,9 +2309,9 @@ mod tests {
     fn export_translates_other_aggregate_labels() {
         let mut grid = crate::grid::Grid::new(1, 1);
         grid.set(
-            &CellAddr::Footer {
+&CellAddr::Footer {
                 row: 0,
-                col: (MARGIN_COLS + 0) as u32,
+                col: ColumnAddr::Main(0),
             },
             "MAX".into(),
         );
@@ -2332,7 +2348,7 @@ mod tests {
         grid.set(
             &CellAddr::Footer {
                 row: 0,
-                col: (MARGIN_COLS - 1) as u32,
+                col: ColumnAddr::Left(MARGIN_COLS - 1),
             },
             "=TOTAL".into(),
         );
@@ -2356,7 +2372,7 @@ mod tests {
         grid.set(
             &CellAddr::Footer {
                 row: 0,
-                col: (MARGIN_COLS - 1) as u32,
+                col: ColumnAddr::Left(MARGIN_COLS - 1),
             },
             "=TOTAL".into(),
         );
@@ -2593,11 +2609,11 @@ mod tests {
         let g = &wb.sheets[0].state.grid;
         let h703 = CellAddr::Header {
             row: (HEADER_ROWS - 1) as u32,
-            col: 703,
+            col: ColumnAddr::Main(1),
         };
         let h706 = CellAddr::Header {
             row: (HEADER_ROWS - 1) as u32,
-            col: 706,
+            col: ColumnAddr::Main(4),
         };
         let t703 = g.text(&h703);
         let t706 = g.text(&h706);
@@ -2762,9 +2778,9 @@ mod tests {
         let g = &back.sheets[0].state.grid;
         let t703 = g.text(&CellAddr::Header {
             row: (HEADER_ROWS - 1) as u32,
-            col: 703,
+            col: ColumnAddr::Main(1),
         });
-        assert!(t703.contains("TAX"), "TAX in 703 after 3 ODF row prefix; 706={:?}", g.text(&CellAddr::Header { row: (HEADER_ROWS - 1) as u32, col: 706 }));
+        assert!(t703.contains("TAX"), "TAX in 703 after 3 ODF row prefix; 706={:?}", g.text(&CellAddr::Header { row: (HEADER_ROWS - 1) as u32, col: ColumnAddr::Main(4) }));
     }
 
     /// Only the TSV **header** + first **data** ODF `table:table-row` (two rows), from a real
@@ -2842,7 +2858,7 @@ mod tests {
         let g = &back.sheets[0].state.grid;
         let t = g.text(&CellAddr::Header {
             row: (HEADER_ROWS - 1) as u32,
-            col: 703,
+            col: ColumnAddr::Main(1),
         });
         assert!(t.contains("TAX"), "2-row slice of real export: TAX in 703, got {t:?}");
     }
@@ -2905,7 +2921,7 @@ mod tests {
         let g = &back.sheets[0].state.grid;
         let h703 = CellAddr::Header {
             row: (HEADER_ROWS - 1) as u32,
-            col: 703,
+            col: ColumnAddr::Main(1),
         };
         let t = g.text(&h703);
         assert!(
@@ -2913,7 +2929,7 @@ mod tests {
             "isolated first `table` only: TAX must be in header col 703, got {t:?} (706={:?})",
             g.text(&CellAddr::Header {
                 row: (HEADER_ROWS - 1) as u32,
-                col: 706,
+                col: ColumnAddr::Main(4),
             })
         );
     }
@@ -3070,11 +3086,11 @@ mod tests {
         let g = &back.sheets[0].state.grid;
         let h703 = CellAddr::Header {
             row: (HEADER_ROWS - 1) as u32,
-            col: 703,
+            col: ColumnAddr::Main(1),
         };
         let h706 = CellAddr::Header {
             row: (HEADER_ROWS - 1) as u32,
-            col: 706,
+            col: ColumnAddr::Main(4),
         };
         let t = g.text(&h703);
         assert!(

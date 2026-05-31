@@ -9,7 +9,7 @@
 //! `crate::grid::CellAddr` so we can migrate incrementally without changing
 //! Grid's storage layout.
 
-use crate::grid::{CellAddr, MarginIndex, HEADER_ROWS, MARGIN_COLS};
+use crate::grid::{CellAddr, ColumnAddr, MarginIndex, HEADER_ROWS, MARGIN_COLS};
 use std::fmt;
 
 /// Row region with 1-based textual index.
@@ -93,36 +93,36 @@ impl CellRef {
         match (&self.row, &self.col) {
             (RowRegion::Header(r), ColRegion::Left(i)) => CellAddr::Header {
                 row: (HEADER_ROWS - (*r as usize)) as u32,
-                col: *i as u32,
+                col: ColumnAddr::Left(*i),
             },
             (RowRegion::Header(r), ColRegion::Right(i)) => CellAddr::Header {
                 row: (HEADER_ROWS - (*r as usize)) as u32,
-                col: (MARGIN_COLS + main_cols + *i as usize) as u32,
+                col: ColumnAddr::Right(*i),
             },
             (RowRegion::Header(r), ColRegion::Data(n)) => CellAddr::Header {
                 row: (HEADER_ROWS - (*r as usize)) as u32,
-                col: (MARGIN_COLS + (*n as usize - 1)) as u32,
+                col: ColumnAddr::Main(*n - 1),
             },
             (RowRegion::Header(r), ColRegion::Global(g)) => CellAddr::Header {
                 row: (HEADER_ROWS - (*r as usize)) as u32,
-                col: *g as u32,
+                col: ColumnAddr::from_global(*g as usize, main_cols),
             },
 
             (RowRegion::Footer(r), ColRegion::Left(i)) => CellAddr::Footer {
                 row: *r - 1,
-                col: *i as u32,
+                col: ColumnAddr::Left(*i),
             },
             (RowRegion::Footer(r), ColRegion::Right(i)) => CellAddr::Footer {
                 row: *r - 1,
-                col: (MARGIN_COLS + main_cols + *i as usize) as u32,
+                col: ColumnAddr::Right(*i),
             },
             (RowRegion::Footer(r), ColRegion::Data(n)) => CellAddr::Footer {
                 row: *r - 1,
-                col: (MARGIN_COLS + (*n as usize - 1)) as u32,
+                col: ColumnAddr::Main(*n - 1),
             },
             (RowRegion::Footer(r), ColRegion::Global(g)) => CellAddr::Footer {
                 row: *r - 1,
-                col: *g as u32,
+                col: ColumnAddr::from_global(*g as usize, main_cols),
             },
 
             (RowRegion::Data(rr), ColRegion::Left(i)) => CellAddr::Left {
@@ -163,68 +163,58 @@ impl CellRef {
     /// Build a CellRef from an existing grid::CellAddr (useful for serializing).
     pub fn from_grid(addr: &CellAddr, main_cols: usize) -> CellRef {
         match addr {
-            CellAddr::Header { row, col } => {
-                let c = *col as usize;
-                if c < MARGIN_COLS {
-                    CellRef {
-                        row: RowRegion::Header((HEADER_ROWS - *row as usize) as u32),
-                        col: ColRegion::Left(*col as usize),
-                        raw_col_fragment: Some(super::addr::mirror_margin_column_name(
-                            *col as usize,
-                            true,
-                        )),
-                        prefix: Some('['),
-                    }
-                } else if c < MARGIN_COLS + main_cols {
-                    CellRef {
-                        row: RowRegion::Header((HEADER_ROWS - *row as usize) as u32),
-                        col: ColRegion::Data((c - MARGIN_COLS) as u32 + 1),
-                        raw_col_fragment: Some(super::addr::excel_column_name(c - MARGIN_COLS)),
-                        prefix: None,
-                    }
-                } else {
-                    CellRef {
-                        row: RowRegion::Header((HEADER_ROWS - *row as usize) as u32),
-                        col: ColRegion::Right((c - MARGIN_COLS - main_cols) as usize),
-                        raw_col_fragment: Some(super::addr::mirror_margin_column_name(
-                            c - MARGIN_COLS - main_cols,
-                            false,
-                        )),
-                        prefix: Some(']'),
-                    }
-                }
-            }
-            CellAddr::Footer { row, col } => {
-                let c = *col as usize;
-                if c < MARGIN_COLS {
-                    CellRef {
-                        row: RowRegion::Footer(*row as u32 + 1),
-                        col: ColRegion::Left(*col as usize),
-                        raw_col_fragment: Some(super::addr::mirror_margin_column_name(
-                            *col as usize,
-                            true,
-                        )),
-                        prefix: Some('['),
-                    }
-                } else if c < MARGIN_COLS + main_cols {
-                    CellRef {
-                        row: RowRegion::Footer(*row as u32 + 1),
-                        col: ColRegion::Data((c - MARGIN_COLS) as u32 + 1),
-                        raw_col_fragment: Some(super::addr::excel_column_name(c - MARGIN_COLS)),
-                        prefix: None,
-                    }
-                } else {
-                    CellRef {
-                        row: RowRegion::Footer(*row as u32 + 1),
-                        col: ColRegion::Right((c - MARGIN_COLS - main_cols) as usize),
-                        raw_col_fragment: Some(super::addr::mirror_margin_column_name(
-                            c - MARGIN_COLS - main_cols,
-                            false,
-                        )),
-                        prefix: Some(']'),
-                    }
-                }
-            }
+            CellAddr::Header { row, col } => match col {
+                ColumnAddr::Left(idx) => CellRef {
+                    row: RowRegion::Header((HEADER_ROWS - *row as usize) as u32),
+                    col: ColRegion::Left(*idx),
+                    raw_col_fragment: Some(super::addr::mirror_margin_column_name(
+                        *idx,
+                        true,
+                    )),
+                    prefix: Some('['),
+                },
+                ColumnAddr::Main(idx) => CellRef {
+                    row: RowRegion::Header((HEADER_ROWS - *row as usize) as u32),
+                    col: ColRegion::Data(*idx as u32 + 1),
+                    raw_col_fragment: Some(super::addr::excel_column_name(*idx as usize)),
+                    prefix: None,
+                },
+                ColumnAddr::Right(idx) => CellRef {
+                    row: RowRegion::Header((HEADER_ROWS - *row as usize) as u32),
+                    col: ColRegion::Right(*idx),
+                    raw_col_fragment: Some(super::addr::mirror_margin_column_name(
+                        *idx,
+                        false,
+                    )),
+                    prefix: Some(']'),
+                },
+            },
+            CellAddr::Footer { row, col } => match col {
+                ColumnAddr::Left(idx) => CellRef {
+                    row: RowRegion::Footer(*row as u32 + 1),
+                    col: ColRegion::Left(*idx),
+                    raw_col_fragment: Some(super::addr::mirror_margin_column_name(
+                        *idx,
+                        true,
+                    )),
+                    prefix: Some('['),
+                },
+                ColumnAddr::Main(idx) => CellRef {
+                    row: RowRegion::Footer(*row as u32 + 1),
+                    col: ColRegion::Data(*idx as u32 + 1),
+                    raw_col_fragment: Some(super::addr::excel_column_name(*idx as usize)),
+                    prefix: None,
+                },
+                ColumnAddr::Right(idx) => CellRef {
+                    row: RowRegion::Footer(*row as u32 + 1),
+                    col: ColRegion::Right(*idx),
+                    raw_col_fragment: Some(super::addr::mirror_margin_column_name(
+                        *idx,
+                        false,
+                    )),
+                    prefix: Some(']'),
+                },
+            },
             CellAddr::Main { row, col } => CellRef {
                 row: RowRegion::Data(*row + 1),
                 col: ColRegion::Data(*col + 1),
@@ -414,7 +404,7 @@ mod tests {
         g.set_main_size(1, 3);
         let addr = CellAddr::Header {
             row: (crate::grid::HEADER_ROWS - 1) as u32,
-            col: (MARGIN_COLS + 2) as u32,
+            col: ColumnAddr::Main(2),
         };
         g.set(&addr, "=TOTAL".into());
         let cref = CellRef::from_grid(&addr, g.main_cols());

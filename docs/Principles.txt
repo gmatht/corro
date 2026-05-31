@@ -1,0 +1,2 @@
+* If we convert a column address to a integer, that should be invariant. For example col_num(]A) should always be col_num(ZZZ)+1, and col_num(ZZZ) should always be defined, regardless of the number of displayed main_cols.
+* When editing a data cell and we move out of the cell we should move to a data cell, even if the current cell hasn't be written to and thus looks blank. 

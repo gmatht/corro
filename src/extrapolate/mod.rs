@@ -2,7 +2,7 @@
 //! operations. This module intentionally provides a small, well-documented API so
 //! the UI can call into it for drag-preview and commit.
 
-use crate::grid::{CellAddr, GridBox, MainRange};
+use crate::grid::{CellAddr, ColumnAddr, GridBox, MainRange};
 use crate::formula::{translate_formula_text_by_offset, is_formula};
 
 /// Direction for a 1-D extrapolation (used by the UI when inferring values).
@@ -22,6 +22,7 @@ pub fn infer_fill_value(
     seed: &[String],
     offset_from_last: i32,
     direction: FillDirection,
+    main_cols: usize,
 ) -> Option<String> {
     let last = seed.last()?.clone();
     if is_formula(&last) {
@@ -29,7 +30,7 @@ pub fn infer_fill_value(
             FillDirection::Right => (0, offset_from_last),
             FillDirection::Down => (offset_from_last, 0),
         };
-        if let Some(translated) = translate_formula_text_by_offset(&last, row_delta, col_delta) {
+         if let Some(translated) = translate_formula_text_by_offset(&last, row_delta, col_delta, main_cols) {
             return Some(translated);
         }
     }
@@ -107,7 +108,7 @@ pub fn generate_preview(
                     // compute row/col delta in main-space relative to source top-left
                     let row_delta = r as i32 - (source.row_start as i32 + src_r as i32);
                     let col_delta = c as i32 - (source.col_start as i32 + src_c as i32);
-                    let translated = translate_formula_text_by_offset(&formula_text, row_delta, col_delta)
+                    let translated = translate_formula_text_by_offset(&formula_text, row_delta, col_delta, grid.main_cols())
                         .unwrap_or_else(|| formula_text.clone());
                     out.push(PreviewCell {
                         addr: CellAddr::Main { row: r, col: c },
@@ -154,7 +155,7 @@ pub fn generate_preview(
             } else {
                 c as i32 - last_col as i32
             };
-            let inferred = infer_fill_value(&seeds, offset, if vertical { FillDirection::Down } else { FillDirection::Right });
+            let inferred = infer_fill_value(&seeds, offset, if vertical { FillDirection::Down } else { FillDirection::Right }, grid.main_cols());
             let value = inferred.unwrap_or_else(|| seeds.last().cloned().unwrap_or_default());
             out.push(PreviewCell { addr: CellAddr::Main { row: r, col: c }, value });
         }

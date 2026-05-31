@@ -187,7 +187,7 @@ mod tests {
         g.set(
             &CellAddr::Header {
                 row: (HEADER_ROWS - 1) as u32,
-                col: MARGIN_COLS as u32 + 1,
+                col: crate::grid::ColumnAddr::Main(1),
             },
             "=A*0.1 -- TAX".into(),
         );

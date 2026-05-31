@@ -4,7 +4,7 @@ use crate::addr::{
     corner_locks_for_bbox, excel_column_name, formula_cell_ref_text, parse_cell_ref_at,
     parse_main_range_formula_at, A1RefLocks,
 };
-use crate::grid::{CellAddr, GridBox as Grid, MainRange, HEADER_ROWS, MARGIN_COLS};
+use crate::grid::{CellAddr, ColumnAddr, GridBox as Grid, MainRange, HEADER_ROWS, MARGIN_COLS};
 use crate::ops::{AggFunc, WorkbookState};
 use std::cell::RefCell;
 
@@ -336,17 +336,18 @@ fn translate_range(
 
 /// Shift A1 cell references in an interop `=…` string by `(row_delta, col_delta)` (main-cell units).
 /// Used for generic export so the pasted file’s top-left is Excel A1. On parse failure, returns `s`.
-pub fn rebase_interop_formula_row_col(s: &str, row_delta: i32, col_delta: i32) -> String {
+pub fn rebase_interop_formula_row_col(s: &str, row_delta: i32, col_delta: i32, main_cols: usize) -> String {
     if row_delta == 0 && col_delta == 0 {
         return s.to_string();
     }
-    translate_formula_text_by_offset(s, row_delta, col_delta).unwrap_or_else(|| s.to_string())
+    translate_formula_text_by_offset(s, row_delta, col_delta, main_cols).unwrap_or_else(|| s.to_string())
 }
 
 pub fn translate_formula_text_by_offset(
     raw: &str,
     row_delta: i32,
     col_delta: i32,
+    main_cols: usize,
 ) -> Option<String> {
     if row_delta == 0 && col_delta == 0 {
         return Some(raw.trim().to_string());
@@ -370,7 +371,7 @@ pub fn translate_formula_text_by_offset(
     if parser.i != parser.s.len() {
         return None;
     }
-    let translated = translate_ast_by_offset(&ast, row_delta, col_delta)?;
+    let translated = translate_ast_by_offset(&ast, row_delta, col_delta, main_cols)?;
     let mut out = format!("={}", render_ast(&translated));
     if let Some(ref label) = label_opt {
         out.push_str(" -- ");
@@ -597,26 +598,26 @@ fn translate_cell_addr_insert_main_cols(
             col: shift_if_unlocked_col(*col, locks, gap_start, delta)?,
         },
         CellAddr::Header { row, col } => {
-            let gc = *col as usize;
+            let gc = col.to_global(main_cols);
             if gc >= MARGIN_COLS && gc < MARGIN_COLS + main_cols {
                 let mc = (gc - MARGIN_COLS) as u32;
                 let nmc = shift_if_unlocked_col(mc, locks, gap_start, delta)?;
                 CellAddr::Header {
                     row: *row,
-                    col: (MARGIN_COLS + nmc as usize) as u32,
+                    col: ColumnAddr::from_global(MARGIN_COLS + nmc as usize, main_cols),
                 }
             } else {
                 addr.clone()
             }
         }
         CellAddr::Footer { row, col } => {
-            let gc = *col as usize;
+            let gc = col.to_global(main_cols);
             if gc >= MARGIN_COLS && gc < MARGIN_COLS + main_cols {
                 let mc = (gc - MARGIN_COLS) as u32;
                 let nmc = shift_if_unlocked_col(mc, locks, gap_start, delta)?;
                 CellAddr::Footer {
                     row: *row,
-                    col: (MARGIN_COLS + nmc as usize) as u32,
+                    col: ColumnAddr::from_global(MARGIN_COLS + nmc as usize, main_cols),
                 }
             } else {
                 addr.clone()
@@ -1061,6 +1062,7 @@ fn translate_cell_addr_by_offset(
     row_delta: i32,
     col_delta: i32,
     locks: &A1RefLocks,
+    main_cols: usize,
 ) -> Option<CellAddr> {
     let shift_u32 = |v: u32, delta: i32| -> Option<u32> {
         if delta >= 0 {
@@ -1070,14 +1072,20 @@ fn translate_cell_addr_by_offset(
         }
     };
     match addr {
-        CellAddr::Header { row, col } => Some(CellAddr::Header {
-            row: shift_u32(*row, row_delta)?,
-            col: shift_u32(*col, col_delta)?,
-        }),
-        CellAddr::Footer { row, col } => Some(CellAddr::Footer {
-            row: shift_u32(*row, row_delta)?,
-            col: shift_u32(*col, col_delta)?,
-        }),
+        CellAddr::Header { row, col } => {
+            let gc = col.to_global(main_cols);
+            Some(CellAddr::Header {
+                row: shift_u32(*row, row_delta)?,
+                col: ColumnAddr::from_global(shift_u32(gc as u32, col_delta)? as usize, main_cols),
+            })
+        }
+        CellAddr::Footer { row, col } => {
+            let gc = col.to_global(main_cols);
+            Some(CellAddr::Footer {
+                row: shift_u32(*row, row_delta)?,
+                col: ColumnAddr::from_global(shift_u32(gc as u32, col_delta)? as usize, main_cols),
+            })
+        }
         CellAddr::Main { row, col } => Some(CellAddr::Main {
             row: if locks.row_absolute {
                 *row
@@ -1107,6 +1115,7 @@ fn translate_range_by_offset(
     locks_br: A1RefLocks,
     row_delta: i32,
     col_delta: i32,
+    main_cols: usize,
 ) -> Option<(MainRange, A1RefLocks, A1RefLocks)> {
     let tl = translate_cell_addr_by_offset(
         &CellAddr::Main {
@@ -1116,6 +1125,7 @@ fn translate_range_by_offset(
         row_delta,
         col_delta,
         &locks_tl,
+        main_cols,
     )?;
     let br = translate_cell_addr_by_offset(
         &CellAddr::Main {
@@ -1125,6 +1135,7 @@ fn translate_range_by_offset(
         row_delta,
         col_delta,
         &locks_br,
+        main_cols,
     )?;
     let (r1, c1, r2, c2) = match (tl, br) {
         (
@@ -1156,13 +1167,13 @@ fn translate_range_by_offset(
     ))
 }
 
-fn translate_ast_by_offset(ast: &Ast, row_delta: i32, col_delta: i32) -> Option<Ast> {
+fn translate_ast_by_offset(ast: &Ast, row_delta: i32, col_delta: i32, main_cols: usize) -> Option<Ast> {
     Some(match ast {
         Ast::Number(n) => Ast::Number(n.clone()),
         Ast::Text(s) => Ast::Text(s.clone()),
         Ast::Name(name) => Ast::Name(name.clone()),
         Ast::Ref { addr, locks } => Ast::Ref {
-            addr: translate_cell_addr_by_offset(addr, row_delta, col_delta, locks)?,
+            addr: translate_cell_addr_by_offset(addr, row_delta, col_delta, locks, main_cols)?,
             locks: *locks,
         },
         Ast::SheetRef {
@@ -1171,7 +1182,7 @@ fn translate_ast_by_offset(ast: &Ast, row_delta: i32, col_delta: i32) -> Option<
             locks,
         } => Ast::SheetRef {
             sheet_id: *sheet_id,
-            addr: translate_cell_addr_by_offset(addr, row_delta, col_delta, locks)?,
+            addr: translate_cell_addr_by_offset(addr, row_delta, col_delta, locks, main_cols)?,
             locks: *locks,
         },
         Ast::Range {
@@ -1180,43 +1191,43 @@ fn translate_ast_by_offset(ast: &Ast, row_delta: i32, col_delta: i32) -> Option<
             locks_br,
         } => {
             let (rng, otl, obr) =
-                translate_range_by_offset(range, *locks_tl, *locks_br, row_delta, col_delta)?;
+                translate_range_by_offset(range, *locks_tl, *locks_br, row_delta, col_delta, main_cols)?;
             Ast::Range {
                 range: rng,
                 locks_tl: otl,
                 locks_br: obr,
             }
         }
-        Ast::Neg(a) => Ast::Neg(Box::new(translate_ast_by_offset(a, row_delta, col_delta)?)),
+        Ast::Neg(a) => Ast::Neg(Box::new(translate_ast_by_offset(a, row_delta, col_delta, main_cols)?)),
         Ast::Add(a, b) => Ast::Add(
-            Box::new(translate_ast_by_offset(a, row_delta, col_delta)?),
-            Box::new(translate_ast_by_offset(b, row_delta, col_delta)?),
+            Box::new(translate_ast_by_offset(a, row_delta, col_delta, main_cols)?),
+            Box::new(translate_ast_by_offset(b, row_delta, col_delta, main_cols)?),
         ),
         Ast::Sub(a, b) => Ast::Sub(
-            Box::new(translate_ast_by_offset(a, row_delta, col_delta)?),
-            Box::new(translate_ast_by_offset(b, row_delta, col_delta)?),
+            Box::new(translate_ast_by_offset(a, row_delta, col_delta, main_cols)?),
+            Box::new(translate_ast_by_offset(b, row_delta, col_delta, main_cols)?),
         ),
         Ast::Mul(a, b) => Ast::Mul(
-            Box::new(translate_ast_by_offset(a, row_delta, col_delta)?),
-            Box::new(translate_ast_by_offset(b, row_delta, col_delta)?),
+            Box::new(translate_ast_by_offset(a, row_delta, col_delta, main_cols)?),
+            Box::new(translate_ast_by_offset(b, row_delta, col_delta, main_cols)?),
         ),
         Ast::Div(a, b) => Ast::Div(
-            Box::new(translate_ast_by_offset(a, row_delta, col_delta)?),
-            Box::new(translate_ast_by_offset(b, row_delta, col_delta)?),
+            Box::new(translate_ast_by_offset(a, row_delta, col_delta, main_cols)?),
+            Box::new(translate_ast_by_offset(b, row_delta, col_delta, main_cols)?),
         ),
         Ast::Pow(a, b) => Ast::Pow(
-            Box::new(translate_ast_by_offset(a, row_delta, col_delta)?),
-            Box::new(translate_ast_by_offset(b, row_delta, col_delta)?),
+            Box::new(translate_ast_by_offset(a, row_delta, col_delta, main_cols)?),
+            Box::new(translate_ast_by_offset(b, row_delta, col_delta, main_cols)?),
         ),
         Ast::Concat(a, b) => Ast::Concat(
-            Box::new(translate_ast_by_offset(a, row_delta, col_delta)?),
-            Box::new(translate_ast_by_offset(b, row_delta, col_delta)?),
+            Box::new(translate_ast_by_offset(a, row_delta, col_delta, main_cols)?),
+            Box::new(translate_ast_by_offset(b, row_delta, col_delta, main_cols)?),
         ),
         Ast::Call { name, args } => Ast::Call {
             name: name.clone(),
             args: args
                 .iter()
-                .map(|a| translate_ast_by_offset(a, row_delta, col_delta))
+                .map(|a| translate_ast_by_offset(a, row_delta, col_delta, main_cols))
                 .collect::<Option<Vec<_>>>()?,
         },
     })
@@ -1440,7 +1451,7 @@ fn templated_formula(grid: &Grid, addr: &CellAddr) -> Option<String> {
 
     let header_addr = CellAddr::Header {
         row: (HEADER_ROWS - 1) as u32,
-        col: (MARGIN_COLS as u32) + *col,
+        col: ColumnAddr::from_global(MARGIN_COLS + *col as usize, grid.main_cols()),
     };
     // Avoid treating margin-aggregate directives (e.g. `=TOTAL`, `==SUM`) as
     // header templates. If the raw header text is an aggregate key, skip
@@ -1467,7 +1478,7 @@ fn templated_formula(grid: &Grid, addr: &CellAddr) -> Option<String> {
             let right_header_col = (MARGIN_COLS as u32) + mc + rmi;
             let right_header_addr = CellAddr::Header {
                 row: (HEADER_ROWS - 1) as u32,
-                col: right_header_col,
+                col: ColumnAddr::from_global(right_header_col as usize, grid.main_cols()),
             };
             if let Some(raw) = grid.get(&right_header_addr) {
                 if crate::ops::margin_key_agg_func(&raw).is_none() {
@@ -1499,7 +1510,7 @@ pub fn export_templated_formula(grid: &Grid, addr: &CellAddr) -> Option<String> 
 pub fn main_column_label_from_header(grid: &Grid, main_col: usize) -> Option<String> {
     let header_addr = CellAddr::Header {
         row: (HEADER_ROWS - 1) as u32,
-        col: (MARGIN_COLS as u32) + main_col as u32,
+        col: ColumnAddr::from_global(MARGIN_COLS + main_col, grid.main_cols()),
     };
     control_formula_label(grid, &header_addr)
 }
@@ -2948,7 +2959,7 @@ mod tests {
         let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(1, 1));
         let addr = CellAddr::Header {
             row: (HEADER_ROWS - 1) as u32,
-            col: (MARGIN_COLS + 1) as u32,
+            col: ColumnAddr::from_global(MARGIN_COLS + 1, g.main_cols()),
         };
         g.set(&addr, "=ToTaL".into());
         assert_eq!(cell_effective_display(&g, &addr), "TOTAL");
@@ -2959,7 +2970,7 @@ mod tests {
         let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(1, 1));
         let addr = CellAddr::Header {
             row: (HEADER_ROWS - 1) as u32,
-            col: (MARGIN_COLS + 1) as u32,
+            col: ColumnAddr::from_global(MARGIN_COLS + 1, g.main_cols()),
         };
         g.set(&addr, "==ToTaL".into());
         assert_eq!(cell_effective_display(&g, &addr), "TOTAL");
@@ -3179,10 +3190,10 @@ mod tests {
     #[test]
     fn translate_formula_text_by_offset_shifts_relative_only() {
         assert_eq!(
-            translate_formula_text_by_offset("=$A$1+B2", 1, 1).unwrap(),
+            translate_formula_text_by_offset("=$A$1+B2", 1, 1, 0).unwrap(),
             "=($A$1+C3)"
         );
-        assert_eq!(translate_formula_text_by_offset("=A1", 1, 0).unwrap(), "=A2");
+        assert_eq!(translate_formula_text_by_offset("=A1", 1, 0, 0).unwrap(), "=A2");
     }
 
     #[test]
@@ -3221,10 +3232,9 @@ mod tests {
         let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(2, 3));
         let mc = g.main_cols();
         // Right-margin column immediately to the right of main block (]A)
-        let right_a = (MARGIN_COLS + mc) as u32;
         let header_addr_a = CellAddr::Header {
             row: (HEADER_ROWS - 1) as u32,
-            col: right_a,
+            col: ColumnAddr::from_global(MARGIN_COLS + mc, g.main_cols()),
         };
         g.set(&header_addr_a, "=B".into());
 
@@ -3237,10 +3247,9 @@ mod tests {
         assert_eq!(templated_formula(&g, &main_addr), Some("=B1".into()));
 
         // ]B (next right-margin) maps to second-last main column.
-        let right_b = (MARGIN_COLS + mc + 1) as u32;
         let header_addr_b = CellAddr::Header {
             row: (HEADER_ROWS - 1) as u32,
-            col: right_b,
+            col: ColumnAddr::from_global(MARGIN_COLS + mc + 1, g.main_cols()),
         };
         g.set(&header_addr_b, "=C".into());
         let main_addr_b = CellAddr::Main {
@@ -4296,7 +4305,7 @@ mod tests {
         g.set(
             &CellAddr::Header {
                 row: (HEADER_ROWS - 1) as u32,
-                col: MARGIN_COLS as u32 + 1,
+                col: ColumnAddr::from_global(MARGIN_COLS + 1, g.main_cols()),
             },
             "=A*2 -- POW2".into(),
         );
@@ -4316,7 +4325,7 @@ mod tests {
                 &g,
                 &CellAddr::Header {
                     row: (HEADER_ROWS - 1) as u32,
-                    col: MARGIN_COLS as u32 + 1,
+                    col: ColumnAddr::from_global(MARGIN_COLS + 1, g.main_cols()),
                 },
             ),
             "POW2"
@@ -4329,7 +4338,7 @@ mod tests {
         g.set(
             &CellAddr::Header {
                 row: (HEADER_ROWS - 1) as u32,
-                col: MARGIN_COLS as u32 + 1,
+                col: ColumnAddr::from_global(MARGIN_COLS + 1, g.main_cols()),
             },
             "=A*0.1 -- TAX".into(),
         );

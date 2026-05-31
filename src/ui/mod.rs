@@ -11,7 +11,7 @@ use crate::formula::{
     format_number_cell_display, is_formula,
 };
 use crate::grid::{
-    CellAddr, CellFormat, FormatScope, GridBox as Grid, MainRange, MarginIndex, NumberFormat,
+    CellAddr, CellFormat, ColumnAddr, FormatScope, GridBox as Grid, MainRange, MarginIndex, NumberFormat,
     SortSpec, TextAlign, FOOTER_ROWS, HEADER_ROWS, MARGIN_COLS, DEFAULT_MAX_COL_WIDTH,
 };
 use crate::io::{
@@ -1059,12 +1059,13 @@ impl App {
         seed: &[String],
         offset_from_last: i32,
         direction: FillDirection,
+        main_cols: usize,
     ) -> Option<String> {
         let dir = match direction {
             FillDirection::Right => crate::extrapolate::FillDirection::Right,
             FillDirection::Down => crate::extrapolate::FillDirection::Down,
         };
-        crate::extrapolate::infer_fill_value(seed, offset_from_last, dir)
+        crate::extrapolate::infer_fill_value(seed, offset_from_last, dir, main_cols)
     }
     /// Captures Edit buffer / caret before replacing [`Self::mode`] with the menu bar.
     ///
@@ -2132,7 +2133,7 @@ fn trailing_blank_main_cols(state: &SheetState) -> usize {
 fn header_template_applies(grid: &Grid, main_col: usize) -> bool {
     let raw = grid.get(&CellAddr::Header {
         row: (HEADER_ROWS - 1) as u32,
-        col: (MARGIN_COLS as u32) + main_col as u32,
+        col: ColumnAddr::Main(main_col as u32),
     });
     // Consider any non-empty header cell as contributing to the visible
     // main-column window. Previously this checked only for formula-like
@@ -2196,10 +2197,9 @@ fn left_margin_template_applies(grid: &Grid, main_row: usize) -> bool {
 // ── Display-time aggregate helpers ───────────────────────────────────────────
 
 fn footer_row_agg_func(grid: &Grid, footer_row_idx: usize) -> Option<AggFunc> {
-    let key_col = (MARGIN_COLS - 1) as u32;
     let val = grid.get(&CellAddr::Footer {
         row: footer_row_idx as u32,
-        col: key_col,
+        col: ColumnAddr::Left(MARGIN_COLS - 1),
     })?;
     crate::ops::margin_key_agg_func(&val)
 }
@@ -2208,7 +2208,7 @@ fn right_col_agg_func(grid: &Grid, global_col: usize) -> Option<AggFunc> {
     let mut labels: Vec<(u32, String)> = grid
         .iter_nonempty()
         .filter_map(|(addr, val)| match addr {
-            CellAddr::Header { row, col } if col as usize == global_col => Some((row, val)),
+            CellAddr::Header { row, col } if col.to_global(grid.main_cols()) == global_col => Some((row, val)),
             _ => None,
         })
         .collect();
@@ -3321,7 +3321,7 @@ impl App {
         for (addr, _) in self.state.grid.iter_nonempty() {
             match addr {
                 CellAddr::Header { col, .. } | CellAddr::Footer { col, .. } => {
-                    cols.insert(col as usize);
+                    cols.insert(col.to_global(self.state.grid.main_cols()));
                 }
                 _ => {}
             }
@@ -3427,6 +3427,8 @@ impl App {
     }
 
     fn reload_workbook_from_log_path(&mut self, path: &Path) -> Result<(), IoError> {
+        let saved_cursor = self.cursor;
+        let saved_main_cols = self.state.grid.main_cols();
         let data = std::fs::read_to_string(path).map_err(IoError::Io)?;
         let mut workbook = WorkbookState::new();
         let mut active_sheet = workbook.sheet_id(workbook.active_sheet);
@@ -3438,6 +3440,23 @@ impl App {
         self.fit_active_sheet_after_load();
         self.offset = data.len() as u64;
         self.ops_applied = replay.op_count;
+        // Restore cursor to its pre-reload global position.
+        self.cursor = saved_cursor;
+        // If the cursor was in the main area before reload and the new grid
+        // is too small to keep it there, grow the grid so the column label
+        // (A, B, C, …) stays the same.  This preserves cursor-driven grid
+        // growth that is not persisted as a SetMainSize op in the log.
+        let was_in_main = saved_cursor.col >= MARGIN_COLS
+            && saved_cursor.col < MARGIN_COLS + saved_main_cols;
+        let current_main_cols = self.state.grid.main_cols();
+        if was_in_main {
+            let needed_main_cols = (saved_cursor.col - MARGIN_COLS + 1).max(current_main_cols);
+            if needed_main_cols > current_main_cols {
+                self.state.grid
+                    .set_main_size(self.state.grid.main_rows(), needed_main_cols);
+                self.commit_active_sheet_cache();
+            }
+        }
         self.refresh_linked_source_mtimes();
         Ok(())
     }
@@ -3918,7 +3937,7 @@ impl App {
         let mut cells = Vec::new();
         for col in (end_col + 1)..self.state.grid.main_cols() as u32 {
             let value =
-                self.infer_fill_value(&seed, col as i32 - end_col as i32, FillDirection::Right)?;
+                self.infer_fill_value(&seed, col as i32 - end_col as i32, FillDirection::Right, self.state.grid.main_cols())?;
             cells.push((CellAddr::Main { row: main_row, col }, value));
         }
         if cells.is_empty() {
@@ -3952,7 +3971,7 @@ impl App {
         let mut cells = Vec::new();
         for row in (end_row + 1)..self.state.grid.main_rows() as u32 {
             let value =
-                self.infer_fill_value(&seed, row as i32 - end_row as i32, FillDirection::Down)?;
+                self.infer_fill_value(&seed, row as i32 - end_row as i32, FillDirection::Down, self.state.grid.main_cols())?;
             cells.push((CellAddr::Main { row, col: main_col }, value));
         }
         if cells.is_empty() {
@@ -4059,6 +4078,7 @@ impl App {
                                 &seed,
                                 offset,
                                 crate::extrapolate::FillDirection::Right,
+                                main_cols as usize,
                             ) {
                                 filled.insert((main_row, main_col));
                                 cells.push((addr, value));
@@ -4148,6 +4168,7 @@ impl App {
                                 &seed,
                                 offset,
                                 crate::extrapolate::FillDirection::Down,
+                                main_cols as usize,
                             ) {
                                 filled.insert((main_row, main_col));
                                 cells.push((addr, value));
@@ -4175,7 +4196,7 @@ impl App {
         if row < hr {
             Some(CellAddr::Header {
                 row: row as u32,
-                col: col as u32,
+                col: ColumnAddr::from_global(col, mc),
             })
         } else if row < hr + mr {
             let mri = row - hr;
@@ -4200,7 +4221,7 @@ impl App {
         } else if row < hr + mr + FOOTER_ROWS {
             Some(CellAddr::Footer {
                 row: (row - hr - mr) as u32,
-                col: col as u32,
+                col: ColumnAddr::from_global(col, mc),
             })
         } else {
             None
@@ -4248,7 +4269,7 @@ impl App {
                 for a in addrs {
                     grid.set(
                         a,
-                        Self::formula_text_for_range_cell(anchor, a, buffer),
+                        Self::formula_text_for_range_cell(anchor, a, buffer, grid.main_cols()),
                     );
                 }
             } else {
@@ -4266,7 +4287,7 @@ impl App {
         if row < hr {
             Some(CellAddr::Header {
                 row: row as u32,
-                col: col as u32,
+                col: ColumnAddr::from_global(col, mc),
             })
         } else if row < hr + mr {
             let mri = row - hr;
@@ -4291,7 +4312,7 @@ impl App {
         } else if row < hr + mr + FOOTER_ROWS {
             Some(CellAddr::Footer {
                 row: (row - hr - mr) as u32,
-                col: col as u32,
+                col: ColumnAddr::from_global(col, mc),
             })
         } else {
             None
@@ -4716,7 +4737,7 @@ impl App {
 
     /// Apply the same edit buffer to `dest` relative to the active cell `anchor`. For `=…`
     /// formulas this shifts non-`$`-locked refs like Excel (anchor cell keeps the text as typed).
-    fn formula_text_for_range_cell(anchor: &CellAddr, dest: &CellAddr, raw: &str) -> String {
+    fn formula_text_for_range_cell(anchor: &CellAddr, dest: &CellAddr, raw: &str, main_cols: usize) -> String {
         if !is_formula(raw) {
             return raw.to_string();
         }
@@ -4732,7 +4753,7 @@ impl App {
         };
         let row_delta = *row as i32 - *ar as i32;
         let col_delta = *col as i32 - *ac as i32;
-        translate_formula_text_by_offset(raw, row_delta, col_delta)
+        translate_formula_text_by_offset(raw, row_delta, col_delta, main_cols)
             .unwrap_or_else(|| raw.to_string())
     }
 
@@ -4772,6 +4793,7 @@ impl App {
         addrs: &[CellAddr],
         anchor: &CellAddr,
         raw_value: &str,
+        main_cols: usize,
     ) -> Option<Op> {
         if !is_formula(raw_value) {
             return None;
@@ -4786,7 +4808,7 @@ impl App {
         };
         let base_row_delta = range.row_start as i32 - *anchor_row as i32;
         let base_col_delta = range.col_start as i32 - *anchor_col as i32;
-        let base_value = translate_formula_text_by_offset(raw_value, base_row_delta, base_col_delta)
+        let base_value = translate_formula_text_by_offset(raw_value, base_row_delta, base_col_delta, main_cols)
             .unwrap_or_else(|| raw_value.to_string());
         Some(Op::RelFillRange {
             range,
@@ -4824,13 +4846,13 @@ impl App {
                     .or_else(|| addrs.first())
                     .expect("multiple edit targets");
                 if addrs.iter().all(|a| {
-                    let expected = Self::formula_text_for_range_cell(anchor, a, &value);
+                    let expected = Self::formula_text_for_range_cell(anchor, a, &value, self.state.grid.main_cols());
                     self.state.grid.get(a).as_deref().unwrap_or("") == expected.as_str()
                 }) {
                     self.pending_fit_to_content_on_commit = false;
                     return Ok(());
                 }
-                let op = Self::relative_fill_op_for_main_range(addrs, anchor, &value).unwrap_or_else(
+                let op = Self::relative_fill_op_for_main_range(addrs, anchor, &value, self.state.grid.main_cols()).unwrap_or_else(
                     || {
                         let cells: Vec<(CellAddr, String)> = addrs
                             .iter()
@@ -4838,7 +4860,7 @@ impl App {
                             .map(|a| {
                                 (
                                     a.clone(),
-                                    Self::formula_text_for_range_cell(anchor, &a, &value),
+                                    Self::formula_text_for_range_cell(anchor, &a, &value, self.state.grid.main_cols()),
                                 )
                             })
                             .collect();
@@ -5010,7 +5032,7 @@ impl App {
         let key_col = MARGIN_COLS - 1;
         let matches_key = match addr {
             CellAddr::Left { col, .. } => *col == key_col,
-            CellAddr::Footer { col, .. } => *col as usize == key_col,
+            CellAddr::Footer { col, .. } => col.to_global(self.state.grid.main_cols()) == key_col,
             _ => false,
         };
         if !matches_key {
@@ -5498,7 +5520,7 @@ impl App {
                 MARGIN_COLS + self.state.grid.main_cols() + col as usize,
             ),
             CellAddr::Header { col, .. } | CellAddr::Footer { col, .. } => {
-                self.fit_column_to_rendered_content(col as usize)
+                self.fit_column_to_rendered_content(col.to_global(self.state.grid.main_cols()))
             }
         }
     }
@@ -5513,7 +5535,7 @@ impl App {
                 MARGIN_COLS + self.state.grid.main_cols() + col as usize,
             ),
             CellAddr::Header { col, .. } | CellAddr::Footer { col, .. } => {
-                self.fit_column_to_rendered_content(col as usize)
+                self.fit_column_to_rendered_content(col.to_global(self.state.grid.main_cols()))
             }
         }
     }
@@ -5671,7 +5693,7 @@ impl App {
             for (addr, _) in self.state.grid.iter_nonempty() {
                 match addr {
                     CellAddr::Header { col: hcol, .. } | CellAddr::Footer { col: hcol, .. }
-                        if (hcol as usize) == col =>
+                        if hcol.to_global(self.state.grid.main_cols()) == col =>
                     {
                         if let Some(raw) = self.state.grid.get(&addr) {
                             let t = raw.trim();
@@ -6008,7 +6030,7 @@ impl App {
         for (addr, _) in self.state.grid.iter_nonempty() {
             match addr {
                 CellAddr::Header { col, .. } | CellAddr::Footer { col, .. }
-                    if col as usize == global_col =>
+                    if col.to_global(main_cols) == global_col =>
                 {
                     let mut measured = None;
                     if let Some(raw) = self.state.grid.get(&addr) {
@@ -6415,21 +6437,23 @@ impl App {
 
     /// Rebuild header rows after inserting a full duplicate line under row `h` (`h+1` < `HEADER_ROWS`).
     fn mitosis_header_row_shift_within_band(&mut self, h: u32, hr: u32) -> Result<bool, RunError> {
-        let mut old: HashMap<(u32, u32), String> = HashMap::new();
+        let mut old: HashMap<(u32, ColumnAddr), String> = HashMap::new();
         for (addr, v) in self.state.grid.iter_nonempty() {
             if let CellAddr::Header { row, col } = addr {
                 old.insert((row, col), v);
             }
         }
 
-        let mut newm: HashMap<(u32, u32), String> = HashMap::new();
+        let mut newm: HashMap<(u32, ColumnAddr), String> = HashMap::new();
         for ((r, c), v) in &old {
             if *r < h {
                 newm.insert((*r, *c), v.clone());
             }
         }
+        let mut seen_cols = HashSet::new();
+        let col_addrs: Vec<ColumnAddr> = old.keys().filter_map(|(_, c)| if seen_cols.insert(*c) { Some(*c) } else { None }).collect();
         for r in (h + 1)..hr {
-            for c in 0u32..self.state.grid.total_cols() as u32 {
+            for &c in &col_addrs {
                 if let Some(v) = old.get(&(r, c)) {
                     if r + 1 < hr {
                         newm.insert((r + 1, c), v.clone());
@@ -6437,7 +6461,7 @@ impl App {
                 }
             }
         }
-        for c in 0u32..self.state.grid.total_cols() as u32 {
+        for &c in &col_addrs {
             if let Some(v) = old.get(&(h, c)) {
                 newm.insert((h, c), v.clone());
                 newm.insert((h + 1, c), v.clone());
@@ -6461,7 +6485,7 @@ impl App {
     fn mitosis_header_last_row_into_new_main_0(&mut self) -> Result<bool, RunError> {
         let hr = HEADER_ROWS;
         let h = (hr - 1) as u32;
-        let mut line: HashMap<u32, String> = HashMap::new();
+        let mut line: HashMap<ColumnAddr, String> = HashMap::new();
         for (addr, v) in self.state.grid.iter_nonempty() {
             if let CellAddr::Header { row, col } = addr {
                 if row == h {
@@ -6476,8 +6500,8 @@ impl App {
 
         let mc = self.state.grid.main_cols();
         let mut fill: Vec<(CellAddr, String)> = Vec::new();
-        for (gc_u, v) in &line {
-            let gc = *gc_u as usize;
+        for (col_addr, v) in &line {
+            let gc = col_addr.to_global(mc);
             if let Some(a) = self.global_to_main_col0_addr_for_main_band(gc, mc) {
                 fill.push((a, v.clone()));
             }
@@ -6559,20 +6583,22 @@ impl App {
 
     fn mitosis_footer_row_shift_within_band(&mut self, f: u32) -> Result<bool, RunError> {
         let fr = FOOTER_ROWS as u32;
-        let mut old: HashMap<(u32, u32), String> = HashMap::new();
+        let mut old: HashMap<(u32, ColumnAddr), String> = HashMap::new();
         for (addr, v) in self.state.grid.iter_nonempty() {
             if let CellAddr::Footer { row, col } = addr {
                 old.insert((row, col), v);
             }
         }
-        let mut newm: HashMap<(u32, u32), String> = HashMap::new();
+        let mut newm: HashMap<(u32, ColumnAddr), String> = HashMap::new();
         for ((r, c), v) in &old {
             if *r < f {
                 newm.insert((*r, *c), v.clone());
             }
         }
+        let mut seen_cols = HashSet::new();
+        let col_addrs: Vec<ColumnAddr> = old.keys().filter_map(|(_, c)| if seen_cols.insert(*c) { Some(*c) } else { None }).collect();
         for r in (f + 1)..fr {
-            for c in 0u32..self.state.grid.total_cols() as u32 {
+            for &c in &col_addrs {
                 if let Some(v) = old.get(&(r, c)) {
                     if r + 1 < fr {
                         newm.insert((r + 1, c), v.clone());
@@ -6580,7 +6606,7 @@ impl App {
                 }
             }
         }
-        for c in 0u32..self.state.grid.total_cols() as u32 {
+        for &c in &col_addrs {
             if let Some(v) = old.get(&(f, c)) {
                 newm.insert((f, c), v.clone());
                 newm.insert((f + 1, c), v.clone());
@@ -6603,9 +6629,9 @@ impl App {
 
     fn apply_fill_replacing_region_map(
         &mut self,
-        old: &HashMap<(u32, u32), String>,
-        newm: &HashMap<(u32, u32), String>,
-        key_to_addr: impl Fn((u32, u32)) -> CellAddr,
+        old: &HashMap<(u32, ColumnAddr), String>,
+        newm: &HashMap<(u32, ColumnAddr), String>,
+        key_to_addr: impl Fn((u32, ColumnAddr)) -> CellAddr,
     ) -> Result<(), RunError> {
         let mut fill: Vec<(CellAddr, String)> = Vec::new();
         for (k, v) in newm {
@@ -6753,13 +6779,13 @@ impl App {
         for (addr, v) in self.state.grid.iter_nonempty() {
             match &addr {
                 CellAddr::Header { col, .. } => {
-                    let g = *col as usize;
+                    let g = col.to_global(main_cols);
                     if g >= gbase && g < gbase + m {
                         old.insert(addr, v);
                     }
                 }
                 CellAddr::Footer { col, .. } => {
-                    let g = *col as usize;
+                    let g = col.to_global(main_cols);
                     if g >= gbase && g < gbase + m {
                         old.insert(addr, v);
                     }
@@ -6782,14 +6808,14 @@ impl App {
         for (a, v) in &old {
             match a {
                 CellAddr::Header { row, col } => {
-                    let l = *col as usize - gbase;
+                    let l = col.to_global(main_cols) - gbase;
                     h_lines
                         .entry(*row)
                         .or_default()
                         .insert(l, v.clone());
                 }
                 CellAddr::Footer { row, col } => {
-                    let l = *col as usize - gbase;
+                    let l = col.to_global(main_cols) - gbase;
                     f_lines
                         .entry(*row)
                         .or_default()
@@ -6811,7 +6837,7 @@ impl App {
                 new.insert(
                     CellAddr::Header {
                         row,
-                        col: (gbase + l) as u32,
+                        col: ColumnAddr::from_global(gbase + l, main_cols),
                     },
                     val,
                 );
@@ -6822,7 +6848,7 @@ impl App {
                 new.insert(
                     CellAddr::Footer {
                         row,
-                        col: (gbase + l) as u32,
+                        col: ColumnAddr::from_global(gbase + l, main_cols),
                     },
                     val,
                 );
@@ -8245,10 +8271,10 @@ impl App {
         }
 
         let (row, col) = match addr {
-            CellAddr::Header { row, col } => (*row as usize, *col as usize),
+            CellAddr::Header { row, col } => (*row as usize, col.to_global(self.state.grid.main_cols())),
             CellAddr::Main { row, col } => (HEADER_ROWS + *row as usize, MARGIN_COLS + *col as usize),
             CellAddr::Footer { row, col } => {
-                (HEADER_ROWS + self.state.grid.main_rows() + *row as usize, *col as usize)
+                (HEADER_ROWS + self.state.grid.main_rows() + *row as usize, col.to_global(self.state.grid.main_cols()))
             }
             CellAddr::Left { row, col } => (HEADER_ROWS + *row as usize, *col as usize),
             CellAddr::Right { row, col } => {
@@ -9282,6 +9308,27 @@ impl App {
         }
     }
 
+    /// Sync the cursor's main-grid position as a floor for shrink_to_content.
+    /// Only constrains shrinking when the cursor is in the main grid region
+    /// (not left/right margins, not header/footer bands).
+    fn sync_cursor_floor(&mut self) {
+        let grid = &self.state.grid;
+        let cursor = &self.cursor;
+        let mc = grid.main_cols();
+        let mr = grid.main_rows();
+        let min_col = if cursor.col >= MARGIN_COLS && cursor.col < MARGIN_COLS + mc {
+            (cursor.col - MARGIN_COLS + 1) as u32
+        } else {
+            0
+        };
+        let min_row = if cursor.row >= HEADER_ROWS && cursor.row < HEADER_ROWS + mr {
+            (cursor.row - HEADER_ROWS + 1) as u32
+        } else {
+            0
+        };
+        self.state.grid.set_min_extent(min_row, min_col);
+    }
+
     pub fn run(&mut self) -> Result<(), RunError> {
         enable_raw_mode()?;
         let mut stdout = stdout();
@@ -9294,6 +9341,7 @@ impl App {
             let mut pending_redraw = true;
             let mut last_paint = Instant::now();
             loop {
+                self.sync_cursor_floor();
                 if self.sync_external()? {
                     pending_redraw = true;
                 }
@@ -9464,7 +9512,7 @@ impl App {
                     .or_else(|| addrs.first())
                     .expect("multi-edit addresses");
                 for a in addrs {
-                    g.set(a, Self::formula_text_for_range_cell(anchor, a, buffer));
+                    g.set(a, Self::formula_text_for_range_cell(anchor, a, buffer, self.state.grid.main_cols()));
                 }
             } else {
                 let addr = self.cursor.to_addr(&self.state.grid);
@@ -13860,7 +13908,7 @@ mod tests {
 
         let header_addr = CellAddr::Header {
             row: (HEADER_ROWS - 1) as u32,
-            col: right_a_global as u32,
+            col: ColumnAddr::from_global(right_a_global, app.state.grid.main_cols()),
         };
         assert_eq!(app.state.grid.get(&header_addr).as_deref(), Some("=B"));
 
@@ -13892,7 +13940,7 @@ mod tests {
         // Sanity: edit_target_addr should match the header cell.
         let expected_header_addr = CellAddr::Header {
             row: (HEADER_ROWS - 1) as u32,
-            col: right_a_global as u32,
+            col: ColumnAddr::from_global(right_a_global, app.state.grid.main_cols()),
         };
         assert_eq!(app.edit_target_addr, Some(expected_header_addr.clone()));
 
@@ -13924,15 +13972,14 @@ mod tests {
         };
 
         // Sanity check: starting address is the D header.
-        assert_eq!(app.cursor.to_addr(&app.state.grid), CellAddr::Header { row: (HEADER_ROWS - 1) as u32, col: (MARGIN_COLS + d_main) as u32 });
+        assert_eq!(app.cursor.to_addr(&app.state.grid), CellAddr::Header { row: (HEADER_ROWS - 1) as u32, col: ColumnAddr::Main(d_main as u32) });
 
         // Simulate Right arrow
         app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::empty())).unwrap();
 
         let addr = app.cursor.to_addr(&app.state.grid);
         // Expect header E (~1 at next main column)
-        let expected_col = (MARGIN_COLS + d_main + 1) as u32;
-        assert_eq!(addr, CellAddr::Header { row: (HEADER_ROWS - 1) as u32, col: expected_col });
+        assert_eq!(addr, CellAddr::Header { row: (HEADER_ROWS - 1) as u32, col: ColumnAddr::Main((d_main + 1) as u32) });
     }
 
     #[test]
@@ -13954,8 +14001,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_secs(1));
 
         let addr = app.cursor.to_addr(&app.state.grid);
-        let expected_col = (MARGIN_COLS + d_main + 1) as u32;
-        assert_eq!(addr, CellAddr::Header { row: (HEADER_ROWS - 1) as u32, col: expected_col });
+        assert_eq!(addr, CellAddr::Header { row: (HEADER_ROWS - 1) as u32, col: ColumnAddr::Main((d_main + 1) as u32) });
     }
 
     #[test]
@@ -14006,7 +14052,7 @@ mod tests {
 
         let header_addr = CellAddr::Header {
             row: (HEADER_ROWS - 1) as u32,
-            col: target_global as u32,
+            col: ColumnAddr::from_global(target_global, app.state.grid.main_cols()),
         };
         assert_eq!(app.state.grid.get(&header_addr).as_deref(), Some("=B"));
 
@@ -14040,8 +14086,7 @@ mod tests {
         // column (the E header / next main column or newly-grown main col).
         app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::empty())).unwrap();
         let addr = app.cursor.to_addr(&app.state.grid);
-        let expected_col = (MARGIN_COLS + d_main + 1) as u32;
-        assert_eq!(addr, CellAddr::Header { row: (HEADER_ROWS - 1) as u32, col: expected_col });
+        assert_eq!(addr, CellAddr::Header { row: (HEADER_ROWS - 1) as u32, col: ColumnAddr::Main((d_main + 1) as u32) });
     }
 
     #[test]
@@ -15197,7 +15242,7 @@ mod tests {
         let mut app = App::new(None);
         app.state
             .grid
-            .set(&CellAddr::Header { row: 0, col: 0 }, "∞".into());
+            .set(&CellAddr::Header { row: 0, col: ColumnAddr::Main(0) }, "∞".into());
         app.cursor = SheetCursor { row: 0, col: 0 };
         app.mode = Mode::Menu {
             stack: vec![MenuLevel {
@@ -15284,8 +15329,8 @@ mod tests {
 
     #[test]
     fn special_value_choices_cover_margin_cells() {
-        assert!(!special_value_choices(&CellAddr::Header { row: 0, col: 0 }).is_empty());
-        assert!(!special_value_choices(&CellAddr::Footer { row: 0, col: 0 }).is_empty());
+        assert!(!special_value_choices(&CellAddr::Header { row: 0, col: ColumnAddr::Main(0) }).is_empty());
+        assert!(!special_value_choices(&CellAddr::Footer { row: 0, col: ColumnAddr::Main(0) }).is_empty());
         assert!(!special_value_choices(&CellAddr::Left { col: 0, row: 0 }).is_empty());
         assert!(!special_value_choices(&CellAddr::Right { col: 0, row: 0 }).is_empty());
         assert!(special_value_choices(&CellAddr::Main { row: 0, col: 0 }).is_empty());
@@ -15328,7 +15373,7 @@ mod tests {
         app.state.grid.set(
             &CellAddr::Header {
                 row: (HEADER_ROWS - 1) as u32,
-                col: MARGIN_COLS as u32 + 1,
+                col: ColumnAddr::Main(1),
             },
             "=A*2 -- POW2".into(),
         );
@@ -15808,7 +15853,7 @@ mod tests {
         app.state.grid.set(
             &CellAddr::Header {
                 row: (HEADER_ROWS - 1) as u32,
-                col: MARGIN_COLS as u32 + 2,
+                col: ColumnAddr::Main(2),
             },
             "=TOTAL".into(),
         );
@@ -16300,7 +16345,7 @@ mod tests {
         state.grid.set(
             &CellAddr::Header {
                 row: (HEADER_ROWS - 1) as u32,
-                col: right_col as u32,
+                col: ColumnAddr::from_global(right_col, state.grid.main_cols()),
             },
             "=TOTAL".into(),
         );
@@ -16321,7 +16366,7 @@ mod tests {
         state.grid.set(
             &CellAddr::Header {
                 row: 0,
-                col: (MARGIN_COLS + 2) as u32,
+                col: ColumnAddr::Main(2),
             },
             "=TOTAL".into(),
         );
@@ -16351,7 +16396,7 @@ mod tests {
         state.grid.set(
             &CellAddr::Header {
                 row: 0,
-                col: (MARGIN_COLS + 2) as u32,
+                col: ColumnAddr::Main(2),
             },
             "=TOTAL".into(),
         );
@@ -16666,14 +16711,14 @@ mod tests {
         state.grid.set(
             &CellAddr::Header {
                 row: 0,
-                col: (MARGIN_COLS + 2) as u32,
+                col: ColumnAddr::Main(2),
             },
             "=TOTAL".into(),
         );
         state.grid.set(
             &CellAddr::Header {
                 row: (HEADER_ROWS - 1) as u32,
-                col: (MARGIN_COLS + 2) as u32,
+                col: ColumnAddr::Main(2),
             },
             "".into(),
         );
@@ -16722,7 +16767,7 @@ mod tests {
         app.state.grid.set(
             &CellAddr::Header {
                 row: (HEADER_ROWS - 1) as u32,
-                col: (MARGIN_COLS + app.state.grid.main_cols() + 1) as u32,
+                col: ColumnAddr::Right(1),
             },
             "=TOTAL".into(),
         );
@@ -16801,7 +16846,7 @@ mod tests {
         state.grid.set(
             &CellAddr::Header {
                 row: (HEADER_ROWS - 1) as u32,
-                col: right_col as u32,
+                col: ColumnAddr::from_global(right_col, state.grid.main_cols()),
             },
             "=TOTAL".into(),
         );
@@ -16899,7 +16944,7 @@ mod tests {
         app.state.grid.set(
             &CellAddr::Header {
                 row: (HEADER_ROWS - 1) as u32,
-                col: (MARGIN_COLS + app.state.grid.main_cols() + 1) as u32,
+                col: ColumnAddr::Right(1),
             },
             "=TOTAL".into(),
         );
@@ -16959,7 +17004,7 @@ mod tests {
         app.state.grid.set(
             &CellAddr::Header {
                 row: (HEADER_ROWS - 1) as u32,
-                col: MARGIN_COLS as u32 + 3,
+                col: ColumnAddr::Main(3),
             },
             "=TOTAL".into(),
         );
@@ -17008,7 +17053,7 @@ mod tests {
             state.grid.set(
                 &CellAddr::Header {
                     row: (HEADER_ROWS - 1) as u32,
-                    col: (right_start + i) as u32,
+                    col: ColumnAddr::from_global(right_start + i, state.grid.main_cols()),
                 },
                 "=TOTAL".into(),
             );
@@ -17201,14 +17246,14 @@ mod tests {
         app.state.grid.set(
             &CellAddr::Header {
                 row: (HEADER_ROWS - 1) as u32,
-                col: MARGIN_COLS as u32 + 1,
+                col: ColumnAddr::Main(1),
             },
             "HDR-B".into(),
         );
         app.state.grid.set(
             &CellAddr::Footer {
                 row: 0,
-                col: MARGIN_COLS as u32 + 1,
+                col: ColumnAddr::Main(1),
             },
             "FTR-B".into(),
         );
@@ -19255,7 +19300,7 @@ mod tests {
         for (addr, v) in app.state.grid.iter_nonempty() {
             if v.trim().contains("2001/01/01") {
                 let col_index = match addr {
-                    CellAddr::Header { col, .. } | CellAddr::Footer { col, .. } => col as usize,
+                    CellAddr::Header { col, .. } | CellAddr::Footer { col, .. } => col.to_global(app.state.grid.main_cols()),
                     CellAddr::Main { col, .. } => MARGIN_COLS + col as usize,
                     CellAddr::Left { col, .. } => col as usize,
                     CellAddr::Right { col, .. } => MARGIN_COLS + app.state.grid.main_cols() + col as usize,
@@ -19420,7 +19465,7 @@ mod tests {
             for (addr, _v) in app.state.grid.iter_nonempty() {
                 match addr {
                     CellAddr::Header { col, .. } | CellAddr::Footer { col, .. } => {
-                        nonblank_cols_set.insert(col as usize);
+                        nonblank_cols_set.insert(col.to_global(app.state.grid.main_cols()));
                     }
                     CellAddr::Main { col, .. } => {
                         nonblank_cols_set.insert(MARGIN_COLS + col as usize);
@@ -19666,7 +19711,7 @@ mod tests {
         app.state.grid.set(
             &CellAddr::Header {
                 row: (HEADER_ROWS - 1) as u32,
-                col: MARGIN_COLS as u32,
+                col: ColumnAddr::Main(0),
             },
             "Hdr".into(),
         );
@@ -19890,10 +19935,10 @@ mod tests {
             .set(&CellAddr::Main { row: 0, col: 2 }, "right".into());
         app.state
             .grid
-            .set(&CellAddr::Header { row: 0, col: (MARGIN_COLS + 1) as u32 }, "hdr".into());
+            .set(&CellAddr::Header { row: 0, col: ColumnAddr::Main(1) }, "hdr".into());
         app.state
             .grid
-            .set(&CellAddr::Footer { row: 0, col: (MARGIN_COLS + 1) as u32 }, "ftr".into());
+            .set(&CellAddr::Footer { row: 0, col: ColumnAddr::Main(1) }, "ftr".into());
         app.cursor = SheetCursor {
             row: HEADER_ROWS,
             col: MARGIN_COLS + 1,
@@ -19936,7 +19981,7 @@ mod tests {
                 .grid
                 .get(&CellAddr::Header {
                     row: 0,
-                    col: (MARGIN_COLS + 2) as u32
+                    col: ColumnAddr::Main(2)
                 })
                 .as_deref(),
             Some("hdr")
@@ -19946,7 +19991,7 @@ mod tests {
                 .grid
                 .get(&CellAddr::Footer {
                     row: 0,
-                    col: (MARGIN_COLS + 2) as u32
+                    col: ColumnAddr::Main(2)
                 })
                 .as_deref(),
             Some("ftr")
@@ -19962,7 +20007,7 @@ mod tests {
             .set(&CellAddr::Main { row: 0, col: 0 }, "data".into());
         app.state
             .grid
-            .set(&CellAddr::Header { row: 0, col: 0 }, "h0".into());
+            .set(&CellAddr::Header { row: 0, col: ColumnAddr::Main(0) }, "h0".into());
         app.cursor = SheetCursor {
             row: HEADER_ROWS - 1,
             col: MARGIN_COLS,
@@ -19996,7 +20041,7 @@ mod tests {
             .set(
                 &CellAddr::Header {
                     row: (HEADER_ROWS - 2) as u32,
-                    col: 0,
+                    col: ColumnAddr::Left(0),
                 },
                 "t".into(),
             );
@@ -20012,7 +20057,7 @@ mod tests {
                 .grid
                 .get(&CellAddr::Header {
                     row: (HEADER_ROWS - 2) as u32,
-                    col: 0
+                    col: ColumnAddr::Left(0)
                 })
                 .as_deref(),
             Some("t")
@@ -20022,7 +20067,7 @@ mod tests {
                 .grid
                 .get(&CellAddr::Header {
                     row: (HEADER_ROWS - 1) as u32,
-                    col: 0
+                    col: ColumnAddr::Left(0)
                 })
                 .as_deref(),
             Some("t")
@@ -21258,7 +21303,7 @@ fn tsv_footer_key_subtotal_computed(
     let CellAddr::Footer { col, .. } = cell_addr else {
         return None;
     };
-    if *col as usize != MARGIN_COLS - 1 {
+    if col.to_global(grid.main_cols()) != MARGIN_COLS - 1 {
         return None;
     }
     let raw = grid.get(cell_addr).unwrap_or_default();
@@ -22202,3 +22247,4 @@ fn unsaved_app_path_set_and_file_nonempty_after_commit() {
         env::remove_var("CORRO_AUTO_UNSAVED_TEST");
     }
 }
+

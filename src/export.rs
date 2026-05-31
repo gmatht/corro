@@ -1,7 +1,7 @@
 //! TSV and CSV export for the main data region.
 
 use crate::formula;
-use crate::grid::{CellAddr, GridBox as Grid, FOOTER_ROWS, HEADER_ROWS, MARGIN_COLS};
+use crate::grid::{CellAddr, ColumnAddr, GridBox as Grid, FOOTER_ROWS, HEADER_ROWS, MARGIN_COLS};
 use std::collections::HashSet;
 use std::io::Write;
 use zip::write::FileOptions;
@@ -540,12 +540,12 @@ fn interop_odf_function_commas_to_semicolons(s: &str) -> String {
     out
 }
 
-fn finish_generic_interop(s: String, rebase: Option<(i32, i32)>) -> String {
+fn finish_generic_interop(grid: &Grid, s: String, rebase: Option<(i32, i32)>) -> String {
     let Some((d_row, d_col)) = rebase else {
         return s;
     };
     if s.trim_start().starts_with('=') {
-        formula::rebase_interop_formula_row_col(&s, d_row, d_col)
+         formula::rebase_interop_formula_row_col(&s, d_row, d_col, grid.main_cols())
     } else {
         s
     }
@@ -701,7 +701,7 @@ pub fn generic_interop_cell_text(
     let raw_stored = grid.text(&addr);
     if !raw_stored.is_empty() && !formula::is_formula(&raw_stored) {
         if crate::ods::subtotal_code_for_label(&raw_stored).is_some() {
-            return Some(finish_generic_interop(raw_stored, rebase));
+            return Some(finish_generic_interop(grid, raw_stored, rebase));
         }
     }
 
@@ -710,23 +710,23 @@ pub fn generic_interop_cell_text(
     // labeled `=TOTAL` would otherwise synthesize `=TOTAL` for every main cell from the row
     // template before we can emit `=SUM(…)` for the amount columns.
     if let Some(agg) = left_margin_row_aggregate_formula(grid, logical_row, global_col) {
-        let s1 = finish_generic_interop(agg, rebase);
+        let s1 = finish_generic_interop(grid, agg, rebase);
         return Some(after_rebase(&s1, excel_list_arg_comma));
     }
 
     if let Some(agg) = right_margin_row_aggregate_formula(grid, logical_row, global_col) {
-        let s1 = finish_generic_interop(agg, rebase);
+        let s1 = finish_generic_interop(grid, agg, rebase);
         return Some(after_rebase(&s1, excel_list_arg_comma));
     }
 
     if let Some(agg) = footer_column_aggregate_formula(grid, logical_row, global_col) {
-        let s1 = finish_generic_interop(agg, rebase);
+        let s1 = finish_generic_interop(grid, agg, rebase);
         return Some(after_rebase(&s1, excel_list_arg_comma));
     }
 
     if let Some(tf) = formula::export_templated_formula(grid, &addr) {
         let s0 = crate::ods::ods_labeled_prefix_strip_to_formula(&tf).unwrap_or(tf);
-        let s1 = finish_generic_interop(s0, rebase);
+        let s1 = finish_generic_interop(grid, s0, rebase);
         return Some(after_rebase(&s1, excel_list_arg_comma));
     }
 
@@ -738,18 +738,18 @@ pub fn generic_interop_cell_text(
             if logical_row == HEADER_ROWS - 1 {
                 return Some(after_rebase(label, excel_list_arg_comma));
             }
-            let s1 = finish_generic_interop(v, rebase);
+            let s1 = finish_generic_interop(grid, v, rebase);
             return Some(after_rebase(&s1, excel_list_arg_comma));
         }
         if let Some(st) = crate::ods::ods_labeled_prefix_strip_to_formula(&v) {
-            let s1 = finish_generic_interop(st, rebase);
+            let s1 = finish_generic_interop(grid, st, rebase);
             return Some(after_rebase(&s1, excel_list_arg_comma));
         }
     }
     if let Some(raw) = grid.get(&addr) {
         if formula::is_formula(&raw) {
             if let Some(st) = crate::ods::ods_labeled_prefix_strip_to_formula(&raw) {
-                let s1 = finish_generic_interop(st, rebase);
+                let s1 = finish_generic_interop(grid, st, rebase);
                 return Some(after_rebase(&s1, excel_list_arg_comma));
             }
         }
@@ -770,10 +770,11 @@ fn aggregate_formula_name(raw: &str) -> Option<&'static str> {
 }
 
 fn right_margin_aggregate_formula_name(grid: &Grid, global_col: usize) -> Option<&'static str> {
+    let main_cols = grid.main_cols();
     let mut labels: Vec<(u32, String)> = grid
         .iter_nonempty()
         .filter_map(|(addr, val)| match addr {
-            CellAddr::Header { row, col } if col as usize == global_col => Some((row, val)),
+            CellAddr::Header { row, col } if col.to_global(main_cols) == global_col => Some((row, val)),
             _ => None,
         })
         .collect();
@@ -907,6 +908,7 @@ fn footer_column_aggregate_formula(
     global_col: usize,
 ) -> Option<String> {
     let main_rows = grid.main_rows();
+    let main_cols = grid.main_cols();
     if logical_row < HEADER_ROWS + main_rows {
         return None;
     }
@@ -916,7 +918,7 @@ fn footer_column_aggregate_formula(
     let footer_row = logical_row - HEADER_ROWS - main_rows;
     let key = grid.text(&CellAddr::Footer {
         row: footer_row as u32,
-        col: (MARGIN_COLS - 1) as u32,
+        col: ColumnAddr::from_global(MARGIN_COLS - 1, main_cols),
     });
     let func = aggregate_formula_name(&key)?;
     let exported_col = global_col - MARGIN_COLS;
@@ -948,7 +950,7 @@ fn cell_value_at(grid: &Grid, logical_row: usize, global_col: usize) -> String {
         let r = logical_row as u32;
         grid.text(&CellAddr::Header {
             row: r,
-            col: global_col as u32,
+            col: ColumnAddr::from_global(global_col, mc),
         })
     } else if logical_row < hr + mr {
         let mri = logical_row - hr;
@@ -976,7 +978,7 @@ fn cell_value_at(grid: &Grid, logical_row: usize, global_col: usize) -> String {
         let r = fr_idx as u32;
         grid.text(&CellAddr::Footer {
             row: r,
-            col: global_col as u32,
+            col: ColumnAddr::from_global(global_col, mc),
         })
     }
 }
@@ -995,6 +997,7 @@ fn rendered_value_at(grid: &Grid, logical_row: usize, global_col: usize) -> Stri
 fn rendered_value_at_ascii(grid: &Grid, logical_row: usize, global_col: usize) -> String {
     let hr = HEADER_ROWS;
     let mr = grid.main_rows();
+    let mc = grid.main_cols();
     let lm = MARGIN_COLS;
 
     if logical_row >= hr && logical_row < hr + mr && global_col < lm {
@@ -1012,7 +1015,7 @@ fn rendered_value_at_ascii(grid: &Grid, logical_row: usize, global_col: usize) -
         let footer_row = logical_row - hr - mr;
         let addr = CellAddr::Footer {
             row: footer_row as u32,
-            col: (lm - 1) as u32,
+            col: ColumnAddr::from_global(lm - 1, mc),
         };
         let raw = grid.text(&addr);
         if crate::ods::subtotal_code_for_label(&raw).is_some() {
@@ -1569,7 +1572,7 @@ mod tests {
     /// no-op and refs stay in grid-space (`A1` instead of the exported sheet’s `C3`).
     #[test]
     fn rebase_interop_shifts_max_with_semicolon_list_separator() {
-        let out = crate::formula::rebase_interop_formula_row_col("=MAX(A1:A5;A7:A9)", 2, 2);
+        let out = crate::formula::rebase_interop_formula_row_col("=MAX(A1:A5;A7:A9)", 2, 2, 4);
         assert_eq!(out, "=MAX(C3:C7,C9:C11)");
     }
 
@@ -1941,12 +1944,12 @@ mod tests {
     #[test]
     fn tsv_export_keeps_left_margin_columns() {
         let mut grid = crate::grid::Grid::new(2, 2);
-        grid.set(&CellAddr::Header { row: 0, col: 0 }, "HDR".into());
+        grid.set(&CellAddr::Header { row: 0, col: crate::grid::ColumnAddr::Left(0) }, "HDR".into());
         grid.set(&CellAddr::Left { row: 0, col: 0 }, "L0".into());
         grid.set(&CellAddr::Main { row: 0, col: 0 }, "A0".into());
         grid.set(&CellAddr::Main { row: 0, col: 1 }, "B0".into());
         grid.set(&CellAddr::Right { row: 0, col: 0 }, "R0".into());
-        grid.set(&CellAddr::Footer { row: 0, col: 0 }, "FTR".into());
+        grid.set(&CellAddr::Footer { row: 0, col: crate::grid::ColumnAddr::Left(0) }, "FTR".into());
         let gb = crate::grid::GridBox::from(grid);
         let mut out = Vec::new();
         export_tsv(&gb, &mut out);
@@ -2032,12 +2035,12 @@ mod tests {
         use crate::grid::HEADER_ROWS;
 
         let mut grid = crate::grid::Grid::new(2, 2);
-        grid.set(
+grid.set(
             &CellAddr::Header {
                 row: (HEADER_ROWS - 1) as u32,
-                col: MARGIN_COLS as u32 + 1,
+                col: crate::grid::ColumnAddr::Main(1),
             },
-            "=A*0.1 -- TAX".into(),
+            "=A*0.1 -- TAX".into()
         );
         grid.set(&CellAddr::Main { row: 0, col: 0 }, "100".into());
         let gb = crate::grid::GridBox::from(grid);
@@ -2084,7 +2087,7 @@ mod tests {
         grid.set(
             &CellAddr::Header {
                 row: (HEADER_ROWS - 1) as u32,
-                col: MARGIN_COLS as u32 + 1,
+                col: ColumnAddr::Main(1),
             },
             "MAX".into(),
         );
@@ -2260,14 +2263,14 @@ mod tests {
         g.set(
             &CellAddr::Header {
                 row: (HEADER_ROWS - 1) as u32,
-                col: (MARGIN_COLS + 1) as u32,
+                col: ColumnAddr::Main(1),
             },
             "=A*0.1 -- TAX".into(),
         );
         g.set(
             &CellAddr::Header {
                 row: (HEADER_ROWS - 1) as u32,
-                col: (MARGIN_COLS + 2) as u32,
+                col: ColumnAddr::Main(2),
             },
             "=TOTAL".into(),
         );
@@ -2357,14 +2360,14 @@ mod tests {
         g.set(
             &CellAddr::Header {
                 row: (HEADER_ROWS - 1) as u32,
-                col: (MARGIN_COLS + 1) as u32,
+                col: ColumnAddr::Main(1),
             },
             "=A*0.1 -- TAX".into(),
         );
         g.set(
             &CellAddr::Header {
                 row: (HEADER_ROWS - 1) as u32,
-                col: (MARGIN_COLS + 2) as u32,
+                col: ColumnAddr::Main(2),
             },
             "=TOTAL".into(),
         );
@@ -2374,7 +2377,7 @@ mod tests {
         g.set(
             &CellAddr::Footer {
                 row: 0,
-                col: (MARGIN_COLS - 1) as u32,
+                col: ColumnAddr::Left(MARGIN_COLS - 1),
             },
             "=TOTAL".into(),
         );
@@ -2454,8 +2457,8 @@ mod tests {
     }
 
     /// TSV/ODS generic strings match after `,` / `;` in function-argument positions (Subtotal).
-    #[test]
-    fn generic_ods_reuses_tsv_interop_excel_list_swap() {
+#[test]
+fn generic_ods_reuses_tsv_interop_excel_list_swap() {
         use crate::grid::HEADER_ROWS;
 
         let m = MARGIN_COLS;
@@ -2463,15 +2466,13 @@ mod tests {
         grid.set(
             &CellAddr::Header {
                 row: (HEADER_ROWS - 1) as u32,
-                col: MARGIN_COLS as u32 + 1,
+                col: ColumnAddr::Main(2),
             },
             "MAX".into(),
         );
         grid.set(&CellAddr::Main { row: 0, col: 0 }, "3".into());
-        grid.set(
-            &CellAddr::Right { col: 0, row: 0 },
-            "=SUBTOTAL(4;A1:B1)".into(),
-        );
+        grid.set(&CellAddr::Right { col: 0, row: 0 },
+            "=SUBTOTAL(4;A1:B1)".into());
         let gb = crate::grid::GridBox::from(grid);
         let re = delimited_default_generic_rebase(&gb);
         let lr = HEADER_ROWS;
@@ -2523,7 +2524,7 @@ mod tests {
         g.set(
             &CellAddr::Footer {
                 row: 0,
-                col: (MARGIN_COLS - 1) as u32,
+                col: ColumnAddr::Left(MARGIN_COLS - 1),
             },
             "MAX".into(),
         );

@@ -18,17 +18,30 @@ pub const MARGIN_COLS: usize = 26 * 27; // A..ZZ inclusive
 /// one place if needed.
 pub type MarginIndex = usize;
 
+/// Objective column address that identifies a column independently of current
+/// `main_cols`.  Once constructed, the same variant + index always refers to
+/// the same logical column regardless of grid resizing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub enum ColumnAddr {
+    /// Left‑margin column (`[{letter}` in UI).  Index is 0‑based margin‑relative.
+    Left(usize),
+    /// Main‑grid column.  Index is the 0‑based main column (0 = A).
+    Main(u32),
+    /// Right‑margin column (`]{letter}` in UI).  Index is 0‑based margin‑relative.
+    Right(usize),
+}
+
 /// Default maximum column display width when a column has content but no explicit override.
 pub const DEFAULT_MAX_COL_WIDTH: usize = 10;
 
 /// Logical cell address (stable across main resize where possible).
-#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CellAddr {
-    /// `~` row: `row` 0 = the top header row; `col` is global column index.
-    Header { row: u32, col: u32 },
+    /// `~` row: `row` 0 = the top header row; `col` is an objective [`ColumnAddr`].
+    Header { row: u32, col: ColumnAddr },
     /// `_` row: same indexing as headers.
-    Footer { row: u32, col: u32 },
+    Footer { row: u32, col: ColumnAddr },
     /// Main grid.
     Main { row: u32, col: u32 },
     /// Left margin: `col` is a MarginIndex (usize), `row` is main row index.
@@ -43,10 +56,132 @@ impl fmt::Display for CellAddr {
             CellAddr::Header { row, col } => {
                 write!(f, "~{}(col {})", HEADER_ROWS as u32 - row, col)
             }
-            CellAddr::Footer { row, col } => write!(f, "_{}(col {})", row + 1, col),
+            CellAddr::Footer { row, col } => write!(f, "_(row {})", row + 1),
             CellAddr::Main { row, col } => write!(f, "({}, {})", row, col),
             CellAddr::Left { col, row } => write!(f, "<{}>({})", col, row),
             CellAddr::Right { col, row } => write!(f, ">{}>({})", col, row),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Factory helpers – the single place that encodes the internal representation
+// of each variant.  All external code should go through these so that future
+// representation changes only need to touch this block.
+// ---------------------------------------------------------------------------
+impl CellAddr {
+    /// Build a header address.  `col` is already an objective [`ColumnAddr`].
+    pub fn header(row: u32, col: ColumnAddr) -> Self {
+        CellAddr::Header { row, col }
+    }
+
+    /// Build a footer address.  `col` is already an objective [`ColumnAddr`].
+    pub fn footer(row: u32, col: ColumnAddr) -> Self {
+        CellAddr::Footer { row, col }
+    }
+
+    /// Build a main‑grid address.
+    pub fn main(row: u32, col: u32) -> Self {
+        CellAddr::Main { row, col }
+    }
+
+    /// Build a left‑margin address.
+    pub fn left(col: MarginIndex, row: u32) -> Self {
+        CellAddr::Left { col, row }
+    }
+
+    /// Build a right‑margin address.
+    pub fn right(col: MarginIndex, row: u32) -> Self {
+        CellAddr::Right { col, row }
+    }
+
+    /// Convert a (row, col) pair and current `main_cols` into the appropriate
+    /// [`CellAddr`] variant, generating objective `ColumnAddr` for header/footer.
+    pub fn from_global(row: usize, col: usize, main_cols: usize) -> Self {
+        if row < HEADER_ROWS {
+            CellAddr::Header {
+                row: (HEADER_ROWS - 1 - row) as u32,
+                col: ColumnAddr::from_global(col, main_cols),
+            }
+        } else if row >= HEADER_ROWS + main_cols {
+            CellAddr::Footer {
+                row: (row - HEADER_ROWS - main_cols) as u32,
+                col: ColumnAddr::from_global(col, main_cols),
+            }
+        } else if col < MARGIN_COLS {
+            CellAddr::Left { col, row: (row - HEADER_ROWS) as u32 }
+        } else if col < MARGIN_COLS + main_cols {
+            CellAddr::Main {
+                row: (row - HEADER_ROWS) as u32,
+                col: (col - MARGIN_COLS) as u32,
+            }
+        } else {
+            CellAddr::Right {
+                col: col - MARGIN_COLS - main_cols,
+                row: (row - HEADER_ROWS) as u32,
+            }
+        }
+    }
+
+    /// Return the global column index for this address, given current `main_cols`.
+    pub fn to_global_col(&self, main_cols: usize) -> usize {
+        match self {
+            CellAddr::Header { col, .. } | CellAddr::Footer { col, .. } => col.to_global(main_cols),
+            CellAddr::Main { col, .. } => MARGIN_COLS + *col as usize,
+            CellAddr::Left { col, .. } => *col,
+            CellAddr::Right { col, .. } => MARGIN_COLS + main_cols + col,
+        }
+    }
+
+    /// Return the objective [`ColumnAddr`] for this address, given current `main_cols`.
+    pub fn to_column_addr(&self, main_cols: usize) -> ColumnAddr {
+        match self {
+            CellAddr::Header { col, .. } | CellAddr::Footer { col, .. } => *col,
+            CellAddr::Main { col, .. } => ColumnAddr::Main(*col),
+            CellAddr::Left { col, .. } => ColumnAddr::Left(*col),
+            CellAddr::Right { col, .. } => ColumnAddr::Right(*col),
+        }
+    }
+
+    /// Return the internal header‑area row index (0 = top header row).
+    pub fn header_row_index(display_row: usize) -> u32 {
+        (HEADER_ROWS - 1 - display_row) as u32
+    }
+
+    /// Return the internal footer‑area row index (0 = first footer row).
+    pub fn footer_row_index(display_row: usize) -> u32 {
+        display_row as u32
+    }
+}
+
+impl fmt::Display for ColumnAddr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ColumnAddr::Left(idx) => write!(f, "left({})", idx),
+            ColumnAddr::Main(idx) => write!(f, "main({})", idx),
+            ColumnAddr::Right(idx) => write!(f, "right({})", idx),
+        }
+    }
+}
+
+impl ColumnAddr {
+    /// Build a [`ColumnAddr`] from a global column index and current `main_cols`.
+    pub fn from_global(col: usize, main_cols: usize) -> Self {
+        if col < MARGIN_COLS {
+            ColumnAddr::Left(col)
+        } else if col < MARGIN_COLS + main_cols {
+            ColumnAddr::Main((col - MARGIN_COLS) as u32)
+        } else {
+            ColumnAddr::Right(col - MARGIN_COLS - main_cols)
+        }
+    }
+
+    /// Convert to a global column index using current `main_cols`.
+    pub fn to_global(&self, main_cols: usize) -> usize {
+        match self {
+            ColumnAddr::Left(idx) => *idx,
+            ColumnAddr::Main(idx) => MARGIN_COLS + *idx as usize,
+            ColumnAddr::Right(idx) => MARGIN_COLS + main_cols + idx,
         }
     }
 }
@@ -69,6 +204,7 @@ pub trait GridImpl {
     // Layout / extent
     fn set_main_size(&mut self, main_rows: usize, main_cols: usize);
     fn ensure_extent_for_cursor(&mut self, row: usize, col: usize) -> bool;
+    fn set_min_extent(&mut self, min_rows: u32, min_cols: u32);
     fn grow_main_row_at_bottom(&mut self);
     fn grow_main_col_at_right(&mut self);
     fn move_main_rows(&mut self, from: usize, count: usize, to: usize);
@@ -193,6 +329,10 @@ impl GridBox {
 
     pub fn ensure_extent_for_cursor(&mut self, row: usize, col: usize) -> bool {
         self.inner.ensure_extent_for_cursor(row, col)
+    }
+
+    pub fn set_min_extent(&mut self, min_rows: u32, min_cols: u32) {
+        self.inner.set_min_extent(min_rows, min_cols)
     }
 
     pub fn grow_main_row_at_bottom(&mut self) {
@@ -434,13 +574,17 @@ pub struct Grid {
     pub col_special_formats: HashMap<usize, CellFormat>,
     /// Exact-cell overrides used for Cell/Selection formatting.
     pub cell_formats: HashMap<CellAddr, CellFormat>,
-    pub header: HashMap<(u32, u32), String>,
-    pub footer: HashMap<(u32, u32), String>,
+    pub header: HashMap<(u32, ColumnAddr), String>,
+    pub footer: HashMap<(u32, ColumnAddr), String>,
     pub(crate) spill_followers: HashMap<CellAddr, String>,
     pub(crate) spill_errors: HashMap<CellAddr, &'static str>,
     pub(crate) volatile_seed: u64,
     /// When false, [`crate::formula::refresh_spills`] is a cheap no-op (spill maps unchanged).
     pub(crate) spills_dirty: bool,
+    /// Cursor floor: never shrink extent_main_rows below this (0 = no floor).
+    min_extent_main_rows: u32,
+    /// Cursor floor: never shrink extent_main_cols below this (0 = no floor).
+    min_extent_main_cols: u32,
 }
 
 impl Default for Grid {
@@ -470,6 +614,8 @@ impl Grid {
             spill_errors: HashMap::new(),
             volatile_seed: 0,
             spills_dirty: true,
+            min_extent_main_rows: 0,
+            min_extent_main_cols: 0,
         };
         g
     }
@@ -578,8 +724,7 @@ impl Grid {
         if c >= tc {
             return false;
         }
-        let c_u32 = c as u32;
-        if self.header.keys().any(|&(_, col)| col == c_u32) {
+        if self.header.keys().any(|&(_, col)| col.to_global(self.extent_main_cols as usize) == c) {
             return true;
         }
         let m = MARGIN_COLS;
@@ -598,16 +743,15 @@ impl Grid {
         if data_region_has_content {
             return true;
         }
-        self.footer.keys().any(|&(_, col)| col == c_u32)
+        self.footer.keys().any(|&(_, col)| col.to_global(self.extent_main_cols as usize) == c)
     }
 
     fn resize_header_footer_width(&mut self) {
-        let total_cols = self.total_cols() as u32;
-        self.header.retain(|&(row, col), value| {
-            row < HEADER_ROWS as u32 && col < total_cols && !value.is_empty()
+        self.header.retain(|&(row, _), value| {
+            row < HEADER_ROWS as u32 && !value.is_empty()
         });
-        self.footer.retain(|&(row, col), value| {
-            row < FOOTER_ROWS as u32 && col < total_cols && !value.is_empty()
+        self.footer.retain(|&(row, _), value| {
+            row < FOOTER_ROWS as u32 && !value.is_empty()
         });
     }
 
@@ -619,15 +763,26 @@ impl Grid {
     /// and does NOT emit any SetMainSize op. Returns true if either extent
     /// was reduced.
     fn shrink_to_content(&mut self) -> bool {
-        // Compute new main cols from stored main_cells only (ignore header/footer
-        // and width/format override maps).
+        // Compute new main cols from main_cells, headers, and footers.
         let mut max_col_plus1: u32 = 0;
         for (&(_r, c), _) in &self.main_cells {
             max_col_plus1 = max_col_plus1.max(c.saturating_add(1));
         }
+        for (&(_r, col), _) in &self.header {
+            if let ColumnAddr::Main(mc) = col {
+                max_col_plus1 = max_col_plus1.max(mc.saturating_add(1));
+            }
+        }
+        for (&(_r, col), _) in &self.footer {
+            if let ColumnAddr::Main(mc) = col {
+                max_col_plus1 = max_col_plus1.max(mc.saturating_add(1));
+            }
+        }
         if max_col_plus1 == 0 {
             max_col_plus1 = 1; // always at least 1
         }
+        // Apply cursor floor (prevents shrinking past cursor position).
+        max_col_plus1 = max_col_plus1.max(self.min_extent_main_cols);
 
         // Compute new main rows from main, left and right stored cells.
         let mut max_row_plus1: u32 = 0;
@@ -643,6 +798,8 @@ impl Grid {
         if max_row_plus1 == 0 {
             max_row_plus1 = 1;
         }
+        // Apply cursor floor.
+        max_row_plus1 = max_row_plus1.max(self.min_extent_main_rows);
 
         let mut changed = false;
         if max_col_plus1 < self.extent_main_cols {
@@ -661,22 +818,28 @@ impl Grid {
         changed
     }
 
+    /// Set a floor that `shrink_to_content` will not shrink below.
+    /// Used by the UI to prevent shrinking past the cursor position.
+    /// A value of 0 means no floor.
+    pub fn set_min_extent(&mut self, min_rows: u32, min_cols: u32) {
+        self.min_extent_main_rows = min_rows;
+        self.min_extent_main_cols = min_cols;
+    }
+
     pub fn set_main_size(&mut self, main_rows: usize, main_cols: usize) {
         let old_main_cols = self.extent_main_cols as usize;
-        let new_main_cols = main_cols.max(1);
-
-        // Debug: surface main-cols resize events in tests (and when CORRO_DEBUG_LOG is enabled).
-        // Use crate::debug_log::log plus stderr so --nocapture test runs show the same traces.
-        #[cfg(debug_assertions)]
-        {
-            let pre = format!(
-                "DEBUG Grid::set_main_size: called main_rows={} main_cols={} old_main_cols={}",
-                main_rows, main_cols, old_main_cols
-            );
-            crate::debug_log::log(&pre);
-            eprintln!("{}", pre);
-        }
-
+        // Don't shrink below the cursor floor or header/footer Main column extent.
+        let header_col_extent = self
+            .header
+            .keys()
+            .chain(self.footer.keys())
+            .filter_map(|&(_, col)| {
+                if let ColumnAddr::Main(mc) = col { Some(mc + 1) } else { None }
+            })
+            .max()
+            .unwrap_or(0)
+            .max(self.min_extent_main_cols);
+        let new_main_cols = main_cols.max(1).max(header_col_extent as usize);
         self.remap_main_col_layout_for_resize(old_main_cols, new_main_cols);
         self.remap_formats_for_resize(old_main_cols, new_main_cols);
         self.extent_main_rows = main_rows.max(1) as u32;
@@ -766,15 +929,14 @@ impl Grid {
         let mut saw_content = false;
         let main_cols = self.main_cols();
 
-        let global_col_u32 = global_col as u32;
         for (&(_, col), val) in &self.header {
-            if col == global_col_u32 {
+            if col.to_global(main_cols) == global_col {
                 saw_content = true;
                 maxw = maxw.max(val.chars().count() + 1);
             }
         }
         for (&(_, col), val) in &self.footer {
-            if col == global_col_u32 {
+            if col.to_global(main_cols) == global_col {
                 saw_content = true;
                 maxw = maxw.max(val.chars().count() + 1);
             }
@@ -1051,8 +1213,12 @@ impl Grid {
             return Some(v.as_str());
         }
         match addr {
-            CellAddr::Header { row, col } => self.header.get(&(*row, *col)).map(|s| s.as_str()),
-            CellAddr::Footer { row, col } => self.footer.get(&(*row, *col)).map(|s| s.as_str()),
+            CellAddr::Header { row, col } => {
+                self.header.get(&(*row, *col)).map(|s| s.as_str())
+            }
+            CellAddr::Footer { row, col } => {
+                self.footer.get(&(*row, *col)).map(|s| s.as_str())
+            }
             CellAddr::Main { row, col } => self.main_cells.get(&(*row, *col)).map(|s| s.as_str()),
             CellAddr::Left { col, row } => self.left.get(&(*row, *col)).map(|s| s.as_str()),
             CellAddr::Right { col, row } => self.right.get(&(*row, *col)).map(|s| s.as_str()),
@@ -1066,7 +1232,6 @@ impl Grid {
     pub fn set(&mut self, addr: &CellAddr, value: String) {
         match addr {
             CellAddr::Header { row, col } => {
-                let c = *col as usize;
                 // Allow header cells to be stored regardless of the current
                 // sheet extent. Header/footer cells are absolute global
                 // columns and should not be silently dropped when the main
@@ -1075,13 +1240,13 @@ impl Grid {
                     if value.is_empty() {
                         self.header.remove(&(*row, *col));
                     } else {
+                        let c = col.to_global(self.extent_main_cols as usize) as u32;
                         self.header.insert((*row, *col), value);
-                        self.auto_fit_column(c);
+                        self.auto_fit_column(c as usize);
                     }
                 }
             }
             CellAddr::Footer { row, col } => {
-                let c = *col as usize;
                 // As with headers, accept footer cells independent of the
                 // current total_cols; do not drop them just because the
                 // main region is presently narrow.
@@ -1089,8 +1254,9 @@ impl Grid {
                     if value.is_empty() {
                         self.footer.remove(&(*row, *col));
                     } else {
+                        let c = col.to_global(self.extent_main_cols as usize) as u32;
                         self.footer.insert((*row, *col), value);
-                        self.auto_fit_column(c);
+                        self.auto_fit_column(c as usize);
                     }
                 }
             }
@@ -1274,8 +1440,31 @@ impl Grid {
             *cells = remapped;
         }
 
-        remap_sparse_main_cols(&mut self.header, &order, ec);
-        remap_sparse_main_cols(&mut self.footer, &order, ec);
+        fn remap_sparse_main_cols_addr(
+            cells: &mut HashMap<(u32, ColumnAddr), String>,
+            order: &[u32],
+            old_main_cols: usize,
+        ) {
+            let mut old_to_new = vec![0usize; old_main_cols];
+            for (new_pos, &old_pos) in order.iter().enumerate() {
+                old_to_new[old_pos as usize] = new_pos;
+            }
+
+            let mut remapped = HashMap::new();
+            for ((row, col), value) in cells.drain() {
+                let new_col = match col {
+                    ColumnAddr::Main(idx) if (idx as usize) < old_main_cols => {
+                        ColumnAddr::Main(old_to_new[idx as usize] as u32)
+                    }
+                    other => other,
+                };
+                remapped.insert((row, new_col), value);
+            }
+            *cells = remapped;
+        }
+
+        remap_sparse_main_cols_addr(&mut self.header, &order, ec);
+        remap_sparse_main_cols_addr(&mut self.footer, &order, ec);
 
         self.remap_main_col_width_overrides_for_order(&order);
 
@@ -1329,11 +1518,23 @@ impl GridImpl for Grid {
     fn iter_nonempty(&self) -> Box<dyn Iterator<Item = (CellAddr, String)> + '_> {
         // Build a vec of non-empty cells across regions and return an iterator.
         let mut v: Vec<(CellAddr, String)> = Vec::new();
-        for (&(r, c), val) in &self.header {
-            v.push((CellAddr::Header { row: r, col: c }, val.clone()));
+        for (&(r, col), val) in &self.header {
+            v.push((
+                CellAddr::Header {
+                    row: r,
+                    col,
+                },
+                val.clone(),
+            ));
         }
-        for (&(r, c), val) in &self.footer {
-            v.push((CellAddr::Footer { row: r, col: c }, val.clone()));
+        for (&(r, col), val) in &self.footer {
+            v.push((
+                CellAddr::Footer {
+                    row: r,
+                    col,
+                },
+                val.clone(),
+            ));
         }
         for (&(r, c), val) in &self.main_cells {
             v.push((CellAddr::Main { row: r, col: c }, val.clone()));
@@ -1361,6 +1562,10 @@ impl GridImpl for Grid {
 
     fn ensure_extent_for_cursor(&mut self, row: usize, col: usize) -> bool {
         self.ensure_extent_for_cursor(row, col)
+    }
+
+    fn set_min_extent(&mut self, min_rows: u32, min_cols: u32) {
+        self.set_min_extent(min_rows, min_cols)
     }
 
     fn grow_main_row_at_bottom(&mut self) {
@@ -1628,10 +1833,14 @@ pub fn addr_logical_row(addr: &CellAddr, grid: &Grid) -> usize {
 /// Global column index for addressing.
 pub fn addr_logical_col(addr: &CellAddr, grid: &Grid) -> usize {
     match addr {
-        CellAddr::Header { col, .. } | CellAddr::Footer { col, .. } => *col as usize,
+        CellAddr::Header { col, .. } | CellAddr::Footer { col, .. } => {
+            col.to_global(grid.extent_main_cols as usize)
+        }
         CellAddr::Main { col, .. } => MARGIN_COLS + *col as usize,
         CellAddr::Left { col, .. } => *col as usize,
-        CellAddr::Right { col, .. } => MARGIN_COLS + grid.extent_main_cols as usize + *col as usize,
+        CellAddr::Right { col, .. } => {
+            MARGIN_COLS + grid.extent_main_cols as usize + *col as usize
+        }
     }
 }
 
@@ -1749,11 +1958,11 @@ mod tests {
         let mut g = Grid::new(1, 1);
         let header = CellAddr::Header {
             row: 0,
-            col: MARGIN_COLS as u32,
+            col: ColumnAddr::Main(0),
         };
         let footer = CellAddr::Footer {
             row: (FOOTER_ROWS - 1) as u32,
-            col: MARGIN_COLS as u32,
+            col: ColumnAddr::Main(0),
         };
 
         g.set(&header, "top".into());
@@ -1813,17 +2022,19 @@ mod tests {
         // Set column formats and header/footer at a column beyond current main cols
         let high_col = MARGIN_COLS + 10;
         g.set_column_format(FormatScope::All, high_col, CellFormat { number: None, align: Some(TextAlign::Right) });
-        g.set(&CellAddr::Header { row: 0, col: high_col as u32 }, "hdr".into());
+        g.set(&CellAddr::Header { row: 0, col: ColumnAddr::Main(10) }, "hdr".into());
 
-        // Remove last main column cell and expect silent shrink
+        // Remove last main column cell and check shrink behavior.
+        // The header at Main(10) prevents the grid from shrinking below that column,
+        // so extent_main_cols stays at the original value (3).
         g.set(&CellAddr::Main { row: 0, col: 2 }, String::new());
 
-        // extent_main_cols should now be 2 (cols 0..1) after shrink
-        assert_eq!(g.main_cols(), 2);
+        // extent_main_cols stays at 3 because the header at Main(10) preserves it
+        assert_eq!(g.main_cols(), 3);
 
         // Column format and header must still be present (not pruned by silent shrink)
         assert_eq!(g.col_all_formats.get(&high_col).is_some(), true);
-        assert_eq!(g.header.get(&(0u32, high_col as u32)).is_some(), true);
+        assert_eq!(g.header.get(&(0u32, ColumnAddr::Main(10))).is_some(), true);
     }
 
     #[test]
@@ -1853,13 +2064,41 @@ mod tests {
     }
 
     #[test]
+    fn shrink_to_content_respects_header_footer_main_cols() {
+        let mut g = Grid::new(2, 5);
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "a".into());
+        g.set(&CellAddr::Header { row: 0, col: ColumnAddr::Main(4) }, "hdr".into());
+        assert_eq!(g.main_cols(), 5);
+        // Remove the only main cell — header at Main(4) prevents shrink below 5
+        g.set(&CellAddr::Main { row: 0, col: 0 }, String::new());
+        assert!(g.main_cols() >= 5,
+            "header at Main(4) should prevent shrink, got {}",
+            g.main_cols());
+        assert!(g.header.contains_key(&(0u32, ColumnAddr::Main(4))));
+    }
+
+    #[test]
     fn no_shrink_on_header_footer_removal() {
         let mut g = Grid::new(2, 2);
-        let high_col = MARGIN_COLS + 5;
-        g.set(&CellAddr::Header { row: 0, col: high_col as u32 }, "h".into());
+        let high_col = crate::grid::ColumnAddr::Main(5);
+        g.set(
+            &CellAddr::Header {
+                row: 0,
+                col: high_col
+            },
+            "h".into()
+        );
         let old_rows = g.main_rows();
-        g.set(&CellAddr::Header { row: 0, col: high_col as u32 }, String::new());
+        g.set(
+            &CellAddr::Header {
+                row: 0,
+                col: high_col
+            },
+            String::new()
+        );
         // Removing header should not change main extents
         assert_eq!(g.main_rows(), old_rows);
     }
+
+
 }

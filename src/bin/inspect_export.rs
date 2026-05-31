@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use corro::ops;
 use corro::export;
-use corro::grid;
+use corro::grid::{CellAddr, ColumnAddr, MARGIN_COLS, HEADER_ROWS};
 
 fn main() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs/tests/subtotal-tiny.corro");
@@ -43,13 +43,13 @@ fn main() {
         // grid is a GridBox; convert to Grid via GridBox::inner as Grid reference is needed.
         // We can compute logical row directly from addr and grid methods: the GridBox provides
         // total logical rows but not the helper; instead use grid.main_rows() to compute hr.
-        let hr = grid::HEADER_ROWS;
+        let hr = HEADER_ROWS;
         let main_rows = grid.main_rows();
         let r = match addr {
-            grid::CellAddr::Header { row, .. } => row as usize,
-            grid::CellAddr::Main { row, .. } => hr + row as usize,
-            grid::CellAddr::Left { row, .. } | grid::CellAddr::Right { row, .. } => hr + row as usize,
-            grid::CellAddr::Footer { row, .. } => hr + main_rows + row as usize,
+            CellAddr::Header { row, .. } => row as usize,
+            CellAddr::Main { row, .. } => hr + row as usize,
+            CellAddr::Left { row, .. } | CellAddr::Right { row, .. } => hr + row as usize,
+            CellAddr::Footer { row, .. } => hr + main_rows + row as usize,
         };
         rows_set.insert(r);
     }
@@ -77,7 +77,7 @@ fn main() {
         let row_key_col = opts.include_row_label_column;
         let mc = grid.main_cols();
         let mr = grid.main_rows();
-        let hr = grid::HEADER_ROWS;
+        let hr = HEADER_ROWS;
 
         println!("\nMatrix -> CellAddr mapping (col_start={} col_end={} rows={}):", c0, c1, rows.len());
         for (ri, row) in matrix.iter().enumerate() {
@@ -102,15 +102,15 @@ fn main() {
                 continue;
             }
             let logical_row = rows[row_index];
-            // Compute sheet_row_label inline (same logic as export::sheet_row_label)
-            let sheet_row_label = if logical_row < grid::HEADER_ROWS {
-                format!("~{}", grid::HEADER_ROWS - logical_row)
-            } else if logical_row < grid::HEADER_ROWS + mr {
-                format!("{}", logical_row - grid::HEADER_ROWS + 1)
-            } else {
-                let fr = logical_row - grid::HEADER_ROWS - mr;
-                format!("_{}", fr + 1)
-            };
+// Compute sheet_row_label inline (same logic as export::sheet_row_label)
+        let sheet_row_label = if logical_row < HEADER_ROWS {
+            format!("~{}", HEADER_ROWS - logical_row)
+        } else if logical_row < HEADER_ROWS + mr {
+            format!("{}", logical_row - HEADER_ROWS + 1)
+        } else {
+            let fr = logical_row - hr - mr;
+            format!("_{}", fr + 1)
+        };
             println!("  logical_row {} (sheet_row_label={})", logical_row, sheet_row_label);
             for (ci, field) in row.iter().enumerate() {
                 if row_key_col && ci == 0 {
@@ -123,19 +123,25 @@ fn main() {
                 // Build corresponding CellAddr for this logical_row/global_col
                 use corro::grid::CellAddr;
                 let addr: CellAddr = if logical_row < hr {
-                    CellAddr::Header { row: logical_row as u32, col: global_col as u32 }
+                    CellAddr::Header { 
+                        row: logical_row as u32, 
+                        col: ColumnAddr::from_global(global_col as usize, mc)
+                    }
                 } else if logical_row < hr + mr {
                     let main_row = logical_row - hr;
-                    if global_col < grid::MARGIN_COLS {
-                        CellAddr::Left { col: global_col, row: main_row as u32 }
-                    } else if global_col < grid::MARGIN_COLS + mc {
-                        CellAddr::Main { row: main_row as u32, col: (global_col - grid::MARGIN_COLS) as u32 }
+                    if global_col < MARGIN_COLS {
+                        CellAddr::Left { col: global_col as usize, row: main_row as u32 }
+                    } else if global_col < MARGIN_COLS + mc {
+                        CellAddr::Main { row: main_row as u32, col: (global_col - MARGIN_COLS) as u32 }
                     } else {
-                        CellAddr::Right { col: global_col - grid::MARGIN_COLS - mc, row: main_row as u32 }
+                        CellAddr::Right { col: global_col as usize - MARGIN_COLS - mc, row: main_row as u32 }
                     }
                 } else {
                     let fr = logical_row - hr - mr;
-                    CellAddr::Footer { row: fr as u32, col: global_col as u32 }
+                    CellAddr::Footer { 
+                        row: fr as u32, 
+                        col: ColumnAddr::from_global(global_col as usize, mc)
+                    }
                 };
 
                 let ref_text = corro::addr::cell_ref_text(&addr, mc);

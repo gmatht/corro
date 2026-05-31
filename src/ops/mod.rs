@@ -10,7 +10,7 @@
 use crate::addr::{
     parse_cell_ref_at, parse_excel_column, parse_main_range_at, parse_sheet_id_prefix_at,
 };
-use crate::grid::{CellAddr, CellFormat, FormatScope, MainRange, SortSpec, MARGIN_COLS};
+use crate::grid::{CellAddr, CellFormat, ColumnAddr, FormatScope, MainRange, SortSpec, MARGIN_COLS};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -658,7 +658,7 @@ impl Op {
                 }
                 for (addr, value) in copied_cells {
                     let pasted = if is_formula_text(&value) {
-                        crate::formula::translate_formula_text_by_offset(&value, 1, 0)
+                        crate::formula::translate_formula_text_by_offset(&value, 1, 0, mc)
                             .unwrap_or_else(|| value.clone())
                     } else {
                         value.clone()
@@ -739,7 +739,7 @@ impl Op {
                 // Paste copied cells with relative formula translation
                 for (addr, value) in copied_cells {
                     let pasted = if is_formula_text(&value) {
-                        crate::formula::translate_formula_text_by_offset(&value, count as i32, 0)
+                        crate::formula::translate_formula_text_by_offset(&value, count as i32, 0, mc)
                             .unwrap_or_else(|| value.clone())
                     } else {
                         value.clone()
@@ -810,20 +810,20 @@ impl Op {
                 }
                 for (addr, value) in state.grid.iter_nonempty() {
                     match addr {
-                        CellAddr::Header { row, col } if col as usize == source_global_col => {
+                        CellAddr::Header { row, col } if col.to_global(original_main_cols) == source_global_col => {
                             copied_cells.push((
                                 CellAddr::Header {
                                     row,
-                                    col: dest_global_col as u32,
+                                    col: ColumnAddr::from_global(dest_global_col, original_main_cols),
                                 },
                                 value,
                             ));
                         }
-                        CellAddr::Footer { row, col } if col as usize == source_global_col => {
+                        CellAddr::Footer { row, col } if col.to_global(original_main_cols) == source_global_col => {
                             copied_cells.push((
                                 CellAddr::Footer {
                                     row,
-                                    col: dest_global_col as u32,
+                                    col: ColumnAddr::from_global(dest_global_col, original_main_cols),
                                 },
                                 value,
                             ));
@@ -858,7 +858,7 @@ impl Op {
                 }
                 for (addr, value) in copied_cells {
                     let pasted = if is_formula_text(&value) {
-                        crate::formula::translate_formula_text_by_offset(&value, 0, 1)
+                        crate::formula::translate_formula_text_by_offset(&value, 0, 1, mc)
                             .unwrap_or_else(|| value.clone())
                     } else {
                         value.clone()
@@ -868,20 +868,20 @@ impl Op {
                 state.grid.bump_volatile_seed();
             }
             Op::DuplicateColRange { col_start, col_end } => {
-                // Duplicate an inclusive contiguous range of main columns,
-                // inserting the duplicated block immediately to the right.
-                let start = *col_start as usize;
-                let end = *col_end as usize; // inclusive
-                if end < start {
-                    return;
-                }
-                let original_main_cols = state.grid.main_cols();
-                // If the requested start is beyond current cols there's nothing
-                // to duplicate from. However if the end extends beyond the
-                // current extent we still duplicate the requested span and
-                // treat missing source columns as blank (so e.g. "A:B" will
-                // duplicate A even when B was previously absent).
-                if start >= original_main_cols {
+// Duplicate an inclusive contiguous range of main columns,
+                 // inserting the duplicated block immediately to the right.
+let start = *col_start as usize;
+                 let end = *col_end as usize; // inclusive
+                 let original_main_cols = state.grid.main_cols();
+                 if end < start {
+                     return;
+                 }
+                 // If the requested start is beyond current cols there's nothing
+                 // to duplicate from. However if the end extends beyond the
+                 // current extent we still duplicate the requested span and
+                 // treat missing source columns as blank (so e.g. "A:B" will
+                 // duplicate A even when B was previously absent).
+                 if start >= original_main_cols {
                     return;
                 }
                 let count = end.saturating_sub(start).saturating_add(1);
@@ -907,17 +907,23 @@ impl Op {
                 let mut header_footer_cells = Vec::new();
                 for (addr, value) in state.grid.iter_nonempty() {
                     match addr {
-                        CellAddr::Header { row, col } if (col as usize) >= source_global_start && (col as usize) <= source_global_start + (end - start) => {
-                            let offset = (col as usize) - source_global_start;
+                        CellAddr::Header { row, col } if {
+                            let g = col.to_global(original_main_cols);
+                            g >= source_global_start && g <= source_global_start + (end - start)
+                        } => {
+                            let offset = col.to_global(original_main_cols) - source_global_start;
                             header_footer_cells.push((
-                                CellAddr::Header { row, col: (source_global_start + offset + count) as u32 },
+                                CellAddr::Header { row, col: ColumnAddr::from_global(source_global_start + offset + count, original_main_cols) },
                                 value,
                             ));
                         }
-                        CellAddr::Footer { row, col } if (col as usize) >= source_global_start && (col as usize) <= source_global_start + (end - start) => {
-                            let offset = (col as usize) - source_global_start;
+                        CellAddr::Footer { row, col } if {
+                            let g = col.to_global(original_main_cols);
+                            g >= source_global_start && g <= source_global_start + (end - start)
+                        } => {
+                            let offset = col.to_global(original_main_cols) - source_global_start;
                             header_footer_cells.push((
-                                CellAddr::Footer { row, col: (source_global_start + offset + count) as u32 },
+                                CellAddr::Footer { row, col: ColumnAddr::from_global(source_global_start + offset + count, original_main_cols) },
                                 value,
                             ));
                         }
@@ -954,7 +960,7 @@ impl Op {
                 // Paste copied cells with formula translation
                 for (addr, value) in copied_cells {
                     let pasted = if is_formula_text(&value) {
-                        crate::formula::translate_formula_text_by_offset(&value, 0, count as i32)
+                        crate::formula::translate_formula_text_by_offset(&value, 0, count as i32, mc)
                             .unwrap_or_else(|| value.clone())
                     } else {
                         value.clone()
@@ -997,11 +1003,12 @@ impl Op {
                 state.grid.bump_volatile_seed();
             }
             Op::RelFillRange { range, value } => {
+                let original_main_cols = state.grid.main_cols();
                 for r in range.row_start..range.row_end {
                     for c in range.col_start..range.col_end {
                         let row_delta = r as i32 - range.row_start as i32;
                         let col_delta = c as i32 - range.col_start as i32;
-                        let v = rel_fill_value_for_cell(value, row_delta, col_delta);
+                        let v = rel_fill_value_for_cell(value, row_delta, col_delta, original_main_cols);
                         let addr = CellAddr::Main { row: r, col: c };
                         state.grid.set(&addr, v);
                     }
@@ -1163,11 +1170,11 @@ fn is_formula_text(value: &str) -> bool {
     value.trim_start().starts_with('=')
 }
 
-fn rel_fill_value_for_cell(base: &str, row_delta: i32, col_delta: i32) -> String {
+fn rel_fill_value_for_cell(base: &str, row_delta: i32, col_delta: i32, main_cols: usize) -> String {
     if !is_formula_text(base) {
         return base.to_string();
     }
-    crate::formula::translate_formula_text_by_offset(base, row_delta, col_delta)
+    crate::formula::translate_formula_text_by_offset(base, row_delta, col_delta, main_cols)
         .unwrap_or_else(|| base.to_string())
 }
 
@@ -1790,7 +1797,7 @@ fn parse_log_addr(
     Some((
         CellAddr::Footer {
             row,
-            col: crate::grid::MARGIN_COLS as u32 + col,
+            col: ColumnAddr::Main(col),
         },
         1 + row_digits + col_len,
     ))
@@ -2881,9 +2888,9 @@ mod tests {
         let op = WorkbookOp::SheetOp {
             sheet_id: 1,
             op: Op::SetCell {
-                addr: CellAddr::Header {
-                    row: (crate::grid::HEADER_ROWS - 1) as u32,
-                    col: (crate::grid::MARGIN_COLS + 2) as u32,
+addr: CellAddr::Header {
+                        row: (crate::grid::HEADER_ROWS - 1) as u32,
+                    col: ColumnAddr::Right(0),
                 },
                 value: "=TOTAL".into(),
             },
@@ -2963,11 +2970,11 @@ mod tests {
                 Op::SetCellRef { cref, .. } => {
                     let addr = cref.to_grid_addr(2); // main_cols doesn't affect header Data mapping
                     assert_eq!(
-                        addr,
-                        CellAddr::Header {
-                            row: (crate::grid::HEADER_ROWS - 1) as u32,
-                            col: (crate::grid::MARGIN_COLS + 10) as u32
-                        }
+addr,
+                    CellAddr::Header {
+                        row: (crate::grid::HEADER_ROWS - 1) as u32,
+                        col: ColumnAddr::Main(10)
+                    }
                     );
                 }
                 other => panic!("unexpected op: {other:?}"),
@@ -2982,7 +2989,7 @@ mod tests {
                         addr,
                         CellAddr::Footer {
                             row: 0,
-                            col: (crate::grid::MARGIN_COLS + 10) as u32
+                            col: crate::grid::ColumnAddr::Main(10)
                         }
                     );
                 }
@@ -3004,7 +3011,7 @@ mod tests {
 
         let addr = CellAddr::Header {
             row: (crate::grid::HEADER_ROWS - 1) as u32,
-            col: (crate::grid::MARGIN_COLS + 1) as u32,
+            col: ColumnAddr::Right(0),
         };
         assert_eq!(sheet.grid.get(&addr).as_deref(), Some("=TOTAL"));
         assert_eq!(
@@ -3024,7 +3031,7 @@ mod tests {
         assert_eq!(sheet.grid.main_cols(), 11);
         let addr = CellAddr::Header {
             row: (crate::grid::HEADER_ROWS - 1) as u32,
-            col: (crate::grid::MARGIN_COLS + 10) as u32,
+            col: ColumnAddr::Main(10),
         };
         assert_eq!(sheet.grid.get(&addr).as_deref(), Some("=TOTAL"));
         assert_eq!(
@@ -3153,14 +3160,14 @@ mod tests {
         state.grid.set(
             &CellAddr::Header {
                 row: 0,
-                col: global_source_col,
+                col: ColumnAddr::Main(1),
             },
             "H".into(),
         );
         state.grid.set(
             &CellAddr::Footer {
                 row: 0,
-                col: global_source_col,
+                col: ColumnAddr::Main(1),
             },
             "F".into(),
         );
@@ -3185,7 +3192,7 @@ mod tests {
                 .grid
                 .get(&CellAddr::Header {
                     row: 0,
-                    col: global_source_col + 1,
+                    col: ColumnAddr::Main(2),
                 })
                 .as_deref(),
             Some("H")
@@ -3195,7 +3202,7 @@ mod tests {
                 .grid
                 .get(&CellAddr::Footer {
                     row: 0,
-                    col: global_source_col + 1,
+                    col: ColumnAddr::Main(2),
                 })
                 .as_deref(),
             Some("F")
@@ -3322,7 +3329,7 @@ mod tests {
     #[test]
     fn format_cell_round_trips_through_log_line() {
         let op = Op::SetCellFormat {
-            addr: CellAddr::Header { row: 0, col: 1 },
+            addr: CellAddr::Header { row: 0, col: crate::grid::ColumnAddr::Main(1) },
             format: CellFormat {
                 number: Some(crate::grid::NumberFormat::Fixed { decimals: 1 }),
                 align: Some(crate::grid::TextAlign::Center),
@@ -3332,7 +3339,7 @@ mod tests {
         assert_eq!(
             parse_op_line(&line),
             Some(Op::SetCellFormat {
-                addr: CellAddr::Header { row: 0, col: 1 },
+addr: CellAddr::Header { row: 0, col: ColumnAddr::Main(1) },
                 format: CellFormat {
                     number: Some(crate::grid::NumberFormat::Fixed { decimals: 1 }),
                     align: Some(crate::grid::TextAlign::Center),

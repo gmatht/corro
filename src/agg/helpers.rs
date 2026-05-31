@@ -1,12 +1,13 @@
-use crate::grid::{CellAddr, GridBox as Grid, MainRange, HEADER_ROWS, MARGIN_COLS};
+use crate::grid::{CellAddr, ColumnAddr, GridBox as Grid, MainRange, HEADER_ROWS, MARGIN_COLS};
 use crate::ops::{AggFunc, AggregateDef};
 
 // Internal helpers kept private to this module
 fn right_col_agg_func(grid: &Grid, global_col: usize) -> Option<AggFunc> {
+    let main_cols = grid.main_cols();
     let mut labels: Vec<(u32, String)> = grid
         .iter_nonempty()
         .filter_map(|(addr, val)| match addr {
-            CellAddr::Header { row, col } if col as usize == global_col => Some((row, val)),
+            CellAddr::Header { row, col } if col.to_global(main_cols) == global_col => Some((row, val)),
             _ => None,
         })
         .collect();
