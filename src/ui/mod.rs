@@ -4359,12 +4359,44 @@ impl App {
     fn sync_external(&mut self) -> Result<bool, IoError> {
         let mut changed = false;
 
-        if self.path.is_some() && self.linked_sources_changed() {
+        // Always check linked sources regardless of whether we have a .corro
+        // path.  When the app is opened directly from a TSV/CSV/ODS there is
+        // no .corro file yet, but we still need to detect external changes.
+        if self.linked_sources_changed() {
             if let Some(path) = self.path.clone() {
+                // Have a .corro file — full replay which re-imports linked
+                // sources via LINK ops and re-applies user edits.
                 self.reload_workbook_from_log_path(&path)?;
-                self.status = "Linked source change applied".into();
-                changed = true;
+            } else {
+                // No .corro file — reload linked sources directly into the
+                // workbook.  Preserve cursor and grid extent just like
+                // reload_workbook_from_log_path does.
+                let saved_cursor = self.cursor;
+                let saved_main_cols = self.state.grid.main_cols();
+                let saved_main_rows = self.state.grid.main_rows();
+                for sheet in &mut self.workbook.sheets {
+                    if let Some(source) = &sheet.linked_source {
+                        if let Ok(state) = crate::ops::load_linked_sheet_state(source) {
+                            sheet.state = state;
+                        }
+                    }
+                }
+                self.view_sheet_id = self.workbook.sheet_id(self.workbook.active_sheet);
+                self.sync_active_sheet_cache();
+                self.fit_active_sheet_after_load();
+                let current_main_cols = self.state.grid.main_cols();
+                let current_main_rows = self.state.grid.main_rows();
+                let restore_cols = saved_main_cols.max(current_main_cols);
+                let restore_rows = saved_main_rows.max(current_main_rows);
+                if restore_cols > current_main_cols || restore_rows > current_main_rows {
+                    self.state.grid.set_main_size(restore_rows, restore_cols);
+                    self.commit_active_sheet_cache();
+                }
+                self.cursor = saved_cursor;
+                self.refresh_linked_source_mtimes();
             }
+            self.status = "Linked source change applied".into();
+            changed = true;
         }
 
         // If we have a path, determine whether we should tail the log.
