@@ -3429,6 +3429,7 @@ impl App {
     fn reload_workbook_from_log_path(&mut self, path: &Path) -> Result<(), IoError> {
         let saved_cursor = self.cursor;
         let saved_main_cols = self.state.grid.main_cols();
+        let saved_main_rows = self.state.grid.main_rows();
         let data = std::fs::read_to_string(path).map_err(IoError::Io)?;
         let mut workbook = WorkbookState::new();
         let mut active_sheet = workbook.sheet_id(workbook.active_sheet);
@@ -3440,15 +3441,17 @@ impl App {
         self.fit_active_sheet_after_load();
         self.offset = data.len() as u64;
         self.ops_applied = replay.op_count;
-        // Never shrink main_cols below its pre-reload value.  Cursor-driven
-        // grid growth is not persisted as a SetMainSize op in the log, so a
-        // linked-source re-import would produce a smaller grid after replay.
-        // Re-apply the pre-reload extent so column labels (A, B, C, … and
-        // ]A, ]B, ]C, …) stay the same regardless of cursor position.
+        // Never shrink main_cols or main_rows below their pre-reload values.
+        // Cursor-driven grid growth is not persisted as a SetMainSize op in
+        // the log, so a linked-source re-import would produce a smaller grid
+        // after replay.  Re-apply the pre-reload extent so all labels stay
+        // the same regardless of cursor position.
         let current_main_cols = self.state.grid.main_cols();
-        if saved_main_cols > current_main_cols {
-            self.state.grid
-                .set_main_size(self.state.grid.main_rows(), saved_main_cols);
+        let current_main_rows = self.state.grid.main_rows();
+        let restore_cols = saved_main_cols.max(current_main_cols);
+        let restore_rows = saved_main_rows.max(current_main_rows);
+        if restore_cols > current_main_cols || restore_rows > current_main_rows {
+            self.state.grid.set_main_size(restore_rows, restore_cols);
             self.commit_active_sheet_cache();
         }
         // Restore cursor to its pre-reload global position.
