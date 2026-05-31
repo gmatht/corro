@@ -1778,7 +1778,7 @@ fn eval_cell_inner(
                 visiting,
                 &mut Vec::new(),
                 budget,
-                false,
+                allow_templates,
             );
             visiting.pop();
             return r;
@@ -1806,7 +1806,7 @@ fn eval_cell_inner(
             return EvalResult::Error("CIRC");
         }
         visiting.push(addr.clone());
-        let r = eval_expr_str(&expr, grid, visiting, &mut Vec::new(), budget, false);
+        let r = eval_expr_str(&expr, grid, visiting, &mut Vec::new(), budget, allow_templates);
         visiting.pop();
         return r;
     }
@@ -1816,7 +1816,7 @@ fn eval_cell_inner(
     }
 
     visiting.push(addr.clone());
-    let r = eval_expr_str(&t[1..], grid, visiting, &mut Vec::new(), budget, false);
+    let r = eval_expr_str(&t[1..], grid, visiting, &mut Vec::new(), budget, allow_templates);
     visiting.pop();
     r
 }
