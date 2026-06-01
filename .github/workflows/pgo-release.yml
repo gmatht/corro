@@ -11,7 +11,7 @@ env:
   CARGO_TERM_COLORS: false
 
 jobs:
-  # ── Linux x86_64: GNU/CentOS 7 compatible, with PGO ─────────────────
+  # ── Linux x86_64: GNU, with PGO ─────────────────────────────────────
   build-linux-release:
     runs-on: ubuntu-latest
     steps:
@@ -22,8 +22,9 @@ jobs:
       - name: Install cross
         run: cargo install cross
 
-      - name: Add llvm-profdata to PATH
-        run: echo "$(rustup which llvm-profdata | xargs dirname)" >> "$GITHUB_PATH"
+      - name: Add LLVM tools to PATH
+        run: |
+          echo "$(rustc --print target-libdir)/../bin" >> "$GITHUB_PATH"
 
       - name: Build PGO-instrumented binary
         run: |
@@ -68,7 +69,7 @@ jobs:
         with:
           files: corro.gz
 
-  # ── Linux x86_64 tiny: GNU, no PGO ──────────────────────────────────
+  # ── Linux x86_64 tiny: no PGO ───────────────────────────────────────
   build-linux-tiny:
     runs-on: ubuntu-latest
     steps:
@@ -92,8 +93,8 @@ jobs:
         with:
           files: corro-tiny.gz
 
-  # ── Linux armv5te: cross-compiled (no PGO) ─────────────────────────
-  build-linux-armv5:
+  # ── Linux armv7hf: cross-compiled (no PGO) ─────────────────────────
+  build-linux-arm:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -103,21 +104,21 @@ jobs:
       - name: Install cross
         run: cargo install cross
 
-      - name: Add armv5te target
-        run: rustup target add armv5te-unknown-linux-gnueabi
+      - name: Add ARM target
+        run: rustup target add armv7-unknown-linux-gnueabihf
 
       - name: Build
-        run: cross build --target armv5te-unknown-linux-gnueabi --release
+        run: cross build --target armv7-unknown-linux-gnueabihf --release
 
       - name: Strip and compress
         run: |
-          strip target/armv5te-unknown-linux-gnueabi/release/corro 2>/dev/null || true
-          gzip -c target/armv5te-unknown-linux-gnueabi/release/corro > corro-armv5.gz
+          strip target/armv7-unknown-linux-gnueabihf/release/corro 2>/dev/null || true
+          gzip -c target/armv7-unknown-linux-gnueabihf/release/corro > corro-arm.gz
 
       - name: Upload release asset
         uses: softprops/action-gh-release@v2
         with:
-          files: corro-armv5.gz
+          files: corro-arm.gz
 
   # ── Linux aarch64: native ARM runner with PGO ───────────────────────
   build-linux-aarch64:
@@ -129,6 +130,10 @@ jobs:
 
       - name: Install cargo-pgo
         run: cargo install cargo-pgo
+
+      - name: Add LLVM tools to PATH
+        run: |
+          echo "$(rustc --print target-libdir)/../bin" >> "$GITHUB_PATH"
 
       - name: Build PGO-instrumented binary
         run: cargo pgo build -- --release
@@ -182,6 +187,11 @@ jobs:
       - name: Install cargo-pgo
         run: cargo install cargo-pgo
 
+      - name: Add LLVM tools to PATH
+        shell: bash
+        run: |
+          echo "$(rustc --print target-libdir)/../bin" >> "$GITHUB_PATH"
+
       - name: Build PGO-instrumented binary
         run: cargo pgo build -- --release
 
@@ -216,7 +226,7 @@ jobs:
         with:
           files: corro.exe.zip
 
-  # ── Windows x86: PGO (cross-compile) ────────────────────────────────
+  # ── Windows x86: PGO ────────────────────────────────────────────────
   build-windows-x86:
     runs-on: windows-latest
     steps:
@@ -227,9 +237,10 @@ jobs:
       - name: Add x86 target
         run: rustup target add i686-pc-windows-msvc
 
-      - name: Add llvm-profdata to PATH
+      - name: Add LLVM tools to PATH
         shell: bash
-        run: echo "$(rustup which llvm-profdata | xargs dirname)" >> "$GITHUB_PATH"
+        run: |
+          echo "$(rustc --print target-libdir)/../bin" >> "$GITHUB_PATH"
 
       - name: Build PGO-instrumented binary
         shell: bash
@@ -281,6 +292,10 @@ jobs:
       - name: Install cargo-pgo
         run: cargo install cargo-pgo
 
+      - name: Add LLVM tools to PATH
+        run: |
+          echo "$(rustc --print target-libdir)/../bin" >> "$GITHUB_PATH"
+
       - name: Build PGO-instrumented binary
         run: cargo pgo build -- --release
 
@@ -289,7 +304,6 @@ jobs:
         run: |
           TRIPLE=$(rustc -vV | grep host | awk '{print $2}')
           echo "bin=target/$TRIPLE/release/corro" >> "$GITHUB_OUTPUT"
-          echo "This runner is arm64, triple=$TRIPLE"
 
       - name: Run workloads (collect PGO profiles)
         run: |
