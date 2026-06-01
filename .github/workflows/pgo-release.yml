@@ -232,8 +232,10 @@ jobs:
         shell: bash
         run: |
           BIN=$(echo "${{ steps.triple.outputs.bin }}" | sed 's|/|\\|g')
-          python3 -c "import time; time.sleep(2); print('q')" | timeout 6 "$BIN" tmp_AG.corro || true
-          python3 -c "import time; time.sleep(2); print('q')" | timeout 5 "$BIN" tmp.tsv || true
+          LLVM_PROFILE_FILE="${{ github.workspace }}/target/pgo-profiles/default_%p.profraw" \
+            python3 -c "import time; time.sleep(2); print('q')" | timeout 6 "$BIN" tmp_AG.corro || true
+          LLVM_PROFILE_FILE="${{ github.workspace }}/target/pgo-profiles/default_%p.profraw" \
+            python3 -c "import time; time.sleep(2); print('q')" | timeout 5 "$BIN" tmp.tsv || true
 
       - name: Build PGO-optimized binary
         run: cargo pgo optimize -- --release
@@ -287,9 +289,9 @@ jobs:
         shell: bash
         run: |
           BIN=target/i686-pc-windows-msvc/release/corro.exe
-          LLVM_PROFILE_FILE="$(pwd)/pgo-data/default_%p.profraw" \
+          LLVM_PROFILE_FILE="${{ github.workspace }}/pgo-data/default_%p.profraw" \
             python3 -c "import time; time.sleep(2); print('q')" | timeout 6 "$BIN" tmp_AG.corro || true
-          LLVM_PROFILE_FILE="$(pwd)/pgo-data/default_%p.profraw" \
+          LLVM_PROFILE_FILE="${{ github.workspace }}/pgo-data/default_%p.profraw" \
             python3 -c "import time; time.sleep(2); print('q')" | timeout 5 "$BIN" tmp.tsv || true
 
       - name: Merge profiles
