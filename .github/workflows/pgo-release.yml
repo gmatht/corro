@@ -22,6 +22,9 @@ jobs:
       - name: Install cross
         run: cargo install cross
 
+      - name: Install llvm-tools
+        run: rustup component add llvm-tools-preview
+
       - name: Add LLVM tools to PATH
         run: |
           LLVM_DIR=$(find $(rustup where toolchain) -name "llvm-profdata*" -type f -exec dirname {} \; | head -1)
@@ -133,6 +136,9 @@ jobs:
       - name: Install cargo-pgo
         run: cargo install cargo-pgo
 
+      - name: Install llvm-tools
+        run: rustup component add llvm-tools-preview
+
       - name: Add LLVM tools to PATH
         run: |
           LLVM_DIR=$(find $(rustup where toolchain) -name "llvm-profdata*" -type f -exec dirname {} \; | head -1)
@@ -190,10 +196,14 @@ jobs:
       - name: Install cargo-pgo
         run: cargo install cargo-pgo
 
+      - name: Install llvm-tools
+        run: rustup component add llvm-tools-preview
+
       - name: Add LLVM tools to PATH
         shell: bash
         run: |
-          LLVM_DIR=$(find $(rustup where toolchain) -name "llvm-profdata*" -type f -exec dirname {} \; | head -1); echo "$LLVM_DIR" >> "$GITHUB_PATH"
+          LLVM_DIR=$(find $(rustup where toolchain) -name "llvm-profdata*" -type f -exec dirname {} \; | head -1)
+          echo "$LLVM_DIR" >> "$GITHUB_PATH"
 
       - name: Build PGO-instrumented binary
         run: cargo pgo build -- --release
@@ -240,10 +250,14 @@ jobs:
       - name: Add x86 target
         run: rustup target add i686-pc-windows-msvc
 
+      - name: Install llvm-tools
+        run: rustup component add llvm-tools-preview
+
       - name: Add LLVM tools to PATH
         shell: bash
         run: |
-          LLVM_DIR=$(find $(rustup where toolchain) -name "llvm-profdata*" -type f -exec dirname {} \; | head -1); echo "$LLVM_DIR" >> "$GITHUB_PATH"
+          LLVM_DIR=$(find $(rustup where toolchain) -name "llvm-profdata*" -type f -exec dirname {} \; | head -1)
+          echo "$LLVM_DIR" >> "$GITHUB_PATH"
 
       - name: Build PGO-instrumented binary
         shell: bash
@@ -295,9 +309,13 @@ jobs:
       - name: Install cargo-pgo
         run: cargo install cargo-pgo
 
+      - name: Install llvm-tools
+        run: rustup component add llvm-tools-preview
+
       - name: Add LLVM tools to PATH
         run: |
-          LLVM_DIR=$(find $(rustup where toolchain) -name "llvm-profdata*" -type f -exec dirname {} \; | head -1); echo "$LLVM_DIR" >> "$GITHUB_PATH"
+          LLVM_DIR=$(find $(rustup where toolchain) -name "llvm-profdata*" -type f -exec dirname {} \; | head -1)
+          echo "$LLVM_DIR" >> "$GITHUB_PATH"
 
       - name: Build PGO-instrumented binary
         run: cargo pgo build -- --release
