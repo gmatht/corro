@@ -1,0 +1,84 @@
+CORRO_LOG 1
+SET A1 Simple math operations are precise
+SET A2 1
+SET A3 =10^-999
+SET A4 -1
+SET [A5 ==SUM
+SET B5 =A5
+FILL B5=
+SET B3 =A3
+SET B3 
+SET A7 i
+SET A8 =SQRT(-1)
+SET A9 =SQRT(-2)+3
+SET A10 =e^i
+SET A12 Physics
+SET [A13 Distance
+SET A13 3000
+SET B13 km
+SET A14 =
+SET A13 3000*1000
+SET A13 3000
+SET A14 =A13
+SET A14 =A13*1000
+SET B14 m
+SET [A15 Min Ping
+SET A15 =A14/c
+SET B15 one-way
+SET A16 =A15*2
+SET B16 two-way
+DUPLICATE_ROW 10
+DUPLICATE_ROW 11
+DUPLICATE_ROW 11
+SET A12 It is the sin of gluttony to eat too much cake.
+SET A13 But the sin of pie is always zero.
+DUPLICATE_ROW 13
+SET A14 =SIN(π)
+SET B3 =A3*2
+SET B3 
+SET B14 <- Sin is not "simple" and not exact
+DUPLICATE_ROW 10
+DUPLICATE_ROW 11
+DUPLICATE_ROW 12
+DUPLICATE_ROW 13
+DUPLICATE_ROW 14
+SET A12 1
+SET A13 i*10^-99
+SET A13 =i*10^-12
+SET A14 -1
+SET [A15 ==SUM
+DUPLICATE_ROW 10
+SET [A11 ==SUM
+SET B16 <- Caution complex numbers are not "simple"... or precise.
+DUPLICATE_ROW 16
+SET A17 ^ CAUTION. Complex numbers are not "simple" and thus not precise.
+SET B26 one-way s
+SET A27 =A26*1000
+SET B27 ms (one-way)
+SET A28 =A27*2
+SET B28 ms
+SET B2 0.2
+SET B3 =
+SET B3 =B2
+FORMAT CELL B3 rational:1
+SET B3 =1/5
+FORMAT CELL B3 rational:1
+SET B3 =1/3
+SET B6 ^^^ 0.2+1/3 exactly
+SET B7 =i-i
+SET B8 =2/2
+SET B8 =SQRT(4)
+SET C7 =TYPEOF(B7)
+RFILL C7:C12 =TYPEOF(B7)
+SET B10 =1/3
+SET C6 =TYPEOF(B6)
+SET B9 =FALSE
+SET D6 =TYPE(B6
+SET D6 =TYPE(B6)
+RFILL D6:D10 =TYPE(B6)
+SET C~1 TYPEOF
+SET D~1 TYPE
+SET A9 :q
+COL_WIDTH I
+COL_WIDTH I
+SET A17 ^^^ CAUTION. Complex numbers are not "simple" and thus not precise.
