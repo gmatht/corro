@@ -19,8 +19,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install cross
-        run: cargo install cross
+      - name: Install cargo-pgo
+        run: cargo install cargo-pgo
 
       - name: Install llvm-tools
         run: rustup component add llvm-tools-preview
@@ -36,18 +36,19 @@ jobs:
           fi
 
       - name: Build PGO-instrumented binary
+        run: cargo pgo build -- --release
+
+      - name: Determine binary path
+        id: triple
         run: |
-          mkdir -p pgo-data
-          RUSTFLAGS="-C profile-generate=pgo-data" \
-            cross build --target x86_64-unknown-linux-gnu --release
+          TRIPLE=$(rustc -vV | grep host | awk '{print $2}')
+          echo "bin=target/$TRIPLE/release/corro" >> "$GITHUB_OUTPUT"
 
       - name: Run workloads (collect PGO profiles)
         run: |
-          BIN=target/x86_64-unknown-linux-gnu/release/corro
-          LLVM_PROFILE_FILE="$(pwd)/pgo-data/default_%p.profraw" \
-            python3 -c "import time; time.sleep(2); print('q')" | timeout 6 "$BIN" tmp_AG.corro || true
-          LLVM_PROFILE_FILE="$(pwd)/pgo-data/default_%p.profraw" \
-            python3 -c "
+          BIN=${{ steps.triple.outputs.bin }}
+          python3 -c "import time; time.sleep(2); print('q')" | timeout 6 "$BIN" tmp_AG.corro || true
+          python3 -c "
           import time, sys
           time.sleep(1)
           for _ in range(8): sys.stdout.write('\x1b[B')
@@ -57,24 +58,18 @@ jobs:
           time.sleep(1)
           print('q')
           " | timeout 6 "$BIN" tmp_AG.corro || true
-          LLVM_PROFILE_FILE="$(pwd)/pgo-data/default_%p.profraw" \
-            python3 -c "import time; time.sleep(2); print('q')" | timeout 5 "$BIN" tmp.tsv || true
-
-      - name: Merge profiles
-        run: |
-          mkdir -p pgo-data
-          ls -la pgo-data/ 2>/dev/null || echo "empty"
-          llvm-profdata merge -o pgo-data/merged.profdata pgo-data/
+          python3 -c "import time; time.sleep(2); print('q')" | timeout 5 "$BIN" tmp.tsv || true
 
       - name: Build PGO-optimized binary
-        run: |
-          RUSTFLAGS="-C profile-use=pgo-data/merged.profdata" \
-            cross build --target x86_64-unknown-linux-gnu --release
+        run: cargo pgo optimize -- --release
+        env:
+          RUSTC_WRAPPER: ""
 
       - name: Strip and compress
         run: |
-          strip target/x86_64-unknown-linux-gnu/release/corro
-          gzip -c target/x86_64-unknown-linux-gnu/release/corro > corro.gz
+          BIN=${{ steps.triple.outputs.bin }}
+          strip "$BIN"
+          gzip -c "$BIN" > corro.gz
 
       - name: Upload release asset
         uses: softprops/action-gh-release@v2
