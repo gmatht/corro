@@ -55,7 +55,10 @@ jobs:
             python3 -c "import time; time.sleep(2); print('q')" | timeout 5 "$BIN" tmp.tsv || true
 
       - name: Merge profiles
-        run: llvm-profdata merge -o pgo-data/merged.profdata pgo-data/
+        run: |
+          mkdir -p pgo-data
+          ls -la pgo-data/ 2>/dev/null || echo "empty"
+          llvm-profdata merge -o pgo-data/merged.profdata pgo-data/
 
       - name: Build PGO-optimized binary
         run: |
@@ -290,7 +293,10 @@ jobs:
 
       - name: Merge profiles
         shell: bash
-        run: llvm-profdata merge -o pgo-data/merged.profdata pgo-data/
+        run: |
+          mkdir -p pgo-data
+          ls -la pgo-data/ 2>/dev/null || echo "empty"
+          llvm-profdata merge -o pgo-data/merged.profdata pgo-data/
 
       - name: Build PGO-optimized binary
         shell: bash
