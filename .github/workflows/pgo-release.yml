@@ -69,7 +69,7 @@ jobs:
         run: |
           BIN=${{ steps.triple.outputs.bin }}
           strip "$BIN"
-          gzip -9 -c "$BIN" > corro.gz
+          7z a -mx=9 -tgzip corro.gz "$BIN"
 
       - name: Upload release asset
         uses: softprops/action-gh-release@v2
@@ -93,7 +93,7 @@ jobs:
       - name: Strip and compress
         run: |
           strip target/x86_64-unknown-linux-gnu/tiny/corro
-          gzip -9 -c target/x86_64-unknown-linux-gnu/tiny/corro > corro-tiny.gz
+          7z a -mx=9 -tgzip corro-tiny.gz target/x86_64-unknown-linux-gnu/tiny/corro
 
       - name: Upload release asset
         uses: softprops/action-gh-release@v2
@@ -120,7 +120,7 @@ jobs:
       - name: Strip and compress
         run: |
           strip target/armv7-unknown-linux-gnueabihf/release/corro 2>/dev/null || true
-          gzip -9 -c target/armv7-unknown-linux-gnueabihf/release/corro > corro-arm.gz
+          7z a -mx=9 -tgzip corro-arm.gz target/armv7-unknown-linux-gnueabihf/release/corro
 
       - name: Upload release asset
         uses: softprops/action-gh-release@v2
@@ -185,7 +185,7 @@ jobs:
         run: |
           BIN=${{ steps.triple.outputs.bin }}
           strip "$BIN" 2>/dev/null || true
-          gzip -9 -c "$BIN" > corro-aarch64.gz
+          7z a -mx=9 -tgzip corro-aarch64.gz "$BIN"
 
       - name: Upload release asset
         uses: softprops/action-gh-release@v2
@@ -298,7 +298,7 @@ jobs:
         run: |
           BIN=${{ steps.triple.outputs.bin }}
           strip "$BIN"
-          gzip -9 -c "$BIN" > corro-osx.gz
+          7z a -mx=9 -tgzip corro-osx.gz "$BIN"
 
       - name: Upload release asset
         uses: softprops/action-gh-release@v2
