@@ -27,15 +27,13 @@ jobs:
 
       - name: Add LLVM tools to PATH
         run: |
-          export TOOLCHAIN="$(rustup where toolchain)"
-          echo "Toolchain: $TOOLCHAIN"
-          find "$TOOLCHAIN" -name "llvm-profdata*" -type f -print 2>&1 || echo "find failed"
-          LLVM_DIR=$(find "$TOOLCHAIN" -name "llvm-profdata*" -type f -exec dirname {} \; | head -1)
+          LLVM_DIR=$(find / -path "*/rustlib/*/bin/llvm-profdata*" -type f 2>/dev/null -exec dirname {} \; | head -1)
           echo "LLVM_DIR=$LLVM_DIR"
           if [ -n "$LLVM_DIR" ]; then
             echo "$LLVM_DIR" >> "$GITHUB_PATH"
           else
-            echo "WARNING: llvm-profdata not found in toolchain"
+            echo "WARNING: llvm-profdata not found anywhere; trying PATH..."
+            which llvm-profdata 2>/dev/null || echo "not on PATH either"
           fi
 
       - name: Run workloads (collect PGO profiles)
