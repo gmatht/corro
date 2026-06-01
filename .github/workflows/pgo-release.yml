@@ -27,15 +27,16 @@ jobs:
 
       - name: Add LLVM tools to PATH
         run: |
-          LLVM_DIR=$(find $(rustup where toolchain) -name "llvm-profdata*" -type f -exec dirname {} \; | head -1)
+          export TOOLCHAIN="$(rustup where toolchain)"
+          echo "Toolchain: $TOOLCHAIN"
+          find "$TOOLCHAIN" -name "llvm-profdata*" -type f -print 2>&1 || echo "find failed"
+          LLVM_DIR=$(find "$TOOLCHAIN" -name "llvm-profdata*" -type f -exec dirname {} \; | head -1)
           echo "LLVM_DIR=$LLVM_DIR"
-          echo "$LLVM_DIR" >> "$GITHUB_PATH"
-
-      - name: Build PGO-instrumented binary
-        run: |
-          mkdir -p pgo-data
-          RUSTFLAGS="-C profile-generate=$(pwd)/pgo-data" \
-            cross build --target x86_64-unknown-linux-gnu --release
+          if [ -n "$LLVM_DIR" ]; then
+            echo "$LLVM_DIR" >> "$GITHUB_PATH"
+          else
+            echo "WARNING: llvm-profdata not found in toolchain"
+          fi
 
       - name: Run workloads (collect PGO profiles)
         run: |
@@ -141,8 +142,15 @@ jobs:
 
       - name: Add LLVM tools to PATH
         run: |
-          LLVM_DIR=$(find $(rustup where toolchain) -name "llvm-profdata*" -type f -exec dirname {} \; | head -1)
-          echo "$LLVM_DIR" >> "$GITHUB_PATH"
+          export TOOLCHAIN="$(rustup where toolchain)"
+          find "$TOOLCHAIN" -name "llvm-profdata*" -type f -print 2>&1 || echo "find failed"
+          LLVM_DIR=$(find "$TOOLCHAIN" -name "llvm-profdata*" -type f -exec dirname {} \; | head -1)
+          echo "LLVM_DIR=$LLVM_DIR"
+          if [ -n "$LLVM_DIR" ]; then
+            echo "$LLVM_DIR" >> "$GITHUB_PATH"
+          else
+            echo "WARNING: llvm-profdata not found in toolchain"
+          fi
 
       - name: Build PGO-instrumented binary
         run: cargo pgo build -- --release
@@ -202,8 +210,15 @@ jobs:
       - name: Add LLVM tools to PATH
         shell: bash
         run: |
-          LLVM_DIR=$(find $(rustup where toolchain) -name "llvm-profdata*" -type f -exec dirname {} \; | head -1)
-          echo "$LLVM_DIR" >> "$GITHUB_PATH"
+          export TOOLCHAIN="$(rustup where toolchain)"
+          find "$TOOLCHAIN" -name "llvm-profdata*" -type f -print 2>&1 || echo "find failed"
+          LLVM_DIR=$(find "$TOOLCHAIN" -name "llvm-profdata*" -type f -exec dirname {} \; | head -1)
+          echo "LLVM_DIR=$LLVM_DIR"
+          if [ -n "$LLVM_DIR" ]; then
+            echo "$LLVM_DIR" >> "$GITHUB_PATH"
+          else
+            echo "WARNING: llvm-profdata not found in toolchain"
+          fi
 
       - name: Build PGO-instrumented binary
         run: cargo pgo build -- --release
@@ -256,8 +271,15 @@ jobs:
       - name: Add LLVM tools to PATH
         shell: bash
         run: |
-          LLVM_DIR=$(find $(rustup where toolchain) -name "llvm-profdata*" -type f -exec dirname {} \; | head -1)
-          echo "$LLVM_DIR" >> "$GITHUB_PATH"
+          export TOOLCHAIN="$(rustup where toolchain)"
+          find "$TOOLCHAIN" -name "llvm-profdata*" -type f -print 2>&1 || echo "find failed"
+          LLVM_DIR=$(find "$TOOLCHAIN" -name "llvm-profdata*" -type f -exec dirname {} \; | head -1)
+          echo "LLVM_DIR=$LLVM_DIR"
+          if [ -n "$LLVM_DIR" ]; then
+            echo "$LLVM_DIR" >> "$GITHUB_PATH"
+          else
+            echo "WARNING: llvm-profdata not found in toolchain"
+          fi
 
       - name: Build PGO-instrumented binary
         shell: bash
@@ -314,8 +336,15 @@ jobs:
 
       - name: Add LLVM tools to PATH
         run: |
-          LLVM_DIR=$(find $(rustup where toolchain) -name "llvm-profdata*" -type f -exec dirname {} \; | head -1)
-          echo "$LLVM_DIR" >> "$GITHUB_PATH"
+          export TOOLCHAIN="$(rustup where toolchain)"
+          find "$TOOLCHAIN" -name "llvm-profdata*" -type f -print 2>&1 || echo "find failed"
+          LLVM_DIR=$(find "$TOOLCHAIN" -name "llvm-profdata*" -type f -exec dirname {} \; | head -1)
+          echo "LLVM_DIR=$LLVM_DIR"
+          if [ -n "$LLVM_DIR" ]; then
+            echo "$LLVM_DIR" >> "$GITHUB_PATH"
+          else
+            echo "WARNING: llvm-profdata not found in toolchain"
+          fi
 
       - name: Build PGO-instrumented binary
         run: cargo pgo build -- --release
