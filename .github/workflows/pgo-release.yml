@@ -1,0 +1,324 @@
+name: PGO Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLORS: false
+
+jobs:
+  # ── Linux x86_64: GNU/CentOS 7 compatible, with PGO ─────────────────
+  build-linux-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cross
+        run: cargo install cross
+
+      - name: Add llvm-profdata to PATH
+        run: echo "$(rustup which llvm-profdata | xargs dirname)" >> "$GITHUB_PATH"
+
+      - name: Build PGO-instrumented binary
+        run: |
+          mkdir -p pgo-data
+          RUSTFLAGS="-C profile-generate=$(pwd)/pgo-data" \
+            cross build --target x86_64-unknown-linux-gnu --release
+
+      - name: Run workloads (collect PGO profiles)
+        run: |
+          BIN=target/x86_64-unknown-linux-gnu/release/corro
+          LLVM_PROFILE_FILE="$(pwd)/pgo-data/default_%p.profraw" \
+            python3 -c "import time; time.sleep(2); print('q')" | timeout 6 "$BIN" tmp_AG.corro || true
+          LLVM_PROFILE_FILE="$(pwd)/pgo-data/default_%p.profraw" \
+            python3 -c "
+          import time, sys
+          time.sleep(1)
+          for _ in range(8): sys.stdout.write('\x1b[B')
+          for _ in range(3): sys.stdout.write('\x1b[C')
+          for _ in range(4): sys.stdout.write('\x1b[A')
+          sys.stdout.flush()
+          time.sleep(1)
+          print('q')
+          " | timeout 6 "$BIN" tmp_AG.corro || true
+          LLVM_PROFILE_FILE="$(pwd)/pgo-data/default_%p.profraw" \
+            python3 -c "import time; time.sleep(2); print('q')" | timeout 5 "$BIN" tmp.tsv || true
+
+      - name: Merge profiles
+        run: llvm-profdata merge -o pgo-data/merged.profdata pgo-data/
+
+      - name: Build PGO-optimized binary
+        run: |
+          RUSTFLAGS="-C profile-use=$(pwd)/pgo-data/merged.profdata" \
+            cross build --target x86_64-unknown-linux-gnu --release
+
+      - name: Strip and compress
+        run: |
+          strip target/x86_64-unknown-linux-gnu/release/corro
+          gzip -c target/x86_64-unknown-linux-gnu/release/corro > corro.gz
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: corro.gz
+
+  # ── Linux x86_64 tiny: GNU, no PGO ──────────────────────────────────
+  build-linux-tiny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cross
+        run: cargo install cross
+
+      - name: Build tiny profile
+        run: cross build --target x86_64-unknown-linux-gnu --profile tiny
+
+      - name: Strip and compress
+        run: |
+          strip target/x86_64-unknown-linux-gnu/tiny/corro
+          gzip -c target/x86_64-unknown-linux-gnu/tiny/corro > corro-tiny.gz
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: corro-tiny.gz
+
+  # ── Linux armv5te: cross-compiled (no PGO) ─────────────────────────
+  build-linux-armv5:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cross
+        run: cargo install cross
+
+      - name: Add armv5te target
+        run: rustup target add armv5te-unknown-linux-gnueabi
+
+      - name: Build
+        run: cross build --target armv5te-unknown-linux-gnueabi --release
+
+      - name: Strip and compress
+        run: |
+          strip target/armv5te-unknown-linux-gnueabi/release/corro 2>/dev/null || true
+          gzip -c target/armv5te-unknown-linux-gnueabi/release/corro > corro-armv5.gz
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: corro-armv5.gz
+
+  # ── Linux aarch64: native ARM runner with PGO ───────────────────────
+  build-linux-aarch64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-pgo
+        run: cargo install cargo-pgo
+
+      - name: Build PGO-instrumented binary
+        run: cargo pgo build -- --release
+
+      - name: Determine binary path
+        id: triple
+        run: |
+          TRIPLE=$(rustc -vV | grep host | awk '{print $2}')
+          echo "bin=target/$TRIPLE/release/corro" >> "$GITHUB_OUTPUT"
+
+      - name: Run workloads (collect PGO profiles)
+        run: |
+          BIN=${{ steps.triple.outputs.bin }}
+          python3 -c "import time; time.sleep(2); print('q')" | timeout 6 "$BIN" tmp_AG.corro || true
+          python3 -c "
+          import time, sys
+          time.sleep(1)
+          for _ in range(8): sys.stdout.write('\x1b[B')
+          for _ in range(3): sys.stdout.write('\x1b[C')
+          for _ in range(4): sys.stdout.write('\x1b[A')
+          sys.stdout.flush()
+          time.sleep(1)
+          print('q')
+          " | timeout 6 "$BIN" tmp_AG.corro || true
+          python3 -c "import time; time.sleep(2); print('q')" | timeout 5 "$BIN" tmp.tsv || true
+
+      - name: Build PGO-optimized binary
+        run: cargo pgo optimize -- --release
+        env:
+          RUSTC_WRAPPER: ""
+
+      - name: Strip and compress
+        run: |
+          BIN=${{ steps.triple.outputs.bin }}
+          strip "$BIN" 2>/dev/null || true
+          gzip -c "$BIN" > corro-aarch64.gz
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: corro-aarch64.gz
+
+  # ── Windows x86_64: PGO ─────────────────────────────────────────────
+  build-windows-x64:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-pgo
+        run: cargo install cargo-pgo
+
+      - name: Build PGO-instrumented binary
+        run: cargo pgo build -- --release
+
+      - name: Determine binary path
+        id: triple
+        shell: bash
+        run: |
+          TRIPLE=$(rustc -vV | grep host | awk '{print $2}')
+          echo "triple=$TRIPLE" >> "$GITHUB_OUTPUT"
+          echo "bin=target/$TRIPLE/release/corro.exe" >> "$GITHUB_OUTPUT"
+
+      - name: Run workloads (collect PGO profiles)
+        shell: bash
+        run: |
+          BIN=$(echo "${{ steps.triple.outputs.bin }}" | sed 's|/|\\|g')
+          python3 -c "import time; time.sleep(2); print('q')" | timeout 6 "$BIN" tmp_AG.corro || true
+          python3 -c "import time; time.sleep(2); print('q')" | timeout 5 "$BIN" tmp.tsv || true
+
+      - name: Build PGO-optimized binary
+        run: cargo pgo optimize -- --release
+        env:
+          RUSTC_WRAPPER: ""
+
+      - name: Compress with zip
+        shell: bash
+        run: |
+          BIN=${{ steps.triple.outputs.bin }}
+          7z a -tzip corro.exe.zip "$BIN"
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: corro.exe.zip
+
+  # ── Windows x86: PGO (cross-compile) ────────────────────────────────
+  build-windows-x86:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Add x86 target
+        run: rustup target add i686-pc-windows-msvc
+
+      - name: Add llvm-profdata to PATH
+        shell: bash
+        run: echo "$(rustup which llvm-profdata | xargs dirname)" >> "$GITHUB_PATH"
+
+      - name: Build PGO-instrumented binary
+        shell: bash
+        run: |
+          mkdir -p pgo-data
+          RUSTFLAGS="-C profile-generate=$(pwd)/pgo-data" \
+            cargo build --target i686-pc-windows-msvc --release
+
+      - name: Run workloads (collect PGO profiles)
+        shell: bash
+        run: |
+          BIN=target/i686-pc-windows-msvc/release/corro.exe
+          LLVM_PROFILE_FILE="$(pwd)/pgo-data/default_%p.profraw" \
+            python3 -c "import time; time.sleep(2); print('q')" | timeout 6 "$BIN" tmp_AG.corro || true
+          LLVM_PROFILE_FILE="$(pwd)/pgo-data/default_%p.profraw" \
+            python3 -c "import time; time.sleep(2); print('q')" | timeout 5 "$BIN" tmp.tsv || true
+
+      - name: Merge profiles
+        shell: bash
+        run: llvm-profdata merge -o pgo-data/merged.profdata pgo-data/
+
+      - name: Build PGO-optimized binary
+        shell: bash
+        run: |
+          RUSTFLAGS="-C profile-use=$(pwd)/pgo-data/merged.profdata" \
+            cargo build --target i686-pc-windows-msvc --release
+
+      - name: Compress with zip
+        shell: bash
+        run: |
+          7z a -tzip corro-x86.exe.zip target/i686-pc-windows-msvc/release/corro.exe
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: corro-x86.exe.zip
+
+  # ── macOS aarch64: PGO ──────────────────────────────────────────────
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install coreutils (for gtimeout)
+        run: brew install coreutils
+
+      - name: Install cargo-pgo
+        run: cargo install cargo-pgo
+
+      - name: Build PGO-instrumented binary
+        run: cargo pgo build -- --release
+
+      - name: Determine binary path
+        id: triple
+        run: |
+          TRIPLE=$(rustc -vV | grep host | awk '{print $2}')
+          echo "bin=target/$TRIPLE/release/corro" >> "$GITHUB_OUTPUT"
+          echo "This runner is arm64, triple=$TRIPLE"
+
+      - name: Run workloads (collect PGO profiles)
+        run: |
+          BIN=${{ steps.triple.outputs.bin }}
+          python3 -c "import time; time.sleep(2); print('q')" | gtimeout 6 "$BIN" tmp_AG.corro || true
+          python3 -c "
+          import time, sys
+          time.sleep(1)
+          for _ in range(8): sys.stdout.write('\x1b[B')
+          for _ in range(3): sys.stdout.write('\x1b[C')
+          for _ in range(4): sys.stdout.write('\x1b[A')
+          sys.stdout.flush()
+          time.sleep(1)
+          print('q')
+          " | gtimeout 6 "$BIN" tmp_AG.corro || true
+          python3 -c "import time; time.sleep(2); print('q')" | gtimeout 5 "$BIN" tmp.tsv || true
+
+      - name: Build PGO-optimized binary
+        run: cargo pgo optimize -- --release
+        env:
+          RUSTC_WRAPPER: ""
+
+      - name: Strip and compress
+        run: |
+          BIN=${{ steps.triple.outputs.bin }}
+          strip "$BIN"
+          gzip -c "$BIN" > corro-osx.gz
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: corro-osx.gz
