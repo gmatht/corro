@@ -35,6 +35,12 @@ jobs:
             echo "WARNING: llvm-profdata not found in ~/.rustup"
           fi
 
+      - name: Build PGO-instrumented binary
+        run: |
+          mkdir -p pgo-data
+          RUSTFLAGS="-C profile-generate=pgo-data" \
+            cross build --target x86_64-unknown-linux-gnu --release
+
       - name: Run workloads (collect PGO profiles)
         run: |
           BIN=target/x86_64-unknown-linux-gnu/release/corro
@@ -62,7 +68,7 @@ jobs:
 
       - name: Build PGO-optimized binary
         run: |
-          RUSTFLAGS="-C profile-use=$(pwd)/pgo-data/merged.profdata" \
+          RUSTFLAGS="-C profile-use=pgo-data/merged.profdata" \
             cross build --target x86_64-unknown-linux-gnu --release
 
       - name: Strip and compress
@@ -279,7 +285,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p pgo-data
-          RUSTFLAGS="-C profile-generate=$(pwd)/pgo-data" \
+          RUSTFLAGS="-C profile-generate=pgo-data" \
             cargo build --target i686-pc-windows-msvc --release
 
       - name: Run workloads (collect PGO profiles)
