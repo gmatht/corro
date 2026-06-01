@@ -213,7 +213,7 @@ jobs:
       - name: Compress with zip
         shell: bash
         run: |
-          BIN=${{ steps.triple.outputs.bin }}
+          BIN=$(echo "${{ steps.triple.outputs.bin }}" | sed 's|/|\\|g')
           7z a -tzip corro.exe.zip "$BIN"
 
       - name: Upload release asset
