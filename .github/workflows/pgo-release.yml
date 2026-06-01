@@ -203,18 +203,10 @@ jobs:
       - name: Build
         run: cargo build --release
 
-      - name: Determine binary path
-        id: triple
-        shell: bash
-        run: |
-          TRIPLE=$(rustc -vV | grep host | awk '{print $2}')
-          echo "bin=target/$TRIPLE/release/corro.exe" >> "$GITHUB_OUTPUT"
-
       - name: Compress with zip
         shell: bash
         run: |
-          BIN=$(echo "${{ steps.triple.outputs.bin }}" | sed 's|/|\\|g')
-          7z a -tzip corro.exe.zip "$BIN"
+          7z a -tzip corro.exe.zip target/release/corro.exe
 
       - name: Upload release asset
         uses: softprops/action-gh-release@v2
