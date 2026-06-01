@@ -35,7 +35,34 @@ opt-level = "z"
 lto = "fat"
 codegen-units = 1
 panic = "abort"
-strip = true
+strip = "symbols"
 
 [profile.release.package.balance-core]
 opt-level = 2
+
+[profile.release.package.corro]
+opt-level = 2
+
+[profile.release.package.ratatui]
+opt-level = 2
+
+[profile.release.package.compact_str]
+opt-level = 2
+
+[profile.tiny]
+inherits = "release"
+opt-level = "z"
+strip = "symbols"
+
+# Override the inherited O2 per-package settings from release back to "z".
+[profile.tiny.package.balance-core]
+opt-level = "z"
+
+[profile.tiny.package.corro]
+opt-level = "z"
+
+[profile.tiny.package.ratatui]
+opt-level = "z"
+
+[profile.tiny.package.compact_str]
+opt-level = "z"
