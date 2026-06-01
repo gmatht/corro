@@ -192,7 +192,7 @@ jobs:
         with:
           files: corro-aarch64.gz
 
-  # ── Windows x86_64: PGO ─────────────────────────────────────────────
+  # ── Windows x86_64: release (no PGO) ─────────────────────────────────
   build-windows-x64:
     runs-on: windows-latest
     steps:
@@ -200,47 +200,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install cargo-pgo
-        run: cargo install cargo-pgo
-
-      - name: Install llvm-tools
-        run: rustup component add llvm-tools-preview
-
-      - name: Add LLVM tools to PATH
-        shell: bash
-        run: |
-          LLVM_DIR=$(find ~/.rustup -name "llvm-profdata*" -type f 2>/dev/null -exec dirname {} \; | head -1)
-          echo "LLVM_DIR=$LLVM_DIR"
-          if [ -n "$LLVM_DIR" ]; then
-            echo "$LLVM_DIR" >> "$GITHUB_PATH"
-          else
-            echo "WARNING: llvm-profdata not found in ~/.rustup"
-          fi
-
-      - name: Build PGO-instrumented binary
-        run: cargo pgo build -- --release
+      - name: Build
+        run: cargo build --release
 
       - name: Determine binary path
         id: triple
         shell: bash
         run: |
           TRIPLE=$(rustc -vV | grep host | awk '{print $2}')
-          echo "triple=$TRIPLE" >> "$GITHUB_OUTPUT"
           echo "bin=target/$TRIPLE/release/corro.exe" >> "$GITHUB_OUTPUT"
-
-      - name: Run workloads (collect PGO profiles)
-        shell: bash
-        run: |
-          BIN=$(echo "${{ steps.triple.outputs.bin }}" | sed 's|/|\\|g')
-          LLVM_PROFILE_FILE="${{ github.workspace }}/target/pgo-profiles/default_%p.profraw" \
-            python3 -c "import time; time.sleep(2); print('q')" | timeout 6 "$BIN" tmp_AG.corro || true
-          LLVM_PROFILE_FILE="${{ github.workspace }}/target/pgo-profiles/default_%p.profraw" \
-            python3 -c "import time; time.sleep(2); print('q')" | timeout 5 "$BIN" tmp.tsv || true
-
-      - name: Build PGO-optimized binary
-        run: cargo pgo optimize -- --release
-        env:
-          RUSTC_WRAPPER: ""
 
       - name: Compress with zip
         shell: bash
@@ -253,7 +221,7 @@ jobs:
         with:
           files: corro.exe.zip
 
-  # ── Windows x86: PGO ────────────────────────────────────────────────
+  # ── Windows x86: release (no PGO) ────────────────────────────────────
   build-windows-x86:
     runs-on: windows-latest
     steps:
@@ -264,48 +232,8 @@ jobs:
       - name: Add x86 target
         run: rustup target add i686-pc-windows-msvc
 
-      - name: Install llvm-tools
-        run: rustup component add llvm-tools-preview
-
-      - name: Add LLVM tools to PATH
-        shell: bash
-        run: |
-          LLVM_DIR=$(find ~/.rustup -name "llvm-profdata*" -type f 2>/dev/null -exec dirname {} \; | head -1)
-          echo "LLVM_DIR=$LLVM_DIR"
-          if [ -n "$LLVM_DIR" ]; then
-            echo "$LLVM_DIR" >> "$GITHUB_PATH"
-          else
-            echo "WARNING: llvm-profdata not found in ~/.rustup"
-          fi
-
-      - name: Build PGO-instrumented binary
-        shell: bash
-        run: |
-          mkdir -p pgo-data
-          RUSTFLAGS="-C profile-generate=pgo-data" \
-            cargo build --target i686-pc-windows-msvc --release
-
-      - name: Run workloads (collect PGO profiles)
-        shell: bash
-        run: |
-          BIN=target/i686-pc-windows-msvc/release/corro.exe
-          LLVM_PROFILE_FILE="${{ github.workspace }}/pgo-data/default_%p.profraw" \
-            python3 -c "import time; time.sleep(2); print('q')" | timeout 6 "$BIN" tmp_AG.corro || true
-          LLVM_PROFILE_FILE="${{ github.workspace }}/pgo-data/default_%p.profraw" \
-            python3 -c "import time; time.sleep(2); print('q')" | timeout 5 "$BIN" tmp.tsv || true
-
-      - name: Merge profiles
-        shell: bash
-        run: |
-          mkdir -p pgo-data
-          ls -la pgo-data/ 2>/dev/null || echo "empty"
-          llvm-profdata merge -o pgo-data/merged.profdata pgo-data/
-
-      - name: Build PGO-optimized binary
-        shell: bash
-        run: |
-          RUSTFLAGS="-C profile-use=$(pwd)/pgo-data/merged.profdata" \
-            cargo build --target i686-pc-windows-msvc --release
+      - name: Build
+        run: cargo build --target i686-pc-windows-msvc --release
 
       - name: Compress with zip
         shell: bash
