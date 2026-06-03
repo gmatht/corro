@@ -689,7 +689,7 @@ pub fn generic_interop_cell_text(
         }
     }
 
-    use crate::ui::SheetCursor;
+    use crate::grid::SheetCursor;
     let cur = SheetCursor {
         row: logical_row,
         col: global_col,
@@ -984,7 +984,7 @@ fn cell_value_at(grid: &Grid, logical_row: usize, global_col: usize) -> String {
 }
 
 fn rendered_value_at(grid: &Grid, logical_row: usize, global_col: usize) -> String {
-    use crate::ui::SheetCursor;
+    use crate::grid::SheetCursor;
     let cur = SheetCursor {
         row: logical_row,
         col: global_col,
@@ -1814,7 +1814,7 @@ mod tests {
                     v_cell, &computed,
                     "Values export at matrix[{i}][{j}] (logical row {lr}, col {gc})"
                 );
-                use crate::ui::SheetCursor;
+                use crate::grid::SheetCursor;
                 let cur = SheetCursor { row: lr, col: gc };
                 let raw_stored = grid.text(&cur.to_addr(grid));
                 let is_bare_agg_label = !raw_stored.is_empty()

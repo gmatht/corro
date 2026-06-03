@@ -1,3 +1,4 @@
+pub mod core;
 pub mod addr;
 pub mod agg;
 pub mod balance;

@@ -12,7 +12,7 @@ use crate::formula::{
 };
 use crate::grid::{
     CellAddr, CellFormat, ColumnAddr, FormatScope, GridBox as Grid, MainRange, MarginIndex, NumberFormat,
-    SortSpec, TextAlign, FOOTER_ROWS, HEADER_ROWS, MARGIN_COLS, DEFAULT_MAX_COL_WIDTH,
+    SheetCursor, SortSpec, TextAlign, FOOTER_ROWS, HEADER_ROWS, MARGIN_COLS, DEFAULT_MAX_COL_WIDTH,
 };
 use crate::io::{
     commit_workbook_op, commit_workbook_set_column_format_batch, load_workbook_revisions_partial,
@@ -261,34 +261,6 @@ impl PlainArrowAxis {
 }
 
 /// Logical cursor position across header+main+footer rows × total global columns.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SheetCursor {
-    pub row: usize,
-    pub col: usize,
-}
-
-impl SheetCursor {
-    fn clamp(&mut self, grid: &Grid) {
-        let rows = HEADER_ROWS + grid.main_rows() + FOOTER_ROWS;
-        let cols = grid.total_cols();
-        if rows > 0 {
-            self.row = self.row.min(rows - 1);
-        }
-        if cols > 0 {
-            self.col = self.col.min(cols - 1);
-        }
-    }
-
-    pub(crate) fn to_addr(self, grid: &Grid) -> CellAddr {
-        addr::sheet_cursor_to_addr(
-            addr::LogicalRow(self.row),
-            addr::GlobalCol(self.col),
-            addr::MainRows(grid.main_rows()),
-            addr::MainCols(grid.main_cols()),
-        )
-    }
-}
-
 #[derive(Clone, Debug)]
 enum Mode {
     Normal,
@@ -3394,36 +3366,17 @@ impl App {
     }
 
     fn refresh_linked_source_mtimes(&mut self) {
-        self.linked_source_mtimes.clear();
-        for sheet in &self.workbook.sheets {
-            if let Some(source) = &sheet.linked_source {
-                if let Ok(meta) = std::fs::metadata(&source.path) {
-                    if let Ok(modified) = meta.modified() {
-                        self.linked_source_mtimes
-                            .insert(source.path.clone(), modified);
-                    }
-                }
-            }
-        }
+        crate::core::linked_source::refresh_linked_source_mtimes(
+            &self.workbook,
+            &mut self.linked_source_mtimes,
+        );
     }
 
     fn linked_sources_changed(&self) -> bool {
-        for sheet in &self.workbook.sheets {
-            let Some(source) = &sheet.linked_source else {
-                continue;
-            };
-            let Ok(meta) = std::fs::metadata(&source.path) else {
-                continue;
-            };
-            let Ok(modified) = meta.modified() else {
-                continue;
-            };
-            match self.linked_source_mtimes.get(&source.path) {
-                Some(prev) if *prev >= modified => {}
-                _ => return true,
-            }
-        }
-        false
+        crate::core::linked_source::linked_sources_changed(
+            &self.workbook,
+            &self.linked_source_mtimes,
+        )
     }
 
     fn reload_workbook_from_log_path(&mut self, path: &Path) -> Result<(), IoError> {
@@ -10734,6 +10687,32 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
         self.input_cursor = None;
         self.mode = Mode::Normal;
         Ok(())
+    }
+
+    /// Dispatch a user action. Returns `true` if the app should exit.
+    pub fn execute(&mut self, action: crate::core::action::Action) -> Result<bool, RunError> {
+        use crate::core::action::Action as A;
+        match action {
+            A::MoveUp => {
+                self.move_cursor_one_row_vertical(false);
+                Ok(false)
+            }
+            A::MoveDown => {
+                self.move_cursor_one_row_vertical(true);
+                Ok(false)
+            }
+            A::MoveLeft => {
+                self.move_cursor_one_col_horizontal(false);
+                Ok(false)
+            }
+            A::MoveRight => {
+                self.move_cursor_one_col_horizontal(true);
+                Ok(false)
+            }
+            A::Quit => Ok(true),
+            A::NoOp => Ok(false),
+            _ => Ok(false),
+        }
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Result<bool, RunError> {

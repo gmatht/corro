@@ -14,6 +14,38 @@ pub const FOOTER_ROWS: usize = 999_999_999;
 /// mirror names (e.g. A..ZZ). Use usize for indexes.
 pub const MARGIN_COLS: usize = 26 * 27; // A..ZZ inclusive
 
+/// Global row/col cursor used by the UI and core logic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SheetCursor {
+    pub row: usize,
+    pub col: usize,
+}
+
+impl SheetCursor {
+    pub fn clamp(&mut self, grid: &GridBox) {
+        let rows = HEADER_ROWS + grid.main_rows() + FOOTER_ROWS;
+        let cols = grid.total_cols();
+        if rows > 0 {
+            self.row = self.row.min(rows - 1);
+        }
+        if cols > 0 {
+            self.col = self.col.min(cols - 1);
+        }
+    }
+
+    pub(crate) fn to_addr(self, grid: &GridBox) -> CellAddr {
+        crate::addr::sheet_cursor_to_addr(
+            crate::addr::LogicalRow(self.row),
+            crate::addr::GlobalCol(self.col),
+            crate::addr::MainRows(grid.main_rows()),
+            crate::addr::MainCols(grid.main_cols()),
+        )
+    }
+}
+
+/// Type alias for margin column indices to make it easy to widen the type in
+/// one place if needed.
+
 /// Type alias for margin column indices to make it easy to widen the type in
 /// one place if needed.
 pub type MarginIndex = usize;

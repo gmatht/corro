@@ -1,8 +1,8 @@
 //! Mixed workload for LLVM PGO: ~20% wall time replaying `.corro` logs (default: `docs/` under the crate),
 //! ~80% arrow navigation plus ratatui draw on a `TestBackend`.
 
-use corro::grid::{HEADER_ROWS, MARGIN_COLS};
-use corro::ui::{App, SheetCursor};
+use corro::grid::{HEADER_ROWS, MARGIN_COLS, SheetCursor};
+use corro::ui::App;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
