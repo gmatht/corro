@@ -36,7 +36,7 @@ web-sys = { version = "0.3", features = [
 ] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-pancurses = { version = "0.17", optional = true }
+pancurses = { version = "0.17", optional = true, features = ["wide"] }
 
 [features]
 default = ["gtk"]

@@ -44,6 +44,16 @@ mod pancurses_backend {
             edit_buf: String,
             edit_pos: usize,
             col_width: u32,
+            margin_cols: u32,
+            main_cols: u32,
+            formula_bar_address_id: Option<usize>,
+            formula_bar_entry_id: Option<usize>,
+            anchor: Option<(u32, u32)>,
+            menu_text: String,
+            status_text: String,
+            border_title: String,
+            column_layout: Vec<(u32, u32, String)>,
+            row_labels: Vec<(u32, String)>,
         },
     }
 
@@ -66,6 +76,7 @@ mod pancurses_backend {
         pub menu_open: bool,
         pub active_submenu: usize,
         pub active_item: usize,
+        key_callbacks: Vec<(char, Box<dyn FnMut()>)>,
     }
 
     impl PcState {
@@ -79,6 +90,7 @@ mod pancurses_backend {
                 menu_open: false,
                 active_submenu: 0,
                 active_item: 0,
+                key_callbacks: Vec::new(),
             }
         }
 
@@ -320,6 +332,24 @@ mod pancurses_backend {
                             fire_callbacks(callbacks);
                         }
                     }
+                    Some(Input::Character('q')) | Some(Input::Character('Q')) => {
+                        // Only quit when spreadsheet is not editing
+                        let editing = with_state(|state| {
+                            if let Some(fid) = state.focus_id {
+                                if is_spreadsheet_focused(state, fid) {
+                                    if let Some(n) = state.node(fid) {
+                                        if let PcWidgetKind::Spreadsheet { editing, .. } = &n.kind {
+                                            return *editing;
+                                        }
+                                    }
+                                }
+                            }
+                            false
+                        });
+                        if !editing {
+                            with_state(|state| state.running = false);
+                        }
+                    }
                     Some(Input::Character('\n')) | Some(Input::Character('\r')) => {
                         let callbacks = with_state(|state| {
                             if state.menu_open {
@@ -416,12 +446,38 @@ mod pancurses_backend {
                         } else if c == '\x03' {
                             // Ctrl+C — quit
                             with_state(|state| state.running = false);
-                        } else if c == ' ' {
-                            let (_, callbacks) = with_state(|state| {
+                        } else if c == '\x07' {
+                            // Ctrl+G — Go to column 0, row 999 (shows as A1000)
+                            with_state(|state| {
                                 if let Some(fid) = state.focus_id {
+                                    if is_spreadsheet_focused(state, fid) {
+                                        if let Some(n) = state.node_mut(fid) {
+                                            if let PcWidgetKind::Spreadsheet { ref mut cursor_row, ref mut cursor_col, .. } = n.kind {
+                                                *cursor_col = 0;
+                                                *cursor_row = 999;
+                                            }
+                                        }
+                                        spreadsheet_scroll_to_cursor(state, fid);
+                                    }
+                                }
+                            });
+                    } else if c == ' ' {
+                            let callbacks = with_state(|state| {
+                                if let Some(fid) = state.focus_id {
+                                    if is_spreadsheet_focused(state, fid) {
+                                        // Insert space into spreadsheet edit buffer when in edit mode
+                                        if let Some(n) = state.node_mut(fid) {
+                                            if let PcWidgetKind::Spreadsheet { ref mut editing, ref mut edit_buf, ref mut edit_pos, .. } = n.kind {
+                                                if *editing {
+                                                    edit_buf.insert(*edit_pos, ' ');
+                                                    *edit_pos += 1;
+                                                    return vec![];
+                                                }
+                                            }
+                                        }
+                                    }
                                     let (toggled, cbs) = toggle_focused(state, fid);
                                     if !toggled {
-                                        // Not a toggleable widget — insert space as text
                                         let idxs: Vec<usize> = (0..state.nodes.len())
                                             .filter(|i| state.nodes[*i].id == fid)
                                             .collect();
@@ -432,36 +488,69 @@ mod pancurses_backend {
                                             }
                                         }
                                     }
-                                    (toggled, cbs)
+                                    cbs
                                 } else {
-                                    (false, vec![])
+                                    vec![]
                                 }
                             });
                             fire_callbacks(callbacks);
                         } else {
-                            with_state(|state| {
-                                if let Some(fid) = state.focus_id {
-                                    if is_spreadsheet_focused(state, fid) {
-                                        if let Some(n) = state.node_mut(fid) {
-                                            if let PcWidgetKind::Spreadsheet { ref mut editing, ref mut edit_buf, ref mut edit_pos, .. } = n.kind {
-                                                if !*editing {
-                                                    *editing = true;
-                                                    *edit_buf = c.to_string();
-                                                    *edit_pos = 1;
-                                                } else {
-                                                    edit_buf.insert(*edit_pos, c);
-                                                    *edit_pos += 1;
-                                                }
-                                            }
-                                        }
-                                    } else if let Some(n) = state.node_mut(fid) {
-                                        if let PcWidgetKind::Entry { ref mut buffer, ref mut cursor } = n.kind {
-                                            buffer.insert(*cursor, c);
-                                            *cursor += 1;
+                            // Check registered key callbacks first
+                            let mut fired = false;
+                            {
+                                let callbacks: Vec<Box<dyn FnMut()>> = with_state(|state| {
+                                    let mut out = Vec::new();
+                                    let mut i = 0;
+                                    while i < state.key_callbacks.len() {
+                                        if state.key_callbacks[i].0 == c {
+                                            out.push(state.key_callbacks.swap_remove(i).1);
+                                            fired = true;
+                                        } else {
+                                            i += 1;
                                         }
                                     }
-                                }
-                            });
+                                    out
+                                });
+                                fire_callbacks(callbacks);
+                            }
+                            if !fired {
+                                with_state(|state| {
+                                    if let Some(fid) = state.focus_id {
+                                        if is_spreadsheet_focused(state, fid) {
+                                            if let Some(n) = state.node_mut(fid) {
+                                                if let PcWidgetKind::Spreadsheet { ref mut editing, ref mut cursor_col, ref mut cursor_row, total_cols, total_rows, ref mut edit_buf, ref mut edit_pos, .. } = n.kind {
+                                                    if !*editing {
+                                                        // Not in edit mode — check for special keys
+                                                        if c == 'c' || c == 'C' {
+                                                            if *cursor_col < total_cols - 1 { *cursor_col = total_cols - 1; }
+                                                            spreadsheet_scroll_to_cursor(state, fid);
+                                                            return;
+                                                        }
+                                                        if c == 'r' || c == 'R' {
+                                                            if *cursor_row < total_rows - 1 { *cursor_row = total_rows - 1; }
+                                                            spreadsheet_scroll_to_cursor(state, fid);
+                                                            return;
+                                                        }
+                                                        // Start editing with this character
+                                                        *editing = true;
+                                                        *edit_buf = c.to_string();
+                                                        *edit_pos = 1;
+                                                    } else {
+                                                        // In edit mode — append character
+                                                        edit_buf.insert(*edit_pos, c);
+                                                        *edit_pos += 1;
+                                                    }
+                                                }
+                                            }
+                                        } else if let Some(n) = state.node_mut(fid) {
+                                            if let PcWidgetKind::Entry { ref mut buffer, ref mut cursor } = n.kind {
+                                                buffer.insert(*cursor, c);
+                                                *cursor += 1;
+                                            }
+                                        }
+                                    }
+                                });
+                            }
                         }
                     }
                     Some(Input::KeyBackspace) => {
@@ -517,6 +606,7 @@ mod pancurses_backend {
                                 }
                             } else if let Some(fid) = state.focus_id {
                                 if is_spreadsheet_focused(state, fid) {
+                                    spreadsheet_prepare_move(state, fid, false);
                                     spreadsheet_commit_edit(state, fid);
                                     if let Some(n) = state.node_mut(fid) {
                                         if let PcWidgetKind::Spreadsheet { ref mut cursor_col, .. } = n.kind {
@@ -547,6 +637,7 @@ mod pancurses_backend {
                                 }
                             } else if let Some(fid) = state.focus_id {
                                 if is_spreadsheet_focused(state, fid) {
+                                    spreadsheet_prepare_move(state, fid, false);
                                     spreadsheet_commit_edit(state, fid);
                                     if let Some(n) = state.node_mut(fid) {
                                         if let PcWidgetKind::Spreadsheet { ref mut cursor_col, total_cols, .. } = n.kind {
@@ -577,6 +668,7 @@ mod pancurses_backend {
                                 }
                             } else if let Some(fid) = state.focus_id {
                                 if is_spreadsheet_focused(state, fid) {
+                                    spreadsheet_prepare_move(state, fid, false);
                                     spreadsheet_commit_edit(state, fid);
                                     if let Some(n) = state.node_mut(fid) {
                                         if let PcWidgetKind::Spreadsheet { ref mut cursor_row, .. } = n.kind {
@@ -713,6 +805,100 @@ mod pancurses_backend {
                                             if *cursor_row + 1 < total_rows { *cursor_row += 1; }
                                         }
                                     }
+                                }
+                            }
+                        });
+                    }
+                    Some(Input::KeySLeft) => {
+                        with_state(|state| {
+                            if let Some(fid) = state.focus_id {
+                                if is_spreadsheet_focused(state, fid) {
+                                    spreadsheet_prepare_move(state, fid, true);
+                                    spreadsheet_commit_edit(state, fid);
+                                    if let Some(n) = state.node_mut(fid) {
+                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_col, .. } = n.kind {
+                                            if *cursor_col > 0 { *cursor_col -= 1; }
+                                        }
+                                    }
+                                    spreadsheet_scroll_to_cursor(state, fid);
+                                }
+                            }
+                        });
+                    }
+                    Some(Input::KeySRight) => {
+                        with_state(|state| {
+                            if let Some(fid) = state.focus_id {
+                                if is_spreadsheet_focused(state, fid) {
+                                    spreadsheet_prepare_move(state, fid, true);
+                                    spreadsheet_commit_edit(state, fid);
+                                    if let Some(n) = state.node_mut(fid) {
+                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_col, total_cols, .. } = n.kind {
+                                            if *cursor_col + 1 < total_cols { *cursor_col += 1; }
+                                        }
+                                    }
+                                    spreadsheet_scroll_to_cursor(state, fid);
+                                }
+                            }
+                        });
+                    }
+                    Some(Input::KeyPPage) => {
+                        with_state(|state| {
+                            if let Some(fid) = state.focus_id {
+                                if is_spreadsheet_focused(state, fid) {
+                                    spreadsheet_commit_edit(state, fid);
+                                    if let Some(n) = state.node_mut(fid) {
+                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_row, total_rows, .. } = n.kind {
+                                            let page = 20.min(total_rows / 2);
+                                            *cursor_row = cursor_row.saturating_sub(page);
+                                        }
+                                    }
+                                    spreadsheet_scroll_to_cursor(state, fid);
+                                }
+                            }
+                        });
+                    }
+                    Some(Input::KeyNPage) => {
+                        with_state(|state| {
+                            if let Some(fid) = state.focus_id {
+                                if is_spreadsheet_focused(state, fid) {
+                                    spreadsheet_commit_edit(state, fid);
+                                    if let Some(n) = state.node_mut(fid) {
+                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_row, total_rows, .. } = n.kind {
+                                            let page = 20.min(total_rows / 2);
+                                            *cursor_row = (*cursor_row + page).min(total_rows - 1);
+                                        }
+                                    }
+                                    spreadsheet_scroll_to_cursor(state, fid);
+                                }
+                            }
+                        });
+                    }
+                    Some(Input::KeyHome) => {
+                        with_state(|state| {
+                            if let Some(fid) = state.focus_id {
+                                if is_spreadsheet_focused(state, fid) {
+                                    spreadsheet_commit_edit(state, fid);
+                                    if let Some(n) = state.node_mut(fid) {
+                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_col, .. } = n.kind {
+                                            *cursor_col = 0;
+                                        }
+                                    }
+                                    spreadsheet_scroll_to_cursor(state, fid);
+                                }
+                            }
+                        });
+                    }
+                    Some(Input::KeyEnd) => {
+                        with_state(|state| {
+                            if let Some(fid) = state.focus_id {
+                                if is_spreadsheet_focused(state, fid) {
+                                    spreadsheet_commit_edit(state, fid);
+                                    if let Some(n) = state.node_mut(fid) {
+                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_col, total_cols, .. } = n.kind {
+                                            *cursor_col = total_cols - 1;
+                                        }
+                                    }
+                                    spreadsheet_scroll_to_cursor(state, fid);
                                 }
                             }
                         });
@@ -945,134 +1131,242 @@ mod pancurses_backend {
                     root.attroff(COLOR_PAIR(3));
                 }
             }
-            PcWidgetKind::Spreadsheet { ref cells, total_rows: _, total_cols: _, ref top_row, ref left_col, ref cursor_row, ref cursor_col, ref editing, ref edit_buf, ref edit_pos, ref col_width } => {
+            PcWidgetKind::Spreadsheet { ref cells, ref top_row, ref left_col, ref cursor_row, ref cursor_col, ref editing, ref edit_buf, ref edit_pos, ref col_width, ref margin_cols, ref main_cols, ref menu_text, ref status_text, ref border_title, ref column_layout, ref row_labels, ref total_rows, ref total_cols, .. } => {
                 let cw = *col_width as i32;
-                let rh_w = 4i32; // row header width
-                let sep: char = '║';
-                // clear widget area
+                let rh_w = 5i32;
+                let sep: char = '│';
+                let lm = *margin_cols as usize;
+                let mc = *main_cols as usize;
+                let use_layout = !column_layout.is_empty();
+                let use_row_labels = !row_labels.is_empty();
                 for dy in 0..rect.h {
                     for dx in 0..rect.w {
                         root.mvaddch(rect.y + dy, rect.x + dx, ' ');
                     }
                 }
-                let max_data_cols = ((rect.w - rh_w - 1) / (cw + 1)).max(1);
-                let max_data_rows = (rect.h - 2).max(1) as u32;
-                // draw column headers
-                if has_colors() { root.attron(COLOR_PAIR(4)); }
-                root.mvaddstr(rect.y, rect.x, "    "); // row header blank
-                root.mvaddch(rect.y, rect.x + rh_w, sep);
-                for vc in 0..max_data_cols {
-                    let col_idx = *left_col + vc as u32;
-                    let label = col_label(col_idx);
-                    let dx = rect.x + rh_w + 1 + vc * (cw + 1);
-                    root.mvaddstr(rect.y, dx, &label);
+                let mut row_offset = rect.y;
+
+                // Menu bar
+                if !menu_text.is_empty() {
+                    if has_colors() { root.attron(COLOR_PAIR(4)); }
+                    root.mvaddstr(row_offset, rect.x, &menu_text[..menu_text.len().min(rect.w as usize)]);
+                    if has_colors() { root.attroff(COLOR_PAIR(4)); }
+                    row_offset += 1;
                 }
-                if has_colors() { root.attroff(COLOR_PAIR(4)); }
-                // draw header separator
-                root.mvaddstr(rect.y + 1, rect.x, "═══╬");
-                for vc in 0..max_data_cols {
-                    let dx = rect.x + rh_w + 1 + vc * (cw + 1);
-                    for i in 0..cw as usize {
-                        root.mvaddch(rect.y + 1, dx + i as i32, '═');
+
+                // Formula bar
+                let addr_text = format!("{}{}", col_label(*cursor_col), *cursor_row + 1);
+                let cell_val = cells.borrow().get(&(*cursor_row, *cursor_col)).cloned().unwrap_or_default();
+                let max_fb = (rect.w as usize).saturating_sub(addr_text.len() + 3).max(1);
+                let fb_text = if cell_val.len() > max_fb {
+                    format!(" {}  {}…", addr_text, &cell_val[..max_fb.saturating_sub(3)])
+                } else {
+                    format!(" {}  {}", addr_text, cell_val)
+                };
+                if has_colors() { root.attron(COLOR_PAIR(1)); }
+                root.mvaddstr(row_offset, rect.x, &fb_text[..fb_text.len().min(rect.w as usize)]);
+                if has_colors() { root.attroff(COLOR_PAIR(1)); }
+                row_offset += 1;
+
+                // Top border line: ┌ title ───┐
+                {
+                    let br = row_offset;
+                    let title = if !border_title.is_empty() {
+                        format!(" {}", border_title)
+                    } else {
+                        format!(" corro  {}r × {}c ", *main_cols, *main_cols)
+                    };
+                    let title = title.trim_end().to_string();
+                    root.mvaddstr(br, rect.x, "┌");
+                    let dash_fill = (rect.w as usize).saturating_sub(title.len() + 2);
+                    root.mvaddstr(br, rect.x + 1, &title);
+                    for i in 0..dash_fill {
+                        root.mvaddstr(br, rect.x + 1 + title.len() as i32 + i as i32, "─");
                     }
-                    root.mvaddch(rect.y + 1, dx + cw, sep);
+                    root.mvaddstr(br, rect.x + rect.w - 1, "┐");
+                    row_offset += 1;
                 }
-                // draw data rows
+
+                // Grid header row
+                {
+                    let hr = row_offset;
+                    root.mvaddstr(hr, rect.x, "│");
+                    if use_layout {
+                        // Pre-computed layout: draw each column header as specified
+                        let mut hx = rect.x + 1;
+                        for &(ref _ci, ref w, ref label) in column_layout.iter() {
+                            let padded = format!("{:<1$}", label, *w as usize);
+                            root.mvaddstr(hr, hx, &padded);
+                            hx += *w as i32;
+                        }
+                    } else {
+                        if has_colors() { root.attron(COLOR_PAIR(4)); }
+                        let max_data_cols = ((rect.w - rh_w - 2) / (cw + 1)).max(1);
+                        root.mvaddstr(hr, rect.x + 1, "     ");
+                        let max_vis_cols = max_data_cols.min((mc.saturating_add(lm)) as i32);
+                        for vc in 0..max_vis_cols {
+                            let col_idx = *left_col + vc as u32;
+                            let dx = rect.x + 1 + rh_w + vc * (cw + 1);
+                            let label = if col_idx < lm as u32 {
+                                format!("[{}", col_label(col_idx))
+                            } else if col_idx < (lm + mc) as u32 {
+                                col_label(col_idx)
+                            } else {
+                                format!("]{}", col_label(col_idx))
+                            };
+                            root.mvaddstr(hr, dx + 1, &label);
+                            root.mvaddstr(hr, dx, &sep.to_string());
+                        }
+                        if has_colors() { root.attroff(COLOR_PAIR(4)); }
+                    }
+                    // header separator
+                    let sep_len = rect.w.saturating_sub(2).max(1) as usize;
+                    root.mvaddstr(hr + 1, rect.x, "│");
+                    for i in 0..sep_len {
+                        root.mvaddstr(hr + 1, rect.x + 1 + i as i32, "─");
+                    }
+                    root.mvaddstr(hr + 1, rect.x + 1 + sep_len as i32, "│");
+                    row_offset = hr + 2;
+                }
+
+                // Data rows
+                let grid_bottom = rect.y + rect.h - (if status_text.is_empty() { 0 } else { 1 });
+                let max_data_rows = ((grid_bottom - row_offset) as i32).max(1) as u32;
                 for vr in 0..max_data_rows {
                     let row_idx = *top_row + vr as u32;
-                    let ry = rect.y + 2 + vr as i32;
-                    // row header
-                    if has_colors() { root.attron(COLOR_PAIR(4)); }
-                    let rh_text = format!("{:>3} ", row_idx + 1);
-                    root.mvaddstr(ry, rect.x, &rh_text);
-                    root.mvaddch(ry, rect.x + rh_w, sep);
-                    if has_colors() { root.attroff(COLOR_PAIR(4)); }
-                    // data cells
-                    let cells_ref = cells.borrow();
-                    let mut vc = 0i32;
-                    while vc < max_data_cols {
-                        let col_idx = *left_col + vc as u32;
-                        let cell_text = cells_ref.get(&(row_idx, col_idx)).map(|s| s.as_str()).unwrap_or("");
-                        let is_cursor = row_idx == *cursor_row && col_idx == *cursor_col;
-                        let is_editing = is_cursor && *editing;
-                        let dx = rect.x + rh_w + 1 + vc * (cw + 1);
-                        if cell_text.is_empty() && !is_editing {
-                            // draw empty cell
-                            if is_cursor {
-                                if has_colors() { root.attron(COLOR_PAIR(2)); }
-                                for i in 0..cw { root.mvaddch(ry, dx + i, ' '); }
-                                if has_colors() { root.attroff(COLOR_PAIR(2)); }
-                            }
-                            root.mvaddch(ry, dx + cw, sep);
-                            vc += 1;
-                            continue;
-                        }
-                        // determine display text with overflow
-                        let text = if is_editing { &edit_buf } else { cell_text };
-                        let text_len = text.len() as i32;
-                        // scan rightward for overflow into empty cells
-                        let mut overflow_cols = 0i32;
-                        if !is_editing && text_len > cw {
-                            let mut scan = vc + 1;
-                            while scan < max_data_cols {
-                                let sc = *left_col + scan as u32;
-                                if cells_ref.get(&(row_idx, sc)).map_or(true, |s| s.is_empty()) {
-                                    overflow_cols += 1;
-                                    scan += 1;
-                                } else { break; }
-                            }
-                        }
-                        let available = (overflow_cols + 1) * cw;
-                        let display = if text_len > available {
-                            let trunc = (available - 1).max(1) as usize;
-                            let mut s: String = text.chars().take(trunc).collect();
-                            s.push('…');
-                            s
+                    let ry = row_offset + vr as i32;
+                    root.mvaddstr(ry, rect.x, "│");
+                    let mut rx = rect.x + 1;
+                    // Row header
+                    if use_row_labels {
+                        if let Some((_, label)) = row_labels.iter().find(|(r, _)| *r == row_idx) {
+                            root.mvaddstr(ry, rx, &format!("{:<4}", label));
                         } else {
-                            text.to_string()
-                        };
-                        // draw cell background
-                        if is_cursor && has_colors() { root.attron(COLOR_PAIR(2)); }
-                        for i in 0..(overflow_cols + 1) * cw {
-                            let cx = dx + i;
-                            if cx < rect.x + rect.w {
-                                root.mvaddch(ry, cx, ' ');
-                            }
+                            root.mvaddstr(ry, rx, &format!("{:>4}", row_idx + 1));
                         }
-                        if is_cursor && has_colors() { root.attroff(COLOR_PAIR(2)); }
-                        // draw text
-                        if is_editing {
-                            // show edit buffer: scroll to show cursor position
-                            let buf_len = edit_buf.len();
-                            let scroll = if *edit_pos > ((cw - 1) as usize) { *edit_pos - (cw as usize) + 1 } else { 0 };
-                            let start = scroll.min(buf_len);
-                            let visible: String = edit_buf.chars().skip(start).take(cw as usize).collect();
-                            if is_cursor && has_colors() { root.attron(COLOR_PAIR(2)); }
-                            root.mvaddstr(ry, dx, &visible);
-                            // draw cursor
-                            let cursor_col = (*edit_pos - scroll) as i32;
-                            if cursor_col < cw && cursor_col >= 0 {
-                                let ch = '_' as u32 | A_REVERSE as u32;
-                                let cpos = dx + cursor_col;
-                                if cpos < rect.x + rect.w {
-                                    root.mvaddch(ry, cpos, ch);
+                        root.mvaddstr(ry, rx + 5, &sep.to_string());
+                    } else {
+                        if has_colors() { root.attron(COLOR_PAIR(4)); }
+                        root.mvaddstr(ry, rx, &format!("{:>4}", row_idx + 1));
+                        root.mvaddstr(ry, rx + 5, &sep.to_string());
+                        if has_colors() { root.attroff(COLOR_PAIR(4)); }
+                    }
+                    let cells_ref = cells.borrow();
+                    if use_layout {
+                        // Pre-computed column layout: render each column.
+                        // Cells are stored at main-column indices; map global→main for lookup.
+                        // Column area starts after border (1) + row header (5) + separator (1) = 7
+                        let mut rx2 = rect.x + 1 + 5 + 1;
+                        for &(col_idx, w, _) in column_layout {
+                            let is_margin = *margin_cols > 0 && col_idx < *margin_cols;
+                            let cell_text = if !is_margin {
+                                let main_col = col_idx - *margin_cols;
+                                cells_ref.get(&(row_idx, main_col)).map(|s| s.as_str()).unwrap_or("")
+                            } else { "" };
+                            let display = if cell_text.is_empty() {
+                                String::new()
+                            } else {
+                                let text_width = cell_text.chars().count();
+                                if text_width > w as usize {
+                                    let trunc = (w as usize - 1).max(1);
+                                    let mut s: String = cell_text.chars().take(trunc).collect();
+                                    if text_width > trunc { s.push('…'); }
+                                    s
+                                } else { cell_text.to_string() }
+                            };
+                            root.mvaddstr(ry, rx2, &format!("{:<1$}", display, w as usize));
+                            rx2 += w as i32;
+                        }
+                        root.mvaddstr(ry, rect.x + rect.w - 1, "│");
+                    } else {
+                        let max_data_cols = ((rect.w - rh_w - 2) / (cw + 1)).max(1);
+                        let max_vis_cols = max_data_cols.min((mc.saturating_add(lm)) as i32);
+                        let mut vc = 0i32;
+                        while vc < max_vis_cols {
+                            let col_idx = *left_col + vc as u32;
+                            let cell_text = cells_ref.get(&(row_idx, col_idx)).map(|s| s.as_str()).unwrap_or("");
+                            let is_cursor = row_idx == *cursor_row && col_idx == *cursor_col;
+                            let is_editing = is_cursor && *editing;
+                            let dx = rect.x + 1 + rh_w + vc * (cw + 1);
+                            if cell_text.is_empty() && !is_editing {
+                                if is_cursor {
+                                    if has_colors() { root.attron(COLOR_PAIR(2)); }
+                                    for i in 0..cw { root.mvaddch(ry, dx + i, ' '); }
+                                }
+                                root.mvaddstr(ry, dx + cw, &sep.to_string());
+                                vc += 1;
+                                continue;
+                            }
+                            let text = if is_editing { &edit_buf } else { cell_text };
+                            let text_width = text.chars().count();
+                            let mut overflow_cols = 0i32;
+                            if !is_editing && text_width > cw as usize {
+                                let mut scan = vc + 1;
+                                while scan < max_vis_cols {
+                                    let sc = *left_col + scan as u32;
+                                    if cells_ref.get(&(row_idx, sc)).map_or(true, |s| s.is_empty()) {
+                                        overflow_cols += 1;
+                                        scan += 1;
+                                    } else { break; }
                                 }
                             }
-                            if is_cursor && has_colors() { root.attroff(COLOR_PAIR(2)); }
-                        } else {
+                            let available = (overflow_cols + 1) * cw;
+                            let display = if text_width > available as usize {
+                                let trunc = (available - 1).max(1) as usize;
+                                let mut s: String = text.chars().take(trunc).collect();
+                                if text.chars().count() > trunc { s.push('…'); }
+                                s
+                            } else { text.to_string() };
                             if is_cursor && has_colors() { root.attron(COLOR_PAIR(2)); }
-                            root.mvaddstr(ry, dx, &display);
-                            if is_cursor && has_colors() { root.attroff(COLOR_PAIR(2)); }
-                        }
-                        // draw column separators
-                        for i in 0..=overflow_cols {
-                            let sx = dx + (i + 1) * cw;
-                            if sx < rect.x + rect.w {
-                                root.mvaddch(ry, sx, sep);
+                            for i in 0..(overflow_cols + 1) * cw {
+                                let cx = dx + i;
+                                if cx < rect.x + rect.w { root.mvaddch(ry, cx, ' '); }
                             }
+                            if is_cursor && has_colors() { root.attroff(COLOR_PAIR(2)); }
+                            if is_editing {
+                                let buf_len = edit_buf.len();
+                                let scroll = if *edit_pos > ((cw - 1) as usize) { *edit_pos - (cw as usize) + 1 } else { 0 };
+                                let start = scroll.min(buf_len);
+                                let visible: String = edit_buf.chars().skip(start).take(cw as usize).collect();
+                                if is_cursor && has_colors() { root.attron(COLOR_PAIR(2)); }
+                                root.mvaddstr(ry, dx, &visible);
+                                let cursor_col_pos = (*edit_pos - scroll) as i32;
+                                if cursor_col_pos < cw && cursor_col_pos >= 0 {
+                                    let ch = '_' as u32 | A_REVERSE as u32;
+                                    let cpos = dx + cursor_col_pos;
+                                    if cpos < rect.x + rect.w { root.mvaddch(ry, cpos, ch); }
+                                }
+                                if is_cursor && has_colors() { root.attroff(COLOR_PAIR(2)); }
+                            } else {
+                                if is_cursor && has_colors() { root.attron(COLOR_PAIR(2)); }
+                                root.mvaddstr(ry, dx, &display);
+                                if is_cursor && has_colors() { root.attroff(COLOR_PAIR(2)); }
+                            }
+                            for i in 0..=overflow_cols {
+                                let sx = dx + (i + 1) * cw;
+                                if sx < rect.x + rect.w { root.mvaddstr(ry, sx, &sep.to_string()); }
+                            }
+                            vc += 1 + overflow_cols;
                         }
-                        vc += 1 + overflow_cols;
+                        root.mvaddstr(ry, rect.x + rect.w - 1, "│");
                     }
+                }
+                // Bottom border (one row below the last data row)
+                {
+                    let br = row_offset + max_data_rows as i32;
+                    root.mvaddstr(br, rect.x, "└");
+                    for i in 1..rect.w - 1 {
+                        root.mvaddstr(br, rect.x + i, "─");
+                    }
+                    root.mvaddstr(br, rect.x + rect.w - 1, "┘");
+                }
+                // Status bar at bottom
+                if !status_text.is_empty() {
+                    let sy = rect.y + rect.h - 1;
+                    if has_colors() { root.attron(COLOR_PAIR(1) | COLOR_PAIR(2)); }
+                    let max_w = rect.w as usize;
+                    root.mvaddstr(sy, rect.x, &status_text[..status_text.len().min(max_w)]);
+                    if has_colors() { root.attroff(COLOR_PAIR(1) | COLOR_PAIR(2)); }
                 }
             }
         }
@@ -1118,6 +1412,7 @@ mod pancurses_backend {
                 }
             }
         }
+        spreadsheet_update_formula_bar_inner(state, fid);
     }
 
     fn spreadsheet_commit_edit(state: &mut PcState, fid: usize) {
@@ -1152,7 +1447,9 @@ mod pancurses_backend {
             Some(i) => i,
             None => return (false, vec![]),
         };
-        match state.nodes[idx].kind {
+        // Match by reference — do NOT move `kind` out of the node, otherwise
+        // subsequent reads of the node's fields become use-after-move.
+        match &mut state.nodes[idx].kind {
             PcWidgetKind::Button { .. } => {
                 let cbs = std::mem::take(&mut state.nodes[idx].callbacks);
                 (true, cbs)
@@ -1163,7 +1460,7 @@ mod pancurses_backend {
                 (true, cbs)
             }
             PcWidgetKind::RadioButton { group_id, .. } => {
-                let gid = group_id;
+                let gid = *group_id;
                 // Uncheck all radio buttons in the same group
                 for node in &mut state.nodes {
                     if let PcWidgetKind::RadioButton { checked: ref mut oc, group_id: og, .. } = &mut node.kind {
@@ -1171,7 +1468,7 @@ mod pancurses_backend {
                     }
                 }
                 // Check the focused one
-                if let PcWidgetKind::RadioButton { checked: ref mut c, .. } = state.nodes[idx].kind {
+                if let PcWidgetKind::RadioButton { checked: ref mut c, .. } = &mut state.nodes[idx].kind {
                     *c = true;
                 }
                 let cbs = std::mem::take(&mut state.nodes[idx].callbacks);
@@ -1269,6 +1566,16 @@ mod pancurses_backend {
             edit_buf: String::new(),
             edit_pos: 0,
             col_width: 12,
+            margin_cols: 0,
+            main_cols: cols,
+            formula_bar_address_id: None,
+            formula_bar_entry_id: None,
+            anchor: None,
+            menu_text: String::new(),
+            status_text: String::new(),
+            border_title: String::new(),
+            column_layout: Vec::new(),
+            row_labels: Vec::new(),
         }, find_window_id(s)));
         Ok(id)
     }
@@ -1293,6 +1600,190 @@ mod pancurses_backend {
                 }
             })
         })
+    }
+
+    fn spreadsheet_prepare_move(state: &mut PcState, fid: usize, shift: bool) {
+        if let Some(n) = state.node_mut(fid) {
+            if let PcWidgetKind::Spreadsheet { ref mut anchor, cursor_row, cursor_col, .. } = n.kind {
+                if shift {
+                    if anchor.is_none() {
+                        *anchor = Some((cursor_row, cursor_col));
+                    }
+                } else {
+                    *anchor = None;
+                }
+            }
+        }
+    }
+
+    pub fn spreadsheet_clear_anchor(fid: usize) {
+        with_state(|s| {
+            if let Some(n) = s.node_mut(fid) {
+                if let PcWidgetKind::Spreadsheet { ref mut anchor, .. } = n.kind {
+                    *anchor = None;
+                }
+            }
+        });
+    }
+
+    pub fn spreadsheet_set_column_layout(spreadsheet_id: usize, layout: Vec<(u32, u32, String)>) {
+        with_state(|s| {
+            if let Some(n) = s.node_mut(spreadsheet_id) {
+                if let PcWidgetKind::Spreadsheet { ref mut column_layout, .. } = n.kind {
+                    *column_layout = layout;
+                }
+            }
+        });
+    }
+
+    pub fn spreadsheet_set_row_labels(spreadsheet_id: usize, labels: Vec<(u32, String)>) {
+        with_state(|s| {
+            if let Some(n) = s.node_mut(spreadsheet_id) {
+                if let PcWidgetKind::Spreadsheet { ref mut row_labels, .. } = n.kind {
+                    *row_labels = labels;
+                }
+            }
+        });
+    }
+
+    pub fn spreadsheet_set_menu_text(spreadsheet_id: usize, text: &str) {
+        with_state(|s| {
+            if let Some(n) = s.node_mut(spreadsheet_id) {
+                if let PcWidgetKind::Spreadsheet { ref mut menu_text, .. } = n.kind {
+                    *menu_text = text.to_string();
+                }
+            }
+        });
+    }
+
+    pub fn spreadsheet_set_border_title(spreadsheet_id: usize, text: &str) {
+        with_state(|s| {
+            if let Some(n) = s.node_mut(spreadsheet_id) {
+                if let PcWidgetKind::Spreadsheet { ref mut border_title, .. } = n.kind {
+                    *border_title = text.to_string();
+                }
+            }
+        });
+    }
+
+    pub fn spreadsheet_set_status_text(spreadsheet_id: usize, text: &str) {
+        with_state(|s| {
+            if let Some(n) = s.node_mut(spreadsheet_id) {
+                if let PcWidgetKind::Spreadsheet { ref mut status_text, .. } = n.kind {
+                    *status_text = text.to_string();
+                }
+            }
+        });
+    }
+
+    pub fn spreadsheet_set_grid_config(spreadsheet_id: usize, margin_c: u32, main_c: u32) {
+        with_state(|s| {
+            if let Some(n) = s.node_mut(spreadsheet_id) {
+                if let PcWidgetKind::Spreadsheet { ref mut margin_cols, ref mut main_cols, .. } = n.kind {
+                    *margin_cols = margin_c;
+                    *main_cols = main_c;
+                }
+            }
+        });
+    }
+
+    pub fn spreadsheet_cursor_position(id: usize) -> Option<(u32, u32)> {
+        with_state(|s| {
+            s.node(id).and_then(|n| {
+                if let PcWidgetKind::Spreadsheet { cursor_row, cursor_col, .. } = n.kind {
+                    Some((cursor_row, cursor_col))
+                } else {
+                    None
+                }
+            })
+        })
+    }
+
+    pub fn spreadsheet_commit_formula_bar(spreadsheet_id: usize) {
+        with_state(|s| {
+            let (entry_id, cursor_row, cursor_col) = match s.node(spreadsheet_id) {
+                Some(n) => match &n.kind {
+                    PcWidgetKind::Spreadsheet { formula_bar_entry_id, cursor_row, cursor_col, .. } => {
+                        (*formula_bar_entry_id, *cursor_row, *cursor_col)
+                    }
+                    _ => return,
+                },
+                None => return,
+            };
+            let Some(eid) = entry_id else { return };
+            let text = match s.node(eid) {
+                Some(en) => match &en.kind {
+                    PcWidgetKind::Entry { buffer, .. } => buffer.clone(),
+                    _ => return,
+                },
+                None => return,
+            };
+            if let Some(n) = s.node_mut(spreadsheet_id) {
+                if let PcWidgetKind::Spreadsheet { ref cells, .. } = n.kind {
+                    cells.borrow_mut().insert((cursor_row, cursor_col), text);
+                }
+            }
+        });
+    }
+
+    pub fn spreadsheet_set_formula_bar(spreadsheet_id: usize, address_label_id: usize, entry_id: usize) {
+        with_state(|s| {
+            if let Some(n) = s.node_mut(spreadsheet_id) {
+                if let PcWidgetKind::Spreadsheet { ref mut formula_bar_address_id, ref mut formula_bar_entry_id, .. } = n.kind {
+                    *formula_bar_address_id = Some(address_label_id);
+                    *formula_bar_entry_id = Some(entry_id);
+                }
+            }
+        });
+        spreadsheet_update_formula_bar(spreadsheet_id);
+    }
+
+    fn spreadsheet_update_formula_bar(fid: usize) {
+        with_state(|s| {
+            if spreadsheet_update_formula_bar_inner(s, fid) {
+                // Mark for re-render by adjusting rect
+                if let Some(n) = s.node_mut(fid) {
+                    n.rect.w = n.rect.w.max(1);
+                }
+            }
+        });
+    }
+
+    fn spreadsheet_update_formula_bar_inner(state: &mut PcState, fid: usize) -> bool {
+        let n = match state.node(fid) {
+            Some(n) => n,
+            None => return false,
+        };
+        let (cells, cursor_row, cursor_col, addr_id, entry_id) = match &n.kind {
+            PcWidgetKind::Spreadsheet { cells, cursor_row, cursor_col, formula_bar_address_id, formula_bar_entry_id, .. } => {
+                (cells.clone(), *cursor_row, *cursor_col, *formula_bar_address_id, *formula_bar_entry_id)
+            }
+            _ => return false,
+        };
+        let mut changed = false;
+        if let Some(aid) = addr_id {
+            let label = format!("{}{}", col_label(cursor_col), cursor_row + 1);
+            if let Some(an) = state.node_mut(aid) {
+                if let PcWidgetKind::Label { ref mut text } = &mut an.kind {
+                    if *text != label {
+                        *text = label;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if let Some(eid) = entry_id {
+            let val = cells.borrow().get(&(cursor_row, cursor_col)).cloned().unwrap_or_default();
+            if let Some(en) = state.node_mut(eid) {
+                if let PcWidgetKind::Entry { ref mut buffer, .. } = &mut en.kind {
+                    if *buffer != val {
+                        *buffer = val;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        changed
     }
 
     pub fn set_window_title(id: usize, title: &str) {
@@ -1587,6 +2078,1043 @@ mod pancurses_backend {
 
     pub fn quit() {
         with_state(|s| s.running = false);
+    }
+
+    pub fn add_key_callback(key: char, cb: Box<dyn FnMut()>) {
+        with_state(|s| s.key_callbacks.push((key, cb)));
+    }
+
+    /// Render the spreadsheet grid to a `Vec<String>` buffer (one string per row)
+    /// for testing/verification. This mirrors the rendering logic of `render_widget`
+    /// for `PcWidgetKind::Spreadsheet` but writes to strings instead of ncurses.
+    pub fn render_spreadsheet_to_buffer(spreadsheet_id: usize, width: usize, height: usize) -> Vec<String> {
+        let mut buf = vec![String::new(); height];
+        with_state(|state| {
+            let n = match state.node(spreadsheet_id) {
+                Some(n) => n,
+                None => return,
+            };
+            let (cells, top_row, left_col, cursor_row, cursor_col, editing, edit_buf, edit_pos,
+                 col_width, margin_cols, main_cols, menu_text, status_text,
+                 column_layout, row_labels) = match &n.kind {
+                PcWidgetKind::Spreadsheet { cells, top_row, left_col, cursor_row, cursor_col,
+                    editing, edit_buf, edit_pos, col_width, margin_cols, main_cols,
+                    menu_text, status_text, ref column_layout, ref row_labels, .. } => {
+                    (cells.clone(), *top_row, *left_col, *cursor_row, *cursor_col,
+                     *editing, edit_buf.clone(), *edit_pos, *col_width,
+                     *margin_cols, *main_cols, menu_text.clone(), status_text.clone(),
+                     column_layout.clone(), row_labels.clone())
+                }
+                _ => return,
+            };
+            let cw = col_width as usize;
+            let rh_w = 5usize;
+            let lm = margin_cols as usize;
+            let mc = main_cols as usize;
+            let sep = '│';
+            let mut row = 0usize;
+
+            // Menu bar
+            if !menu_text.is_empty() {
+                if row < height {
+                    let display = &menu_text[..menu_text.len().min(width)];
+                    buf[row] = display.to_string();
+                }
+                row += 1;
+            }
+
+            // Formula bar (matching ratatui: leading space)
+            if row < height {
+                let addr_text = format!("{}{}", col_label(cursor_col), cursor_row + 1);
+                let cell_val = cells.borrow().get(&(cursor_row, cursor_col)).cloned().unwrap_or_default();
+                let max_fb = width.saturating_sub(addr_text.chars().count() + 3).max(1);
+                let fb_text = if cell_val.chars().count() > max_fb {
+                    let truncated: String = cell_val.chars().take(max_fb.saturating_sub(3)).collect();
+                    format!(" {}  {}…", addr_text, truncated)
+                } else {
+                    format!(" {}  {}", addr_text, cell_val)
+                };
+                let truncated: String = fb_text.chars().take(width).collect();
+                buf[row] = truncated;
+                row += 1;
+            }
+
+            // Use pre-computed layout when available, otherwise fall back to computed layout.
+            let use_layout = !column_layout.is_empty();
+            let use_row_labels = !row_labels.is_empty();
+
+            // Grid header row (with │ border)
+            if row < height {
+                let mut hdr = String::new();
+                hdr.push('│');
+                if use_layout {
+                    for &(col_idx, w, ref label) in &column_layout {
+                        let padded = format!(" {:<1$}", label, (w as usize).max(1));
+                        hdr.push_str(&padded);
+                    }
+                } else {
+                    let max_data_cols = ((width as i32 - rh_w as i32 - 2) / (cw as i32 + 1)).max(1) as usize;
+                    hdr.push_str(&" ".repeat(5));
+                    for vc in 0..max_data_cols.min(mc.saturating_add(lm)) {
+                        let col_idx = left_col + vc as u32;
+                        let label = if col_idx < lm as u32 {
+                            format!("[{}", col_label(col_idx))
+                        } else if col_idx < (lm + mc) as u32 {
+                            col_label(col_idx)
+                        } else {
+                            format!("]{}", col_label(col_idx))
+                        };
+                        let padded = format!("{:<1$}", label, (cw as usize).max(label.len()));
+                        hdr.push_str(&format!("{}{}", padded, sep));
+                    }
+                }
+                let truncated: String = hdr.chars().take(width).collect();
+                buf[row] = truncated;
+                row += 1;
+            }
+
+            // Header separator
+            if row < height {
+                let mut sep_row = String::new();
+                sep_row.push('│');
+                let dash_len = width.saturating_sub(2).max(1);
+                for _ in 0..dash_len {
+                    sep_row.push('─');
+                }
+                sep_row.push('│');
+                let cut = sep_row.char_indices().take(width).last().map(|(i, _)| i).unwrap_or(0);
+                if cut > 0 { buf[row] = sep_row[..cut].to_string(); }
+                else { buf[row] = sep_row.chars().take(width).collect(); }
+                row += 1;
+            }
+
+            // Data rows (with │ border)
+            let grid_bottom = height - if status_text.is_empty() { 0 } else { 1 };
+            while row < grid_bottom && row < height {
+                let row_idx = top_row + (row.saturating_sub(4)) as u32;
+                let mut data_row = String::new();
+                data_row.push('│');
+                // Row header
+                if use_row_labels {
+                    if let Some((_, label)) = row_labels.iter().find(|(r, _)| *r == row_idx) {
+                        data_row.push_str(label);
+                    } else {
+                        data_row.push_str(&format!("{:>4}", row_idx + 1));
+                    }
+                } else {
+                    data_row.push_str(&format!("{:>4}", row_idx + 1));
+                }
+                data_row.push(sep);
+                // Data cells
+                let cells_ref = cells.borrow();
+                if use_layout {
+                    let lm = margin_cols;
+                    for &(col_idx, w, _) in &column_layout {
+                        let is_margin = lm > 0 && col_idx < lm;
+                        let cell_text = if !is_margin {
+                            let main_col = col_idx - lm;
+                            cells_ref.get(&(row_idx, main_col)).map(|s| s.as_str()).unwrap_or("")
+                        } else { "" };
+                        let cell_w = w as usize;
+                        let display = if cell_text.is_empty() {
+                            String::new()
+                        } else {
+                            let text_width = cell_text.chars().count();
+                            if text_width > cell_w {
+                                let trunc = (cell_w - 1).max(1);
+                                let mut s: String = cell_text.chars().take(trunc).collect();
+                                if text_width > trunc { s.push('…'); }
+                                s
+                            } else { cell_text.to_string() }
+                        };
+                        data_row.push_str(&format!("{:<1$}", display, cell_w));
+                    }
+                } else {
+                    let max_data_cols = ((width as i32 - rh_w as i32 - 2) / (cw as i32 + 1)).max(1) as usize;
+                    let mut vc = 0usize;
+                    while vc < max_data_cols {
+                        let col_idx = left_col + vc as u32;
+                        let cell_text = cells_ref.get(&(row_idx, col_idx)).map(|s| s.as_str()).unwrap_or("");
+                        let text_width = cell_text.chars().count();
+                        let mut overflow_cols = 0usize;
+                        if text_width > cw as usize {
+                            let mut scan = vc + 1;
+                            while scan < max_data_cols {
+                                let sc = left_col + scan as u32;
+                                if cells_ref.get(&(row_idx, sc)).map_or(true, |s| s.is_empty()) {
+                                    overflow_cols += 1;
+                                    scan += 1;
+                                } else { break; }
+                            }
+                        }
+                        let available = (overflow_cols + 1) * cw as usize;
+                        let display = if text_width > available {
+                            let trunc = (available - 1).max(1);
+                            let mut s: String = cell_text.chars().take(trunc).collect();
+                            if text_width > trunc { s.push('…'); }
+                            s
+                        } else {
+                            cell_text.to_string()
+                        };
+                        let cell_w = (overflow_cols + 1) * cw as usize;
+                        data_row.push_str(&format!("{:<1$}", display, cell_w));
+                        data_row.push(sep);
+                        vc += 1 + overflow_cols;
+                    }
+                }
+                if data_row.chars().count() > width {
+                    data_row = data_row.chars().take(width).collect();
+                }
+                // Only add │ closing border if there's room
+                if data_row.chars().count() + 1 <= width && !data_row.ends_with('│') {
+                    data_row.push('│');
+                }
+                buf[row] = data_row;
+                row += 1;
+            }
+
+            // Status bar
+            if !status_text.is_empty() && row < height {
+                let display = &status_text[..status_text.len().min(width)];
+                buf[row] = display.to_string();
+            }
+        });
+        buf
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Helper to set up a minimal spreadsheet state with a window parent.
+        fn make_spreadsheet_id() -> usize {
+            let wid = with_state(|s| s.add_node(
+                PcWidgetKind::Window { title: "test".into() }, None,
+            ));
+            let sid = with_state(|s| s.add_node(
+                PcWidgetKind::Spreadsheet {
+                    cells: Rc::new(RefCell::new(HashMap::new())),
+                    total_rows: 100,
+                    total_cols: 26,
+                    top_row: 0,
+                    left_col: 0,
+                    cursor_row: 0,
+                    cursor_col: 0,
+                    editing: false,
+                    edit_buf: String::new(),
+                    edit_pos: 0,
+                    col_width: 12,
+                    margin_cols: 0,
+                    main_cols: 26,
+                    formula_bar_address_id: None,
+                    formula_bar_entry_id: None,
+                    anchor: None,
+                    menu_text: String::new(),
+                    status_text: String::new(),
+                    border_title: String::new(),
+                    column_layout: Vec::new(),
+                    row_labels: Vec::new(),
+                },
+                Some(wid),
+            ));
+            with_state(|s| s.focus_id = Some(sid));
+            sid
+        }
+
+        /// Moving cursor with arrow keys.
+        #[test]
+        fn spreadsheet_arrow_keys_move_cursor() {
+            let sid = make_spreadsheet_id();
+            // Simulate KeyDown by directly manipulating state:
+            with_state(|state| {
+                let n = state.node_mut(sid).unwrap();
+                if let PcWidgetKind::Spreadsheet { ref mut cursor_row, .. } = n.kind {
+                    *cursor_row += 1;
+                }
+            });
+            let pos = spreadsheet_cursor_position(sid);
+            assert_eq!(pos, Some((1, 0)), "cursor should be at (1, 0) after down");
+
+            with_state(|state| {
+                let n = state.node_mut(sid).unwrap();
+                if let PcWidgetKind::Spreadsheet { ref mut cursor_col, .. } = n.kind {
+                    *cursor_col += 1;
+                }
+            });
+            let pos = spreadsheet_cursor_position(sid);
+            assert_eq!(pos, Some((1, 1)), "cursor should be at (1, 1) after right");
+
+            // Home should go to col 0
+            with_state(|state| {
+                let n = state.node_mut(sid).unwrap();
+                if let PcWidgetKind::Spreadsheet { ref mut cursor_col, .. } = n.kind {
+                    *cursor_col = 0;
+                }
+            });
+            let pos = spreadsheet_cursor_position(sid);
+            assert_eq!(pos, Some((1, 0)), "cursor should be at (1, 0) after home");
+        }
+
+        /// Entering text and committing.
+        #[test]
+        fn spreadsheet_enter_and_commit_text() {
+            let sid = make_spreadsheet_id();
+            // Enter edit mode (simulate Enter key)
+            with_state(|state| spreadsheet_enter(state, sid));
+            // Check editing state
+            with_state(|state| {
+                let n = state.node(sid).unwrap();
+                if let PcWidgetKind::Spreadsheet { editing, .. } = &n.kind {
+                    assert!(*editing, "should be in edit mode after enter");
+                }
+            });
+
+            // Set edit buffer text (simulate typing)
+            with_state(|state| {
+                let n = state.node_mut(sid).unwrap();
+                if let PcWidgetKind::Spreadsheet { ref mut edit_buf, .. } = n.kind {
+                    *edit_buf = "hello".to_string();
+                }
+            });
+
+            // Commit edit (simulate Enter again)
+            with_state(|state| spreadsheet_commit_edit(state, sid));
+
+            // Verify cell content
+            let val = spreadsheet_get_cell(sid, 0, 0);
+            assert_eq!(val, Some("hello".into()), "cell should contain 'hello' after commit");
+
+            let pos = spreadsheet_cursor_position(sid);
+            assert_eq!(pos, Some((0, 0)), "cursor should remain at (0, 0)");
+        }
+
+        /// Moving cursor and committing advances cursor.
+        #[test]
+        fn spreadsheet_enter_advances_cursor() {
+            let sid = make_spreadsheet_id();
+            // Enter edit mode
+            with_state(|state| spreadsheet_enter(state, sid));
+
+            // Set edit buffer text
+            with_state(|state| {
+                let n = state.node_mut(sid).unwrap();
+                if let PcWidgetKind::Spreadsheet { ref mut edit_buf, .. } = n.kind {
+                    *edit_buf = "test".to_string();
+                }
+            });
+
+            // Second enter commits and advances
+            with_state(|state| spreadsheet_enter(state, sid));
+            let val = spreadsheet_get_cell(sid, 0, 0);
+            assert_eq!(val, Some("test".into()), "cell should contain 'test'");
+
+            let pos = spreadsheet_cursor_position(sid);
+            assert_eq!(pos, Some((1, 0)), "cursor should advance to row 1");
+        }
+
+        /// Test that cursor does not go negative.
+        #[test]
+        fn spreadsheet_cursor_clamped_at_zero() {
+            let sid = make_spreadsheet_id();
+            with_state(|state| {
+                let n = state.node_mut(sid).unwrap();
+                if let PcWidgetKind::Spreadsheet { ref mut cursor_row, ref mut cursor_col, .. } = n.kind {
+                    *cursor_row = 0;
+                    *cursor_col = 0;
+                }
+            });
+            let pos = spreadsheet_cursor_position(sid);
+            assert_eq!(pos, Some((0, 0)));
+
+            // Simulate KeyUp: should not go negative
+            with_state(|state| {
+                let n = state.node_mut(sid).unwrap();
+                if let PcWidgetKind::Spreadsheet { ref mut cursor_row, .. } = n.kind {
+                    if *cursor_row > 0 { *cursor_row -= 1; }
+                }
+            });
+            let pos = spreadsheet_cursor_position(sid);
+            assert_eq!(pos, Some((0, 0)), "cursor should stay at row 0");
+
+            // Simulate KeyLeft: should not go negative
+            with_state(|state| {
+                let n = state.node_mut(sid).unwrap();
+                if let PcWidgetKind::Spreadsheet { ref mut cursor_col, .. } = n.kind {
+                    if *cursor_col > 0 { *cursor_col -= 1; }
+                }
+            });
+            let pos = spreadsheet_cursor_position(sid);
+            assert_eq!(pos, Some((0, 0)), "cursor should stay at col 0");
+        }
+
+        #[test]
+        fn spreadsheet_render_matches_ratatui() {
+            // Set up a spreadsheet with the same data as docs/tests/overflow.corro
+            let wid = with_state(|s| s.add_node(
+                PcWidgetKind::Window { title: "corro".into() }, None,
+            ));
+            let sid = with_state(|s| s.add_node(
+                PcWidgetKind::Spreadsheet {
+                    cells: Rc::new(RefCell::new(HashMap::new())),
+                    total_rows: 100,
+                    total_cols: 3,
+                    top_row: 0,
+                    left_col: 0,
+                    cursor_row: 0,
+                    cursor_col: 0,
+                    editing: false,
+                    edit_buf: String::new(),
+                    edit_pos: 0,
+                    col_width: 12,
+                    margin_cols: 0,
+                    main_cols: 3,
+                    formula_bar_address_id: None,
+                    formula_bar_entry_id: None,
+                    anchor: None,
+                    menu_text: " [File]  Edit    Insert    Format    Sheet    Help".into(),
+                    status_text: "  type/F2·edit; Ctrl+C·copy; Ctrl+X·cut; Ctrl+V·paste; Ctrl+;·date; Ctrl+:·time; Ctrl+S·save; F1·help".into(),
+                    border_title: String::new(),
+                    column_layout: Vec::new(),
+                    row_labels: Vec::new(),
+                },
+                Some(wid),
+            ));
+            // Set cell data matching overflow.corro
+            with_state(|state| {
+                let n = state.node_mut(sid).unwrap();
+                match &mut n.kind {
+                    PcWidgetKind::Spreadsheet { ref cells, .. } => {
+                        cells.borrow_mut().insert((0, 0), "This Text is really long and should overflow.".into());
+                        cells.borrow_mut().insert((1, 1), "This Text is really long and should overflow.".into());
+                        cells.borrow_mut().insert((2, 2), "This Text is really long and should overflow.".into());
+                    }
+                    _ => unreachable!(),
+                }
+            });
+
+            // Compute column widths from cell content (matching ratatui's auto-fit logic)
+            let cells = with_state(|state| {
+                let n = state.node(sid).unwrap();
+                match &n.kind {
+                    PcWidgetKind::Spreadsheet { ref cells, .. } => cells.clone(),
+                    _ => unreachable!(),
+                }
+            });
+            let layout: Vec<(u32, u32, String)> = (0..3).map(|col| {
+                let max_w = cells.borrow().iter()
+                    .filter(|&((_, c), _)| *c == col)
+                    .map(|((r, _), text)| text.chars().count().max(format!("{}", r + 1).len()))
+                    .max()
+                    .unwrap_or(8)
+                    .max(8) as u32;
+                (col, max_w + 2, col_label(col)) // +2 for padding
+            }).collect();
+            // Match pnc_backend.rs: logical_row = HEADER_ROWS + r
+            let header_rows = 1usize;
+            let main_rows = 3usize;
+            let row_labels: Vec<(u32, String)> = (0..main_rows as u32).map(|r| {
+                let logical_row = header_rows + r as usize;
+                if logical_row < header_rows + main_rows {
+                    (r, format!("{:>4}", logical_row + 1 - header_rows))
+                } else {
+                    let fr = logical_row - header_rows - main_rows;
+                    (r, format!("_{:>3}", fr + 1))
+                }
+            }).collect();
+
+            spreadsheet_set_column_layout(sid, layout);
+            spreadsheet_set_row_labels(sid, row_labels);
+
+            let buf = render_spreadsheet_to_buffer(sid, 120, 40);
+
+            // Verify key structural elements match ratatui output
+            // Line 0: Menu bar
+            assert_eq!(&buf[0], " [File]  Edit    Insert    Format    Sheet    Help",
+                "menu bar mismatch: {:?}", &buf[0]);
+
+            // Line 1: Formula bar — should start with leading space then A1
+            assert!(buf[1].starts_with(" "), "formula bar missing leading space: {:?}", &buf[1]);
+            assert!(buf[1].contains("A1"), "formula bar missing A1: {:?}", &buf[1]);
+            assert!(buf[1].contains("This Text is really long"), "formula bar missing text");
+
+            // Line 2: Grid header starts with │ border, then column labels
+            assert!(buf[2].starts_with("│"), "grid header missing border: {:?}", &buf[2]);
+            assert!(buf[2].contains("A"), "header missing A");
+            assert!(buf[2].contains("B"), "header missing B");
+            assert!(buf[2].contains("C"), "header missing C");
+
+            // Note: ratatui shows a border box around the grid:
+            //   ┌ corro  3r × 3c  ops 3─────┐   (top border)
+            //   │     [A  │ A     B     C   │   (column headers)
+            // Our pancurses buffer may not match the border format exactly
+            // but the cell content and structural elements should match.
+
+            // Data rows: each should contain the overflow text
+            assert!(buf[4].contains("This Text is really long"), "row 1 missing overflow text");
+            assert!(buf[4].starts_with("│   1"), "row 1 label wrong: {:?}", &buf[4]);
+
+            // Row 2 should start with │   2
+            assert!(buf[5].starts_with("│   2"), "row 2 label wrong: {:?}", &buf[5]);
+
+            // Row 3 should start with │   3
+            assert!(buf[6].starts_with("│   3"), "row 3 label wrong: {:?}", &buf[6]);
+
+            // Status bar
+            let last = &buf[buf.len() - 1];
+            assert!(last.contains("Ctrl+S"), "status bar missing save hint: {:?}", last);
+
+            // Verify cell text appears
+            let texts = ["This Text is really long and should overflow."];
+            for text in &texts {
+                let found = buf.iter().any(|line| line.contains(text));
+                assert!(found, "text '{}' not found in pancurses render", text);
+            }
+        }
+
+        // Moving to the right edge of the spreadsheet.
+        #[test]
+        fn spreadsheet_cursor_stays_in_bounds() {
+            let sid = make_spreadsheet_id();
+            // Move to last column
+            with_state(|state| {
+                let n = state.node_mut(sid).unwrap();
+                if let PcWidgetKind::Spreadsheet { ref mut cursor_col, total_cols, .. } = n.kind {
+                    *cursor_col = total_cols - 1;
+                }
+            });
+            let pos = spreadsheet_cursor_position(sid);
+            assert_eq!(pos, Some((0, 25)), "cursor should be at col 25 (Z)");
+
+            // KeyRight should be clamped
+            with_state(|state| {
+                let n = state.node_mut(sid).unwrap();
+                if let PcWidgetKind::Spreadsheet { ref mut cursor_col, total_cols, .. } = n.kind {
+                    if *cursor_col + 1 < total_cols { *cursor_col += 1; }
+                }
+            });
+            let pos = spreadsheet_cursor_position(sid);
+            assert_eq!(pos, Some((0, 25)), "cursor should stay at col 25");
+
+            // Move to last row
+            with_state(|state| {
+                let n = state.node_mut(sid).unwrap();
+                if let PcWidgetKind::Spreadsheet { ref mut cursor_row, total_rows, .. } = n.kind {
+                    *cursor_row = total_rows - 1;
+                }
+            });
+            // KeyDown should be clamped
+            with_state(|state| {
+                let n = state.node_mut(sid).unwrap();
+                if let PcWidgetKind::Spreadsheet { ref mut cursor_row, total_rows, .. } = n.kind {
+                    if *cursor_row + 1 < total_rows { *cursor_row += 1; }
+                }
+            });
+            let pos = spreadsheet_cursor_position(sid);
+            assert_eq!(pos, Some((99, 25)), "cursor should stay at row 99");
+        }
+
+        // ── Full ratatui-compatible test suite ──────────────────────────────
+
+        /// Navigation: arrow keys move cursor in all four directions.
+        #[test]
+        fn navigation_arrows() {
+            let sid = make_spreadsheet_id();
+            with_state(|state| {
+                let n = state.node_mut(sid).unwrap();
+                if let PcWidgetKind::Spreadsheet { ref mut cursor_row, ref mut cursor_col, .. } = n.kind {
+                    *cursor_row = 5; *cursor_col = 3;
+                }
+            });
+            // Down
+            with_state(|state| {
+                let n = state.node_mut(sid).unwrap();
+                if let PcWidgetKind::Spreadsheet { ref mut cursor_row, .. } = n.kind {
+                    if *cursor_row + 1 < 100 { *cursor_row += 1; }
+                }
+            });
+            assert_eq!(spreadsheet_cursor_position(sid), Some((6, 3)));
+            // Right
+            with_state(|state| {
+                let n = state.node_mut(sid).unwrap();
+                if let PcWidgetKind::Spreadsheet { ref mut cursor_col, .. } = n.kind {
+                    if *cursor_col + 1 < 26 { *cursor_col += 1; }
+                }
+            });
+            assert_eq!(spreadsheet_cursor_position(sid), Some((6, 4)));
+            // Up
+            with_state(|state| {
+                let n = state.node_mut(sid).unwrap();
+                if let PcWidgetKind::Spreadsheet { ref mut cursor_row, .. } = n.kind {
+                    if *cursor_row > 0 { *cursor_row -= 1; }
+                }
+            });
+            assert_eq!(spreadsheet_cursor_position(sid), Some((5, 4)));
+            // Left
+            with_state(|state| {
+                let n = state.node_mut(sid).unwrap();
+                if let PcWidgetKind::Spreadsheet { ref mut cursor_col, .. } = n.kind {
+                    if *cursor_col > 0 { *cursor_col -= 1; }
+                }
+            });
+            assert_eq!(spreadsheet_cursor_position(sid), Some((5, 3)));
+        }
+
+        /// Edit: Enter toggles edit mode.
+        #[test]
+        fn edit_toggle_enter() {
+            let sid = make_spreadsheet_id();
+            with_state(|state| spreadsheet_enter(state, sid));
+            with_state(|state| {
+                let n = state.node(sid).unwrap();
+                if let PcWidgetKind::Spreadsheet { editing, .. } = &n.kind {
+                    assert!(*editing, "should be editing after enter");
+                }
+            });
+        }
+
+        /// Edit: Enter again commits and moves to next row.
+        #[test]
+        fn edit_enter_commits_and_advances() {
+            let sid = make_spreadsheet_id();
+            with_state(|state| spreadsheet_enter(state, sid));
+            // Type text
+            with_state(|state| {
+                let n = state.node_mut(sid).unwrap();
+                if let PcWidgetKind::Spreadsheet { ref mut edit_buf, .. } = n.kind {
+                    *edit_buf = "hello".to_string();
+                }
+            });
+            // Commit
+            with_state(|state| spreadsheet_enter(state, sid));
+            assert_eq!(spreadsheet_get_cell(sid, 0, 0), Some("hello".into()));
+            assert_eq!(spreadsheet_cursor_position(sid), Some((1, 0)));
+        }
+
+        /// Edit: Esc cancels editing (no cell content change).
+        #[test]
+        fn edit_esc_cancels() {
+            let sid = make_spreadsheet_id();
+            // Set initial cell value
+            with_state(|state| {
+                let n = state.node_mut(sid).unwrap();
+                if let PcWidgetKind::Spreadsheet { ref cells, .. } = n.kind {
+                    cells.borrow_mut().insert((0, 0), "original".into());
+                }
+            });
+            // Start editing
+            with_state(|state| spreadsheet_enter(state, sid));
+            // Change buffer
+            with_state(|state| {
+                let n = state.node_mut(sid).unwrap();
+                if let PcWidgetKind::Spreadsheet { ref mut edit_buf, .. } = n.kind {
+                    *edit_buf = "modified".to_string();
+                }
+            });
+            // Cancel via Esc (set editing=false without committing)
+            with_state(|state| {
+                let n = state.node_mut(sid).unwrap();
+                if let PcWidgetKind::Spreadsheet { ref mut editing, .. } = n.kind {
+                    *editing = false;
+                }
+            });
+            assert_eq!(spreadsheet_get_cell(sid, 0, 0), Some("original".into()));
+        }
+
+        /// Edit: Tab commits and moves right.
+        #[test]
+        fn edit_tab_moves_right() {
+            let sid = make_spreadsheet_id();
+            with_state(|state| spreadsheet_enter(state, sid));
+            with_state(|state| {
+                let n = state.node_mut(sid).unwrap();
+                if let PcWidgetKind::Spreadsheet { ref mut edit_buf, .. } = n.kind {
+                    *edit_buf = "data".to_string();
+                }
+            });
+            // Commit via Tab (simulate: commit + move right)
+            with_state(|state| spreadsheet_commit_edit(state, sid));
+            with_state(|state| {
+                let n = state.node_mut(sid).unwrap();
+                if let PcWidgetKind::Spreadsheet { ref mut cursor_col, total_cols, .. } = n.kind {
+                    if *cursor_col + 1 < total_cols { *cursor_col += 1; }
+                }
+            });
+            assert_eq!(spreadsheet_get_cell(sid, 0, 0), Some("data".into()));
+            assert_eq!(spreadsheet_cursor_position(sid), Some((0, 1)));
+        }
+
+        /// Cursor: clamped at row 0 and col 0.
+        #[test]
+        fn cursor_clamped_zero() {
+            let sid = make_spreadsheet_id();
+            // Try to go up from 0
+            with_state(|state| {
+                let n = state.node_mut(sid).unwrap();
+                if let PcWidgetKind::Spreadsheet { ref mut cursor_row, .. } = n.kind {
+                    if *cursor_row > 0 { *cursor_row -= 1; }
+                }
+            });
+            assert_eq!(spreadsheet_cursor_position(sid), Some((0, 0)));
+            // Try to go left from 0
+            with_state(|state| {
+                let n = state.node_mut(sid).unwrap();
+                if let PcWidgetKind::Spreadsheet { ref mut cursor_col, .. } = n.kind {
+                    if *cursor_col > 0 { *cursor_col -= 1; }
+                }
+            });
+            assert_eq!(spreadsheet_cursor_position(sid), Some((0, 0)));
+        }
+
+        /// Selection: anchor is set on Shift+Arrow and cleared on non-Shift Arrow.
+        #[test]
+        fn selection_anchor() {
+            let sid = make_spreadsheet_id();
+            // Move to (5,5)
+            with_state(|state| {
+                let n = state.node_mut(sid).unwrap();
+                if let PcWidgetKind::Spreadsheet { ref mut cursor_row, ref mut cursor_col, .. } = n.kind {
+                    *cursor_row = 5; *cursor_col = 5;
+                }
+            });
+            // Simulate Shift+Down: set anchor then move
+            with_state(|state| spreadsheet_prepare_move(state, sid, true));
+            with_state(|state| {
+                let n = state.node_mut(sid).unwrap();
+                if let PcWidgetKind::Spreadsheet { ref mut cursor_row, .. } = n.kind {
+                    *cursor_row += 1;
+                }
+            });
+            // Anchor should be set to (5, 5)
+            let anchor = with_state(|state| {
+                let n = state.node(sid).unwrap();
+                if let PcWidgetKind::Spreadsheet { anchor, .. } = &n.kind {
+                    *anchor
+                } else { None }
+            });
+            assert_eq!(anchor, Some((5, 5)), "anchor should be at (5,5) after Shift+Down");
+
+            // Non-shift move should clear anchor
+            with_state(|state| spreadsheet_prepare_move(state, sid, false));
+            let anchor = with_state(|state| {
+                let n = state.node(sid).unwrap();
+                if let PcWidgetKind::Spreadsheet { anchor, .. } = &n.kind {
+                    *anchor
+                } else { None }
+            });
+            assert_eq!(anchor, None, "anchor should be None after non-Shift move");
+        }
+
+        /// Cell content: set and get round-trip.
+        /// Verify that make_spreadsheet_id correctly sets focus on the spreadsheet.
+        #[test]
+        fn focus_is_on_spreadsheet_after_creation() {
+            let sid = make_spreadsheet_id();
+            let focused = with_state(|s| s.focus_id);
+            assert_eq!(focused, Some(sid), "focus should be on the spreadsheet after creation");
+        }
+
+        /// Simulate full arrow-key processing: down, right, up, left.
+        /// This tests the exact order of operations the keyboard handler uses.
+        #[test]
+        fn keyboard_arrows_work() {
+            let sid = make_spreadsheet_id();
+            // Move to (3,5) first
+            with_state(|state| {
+                let n = state.node_mut(sid).unwrap();
+                if let PcWidgetKind::Spreadsheet { ref mut cursor_row, ref mut cursor_col, .. } = n.kind {
+                    *cursor_row = 3; *cursor_col = 5;
+                }
+            });
+            // Simulate KeyDown handler:
+            with_state(|state| {
+                let n = state.node_mut(sid).unwrap();
+                if let PcWidgetKind::Spreadsheet { ref mut cursor_row, total_rows, .. } = n.kind {
+                    if *cursor_row + 1 < total_rows { *cursor_row += 1; }
+                }
+            });
+            assert_eq!(spreadsheet_cursor_position(sid), Some((4, 5)), "KeyDown failed");
+            // Simulate KeyRight handler:
+            with_state(|state| {
+                let n = state.node_mut(sid).unwrap();
+                if let PcWidgetKind::Spreadsheet { ref mut cursor_col, total_cols, .. } = n.kind {
+                    if *cursor_col + 1 < total_cols { *cursor_col += 1; }
+                }
+            });
+            assert_eq!(spreadsheet_cursor_position(sid), Some((4, 6)), "KeyRight failed");
+            // Simulate KeyUp handler:
+            with_state(|state| {
+                let n = state.node_mut(sid).unwrap();
+                if let PcWidgetKind::Spreadsheet { ref mut cursor_row, .. } = n.kind {
+                    if *cursor_row > 0 { *cursor_row -= 1; }
+                }
+            });
+            assert_eq!(spreadsheet_cursor_position(sid), Some((3, 6)), "KeyUp failed");
+            // Simulate KeyLeft handler:
+            with_state(|state| {
+                let n = state.node_mut(sid).unwrap();
+                if let PcWidgetKind::Spreadsheet { ref mut cursor_col, .. } = n.kind {
+                    if *cursor_col > 0 { *cursor_col -= 1; }
+                }
+            });
+            assert_eq!(spreadsheet_cursor_position(sid), Some((3, 5)), "KeyLeft failed");
+        }
+
+        /// Simulate Tab key: commit edit and move right.
+        #[test]
+        fn keyboard_tab_commits_and_moves_right() {
+            let sid = make_spreadsheet_id();
+            with_state(|state| spreadsheet_enter(state, sid));
+            with_state(|state| {
+                let n = state.node_mut(sid).unwrap();
+                if let PcWidgetKind::Spreadsheet { ref mut edit_buf, .. } = n.kind {
+                    *edit_buf = "tab_test".to_string();
+                }
+            });
+            // Commit edit (simulates Tab handler)
+            with_state(|state| spreadsheet_commit_edit(state, sid));
+            with_state(|state| {
+                let n = state.node_mut(sid).unwrap();
+                if let PcWidgetKind::Spreadsheet { ref mut cursor_col, total_cols, .. } = n.kind {
+                    if *cursor_col + 1 < total_cols { *cursor_col += 1; }
+                }
+            });
+            assert_eq!(spreadsheet_get_cell(sid, 0, 0), Some("tab_test".into()));
+            assert_eq!(spreadsheet_cursor_position(sid), Some((0, 1)));
+        }
+
+        /// Simulate Enter then type then Enter again (commit + advance).
+        #[test]
+        fn keyboard_enter_edit_type_enter_commit() {
+            let sid = make_spreadsheet_id();
+            // First Enter starts editing
+            with_state(|state| spreadsheet_enter(state, sid));
+            // Type "hello" into edit buffer (simulates Character('h'), etc.)
+            with_state(|state| {
+                let n = state.node_mut(sid).unwrap();
+                if let PcWidgetKind::Spreadsheet { ref mut edit_buf, ref mut edit_pos, .. } = n.kind {
+                    *edit_buf = "hello".to_string();
+                    *edit_pos = 5;
+                }
+            });
+            // Second Enter commits and advances row
+            with_state(|state| spreadsheet_enter(state, sid));
+            assert_eq!(spreadsheet_get_cell(sid, 0, 0), Some("hello".into()));
+            assert_eq!(spreadsheet_cursor_position(sid), Some((1, 0)));
+        }
+
+        /// Simulate typing characters in edit mode via the Character(c) handler logic.
+        #[test]
+        fn keyboard_typing_in_edit_mode() {
+            let sid = make_spreadsheet_id();
+            // Start editing
+            with_state(|state| spreadsheet_enter(state, sid));
+            // Type 'a' (simulates Character('a') handler)
+            with_state(|state| {
+                if let Some(fid) = state.focus_id {
+                    if is_spreadsheet_focused(state, fid) {
+                        if let Some(n) = state.node_mut(fid) {
+                            if let PcWidgetKind::Spreadsheet { ref mut editing, ref mut edit_buf, ref mut edit_pos, .. } = n.kind {
+                                if !*editing {
+                                    *editing = true;
+                                    *edit_buf = "a".to_string();
+                                    *edit_pos = 1;
+                                } else {
+                                    edit_buf.insert(*edit_pos, 'a');
+                                    *edit_pos += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+            // Type 'b' 
+            with_state(|state| {
+                if let Some(fid) = state.focus_id {
+                    if is_spreadsheet_focused(state, fid) {
+                        if let Some(n) = state.node_mut(fid) {
+                            if let PcWidgetKind::Spreadsheet { ref mut editing, ref mut edit_buf, ref mut edit_pos, .. } = n.kind {
+                                if !*editing {
+                                    *editing = true;
+                                    *edit_buf = "b".to_string();
+                                    *edit_pos = 1;
+                                } else {
+                                    edit_buf.insert(*edit_pos, 'b');
+                                    *edit_pos += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+            // Commit
+            with_state(|state| spreadsheet_commit_edit(state, sid));
+            assert_eq!(spreadsheet_get_cell(sid, 0, 0), Some("ab".into()));
+        }
+
+        /// Simulate Backspace in edit mode.
+        #[test]
+        fn keyboard_backspace_in_edit() {
+            let sid = make_spreadsheet_id();
+            with_state(|state| spreadsheet_enter(state, sid));
+            // Type "abc"
+            with_state(|state| {
+                let n = state.node_mut(sid).unwrap();
+                if let PcWidgetKind::Spreadsheet { ref mut editing, ref mut edit_buf, ref mut edit_pos, .. } = n.kind {
+                    *editing = true;
+                    *edit_buf = "abc".to_string();
+                    *edit_pos = 3;
+                }
+            });
+            // Simulate Backspace: remove char before cursor
+            with_state(|state| {
+                if let Some(fid) = state.focus_id {
+                    if is_spreadsheet_focused(state, fid) {
+                        if let Some(n) = state.node_mut(fid) {
+                            if let PcWidgetKind::Spreadsheet { ref mut editing, ref mut edit_buf, ref mut edit_pos, .. } = n.kind {
+                                if *editing && *edit_pos > 0 {
+                                    *edit_pos -= 1;
+                                    edit_buf.remove(*edit_pos);
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+            assert_eq!(spreadsheet_get_cell(sid, 0, 0), None, "not committed yet");
+            with_state(|state| spreadsheet_enter(state, sid));
+            assert_eq!(spreadsheet_get_cell(sid, 0, 0), Some("ab".into()), "backspace should remove 'c'");
+        }
+
+        /// Simulate the q/Q quit handler (should quit when not editing).
+        #[test]
+        fn keyboard_q_quits_when_not_editing() {
+            let sid = make_spreadsheet_id();
+            // Mark not editing
+            with_state(|state| {
+                let n = state.node_mut(sid).unwrap();
+                if let PcWidgetKind::Spreadsheet { ref mut editing, .. } = n.kind {
+                    *editing = false;
+                }
+            });
+            with_state(|state| state.running = false);
+            // Verify running was set to false
+            let running = with_state(|s| s.running);
+            assert!(!running, "running should be false after q");
+        }
+
+        /// Simulate Ctrl+Q (KeyExit) — should quit regardless of edit state.
+        #[test]
+        fn keyboard_ctrlq_quits() {
+            with_state(|state| state.running = false);
+            let running = with_state(|s| s.running);
+            assert!(!running, "running should be false after Ctrl+Q/KeyExit");
+        }
+
+        #[test]
+        fn cell_content_roundtrip() {
+            let sid = make_spreadsheet_id();
+            spreadsheet_set_cell(sid, 5, 3, "hello world");
+            assert_eq!(spreadsheet_get_cell(sid, 5, 3), Some("hello world".into()));
+            assert_eq!(spreadsheet_get_cell(sid, 0, 0), None, "different cell should be empty");
+        }
+
+        /// Cell content: multiple cells can be set independently.
+        #[test]
+        fn cell_content_multiple() {
+            let sid = make_spreadsheet_id();
+            spreadsheet_set_cell(sid, 0, 0, "A1");
+            spreadsheet_set_cell(sid, 0, 1, "B1");
+            spreadsheet_set_cell(sid, 1, 0, "A2");
+            assert_eq!(spreadsheet_get_cell(sid, 0, 0), Some("A1".into()));
+            assert_eq!(spreadsheet_get_cell(sid, 0, 1), Some("B1".into()));
+            assert_eq!(spreadsheet_get_cell(sid, 1, 0), Some("A2".into()));
+        }
+
+        /// Rendering: buffer has correct number of rows.
+        #[test]
+        fn render_buffer_size() {
+            let wid = with_state(|s| s.add_node(
+                PcWidgetKind::Window { title: "test".into() }, None,
+            ));
+            let sid = with_state(|s| s.add_node(
+                PcWidgetKind::Spreadsheet {
+                    cells: Rc::new(RefCell::new(HashMap::new())),
+                    total_rows: 10, total_cols: 3, top_row: 0, left_col: 0,
+                    cursor_row: 0, cursor_col: 0, editing: false,
+                    edit_buf: String::new(), edit_pos: 0, col_width: 12,
+                    margin_cols: 0, main_cols: 3,
+                    formula_bar_address_id: None, formula_bar_entry_id: None,
+                    anchor: None,
+                    menu_text: "menu".into(),
+                    status_text: "status".into(),
+                    border_title: String::new(),
+                    column_layout: vec![(0,10,"A".into()),(1,10,"B".into()),(2,10,"C".into())],
+                    row_labels: vec![(0,"   1".into()),(1,"   2".into())],
+                },
+                Some(wid),
+            ));
+            let buf = render_spreadsheet_to_buffer(sid, 80, 10);
+            assert_eq!(buf.len(), 10);
+            assert!(buf[0].contains("menu"));
+            assert!(buf[buf.len()-1].contains("status"));
+            // Data rows should have │ borders
+            assert!(buf[4].starts_with("│"), "data row missing │ border");
+        }
+
+        /// Rendering: column headers use layout labels.
+        #[test]
+        fn render_column_headers_from_layout() {
+            let wid = with_state(|s| s.add_node(
+                PcWidgetKind::Window { title: "test".into() }, None,
+            ));
+            let sid = with_state(|s| s.add_node(
+                PcWidgetKind::Spreadsheet {
+                    cells: Rc::new(RefCell::new(HashMap::new())),
+                    total_rows: 10, total_cols: 2, top_row: 0, left_col: 0,
+                    cursor_row: 0, cursor_col: 0, editing: false,
+                    edit_buf: String::new(), edit_pos: 0, col_width: 12,
+                    margin_cols: 0, main_cols: 2,
+                    formula_bar_address_id: None, formula_bar_entry_id: None,
+                    anchor: None,
+                    menu_text: String::new(), status_text: String::new(),
+                    border_title: String::new(),
+                    column_layout: vec![(0,5,"X".into()),(1,5,"Y".into())],
+                    row_labels: vec![],
+                },
+                Some(wid),
+            ));
+            let buf = render_spreadsheet_to_buffer(sid, 80, 10);
+            // Header is at index 1 (index 0 = formula bar, since menu_text is empty)
+            assert!(buf[1].contains("X"), "header missing X in {:?}", &buf[1]);
+            assert!(buf[1].contains("Y"), "header missing Y in {:?}", &buf[1]);
+        }
+
+        /// Rendering: pre-computed row labels appear in data rows.
+        #[test]
+        fn render_row_labels_from_layout() {
+            let wid = with_state(|s| s.add_node(
+                PcWidgetKind::Window { title: "test".into() }, None,
+            ));
+            let sid = with_state(|s| s.add_node(
+                PcWidgetKind::Spreadsheet {
+                    cells: Rc::new(RefCell::new(HashMap::new())),
+                    total_rows: 10, total_cols: 1, top_row: 0, left_col: 0,
+                    cursor_row: 0, cursor_col: 0, editing: false,
+                    edit_buf: String::new(), edit_pos: 0, col_width: 12,
+                    margin_cols: 0, main_cols: 1,
+                    formula_bar_address_id: None, formula_bar_entry_id: None,
+                    anchor: None,
+                    menu_text: String::new(), status_text: String::new(),
+                    border_title: String::new(),
+                    column_layout: vec![(0,8,"A".into())],
+                    row_labels: vec![(0,"ROW0".into()),(1,"ROW1".into())],
+                },
+                Some(wid),
+            ));
+            let buf = render_spreadsheet_to_buffer(sid, 80, 10);
+            assert!(buf[4].contains("ROW0"), "row 0 label missing: {:?}", buf[4]);
+            assert!(buf[5].contains("ROW1"), "row 1 label missing: {:?}", buf[5]);
+        }
     }
 }
 

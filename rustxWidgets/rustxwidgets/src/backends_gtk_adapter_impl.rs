@@ -5,7 +5,7 @@ mod gtk_adapter {
     use std::cell::RefCell;
     use std::rc::Rc;
     use crate::core::{Error, Widget};
-    use gtk_dynamic_loader::{Window as GWindow, Button as GButton, Label as GLabel, BoxWidget as GBox, Grid as GGrid, Entry as GEntry, Dialog as GDialog, DropDown as GDropDown, CheckButton as GCheckButton, RadioButton as GRadioButton, TextView as GTextView};
+    use gtk_dynamic_loader::{Window as GWindow, Button as GButton, Label as GLabel, BoxWidget as GBox, Grid as GGrid, Entry as GEntry, Dialog as GDialog, DropDown as GDropDown, CheckButton as GCheckButton, RadioButton as GRadioButton, TextView as GTextView, ScrolledWindow as GScrolledWindow};
 
     /// A thin transparent wrapper around gtk_compat::Window
     #[repr(transparent)]
@@ -22,6 +22,10 @@ mod gtk_adapter {
             self.0.set_title(title);
         }
 
+        pub fn set_default_size(&self, w: i32, h: i32) {
+            self.0.set_default_size(w, h);
+        }
+
         pub fn set_child(&self, child: &impl AsRef<*mut c_void>) {
             self.0.set_child(child);
         }
@@ -36,9 +40,6 @@ mod gtk_adapter {
             self.0.insert_action_group(name, group_ptr);
         }
 
-        pub fn set_default_size(&self, width: i32, height: i32) {
-            self.0.set_default_size(width, height);
-        }
     }
 
     #[repr(transparent)]
@@ -508,24 +509,22 @@ mod gtk_adapter {
             }
         }
 
-        pub fn on_key(&self, cb: Box<dyn FnMut(u32) -> bool>) {
+        pub fn on_key(&self, cb: Box<dyn FnMut(u32, u32) -> bool>) {
             let loader = crate::backends::gtk::loader()
                 .expect("GTK loader not initialized after Canvas creation");
             let symbols = &loader.symbols;
             let inner = *self.drawing_area.as_ref();
             let is_gtk4 = symbols.gtk_gesture_click_new.is_some();
             if is_gtk4 {
-                // GTK4: use EventControllerKey — store pointer to keep alive
                 if let Ok(ctrl) = gtk_dynamic_loader::EventControllerKey::new(loader.clone()) {
                     let mut cb = cb;
-                    let _ = ctrl.connect_key_pressed(Box::new(move |keyval: u32| -> i32 {
-                        if cb(keyval) { 1 } else { 0 }
+                    let _ = ctrl.connect_key_pressed(Box::new(move |keyval: u32, state: u32| -> i32 {
+                        if cb(keyval, state) { 1 } else { 0 }
                     }));
                     ctrl.add_to_widget(&self.drawing_area);
                     self._controllers.borrow_mut().push(Box::new(ctrl));
                 }
             } else {
-                // GTK3: use key-press-event signal (no controller lifetime issue)
                 let mut cb = cb;
                 let l2 = loader.clone();
                 let l3 = l2.clone();
@@ -534,7 +533,8 @@ mod gtk_adapter {
                         &l3, inner, "key-press-event",
                         Box::new(move |ev: *mut c_void| -> i32 {
                             let keyval = gtk_dynamic_loader::EventControllerKey::get_keyval_static(&l2, ev);
-                            if cb(keyval) { 1 } else { 0 }
+                            let state = 0u32;
+                            if cb(keyval, state) { 1 } else { 0 }
                         }),
                     );
                 }
@@ -548,6 +548,34 @@ mod gtk_adapter {
             drawing_area: da,
             _controllers: Rc::new(RefCell::new(Vec::new())),
         })
+    }
+
+    // ---- ScrolledWindow ----
+
+    #[repr(transparent)]
+    pub struct ScrolledWindow(pub GScrolledWindow);
+
+    impl ScrolledWindow {
+        pub fn set_child(&self, child: &impl AsRef<*mut c_void>) {
+            self.0.set_child(child);
+        }
+        pub fn set_policy(&self, hscroll: u32, vscroll: u32) {
+            self.0.set_policy(hscroll, vscroll);
+        }
+        pub fn set_hexpand(&self, expand: bool) { self.0.set_hexpand(expand); }
+        pub fn set_vexpand(&self, expand: bool) { self.0.set_vexpand(expand); }
+        pub fn set_size_request(&self, w: i32, h: i32) { self.0.set_size_request(w, h); }
+    }
+
+    impl AsRef<*mut c_void> for ScrolledWindow { fn as_ref(&self) -> &*mut c_void { self.0.as_ref() } }
+    impl Widget for ScrolledWindow { fn raw_handle(&self) -> *mut c_void { *self.0.as_ref() } }
+
+    pub fn create_scrolled_window() -> Result<ScrolledWindow, Error> {
+        let loader = crate::backends::gtk::loader()
+            .ok_or_else(|| Error::Backend("GTK loader not initialized".into()))?;
+        let sw = gtk_dynamic_loader::ScrolledWindow::new(loader.clone())
+            .map_err(|e| Error::Backend(format!("{}", e)))?;
+        Ok(ScrolledWindow(sw))
     }
 
     // ---- Overlay (cross-platform stacking container) ----
@@ -616,13 +644,39 @@ mod gtk_adapter {
     pub struct Spreadsheet(pub Canvas, pub Overlay);
 
     impl Clone for Spreadsheet { fn clone(&self) -> Self { Spreadsheet(self.0.clone(), self.1.clone()) } }
-    impl AsRef<*mut c_void> for Spreadsheet { fn as_ref(&self) -> &*mut c_void { self.0.as_ref() } }
-    impl Widget for Spreadsheet { fn raw_handle(&self) -> *mut c_void { *self.0.as_ref() } }
+    // The overlay is the outer container; as_ref/Widget must return its handle
+    // so that adding the spreadsheet to a parent container adds the overlay
+    // (which wraps the canvas), not the canvas itself.
+    impl AsRef<*mut c_void> for Spreadsheet { fn as_ref(&self) -> &*mut c_void { self.1.as_ref() } }
+    impl Widget for Spreadsheet { fn raw_handle(&self) -> *mut c_void { *self.1.as_ref() } }
 
     impl Spreadsheet {
         pub fn set_cell(&self, _row: usize, _col: usize, _text: &str) { /* user manages data via callbacks */ }
         pub fn get_cell(&self, _row: usize, _col: usize) -> Option<String> { None }
         pub fn queue_redraw(&self) { self.0.queue_redraw(); }
+
+        pub fn set_draw_callback(&self, cb: Box<dyn FnMut(&mut dyn crate::core::DrawContext, i32, i32)>) {
+            self.0.set_draw_callback(cb);
+        }
+
+        pub fn on_key(&self, cb: Box<dyn FnMut(u32, u32) -> bool>) {
+            self.0.on_key(cb);
+        }
+
+        pub fn on_click(&self, cb: Box<dyn FnMut(f64, f64)>) {
+            self.0.on_click(cb);
+        }
+
+        pub fn set_hexpand(&self, expand: bool) { self.1.set_hexpand(expand); }
+        pub fn set_vexpand(&self, expand: bool) { self.1.set_vexpand(expand); }
+
+        pub fn canvas(&self) -> &Canvas {
+            &self.0
+        }
+
+        pub fn overlay(&self) -> &Overlay {
+            &self.1
+        }
     }
 
     pub fn create_spreadsheet(rows: usize, cols: usize) -> Result<Spreadsheet, Error> {

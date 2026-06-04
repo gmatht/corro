@@ -464,6 +464,10 @@ mod pancurses_adapter {
         pub(crate) id: usize,
     }
 
+    impl Clone for Spreadsheet {
+        fn clone(&self) -> Self { Spreadsheet { id: self.id } }
+    }
+
     impl AsRef<*mut c_void> for Spreadsheet {
         fn as_ref(&self) -> &*mut c_void {
             unsafe { &*(&self.id as *const usize as *const *mut c_void) }
@@ -477,11 +481,41 @@ mod pancurses_adapter {
     }
 
     impl Spreadsheet {
+        pub fn id(&self) -> usize { self.id }
         pub fn set_cell(&self, row: u32, col: u32, text: &str) {
             crate::backends::pancurses::spreadsheet_set_cell(self.id, row, col, text);
         }
         pub fn get_cell(&self, row: u32, col: u32) -> Option<String> {
             crate::backends::pancurses::spreadsheet_get_cell(self.id, row, col)
+        }
+        pub fn cursor_position(&self) -> Option<(u32, u32)> {
+            crate::backends::pancurses::spreadsheet_cursor_position(self.id)
+        }
+        pub fn set_grid_config(&self, margin_cols: u32, main_cols: u32) {
+            crate::backends::pancurses::spreadsheet_set_grid_config(self.id, margin_cols, main_cols);
+        }
+        pub fn set_column_layout(&self, layout: Vec<(u32, u32, String)>) {
+            crate::backends::pancurses::spreadsheet_set_column_layout(self.id, layout);
+        }
+        pub fn set_row_labels(&self, labels: Vec<(u32, String)>) {
+            crate::backends::pancurses::spreadsheet_set_row_labels(self.id, labels);
+        }
+        pub fn set_menu_text(&self, text: &str) {
+            crate::backends::pancurses::spreadsheet_set_menu_text(self.id, text);
+        }
+        pub fn set_border_title(&self, text: &str) {
+            crate::backends::pancurses::spreadsheet_set_border_title(self.id, text);
+        }
+        pub fn set_status_text(&self, text: &str) {
+            crate::backends::pancurses::spreadsheet_set_status_text(self.id, text);
+        }
+        pub fn set_formula_bar(&self, address_label: &Label, entry: &Entry) {
+            crate::backends::pancurses::spreadsheet_set_formula_bar(
+                self.id, address_label.id, entry.id,
+            );
+        }
+        pub fn commit_formula_bar(&self) {
+            crate::backends::pancurses::spreadsheet_commit_formula_bar(self.id);
         }
     }
 
@@ -579,6 +613,10 @@ mod pancurses_adapter {
         crate::backends::pancurses::create_spreadsheet(rows, cols)
             .map(|id| Spreadsheet { id })
             .map_err(|e| Error::Backend(format!("{}", e)))
+    }
+
+    pub fn add_key_callback(key: char, cb: Box<dyn FnMut()>) {
+        crate::backends::pancurses::add_key_callback(key, cb);
     }
 }
 

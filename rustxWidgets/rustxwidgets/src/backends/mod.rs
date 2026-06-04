@@ -9,19 +9,24 @@ pub trait BackendApp {
     fn run(self: Box<Self>) -> Result<(), BackendError>;
 }
 
-#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
+/// Priority chain: each backend module is always compiled when its feature is on,
+/// but `init` is re-exported only for the highest-priority backend available.
+/// Platform-specific backends (gtk, nwg, wasm, android) naturally exclude each
+/// other. Pancurses is a fallback when no platform-native backend applies.
+
+#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
 pub mod gtk;
-#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
+#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
 pub use self::gtk::init;
 
-#[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+#[cfg(all(windows, not(feature = "zork")))]
 pub mod nwg;
-#[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+#[cfg(all(windows, not(feature = "zork")))]
 pub use self::nwg::init;
 
-#[cfg(all(target_arch = "wasm32", not(feature = "pancurses"), not(feature = "zork")))]
+#[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
 pub mod wasm;
-#[cfg(all(target_arch = "wasm32", not(feature = "pancurses"), not(feature = "zork")))]
+#[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
 pub use self::wasm::init;
 
 #[cfg(all(target_os = "android", not(feature = "zork")))]
@@ -29,9 +34,11 @@ pub mod android;
 #[cfg(all(target_os = "android", not(feature = "zork")))]
 pub use self::android::init_backend as init;
 
+/// pancurses is a cross-platform fallback; its `init` is exported only when no
+/// higher-priority backend is compiled for the current platform.
 #[cfg(feature = "pancurses")]
 pub mod pancurses;
-#[cfg(feature = "pancurses")]
+#[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
 pub use self::pancurses::init;
 
 #[cfg(feature = "zork")]

@@ -56,12 +56,9 @@ pub struct App {
 
 impl App {
     /// Initialize the default backend and return an App wrapper.
+    /// Uses the priority chain from `backends::init()` (gtk > nwg > wasm > android > pancurses).
     pub fn init() -> Result<Self, Error> {
-        let b = match crate::backends::init() {
-            Ok(b) => b,
-            Err(e) => return Err(Error::Backend(format!("{}", e))),
-        };
-        #[cfg(not(feature = "pancurses"))]
+        let b = crate::backends::init().map_err(|e| Error::Backend(format!("{}", e)))?;
         return Ok(App {
             inner: Arc::new(b),
             #[cfg(windows)]
@@ -69,123 +66,126 @@ impl App {
             #[cfg(windows)]
             action_registry: Rc::new(RefCell::new(HashMap::new())),
         });
-        #[cfg(feature = "pancurses")]
-        return Ok(App { inner: Arc::new(b) });
     }
 
     // -- Linux paths --
 
-    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
     pub fn create_window(&self) -> Result<crate::backends_gtk_adapter::Window, Error> {
         crate::backends_gtk_adapter::create_window().map_err(|e| e)
     }
 
-    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
     pub fn create_button(&self, label: &str) -> Result<crate::backends_gtk_adapter::Button, Error> {
         crate::backends_gtk_adapter::create_button(label).map_err(|e| e)
     }
 
-    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
     pub fn create_label(&self, text: &str) -> Result<crate::backends_gtk_adapter::Label, Error> {
         crate::backends_gtk_adapter::create_label(text).map_err(|e| e)
     }
 
-    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
     pub fn create_box(&self, orientation: gtk_dynamic_loader::Orientation, spacing: i32) -> Result<crate::backends_gtk_adapter::BoxWidget, Error> {
         crate::backends_gtk_adapter::create_box(orientation, spacing).map_err(|e| e)
     }
 
-    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
     pub fn create_grid(&self) -> Result<crate::backends_gtk_adapter::Grid, Error> {
         crate::backends_gtk_adapter::create_grid().map_err(|e| e)
     }
 
-    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
     pub fn create_entry(&self) -> Result<crate::backends_gtk_adapter::Entry, Error> {
         crate::backends_gtk_adapter::create_entry().map_err(|e| e)
     }
 
-    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
     pub fn create_menu(&self) -> Result<crate::backends_gtk_adapter::Menu, Error> {
         crate::backends_gtk_adapter::create_menu().map_err(|e| e)
     }
 
-    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
     /// # Safety
     /// `action_group` must be a valid GActionGroup pointer or null.
     pub unsafe fn create_menubar(&self, model: &crate::backends_gtk_adapter::Menu, action_group: *mut c_void) -> Result<crate::backends_gtk_adapter::MenuBar, Error> {
         crate::backends_gtk_adapter::create_menubar(model, action_group).map_err(|e| e)
     }
 
-    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
     pub fn create_simple_action(&self, name: &str) -> Result<crate::backends_gtk_adapter::SimpleAction, Error> {
         crate::backends_gtk_adapter::create_simple_action(name).map_err(|e| e)
     }
 
-    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
     pub fn create_dialog(&self) -> Result<crate::backends_gtk_adapter::Dialog, Error> {
         crate::backends_gtk_adapter::create_dialog().map_err(|e| e)
     }
 
-    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
     pub fn create_dropdown(&self, items: &[&str]) -> Result<crate::backends_gtk_adapter::DropDown, Error> {
         crate::backends_gtk_adapter::create_dropdown(items).map_err(|e| e)
     }
 
-    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
     pub fn create_checkbutton(&self, label: &str) -> Result<crate::backends_gtk_adapter::CheckButton, Error> {
         crate::backends_gtk_adapter::create_checkbutton(label).map_err(|e| e)
     }
 
-    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
     pub fn create_radiobutton(&self, label: &str) -> Result<crate::backends_gtk_adapter::RadioButton, Error> {
         crate::backends_gtk_adapter::create_radiobutton(None, label).map_err(|e| e)
     }
 
-    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
     pub fn create_textview(&self) -> Result<crate::backends_gtk_adapter::TextView, Error> {
         crate::backends_gtk_adapter::create_textview().map_err(|e| e)
     }
 
-    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
     pub fn create_canvas(&self) -> Result<crate::backends_gtk_adapter::Canvas, Error> {
         crate::backends_gtk_adapter::create_canvas()
     }
 
-    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+    pub fn create_scrolled_window(&self) -> Result<crate::backends_gtk_adapter::ScrolledWindow, Error> {
+        crate::backends_gtk_adapter::create_scrolled_window()
+    }
+
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
     pub fn create_overlay(&self) -> Result<crate::backends_gtk_adapter::Overlay, Error> {
         crate::backends_gtk_adapter::create_overlay()
     }
 
-    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
     pub fn open_file(&self, title: &str) -> Result<Option<String>, Error> {
         crate::backends_gtk_adapter::open_file(title)
     }
 
-    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
     pub fn save_file(&self, title: &str) -> Result<Option<String>, Error> {
         crate::backends_gtk_adapter::save_file(title)
     }
 
-    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
     pub fn create_spreadsheet(&self, rows: usize, cols: usize) -> Result<crate::backends_gtk_adapter::Spreadsheet, Error> {
         crate::backends_gtk_adapter::create_spreadsheet(rows, cols)
     }
 
     // -- Windows paths --
 
-    #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(windows, not(feature = "zork")))]
     pub fn create_window(&self) -> Result<crate::backends_nwg_adapter::Window, Error> {
         crate::backends_nwg_adapter::create_window(&self.parent_cell)
     }
 
-    #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(windows, not(feature = "zork")))]
     pub fn create_button(&self, _label: &str) -> Result<crate::backends_nwg_adapter::Button, Error> {
         let parent = self.parent_cell.borrow().copied().unwrap_or(std::ptr::null_mut());
         crate::backends_nwg_adapter::create_button(parent)
     }
 
-    #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(windows, not(feature = "zork")))]
     pub fn create_label(&self, text: &str) -> Result<crate::backends_nwg_adapter::Label, Error> {
         let parent = self.parent_cell.borrow().copied().unwrap_or(std::ptr::null_mut());
         let lbl = crate::backends_nwg_adapter::create_label(parent)?;
@@ -193,111 +193,111 @@ impl App {
         Ok(lbl)
     }
 
-    #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(windows, not(feature = "zork")))]
     pub fn create_box(&self, orientation: crate::backends_nwg_adapter::Orientation, spacing: i32) -> Result<crate::backends_nwg_adapter::BoxWidget, Error> {
         crate::backends_nwg_adapter::create_box(orientation, spacing)
     }
 
-    #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(windows, not(feature = "zork")))]
     pub fn create_grid(&self) -> Result<crate::backends_nwg_adapter::Grid, Error> {
         crate::backends_nwg_adapter::create_grid()
     }
 
-    #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(windows, not(feature = "zork")))]
     pub fn create_entry(&self) -> Result<crate::backends_nwg_adapter::Entry, Error> {
         let parent = self.parent_cell.borrow().copied().unwrap_or(std::ptr::null_mut());
         crate::backends_nwg_adapter::create_entry(parent)
     }
 
-    #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(windows, not(feature = "zork")))]
     pub fn create_menu(&self) -> Result<crate::backends_nwg_adapter::Menu, Error> {
         crate::backends_nwg_adapter::create_menu()
     }
 
-    #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(windows, not(feature = "zork")))]
     pub fn create_menubar(&self, model: &crate::backends_nwg_adapter::Menu) -> Result<crate::backends_nwg_adapter::MenuBar, Error> {
         let win_hwnd = self.parent_cell.borrow().copied().unwrap_or(std::ptr::null_mut());
         crate::backends_nwg_adapter::create_menubar(model, win_hwnd, self.action_registry.clone())
     }
 
-    #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(windows, not(feature = "zork")))]
     pub fn create_simple_action(&self, name: &str) -> Result<crate::backends_nwg_adapter::SimpleAction, Error> {
         crate::backends_nwg_adapter::create_simple_action(name, self.action_registry.clone())
     }
 
-    // -- Pancurses paths --
+    // -- Pancurses paths (fallback, blocked when a platform-native backend applies) --
 
-    #[cfg(feature = "pancurses")]
+    #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
     pub fn create_window(&self) -> Result<crate::backends_pancurses_adapter::Window, Error> {
         crate::backends_pancurses_adapter::create_window()
     }
 
-    #[cfg(feature = "pancurses")]
+    #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
     pub fn create_button(&self, label: &str) -> Result<crate::backends_pancurses_adapter::Button, Error> {
         crate::backends_pancurses_adapter::create_button(label)
     }
 
-    #[cfg(feature = "pancurses")]
+    #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
     pub fn create_label(&self, text: &str) -> Result<crate::backends_pancurses_adapter::Label, Error> {
         crate::backends_pancurses_adapter::create_label(text)
     }
 
-    #[cfg(feature = "pancurses")]
+    #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
     pub fn create_box(&self, orientation: crate::backends_pancurses_adapter::Orientation, spacing: i32) -> Result<crate::backends_pancurses_adapter::BoxWidget, Error> {
         crate::backends_pancurses_adapter::create_box(orientation, spacing)
     }
 
-    #[cfg(feature = "pancurses")]
+    #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
     pub fn create_grid(&self) -> Result<crate::backends_pancurses_adapter::Grid, Error> {
         crate::backends_pancurses_adapter::create_grid()
     }
 
-    #[cfg(feature = "pancurses")]
+    #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
     pub fn create_entry(&self) -> Result<crate::backends_pancurses_adapter::Entry, Error> {
         crate::backends_pancurses_adapter::create_entry()
     }
 
-    #[cfg(feature = "pancurses")]
+    #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
     pub fn create_menu(&self) -> Result<crate::backends_pancurses_adapter::Menu, Error> {
         crate::backends_pancurses_adapter::create_menu()
     }
 
-    #[cfg(feature = "pancurses")]
+    #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
     pub fn create_menubar(&self, model: &crate::backends_pancurses_adapter::Menu, _action_group: *mut std::os::raw::c_void) -> Result<crate::backends_pancurses_adapter::MenuBar, Error> {
         crate::backends_pancurses_adapter::create_menubar(model, _action_group)
     }
 
-    #[cfg(feature = "pancurses")]
+    #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
     pub fn create_simple_action(&self, name: &str) -> Result<crate::backends_pancurses_adapter::SimpleAction, Error> {
         crate::backends_pancurses_adapter::create_simple_action(name)
     }
 
-    #[cfg(feature = "pancurses")]
+    #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
     pub fn create_dialog(&self) -> Result<crate::backends_pancurses_adapter::Dialog, Error> {
         crate::backends_pancurses_adapter::create_dialog()
     }
 
-    #[cfg(feature = "pancurses")]
+    #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
     pub fn create_dropdown(&self, items: &[&str]) -> Result<crate::backends_pancurses_adapter::DropDown, Error> {
         crate::backends_pancurses_adapter::create_dropdown(items)
     }
 
-    #[cfg(feature = "pancurses")]
+    #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
     pub fn create_checkbutton(&self, label: &str) -> Result<crate::backends_pancurses_adapter::CheckButton, Error> {
         crate::backends_pancurses_adapter::create_checkbutton(label)
     }
 
-    #[cfg(feature = "pancurses")]
+    #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
     pub fn create_radiobutton(&self, label: &str) -> Result<crate::backends_pancurses_adapter::RadioButton, Error> {
         crate::backends_pancurses_adapter::create_radiobutton(None, label)
     }
 
-    #[cfg(feature = "pancurses")]
+    #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
     pub fn create_textview(&self) -> Result<crate::backends_pancurses_adapter::TextView, Error> {
         crate::backends_pancurses_adapter::create_textview()
     }
 
-    #[cfg(feature = "pancurses")]
+    #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
     pub fn create_spreadsheet(&self, rows: u32, cols: u32) -> Result<crate::backends_pancurses_adapter::Spreadsheet, Error> {
         crate::backends_pancurses_adapter::create_spreadsheet(rows, cols)
     }
@@ -376,72 +376,72 @@ impl App {
 
     // -- WASM paths --
 
-    #[cfg(all(target_arch = "wasm32", not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
     pub fn create_window(&self) -> Result<crate::backends_wasm_adapter::Window, Error> {
         crate::backends_wasm_adapter::create_window()
     }
 
-    #[cfg(all(target_arch = "wasm32", not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
     pub fn create_button(&self, label: &str) -> Result<crate::backends_wasm_adapter::Button, Error> {
         crate::backends_wasm_adapter::create_button(label)
     }
 
-    #[cfg(all(target_arch = "wasm32", not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
     pub fn create_label(&self, text: &str) -> Result<crate::backends_wasm_adapter::Label, Error> {
         crate::backends_wasm_adapter::create_label(text)
     }
 
-    #[cfg(all(target_arch = "wasm32", not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
     pub fn create_box(&self, orientation: crate::backends_wasm_adapter::Orientation, spacing: i32) -> Result<crate::backends_wasm_adapter::BoxWidget, Error> {
         crate::backends_wasm_adapter::create_box(orientation, spacing)
     }
 
-    #[cfg(all(target_arch = "wasm32", not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
     pub fn create_grid(&self) -> Result<crate::backends_wasm_adapter::Grid, Error> {
         crate::backends_wasm_adapter::create_grid()
     }
 
-    #[cfg(all(target_arch = "wasm32", not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
     pub fn create_entry(&self) -> Result<crate::backends_wasm_adapter::Entry, Error> {
         crate::backends_wasm_adapter::create_entry()
     }
 
-    #[cfg(all(target_arch = "wasm32", not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
     pub fn create_menu(&self) -> Result<crate::backends_wasm_adapter::Menu, Error> {
         crate::backends_wasm_adapter::create_menu()
     }
 
-    #[cfg(all(target_arch = "wasm32", not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
     pub fn create_menubar(&self, model: &crate::backends_wasm_adapter::Menu, action_group: *mut c_void) -> Result<crate::backends_wasm_adapter::MenuBar, Error> {
         crate::backends_wasm_adapter::create_menubar(model, action_group)
     }
 
-    #[cfg(all(target_arch = "wasm32", not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
     pub fn create_simple_action(&self, name: &str) -> Result<crate::backends_wasm_adapter::SimpleAction, Error> {
         crate::backends_wasm_adapter::create_simple_action(name)
     }
 
-    #[cfg(all(target_arch = "wasm32", not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
     pub fn create_dialog(&self) -> Result<crate::backends_wasm_adapter::Dialog, Error> {
         crate::backends_wasm_adapter::create_dialog()
     }
 
-    #[cfg(all(target_arch = "wasm32", not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
     pub fn create_dropdown(&self, items: &[&str]) -> Result<crate::backends_wasm_adapter::DropDown, Error> {
         crate::backends_wasm_adapter::create_dropdown(items)
     }
 
-    #[cfg(all(target_arch = "wasm32", not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
     pub fn create_checkbutton(&self, label: &str) -> Result<crate::backends_wasm_adapter::CheckButton, Error> {
         crate::backends_wasm_adapter::create_checkbutton(label)
     }
 
-    #[cfg(all(target_arch = "wasm32", not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
     pub fn create_radiobutton(&self, label: &str) -> Result<crate::backends_wasm_adapter::RadioButton, Error> {
         crate::backends_wasm_adapter::create_radiobutton(None, label)
     }
 
-#[cfg(all(target_arch = "wasm32", not(feature = "pancurses")))]
+#[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
 pub fn create_textview(&self) -> Result<crate::backends_wasm_adapter::TextView, Error> {
     crate::backends_wasm_adapter::create_textview()
 }

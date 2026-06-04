@@ -500,7 +500,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let commit_kb = commit_edit.clone();
     let start_kb = start_edit.clone();
     let refresh_kb = refresh_selection.clone();
-    canvas.on_key(Box::new(move |keyval: u32| -> bool {
+    canvas.on_key(Box::new(move |keyval: u32, _state: u32| -> bool {
         if *text_active_kb.borrow() { return false; }
         if edit_kb.borrow().is_some() {
             if keyval == 0xFF1B { // Escape

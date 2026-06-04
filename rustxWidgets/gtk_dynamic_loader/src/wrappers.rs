@@ -998,9 +998,9 @@ impl EventControllerKey {
         Ok(EventControllerKey { inner, loader, _not_send: PhantomData })
     }
 
-    pub fn connect_key_pressed<F: FnMut(u32) -> i32 + 'static>(&self, f: F) -> Result<u64, Error> {
+    pub fn connect_key_pressed<F: FnMut(u32, u32) -> i32 + 'static>(&self, f: F) -> Result<u64, Error> {
         guard_widget_or!(self, "EventControllerKey", "connect_key_pressed", Err(Error::Other("key controller dropped".into())));
-        let boxed: Box<Box<dyn FnMut(u32) -> i32>> = Box::new(Box::new(f));
+        let boxed: Box<Box<dyn FnMut(u32, u32) -> i32>> = Box::new(Box::new(f));
         let raw = Box::into_raw(boxed) as *mut c_void;
         unsafe { self.connect_key_pressed_raw(raw) }
     }
