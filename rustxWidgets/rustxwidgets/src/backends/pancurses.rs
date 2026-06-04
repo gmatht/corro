@@ -1205,8 +1205,8 @@ mod pancurses_backend {
                         hx += 5;
                         let n = column_layout.len();
                         for (i, &(ref _ci, ref w, ref label)) in column_layout.iter().enumerate() {
-                            // Need room for: column content + space + right padding + right border
-                            if hx + *w as i32 + 6 > rect.x + rect.w - 1 { break; }
+                            // Need room for: column content + space + right border
+                            if hx + *w as i32 + 1 > rect.x + rect.w - 1 { break; }
                             let padded = format!("{:<1$}", label, *w as usize);
                             root.mvaddstr(hr, hx, &padded);
                             hx += *w as i32;
@@ -1315,14 +1315,24 @@ mod pancurses_backend {
                                     } else { break; }
                                 }
                             }
+                            // Include gap after current column as available space
+                            // (ratatui treats the inter-column gap as overflow room)
+                            let gap_after = if overflow_cols == 0 && vi + 1 < n { 1 } else { 0 };
                             let total_avail: usize = column_layout[vi..=vi+overflow_cols].iter()
                                 .map(|&(_, w, _)| w as usize).sum::<usize>()
-                                + overflow_cols; // spaces between
+                                + overflow_cols // spaces between overflow columns
+                                + gap_after;   // gap to next column
                             let display = if text_width > total_avail {
-                                let trunc = total_avail.saturating_sub(1).max(1);
-                                let mut s: String = cell_text.chars().take(trunc).collect();
-                                if text_width > trunc { s.push('…'); }
-                                s
+                                if overflow_cols == 0 {
+                                    // No adjacent empty cells — clip text at boundary
+                                    // The adjacent cell content provides the visual truncation indicator
+                                    cell_text.chars().take(total_avail).collect()
+                                } else {
+                                    let trunc = total_avail.saturating_sub(1).max(1);
+                                    let mut s: String = cell_text.chars().take(trunc).collect();
+                                    if text_width > trunc { s.push('…'); }
+                                    s
+                                }
                             } else { cell_text.to_string() };
                             root.mvaddstr(ry, sx, &display);
                             vi += 1 + overflow_cols as usize;
@@ -1358,12 +1368,17 @@ mod pancurses_backend {
                                     } else { break; }
                                 }
                             }
-                            let available = (overflow_cols + 1) * cw;
+                            let gap_after = if overflow_cols == 0 { 1 } else { 0 };
+                            let available = (overflow_cols + 1) * cw + gap_after;
                             let display = if text_width > available as usize {
-                                let trunc = (available - 1).max(1) as usize;
-                                let mut s: String = text.chars().take(trunc).collect();
-                                if text.chars().count() > trunc { s.push('…'); }
-                                s
+                                if overflow_cols == 0 {
+                                    text.chars().take(available as usize).collect()
+                                } else {
+                                    let trunc = (available - 1).max(1) as usize;
+                                    let mut s: String = text.chars().take(trunc).collect();
+                                    if text.chars().count() > trunc { s.push('…'); }
+                                    s
+                                }
                             } else { text.to_string() };
                             if is_cursor && has_colors() { root.attron(COLOR_PAIR(2)); }
                             for i in 0..(overflow_cols + 1) * cw {
