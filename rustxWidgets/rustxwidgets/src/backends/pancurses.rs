@@ -52,6 +52,7 @@ mod pancurses_backend {
             menu_text: String,
             status_text: String,
             border_title: String,
+            formula_bar_trailing: String,
             column_layout: Vec<(u32, u32, String)>,
             row_labels: Vec<(u32, String)>,
         },
@@ -1131,14 +1132,12 @@ mod pancurses_backend {
                     root.attroff(COLOR_PAIR(3));
                 }
             }
-            PcWidgetKind::Spreadsheet { ref cells, ref top_row, ref left_col, ref cursor_row, ref cursor_col, ref editing, ref edit_buf, ref edit_pos, ref col_width, ref margin_cols, ref main_cols, ref menu_text, ref status_text, ref border_title, ref column_layout, ref row_labels, ref total_rows, ref total_cols, .. } => {
+            PcWidgetKind::Spreadsheet { ref cells, ref top_row, ref left_col, ref cursor_row, ref cursor_col, ref editing, ref edit_buf, ref edit_pos, ref col_width, ref margin_cols, ref main_cols, ref menu_text, ref status_text, ref border_title, ref formula_bar_trailing, ref column_layout, ref row_labels, ref total_rows, ref total_cols, .. } => {
                 let cw = *col_width as i32;
                 let rh_w = 5i32;
-                let sep: char = '│';
                 let lm = *margin_cols as usize;
                 let mc = *main_cols as usize;
                 let use_layout = !column_layout.is_empty();
-                let use_row_labels = !row_labels.is_empty();
                 for dy in 0..rect.h {
                     for dx in 0..rect.w {
                         root.mvaddch(rect.y + dy, rect.x + dx, ' ');
@@ -1149,7 +1148,9 @@ mod pancurses_backend {
                 // Menu bar
                 if !menu_text.is_empty() {
                     if has_colors() { root.attron(COLOR_PAIR(4)); }
-                    root.mvaddstr(row_offset, rect.x, &menu_text[..menu_text.len().min(rect.w as usize)]);
+                    let max_chars = rect.w as usize;
+                    let end = menu_text.char_indices().nth(max_chars).map(|(i, _)| i).unwrap_or(menu_text.len());
+                    root.mvaddstr(row_offset, rect.x, &menu_text[..end]);
                     if has_colors() { root.attroff(COLOR_PAIR(4)); }
                     row_offset += 1;
                 }
@@ -1157,14 +1158,18 @@ mod pancurses_backend {
                 // Formula bar
                 let addr_text = format!("{}{}", col_label(*cursor_col), *cursor_row + 1);
                 let cell_val = cells.borrow().get(&(*cursor_row, *cursor_col)).cloned().unwrap_or_default();
-                let max_fb = (rect.w as usize).saturating_sub(addr_text.len() + 3).max(1);
-                let fb_text = if cell_val.len() > max_fb {
-                    format!(" {}  {}…", addr_text, &cell_val[..max_fb.saturating_sub(3)])
+                let addr_vis = addr_text.chars().count();
+                let max_fb = (rect.w as usize).saturating_sub(addr_vis + 3).max(1);
+                let fb_text = if cell_val.chars().count() > max_fb {
+                    let trunc_end = cell_val.char_indices().nth(max_fb.saturating_sub(3)).map(|(i, _)| i).unwrap_or(cell_val.len());
+                    format!(" {}  {}…{}", addr_text, &cell_val[..trunc_end], formula_bar_trailing)
                 } else {
-                    format!(" {}  {}", addr_text, cell_val)
+                    format!(" {}  {}{}", addr_text, cell_val, formula_bar_trailing)
                 };
+                let fb_vis = fb_text.chars().count();
                 if has_colors() { root.attron(COLOR_PAIR(1)); }
-                root.mvaddstr(row_offset, rect.x, &fb_text[..fb_text.len().min(rect.w as usize)]);
+                let fb_end = fb_text.char_indices().nth(rect.w as usize).map(|(i, _)| i).unwrap_or(fb_text.len());
+                root.mvaddstr(row_offset, rect.x, &fb_text[..fb_end]);
                 if has_colors() { root.attroff(COLOR_PAIR(1)); }
                 row_offset += 1;
 
@@ -1177,11 +1182,12 @@ mod pancurses_backend {
                         format!(" corro  {}r × {}c ", *main_cols, *main_cols)
                     };
                     let title = title.trim_end().to_string();
+                    let title_vis = title.chars().count();
                     root.mvaddstr(br, rect.x, "┌");
-                    let dash_fill = (rect.w as usize).saturating_sub(title.len() + 2);
+                    let dash_fill = (rect.w as usize).saturating_sub(title_vis + 2);
                     root.mvaddstr(br, rect.x + 1, &title);
                     for i in 0..dash_fill {
-                        root.mvaddstr(br, rect.x + 1 + title.len() as i32 + i as i32, "─");
+                        root.mvaddstr(br, rect.x + 1 + title_vis as i32 + i as i32, "─");
                     }
                     root.mvaddstr(br, rect.x + rect.w - 1, "┐");
                     row_offset += 1;
@@ -1192,108 +1198,150 @@ mod pancurses_backend {
                     let hr = row_offset;
                     root.mvaddstr(hr, rect.x, "│");
                     if use_layout {
-                        // Pre-computed layout: draw each column header as specified
+                        // Pre-computed layout: draw each column header in its width with a space between
+                        // Reserve row label gutter (5 spaces) before the first column
                         let mut hx = rect.x + 1;
-                        for &(ref _ci, ref w, ref label) in column_layout.iter() {
+                        root.mvaddstr(hr, hx, &" ".repeat(5));
+                        hx += 5;
+                        let n = column_layout.len();
+                        for (i, &(ref _ci, ref w, ref label)) in column_layout.iter().enumerate() {
+                            // Need room for: column content + space + right padding + right border
+                            if hx + *w as i32 + 6 > rect.x + rect.w - 1 { break; }
                             let padded = format!("{:<1$}", label, *w as usize);
                             root.mvaddstr(hr, hx, &padded);
                             hx += *w as i32;
+                            if i + 1 < n {
+                                root.mvaddch(hr, hx, ' ');
+                                hx += 1;
+                            }
+                        }
+                        // Right border
+                        if hx <= rect.x + rect.w - 1 {
+                            root.mvaddstr(hr, rect.x + rect.w - 1, "│");
                         }
                     } else {
                         if has_colors() { root.attron(COLOR_PAIR(4)); }
-                        let max_data_cols = ((rect.w - rh_w - 2) / (cw + 1)).max(1);
-                        root.mvaddstr(hr, rect.x + 1, "     ");
-                        let max_vis_cols = max_data_cols.min((mc.saturating_add(lm)) as i32);
+                        // Row label gutter: 5 spaces, then columns
+                        let max_vis_cols = ((rect.w - rh_w - 2) / (cw + 1)).max(1).min(100);
+                        let mut hx = rect.x + 1;
+                        root.mvaddstr(hr, hx, &" ".repeat(rh_w as usize));
+                        hx += rh_w;
                         for vc in 0..max_vis_cols {
                             let col_idx = *left_col + vc as u32;
-                            let dx = rect.x + 1 + rh_w + vc * (cw + 1);
                             let label = if col_idx < lm as u32 {
                                 format!("[{}", col_label(col_idx))
                             } else if col_idx < (lm + mc) as u32 {
-                                col_label(col_idx)
+                                col_label(col_idx - lm as u32)
                             } else {
-                                format!("]{}", col_label(col_idx))
+                                format!("]{}", col_label(col_idx - lm as u32 - mc as u32))
                             };
-                            root.mvaddstr(hr, dx + 1, &label);
-                            root.mvaddstr(hr, dx, &sep.to_string());
+                            if hx + *col_width as i32 + 6 > rect.x + rect.w { break; }
+                            let padded = format!("{:<1$}", label, *col_width as usize);
+                            root.mvaddstr(hr, hx, &padded);
+                            hx += *col_width as i32;
+                            if hx < rect.x + rect.w {
+                                root.mvaddch(hr, hx, ' '); hx += 1;
+                            }
                         }
                         if has_colors() { root.attroff(COLOR_PAIR(4)); }
                     }
-                    // header separator
-                    let sep_len = rect.w.saturating_sub(2).max(1) as usize;
-                    root.mvaddstr(hr + 1, rect.x, "│");
+                    // header separator — match ratatui: ││──...──│
+                    let sep_len = rect.w.saturating_sub(3).max(1) as usize;
+                    root.mvaddstr(hr + 1, rect.x, "││");
                     for i in 0..sep_len {
-                        root.mvaddstr(hr + 1, rect.x + 1 + i as i32, "─");
+                        root.mvaddstr(hr + 1, rect.x + 2 + i as i32, "─");
                     }
-                    root.mvaddstr(hr + 1, rect.x + 1 + sep_len as i32, "│");
+                    root.mvaddstr(hr + 1, rect.x + 2 + sep_len as i32, "│");
                     row_offset = hr + 2;
                 }
 
-                // Data rows
-                let grid_bottom = rect.y + rect.h - (if status_text.is_empty() { 0 } else { 1 });
+                // Data rows — compute available rows, leaving room for bottom border + optional status line
+                let has_status = !status_text.is_empty();
+                let grid_bottom = rect.y + rect.h - (if has_status { 2 } else { 1 });
                 let max_data_rows = ((grid_bottom - row_offset) as i32).max(1) as u32;
                 for vr in 0..max_data_rows {
                     let row_idx = *top_row + vr as u32;
                     let ry = row_offset + vr as i32;
                     root.mvaddstr(ry, rect.x, "│");
-                    let mut rx = rect.x + 1;
-                    // Row header
-                    if use_row_labels {
-                        if let Some((_, label)) = row_labels.iter().find(|(r, _)| *r == row_idx) {
-                            root.mvaddstr(ry, rx, &format!("{:<4}", label));
-                        } else {
-                            root.mvaddstr(ry, rx, &format!("{:>4}", row_idx + 1));
-                        }
-                        root.mvaddstr(ry, rx + 5, &sep.to_string());
-                    } else {
-                        if has_colors() { root.attron(COLOR_PAIR(4)); }
-                        root.mvaddstr(ry, rx, &format!("{:>4}", row_idx + 1));
-                        root.mvaddstr(ry, rx + 5, &sep.to_string());
-                        if has_colors() { root.attroff(COLOR_PAIR(4)); }
-                    }
+                    let rx = rect.x + 1;
+                    // Row header: right-aligned in 4 chars + trailing space = 5 chars (match ratatui)
+                    let label_str = row_labels.iter()
+                        .find(|(r, _)| *r == row_idx)
+                        .map(|(_, l)| l.as_str())
+                        .unwrap_or("");
+                    root.mvaddstr(ry, rx, &format!("{:>4} ", label_str));
                     let cells_ref = cells.borrow();
                     if use_layout {
-                        // Pre-computed column layout: render each column.
-                        // Cells are stored at main-column indices; map global→main for lookup.
-                        // Column area starts after border (1) + row header (5) + separator (1) = 7
-                        let mut rx2 = rect.x + 1 + 5 + 1;
-                        for &(col_idx, w, _) in column_layout {
+                        // Layout mode with overflow support: cells overflow into adjacent empty columns
+                        let n = column_layout.len();
+                        let mut col_positions: Vec<(u32, i32)> = Vec::new(); // (col_idx, screen_x)
+                        let mut rx2 = rect.x + 1 + 5; // start right after row label (no extra space)
+                        for (idx, &(col_idx, w, _)) in column_layout.iter().enumerate() {
+                            col_positions.push((col_idx, rx2));
+                            rx2 += w as i32;
+                            if idx + 1 < n {
+                                rx2 += 1; // space between columns
+                            }
+                        }
+                        // Draw cells with overflow
+                        let mut vi = 0;
+                        while vi < n {
+                            let (col_idx, sx) = col_positions[vi];
                             let is_margin = *margin_cols > 0 && col_idx < *margin_cols;
                             let cell_text = if !is_margin {
-                                let main_col = col_idx - *margin_cols;
+                                let main_col = if col_idx < *margin_cols { col_idx } else { col_idx - *margin_cols };
                                 cells_ref.get(&(row_idx, main_col)).map(|s| s.as_str()).unwrap_or("")
                             } else { "" };
-                            let display = if cell_text.is_empty() {
-                                String::new()
-                            } else {
-                                let text_width = cell_text.chars().count();
-                                if text_width > w as usize {
-                                    let trunc = (w as usize - 1).max(1);
-                                    let mut s: String = cell_text.chars().take(trunc).collect();
-                                    if text_width > trunc { s.push('…'); }
-                                    s
-                                } else { cell_text.to_string() }
-                            };
-                            root.mvaddstr(ry, rx2, &format!("{:<1$}", display, w as usize));
-                            rx2 += w as i32;
+                            if cell_text.is_empty() {
+                                vi += 1;
+                                continue;
+                            }
+                            let w = column_layout[vi].1 as usize;
+                            let text_width = cell_text.chars().count();
+                            // Find overflow space into adjacent empty columns
+                            let mut overflow_cols = 0usize;
+                            if text_width > w {
+                                let mut scan = vi + 1;
+                                while scan < n {
+                                    let (sc_idx, _) = col_positions[scan];
+                                    let is_margin2 = *margin_cols > 0 && sc_idx < *margin_cols;
+                                    let sc_text = if !is_margin2 {
+                                        let main_sc = if sc_idx < *margin_cols { sc_idx } else { sc_idx - *margin_cols };
+                                        cells_ref.get(&(row_idx, main_sc)).map(|s| s.as_str()).unwrap_or("")
+                                    } else { "" };
+                                    if sc_text.is_empty() {
+                                        overflow_cols += 1;
+                                        scan += 1;
+                                    } else { break; }
+                                }
+                            }
+                            let total_avail: usize = column_layout[vi..=vi+overflow_cols].iter()
+                                .map(|&(_, w, _)| w as usize).sum::<usize>()
+                                + overflow_cols; // spaces between
+                            let display = if text_width > total_avail {
+                                let trunc = total_avail.saturating_sub(1).max(1);
+                                let mut s: String = cell_text.chars().take(trunc).collect();
+                                if text_width > trunc { s.push('…'); }
+                                s
+                            } else { cell_text.to_string() };
+                            root.mvaddstr(ry, sx, &display);
+                            vi += 1 + overflow_cols as usize;
                         }
                         root.mvaddstr(ry, rect.x + rect.w - 1, "│");
                     } else {
-                        let max_data_cols = ((rect.w - rh_w - 2) / (cw + 1)).max(1);
-                        let max_vis_cols = max_data_cols.min((mc.saturating_add(lm)) as i32);
+                        let max_vis_cols = ((rect.w - rh_w - 2) / (cw + 1)).max(1).min((mc.saturating_add(lm)) as i32);
                         let mut vc = 0i32;
                         while vc < max_vis_cols {
                             let col_idx = *left_col + vc as u32;
                             let cell_text = cells_ref.get(&(row_idx, col_idx)).map(|s| s.as_str()).unwrap_or("");
                             let is_cursor = row_idx == *cursor_row && col_idx == *cursor_col;
                             let is_editing = is_cursor && *editing;
-                            let dx = rect.x + 1 + rh_w + vc * (cw + 1);
+                            let col_screen_x = rect.x + 1 + rh_w + vc * (cw + 1);
                             if cell_text.is_empty() && !is_editing {
                                 if is_cursor {
                                     if has_colors() { root.attron(COLOR_PAIR(2)); }
-                                    for i in 0..cw { root.mvaddch(ry, dx + i, ' '); }
+                                    for i in 0..cw { root.mvaddch(ry, col_screen_x + i, ' '); }
                                 }
-                                root.mvaddstr(ry, dx + cw, &sep.to_string());
                                 vc += 1;
                                 continue;
                             }
@@ -1319,7 +1367,7 @@ mod pancurses_backend {
                             } else { text.to_string() };
                             if is_cursor && has_colors() { root.attron(COLOR_PAIR(2)); }
                             for i in 0..(overflow_cols + 1) * cw {
-                                let cx = dx + i;
+                                let cx = col_screen_x + i;
                                 if cx < rect.x + rect.w { root.mvaddch(ry, cx, ' '); }
                             }
                             if is_cursor && has_colors() { root.attroff(COLOR_PAIR(2)); }
@@ -1329,29 +1377,25 @@ mod pancurses_backend {
                                 let start = scroll.min(buf_len);
                                 let visible: String = edit_buf.chars().skip(start).take(cw as usize).collect();
                                 if is_cursor && has_colors() { root.attron(COLOR_PAIR(2)); }
-                                root.mvaddstr(ry, dx, &visible);
+                                root.mvaddstr(ry, col_screen_x, &visible);
                                 let cursor_col_pos = (*edit_pos - scroll) as i32;
                                 if cursor_col_pos < cw && cursor_col_pos >= 0 {
                                     let ch = '_' as u32 | A_REVERSE as u32;
-                                    let cpos = dx + cursor_col_pos;
+                                    let cpos = col_screen_x + cursor_col_pos;
                                     if cpos < rect.x + rect.w { root.mvaddch(ry, cpos, ch); }
                                 }
                                 if is_cursor && has_colors() { root.attroff(COLOR_PAIR(2)); }
                             } else {
                                 if is_cursor && has_colors() { root.attron(COLOR_PAIR(2)); }
-                                root.mvaddstr(ry, dx, &display);
+                                root.mvaddstr(ry, col_screen_x, &display);
                                 if is_cursor && has_colors() { root.attroff(COLOR_PAIR(2)); }
-                            }
-                            for i in 0..=overflow_cols {
-                                let sx = dx + (i + 1) * cw;
-                                if sx < rect.x + rect.w { root.mvaddstr(ry, sx, &sep.to_string()); }
                             }
                             vc += 1 + overflow_cols;
                         }
                         root.mvaddstr(ry, rect.x + rect.w - 1, "│");
                     }
                 }
-                // Bottom border (one row below the last data row)
+                // Bottom border
                 {
                     let br = row_offset + max_data_rows as i32;
                     root.mvaddstr(br, rect.x, "└");
@@ -1360,13 +1404,16 @@ mod pancurses_backend {
                     }
                     root.mvaddstr(br, rect.x + rect.w - 1, "┘");
                 }
-                // Status bar at bottom
-                if !status_text.is_empty() {
-                    let sy = rect.y + rect.h - 1;
-                    if has_colors() { root.attron(COLOR_PAIR(1) | COLOR_PAIR(2)); }
-                    let max_w = rect.w as usize;
-                    root.mvaddstr(sy, rect.x, &status_text[..status_text.len().min(max_w)]);
-                    if has_colors() { root.attroff(COLOR_PAIR(1) | COLOR_PAIR(2)); }
+                // Status bar — below bottom border (if non-empty)
+                if has_status {
+                    let sy = row_offset + max_data_rows as i32 + 1;
+                    if sy < rect.y + rect.h {
+                        if has_colors() { root.attron(COLOR_PAIR(3)); }
+                        let max_w = rect.w as usize;
+                        let st_end = status_text.char_indices().nth(max_w).map(|(i, _)| i).unwrap_or(status_text.len());
+                        root.mvaddstr(sy, rect.x, &status_text[..st_end]);
+                        if has_colors() { root.attroff(COLOR_PAIR(3)); }
+                    }
                 }
             }
         }
@@ -1574,6 +1621,7 @@ mod pancurses_backend {
             menu_text: String::new(),
             status_text: String::new(),
             border_title: String::new(),
+            formula_bar_trailing: String::new(),
             column_layout: Vec::new(),
             row_labels: Vec::new(),
         }, find_window_id(s)));
@@ -1671,6 +1719,16 @@ mod pancurses_backend {
             if let Some(n) = s.node_mut(spreadsheet_id) {
                 if let PcWidgetKind::Spreadsheet { ref mut status_text, .. } = n.kind {
                     *status_text = text.to_string();
+                }
+            }
+        });
+    }
+
+    pub fn spreadsheet_set_formula_bar_trailing(spreadsheet_id: usize, text: &str) {
+        with_state(|s| {
+            if let Some(n) = s.node_mut(spreadsheet_id) {
+                if let PcWidgetKind::Spreadsheet { ref mut formula_bar_trailing, .. } = n.kind {
+                    *formula_bar_trailing = text.to_string();
                 }
             }
         });
