@@ -1715,9 +1715,14 @@ mod pancurses_backend {
                             }
                             vi += 1 + overflow_cols as usize;
                         }
+                        // Move cursor to right border position
+                        out.push_str(&sgr_cup(ry, rect.x + rect.w - 1));
+                        // Apply deferred SGR reset BEFORE the filler and right
+                        // border so both use default styling, matching ratatui.
+                        if defer_sgr_reset {
+                            out.push_str(&last_sgr);
+                        }
                         // Fill remaining row width before right border
-                        // If the last cell deferred its SGR reset, the filler
-                        // spaces and border inherit the cursor/boundary style.
                         let after_content = rect.x + 1 + 5 + column_layout.iter()
                             .map(|&(_, w, _)| w as i32).sum::<i32>()
                             + (n.saturating_sub(1) as i32); // gaps between columns
@@ -1726,12 +1731,6 @@ mod pancurses_backend {
                             if gap > 0 {
                                 out.push_str(&" ".repeat(gap));
                             }
-                        }
-                        out.push_str(&sgr_cup(ry, rect.x + rect.w - 1));
-                        // Apply deferred SGR reset BEFORE the right border so
-                        // the border `│` uses default styling.
-                        if defer_sgr_reset {
-                            out.push_str(&last_sgr);
                         }
                         out.push_str("│");
                     } else {
