@@ -1335,9 +1335,9 @@ mod pancurses_backend {
                                 + gap_after;   // gap to next column
                             let display = if text_width > total_avail {
                                 if overflow_cols == 0 {
-                                    // No adjacent empty cells — clip text at boundary
-                                    // The adjacent cell content provides the visual truncation indicator
-                                    cell_text.chars().take(total_avail).collect()
+                                    let trunc = total_avail.saturating_sub(1).max(1);
+                                    cell_text.chars().take(trunc).collect::<String>()
+                                    + if text_width > trunc { "…" } else { "" }
                                 } else {
                                     let trunc = total_avail.saturating_sub(1).max(1);
                                     let mut s: String = cell_text.chars().take(trunc).collect();
@@ -1383,7 +1383,9 @@ mod pancurses_backend {
                             let available = (overflow_cols + 1) * cw + gap_after;
                             let display = if text_width > available as usize {
                                 if overflow_cols == 0 {
-                                    text.chars().take(available as usize).collect()
+                                    let trunc = (available.saturating_sub(1)).max(1) as usize;
+                                    text.chars().take(trunc).collect::<String>()
+                                        + if text.chars().count() > trunc { "…" } else { "" }
                                 } else {
                                     let trunc = (available - 1).max(1) as usize;
                                     let mut s: String = text.chars().take(trunc).collect();
