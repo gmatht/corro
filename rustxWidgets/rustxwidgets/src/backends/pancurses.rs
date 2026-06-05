@@ -95,7 +95,8 @@ mod pancurses_backend {
             formula_bar_trailing: String,
             column_layout: Vec<(u32, u32, String)>,
             row_labels: Vec<(u32, String)>,
-            tab_text: String,
+            tab_titles: Vec<String>,
+            tab_active: usize,
         },
     }
 
@@ -1183,7 +1184,7 @@ mod pancurses_backend {
                     root.attroff(COLOR_PAIR(3));
                 }
             }
-            PcWidgetKind::Spreadsheet { ref cells, ref raw_cells, ref cell_styles, ref top_row, ref left_col, ref cursor_row, ref cursor_col, ref editing, ref edit_buf, ref edit_pos, ref col_width, ref margin_cols, ref main_cols, ref menu_text, ref status_text, ref border_title, ref formula_bar_trailing, ref column_layout, ref row_labels, ref total_rows, ref total_cols, ref tab_text, header_row_count, main_row_count, .. } => {
+            PcWidgetKind::Spreadsheet { ref cells, ref raw_cells, ref cell_styles, ref top_row, ref left_col, ref cursor_row, ref cursor_col, ref editing, ref edit_buf, ref edit_pos, ref col_width, ref margin_cols, ref main_cols, ref menu_text, ref status_text, ref border_title, ref formula_bar_trailing, ref column_layout, ref row_labels, ref total_rows, ref total_cols, ref tab_titles, ref tab_active, header_row_count, main_row_count, .. } => {
                 // ── Direct SGR rendering ──
                 let lm = *margin_cols as usize;
                 let mc = *main_cols as usize;
@@ -1344,7 +1345,7 @@ mod pancurses_backend {
 
                 // Data rows
                 let has_status = !status_text.is_empty();
-                let has_tabs = !tab_text.is_empty();
+                let has_tabs = !tab_titles.is_empty();
                 let extra_lines = 1
                     + if has_tabs { 1 } else if has_status { 1 } else { 0 };
                 let grid_bottom = rect.y + rect.h - extra_lines;
@@ -1358,6 +1359,18 @@ mod pancurses_backend {
                         .find(|(r, _)| *r == row_idx)
                         .map(|(_, l)| l.as_str())
                         .unwrap_or("");
+                    // Blank rows (past the end of actual data) have no label;
+                    // render them as empty lines matching ratatui.
+                    if label_str.is_empty() {
+                        out.push_str(&sgr_cup(ry, rect.x));
+                        out.push_str("│");
+                        let blank_w = (rect.w - 2).max(0) as usize;
+                        if blank_w > 0 {
+                            out.push_str(&" ".repeat(blank_w));
+                        }
+                        out.push_str("│");
+                        continue;
+                    }
                     // Row label styling matches ratatui:
                     // - cursor row: bold + black fg + yellow bg
                     // - footer rows: bold + cyan fg
@@ -1591,7 +1604,7 @@ mod pancurses_backend {
                                 sgr_cell_agg()
                             } else if is_boundary {
                                 sgr_sep()
-                            } else if is_left_margin_col || is_right_margin_col {
+                            } else if (is_left_margin_col || is_right_margin_col) && cell_text.is_empty() {
                                 sgr_sep()
                             } else if prev_overflowed && !is_left_margin_col && !is_right_margin_col {
                                 sgr_sep()
@@ -1784,18 +1797,39 @@ mod pancurses_backend {
                         }
                     }
                 }
-                // Tab bar
-                if !tab_text.is_empty() {
+                // Tab bar (styled matching ratatui: inactive=white fg+gray bg, active=bold+black fg+yellow bg)
+                if !tab_titles.is_empty() {
                     let ty = row_offset + max_data_rows as i32 + 1;
                     if ty < rect.y + rect.h {
                         let max_w = rect.w as usize;
-                        let tab_end = tab_text.char_indices().nth(max_w).map(|(i, _)| i).unwrap_or(tab_text.len());
-                        out.push_str(&sgr_cup(ty, rect.x));
-                        out.push_str(&tab_text[..tab_end]);
-                        let tab_vis = tab_text[..tab_end].chars().count();
-                        if tab_vis < rect.w as usize {
-                            out.push_str(&" ".repeat(rect.w as usize - tab_vis));
+                        let tab_inactive_sgr = "\x1b[38;5;15m\x1b[48;5;8m";
+                        let tab_active_sgr = "\x1b[1m\x1b[38;5;0m\x1b[48;5;3m";
+                        let reset_sgr = "\x1b[0m";
+                        let mut out_line = String::new();
+                        let mut vis_count = 0usize;
+                        for (idx, title) in tab_titles.iter().enumerate() {
+                            if idx > 0 {
+                                let gap = "  ";
+                                if vis_count + gap.len() > max_w { break; }
+                                out_line.push_str(tab_inactive_sgr);
+                                out_line.push_str(gap);
+                                vis_count += gap.len();
+                            }
+                            let tab_text = format!(" {} ", title);
+                            if vis_count + tab_text.len() > max_w { break; }
+                            let style = if idx == *tab_active { tab_active_sgr } else { tab_inactive_sgr };
+                            out_line.push_str(style);
+                            out_line.push_str(&tab_text);
+                            out_line.push_str(reset_sgr);
+                            vis_count += tab_text.len();
                         }
+                        // Fill remaining width with inactive style
+                        if vis_count < max_w {
+                            out_line.push_str(tab_inactive_sgr);
+                            out_line.push_str(&" ".repeat(max_w - vis_count));
+                        }
+                        out.push_str(&sgr_cup(ty, rect.x));
+                        out.push_str(&out_line);
                     }
                 }
 
@@ -2016,7 +2050,8 @@ mod pancurses_backend {
             formula_bar_trailing: String::new(),
             column_layout: Vec::new(),
             row_labels: Vec::new(),
-            tab_text: String::new(),
+            tab_titles: Vec::new(),
+            tab_active: 0,
         }, find_window_id(s)));
         Ok(id)
     }
@@ -2147,11 +2182,12 @@ mod pancurses_backend {
         });
     }
 
-    pub fn spreadsheet_set_tab_text(spreadsheet_id: usize, text: &str) {
+    pub fn spreadsheet_set_tab_data(spreadsheet_id: usize, titles: &[String], active: usize) {
         with_state(|s| {
             if let Some(n) = s.node_mut(spreadsheet_id) {
-                if let PcWidgetKind::Spreadsheet { ref mut tab_text, .. } = n.kind {
-                    *tab_text = text.to_string();
+                if let PcWidgetKind::Spreadsheet { ref mut tab_titles, ref mut tab_active, .. } = n.kind {
+                    *tab_titles = titles.to_vec();
+                    *tab_active = active;
                 }
             }
         });
@@ -2887,7 +2923,8 @@ mod pancurses_backend {
                     formula_bar_trailing: String::new(),
                     column_layout: Vec::new(),
                     row_labels: Vec::new(),
-                    tab_text: String::new(),
+                    tab_titles: Vec::new(),
+                    tab_active: 0,
                     header_row_count: 2,
                     main_row_count: 24,
                 },
@@ -3055,7 +3092,8 @@ mod pancurses_backend {
                     formula_bar_trailing: String::new(),
                     column_layout: Vec::new(),
                     row_labels: Vec::new(),
-                    tab_text: String::new(),
+                    tab_titles: Vec::new(),
+                    tab_active: 0,
                     header_row_count: 2,
                     main_row_count: 24,
                 },
@@ -3638,7 +3676,8 @@ mod pancurses_backend {
                     formula_bar_trailing: String::new(),
                     column_layout: vec![(0,10,"A".into()),(1,10,"B".into()),(2,10,"C".into())],
                     row_labels: vec![(0,"   1".into()),(1,"   2".into())],
-                    tab_text: String::new(),
+                    tab_titles: Vec::new(),
+                    tab_active: 0,
                     header_row_count: 2,
                     main_row_count: 20,
                 },
@@ -3674,7 +3713,8 @@ mod pancurses_backend {
                     formula_bar_trailing: String::new(),
                     column_layout: vec![(0,5,"X".into()),(1,5,"Y".into())],
                     row_labels: vec![],
-                    tab_text: String::new(),
+                    tab_titles: Vec::new(),
+                    tab_active: 0,
                     header_row_count: 2,
                     main_row_count: 20,
                 },
@@ -3708,7 +3748,8 @@ mod pancurses_backend {
                     formula_bar_trailing: String::new(),
                     column_layout: vec![(0,8,"A".into())],
                     row_labels: vec![(0,"ROW0".into()),(1,"ROW1".into())],
-                    tab_text: String::new(),
+                    tab_titles: Vec::new(),
+                    tab_active: 0,
                     header_row_count: 2,
                     main_row_count: 20,
                 },
