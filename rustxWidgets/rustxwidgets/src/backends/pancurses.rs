@@ -2343,13 +2343,7 @@ mod pancurses_backend {
                     let mut vi = 0usize;
                     while vi < n {
                         let (col_idx, w, _) = column_layout[vi];
-                        let is_margin = lm > 0 && col_idx < lm;
-                        let cell_text = if !is_margin {
-                            let main_col = col_idx - lm;
-                            cells_ref.get(&(row_idx, main_col)).map(|s| s.as_str()).unwrap_or("")
-                        } else {
-                            cells_ref.get(&(row_idx, col_idx)).map(|s| s.as_str()).unwrap_or("")
-                        };
+                        let cell_text = cells_ref.get(&(row_idx, col_idx)).map(|s| s.as_str()).unwrap_or("");
                         let cell_w = w as usize;
                         if cell_text.is_empty() {
                             data_row.push_str(&format!("{:<1$}", "", cell_w));
@@ -2363,13 +2357,7 @@ mod pancurses_backend {
                             let mut scan = vi + 1;
                             while scan < n {
                                 let (sc_idx, _, _) = column_layout[scan];
-                                let is_margin2 = lm > 0 && sc_idx < lm;
-                                let sc_text = if !is_margin2 {
-                                    let main_sc = sc_idx - lm;
-                                    cells_ref.get(&(row_idx, main_sc)).map(|s| s.as_str()).unwrap_or("")
-                                } else {
-                                    cells_ref.get(&(row_idx, sc_idx)).map(|s| s.as_str()).unwrap_or("")
-                                };
+                                let sc_text = cells_ref.get(&(row_idx, sc_idx)).map(|s| s.as_str()).unwrap_or("");
                                 if sc_text.is_empty() {
                                     overflow_cols += 1;
                                     scan += 1;
