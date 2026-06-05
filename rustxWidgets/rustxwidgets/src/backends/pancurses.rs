@@ -1496,24 +1496,34 @@ mod pancurses_backend {
                                         out.push(' ');
                                     }
                                 } else if (col_idx as usize) >= lm + mc {
-                                    // Right-margin column: dark gray foreground.
+                                    // Right-margin column: aggregate or dark gray.
                                     // Match ratatui: only the first empty
                                     // right-margin column gets gray when there
                                     // is no overflow; all get gray when the
-                                    // row has overflow (force_right_gray).
+                                    // row has overflow (force_right_gray);
+                                    // aggregate cells get cyan fg.
                                     let cw = column_layout[vi].1 as i32;
                                     let use_gray = is_boundary || force_right_gray || !right_gray_done;
+                                    let use_agg = cell_style == 2 || cell_style == 3;
                                     out.push_str(&sgr_cup(ry, sx));
                                     if is_boundary {
                                         out.push_str(SGR_UNDERLINE);
                                     }
-                                    if use_gray {
+                                    if use_agg {
+                                        if cell_style == 3 {
+                                            out.push_str(sgr_cell_footer_agg());
+                                        } else {
+                                            out.push_str(sgr_cell_agg());
+                                        }
+                                    } else if use_gray {
                                         out.push_str(sgr_sep());
                                     }
                                     for _ in 0..cw {
                                         out.push(' ');
                                     }
-                                    if use_gray {
+                                    if use_agg {
+                                        out.push_str(SGR_FG_DEFAULT);
+                                    } else if use_gray {
                                         if is_boundary && vi + 1 >= n {
                                             out.push_str(SGR_RESET);
                                         } else {
@@ -1524,17 +1534,21 @@ mod pancurses_backend {
                                     if gap_after > 0 {
                                         out.push(' ');
                                     }
-                                    if !right_gray_done && !force_right_gray && !is_boundary {
+                                    if !right_gray_done && !force_right_gray && !is_boundary && !use_agg {
                                         right_gray_done = true;
                                     }
                                 } else {
-                                    // Empty cell in main column: default spaces
+                                    // Empty cell in main column: check style
                                     let cw = column_layout[vi].1 as i32;
                                     out.push_str(&sgr_cup(ry, sx));
                                     if is_boundary {
                                         out.push_str(sgr_sep());
                                     } else if prev_overflowed {
                                         out.push_str(sgr_sep());
+                                    } else if cell_style == 2 {
+                                        out.push_str(sgr_cell_agg());
+                                    } else if cell_style == 3 {
+                                        out.push_str(sgr_cell_footer_agg());
                                     } else {
                                         out.push_str(SGR_FG_DEFAULT);
                                         out.push_str(SGR_BG_DEFAULT);
@@ -1543,6 +1557,8 @@ mod pancurses_backend {
                                         out.push(' ');
                                     }
                                     if is_boundary || prev_overflowed {
+                                        out.push_str(SGR_FG_DEFAULT);
+                                    } else if cell_style == 2 || cell_style == 3 {
                                         out.push_str(SGR_FG_DEFAULT);
                                     }
                                     let gap_after = if vi + 1 < n { 1 } else { 0 };
@@ -1604,9 +1620,11 @@ mod pancurses_backend {
                                 sgr_cell_agg()
                             } else if is_boundary {
                                 sgr_sep()
-                            } else if (is_left_margin_col || is_right_margin_col) && cell_text.is_empty() {
+                            } else if is_left_margin_col {
                                 sgr_sep()
-                            } else if prev_overflowed && !is_left_margin_col && !is_right_margin_col {
+                            } else if is_right_margin_col && cell_text.is_empty() {
+                                sgr_sep()
+                            } else if prev_overflowed && cell_text.is_empty() && !is_left_margin_col && !is_right_margin_col {
                                 sgr_sep()
                             } else {
                                 ""
