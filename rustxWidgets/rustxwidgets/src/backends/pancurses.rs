@@ -1452,6 +1452,7 @@ mod pancurses_backend {
                             let is_cursor_cell = cell_style == 1;
                             if cell_text.is_empty() {
                                 // Empty cell: draw cursor highlight if needed
+                                let is_agg_empty = cell_style == 2 || cell_style == 3;
                                 if is_cursor_cell {
                                     let cw = column_layout[vi].1 as i32;
                                     out.push_str(&sgr_cup(ry, sx));
@@ -1460,6 +1461,26 @@ mod pancurses_backend {
                                         out.push(' ');
                                     }
                                     out.push_str(SGR_BG_DEFAULT);
+                                    let gap_after = if vi + 1 < n { 1 } else { 0 };
+                                    if gap_after > 0 {
+                                        out.push(' ');
+                                    }
+                                } else if is_agg_empty {
+                                    // Empty aggregate cell: cyan foreground
+                                    let cw = column_layout[vi].1 as i32;
+                                    out.push_str(&sgr_cup(ry, sx));
+                                    if is_boundary {
+                                        out.push_str(SGR_UNDERLINE);
+                                    }
+                                    if cell_style == 3 {
+                                        out.push_str(sgr_cell_footer_agg());
+                                    } else {
+                                        out.push_str(sgr_cell_agg());
+                                    }
+                                    for _ in 0..cw {
+                                        out.push(' ');
+                                    }
+                                    out.push_str(SGR_FG_DEFAULT);
                                     let gap_after = if vi + 1 < n { 1 } else { 0 };
                                     if gap_after > 0 {
                                         out.push(' ');
@@ -1502,21 +1523,21 @@ mod pancurses_backend {
                                         out.push(' ');
                                     }
                                     if use_gray {
-                                        if is_boundary && vi + 1 >= n {
-                                            out.push_str(SGR_RESET);
-                                        } else {
-                                            out.push_str(SGR_FG_DEFAULT);
-                                        }
+                                    if is_boundary && vi + 1 >= n {
+                                        out.push_str(SGR_RESET);
                                     } else {
                                         out.push_str(SGR_FG_DEFAULT);
-                                        out.push_str(SGR_BG_DEFAULT);
-                                    }
-                                    let gap_after = if vi + 1 < n { 1 } else { 0 };
-                                    if gap_after > 0 {
-                                        out.push(' ');
                                     }
                                 } else {
-                                    // Empty cell in main column: check style
+                                    out.push_str(SGR_FG_DEFAULT);
+                                    out.push_str(SGR_BG_DEFAULT);
+                                }
+                                let gap_after = if vi + 1 < n { 1 } else { 0 };
+                                if gap_after > 0 {
+                                    out.push(' ');
+                                }
+                            } else {
+                                // Empty cell in main column: check style
                                     let cw = column_layout[vi].1 as i32;
                                     out.push_str(&sgr_cup(ry, sx));
                                     if is_boundary {
@@ -1665,7 +1686,7 @@ mod pancurses_backend {
                                 if is_cursor_cell {
                                     out.push_str(SGR_BG_DEFAULT);
                                 } else if cell_style == 2 || cell_style == 3 {
-                                    out.push_str(SGR_RESET);
+                                    out.push_str(SGR_FG_DEFAULT);
                                 } else if is_boundary && !is_overflowing {
                                     if vi + 1 >= n {
                                         out.push_str(SGR_RESET);
@@ -1786,7 +1807,7 @@ mod pancurses_backend {
                             if is_cursor_cell {
                                 out.push_str(SGR_BG_DEFAULT);
                             } else if cell_style == 2 || cell_style == 3 {
-                                out.push_str(SGR_RESET);
+                                out.push_str(SGR_FG_DEFAULT);
                             }
                             vc += 1 + overflow_cols;
                         }
