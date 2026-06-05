@@ -1318,9 +1318,12 @@ mod pancurses_backend {
                                     } else { break; }
                                 }
                             }
-                            // Include gap after current column as available space
-                            // (ratatui treats the inter-column gap as overflow room)
-                            let gap_after = if overflow_cols == 0 && vi + 1 < n { 1 } else { 0 };
+                            // Include gap after the last overflow column as available space
+                            // (ratatui treats the inter-column gap as overflow room).
+                            // When overflow_cols == 0 the gap is after the current column;
+                            // when overflow_cols > 0 it is after the last overflow column.
+                            let gap_target = vi + overflow_cols;
+                            let gap_after = if gap_target + 1 < n { 1 } else { 0 };
                             let total_avail: usize = column_layout[vi..=vi+overflow_cols].iter()
                                 .map(|&(_, w, _)| w as usize).sum::<usize>()
                                 + overflow_cols // spaces between overflow columns
