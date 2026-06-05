@@ -693,8 +693,9 @@ mod pancurses_backend {
                                     spreadsheet_prepare_move(state, fid, false);
                                     spreadsheet_commit_edit(state, fid);
                                     if let Some(n) = state.node_mut(fid) {
-                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_col, total_cols, .. } = n.kind {
-                                            if *cursor_col + 1 < total_cols { *cursor_col += 1; }
+                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_row, ref mut cursor_col, margin_cols, main_cols, .. } = n.kind {
+                                            let max_global = margin_cols + main_cols + margin_cols;
+                                            if *cursor_col + 1 < max_global { *cursor_col += 1; }
                                         }
                                     }
                                     spreadsheet_scroll_to_cursor(state, fid);
@@ -751,6 +752,7 @@ mod pancurses_backend {
                                     spreadsheet_commit_edit(state, fid);
                                     if let Some(n) = state.node_mut(fid) {
                                         if let PcWidgetKind::Spreadsheet { ref mut cursor_row, total_rows, .. } = n.kind {
+                                            // total_rows is the number of display rows, which is the correct upper bound
                                             if *cursor_row + 1 < total_rows { *cursor_row += 1; }
                                         }
                                     }
@@ -1209,12 +1211,23 @@ mod pancurses_backend {
 
                 // Formula bar: cyan fg, default bg
                 {
-                    let display_col = if *cursor_col < *margin_cols { *cursor_col } else { *cursor_col - *margin_cols };
+                    let cc = *cursor_col;
+                    let mc = *main_cols;
+                    let lm = *margin_cols;
+                    let col_part = if cc < lm {
+                        let margin_idx = lm.saturating_sub(1).saturating_sub(cc);
+                        format!("[{}", col_label(margin_idx))
+                    } else if cc < lm + mc {
+                        col_label(cc - lm)
+                    } else {
+                        let right_idx = cc.saturating_sub(lm).saturating_sub(mc);
+                        format!("]{}", col_label(right_idx))
+                    };
                     let row_label = row_labels.iter()
                         .find(|(r, _)| *r == *cursor_row)
                         .map(|(_, l)| l.as_str())
                         .unwrap_or("1");
-                    let addr_text = format!("{}{}", col_label(display_col), row_label.trim());
+                    let addr_text = format!("{}{}", col_part, row_label.trim());
                     let cell_val = raw_cells.borrow().get(&(*cursor_row, *cursor_col)).cloned().unwrap_or_default();
                     let addr_vis = addr_text.chars().count();
                     let max_fb = (rect.w as usize).saturating_sub(addr_vis + 3).max(1);
@@ -1955,17 +1968,15 @@ mod pancurses_backend {
     }
 
     fn col_label(idx: u32) -> String {
-        if idx < 26 {
-            let c = (b'A' + idx as u8) as char;
-            c.to_string()
-        } else {
-            let prefix = (idx / 26 - 1) as u8;
-            let suffix = (idx % 26) as u8;
-            let mut s = String::new();
-            s.push((b'A' + prefix) as char);
-            s.push((b'A' + suffix) as char);
-            s
+        if idx == u32::MAX { return String::new(); }
+        let mut n = idx as u64 + 1;
+        let mut s = String::new();
+        while n > 0 {
+            n -= 1;
+            s.push((b'A' + (n % 26) as u8) as char);
+            n /= 26;
         }
+        s.chars().rev().collect()
     }
 
     /// Activate the focused widget: toggle CheckButton/RadioButton or fire Button callbacks.
@@ -2352,20 +2363,28 @@ mod pancurses_backend {
             Some(n) => n,
             None => return false,
         };
-        let (cells, row_labels, cursor_row, cursor_col, margin_cols, addr_id, entry_id) = match &n.kind {
-            PcWidgetKind::Spreadsheet { cells, row_labels, cursor_row, cursor_col, margin_cols, formula_bar_address_id, formula_bar_entry_id, .. } => {
-                (cells.clone(), row_labels.clone(), *cursor_row, *cursor_col, *margin_cols, *formula_bar_address_id, *formula_bar_entry_id)
+        let (cells, row_labels, cursor_row, cursor_col, margin_cols, main_cols, addr_id, entry_id) = match &n.kind {
+            PcWidgetKind::Spreadsheet { cells, row_labels, cursor_row, cursor_col, margin_cols, main_cols, formula_bar_address_id, formula_bar_entry_id, .. } => {
+                (cells.clone(), row_labels.clone(), *cursor_row, *cursor_col, *margin_cols, *main_cols, *formula_bar_address_id, *formula_bar_entry_id)
             }
             _ => return false,
         };
         let mut changed = false;
         if let Some(aid) = addr_id {
-            let display_col = if cursor_col < margin_cols { cursor_col } else { cursor_col - margin_cols };
+            let col_part = if cursor_col < margin_cols {
+                let margin_idx = margin_cols.saturating_sub(1).saturating_sub(cursor_col);
+                format!("[{}", col_label(margin_idx))
+            } else if cursor_col < margin_cols + main_cols {
+                col_label(cursor_col - margin_cols)
+            } else {
+                let right_idx = cursor_col.saturating_sub(margin_cols).saturating_sub(main_cols);
+                format!("]{}", col_label(right_idx))
+            };
             let row_label = row_labels.iter()
                 .find(|(r, _)| *r == cursor_row)
                 .map(|(_, l)| l.as_str())
                 .unwrap_or("1");
-            let label = format!("{}{}", col_label(display_col), row_label.trim());
+            let label = format!("{}{}", col_part, row_label.trim());
             if let Some(an) = state.node_mut(aid) {
                 if let PcWidgetKind::Label { ref mut text } = &mut an.kind {
                     if *text != label {
