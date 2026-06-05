@@ -1296,7 +1296,8 @@ mod pancurses_backend {
                                 out.push_str(&" ".repeat(gap));
                             }
                             out.push_str(&sgr_cup(hr, rect.x + rect.w - 1));
-                            out.push_str("│");
+                        out.push_str("│");
+                    } else {
                         }
                     } else {
                         let cw = *col_width as i32;
@@ -1715,22 +1716,23 @@ mod pancurses_backend {
                             }
                             vi += 1 + overflow_cols as usize;
                         }
-                        // Move cursor to right border position
-                        out.push_str(&sgr_cup(ry, rect.x + rect.w - 1));
                         // Apply deferred SGR reset BEFORE the filler and right
                         // border so both use default styling, matching ratatui.
+                        // (No CUP to right border – the cursor is already at the
+                        // correct sequential position after the cell loop.)
                         if defer_sgr_reset {
                             out.push_str(&last_sgr);
                         }
-                        // Fill remaining row width before right border
+                        // Fill remaining row width before right border.
+                        // The cursor is at after_content-1 after the last cell
+                        // (the last column has no gap).  The fill needs to span
+                        // [after_content-1 .. right_border-1], then │ at right_border.
                         let after_content = rect.x + 1 + 5 + column_layout.iter()
                             .map(|&(_, w, _)| w as i32).sum::<i32>()
                             + (n.saturating_sub(1) as i32); // gaps between columns
-                        if after_content < rect.x + rect.w - 1 {
-                            let gap = (rect.x + rect.w - 1 - after_content) as usize;
-                            if gap > 0 {
-                                out.push_str(&" ".repeat(gap));
-                            }
+                        let gap = (rect.x + rect.w - after_content) as usize;
+                        if gap > 0 {
+                            out.push_str(&" ".repeat(gap));
                         }
                         out.push_str("│");
                     } else {
