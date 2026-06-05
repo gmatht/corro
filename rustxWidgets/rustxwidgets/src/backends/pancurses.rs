@@ -1438,6 +1438,9 @@ mod pancurses_backend {
                             }
                         }
                         let mut vi = 0;
+                        let mut prev_overflowed = false;
+                        let mut right_gray_done = false;
+                        let mut force_right_gray = false;
                         while vi < n {
                             let (col_idx, sx) = col_positions[vi];
                             let cell_text = cells_ref.get(&(row_idx, col_idx))
@@ -1475,42 +1478,64 @@ mod pancurses_backend {
                                         out.push(' ');
                                     }
                                 } else if (col_idx as usize) >= lm + mc {
-                                    // Right-margin column: dark gray foreground
+                                    // Right-margin column: dark gray foreground.
+                                    // Match ratatui: only the first empty
+                                    // right-margin column gets gray when there
+                                    // is no overflow; all get gray when the
+                                    // row has overflow (force_right_gray).
                                     let cw = column_layout[vi].1 as i32;
+                                    let use_gray = force_right_gray || !right_gray_done;
                                     out.push_str(&sgr_cup(ry, sx));
                                     if is_boundary {
                                         out.push_str(SGR_UNDERLINE);
                                     }
-                                    out.push_str(sgr_sep());
+                                    if use_gray {
+                                        out.push_str(sgr_sep());
+                                    }
                                     for _ in 0..cw {
                                         out.push(' ');
                                     }
-                                    out.push_str(SGR_FG_DEFAULT);
+                                    if use_gray {
+                                        out.push_str(SGR_FG_DEFAULT);
+                                    }
                                     let gap_after = if vi + 1 < n { 1 } else { 0 };
                                     if gap_after > 0 {
                                         out.push(' ');
+                                    }
+                                    if !right_gray_done && !force_right_gray {
+                                        right_gray_done = true;
                                     }
                                 } else {
                                     // Empty cell in main column: default spaces
                                     let cw = column_layout[vi].1 as i32;
                                     out.push_str(&sgr_cup(ry, sx));
-                                    out.push_str(SGR_FG_DEFAULT);
-                                    out.push_str(SGR_BG_DEFAULT);
+                                    if prev_overflowed {
+                                        out.push_str(sgr_sep());
+                                    } else {
+                                        out.push_str(SGR_FG_DEFAULT);
+                                        out.push_str(SGR_BG_DEFAULT);
+                                    }
                                     for _ in 0..cw {
                                         out.push(' ');
+                                    }
+                                    if prev_overflowed {
+                                        out.push_str(SGR_FG_DEFAULT);
                                     }
                                     let gap_after = if vi + 1 < n { 1 } else { 0 };
                                     if gap_after > 0 {
                                         out.push(' ');
                                     }
                                 }
+                                prev_overflowed = false;
                                 vi += 1;
                                 continue;
                             }
                             let w = column_layout[vi].1 as usize;
                             let text_width = cell_text.chars().count();
                             let mut overflow_cols = 0usize;
+                            let mut can_overflow = false;
                             if text_width > w {
+                                can_overflow = true;
                                 let mut scan = vi + 1;
                                 while scan < n {
                                     let (sc_idx, _) = col_positions[scan];
@@ -1543,7 +1568,8 @@ mod pancurses_backend {
                             //   2. footer agg  → bold + fg(Cyan)
                             //   3. agg         → fg(Cyan)
                             //   4. border col  → fg(DarkGray)
-                            //   5. default     → none
+                            //   5. displaced by overflow → fg(DarkGray)
+                            //   6. default     → none
                             let is_left_margin_col = (col_idx as usize) < lm;
                             let is_right_margin_col = (col_idx as usize) >= lm + mc;
                             let cell_sgr = if is_cursor_cell {
@@ -1553,6 +1579,8 @@ mod pancurses_backend {
                             } else if cell_style == 2 {
                                 sgr_cell_agg()
                             } else if is_left_margin_col || is_right_margin_col {
+                                sgr_sep()
+                            } else if prev_overflowed && !is_left_margin_col && !is_right_margin_col {
                                 sgr_sep()
                             } else {
                                 ""
@@ -1577,16 +1605,29 @@ mod pancurses_backend {
                             if pad > 0 {
                                 out.push_str(&" ".repeat(pad));
                             }
+                            // If the display text overflows past the column
+                            // width into the gap area, suppress the gap.
+                            let real_gap = if display_w > avail_w { 0 } else { gap_after };
+                            let sgr_applied = !cell_sgr.is_empty();
                             if is_cursor_cell {
                                 out.push_str(SGR_BG_DEFAULT);
                             } else if cell_style == 2 || cell_style == 3 {
                                 out.push_str(SGR_FG_DEFAULT);
                             } else if is_left_margin_col || is_right_margin_col {
                                 out.push_str(SGR_FG_DEFAULT);
+                            } else if sgr_applied {
+                                out.push_str(SGR_FG_DEFAULT);
                             }
                             // Inter-column gap (1 space) – drawn in default style
-                            if gap_after > 0 {
+                            if real_gap > 0 {
                                 out.push(' ');
+                            }
+                            let overflowed_this = can_overflow && overflow_cols == 0;
+                            if overflowed_this {
+                                prev_overflowed = true;
+                                force_right_gray = true;
+                            } else {
+                                prev_overflowed = false;
                             }
                             vi += 1 + overflow_cols as usize;
                         }
