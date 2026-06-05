@@ -515,10 +515,25 @@ impl App {
         crate::backends_wasm_adapter::create_radiobutton(None, label)
     }
 
-#[cfg(all(target_arch = "wasm32", not(feature = "pancurses")))]
-pub fn create_textview(&self) -> Result<crate::backends_wasm_adapter::TextView, Error> {
-    crate::backends_wasm_adapter::create_textview()
-}
+    #[cfg(all(target_arch = "wasm32", not(feature = "pancurses"), not(feature = "zork")))]
+    pub fn create_textview(&self) -> Result<crate::backends_wasm_adapter::TextView, Error> {
+        crate::backends_wasm_adapter::create_textview()
+    }
+
+    #[cfg(all(target_arch = "wasm32", not(feature = "pancurses"), not(feature = "zork")))]
+    pub fn create_canvas(&self) -> Result<crate::backends_wasm_adapter::Canvas, Error> {
+        crate::backends_wasm_adapter::create_canvas()
+    }
+
+    #[cfg(all(target_arch = "wasm32", not(feature = "pancurses"), not(feature = "zork")))]
+    pub fn create_overlay(&self) -> Result<crate::backends_wasm_adapter::Overlay, Error> {
+        crate::backends_wasm_adapter::create_overlay()
+    }
+
+    #[cfg(all(target_arch = "wasm32", not(feature = "pancurses"), not(feature = "zork")))]
+    pub fn create_scrolled_window(&self) -> Result<crate::backends_wasm_adapter::ScrolledWindow, Error> {
+        crate::backends_wasm_adapter::create_scrolled_window()
+    }
 
 // -- Android paths --
 

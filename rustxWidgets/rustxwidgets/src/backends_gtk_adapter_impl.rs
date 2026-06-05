@@ -242,6 +242,7 @@ mod gtk_adapter {
 
     #[repr(transparent)]
     pub struct Dialog(pub GDialog);
+    impl Clone for Dialog { fn clone(&self) -> Self { Dialog(self.0.clone()) } }
     impl Widget for Dialog { fn raw_handle(&self) -> *mut c_void { *self.0.as_ref() } }
     impl AsRef<*mut c_void> for Dialog { fn as_ref(&self) -> &*mut c_void { self.0.as_ref() } }
 
@@ -255,6 +256,7 @@ mod gtk_adapter {
         pub fn connect_response<F: FnMut(i32) + 'static>(&self, f: F) -> Result<u64, Error> {
             self.0.connect_response(f).map_err(|e| Error::Backend(format!("{}", e)))
         }
+        pub fn close(&self) { self.0.close(); }
     }
 
     pub fn create_dialog() -> Result<Dialog, Error> {

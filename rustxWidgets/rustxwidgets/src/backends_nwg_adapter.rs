@@ -140,6 +140,7 @@ mod nwg_adapter {
         pub(crate) inner: Rc<nwg::Button>,
         pub(crate) _handler: Rc<nwg::EventHandler>,
         pub(crate) click_cb: Rc<RefCell<Option<Box<dyn FnMut()>>>>,
+        pub(crate) _raw_click_handler: Rc<RefCell<Vec<nwg::RawEventHandler>>>,
     }
 
     impl Button {
@@ -162,6 +163,36 @@ mod nwg_adapter {
                 }
             }
         }
+        pub fn set_font_style(&self, weight: i32, italic: bool) {
+            if let Some(hwnd) = self.inner.handle.hwnd() {
+                unsafe {
+                    let mut lf: winapi::um::wingdi::LOGFONTW = std::mem::zeroed();
+                    lf.lfHeight = -13;
+                    lf.lfWeight = weight;
+                    lf.lfItalic = italic as u8;
+                    lf.lfCharSet = winapi::um::wingdi::ANSI_CHARSET as u8;
+                    lf.lfOutPrecision = winapi::um::wingdi::OUT_DEFAULT_PRECIS as u8;
+                    lf.lfClipPrecision = winapi::um::wingdi::CLIP_DEFAULT_PRECIS as u8;
+                    lf.lfQuality = winapi::um::wingdi::PROOF_QUALITY as u8;
+                    lf.lfPitchAndFamily = winapi::um::wingdi::DEFAULT_PITCH as u8;
+                    let face = "Segoe UI\0".encode_utf16().collect::<Vec<_>>();
+                    let mut i = 0;
+                    while i < face.len().min(32) {
+                        lf.lfFaceName[i] = face[i];
+                        i += 1;
+                    }
+                    let hfont = winapi::um::wingdi::CreateFontIndirectW(&lf);
+                    if !hfont.is_null() {
+                        winapi::um::winuser::SendMessageW(
+                            hwnd as _,
+                            winapi::um::winuser::WM_SETFONT,
+                            hfont as usize,
+                            1,
+                        );
+                    }
+                }
+            }
+        }
     }
 
     impl AsRef<*mut c_void> for Button {
@@ -173,7 +204,43 @@ mod nwg_adapter {
     pub fn create_button(parent: *mut c_void, text: &str) -> Result<Button, Error> {
         let (inner, click_cb, handler) = crate::backends::nwg::create_button(parent, text)
             .map_err(|e| Error::Backend(format!("{}", e)))?;
-        Ok(Button { inner: Rc::new(inner), _handler: Rc::new(handler), click_cb })
+        let hwnd = inner.handle.hwnd().unwrap_or(std::ptr::null_mut());
+        let raw_handlers: Rc<RefCell<Vec<nwg::RawEventHandler>>> = Rc::new(RefCell::new(Vec::new()));
+        if hwnd != std::ptr::null_mut() {
+            static RAW_BTN_CLICK_ID: AtomicUsize = AtomicUsize::new(0x60000000);
+            let cb = click_cb.clone();
+            let rid = RAW_BTN_CLICK_ID.fetch_add(1, Ordering::SeqCst);
+            if let Ok(raw) = nwg::bind_raw_event_handler(
+                &nwg::ControlHandle::Hwnd(hwnd), rid,
+                move |_h, msg, w, l| {
+                    match msg {
+                        winapi::um::winuser::WM_LBUTTONUP => {
+                            let mut rect = std::mem::MaybeUninit::zeroed();
+                            let rc = unsafe {
+                                winapi::um::winuser::GetClientRect(hwnd as _, rect.as_mut_ptr());
+                                rect.assume_init()
+                            };
+                            let x = (l & 0xFFFF) as i16;
+                            let y = ((l >> 16) & 0xFFFF) as i16;
+                            if i32::from(x) <= rc.right && i32::from(y) <= rc.bottom {
+                                if let Some(ref mut f) = *cb.borrow_mut() { f(); }
+                            }
+                            None
+                        }
+                        winapi::um::winuser::WM_KEYUP => {
+                            if w == winapi::um::winuser::VK_SPACE as usize {
+                                if let Some(ref mut f) = *cb.borrow_mut() { f(); }
+                            }
+                            None
+                        }
+                        _ => None
+                    }
+                },
+            ) {
+                raw_handlers.borrow_mut().push(raw);
+            }
+        }
+        Ok(Button { inner: Rc::new(inner), _handler: Rc::new(handler), click_cb, _raw_click_handler: raw_handlers })
     }
 
     // -- Label --
@@ -299,18 +366,34 @@ mod nwg_adapter {
                 crate::backends::nwg::Orientation::Vertical =>
                     vex.iter().filter(|&&e| e).count(),
             };
-            let fixed_total: i32 = (0..n).map(|i| {
+            let mut desired_sizes: Vec<i32> = Vec::with_capacity(n);
+            for i in 0..n {
                 let is_expand = match self.orientation {
                     crate::backends::nwg::Orientation::Horizontal => hex[i],
                     crate::backends::nwg::Orientation::Vertical => vex[i],
                 };
-                if is_expand { 0 } else {
-                    match self.orientation {
+                if !is_expand {
+                    let hardcoded = match self.orientation {
                         crate::backends::nwg::Orientation::Horizontal => 60,
                         crate::backends::nwg::Orientation::Vertical => 28,
+                    };
+                    unsafe {
+                        let mut rect: winapi::shared::windef::RECT = std::mem::zeroed();
+                        if winapi::um::winuser::GetWindowRect(children[i] as _, &mut rect) != 0 {
+                            let sz = match self.orientation {
+                                crate::backends::nwg::Orientation::Horizontal => rect.right - rect.left,
+                                crate::backends::nwg::Orientation::Vertical => rect.bottom - rect.top,
+                            };
+                            desired_sizes.push(if sz > 10 { sz } else { hardcoded });
+                        } else {
+                            desired_sizes.push(hardcoded);
+                        }
                     }
+                } else {
+                    desired_sizes.push(0);
                 }
-            }).sum();
+            }
+            let fixed_total: i32 = desired_sizes.iter().sum();
             let mut pos = 5;
             let remaining = match self.orientation {
                 crate::backends::nwg::Orientation::Horizontal => (w - 10 - fixed_total - spacing_total).max(0),
@@ -326,10 +409,10 @@ mod nwg_adapter {
                 };
                 let (cw, ch) = match self.orientation {
                     crate::backends::nwg::Orientation::Horizontal => {
-                        if is_expand { (expand_size, fixed_h) } else { (60, fixed_h) }
+                        if is_expand { (expand_size, fixed_h) } else { (desired_sizes[i], fixed_h) }
                     }
                     crate::backends::nwg::Orientation::Vertical => {
-                        if is_expand { (fixed_w, expand_size) } else { (fixed_w, 28) }
+                        if is_expand { (fixed_w, expand_size) } else { (fixed_w, desired_sizes[i]) }
                     }
                 };
                 match self.orientation {
@@ -464,7 +547,34 @@ mod nwg_adapter {
             }
         }
         pub fn set_visible(&self, v: bool) { self.inner.set_visible(v); }
-        pub fn grab_focus(&self) { let _ = self.inner.set_focus(); }
+        pub fn grab_focus(&self) {
+            let _ = self.inner.set_focus();
+            if let Some(hwnd) = self.inner.handle.hwnd() {
+                unsafe {
+                    winapi::um::winuser::ShowWindow(hwnd as _, winapi::um::winuser::SW_SHOW);
+                    winapi::um::winuser::SetWindowPos(
+                        hwnd as _, winapi::um::winuser::HWND_TOP,
+                        0, 0, 0, 0,
+                        winapi::um::winuser::SWP_NOMOVE | winapi::um::winuser::SWP_NOSIZE | winapi::um::winuser::SWP_SHOWWINDOW,
+                    );
+                    winapi::um::winuser::RedrawWindow(
+                        hwnd as _,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        winapi::um::winuser::RDW_INVALIDATE | winapi::um::winuser::RDW_UPDATENOW | winapi::um::winuser::RDW_ERASE | winapi::um::winuser::RDW_FRAME,
+                    );
+                    let parent = winapi::um::winuser::GetParent(hwnd as _);
+                    if !parent.is_null() {
+                        winapi::um::winuser::RedrawWindow(
+                            parent,
+                            std::ptr::null_mut(),
+                            std::ptr::null_mut(),
+                            winapi::um::winuser::RDW_INVALIDATE | winapi::um::winuser::RDW_UPDATENOW | winapi::um::winuser::RDW_ALLCHILDREN | winapi::um::winuser::RDW_FRAME,
+                        );
+                    }
+                }
+            }
+        }
         pub fn add_class(&self, _class: &str) {}
         pub fn remove_class(&self, _class: &str) {}
         pub fn set_margin_start(&self, px: i32) {
@@ -516,6 +626,19 @@ mod nwg_adapter {
         let focus_in_cb: Rc<RefCell<Option<Box<dyn FnMut(*mut c_void) -> i32>>>> = Rc::new(RefCell::new(None));
         let focus_out_cb: Rc<RefCell<Option<Box<dyn FnMut(*mut c_void) -> i32>>>> = Rc::new(RefCell::new(None));
         let hwnd = inner.handle.hwnd().unwrap_or(std::ptr::null_mut());
+        if hwnd != std::ptr::null_mut() {
+            unsafe {
+                let ex = winapi::um::winuser::GetWindowLongW(
+                    hwnd as _, winapi::um::winuser::GWL_EXSTYLE);
+                winapi::um::winuser::SetWindowLongW(
+                    hwnd as _, winapi::um::winuser::GWL_EXSTYLE,
+                    ex | winapi::um::winuser::WS_EX_CLIENTEDGE as i32);
+                winapi::um::winuser::SetWindowPos(
+                    hwnd as _, std::ptr::null_mut(), 0, 0, 0, 0,
+                    winapi::um::winuser::SWP_NOMOVE | winapi::um::winuser::SWP_NOSIZE
+                    | winapi::um::winuser::SWP_NOZORDER | winapi::um::winuser::SWP_FRAMECHANGED);
+            }
+        }
 
         let _focus_in_handler = if hwnd != std::ptr::null_mut() {
             let cb = focus_in_cb.clone();
@@ -526,7 +649,6 @@ mod nwg_adapter {
                 move |_h, msg, _w, _l| {
                     if msg == winapi::um::winuser::WM_SETFOCUS {
                         if let Some(ref mut f) = *cb.borrow_mut() { f(std::ptr::null_mut()); }
-                        return Some(0);
                     }
                     None
                 },
@@ -542,7 +664,6 @@ mod nwg_adapter {
                 move |_h, msg, _w, _l| {
                     if msg == winapi::um::winuser::WM_KILLFOCUS {
                         if let Some(ref mut f) = *cb.borrow_mut() { f(std::ptr::null_mut()); }
-                        return Some(0);
                     }
                     None
                 },
@@ -688,12 +809,25 @@ mod nwg_adapter {
     // ========== Dialog ==========
 
     pub struct Dialog {
-        pub(crate) inner: nwg::Window,
-        pub(crate) buttons: RefCell<Vec<(nwg::Button, nwg::EventHandler)>>,
+        pub(crate) inner: Rc<nwg::Window>,
+        pub(crate) buttons: Rc<RefCell<Vec<(nwg::Button, nwg::EventHandler)>>>,
         pub(crate) response_cb: Rc<RefCell<Option<Box<dyn FnMut(i32)>>>>,
-        pub(crate) _handler: nwg::EventHandler,
+        pub(crate) _handler: Rc<nwg::EventHandler>,
         layout_cb: Rc<RefCell<Option<Box<dyn FnMut(i32, i32)>>>>,
         child_hwnd: Rc<RefCell<Option<*mut c_void>>>,
+    }
+
+    impl Clone for Dialog {
+        fn clone(&self) -> Self {
+            Dialog {
+                inner: self.inner.clone(),
+                buttons: self.buttons.clone(),
+                response_cb: self.response_cb.clone(),
+                _handler: self._handler.clone(),
+                layout_cb: self.layout_cb.clone(),
+                child_hwnd: self.child_hwnd.clone(),
+            }
+        }
     }
 
     impl Dialog {
@@ -751,6 +885,13 @@ mod nwg_adapter {
             *self.response_cb.borrow_mut() = Some(Box::new(f));
             Ok(0)
         }
+        pub fn close(&self) {
+            if let Some(hwnd) = self.inner.handle.hwnd() {
+                unsafe {
+                    winapi::um::winuser::ShowWindow(hwnd as _, winapi::um::winuser::SW_HIDE);
+                }
+            }
+        }
     }
 
     impl AsRef<*mut c_void> for Dialog {
@@ -792,7 +933,7 @@ mod nwg_adapter {
             ).map_err(|e| Error::Backend(format!("{}", e)))?;
         }
 
-        Ok(Dialog { inner, buttons: RefCell::new(Vec::new()), response_cb, _handler: handler, layout_cb, child_hwnd })
+        Ok(Dialog { inner: Rc::new(inner), buttons: Rc::new(RefCell::new(Vec::new())), response_cb, _handler: Rc::new(handler), layout_cb, child_hwnd })
     }
 
     pub fn create_dialog_button(
@@ -816,14 +957,17 @@ mod nwg_adapter {
     impl NwgDrawContext {
         fn make_font(name: &str, size: f64, weight: i32, italic: bool) -> winapi::shared::windef::HFONT {
             unsafe {
-                let wide_name: Vec<u16> = name.encode_utf16().collect();
+                let is_mono = name.eq_ignore_ascii_case("monospace");
+                let face = if is_mono { "Courier New" } else { name };
+                let wide_name: Vec<u16> = face.encode_utf16().chain(std::iter::once(0)).collect();
+                let pitch = if is_mono { winapi::um::wingdi::FF_MODERN } else { 0 };
                 winapi::um::wingdi::CreateFontW(
                     -(size.abs() as i32), 0, 0, 0, weight as i32, italic as u32, 0, 0,
                     winapi::um::wingdi::ANSI_CHARSET,
                     winapi::um::wingdi::OUT_DEFAULT_PRECIS,
                     winapi::um::wingdi::CLIP_DEFAULT_PRECIS,
-                    winapi::um::wingdi::DEFAULT_QUALITY,
-                    winapi::um::wingdi::DEFAULT_PITCH,
+                    winapi::um::wingdi::PROOF_QUALITY,
+                    winapi::um::wingdi::DEFAULT_PITCH | pitch,
                     wide_name.as_ptr(),
                 )
             }
@@ -878,7 +1022,7 @@ mod nwg_adapter {
                     (r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8);
                 winapi::um::wingdi::SetTextColor(self.hdc, color);
                 let old_bkmode = winapi::um::wingdi::SetBkMode(self.hdc, winapi::um::wingdi::TRANSPARENT as i32);
-                let hfont = Self::make_font(font, size, if weight != 0 { winapi::um::wingdi::FW_BOLD as i32 } else { winapi::um::wingdi::FW_NORMAL as i32 }, false);
+                let hfont = Self::make_font(font, size, if weight != 0 { winapi::um::wingdi::FW_BOLD as i32 } else { winapi::um::wingdi::FW_NORMAL as i32 }, _slant != 0);
                 if !hfont.is_null() {
                     let old_font = winapi::um::wingdi::SelectObject(self.hdc, hfont as _);
                     let mut rect = winapi::shared::windef::RECT {
@@ -896,7 +1040,7 @@ mod nwg_adapter {
         fn text_extents_styled(&self, text: &str, font: &str, size: f64, _slant: i32, weight: i32) -> (f64, f64, f64, f64) {
             unsafe {
                 let wide: Vec<u16> = text.encode_utf16().collect();
-                let hfont = Self::make_font(font, size, if weight != 0 { winapi::um::wingdi::FW_BOLD as i32 } else { winapi::um::wingdi::FW_NORMAL as i32 }, false);
+                let hfont = Self::make_font(font, size, if weight != 0 { winapi::um::wingdi::FW_BOLD as i32 } else { winapi::um::wingdi::FW_NORMAL as i32 }, _slant != 0);
                 if hfont.is_null() { return (0.0, 0.0, 0.0, 0.0); }
                 let old_font = winapi::um::wingdi::SelectObject(self.hdc, hfont as _);
                 let mut size_tag: winapi::shared::windef::SIZE = std::mem::zeroed();

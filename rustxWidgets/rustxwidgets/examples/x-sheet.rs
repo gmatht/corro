@@ -110,6 +110,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     save_btn.set_size_request(70, 24);
     quit_btn.set_size_request(50, 24);
     for b in [&bold_btn, &italic_btn, &al_l, &al_c, &al_r, &hl_btn, &fg_btn] { b.set_size_request(28, 24); }
+    #[cfg(windows)]
+    bold_btn.set_font_style(700, false);
+    #[cfg(windows)]
+    italic_btn.set_font_style(400, true);
     toolbar.append(&open_btn);
     toolbar.append(&save_btn);
     toolbar.append(&quit_btn);

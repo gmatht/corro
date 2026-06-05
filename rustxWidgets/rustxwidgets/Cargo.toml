@@ -33,6 +33,7 @@ web-sys = { version = "0.3", features = [
   "CanvasRenderingContext2d", "CssStyleDeclaration", "DomTokenList",
   "HtmlCollection", "Window",
   "Text",
+  "TextMetrics",
 ] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
@@ -43,5 +44,5 @@ gtk = ["dep:gtk_dynamic_loader"]
 pancurses = ["dep:pancurses"]
 zork = ["dep:rustyline"]
 
-[dev-dependencies]
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 proptest = "1.6"
