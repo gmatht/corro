@@ -28,7 +28,7 @@ mod pancurses_backend {
     fn sgr_formula() -> &'static str { "\x1b[38;5;6m\x1b[49m" }
     fn sgr_header_active() -> &'static str { "\x1b[1m\x1b[38;5;0m\x1b[48;5;3m" }
     fn sgr_header_inactive() -> &'static str { "\x1b[1m\x1b[38;5;6m" }
-    fn sgr_row_cursor() -> &'static str { "\x1b[1m\x1b[38;5;0m\x1b[48;5;3m" }
+    fn sgr_row_cursor() -> &'static str { "\x1b[1;4m\x1b[38;5;0m\x1b[48;5;3m" }
     fn sgr_row_normal() -> &'static str { "\x1b[38;5;3m" }
     fn sgr_row_footer() -> &'static str { "\x1b[1m\x1b[38;5;6m" }
     fn sgr_row_underline() -> &'static str { "\x1b[4m\x1b[38;5;3m" }
