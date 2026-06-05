@@ -1223,13 +1223,13 @@ mod pancurses_backend {
                     out.push_str(&sgr_cup(row_offset, rect.x));
                     out.push_str(sgr_formula());
                     out.push_str(&fb_text[..fb_end]);
-                    let remaining = (rect.w as usize).saturating_sub(fb_text[..fb_end].chars().count());
-                    if remaining > 0 {
-                        out.push_str(&" ".repeat(remaining - 1));
-                        out.push_str(SGR_FG_DEFAULT);
-                        out.push(' ');
-                    } else {
-                        out.push_str(SGR_FG_DEFAULT);
+                    out.push_str(SGR_FG_DEFAULT);
+                    out.push_str(SGR_BG_DEFAULT);
+                    // Fill rest of formula bar line with spaces to prevent
+                    // ncurses background from bleeding through.
+                    let fb_vis = fb_text[..fb_end].chars().count();
+                    if fb_vis < rect.w as usize {
+                        out.push_str(&" ".repeat(rect.w as usize - fb_vis));
                     }
                     row_offset += 1;
                 }
@@ -1458,8 +1458,8 @@ mod pancurses_backend {
                                     if gap_after > 0 {
                                         out.push(' ');
                                     }
-                                } else if (col_idx as usize) < lm || (col_idx as usize) >= lm + mc {
-                                    // Border column (left-margin / right-margin): dark gray
+                                } else if (col_idx as usize) < lm {
+                                    // Left-margin column: dark gray foreground
                                     let cw = column_layout[vi].1 as i32;
                                     out.push_str(&sgr_cup(ry, sx));
                                     if is_boundary {
@@ -1470,6 +1470,35 @@ mod pancurses_backend {
                                         out.push(' ');
                                     }
                                     out.push_str(SGR_FG_DEFAULT);
+                                    let gap_after = if vi + 1 < n { 1 } else { 0 };
+                                    if gap_after > 0 {
+                                        out.push(' ');
+                                    }
+                                } else if (col_idx as usize) >= lm + mc {
+                                    // Right-margin column: dark gray foreground
+                                    let cw = column_layout[vi].1 as i32;
+                                    out.push_str(&sgr_cup(ry, sx));
+                                    if is_boundary {
+                                        out.push_str(SGR_UNDERLINE);
+                                    }
+                                    out.push_str(sgr_sep());
+                                    for _ in 0..cw {
+                                        out.push(' ');
+                                    }
+                                    out.push_str(SGR_FG_DEFAULT);
+                                    let gap_after = if vi + 1 < n { 1 } else { 0 };
+                                    if gap_after > 0 {
+                                        out.push(' ');
+                                    }
+                                } else {
+                                    // Empty cell in main column: default spaces
+                                    let cw = column_layout[vi].1 as i32;
+                                    out.push_str(&sgr_cup(ry, sx));
+                                    out.push_str(SGR_FG_DEFAULT);
+                                    out.push_str(SGR_BG_DEFAULT);
+                                    for _ in 0..cw {
+                                        out.push(' ');
+                                    }
                                     let gap_after = if vi + 1 < n { 1 } else { 0 };
                                     if gap_after > 0 {
                                         out.push(' ');
@@ -1515,14 +1544,15 @@ mod pancurses_backend {
                             //   3. agg         → fg(Cyan)
                             //   4. border col  → fg(DarkGray)
                             //   5. default     → none
-                            let is_border_col = (col_idx as usize) < lm || (col_idx as usize) >= lm + mc;
+                            let is_left_margin_col = (col_idx as usize) < lm;
+                            let is_right_margin_col = (col_idx as usize) >= lm + mc;
                             let cell_sgr = if is_cursor_cell {
                                 sgr_cell_cursor()
                             } else if cell_style == 3 {
                                 sgr_cell_footer_agg()
                             } else if cell_style == 2 {
                                 sgr_cell_agg()
-                            } else if is_border_col {
+                            } else if is_left_margin_col || is_right_margin_col {
                                 sgr_sep()
                             } else {
                                 ""
@@ -1550,6 +1580,8 @@ mod pancurses_backend {
                             if is_cursor_cell {
                                 out.push_str(SGR_BG_DEFAULT);
                             } else if cell_style == 2 || cell_style == 3 {
+                                out.push_str(SGR_FG_DEFAULT);
+                            } else if is_left_margin_col || is_right_margin_col {
                                 out.push_str(SGR_FG_DEFAULT);
                             }
                             // Inter-column gap (1 space) – drawn in default style
@@ -1585,7 +1617,7 @@ mod pancurses_backend {
                                 if is_cursor_cell {
                                     out.push_str(&sgr_cup(ry, col_screen_x));
                                     for _ in 0..cw { out.push(' '); }
-                                } else if (col_idx as usize) < lm || (col_idx as usize) >= lm + mc {
+                                } else if (col_idx as usize) < lm {
                                     out.push_str(&sgr_cup(ry, col_screen_x));
                                     if is_boundary {
                                         out.push_str(SGR_UNDERLINE);
@@ -1593,6 +1625,11 @@ mod pancurses_backend {
                                     out.push_str(sgr_sep());
                                     for _ in 0..cw { out.push(' '); }
                                     out.push_str(SGR_FG_DEFAULT);
+                                } else {
+                                    out.push_str(&sgr_cup(ry, col_screen_x));
+                                    out.push_str(SGR_FG_DEFAULT);
+                                    out.push_str(SGR_BG_DEFAULT);
+                                    for _ in 0..cw { out.push(' '); }
                                 }
                                 vc += 1;
                                 continue;
