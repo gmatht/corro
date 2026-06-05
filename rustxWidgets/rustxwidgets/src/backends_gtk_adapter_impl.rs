@@ -239,6 +239,31 @@ mod gtk_adapter {
         Ok(SimpleAction(a))
     }
 
+    // ---- Application (action group host for menus) ----
+
+    #[repr(transparent)]
+    pub struct Application(pub gtk_dynamic_loader::Application);
+
+    impl Application {
+        pub fn register(&self) -> Result<(), Error> {
+            self.0.register().map_err(|e| Error::Backend(format!("{}", e)))
+        }
+        pub fn as_ptr(&self) -> *mut c_void {
+            self.0.as_ptr()
+        }
+        pub fn add_action(&self, action: &SimpleAction) -> Result<(), Error> {
+            self.0.add_action(&action.0).map_err(|e| Error::Backend(format!("{}", e)))
+        }
+    }
+
+    pub fn create_application() -> Result<Application, Error> {
+        let loader = crate::backends::gtk::loader()
+            .ok_or_else(|| Error::Backend("GTK loader not initialized".into()))?;
+        let app = gtk_dynamic_loader::Application::new(loader, Some("org.corro.Corro"))
+            .map_err(|e| Error::Backend(format!("{}", e)))?;
+        Ok(Application(app))
+    }
+
     // ---- Dialog ----
 
     #[repr(transparent)]

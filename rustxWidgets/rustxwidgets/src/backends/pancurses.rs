@@ -1198,6 +1198,10 @@ mod pancurses_backend {
                     out.push_str(&sgr_cup(row_offset, rect.x));
                     out.push_str(sgr_menu());
                     out.push_str(&menu_text[..end]);
+                    let remaining = (rect.w as usize).saturating_sub(end);
+                    if remaining > 0 {
+                        out.push_str(&" ".repeat(remaining));
+                    }
                     row_offset += 1;
                 }
 
@@ -1218,6 +1222,10 @@ mod pancurses_backend {
                     out.push_str(&sgr_cup(row_offset, rect.x));
                     out.push_str(sgr_formula());
                     out.push_str(&fb_text[..fb_end]);
+                    let remaining = (rect.w as usize).saturating_sub(fb_text[..fb_end].chars().count());
+                    if remaining > 0 {
+                        out.push_str(&" ".repeat(remaining));
+                    }
                     out.push_str(SGR_FG_DEFAULT);
                     row_offset += 1;
                 }
@@ -1274,6 +1282,10 @@ mod pancurses_backend {
                             }
                         }
                         if hx <= rect.x + rect.w - 1 {
+                            let gap = (rect.x + rect.w - 1 - hx) as usize;
+                            if gap > 0 {
+                                out.push_str(&" ".repeat(gap));
+                            }
                             out.push_str(&sgr_cup(hr, rect.x + rect.w - 1));
                             out.push_str("│");
                         }
@@ -1367,7 +1379,10 @@ mod pancurses_backend {
                     out.push_str(&sgr_cup(ry, rect.x + 1));
                     out.push_str(row_label_style);
                     out.push_str(&format!("{:>4} ", label_str));
-                    out.push_str(SGR_RESET);
+                    // Reset bold/fg/bg but keep underline (needed for boundary rows)
+                    out.push_str("\x1b[22m");
+                    out.push_str(SGR_FG_DEFAULT);
+                    out.push_str(SGR_BG_DEFAULT);
 
                     // Separator between row label and first data column (dark gray)
                     // For the left margin gap: dark gray fg for 4 spaces
@@ -1393,6 +1408,13 @@ mod pancurses_backend {
                                 rx2 += 1;
                             }
                         }
+                        // Determine last rendered x position for row-fill detection
+                        let last_col_end = if col_positions.is_empty() {
+                            rect.x + 1 + 5
+                        } else {
+                            let last_idx = col_positions.len() - 1;
+                            col_positions[last_idx].1 + column_layout[last_idx].1 as i32
+                        };
                         // Draw separator (dark gray) for left margin column if empty
                         if !col_positions.is_empty() {
                             let (first_col, first_sx) = col_positions[0];
@@ -1421,9 +1443,11 @@ mod pancurses_backend {
                                 if is_cursor_cell {
                                     let cw = column_layout[vi].1 as i32;
                                     out.push_str(&sgr_cup(ry, sx));
+                                    out.push_str(sgr_cell_cursor());
                                     for _ in 0..cw {
                                         out.push(' ');
                                     }
+                                    out.push_str(SGR_BG_DEFAULT);
                                 }
                                 vi += 1;
                                 continue;
@@ -1474,12 +1498,41 @@ mod pancurses_backend {
                                 out.push_str(cell_sgr);
                             }
                             out.push_str(&display);
+                            // avail_w = width within the cell's column(s), excluding
+                            // the trailing gap to the next column (gap_after is written
+                            // separately so it uses default style, matching ratatui).
+                            let avail_w = if overflow_cols > 0 {
+                                column_layout[vi..=vi+overflow_cols].iter()
+                                    .map(|&(_, w, _)| w as usize).sum::<usize>()
+                                    + overflow_cols
+                            } else {
+                                w
+                            };
+                            let display_w = display.chars().count();
+                            let pad = avail_w.saturating_sub(display_w);
+                            if pad > 0 {
+                                out.push_str(&" ".repeat(pad));
+                            }
                             if is_cursor_cell {
                                 out.push_str(SGR_BG_DEFAULT);
                             } else if cell_style == 2 || cell_style == 3 {
                                 out.push_str(SGR_FG_DEFAULT);
                             }
+                            // Inter-column gap (1 space) – drawn in default style
+                            if gap_after > 0 {
+                                out.push(' ');
+                            }
                             vi += 1 + overflow_cols as usize;
+                        }
+                        // Fill remaining row width before right border
+                        let after_content = rect.x + 1 + 5 + column_layout.iter()
+                            .map(|&(_, w, _)| w as i32).sum::<i32>()
+                            + (n.saturating_sub(1) as i32); // gaps between columns
+                        if after_content < rect.x + rect.w - 1 {
+                            let gap = (rect.x + rect.w - 1 - after_content) as usize;
+                            if gap > 0 {
+                                out.push_str(&" ".repeat(gap));
+                            }
                         }
                         out.push_str(&sgr_cup(ry, rect.x + rect.w - 1));
                         out.push_str("│");
@@ -1570,14 +1623,16 @@ mod pancurses_backend {
                         out.push_str(&sgr_cup(sr, rect.x));
                         out.push_str(sgr_sep());
                         out.push_str(&status_text[..st_end]);
+                        let st_vis = status_text[..st_end].chars().count();
                         if has_tabs {
-                            let st_vis = status_text[..st_end].chars().count();
                             if st_vis < rect.w as usize - 1 {
-                                for i in st_vis as i32..rect.w - 1 {
+                                for _ in st_vis..rect.w as usize - 1 {
                                     out.push('─');
                                 }
                                 out.push_str("┘");
                             }
+                        } else if st_vis < rect.w as usize {
+                            out.push_str(&" ".repeat(rect.w as usize - st_vis));
                         }
                     }
                 }
@@ -1589,11 +1644,15 @@ mod pancurses_backend {
                         let tab_end = tab_text.char_indices().nth(max_w).map(|(i, _)| i).unwrap_or(tab_text.len());
                         out.push_str(&sgr_cup(ty, rect.x));
                         out.push_str(&tab_text[..tab_end]);
+                        let tab_vis = tab_text[..tab_end].chars().count();
+                        if tab_vis < rect.w as usize {
+                            out.push_str(&" ".repeat(rect.w as usize - tab_vis));
+                        }
                     }
                 }
 
-                // Emit the complete styled output
-                emit_sgr(&out);
+                // Store SGR output for emission after ncurses refresh
+                with_state(|s| s.spreadsheet_output.push_str(&out));
             }
         }
     }
@@ -2673,6 +2732,8 @@ mod pancurses_backend {
                     column_layout: Vec::new(),
                     row_labels: Vec::new(),
                     tab_text: String::new(),
+                    header_row_count: 2,
+                    main_row_count: 24,
                 },
                 Some(wid),
             ));
@@ -2839,6 +2900,8 @@ mod pancurses_backend {
                     column_layout: Vec::new(),
                     row_labels: Vec::new(),
                     tab_text: String::new(),
+                    header_row_count: 2,
+                    main_row_count: 24,
                 },
                 Some(wid),
             ));
@@ -3420,6 +3483,8 @@ mod pancurses_backend {
                     column_layout: vec![(0,10,"A".into()),(1,10,"B".into()),(2,10,"C".into())],
                     row_labels: vec![(0,"   1".into()),(1,"   2".into())],
                     tab_text: String::new(),
+                    header_row_count: 2,
+                    main_row_count: 20,
                 },
                 Some(wid),
             ));
@@ -3454,6 +3519,8 @@ mod pancurses_backend {
                     column_layout: vec![(0,5,"X".into()),(1,5,"Y".into())],
                     row_labels: vec![],
                     tab_text: String::new(),
+                    header_row_count: 2,
+                    main_row_count: 20,
                 },
                 Some(wid),
             ));
@@ -3486,6 +3553,8 @@ mod pancurses_backend {
                     column_layout: vec![(0,8,"A".into())],
                     row_labels: vec![(0,"ROW0".into()),(1,"ROW1".into())],
                     tab_text: String::new(),
+                    header_row_count: 2,
+                    main_row_count: 20,
                 },
                 Some(wid),
             ));

@@ -5,7 +5,7 @@ pub use crate::core::{App, DrawContext, Error, HandlerId, Widget};
 /// Others are available via their adapter module directly.
 
 #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
-pub use crate::backends_gtk_adapter::{Window, Button, Label, BoxWidget, Grid, Entry, Menu, MenuBar, SimpleAction, Dialog, DropDown, CheckButton, RadioButton, TextView, Orientation, Canvas, Overlay, Spreadsheet, ScrolledWindow};
+pub use crate::backends_gtk_adapter::{Window, Button, Label, BoxWidget, Grid, Entry, Menu, MenuBar, SimpleAction, Application, Dialog, DropDown, CheckButton, RadioButton, TextView, Orientation, Canvas, Overlay, Spreadsheet, ScrolledWindow};
 
 #[cfg(all(windows, not(feature = "zork")))]
 pub use crate::backends_nwg_adapter::{Window, Button, Label, Menu, SimpleAction};
