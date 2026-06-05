@@ -1685,7 +1685,9 @@ mod pancurses_backend {
                             } else {
                                 if is_cursor_cell {
                                     out.push_str(SGR_BG_DEFAULT);
-                                } else if cell_style == 2 || cell_style == 3 {
+                                } else if cell_style == 2 {
+                                    out.push_str(SGR_FG_DEFAULT);
+                                } else if cell_style == 3 {
                                     out.push_str(SGR_RESET);
                                 } else if is_boundary && !is_overflowing {
                                     if vi + 1 >= n {
@@ -1806,7 +1808,9 @@ mod pancurses_backend {
                             out.push_str(&display);
                             if is_cursor_cell {
                                 out.push_str(SGR_BG_DEFAULT);
-                            } else if cell_style == 2 || cell_style == 3 {
+                            } else if cell_style == 2 {
+                                out.push_str(SGR_FG_DEFAULT);
+                            } else if cell_style == 3 {
                                 out.push_str(SGR_RESET);
                             }
                             vc += 1 + overflow_cols;
