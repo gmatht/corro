@@ -1189,6 +1189,7 @@ mod pancurses_backend {
                 let mc = *main_cols as usize;
                 let use_layout = !column_layout.is_empty();
                 let mut out = String::new();
+                out.push_str(SGR_RESET);
                 let mut row_offset = rect.y;
 
                 // Menu bar: black fg on cyan bg
@@ -1224,9 +1225,12 @@ mod pancurses_backend {
                     out.push_str(&fb_text[..fb_end]);
                     let remaining = (rect.w as usize).saturating_sub(fb_text[..fb_end].chars().count());
                     if remaining > 0 {
-                        out.push_str(&" ".repeat(remaining));
+                        out.push_str(&" ".repeat(remaining - 1));
+                        out.push_str(SGR_FG_DEFAULT);
+                        out.push(' ');
+                    } else {
+                        out.push_str(SGR_FG_DEFAULT);
                     }
-                    out.push_str(SGR_FG_DEFAULT);
                     row_offset += 1;
                 }
 
@@ -1379,10 +1383,12 @@ mod pancurses_backend {
                     out.push_str(&sgr_cup(ry, rect.x + 1));
                     out.push_str(row_label_style);
                     out.push_str(&format!("{:>4} ", label_str));
-                    // Reset bold/fg/bg but keep underline (needed for boundary rows)
-                    out.push_str("\x1b[22m");
-                    out.push_str(SGR_FG_DEFAULT);
-                    out.push_str(SGR_BG_DEFAULT);
+                    // Reset all attributes, then re-apply underline for boundary rows.
+                    // This prevents underline from leaking to the next row.
+                    out.push_str(SGR_RESET);
+                    if is_boundary {
+                        out.push_str(SGR_UNDERLINE);
+                    }
 
                     // Separator between row label and first data column (dark gray)
                     // For the left margin gap: dark gray fg for 4 spaces
@@ -1448,6 +1454,26 @@ mod pancurses_backend {
                                         out.push(' ');
                                     }
                                     out.push_str(SGR_BG_DEFAULT);
+                                    let gap_after = if vi + 1 < n { 1 } else { 0 };
+                                    if gap_after > 0 {
+                                        out.push(' ');
+                                    }
+                                } else if (col_idx as usize) < lm || (col_idx as usize) >= lm + mc {
+                                    // Border column (left-margin / right-margin): dark gray
+                                    let cw = column_layout[vi].1 as i32;
+                                    out.push_str(&sgr_cup(ry, sx));
+                                    if is_boundary {
+                                        out.push_str(SGR_UNDERLINE);
+                                    }
+                                    out.push_str(sgr_sep());
+                                    for _ in 0..cw {
+                                        out.push(' ');
+                                    }
+                                    out.push_str(SGR_FG_DEFAULT);
+                                    let gap_after = if vi + 1 < n { 1 } else { 0 };
+                                    if gap_after > 0 {
+                                        out.push(' ');
+                                    }
                                 }
                                 vi += 1;
                                 continue;
@@ -1483,13 +1509,21 @@ mod pancurses_backend {
                                     s
                                 }
                             } else { cell_text.to_string() };
-                            // Cell SGR style matching ratatui
+                            // Cell SGR style matching ratatui priority:
+                            //   1. cursor cell → bg(DarkGray)
+                            //   2. footer agg  → bold + fg(Cyan)
+                            //   3. agg         → fg(Cyan)
+                            //   4. border col  → fg(DarkGray)
+                            //   5. default     → none
+                            let is_border_col = (col_idx as usize) < lm || (col_idx as usize) >= lm + mc;
                             let cell_sgr = if is_cursor_cell {
                                 sgr_cell_cursor()
                             } else if cell_style == 3 {
                                 sgr_cell_footer_agg()
                             } else if cell_style == 2 {
                                 sgr_cell_agg()
+                            } else if is_border_col {
+                                sgr_sep()
                             } else {
                                 ""
                             };
@@ -1551,6 +1585,14 @@ mod pancurses_backend {
                                 if is_cursor_cell {
                                     out.push_str(&sgr_cup(ry, col_screen_x));
                                     for _ in 0..cw { out.push(' '); }
+                                } else if (col_idx as usize) < lm || (col_idx as usize) >= lm + mc {
+                                    out.push_str(&sgr_cup(ry, col_screen_x));
+                                    if is_boundary {
+                                        out.push_str(SGR_UNDERLINE);
+                                    }
+                                    out.push_str(sgr_sep());
+                                    for _ in 0..cw { out.push(' '); }
+                                    out.push_str(SGR_FG_DEFAULT);
                                 }
                                 vc += 1;
                                 continue;
