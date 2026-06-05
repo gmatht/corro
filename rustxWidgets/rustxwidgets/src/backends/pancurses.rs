@@ -1335,9 +1335,7 @@ mod pancurses_backend {
                                 + gap_after;   // gap to next column
                             let display = if text_width > total_avail {
                                 if overflow_cols == 0 {
-                                    let trunc = total_avail.saturating_sub(1).max(1);
-                                    cell_text.chars().take(trunc).collect::<String>()
-                                    + if text_width > trunc { "…" } else { "" }
+                                    cell_text.chars().take(total_avail).collect::<String>()
                                 } else {
                                     let trunc = total_avail.saturating_sub(1).max(1);
                                     let mut s: String = cell_text.chars().take(trunc).collect();
@@ -1383,9 +1381,7 @@ mod pancurses_backend {
                             let available = (overflow_cols + 1) * cw + gap_after;
                             let display = if text_width > available as usize {
                                 if overflow_cols == 0 {
-                                    let trunc = (available.saturating_sub(1)).max(1) as usize;
-                                    text.chars().take(trunc).collect::<String>()
-                                        + if text.chars().count() > trunc { "…" } else { "" }
+                                    text.chars().take(available as usize).collect()
                                 } else {
                                     let trunc = (available - 1).max(1) as usize;
                                     let mut s: String = text.chars().take(trunc).collect();
@@ -2403,12 +2399,15 @@ mod pancurses_backend {
                                 s
                             }
                         } else { cell_text.to_string() };
-                        // Pad to combined width of current + overflow columns to maintain alignment
+                        // Pad to combined width of current + overflow columns to maintain alignment.
+                        // When overflow_cols==0, include the gap (total_avail) so the gap
+                        // character is preserved, matching ratatui's use of the inter-column
+                        // gap as overflow room.
                         let total_width = if overflow_cols > 0 {
                             column_layout[vi..=vi+overflow_cols].iter()
                                 .map(|&(_, w, _)| w as usize).sum::<usize>()
                         } else {
-                            cell_w
+                            total_avail
                         };
                         data_row.push_str(&format!("{:<1$}", display, total_width));
                         vi += 1 + overflow_cols;
@@ -2433,10 +2432,14 @@ mod pancurses_backend {
                         }
                         let available = (overflow_cols + 1) * cw as usize;
                         let display = if text_width > available {
-                            let trunc = (available - 1).max(1);
-                            let mut s: String = cell_text.chars().take(trunc).collect();
-                            if text_width > trunc { s.push('…'); }
-                            s
+                            if overflow_cols == 0 {
+                                cell_text.chars().take(available).collect()
+                            } else {
+                                let trunc = (available - 1).max(1);
+                                let mut s: String = cell_text.chars().take(trunc).collect();
+                                if text_width > trunc { s.push('…'); }
+                                s
+                            }
                         } else {
                             cell_text.to_string()
                         };
