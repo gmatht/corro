@@ -56,6 +56,7 @@ mod pancurses_backend {
             formula_bar_trailing: String,
             column_layout: Vec<(u32, u32, String)>,
             row_labels: Vec<(u32, String)>,
+            tab_text: String,
         },
     }
 
@@ -1133,7 +1134,7 @@ mod pancurses_backend {
                     root.attroff(COLOR_PAIR(3));
                 }
             }
-            PcWidgetKind::Spreadsheet { ref cells, ref raw_cells, ref top_row, ref left_col, ref cursor_row, ref cursor_col, ref editing, ref edit_buf, ref edit_pos, ref col_width, ref margin_cols, ref main_cols, ref menu_text, ref status_text, ref border_title, ref formula_bar_trailing, ref column_layout, ref row_labels, ref total_rows, ref total_cols, .. } => {
+            PcWidgetKind::Spreadsheet { ref cells, ref raw_cells, ref top_row, ref left_col, ref cursor_row, ref cursor_col, ref editing, ref edit_buf, ref edit_pos, ref col_width, ref margin_cols, ref main_cols, ref menu_text, ref status_text, ref border_title, ref formula_bar_trailing, ref column_layout, ref row_labels, ref total_rows, ref total_cols, ref tab_text, .. } => {
                 let cw = *col_width as i32;
                 let rh_w = 5i32;
                 let lm = *margin_cols as usize;
@@ -1263,9 +1264,12 @@ mod pancurses_backend {
                     row_offset = hr + 2;
                 }
 
-                // Data rows — compute available rows, leaving room for bottom border + optional status line
+                // Data rows — compute available rows, leaving room for bottom border + optional status/tab lines
                 let has_status = !status_text.is_empty();
-                let grid_bottom = rect.y + rect.h - (if has_status { 2 } else { 1 });
+                let has_tabs = !tab_text.is_empty();
+                // When tabs exist, status overlays the bottom border line; otherwise status takes a separate line.
+                let extra_lines = if has_tabs { 1 } else if has_status { 1 } else { 0 };
+                let grid_bottom = rect.y + rect.h - (1 + extra_lines);
                 let max_data_rows = ((grid_bottom - row_offset) as i32).max(1) as u32;
                 for vr in 0..max_data_rows {
                     let row_idx = *top_row + vr as u32;
@@ -1418,24 +1422,38 @@ mod pancurses_backend {
                         root.mvaddstr(ry, rect.x + rect.w - 1, "│");
                     }
                 }
-                // Bottom border
+                // Bottom border line (ratatui: hints text overwrites left part, ─ and ┘ remain on right)
                 {
                     let br = row_offset + max_data_rows as i32;
-                    root.mvaddstr(br, rect.x, "└");
-                    for i in 1..rect.w - 1 {
-                        root.mvaddstr(br, rect.x + i, "─");
-                    }
-                    root.mvaddstr(br, rect.x + rect.w - 1, "┘");
-                }
-                // Status bar — below bottom border (if non-empty)
-                if has_status {
-                    let sy = row_offset + max_data_rows as i32 + 1;
-                    if sy < rect.y + rect.h {
+                    if has_status {
+                        // Draw status text first, then fill remaining with ─ and ┘
                         if has_colors() { root.attron(COLOR_PAIR(3)); }
                         let max_w = rect.w as usize;
                         let st_end = status_text.char_indices().nth(max_w).map(|(i, _)| i).unwrap_or(status_text.len());
-                        root.mvaddstr(sy, rect.x, &status_text[..st_end]);
+                        let st_vis = status_text[..st_end].chars().count();
+                        root.mvaddstr(br, rect.x, &status_text[..st_end]);
                         if has_colors() { root.attroff(COLOR_PAIR(3)); }
+                        if st_vis < rect.w as usize - 1 {
+                            for i in st_vis as i32..rect.w - 1 {
+                                root.mvaddstr(br, rect.x + i, "─");
+                            }
+                            root.mvaddstr(br, rect.x + rect.w - 1, "┘");
+                        }
+                    } else {
+                        root.mvaddstr(br, rect.x, "└");
+                        for i in 1..rect.w - 1 {
+                            root.mvaddstr(br, rect.x + i, "─");
+                        }
+                        root.mvaddstr(br, rect.x + rect.w - 1, "┘");
+                    }
+                }
+                // Tab bar — below the grid (if non-empty)
+                if !tab_text.is_empty() {
+                    let ty = row_offset + max_data_rows as i32 + 1;
+                    if ty < rect.y + rect.h {
+                        let max_w = rect.w as usize;
+                        let tab_end = tab_text.char_indices().nth(max_w).map(|(i, _)| i).unwrap_or(tab_text.len());
+                        root.mvaddstr(ty, rect.x, &tab_text[..tab_end]);
                     }
                 }
             }
@@ -1649,6 +1667,7 @@ mod pancurses_backend {
             formula_bar_trailing: String::new(),
             column_layout: Vec::new(),
             row_labels: Vec::new(),
+            tab_text: String::new(),
         }, find_window_id(s)));
         Ok(id)
     }
@@ -1764,6 +1783,16 @@ mod pancurses_backend {
             if let Some(n) = s.node_mut(spreadsheet_id) {
                 if let PcWidgetKind::Spreadsheet { ref mut formula_bar_trailing, .. } = n.kind {
                     *formula_bar_trailing = text.to_string();
+                }
+            }
+        });
+    }
+
+    pub fn spreadsheet_set_tab_text(spreadsheet_id: usize, text: &str) {
+        with_state(|s| {
+            if let Some(n) = s.node_mut(spreadsheet_id) {
+                if let PcWidgetKind::Spreadsheet { ref mut tab_text, .. } = n.kind {
+                    *tab_text = text.to_string();
                 }
             }
         });

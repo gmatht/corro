@@ -515,6 +515,9 @@ mod pancurses_adapter {
         pub fn set_formula_bar_trailing(&self, text: &str) {
             crate::backends::pancurses::spreadsheet_set_formula_bar_trailing(self.id, text);
         }
+        pub fn set_tab_text(&self, text: &str) {
+            crate::backends::pancurses::spreadsheet_set_tab_text(self.id, text);
+        }
         pub fn set_formula_bar(&self, address_label: &Label, entry: &Entry) {
             crate::backends::pancurses::spreadsheet_set_formula_bar(
                 self.id, address_label.id, entry.id,
