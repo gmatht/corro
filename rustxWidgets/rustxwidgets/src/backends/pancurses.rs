@@ -1205,15 +1205,22 @@ mod pancurses_backend {
                         root.mvaddstr(hr, hx, &" ".repeat(5));
                         hx += 5;
                         let n = column_layout.len();
+                        let mut hx_extra: i32 = 0;
                         for (i, &(ref _ci, ref w, ref label)) in column_layout.iter().enumerate() {
                             // Need room for: column content + space + right border
-                            if hx + *w as i32 + 1 > rect.x + rect.w - 1 { break; }
+                            // Match ratatui's visible_cols_render_width which uses 2-char separators
+                            // at the left-margin/main and main/right-margin boundaries.
+                            if hx + hx_extra + *w as i32 + 1 > rect.x + rect.w - 1 { break; }
                             let padded = format!("{:<1$}", label, *w as usize);
                             root.mvaddstr(hr, hx, &padded);
                             hx += *w as i32;
                             if i + 1 < n {
                                 root.mvaddch(hr, hx, ' ');
                                 hx += 1;
+                            }
+                            // Consume extra budget at margin boundaries
+                            if *margin_cols > 0 && (*_ci == *margin_cols as u32 - 1 || *_ci == *margin_cols as u32 + *main_cols as u32 - 1) {
+                                hx_extra += 1;
                             }
                         }
                         // Right border
