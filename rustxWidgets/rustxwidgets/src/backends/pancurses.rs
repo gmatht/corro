@@ -1457,8 +1457,8 @@ mod pancurses_backend {
                         }
                         let mut vi = 0;
                         let mut prev_overflowed = false;
-                        let mut right_gray_done = false;
-                        let mut force_right_gray = false;
+                        let mut defer_sgr_reset = false;
+                        let mut last_sgr = String::new();
                         while vi < n {
                             let (col_idx, sx) = col_positions[vi];
                             let cell_text = cells_ref.get(&(row_idx, col_idx))
@@ -1496,14 +1496,14 @@ mod pancurses_backend {
                                         out.push(' ');
                                     }
                                 } else if (col_idx as usize) >= lm + mc {
-                                    // Right-margin column: aggregate or dark gray.
-                                    // Match ratatui: only the first empty
-                                    // right-margin column gets gray when there
-                                    // is no overflow; all get gray when the
-                                    // row has overflow (force_right_gray);
-                                    // aggregate cells get cyan fg.
+                                    // Right-margin column: aggregate or dark gray border.
+                                    // Match ratatui: only the first right-margin column
+                                    // (lm+mc) gets a dark gray border; all other
+                                    // right-margin columns get default styling.
+                                    // Aggregate cells get cyan fg.
                                     let cw = column_layout[vi].1 as i32;
-                                    let use_gray = is_boundary || force_right_gray || !right_gray_done;
+                                    let is_right_border = (col_idx as usize) == lm + mc;
+                                    let use_gray = is_boundary || is_right_border;
                                     let use_agg = cell_style == 2 || cell_style == 3;
                                     out.push_str(&sgr_cup(ry, sx));
                                     if is_boundary {
@@ -1533,9 +1533,6 @@ mod pancurses_backend {
                                     let gap_after = if vi + 1 < n { 1 } else { 0 };
                                     if gap_after > 0 {
                                         out.push(' ');
-                                    }
-                                    if !right_gray_done && !force_right_gray && !is_boundary && !use_agg {
-                                        right_gray_done = true;
                                     }
                                 } else {
                                     // Empty cell in main column: check style
@@ -1589,10 +1586,24 @@ mod pancurses_backend {
                             }
                             let gap_target = vi + overflow_cols;
                             let gap_after = if gap_target + 1 < n { 1 } else { 0 };
-                            let total_avail: usize = column_layout[vi..=vi+overflow_cols].iter()
+                            let mut total_avail: usize = column_layout[vi..=vi+overflow_cols].iter()
                                 .map(|&(_, w, _)| w as usize).sum::<usize>()
                                 + overflow_cols
                                 + gap_after;
+                            // Include remaining viewport space (right gap) so
+                            // cell style/background fills to the right border,
+                            // matching ratatui.
+                            if gap_target + 1 >= n {
+                                let used_w: usize = column_layout.iter()
+                                    .map(|&(_, w, _)| w as usize).sum::<usize>()
+                                    + n.saturating_sub(1);
+                                // Leave 1-char gap before the right border
+                                // (matching ratatui filler behavior).
+                                let total_w = (rect.w as usize).saturating_sub(8);
+                                if total_w > used_w {
+                                    total_avail = total_avail.saturating_add(total_w - used_w);
+                                }
+                            }
                             let display = if text_width > total_avail {
                                 if overflow_cols == 0 {
                                     cell_text.chars().take(total_avail).collect::<String>()
@@ -1610,6 +1621,10 @@ mod pancurses_backend {
                             //   4. border col  → fg(DarkGray)
                             //   5. displaced by overflow → fg(DarkGray)
                             //   6. default     → none
+                            //
+                            // When a cell text overflows (can_overflow), the
+                            // entire overflowed text uses default style (matching
+                            // ratatui's spill logic) rather than boundary gray.
                             let is_left_margin_col = (col_idx as usize) < lm;
                             let is_right_margin_col = (col_idx as usize) >= lm + mc;
                             let cell_sgr = if is_cursor_cell {
@@ -1618,7 +1633,7 @@ mod pancurses_backend {
                                 sgr_cell_footer_agg()
                             } else if cell_style == 2 {
                                 sgr_cell_agg()
-                            } else if is_boundary {
+                            } else if is_boundary && !can_overflow {
                                 sgr_sep()
                             } else if is_left_margin_col {
                                 sgr_sep()
@@ -1629,6 +1644,9 @@ mod pancurses_backend {
                             } else {
                                 ""
                             };
+                            // When the cell overflows, skip the boundary SGR reset
+                            // too so the overflow text stays in default style.
+                            let is_overflowing = can_overflow;
                             out.push_str(&sgr_cup(ry, sx));
                             if !cell_sgr.is_empty() {
                                 out.push_str(cell_sgr);
@@ -1653,20 +1671,33 @@ mod pancurses_backend {
                             // width into the gap area, suppress the gap.
                             let real_gap = if display_w > avail_w { 0 } else { gap_after };
                             let sgr_applied = !cell_sgr.is_empty();
-                            if is_cursor_cell {
-                                out.push_str(SGR_BG_DEFAULT);
-                            } else if cell_style == 2 || cell_style == 3 {
-                                out.push_str(SGR_FG_DEFAULT);
-                            } else if is_boundary {
-                                if vi + 1 >= n {
-                                    out.push_str(SGR_RESET);
+                            // Defer SGR reset for last cell in row when it
+                            // has cursor or boundary styling, so the fill
+                            // spaces and right border share the same styling.
+                            let is_last = vi + 1 >= n;
+                            if is_last && (is_cursor_cell || is_boundary) {
+                                defer_sgr_reset = true;
+                                last_sgr = if is_cursor_cell {
+                                    SGR_BG_DEFAULT.to_string()
                                 } else {
+                                    SGR_RESET.to_string()
+                                };
+                            } else {
+                                if is_cursor_cell {
+                                    out.push_str(SGR_BG_DEFAULT);
+                                } else if cell_style == 2 || cell_style == 3 {
+                                    out.push_str(SGR_FG_DEFAULT);
+                                } else if is_boundary && !is_overflowing {
+                                    if vi + 1 >= n {
+                                        out.push_str(SGR_RESET);
+                                    } else {
+                                        out.push_str(SGR_FG_DEFAULT);
+                                    }
+                                } else if is_left_margin_col || is_right_margin_col {
+                                    out.push_str(SGR_FG_DEFAULT);
+                                } else if sgr_applied {
                                     out.push_str(SGR_FG_DEFAULT);
                                 }
-                            } else if is_left_margin_col || is_right_margin_col {
-                                out.push_str(SGR_FG_DEFAULT);
-                            } else if sgr_applied {
-                                out.push_str(SGR_FG_DEFAULT);
                             }
                             // Inter-column gap (1 space) – drawn in default style
                             if real_gap > 0 {
@@ -1675,13 +1706,14 @@ mod pancurses_backend {
                             let overflowed_this = can_overflow && overflow_cols == 0;
                             if overflowed_this {
                                 prev_overflowed = true;
-                                force_right_gray = true;
                             } else {
                                 prev_overflowed = false;
                             }
                             vi += 1 + overflow_cols as usize;
                         }
                         // Fill remaining row width before right border
+                        // If the last cell deferred its SGR reset, the filler
+                        // spaces and border inherit the cursor/boundary style.
                         let after_content = rect.x + 1 + 5 + column_layout.iter()
                             .map(|&(_, w, _)| w as i32).sum::<i32>()
                             + (n.saturating_sub(1) as i32); // gaps between columns
@@ -1692,6 +1724,11 @@ mod pancurses_backend {
                             }
                         }
                         out.push_str(&sgr_cup(ry, rect.x + rect.w - 1));
+                        // Apply deferred SGR reset BEFORE the right border so
+                        // the border `│` uses default styling.
+                        if defer_sgr_reset {
+                            out.push_str(&last_sgr);
+                        }
                         out.push_str("│");
                     } else {
                         let cw = *col_width as i32;
