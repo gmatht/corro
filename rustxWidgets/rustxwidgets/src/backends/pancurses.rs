@@ -2189,14 +2189,14 @@ mod pancurses_backend {
             };
             let (cells, raw_cells, top_row, left_col, cursor_row, cursor_col, editing, edit_buf, edit_pos,
                  col_width, margin_cols, main_cols, menu_text, status_text,
-                 column_layout, row_labels) = match &n.kind {
+                 formula_bar_trailing, column_layout, row_labels) = match &n.kind {
                 PcWidgetKind::Spreadsheet { cells, raw_cells, top_row, left_col, cursor_row, cursor_col,
                     editing, edit_buf, edit_pos, col_width, margin_cols, main_cols,
-                    menu_text, status_text, ref column_layout, ref row_labels, .. } => {
+                    menu_text, status_text, ref formula_bar_trailing, ref column_layout, ref row_labels, .. } => {
                     (cells.clone(), raw_cells.clone(), *top_row, *left_col, *cursor_row, *cursor_col,
                      *editing, edit_buf.clone(), *edit_pos, *col_width,
                      *margin_cols, *main_cols, menu_text.clone(), status_text.clone(),
-                     column_layout.clone(), row_labels.clone())
+                     formula_bar_trailing.clone(), column_layout.clone(), row_labels.clone())
                 }
                 _ => return,
             };
@@ -2216,16 +2216,16 @@ mod pancurses_backend {
                 row += 1;
             }
 
-            // Formula bar (matching ratatui: leading space)
+            // Formula bar (matching ratatui: leading space, trailing text)
             if row < height {
                 let addr_text = format!("{}{}", col_label(cursor_col), cursor_row + 1);
                 let cell_val = raw_cells.borrow().get(&(cursor_row, cursor_col)).cloned().unwrap_or_default();
-                let max_fb = width.saturating_sub(addr_text.chars().count() + 3).max(1);
+                let max_fb = width.saturating_sub(addr_text.chars().count() + 3 + formula_bar_trailing.chars().count()).max(1);
                 let fb_text = if cell_val.chars().count() > max_fb {
                     let truncated: String = cell_val.chars().take(max_fb.saturating_sub(3)).collect();
-                    format!(" {}  {}…", addr_text, truncated)
+                    format!(" {}  {}…{}", addr_text, truncated, formula_bar_trailing)
                 } else {
-                    format!(" {}  {}", addr_text, cell_val)
+                    format!(" {}  {}{}", addr_text, cell_val, formula_bar_trailing)
                 };
                 let truncated: String = fb_text.chars().take(width).collect();
                 buf[row] = truncated;
@@ -2302,25 +2302,63 @@ mod pancurses_backend {
                 let cells_ref = cells.borrow();
                 if use_layout {
                     let lm = margin_cols;
-                    for &(col_idx, w, _) in &column_layout {
+                    let n = column_layout.len();
+                    let mut vi = 0usize;
+                    while vi < n {
+                        let (col_idx, w, _) = column_layout[vi];
                         let is_margin = lm > 0 && col_idx < lm;
                         let cell_text = if !is_margin {
                             let main_col = col_idx - lm;
                             cells_ref.get(&(row_idx, main_col)).map(|s| s.as_str()).unwrap_or("")
                         } else { "" };
                         let cell_w = w as usize;
-                        let display = if cell_text.is_empty() {
-                            String::new()
-                        } else {
-                            let text_width = cell_text.chars().count();
-                            if text_width > cell_w {
-                                let trunc = (cell_w - 1).max(1);
+                        if cell_text.is_empty() {
+                            data_row.push_str(&format!("{:<1$}", "", cell_w));
+                            vi += 1;
+                            continue;
+                        }
+                        let text_width = cell_text.chars().count();
+                        // Find overflow space into adjacent empty columns
+                        let mut overflow_cols = 0usize;
+                        if text_width > cell_w {
+                            let mut scan = vi + 1;
+                            while scan < n {
+                                let (sc_idx, _, _) = column_layout[scan];
+                                let is_margin2 = lm > 0 && sc_idx < lm;
+                                let sc_text = if !is_margin2 {
+                                    let main_sc = sc_idx - lm;
+                                    cells_ref.get(&(row_idx, main_sc)).map(|s| s.as_str()).unwrap_or("")
+                                } else { "" };
+                                if sc_text.is_empty() {
+                                    overflow_cols += 1;
+                                    scan += 1;
+                                } else { break; }
+                            }
+                        }
+                        let gap_after = if overflow_cols == 0 && vi + 1 < n { 1 } else { 0 };
+                        let total_avail: usize = column_layout[vi..=vi+overflow_cols].iter()
+                            .map(|&(_, w, _)| w as usize).sum::<usize>()
+                            + overflow_cols // spaces between overflow columns
+                            + gap_after;   // gap to next column
+                        let display = if text_width > total_avail {
+                            if overflow_cols == 0 {
+                                cell_text.chars().take(total_avail).collect()
+                            } else {
+                                let trunc = total_avail.saturating_sub(1).max(1);
                                 let mut s: String = cell_text.chars().take(trunc).collect();
                                 if text_width > trunc { s.push('…'); }
                                 s
-                            } else { cell_text.to_string() }
+                            }
+                        } else { cell_text.to_string() };
+                        // Pad to combined width of current + overflow columns to maintain alignment
+                        let total_width = if overflow_cols > 0 {
+                            column_layout[vi..=vi+overflow_cols].iter()
+                                .map(|&(_, w, _)| w as usize).sum::<usize>()
+                        } else {
+                            cell_w
                         };
-                        data_row.push_str(&format!("{:<1$}", display, cell_w));
+                        data_row.push_str(&format!("{:<1$}", display, total_width));
+                        vi += 1 + overflow_cols;
                     }
                 } else {
                     let max_data_cols = ((width as i32 - rh_w as i32 - 2) / (cw as i32 + 1)).max(1) as usize;
@@ -2406,6 +2444,7 @@ mod pancurses_backend {
                     menu_text: String::new(),
                     status_text: String::new(),
                     border_title: String::new(),
+                    formula_bar_trailing: String::new(),
                     column_layout: Vec::new(),
                     row_labels: Vec::new(),
                 },
@@ -2569,6 +2608,7 @@ mod pancurses_backend {
                     menu_text: " [File]  Edit    Insert    Format    Sheet    Help".into(),
                     status_text: "  type/F2·edit; Ctrl+C·copy; Ctrl+X·cut; Ctrl+V·paste; Ctrl+;·date; Ctrl+:·time; Ctrl+S·save; F1·help".into(),
                     border_title: String::new(),
+                    formula_bar_trailing: String::new(),
                     column_layout: Vec::new(),
                     row_labels: Vec::new(),
                 },
@@ -3147,6 +3187,7 @@ mod pancurses_backend {
                     menu_text: "menu".into(),
                     status_text: "status".into(),
                     border_title: String::new(),
+                    formula_bar_trailing: String::new(),
                     column_layout: vec![(0,10,"A".into()),(1,10,"B".into()),(2,10,"C".into())],
                     row_labels: vec![(0,"   1".into()),(1,"   2".into())],
                 },
@@ -3178,6 +3219,7 @@ mod pancurses_backend {
                     anchor: None,
                     menu_text: String::new(), status_text: String::new(),
                     border_title: String::new(),
+                    formula_bar_trailing: String::new(),
                     column_layout: vec![(0,5,"X".into()),(1,5,"Y".into())],
                     row_labels: vec![],
                 },
@@ -3207,6 +3249,7 @@ mod pancurses_backend {
                     anchor: None,
                     menu_text: String::new(), status_text: String::new(),
                     border_title: String::new(),
+                    formula_bar_trailing: String::new(),
                     column_layout: vec![(0,8,"A".into())],
                     row_labels: vec![(0,"ROW0".into()),(1,"ROW1".into())],
                 },
