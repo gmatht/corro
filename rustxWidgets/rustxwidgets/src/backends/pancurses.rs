@@ -1259,9 +1259,12 @@ mod pancurses_backend {
                 // Data rows — compute available rows, leaving room for bottom border + optional status/tab lines
                 let has_status = !status_text.is_empty();
                 let has_tabs = !tab_text.is_empty();
-                // When tabs exist, status overlays the bottom border line; otherwise status takes a separate line.
-                let extra_lines = if has_tabs { 1 } else if has_status { 1 } else { 0 };
-                let grid_bottom = rect.y + rect.h - (1 + extra_lines);
+                // Reserve lines below the grid: bottom border always gets one;
+                // status gets its own line (below the border) when tabs are absent,
+                // otherwise status overlays the border line (matching ratatui).
+                let extra_lines = 1 // bottom border
+                    + if has_tabs { 1 } else if has_status { 1 } else { 0 };
+                let grid_bottom = rect.y + rect.h - extra_lines;
                 let max_data_rows = ((grid_bottom - row_offset) as i32).max(1) as u32;
                 for vr in 0..max_data_rows {
                     let row_idx = *top_row + vr as u32;
@@ -1418,32 +1421,45 @@ mod pancurses_backend {
                         root.mvaddstr(ry, rect.x + rect.w - 1, "│");
                     }
                 }
-                // Bottom border line (ratatui: hints text overwrites left part, ─ and ┘ remain on right)
+                // Bottom border line
                 {
                     let br = row_offset + max_data_rows as i32;
-                    if has_status {
-                        // Draw status text first, then fill remaining with ─ and ┘
+                    root.mvaddstr(br, rect.x, "└");
+                    for i in 1..rect.w - 1 {
+                        root.mvaddstr(br, rect.x + i, "─");
+                    }
+                    root.mvaddstr(br, rect.x + rect.w - 1, "┘");
+                }
+                // Status bar — on its own line below the bottom border (unless tabs are
+                // present, in which case it overlays the border line, matching ratatui).
+                if has_status {
+                    let sr = if has_tabs {
+                        // Overlay status on the border line
+                        row_offset + max_data_rows as i32
+                    } else {
+                        // Separate line below the border
+                        row_offset + max_data_rows as i32 + 1
+                    };
+                    if sr < rect.y + rect.h {
                         if has_colors() { root.attron(COLOR_PAIR(3)); }
                         let max_w = rect.w as usize;
                         let st_end = status_text.char_indices().nth(max_w).map(|(i, _)| i).unwrap_or(status_text.len());
-                        let st_vis = status_text[..st_end].chars().count();
-                        root.mvaddstr(br, rect.x, &status_text[..st_end]);
+                        root.mvaddstr(sr, rect.x, &status_text[..st_end]);
                         if has_colors() { root.attroff(COLOR_PAIR(3)); }
-                        if st_vis < rect.w as usize - 1 {
-                            for i in st_vis as i32..rect.w - 1 {
-                                root.mvaddstr(br, rect.x + i, "─");
+                        // If tabs are present, fill the remainder of this line with ─ and ┘
+                        // (matching ratatui's overlay behavior).
+                        if has_tabs {
+                            let st_vis = status_text[..st_end].chars().count();
+                            if st_vis < rect.w as usize - 1 {
+                                for i in st_vis as i32..rect.w - 1 {
+                                    root.mvaddstr(sr, rect.x + i, "─");
+                                }
+                                root.mvaddstr(sr, rect.x + rect.w - 1, "┘");
                             }
-                            root.mvaddstr(br, rect.x + rect.w - 1, "┘");
                         }
-                    } else {
-                        root.mvaddstr(br, rect.x, "└");
-                        for i in 1..rect.w - 1 {
-                            root.mvaddstr(br, rect.x + i, "─");
-                        }
-                        root.mvaddstr(br, rect.x + rect.w - 1, "┘");
                     }
                 }
-                // Tab bar — below the grid (if non-empty)
+                // Tab bar — below the bottom border
                 if !tab_text.is_empty() {
                     let ty = row_offset + max_data_rows as i32 + 1;
                     if ty < rect.y + rect.h {
@@ -2296,11 +2312,12 @@ mod pancurses_backend {
                 row += 1;
             }
 
-            // Header separator
+            // Header separator (matching ratatui: ││───│)
             if row < height {
                 let mut sep_row = String::new();
                 sep_row.push('│');
-                let dash_len = width.saturating_sub(2).max(1);
+                sep_row.push('│');
+                let dash_len = width.saturating_sub(3).max(1);
                 for _ in 0..dash_len {
                     sep_row.push('─');
                 }
@@ -2312,7 +2329,7 @@ mod pancurses_backend {
             }
 
             // Data rows (with │ border)
-            let grid_bottom = height - if status_text.is_empty() { 0 } else { 1 };
+            let grid_bottom = height - if status_text.is_empty() { 0 } else { 2 };
             while row < grid_bottom && row < height {
                 let row_idx = top_row + (row.saturating_sub(4)) as u32;
                 let mut data_row = String::new();
@@ -2438,7 +2455,23 @@ mod pancurses_backend {
                 row += 1;
             }
 
-            // Status bar
+            // Bottom border line (matching ratatui layout)
+            if row < height {
+                let mut border = String::new();
+                border.push('└');
+                for _ in 1..width.saturating_sub(1) {
+                    border.push('─');
+                }
+                if width > 1 {
+                    border.push('┘');
+                }
+                let cut = border.char_indices().take(width).last().map(|(i, _)| i).unwrap_or(0);
+                if cut > 0 { buf[row] = border[..cut].to_string(); }
+                else { buf[row] = border.chars().take(width).collect(); }
+                row += 1;
+            }
+
+            // Status bar (always on its own line below the bottom border)
             if !status_text.is_empty() && row < height {
                 let display = &status_text[..status_text.len().min(width)];
                 buf[row] = display.to_string();
