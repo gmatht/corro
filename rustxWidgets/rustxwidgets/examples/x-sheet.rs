@@ -1,5 +1,4 @@
 use rustxwidgets::prelude::*;
-use rustxwidgets::backends_gtk_adapter as gtk;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -72,7 +71,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Seed demo data
     {
         let mut t = texts.borrow_mut();
-        let mut f = fmts.borrow_mut();
+        let _f = fmts.borrow_mut();
         t[0][0] = "Short".into();
         t[1][0] = "VeryLongHeaderThatOverflows".into();
         t[2][0] = "CellWithAVeryLongWordThatWillSpanMultipleCells".into();
@@ -92,10 +91,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Layout
-    let vbox = app.create_box(Orientation::Vertical, 0)?;
+    let mut vbox = app.create_box(Orientation::Vertical, 0)?;
 
     // Toolbar
-    let toolbar = app.create_box(Orientation::Horizontal, 2)?;
+    let mut toolbar = app.create_box(Orientation::Horizontal, 2)?;
     let open_btn = app.create_button("Open")?;
     let save_btn = app.create_button("Save As")?;
     let quit_btn = app.create_button("Quit")?;
@@ -121,11 +120,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     toolbar.append(&al_r);
     toolbar.append(&hl_btn);
     toolbar.append(&fg_btn);
-    let toolbar_box = app.create_box(Orientation::Vertical, 0)?;
+    let mut toolbar_box = app.create_box(Orientation::Vertical, 0)?;
     toolbar_box.append(&toolbar);
 
     // Formula bar
-    let formula_bar = app.create_box(Orientation::Horizontal, 4)?;
+    let mut formula_bar = app.create_box(Orientation::Horizontal, 4)?;
     let fx_label = app.create_label("  fx  ")?;
     formula_bar.append(&fx_label);
     let formula_entry = app.create_entry()?;
@@ -133,46 +132,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     formula_entry.set_size_request(400, 26);
     formula_bar.append(&formula_entry);
 
-    // Load the GTK backend loader for CSS/compat checks
-    let gtk_loader = rustxwidgets::backends::gtk::loader()
-        .expect("GTK loader not initialized");
-    let is_gtk4 = gtk_loader.symbols.gtk_container_add.is_none();
-
     // Canvas + Overlay
     let overlay = app.create_overlay()?;
     let canvas = app.create_canvas()?;
     let total_w_i = total_w as i32;
     let total_h_i = total_h as i32;
     canvas.set_size_request(total_w_i, total_h_i);
-    if is_gtk4 {
-        canvas.set_content_size(total_w_i, total_h_i);
-    }
+    canvas.set_content_size(total_w_i, total_h_i);
     overlay.set_child(&canvas);
-    overlay.set_hexpand(true);
+    #[cfg(feature = "gtk")]
     overlay.set_vexpand(true);
+    #[cfg(feature = "gtk")]
+    overlay.set_hexpand(true);
 
-    // ScrolledWindow wrapping the overlay (same as g-spreadsheet-canvas)
-    let scrolled = gtk_dynamic_loader::ScrolledWindow::new(gtk_loader.clone())?;
-    scrolled.set_policy(0, 0);
-    scrolled.set_child(&overlay);
+    #[cfg(feature = "gtk")]
+    let scrolled = {
+        let gtk_loader = rustxwidgets::backends::gtk::loader()
+            .expect("GTK loader not initialized");
+        let s = gtk_dynamic_loader::ScrolledWindow::new(gtk_loader.clone())?;
+        s.set_policy(0, 0);
+        s.set_child(&overlay);
+        let css = r#"
+        button { font-size: 11px; padding: 1px 8px; min-height: 20px; }
+        entry { padding: 0; border: none; font-family: monospace; font-size: 13px; min-height: 0; }
+        entry:focus { outline: none; }
+        .cell-bold { font-weight: bold; }
+        .cell-italic { font-style: italic; }
+        .cell-both { font-weight: bold; font-style: italic; }
+        .cell-fg-red { color: #cc0000; }
+        .cell-fg-blue { color: #0000cc; }
+        .cell-fg-green { color: #006600; }
+        "#;
+        if let Some(provider) = gtk_dynamic_loader::create_css_provider(&gtk_loader, css) {
+            gtk_dynamic_loader::add_css_provider_global(&gtk_loader, *win.as_ref(), provider, 600);
+        }
+        s
+    };
+    #[cfg(feature = "gtk")]
     scrolled.set_hexpand(true);
+    #[cfg(feature = "gtk")]
     scrolled.set_vexpand(true);
-
-    // Global CSS (same as g-spreadsheet-canvas for pixel-perfect rendering)
-    let css = r#"
-    button { font-size: 11px; padding: 1px 8px; min-height: 20px; }
-    entry { padding: 0; border: none; font-family: monospace; font-size: 13px; min-height: 0; }
-    entry:focus { outline: none; }
-    .cell-bold { font-weight: bold; }
-    .cell-italic { font-style: italic; }
-    .cell-both { font-weight: bold; font-style: italic; }
-    .cell-fg-red { color: #cc0000; }
-    .cell-fg-blue { color: #0000cc; }
-    .cell-fg-green { color: #006600; }
-    "#;
-    if let Some(provider) = gtk_dynamic_loader::create_css_provider(&gtk_loader, css) {
-        gtk_dynamic_loader::add_css_provider_global(&gtk_loader, *win.as_ref(), provider, 600);
-    }
+    #[cfg(not(feature = "gtk"))]
+    let scrolled = {
+        let s = app.create_scrolled_window()?;
+        s.set_policy(0, 0);
+        s.set_child(&overlay);
+        s
+    };
+    #[cfg(not(feature = "gtk"))]
+    scrolled.set_hexpand(true);
+    #[cfg(not(feature = "gtk"))]
+    scrolled.set_vexpand(true);
 
     // Focus tracking for formula entry
     let text_input_active2 = text_input_active.clone();
@@ -231,11 +241,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let commit = commit_edit.clone();
         let sel_edit = sel.clone();
         let refresh = refresh_selection.clone();
+        let app_for_edit = app.clone();
         let self_ref: Rc<RefCell<Option<Rc<dyn Fn(usize, usize)>>>> = Rc::new(RefCell::new(None));
         let self_ref2 = self_ref.clone();
         let start: Rc<dyn Fn(usize, usize)> = Rc::new(move |r: usize, c: usize| {
             if edit_entry.borrow().is_some() { return; }
-            if let Ok(entry) = gtk::create_entry() {
+            let created = {
+                #[cfg(not(windows))]
+                { gtk::create_entry() }
+                #[cfg(windows)]
+                { app_for_edit.create_entry() }
+            };
+            if let Ok(entry) = created {
                 *text_active.borrow_mut() = true;
                 entry.set_text(&texts_edit.borrow()[r][c]);
                 // Apply cell formatting to the entry widget
@@ -607,7 +624,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let edit_entry_al = editing_entry.clone();
+    let _edit_entry_al = editing_entry.clone();
     let _ = al_l.on_click({
         let sel_al = sel.clone(); let fmts_al = fmts.clone(); let cv_al = canvas.clone();
         let ed_al = editing_entry.clone();
@@ -684,10 +701,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // File operations
+    let app_open = app.clone();
     let texts_open = texts.clone();
     let cv_open = canvas.clone();
     let _ = open_btn.on_click(move || {
-        if let Ok(Some(path)) = gtk::open_file("Open spreadsheet") {
+        if let Ok(Some(path)) = app_open.open_file("Open spreadsheet") {
             if let Ok(data) = std::fs::read_to_string(&path) {
                 if let Ok(mut t) = texts_open.try_borrow_mut() {
                     for row in t.iter_mut() { for cell in row.iter_mut() { *cell = String::new(); } }
@@ -703,9 +721,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     });
+    let app_save = app.clone();
     let texts_save = texts.clone();
     let _ = save_btn.on_click(move || {
-        if let Ok(Some(path)) = gtk::save_file("Save spreadsheet as") {
+        if let Ok(Some(path)) = app_save.save_file("Save spreadsheet as") {
             let mut out = String::new();
             if let Ok(t) = texts_save.try_borrow() {
                 for row in t.iter() {
@@ -726,9 +745,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     vbox.append(&toolbar_box);
     vbox.append(&formula_bar);
     vbox.append(&scrolled);
-    vbox.set_vexpand(true);
-    vbox.set_hexpand(true);
-    win.set_child(&vbox);
+    vbox.set_child_vexpand(&scrolled, true);
+    vbox.set_child_hexpand(&scrolled, true);
+    win.set_child_box(&vbox);
     win.present();
 
     app.run().map_err(|e| Box::new(e) as Box<dyn std::error::Error>)

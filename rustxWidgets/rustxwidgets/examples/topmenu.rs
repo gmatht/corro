@@ -5,7 +5,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Status label
     let status_label = app.create_label("Ready")?;
-    let label = status_label.clone();
+    let _label = status_label.clone();
 
     // Build simple menu bar items
     let mut file_menu = app.create_menu()?;
@@ -26,16 +26,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     window.set_title("RustXWidgets Top Menu Demo");
 
     // Create MenuBar
-    let menubar = unsafe { app.create_menubar(&menubar_model, std::ptr::null_mut())? };
+    let menubar = unsafe { app.create_menubar(&menubar_model, window.hwnd())? };
 
     // Pack menubar + status label in a vertical box
-    let vbox = app.create_box(
+    let mut vbox = app.create_box(
         rustxwidgets::prelude::Orientation::Vertical, 0,
     )?;
     vbox.append(&menubar);
     vbox.append(&status_label);
 
-    window.set_child(&vbox);
+    window.set_child_box(&vbox);
     window.present();
 
     println!("Running topmenu demo. Press ESC to quit.");

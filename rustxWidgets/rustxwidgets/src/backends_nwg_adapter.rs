@@ -1,16 +1,17 @@
 #[cfg(windows)]
 mod nwg_adapter {
     use native_windows_gui as nwg;
-    use crate::core::{Error, Widget};
+    use crate::core::{Error, Widget, DrawContext};
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::os::raw::c_void;
     use std::rc::Rc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn set_window_pos(hwnd: *mut c_void, x: i32, y: i32, w: i32, h: i32) {
         unsafe {
             winapi::um::winuser::SetWindowPos(
-                hwnd as winapi::um::winnt::HWND,
+                hwnd as winapi::shared::windef::HWND,
                 std::ptr::null_mut(), x, y, w, h,
                 winapi::um::winuser::SWP_NOZORDER | winapi::um::winuser::SWP_SHOWWINDOW,
             );
@@ -22,41 +23,122 @@ mod nwg_adapter {
     pub struct Window {
         pub(crate) inner: nwg::Window,
         pub(crate) _handler: nwg::EventHandler,
+        root_child: Rc<RefCell<Option<*mut c_void>>>,
+        layout_cb: Rc<RefCell<Option<Box<dyn FnMut(i32, i32)>>>>,
     }
 
     impl Widget for Window {
         fn raw_handle(&self) -> *mut c_void {
-            self.inner.hwnd().unwrap_or(std::ptr::null_mut()) as *mut c_void
+            self.inner.handle.hwnd().unwrap_or(std::ptr::null_mut()) as *mut c_void
         }
     }
 
     impl AsRef<*mut c_void> for Window {
         fn as_ref(&self) -> &*mut c_void {
-            unsafe { &*(&self.inner.hwnd().unwrap_or(std::ptr::null_mut()) as *const _ as *const *mut c_void) }
+            unsafe { &*(&self.inner.handle.hwnd().unwrap_or(std::ptr::null_mut()) as *const _ as *const *mut c_void) }
         }
     }
 
     impl Window {
         pub fn set_title(&self, title: &str) { self.inner.set_text(title); }
-        pub fn set_child(&self, _child: &impl AsRef<*mut c_void>) {}
-        pub fn present(&self) {}
+        pub fn set_child(&self, child: &impl AsRef<*mut c_void>) {
+            let ptr = *child.as_ref();
+            if !ptr.is_null() {
+                unsafe {
+                    winapi::um::winuser::SetParent(ptr as _, self.hwnd() as _);
+                }
+                *self.root_child.borrow_mut() = Some(ptr);
+                let hwnd = ptr;
+                *self.layout_cb.borrow_mut() = Some(Box::new(move |w, h| {
+                    set_window_pos(hwnd, 0, 0, w, h);
+                }));
+            }
+        }
+        pub fn set_child_box(&self, bx: &BoxWidget) {
+            if !bx.hwnd.is_null() {
+                unsafe {
+                    winapi::um::winuser::SetParent(bx.hwnd as _, self.hwnd() as _);
+                }
+            }
+            let hwnd = bx.hwnd;
+            let bx = bx.clone();
+            *self.layout_cb.borrow_mut() = Some(Box::new(move |w, h| {
+                set_window_pos(hwnd, 0, 0, w, h);
+                bx.layout(0, 0, w, h);
+            }));
+        }
+        pub fn set_layout_cb<F: FnMut(i32, i32) + 'static>(&self, f: F) {
+            *self.layout_cb.borrow_mut() = Some(Box::new(f));
+        }
+        pub fn set_default_size(&self, w: i32, h: i32) {
+            let hwnd = self.inner.handle.hwnd().unwrap_or(std::ptr::null_mut());
+            if hwnd != std::ptr::null_mut() {
+                unsafe {
+                    winapi::um::winuser::SetWindowPos(
+                        hwnd as _,
+                        std::ptr::null_mut(), 0, 0, w, h,
+                        winapi::um::winuser::SWP_NOZORDER | winapi::um::winuser::SWP_NOMOVE,
+                    );
+                }
+            }
+        }
+        pub fn present(&self) {
+            let hwnd = self.inner.handle.hwnd().unwrap_or(std::ptr::null_mut());
+            if hwnd != std::ptr::null_mut() {
+                unsafe {
+                    let mut rect: winapi::shared::windef::RECT = std::mem::zeroed();
+                    winapi::um::winuser::GetClientRect(hwnd, &mut rect);
+                    let w = rect.right - rect.left;
+                    let h = rect.bottom - rect.top;
+                    if let Some(ref mut cb) = *self.layout_cb.borrow_mut() {
+                        cb(w, h);
+                    }
+                }
+            }
+        }
         pub fn insert_action_group(&self, _name: &str, _group_ptr: *mut c_void) {}
         pub fn hwnd(&self) -> *mut c_void {
-            self.inner.hwnd().unwrap_or(std::ptr::null_mut()) as *mut c_void
+            self.inner.handle.hwnd().unwrap_or(std::ptr::null_mut()) as *mut c_void
         }
     }
 
     pub fn create_window(parent_cell: &Rc<RefCell<Option<*mut c_void>>>) -> Result<Window, Error> {
         let (inner, handler) = crate::backends::nwg::create_window(parent_cell)
             .map_err(|e| Error::Backend(format!("{}", e)))?;
-        Ok(Window { inner, _handler: handler })
+        let root_child: Rc<RefCell<Option<*mut c_void>>> = Rc::new(RefCell::new(None));
+        let layout_cb: Rc<RefCell<Option<Box<dyn FnMut(i32, i32)>>>> = Rc::new(RefCell::new(None));
+
+        // Bind raw WM_SIZE handler
+        let hwnd = inner.handle.hwnd().unwrap_or(std::ptr::null_mut());
+        if hwnd != std::ptr::null_mut() {
+            let cb = layout_cb.clone();
+            static RAW_HANDLER_ID: AtomicUsize = AtomicUsize::new(0x10000000);
+            let handler_id = RAW_HANDLER_ID.fetch_add(1, Ordering::SeqCst);
+            nwg::bind_raw_event_handler(
+                &nwg::ControlHandle::Hwnd(hwnd),
+                handler_id,
+                move |_h, msg, _w, l| {
+                    if msg == winapi::um::winuser::WM_SIZE {
+                        let w = (l & 0xFFFF) as i32;
+                        let h = ((l >> 16) & 0xFFFF) as i32;
+                        if let Some(ref mut cb) = *cb.borrow_mut() {
+                            cb(w, h);
+                        }
+                    }
+                    None
+                },
+            ).map_err(|e| Error::Backend(format!("{}", e)))?;
+        }
+
+        Ok(Window { inner, _handler: handler, root_child, layout_cb })
     }
 
     // -- Button --
 
+    #[derive(Clone)]
     pub struct Button {
-        pub(crate) inner: nwg::Button,
-        pub(crate) _handler: nwg::EventHandler,
+        pub(crate) inner: Rc<nwg::Button>,
+        pub(crate) _handler: Rc<nwg::EventHandler>,
         pub(crate) click_cb: Rc<RefCell<Option<Box<dyn FnMut()>>>>,
     }
 
@@ -69,77 +151,227 @@ mod nwg_adapter {
             if let Some(ref mut cb) = *self.click_cb.borrow_mut() { cb(); }
             Ok(0)
         }
+        pub fn set_size_request(&self, w: i32, h: i32) {
+            if let Some(hwnd) = self.inner.handle.hwnd() {
+                unsafe {
+                    winapi::um::winuser::SetWindowPos(
+                        hwnd as _,
+                        std::ptr::null_mut(), 0, 0, w, h,
+                        winapi::um::winuser::SWP_NOZORDER | winapi::um::winuser::SWP_NOMOVE | winapi::um::winuser::SWP_SHOWWINDOW,
+                    );
+                }
+            }
+        }
     }
 
     impl AsRef<*mut c_void> for Button {
         fn as_ref(&self) -> &*mut c_void {
-            unsafe { &*(&self.inner.hwnd().unwrap_or(std::ptr::null_mut()) as *const _ as *const *mut c_void) }
+            unsafe { &*(&self.inner.handle.hwnd().unwrap_or(std::ptr::null_mut()) as *const _ as *const *mut c_void) }
         }
     }
 
-    pub fn create_button(parent: *mut c_void) -> Result<Button, Error> {
-        let (inner, click_cb, handler) = crate::backends::nwg::create_button(parent)
+    pub fn create_button(parent: *mut c_void, text: &str) -> Result<Button, Error> {
+        let (inner, click_cb, handler) = crate::backends::nwg::create_button(parent, text)
             .map_err(|e| Error::Backend(format!("{}", e)))?;
-        Ok(Button { inner, _handler: handler, click_cb })
+        Ok(Button { inner: Rc::new(inner), _handler: Rc::new(handler), click_cb })
     }
 
     // -- Label --
 
-    pub struct Label(pub(crate) nwg::Label);
+    #[derive(Clone)]
+    pub struct Label(pub(crate) Rc<nwg::Label>);
 
     impl Label {
         pub fn set_text(&self, text: &str) { self.0.set_text(text); }
         pub fn get_text(&self) -> Option<String> { Some(self.0.text()) }
         pub fn set_visible(&self, visible: bool) { self.0.set_visible(visible); }
         pub fn set_markup(&self, markup: &str) { self.0.set_text(markup); }
+        pub fn set_margin_start(&self, _px: i32) {}
+        pub fn set_margin_top(&self, _px: i32) {}
+        pub fn set_halign(&self, _align: i32) {}
+        pub fn set_valign(&self, _align: i32) {}
     }
 
     impl AsRef<*mut c_void> for Label {
         fn as_ref(&self) -> &*mut c_void {
-            unsafe { &*(&self.0.hwnd().unwrap_or(std::ptr::null_mut()) as *const _ as *const *mut c_void) }
+            unsafe { &*(&self.0.handle.hwnd().unwrap_or(std::ptr::null_mut()) as *const _ as *const *mut c_void) }
         }
     }
 
     pub fn create_label(parent: *mut c_void) -> Result<Label, Error> {
-        crate::backends::nwg::create_label(parent).map(Label).map_err(|e| Error::Backend(format!("{}", e)))
+        crate::backends::nwg::create_label(parent).map(|l| Label(Rc::new(l))).map_err(|e| Error::Backend(format!("{}", e)))
     }
 
     // -- BoxWidget --
 
     pub struct BoxWidget {
+        pub(crate) frame: Option<Rc<nwg::Frame>>,
+        pub(crate) hwnd: *mut c_void,
         pub(crate) children: Vec<*mut c_void>,
+        pub(crate) child_vexpand: Vec<bool>,
+        pub(crate) child_hexpand: Vec<bool>,
         pub(crate) orientation: crate::backends::nwg::Orientation,
         pub(crate) spacing: i32,
     }
 
-    impl BoxWidget {
-        pub fn append(&mut self, child: &impl AsRef<*mut c_void>) {
-            let ptr = *child.as_ref();
-            if !ptr.is_null() { self.children.push(ptr); }
-        }
-        pub fn layout(&self, x: i32, y: i32, w: i32, h: i32) {
-            let mut pos = 5;
-            let (iw, ih) = match self.orientation {
-                crate::backends::nwg::Orientation::Horizontal => (60, h - 10),
-                crate::backends::nwg::Orientation::Vertical => (w - 10, 28),
-            };
-            for &child in &self.children {
-                match self.orientation {
-                    crate::backends::nwg::Orientation::Horizontal => {
-                        set_window_pos(child, x + pos, y + 5, iw, ih);
-                        pos += iw + self.spacing;
-                    }
-                    crate::backends::nwg::Orientation::Vertical => {
-                        set_window_pos(child, x + 5, y + pos, iw, ih);
-                        pos += ih + self.spacing;
-                    }
-                }
+    impl Clone for BoxWidget {
+        fn clone(&self) -> Self {
+            BoxWidget {
+                frame: self.frame.clone(),
+                hwnd: self.hwnd,
+                children: self.children.clone(),
+                child_vexpand: self.child_vexpand.clone(),
+                child_hexpand: self.child_hexpand.clone(),
+                orientation: self.orientation,
+                spacing: self.spacing,
             }
         }
     }
 
-    pub fn create_box(orientation: crate::backends::nwg::Orientation, spacing: i32) -> Result<BoxWidget, Error> {
-        Ok(BoxWidget { children: Vec::new(), orientation, spacing })
+    impl AsRef<*mut c_void> for BoxWidget {
+        fn as_ref(&self) -> &*mut c_void {
+            &self.hwnd
+        }
+    }
+
+    pub trait Appendable {
+        fn collect_hwnds(&self) -> Vec<*mut c_void>;
+    }
+
+    impl<T: AsRef<*mut c_void>> Appendable for T {
+        fn collect_hwnds(&self) -> Vec<*mut c_void> {
+            let ptr = *self.as_ref();
+            if ptr.is_null() { vec![] } else { vec![ptr] }
+        }
+    }
+
+    impl BoxWidget {
+        pub fn append(&mut self, child: &impl Appendable) {
+            let hwnds = child.collect_hwnds();
+            for &ptr in &hwnds {
+                if !ptr.is_null() && !self.hwnd.is_null() {
+                    unsafe {
+                        winapi::um::winuser::SetParent(ptr as _, self.hwnd as _);
+                    }
+                }
+            }
+            let count = hwnds.iter().filter(|&&c| !c.is_null()).count();
+            self.children.extend(hwnds.into_iter().filter(|&c| !c.is_null()));
+            self.child_vexpand.resize(self.children.len(), false);
+            self.child_hexpand.resize(self.children.len(), false);
+        }
+        pub fn set_child_vexpand(&mut self, child: &impl AsRef<*mut c_void>, expand: bool) {
+            let ptr = *child.as_ref();
+            if let Some(idx) = self.children.iter().position(|&c| c == ptr) {
+                self.child_vexpand[idx] = expand;
+            }
+        }
+        pub fn set_child_hexpand(&mut self, child: &impl AsRef<*mut c_void>, expand: bool) {
+            let ptr = *child.as_ref();
+            if let Some(idx) = self.children.iter().position(|&c| c == ptr) {
+                self.child_hexpand[idx] = expand;
+            }
+        }
+        pub fn layout(&self, _x: i32, _y: i32, w: i32, h: i32) {
+            let n = self.children.len();
+            if n == 0 { return; }
+            let spacing_total = self.spacing * (n as i32 - 1).max(0);
+            let (fixed_w, fixed_h) = match self.orientation {
+                crate::backends::nwg::Orientation::Horizontal => {
+                    (0, h - 10)
+                }
+                crate::backends::nwg::Orientation::Vertical => {
+                    (w - 10, 0)
+                }
+            };
+            // Count expandable children
+            let expand_count = match self.orientation {
+                crate::backends::nwg::Orientation::Horizontal =>
+                    self.child_hexpand.iter().filter(|&&e| e).count(),
+                crate::backends::nwg::Orientation::Vertical =>
+                    self.child_vexpand.iter().filter(|&&e| e).count(),
+            };
+            // Calculate fixed children size
+            let fixed_total: i32 = (0..n).map(|i| {
+                let is_expand = match self.orientation {
+                    crate::backends::nwg::Orientation::Horizontal => self.child_hexpand[i],
+                    crate::backends::nwg::Orientation::Vertical => self.child_vexpand[i],
+                };
+                if is_expand { 0 } else {
+                    match self.orientation {
+                        crate::backends::nwg::Orientation::Horizontal => 60,
+                        crate::backends::nwg::Orientation::Vertical => 28,
+                    }
+                }
+            }).sum();
+            let mut pos = 5;
+            let remaining = match self.orientation {
+                crate::backends::nwg::Orientation::Horizontal => (w - 10 - fixed_total - spacing_total).max(0),
+                crate::backends::nwg::Orientation::Vertical => (h - 10 - fixed_total - spacing_total).max(0),
+            };
+            let expand_size = if expand_count > 0 { remaining / expand_count as i32 } else { 0 };
+
+            for i in 0..n {
+                let child = self.children[i];
+                let is_expand = match self.orientation {
+                    crate::backends::nwg::Orientation::Horizontal => self.child_hexpand[i],
+                    crate::backends::nwg::Orientation::Vertical => self.child_vexpand[i],
+                };
+                let (cw, ch) = match self.orientation {
+                    crate::backends::nwg::Orientation::Horizontal => {
+                        if is_expand { (expand_size, fixed_h) } else { (60, fixed_h) }
+                    }
+                    crate::backends::nwg::Orientation::Vertical => {
+                        if is_expand { (fixed_w, expand_size) } else { (fixed_w, 28) }
+                    }
+                };
+                match self.orientation {
+                    crate::backends::nwg::Orientation::Horizontal => {
+                        set_window_pos(child, pos, 5, cw, ch);
+                        pos += cw + self.spacing;
+                    }
+                    crate::backends::nwg::Orientation::Vertical => {
+                        set_window_pos(child, 5, pos, cw, ch);
+                        pos += ch + self.spacing;
+                    }
+                }
+            }
+        }
+        pub fn set_vexpand(&self, _expand: bool) {}
+        pub fn set_hexpand(&self, _expand: bool) {}
+    }
+
+    pub fn create_box(orientation: crate::backends::nwg::Orientation, spacing: i32, parent: *mut c_void) -> Result<BoxWidget, Error> {
+        let mut frame = nwg::Frame::default();
+        if !parent.is_null() {
+            nwg::Frame::builder()
+                .flags(nwg::FrameFlags::NONE)
+                .size((0, 0))
+                .position((0, 0))
+                .parent(&nwg::ControlHandle::Hwnd(parent as _))
+                .build(&mut frame)
+                .map_err(|e| Error::Backend(format!("{}", e)))?;
+        }
+        let hwnd = frame.handle.hwnd().unwrap_or(std::ptr::null_mut()) as *mut c_void;
+        let bw = BoxWidget { frame: Some(Rc::new(frame)), hwnd, children: Vec::new(), child_vexpand: Vec::new(), child_hexpand: Vec::new(), orientation, spacing };
+        // Auto-layout on WM_SIZE so nested boxes position their children
+        if hwnd != std::ptr::null_mut() {
+            let bw2 = bw.clone();
+            static BOX_SIZE_ID: AtomicUsize = AtomicUsize::new(0xB0000000);
+            let id = BOX_SIZE_ID.fetch_add(1, Ordering::SeqCst);
+            let _ = nwg::bind_raw_event_handler(
+                &nwg::ControlHandle::Hwnd(hwnd as _), id,
+                move |_h, msg, _w, l| {
+                    if msg == winapi::um::winuser::WM_SIZE {
+                        let w = (l & 0xFFFF) as i32;
+                        let h = ((l >> 16) & 0xFFFF) as i32;
+                        bw2.layout(0, 0, w, h);
+                    }
+                    None
+                },
+            );
+        }
+        Ok(bw)
     }
 
     // -- Grid --
@@ -157,9 +389,27 @@ mod nwg_adapter {
     // -- Entry --
 
     pub struct Entry {
-        pub(crate) inner: nwg::TextInput,
-        pub(crate) _handler: nwg::EventHandler,
+        pub(crate) inner: Rc<nwg::TextInput>,
+        pub(crate) _handler: Rc<nwg::EventHandler>,
         pub(crate) changed_cb: Rc<RefCell<Option<Box<dyn FnMut()>>>>,
+        focus_in_cb: Rc<RefCell<Option<Box<dyn FnMut(*mut c_void) -> i32>>>>,
+        focus_out_cb: Rc<RefCell<Option<Box<dyn FnMut(*mut c_void) -> i32>>>>,
+        _focus_in_handler: Option<nwg::RawEventHandler>,
+        _focus_out_handler: Option<nwg::RawEventHandler>,
+    }
+
+    impl Clone for Entry {
+        fn clone(&self) -> Self {
+            Entry {
+                inner: self.inner.clone(),
+                _handler: self._handler.clone(),
+                changed_cb: self.changed_cb.clone(),
+                focus_in_cb: self.focus_in_cb.clone(),
+                focus_out_cb: self.focus_out_cb.clone(),
+                _focus_in_handler: None,
+                _focus_out_handler: None,
+            }
+        }
     }
 
     impl Entry {
@@ -171,19 +421,905 @@ mod nwg_adapter {
         }
         pub fn set_width_chars(&self, _n: i32) {}
         pub fn set_size_request(&self, _w: i32, _h: i32) {}
+        pub fn set_visible(&self, v: bool) { self.inner.set_visible(v); }
         pub fn grab_focus(&self) { let _ = self.inner.set_focus(); }
+        pub fn add_class(&self, _class: &str) {}
+        pub fn remove_class(&self, _class: &str) {}
+        pub fn set_margin_start(&self, _px: i32) {}
+        pub fn set_margin_top(&self, _px: i32) {}
+        pub fn set_halign(&self, _align: i32) {}
+        pub fn set_valign(&self, _align: i32) {}
+        pub fn connect_activate(&self, _f: impl FnMut(*mut c_void) + 'static) -> Result<u64, Error> { Ok(0) }
+        pub fn connect_focus_in_event(&self, f: impl FnMut(*mut c_void) -> i32 + 'static) -> Result<u64, Error> {
+            *self.focus_in_cb.borrow_mut() = Some(Box::new(f));
+            Ok(0)
+        }
+        pub fn connect_focus_out_event(&self, f: impl FnMut(*mut c_void) -> i32 + 'static) -> Result<u64, Error> {
+            *self.focus_out_cb.borrow_mut() = Some(Box::new(f));
+            Ok(0)
+        }
     }
 
     impl AsRef<*mut c_void> for Entry {
         fn as_ref(&self) -> &*mut c_void {
-            unsafe { &*(&self.inner.hwnd().unwrap_or(std::ptr::null_mut()) as *const _ as *const *mut c_void) }
+            unsafe { &*(&self.inner.handle.hwnd().unwrap_or(std::ptr::null_mut()) as *const _ as *const *mut c_void) }
         }
     }
 
     pub fn create_entry(parent: *mut c_void) -> Result<Entry, Error> {
         let (inner, changed_cb, handler) = crate::backends::nwg::create_entry(parent)
             .map_err(|e| Error::Backend(format!("{}", e)))?;
-        Ok(Entry { inner, _handler: handler, changed_cb })
+        let focus_in_cb: Rc<RefCell<Option<Box<dyn FnMut(*mut c_void) -> i32>>>> = Rc::new(RefCell::new(None));
+        let focus_out_cb: Rc<RefCell<Option<Box<dyn FnMut(*mut c_void) -> i32>>>> = Rc::new(RefCell::new(None));
+        let hwnd = inner.handle.hwnd().unwrap_or(std::ptr::null_mut());
+
+        let _focus_in_handler = if hwnd != std::ptr::null_mut() {
+            let cb = focus_in_cb.clone();
+            static FOCUS_IN_ID: AtomicUsize = AtomicUsize::new(0x40000000);
+            let id = FOCUS_IN_ID.fetch_add(1, Ordering::SeqCst);
+            nwg::bind_raw_event_handler(
+                &nwg::ControlHandle::Hwnd(hwnd), id,
+                move |_h, msg, _w, _l| {
+                    if msg == winapi::um::winuser::WM_SETFOCUS {
+                        if let Some(ref mut f) = *cb.borrow_mut() { f(std::ptr::null_mut()); }
+                        return Some(0);
+                    }
+                    None
+                },
+            ).ok()
+        } else { None };
+
+        let _focus_out_handler = if hwnd != std::ptr::null_mut() {
+            let cb = focus_out_cb.clone();
+            static FOCUS_OUT_ID: AtomicUsize = AtomicUsize::new(0x50000000);
+            let id = FOCUS_OUT_ID.fetch_add(1, Ordering::SeqCst);
+            nwg::bind_raw_event_handler(
+                &nwg::ControlHandle::Hwnd(hwnd), id,
+                move |_h, msg, _w, _l| {
+                    if msg == winapi::um::winuser::WM_KILLFOCUS {
+                        if let Some(ref mut f) = *cb.borrow_mut() { f(std::ptr::null_mut()); }
+                        return Some(0);
+                    }
+                    None
+                },
+            ).ok()
+        } else { None };
+
+        Ok(Entry { inner: Rc::new(inner), _handler: Rc::new(handler), changed_cb, focus_in_cb, focus_out_cb, _focus_in_handler, _focus_out_handler })
+    }
+
+    // ========== DropDown ==========
+
+    #[derive(Clone)]
+    pub struct DropDown {
+        pub(crate) inner: Rc<nwg::ComboBox<String>>,
+        pub(crate) _handler: Rc<nwg::EventHandler>,
+    }
+
+    impl DropDown {
+        pub fn set_active(&self, index: Option<u32>) {
+            self.inner.set_selection(index.map(|i| i as usize));
+        }
+        pub fn active(&self) -> Option<u32> {
+            self.inner.selection().map(|i| i as u32)
+        }
+        pub fn get_active(&self) -> u32 {
+            self.inner.selection().unwrap_or(0) as u32
+        }
+        pub fn connect_changed(&self, _f: impl FnMut() + 'static) -> Result<u64, Error> {
+            Ok(0)
+        }
+    }
+
+    impl AsRef<*mut c_void> for DropDown {
+        fn as_ref(&self) -> &*mut c_void {
+            unsafe { &*(&self.inner.handle.hwnd().unwrap_or(std::ptr::null_mut()) as *const _ as *const *mut c_void) }
+        }
+    }
+
+    pub fn create_dropdown(parent: *mut c_void, items: &[&str]) -> Result<DropDown, Error> {
+        let (inner, handler) = crate::backends::nwg::create_dropdown(parent, items)
+            .map_err(|e| Error::Backend(format!("{}", e)))?;
+        Ok(DropDown { inner: Rc::new(inner), _handler: Rc::new(handler) })
+    }
+
+    // ========== CheckButton ==========
+
+    #[derive(Clone)]
+    pub struct CheckButton {
+        pub(crate) inner: Rc<nwg::CheckBox>,
+        pub(crate) _handler: Rc<nwg::EventHandler>,
+    }
+
+    impl CheckButton {
+        pub fn set_active(&self, active: bool) {
+            self.inner.set_check_state(if active { nwg::CheckBoxState::Checked } else { nwg::CheckBoxState::Unchecked });
+        }
+        pub fn is_active(&self) -> bool {
+            matches!(self.inner.check_state(), nwg::CheckBoxState::Checked)
+        }
+        pub fn set_label(&self, label: &str) { self.inner.set_text(label); }
+        pub fn get_label(&self) -> Option<String> { Some(self.inner.text()) }
+        pub fn connect_toggled(&self, _f: impl FnMut() + 'static) -> Result<u64, Error> {
+            Ok(0)
+        }
+    }
+
+    impl AsRef<*mut c_void> for CheckButton {
+        fn as_ref(&self) -> &*mut c_void {
+            unsafe { &*(&self.inner.handle.hwnd().unwrap_or(std::ptr::null_mut()) as *const _ as *const *mut c_void) }
+        }
+    }
+
+    pub fn create_checkbutton(parent: *mut c_void) -> Result<CheckButton, Error> {
+        let (inner, handler) = crate::backends::nwg::create_checkbox(parent, "Check")
+            .map_err(|e| Error::Backend(format!("{}", e)))?;
+        Ok(CheckButton { inner: Rc::new(inner), _handler: Rc::new(handler) })
+    }
+
+    // ========== RadioButton ==========
+
+    #[derive(Clone)]
+    pub struct RadioButton {
+        pub(crate) inner: Rc<nwg::RadioButton>,
+        pub(crate) _handler: Rc<nwg::EventHandler>,
+    }
+
+    impl RadioButton {
+        pub fn set_active(&self, active: bool) {
+            self.inner.set_check_state(if active { nwg::RadioButtonState::Checked } else { nwg::RadioButtonState::Unchecked });
+        }
+        pub fn is_active(&self) -> bool {
+            self.inner.check_state() == nwg::RadioButtonState::Checked
+        }
+        pub fn set_label(&self, label: &str) { self.inner.set_text(label); }
+        pub fn get_label(&self) -> Option<String> { Some(self.inner.text()) }
+        pub fn connect_toggled(&self, _f: impl FnMut() + 'static) -> Result<u64, Error> {
+            Ok(0)
+        }
+    }
+
+    impl AsRef<*mut c_void> for RadioButton {
+        fn as_ref(&self) -> &*mut c_void {
+            unsafe { &*(&self.inner.handle.hwnd().unwrap_or(std::ptr::null_mut()) as *const _ as *const *mut c_void) }
+        }
+    }
+
+    pub fn create_radiobutton(parent: *mut c_void) -> Result<RadioButton, Error> {
+        let (inner, handler) = crate::backends::nwg::create_radiobutton(parent, "Radio", false)
+            .map_err(|e| Error::Backend(format!("{}", e)))?;
+        Ok(RadioButton { inner: Rc::new(inner), _handler: Rc::new(handler) })
+    }
+
+    // ========== TextView ==========
+
+    #[derive(Clone)]
+    pub struct TextView {
+        pub(crate) inner: Rc<nwg::TextBox>,
+        pub(crate) changed_cb: Rc<RefCell<Option<Box<dyn FnMut()>>>>,
+        pub(crate) _handler: Rc<nwg::EventHandler>,
+    }
+
+    impl TextView {
+        pub fn get_buffer(&self) -> &RefCell<Option<Box<dyn FnMut()>>> { &self.changed_cb }
+        pub fn set_text(&self, text: &str) { self.inner.set_text(text); }
+        pub fn get_text(&self) -> Option<String> { Some(self.inner.text()) }
+        pub fn set_editable(&self, editable: bool) { self.inner.set_readonly(!editable); }
+        pub fn set_size_request(&self, _w: i32, _h: i32) {}
+        pub fn set_wrap_mode(&self, _mode: i32) {}
+    }
+
+    impl AsRef<*mut c_void> for TextView {
+        fn as_ref(&self) -> &*mut c_void {
+            unsafe { &*(&self.inner.handle.hwnd().unwrap_or(std::ptr::null_mut()) as *const _ as *const *mut c_void) }
+        }
+    }
+
+    pub fn create_textview(parent: *mut c_void) -> Result<TextView, Error> {
+        let (inner, changed_cb, handler) = crate::backends::nwg::create_textview(parent)
+            .map_err(|e| Error::Backend(format!("{}", e)))?;
+        Ok(TextView { inner: Rc::new(inner), changed_cb, _handler: Rc::new(handler) })
+    }
+
+    // ========== Dialog ==========
+
+    pub struct Dialog {
+        pub(crate) inner: nwg::Window,
+        pub(crate) buttons: RefCell<Vec<(nwg::Button, nwg::EventHandler)>>,
+        pub(crate) response_cb: Rc<RefCell<Option<Box<dyn FnMut(i32)>>>>,
+        pub(crate) _handler: nwg::EventHandler,
+        layout_cb: Rc<RefCell<Option<Box<dyn FnMut(i32, i32)>>>>,
+        child_hwnd: Rc<RefCell<Option<*mut c_void>>>,
+    }
+
+    impl Dialog {
+        pub fn run(&self) -> i32 { 0 }
+        pub fn set_title(&self, title: &str) { self.inner.set_text(title); }
+        pub fn set_size_request(&self, _w: i32, _h: i32) {}
+        pub fn set_default_size(&self, w: i32, h: i32) {
+            let hwnd = self.inner.handle.hwnd().unwrap_or(std::ptr::null_mut());
+            if hwnd != std::ptr::null_mut() {
+                unsafe {
+                    winapi::um::winuser::SetWindowPos(
+                        hwnd as _, std::ptr::null_mut(), 0, 0, w, h,
+                        winapi::um::winuser::SWP_NOZORDER | winapi::um::winuser::SWP_NOMOVE,
+                    );
+                }
+            }
+        }
+        pub fn present(&self) {
+            let hwnd = self.inner.handle.hwnd().unwrap_or(std::ptr::null_mut());
+            if hwnd != std::ptr::null_mut() {
+                unsafe {
+                    let mut rect: winapi::shared::windef::RECT = std::mem::zeroed();
+                    winapi::um::winuser::GetClientRect(hwnd, &mut rect);
+                    let w = rect.right - rect.left;
+                    let h = rect.bottom - rect.top;
+                    if let Some(ref mut cb) = *self.layout_cb.borrow_mut() {
+                        cb(w, h);
+                    }
+                }
+            }
+        }
+        pub fn append_content_area(&self, child: &impl Appendable) {
+            for &ptr in &child.collect_hwnds() {
+                if !ptr.is_null() {
+                    unsafe {
+                        winapi::um::winuser::SetParent(ptr as _, self.inner.handle.hwnd().unwrap_or(std::ptr::null_mut()) as _);
+                    }
+                    *self.child_hwnd.borrow_mut() = Some(ptr);
+                    let child_hwnd = ptr;
+                    *self.layout_cb.borrow_mut() = Some(Box::new(move |w, h| {
+                        set_window_pos(child_hwnd, 0, 0, w, h);
+                    }));
+                }
+            }
+        }
+        pub fn add_button(&self, text: &str, response_id: i32) {
+            let hwnd = self.inner.handle.hwnd().unwrap_or(std::ptr::null_mut());
+            let cb = self.response_cb.clone();
+            let result = crate::backends::nwg::create_dialog_button(hwnd as *mut c_void, text, response_id, cb);
+            if let Ok(btn) = result {
+                self.buttons.borrow_mut().push(btn);
+            }
+        }
+        pub fn connect_response<F: FnMut(i32) + 'static>(&self, f: F) -> Result<u64, Error> {
+            *self.response_cb.borrow_mut() = Some(Box::new(f));
+            Ok(0)
+        }
+    }
+
+    impl AsRef<*mut c_void> for Dialog {
+        fn as_ref(&self) -> &*mut c_void {
+            unsafe { &*(&self.inner.handle.hwnd().unwrap_or(std::ptr::null_mut()) as *const _ as *const *mut c_void) }
+        }
+    }
+
+    pub fn create_dialog(
+        parent_cell: &Rc<RefCell<Option<*mut c_void>>>,
+    ) -> Result<Dialog, Error> {
+        let response_cb: Rc<RefCell<Option<Box<dyn FnMut(i32)>>>> = Rc::new(RefCell::new(None));
+        let btn_cb = response_cb.clone();
+        let (inner, _, handler) = crate::backends::nwg::create_dialog(parent_cell, btn_cb)
+            .map_err(|e| Error::Backend(format!("{}", e)))?;
+
+        let layout_cb: Rc<RefCell<Option<Box<dyn FnMut(i32, i32)>>>> = Rc::new(RefCell::new(None));
+        let child_hwnd: Rc<RefCell<Option<*mut c_void>>> = Rc::new(RefCell::new(None));
+
+        // Bind raw WM_SIZE handler for dialog
+        let dlg_hwnd = inner.handle.hwnd().unwrap_or(std::ptr::null_mut());
+        if dlg_hwnd != std::ptr::null_mut() {
+            let cb = layout_cb.clone();
+            static DIALOG_RAW_HANDLER_ID: AtomicUsize = AtomicUsize::new(0x20000000);
+            let handler_id = DIALOG_RAW_HANDLER_ID.fetch_add(1, Ordering::SeqCst);
+            nwg::bind_raw_event_handler(
+                &nwg::ControlHandle::Hwnd(dlg_hwnd),
+                handler_id,
+                move |_h, msg, _w, l| {
+                    if msg == winapi::um::winuser::WM_SIZE {
+                        let w = (l & 0xFFFF) as i32;
+                        let h = ((l >> 16) & 0xFFFF) as i32;
+                        if let Some(ref mut cb) = *cb.borrow_mut() {
+                            cb(w, h);
+                        }
+                    }
+                    None
+                },
+            ).map_err(|e| Error::Backend(format!("{}", e)))?;
+        }
+
+        Ok(Dialog { inner, buttons: RefCell::new(Vec::new()), response_cb, _handler: handler, layout_cb, child_hwnd })
+    }
+
+    pub fn create_dialog_button(
+        parent: *mut c_void,
+        text: &str,
+        response_id: i32,
+        cb: Rc<RefCell<Option<Box<dyn FnMut(i32)>>>>,
+    ) -> Result<(nwg::Button, nwg::EventHandler), Error> {
+        crate::backends::nwg::create_dialog_button(parent, text, response_id, cb)
+            .map_err(|e| Error::Backend(format!("{}", e)))
+    }
+
+    // ========== GDI DrawContext ==========
+
+    pub struct NwgDrawContext {
+        hdc: winapi::shared::windef::HDC,
+        w: i32,
+        h: i32,
+    }
+
+    impl NwgDrawContext {
+        fn make_font(name: &str, size: f64, weight: i32, italic: bool) -> winapi::shared::windef::HFONT {
+            unsafe {
+                let wide_name: Vec<u16> = name.encode_utf16().collect();
+                winapi::um::wingdi::CreateFontW(
+                    -(size.abs() as i32), 0, 0, 0, weight as i32, italic as u32, 0, 0,
+                    winapi::um::wingdi::ANSI_CHARSET,
+                    winapi::um::wingdi::OUT_DEFAULT_PRECIS,
+                    winapi::um::wingdi::CLIP_DEFAULT_PRECIS,
+                    winapi::um::wingdi::DEFAULT_QUALITY,
+                    winapi::um::wingdi::DEFAULT_PITCH,
+                    wide_name.as_ptr(),
+                )
+            }
+        }
+    }
+
+    impl DrawContext for NwgDrawContext {
+        fn fill_rect(&mut self, x: f64, y: f64, w: f64, h: f64, r: f64, g: f64, b: f64, _a: f64) {
+            unsafe {
+                let color: u32 = winapi::um::wingdi::RGB(
+                    (r as u8).min(255), (g as u8).min(255), (b as u8).min(255));
+                let brush = winapi::um::wingdi::CreateSolidBrush(color);
+                if !brush.is_null() {
+                    let mut rect = winapi::shared::windef::RECT {
+                        left: x as i32, top: y as i32,
+                        right: (x + w) as i32, bottom: (y + h) as i32,
+                    };
+                    winapi::um::winuser::FillRect(self.hdc, &mut rect, brush);
+                    winapi::um::wingdi::DeleteObject(brush as _);
+                }
+            }
+        }
+        fn stroke_rect(&mut self, x: f64, y: f64, w: f64, h: f64, r: f64, g: f64, b: f64, _a: f64, lw: f64) {
+            unsafe {
+                let color: u32 = winapi::um::wingdi::RGB(
+                    (r as u8).min(255), (g as u8).min(255), (b as u8).min(255));
+                let pen = winapi::um::wingdi::CreatePen(winapi::um::wingdi::PS_SOLID as i32, lw as i32, color);
+                if !pen.is_null() {
+                    let old_pen = winapi::um::wingdi::SelectObject(self.hdc, pen as _);
+                    let null_brush = winapi::um::wingdi::GetStockObject(winapi::um::wingdi::NULL_BRUSH as i32);
+                    let old_brush = winapi::um::wingdi::SelectObject(self.hdc, null_brush);
+                    winapi::um::wingdi::Rectangle(self.hdc, x as i32, y as i32, (x + w) as i32, (y + h) as i32);
+                    winapi::um::wingdi::SelectObject(self.hdc, old_pen);
+                    winapi::um::wingdi::SelectObject(self.hdc, old_brush);
+                    winapi::um::wingdi::DeleteObject(pen as _);
+                }
+            }
+        }
+        fn draw_text_styled(&mut self, x: f64, y: f64, text: &str, font: &str, size: f64,
+                            r: f64, g: f64, b: f64, _a: f64, _slant: i32, weight: i32) {
+            unsafe {
+                let wide: Vec<u16> = text.encode_utf16().collect();
+                let color: u32 = winapi::um::wingdi::RGB(
+                    (r as u8).min(255), (g as u8).min(255), (b as u8).min(255));
+                winapi::um::wingdi::SetTextColor(self.hdc, color);
+                let hfont = Self::make_font(font, size, if weight != 0 { winapi::um::wingdi::FW_BOLD as i32 } else { winapi::um::wingdi::FW_NORMAL as i32 }, false);
+                if !hfont.is_null() {
+                    let old_font = winapi::um::wingdi::SelectObject(self.hdc, hfont as _);
+                    let mut rect = winapi::shared::windef::RECT {
+                        left: x as i32, top: y as i32,
+                        right: self.w, bottom: self.h,
+                    };
+                    winapi::um::winuser::DrawTextW(self.hdc, wide.as_ptr() as _, wide.len() as i32,
+                        &mut rect, winapi::um::winuser::DT_LEFT | winapi::um::winuser::DT_TOP | winapi::um::winuser::DT_NOCLIP);
+                    winapi::um::wingdi::SelectObject(self.hdc, old_font);
+                    winapi::um::wingdi::DeleteObject(hfont as _);
+                }
+            }
+        }
+        fn text_extents_styled(&self, text: &str, font: &str, size: f64, _slant: i32, weight: i32) -> (f64, f64, f64, f64) {
+            unsafe {
+                let wide: Vec<u16> = text.encode_utf16().collect();
+                let hfont = Self::make_font(font, size, if weight != 0 { winapi::um::wingdi::FW_BOLD as i32 } else { winapi::um::wingdi::FW_NORMAL as i32 }, false);
+                if hfont.is_null() { return (0.0, 0.0, 0.0, 0.0); }
+                let old_font = winapi::um::wingdi::SelectObject(self.hdc, hfont as _);
+                let mut size_tag: winapi::shared::windef::SIZE = std::mem::zeroed();
+                winapi::um::wingdi::GetTextExtentPoint32W(self.hdc, wide.as_ptr() as _, wide.len() as i32, &mut size_tag);
+                winapi::um::wingdi::SelectObject(self.hdc, old_font);
+                winapi::um::wingdi::DeleteObject(hfont as _);
+                (0.0, 0.0, size_tag.cx as f64, size_tag.cy as f64)
+            }
+        }
+        fn clear(&mut self, r: f64, g: f64, b: f64, _a: f64) {
+            self.fill_rect(0.0, 0.0, self.w as f64, self.h as f64, r, g, b, 1.0);
+        }
+        fn save(&mut self) {
+            unsafe { winapi::um::wingdi::SaveDC(self.hdc); }
+        }
+        fn restore(&mut self) {
+            unsafe { winapi::um::wingdi::RestoreDC(self.hdc, -1); }
+        }
+        fn clip(&mut self, x: f64, y: f64, w: f64, h: f64) {
+            unsafe { winapi::um::wingdi::IntersectClipRect(self.hdc, x as i32, y as i32, (x + w) as i32, (y + h) as i32); }
+        }
+    }
+
+    // ========== Canvas ==========
+
+    pub struct Canvas {
+        frame: Option<Rc<nwg::Frame>>,
+        hwnd: *mut c_void,
+        draw_cb: Rc<RefCell<Option<Box<dyn FnMut(&mut dyn crate::core::DrawContext, i32, i32)>>>>,
+        click_cb: Rc<RefCell<Option<Box<dyn FnMut(f64, f64)>>>>,
+        key_cb: Rc<RefCell<Option<Box<dyn FnMut(u32) -> bool>>>>,
+        _raw_handler: Option<nwg::RawEventHandler>,
+        painting: Rc<RefCell<bool>>,
+    }
+
+    impl Canvas {
+        pub fn set_draw_callback(&self, cb: Box<dyn FnMut(&mut dyn DrawContext, i32, i32)>) {
+            *self.draw_cb.borrow_mut() = Some(cb);
+            self.queue_redraw();
+        }
+        pub fn queue_redraw(&self) {
+            if !self.hwnd.is_null() {
+                unsafe {
+                    winapi::um::winuser::InvalidateRect(self.hwnd as _, std::ptr::null_mut(), 1);
+                }
+            }
+        }
+        pub fn set_size_request(&self, w: i32, h: i32) {
+            if !self.hwnd.is_null() {
+                unsafe {
+                    winapi::um::winuser::SetWindowPos(
+                        self.hwnd as _,
+                        std::ptr::null_mut(), 0, 0, w, h,
+                        winapi::um::winuser::SWP_NOZORDER | winapi::um::winuser::SWP_NOMOVE | winapi::um::winuser::SWP_SHOWWINDOW,
+                    );
+                }
+            }
+        }
+        pub fn set_content_size(&self, _w: i32, _h: i32) {}
+        pub fn on_click(&self, cb: Box<dyn FnMut(f64, f64)>) {
+            *self.click_cb.borrow_mut() = Some(cb);
+        }
+        pub fn on_key(&self, cb: Box<dyn FnMut(u32) -> bool>) {
+            *self.key_cb.borrow_mut() = Some(cb);
+        }
+    }
+
+    impl Clone for Canvas {
+        fn clone(&self) -> Self {
+            Canvas {
+                frame: self.frame.clone(),
+                hwnd: self.hwnd,
+                draw_cb: self.draw_cb.clone(),
+                click_cb: self.click_cb.clone(),
+                key_cb: self.key_cb.clone(),
+                _raw_handler: None,
+                painting: self.painting.clone(),
+            }
+        }
+    }
+
+    impl AsRef<*mut c_void> for Canvas {
+        fn as_ref(&self) -> &*mut c_void {
+            &self.hwnd
+        }
+    }
+
+    impl Widget for Canvas {
+        fn raw_handle(&self) -> *mut c_void { self.hwnd }
+    }
+
+    pub fn create_canvas(parent: *mut c_void) -> Result<Canvas, Error> {
+        let mut frame = nwg::Frame::default();
+        if !parent.is_null() {
+            nwg::Frame::builder()
+                .flags(nwg::FrameFlags::NONE)
+                .size((0, 0))
+                .position((0, 0))
+                .parent(&nwg::ControlHandle::Hwnd(parent as _))
+                .build(&mut frame)
+                .map_err(|e| Error::Backend(format!("{}", e)))?;
+        }
+        let hwnd = frame.handle.hwnd().unwrap_or(std::ptr::null_mut()) as *mut c_void;
+        let draw_cb: Rc<RefCell<Option<Box<dyn FnMut(&mut dyn DrawContext, i32, i32)>>>> = Rc::new(RefCell::new(None));
+        let painting: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+
+        // Bind WM_PAINT handler
+        let _raw_handler = if hwnd != std::ptr::null_mut() {
+            let cb = draw_cb.clone();
+            let paint_flag = painting.clone();
+            static CANVAS_RAW_HANDLER_ID: AtomicUsize = AtomicUsize::new(0x30000000);
+            let handler_id = CANVAS_RAW_HANDLER_ID.fetch_add(1, Ordering::SeqCst);
+            let raw_hwnd: winapi::shared::windef::HWND = hwnd as _;
+            nwg::bind_raw_event_handler(
+                &nwg::ControlHandle::Hwnd(raw_hwnd),
+                handler_id,
+                move |_h, msg, _w, _l| {
+                    if msg != winapi::um::winuser::WM_PAINT { return None; }
+                    if *paint_flag.borrow() { return Some(0); }
+                    *paint_flag.borrow_mut() = true;
+                    unsafe {
+                        let mut ps: winapi::um::winuser::PAINTSTRUCT = std::mem::zeroed();
+                        let hdc = winapi::um::winuser::BeginPaint(hwnd as _, &mut ps);
+                        let mut rect: winapi::shared::windef::RECT = std::mem::zeroed();
+                        winapi::um::winuser::GetClientRect(hwnd as _, &mut rect);
+                        let w = rect.right;
+                        let h = rect.bottom;
+                        if let Some(ref mut draw_fn) = *cb.borrow_mut() {
+                            let mut ctx = NwgDrawContext { hdc, w, h };
+                            draw_fn(&mut ctx, w, h);
+                        }
+                        winapi::um::winuser::EndPaint(hwnd as _, &mut ps);
+                    }
+                    *paint_flag.borrow_mut() = false;
+                    Some(0)
+                },
+            ).ok()
+        } else {
+            None
+        };
+
+        Ok(Canvas {
+            frame: Some(Rc::new(frame)),
+            hwnd,
+            draw_cb,
+            click_cb: Rc::new(RefCell::new(None)),
+            key_cb: Rc::new(RefCell::new(None)),
+            _raw_handler,
+            painting,
+        })
+    }
+
+    // ========== Overlay ==========
+
+    pub struct Overlay {
+        frame: Option<Rc<nwg::Frame>>,
+        hwnd: *mut c_void,
+    }
+
+    impl Overlay {
+        pub fn set_child(&self, child: &impl AsRef<*mut c_void>) {
+            let ptr = *child.as_ref();
+            if !ptr.is_null() && !self.hwnd.is_null() {
+                unsafe {
+                    winapi::um::winuser::SetParent(ptr as _, self.hwnd as _);
+                }
+            }
+        }
+        pub fn add_overlay(&self, _child: &impl AsRef<*mut c_void>) {}
+        pub fn set_overlay_pass_through(&self, _child: &impl AsRef<*mut c_void>, _pass: bool) {}
+        pub fn remove(&self, _child: &impl AsRef<*mut c_void>) {}
+        pub fn show_all(&self) {}
+        pub fn set_vexpand(&self, _expand: bool) {}
+        pub fn set_hexpand(&self, _expand: bool) {}
+        pub fn set_size_request(&self, w: i32, h: i32) {
+            if !self.hwnd.is_null() {
+                unsafe {
+                    winapi::um::winuser::SetWindowPos(
+                        self.hwnd as _,
+                        std::ptr::null_mut(), 0, 0, w, h,
+                        winapi::um::winuser::SWP_NOZORDER | winapi::um::winuser::SWP_NOMOVE | winapi::um::winuser::SWP_SHOWWINDOW,
+                    );
+                }
+            }
+        }
+    }
+
+    impl Clone for Overlay {
+        fn clone(&self) -> Self {
+            Overlay { frame: self.frame.clone(), hwnd: self.hwnd }
+        }
+    }
+
+    impl AsRef<*mut c_void> for Overlay {
+        fn as_ref(&self) -> &*mut c_void {
+            &self.hwnd
+        }
+    }
+
+    impl Widget for Overlay {
+        fn raw_handle(&self) -> *mut c_void { self.hwnd }
+    }
+
+    pub fn create_overlay(parent: *mut c_void) -> Result<Overlay, Error> {
+        let mut frame = nwg::Frame::default();
+        if !parent.is_null() {
+            nwg::Frame::builder()
+                .flags(nwg::FrameFlags::NONE)
+                .size((0, 0))
+                .position((0, 0))
+                .parent(&nwg::ControlHandle::Hwnd(parent as _))
+                .build(&mut frame)
+                .map_err(|e| Error::Backend(format!("{}", e)))?;
+        }
+        let hwnd = frame.handle.hwnd().unwrap_or(std::ptr::null_mut()) as *mut c_void;
+        Ok(Overlay { frame: Some(Rc::new(frame)), hwnd })
+    }
+
+    // ========== ScrolledWindow ==========
+
+    pub struct ScrolledWindow {
+        frame: Option<Rc<nwg::Frame>>,
+        hwnd: *mut c_void,
+        child: Rc<RefCell<Option<*mut c_void>>>,
+        vscroll: Rc<RefCell<nwg::ScrollBar>>,
+        hscroll: Rc<RefCell<nwg::ScrollBar>>,
+        _handlers: Rc<Vec<nwg::RawEventHandler>>,
+        child_size: Rc<RefCell<(i32, i32)>>,
+    }
+
+    impl Clone for ScrolledWindow {
+        fn clone(&self) -> Self {
+            ScrolledWindow {
+                frame: self.frame.clone(),
+                hwnd: self.hwnd,
+                child: self.child.clone(),
+                vscroll: self.vscroll.clone(),
+                hscroll: self.hscroll.clone(),
+                _handlers: self._handlers.clone(),
+                child_size: self.child_size.clone(),
+            }
+        }
+    }
+
+    impl ScrolledWindow {
+        pub fn set_child(&self, child: &impl AsRef<*mut c_void>) {
+            let ptr = *child.as_ref();
+            if ptr.is_null() || self.hwnd.is_null() { return; }
+            unsafe {
+                winapi::um::winuser::SetParent(ptr as _, self.hwnd as _);
+            }
+            *self.child.borrow_mut() = Some(ptr);
+            // Get child size for scroll range
+            unsafe {
+                let mut rect: winapi::shared::windef::RECT = std::mem::zeroed();
+                winapi::um::winuser::GetWindowRect(ptr as _, &mut rect);
+                *self.child_size.borrow_mut() = (rect.right - rect.left, rect.bottom - rect.top);
+            }
+            self.update_scroll_range();
+        }
+
+        pub fn set_policy(&self, _h: u32, _v: u32) {
+            // NWG: always show both scrollbars
+        }
+
+        pub fn set_vexpand(&self, _v: bool) {}
+        pub fn set_hexpand(&self, _h: bool) {}
+
+        fn update_scroll_range(&self) {
+            let (child_w, child_h) = *self.child_size.borrow();
+            unsafe {
+                let mut rect: winapi::shared::windef::RECT = std::mem::zeroed();
+                winapi::um::winuser::GetClientRect(self.hwnd as _, &mut rect);
+                let view_w = rect.right - rect.left;
+                let view_h = rect.bottom - rect.top;
+                let vrange = if child_h > view_h { (child_h - view_h) as usize } else { 0usize };
+                let hrange = if child_w > view_w { (child_w - view_w) as usize } else { 0usize };
+                if let Ok(mut sb) = self.vscroll.try_borrow_mut() {
+                    sb.set_range(0..vrange.max(1));
+                }
+                if let Ok(mut sb) = self.hscroll.try_borrow_mut() {
+                    sb.set_range(0..hrange.max(1));
+                }
+            }
+        }
+
+        fn on_scroll(&self) {
+            let (child_w, child_h) = *self.child_size.borrow();
+            if child_w == 0 && child_h == 0 { return; }
+            let child_hwnd = match *self.child.borrow() {
+                Some(h) => h,
+                None => return,
+            };
+            let vpos = if let Ok(sb) = self.vscroll.try_borrow() { sb.pos() } else { return };
+            let hpos = if let Ok(sb) = self.hscroll.try_borrow() { sb.pos() } else { return };
+            unsafe {
+                let mut rect: winapi::shared::windef::RECT = std::mem::zeroed();
+                winapi::um::winuser::GetClientRect(self.hwnd as _, &mut rect);
+                let view_w = rect.right - rect.left;
+                let view_h = rect.bottom - rect.top;
+                let max_v = (child_h - view_h).max(0);
+                let max_h = (child_w - view_w).max(0);
+                let v_range = if let Ok(sb) = self.vscroll.try_borrow() { sb.range().end } else { 1 };
+                let h_range = if let Ok(sb) = self.hscroll.try_borrow() { sb.range().end } else { 1 };
+                let scroll_y = if v_range > 0 { -(vpos as i32 * max_v / v_range as i32) } else { 0 };
+                let scroll_x = if h_range > 0 { -(hpos as i32 * max_h / h_range as i32) } else { 0 };
+                winapi::um::winuser::SetWindowPos(
+                    child_hwnd as _,
+                    std::ptr::null_mut(),
+                    scroll_x, scroll_y,
+                    0, 0,
+                    winapi::um::winuser::SWP_NOZORDER | winapi::um::winuser::SWP_NOSIZE | winapi::um::winuser::SWP_SHOWWINDOW,
+                );
+            }
+        }
+    }
+
+    impl AsRef<*mut c_void> for ScrolledWindow {
+        fn as_ref(&self) -> &*mut c_void {
+            &self.hwnd
+        }
+    }
+
+    pub fn create_scrolled_window(parent: *mut c_void) -> Result<ScrolledWindow, Error> {
+        let mut frame = nwg::Frame::default();
+        if !parent.is_null() {
+            nwg::Frame::builder()
+                .flags(nwg::FrameFlags::NONE)
+                .size((0, 0))
+                .position((0, 0))
+                .parent(&nwg::ControlHandle::Hwnd(parent as _))
+                .build(&mut frame)
+                .map_err(|e| Error::Backend(format!("{}", e)))?;
+        }
+        let hwnd = frame.handle.hwnd().unwrap_or(std::ptr::null_mut()) as *mut c_void;
+
+        let mut vscroll = nwg::ScrollBar::default();
+        nwg::ScrollBar::builder()
+            .flags(nwg::ScrollBarFlags::VISIBLE | nwg::ScrollBarFlags::VERTICAL)
+            .parent(&nwg::ControlHandle::Hwnd(hwnd as _))
+            .range(Some(0..1))
+            .pos(Some(0))
+            .build(&mut vscroll)
+            .map_err(|e| Error::Backend(format!("{}", e)))?;
+
+        let mut hscroll = nwg::ScrollBar::default();
+        nwg::ScrollBar::builder()
+            .flags(nwg::ScrollBarFlags::VISIBLE | nwg::ScrollBarFlags::HORIZONTAL)
+            .parent(&nwg::ControlHandle::Hwnd(hwnd as _))
+            .range(Some(0..1))
+            .pos(Some(0))
+            .build(&mut hscroll)
+            .map_err(|e| Error::Backend(format!("{}", e)))?;
+
+        let vscroll = Rc::new(RefCell::new(vscroll));
+        let hscroll = Rc::new(RefCell::new(hscroll));
+        let child: Rc<RefCell<Option<*mut c_void>>> = Rc::new(RefCell::new(None));
+        let child_size: Rc<RefCell<(i32, i32)>> = Rc::new(RefCell::new((0, 0)));
+
+        // Position scrollbars at right/bottom edges
+        let v_hwnd = if let Ok(sb) = vscroll.try_borrow() {
+            sb.handle.hwnd().unwrap_or(std::ptr::null_mut())
+        } else { std::ptr::null_mut() };
+        let h_hwnd = if let Ok(sb) = hscroll.try_borrow() {
+            sb.handle.hwnd().unwrap_or(std::ptr::null_mut())
+        } else { std::ptr::null_mut() };
+
+        let mut handlers: Vec<nwg::RawEventHandler> = Vec::new();
+
+        // WM_SIZE on frame to reposition scrollbars and update range
+        if hwnd != std::ptr::null_mut() {
+            let vscroll_sz = vscroll.clone();
+            let hscroll_sz = hscroll.clone();
+            let child_sz = child_size.clone();
+            let c_hwnd = hwnd;
+            static SIZE_ID: AtomicUsize = AtomicUsize::new(0x80000000);
+            let sid = SIZE_ID.fetch_add(1, Ordering::SeqCst);
+            if let Some(h) = nwg::bind_raw_event_handler(
+                &nwg::ControlHandle::Hwnd(hwnd as _), sid,
+                move |_h, msg, _w, _l| {
+                    if msg != winapi::um::winuser::WM_SIZE { return None; }
+                    unsafe {
+                        let mut rect: winapi::shared::windef::RECT = std::mem::zeroed();
+                        winapi::um::winuser::GetClientRect(c_hwnd as _, &mut rect);
+                        let w = rect.right;
+                        let h = rect.bottom;
+                        let scroll_w = 20i32;
+                        let scroll_h = 20i32;
+                        if let Ok(sb) = vscroll_sz.try_borrow() {
+                            if let Some(vh) = sb.handle.hwnd() {
+                                winapi::um::winuser::SetWindowPos(
+                                    vh as _, std::ptr::null_mut(),
+                                    w - scroll_w, 0, scroll_w, h - scroll_h,
+                                    winapi::um::winuser::SWP_NOZORDER | winapi::um::winuser::SWP_SHOWWINDOW,
+                                );
+                            }
+                        }
+                        if let Ok(sb) = hscroll_sz.try_borrow() {
+                            if let Some(hh) = sb.handle.hwnd() {
+                                winapi::um::winuser::SetWindowPos(
+                                    hh as _, std::ptr::null_mut(),
+                                    0, h - scroll_h, w - scroll_w, scroll_h,
+                                    winapi::um::winuser::SWP_NOZORDER | winapi::um::winuser::SWP_SHOWWINDOW,
+                                );
+                            }
+                        }
+                        // Update scroll range based on child size
+                        let (cw, ch) = *child_sz.borrow();
+                        let view_w = w;
+                        let view_h = h;
+                        let vrange = if ch > view_h { (ch - view_h) as usize } else { 0usize };
+                        let hrange = if cw > view_w { (cw - view_w) as usize } else { 0usize };
+                        if let Ok(sb) = vscroll_sz.try_borrow_mut() {
+                            sb.set_range(0..vrange.max(1));
+                        }
+                        if let Ok(sb) = hscroll_sz.try_borrow_mut() {
+                            sb.set_range(0..hrange.max(1));
+                        }
+                    }
+                    None
+                },
+            ).ok() { handlers.push(h); }
+
+            // VScroll raw handler
+            let vscroll_sc = vscroll.clone();
+            let child_sc = child.clone();
+            let c_hwnd_sc = hwnd;
+            let child_sz_sc = child_size.clone();
+            static VSCROLL_ID: AtomicUsize = AtomicUsize::new(0x90000000);
+            let vsid = VSCROLL_ID.fetch_add(1, Ordering::SeqCst);
+            if let Some(h) = nwg::bind_raw_event_handler(
+                &nwg::ControlHandle::Hwnd(v_hwnd as _), vsid,
+                move |_h, msg, _w, _l| {
+                    if msg != winapi::um::winuser::WM_VSCROLL { return None; }
+                    let (cw, ch) = *child_sz_sc.borrow();
+                    if cw == 0 && ch == 0 { return Some(0); }
+                    let child_hwnd = match *child_sc.borrow() { Some(h) => h, None => return Some(0) };
+                    let pos = if let Ok(sb) = vscroll_sc.try_borrow() { sb.pos() } else { return Some(0) };
+                    unsafe {
+                        let mut rect: winapi::shared::windef::RECT = std::mem::zeroed();
+                        winapi::um::winuser::GetClientRect(c_hwnd_sc as _, &mut rect);
+                        let view_h = rect.bottom - rect.top;
+                        let max_v = (ch - view_h).max(0);
+                        let range = if let Ok(sb) = vscroll_sc.try_borrow() { sb.range().end.max(1) } else { 1 };
+                        let scroll_y = -(pos as i32 * max_v / range as i32);
+                        winapi::um::winuser::SetWindowPos(
+                            child_hwnd as _, std::ptr::null_mut(),
+                            0, scroll_y, 0, 0,
+                            winapi::um::winuser::SWP_NOZORDER | winapi::um::winuser::SWP_NOSIZE | winapi::um::winuser::SWP_SHOWWINDOW,
+                        );
+                    }
+                    Some(0)
+                },
+            ).ok() { handlers.push(h); }
+
+            // HScroll raw handler
+            let hscroll_sc = hscroll.clone();
+            let child_sc2 = child.clone();
+            let c_hwnd_sc2 = hwnd;
+            let child_sz_sc2 = child_size.clone();
+            static HSCROLL_ID: AtomicUsize = AtomicUsize::new(0xA0000000);
+            let hsid = HSCROLL_ID.fetch_add(1, Ordering::SeqCst);
+            if let Some(h) = nwg::bind_raw_event_handler(
+                &nwg::ControlHandle::Hwnd(h_hwnd as _), hsid,
+                move |_h, msg, _w, _l| {
+                    if msg != winapi::um::winuser::WM_HSCROLL { return None; }
+                    let (cw, ch) = *child_sz_sc2.borrow();
+                    if cw == 0 && ch == 0 { return Some(0); }
+                    let child_hwnd = match *child_sc2.borrow() { Some(h) => h, None => return Some(0) };
+                    let pos = if let Ok(sb) = hscroll_sc.try_borrow() { sb.pos() } else { return Some(0) };
+                    unsafe {
+                        let mut rect: winapi::shared::windef::RECT = std::mem::zeroed();
+                        winapi::um::winuser::GetClientRect(c_hwnd_sc2 as _, &mut rect);
+                        let view_w = rect.right - rect.left;
+                        let max_h = (cw - view_w).max(0);
+                        let range = if let Ok(sb) = hscroll_sc.try_borrow() { sb.range().end.max(1) } else { 1 };
+                        let scroll_x = -(pos as i32 * max_h / range as i32);
+                        winapi::um::winuser::SetWindowPos(
+                            child_hwnd as _, std::ptr::null_mut(),
+                            scroll_x, 0, 0, 0,
+                            winapi::um::winuser::SWP_NOZORDER | winapi::um::winuser::SWP_NOSIZE | winapi::um::winuser::SWP_SHOWWINDOW,
+                        );
+                    }
+                    Some(0)
+                },
+            ).ok() { handlers.push(h); }
+        }
+
+        Ok(ScrolledWindow {
+            frame: Some(Rc::new(frame)),
+            hwnd,
+            child,
+            vscroll,
+            hscroll,
+            _handlers: Rc::new(handlers),
+            child_size,
+        })
     }
 
     // ========== Menu / MenuBar / SimpleAction ==========
@@ -238,49 +1374,59 @@ mod nwg_adapter {
     type MenuIndex = HashMap<(*mut std::ffi::c_void, u32), String>;
 
     pub struct MenuBar {
-        pub(crate) _menu: nwg::Menu,
+        pub(crate) _menus: Vec<nwg::Menu>,
+        pub(crate) _items: Vec<nwg::MenuItem>,
         pub(crate) _raw_handler: nwg::RawEventHandler,
         pub(crate) action_registry: Rc<RefCell<HashMap<String, Box<dyn FnMut()>>>>,
     }
 
     impl AsRef<*mut c_void> for MenuBar {
-        fn as_ref(&self) -> &*mut c_void { std::ptr::null() }
+        fn as_ref(&self) -> &*mut c_void {
+            static NULL: usize = 0;
+            unsafe { &*(&NULL as *const usize as *const *mut c_void) }
+        }
     }
 
     /// Recursively build NWG menu items, recording the (hmenu, index)→action mapping.
-    /// `local_idx` tracks the 0-based index within the CURRENT menu (resets per submenu).
+    /// Collectors `menus` and `items` keep the NWG objects alive (else Drop destroys them).
     fn build_and_index(
         parent_handle: &nwg::ControlHandle,
         items: &[crate::backends::nwg::MenuItemData],
         index: &mut MenuIndex,
+        menus: &mut Vec<nwg::Menu>,
+        items_collector: &mut Vec<nwg::MenuItem>,
     ) -> Result<(), nwg::NwgError> {
         for (i, item) in items.iter().enumerate() {
             if let Some(ref children) = item.submenu {
                 let mut sub = nwg::Menu::default();
                 nwg::Menu::builder()
                     .text(&format!("&{}", item.label))
-                    .popup(true)
+                    .popup(false)
                     .parent(parent_handle.clone())
                     .build(&mut sub)?;
-                let sub_hmenu = sub.hmenu().unwrap_or(std::ptr::null_mut());
+                let sub_hmenu = sub.handle.hmenu().map(|(_, h)| h).unwrap_or(std::ptr::null_mut());
                 let sub_handle = match parent_handle {
                     nwg::ControlHandle::Hwnd(h) => nwg::ControlHandle::PopMenu(*h, sub_hmenu),
                     nwg::ControlHandle::PopMenu(h, _) => nwg::ControlHandle::PopMenu(*h, sub_hmenu),
+                    _ => unreachable!(),
                 };
-                build_and_index(&sub_handle, children, index)?;
+                menus.push(sub);
+                build_and_index(&sub_handle, children, index, menus, items_collector)?;
             } else {
                 let mut mi = nwg::MenuItem::default();
                 nwg::MenuItem::builder()
                     .text(&format!("&{}", item.label))
                     .parent(parent_handle.clone())
                     .build(&mut mi)?;
-                let parent_hmenu = match parent_handle {
-                    nwg::ControlHandle::Hwnd(h) => *h,
-                    nwg::ControlHandle::PopMenu(_h, m) => *m,
+                let parent_hmenu: *mut c_void = match parent_handle {
+                    nwg::ControlHandle::Hwnd(h) => *h as *mut c_void,
+                    nwg::ControlHandle::PopMenu(_h, m) => *m as *mut c_void,
+                    _ => unreachable!(),
                 };
                 if !item.detailed_action.is_empty() {
                     index.insert((parent_hmenu as *mut c_void, i as u32), item.detailed_action.clone());
                 }
+                items_collector.push(mi);
             }
         }
         Ok(())
@@ -304,24 +1450,40 @@ mod nwg_adapter {
         window_hwnd: *mut c_void,
         action_registry: Rc<RefCell<HashMap<String, Box<dyn FnMut()>>>>,
     ) -> Result<MenuBar, Error> {
-        // Build the menubar (popup=false → window-level menubar)
-        let mut bar = nwg::Menu::default();
-        nwg::Menu::builder()
-            .popup(false)
-            .parent(&nwg::ControlHandle::Hwnd(window_hwnd as _))
-            .build(&mut bar)
-            .map_err(|e| Error::Backend(format!("{}", e)))?;
-
-        let bar_handle = nwg::ControlHandle::PopMenu(
-            window_hwnd as *mut std::ffi::c_void as _,
-            bar.hmenu().unwrap_or(std::ptr::null_mut()),
-        );
-
-        // Build index: (hmenu, local_index) → action_name
+        let window_handle = nwg::ControlHandle::Hwnd(window_hwnd as _);
         let mut index: MenuIndex = HashMap::new();
         let data = as_nwg_data(&model.items);
-        build_and_index(&bar_handle, &data, &mut index)
-            .map_err(|e| Error::Backend(format!("{}", e)))?;
+        let mut menus: Vec<nwg::Menu> = Vec::new();
+        let mut items: Vec<nwg::MenuItem> = Vec::new();
+
+        // Build top-level menubar entries (File, Edit, Help, ...)
+        for item in &data {
+            if let Some(ref children) = item.submenu {
+                let mut menu = nwg::Menu::default();
+                nwg::Menu::builder()
+                    .text(&format!("&{}", item.label))
+                    .popup(false)
+                    .parent(&window_handle)
+                    .build(&mut menu)
+                    .map_err(|e| Error::Backend(format!("{}", e)))?;
+                let menu_hmenu = menu.handle.hmenu().map(|(_, h)| h).unwrap_or(std::ptr::null_mut());
+                let menu_handle = nwg::ControlHandle::PopMenu(
+                    window_hwnd as *mut std::ffi::c_void as _,
+                    menu_hmenu,
+                );
+                menus.push(menu);
+                build_and_index(&menu_handle, children, &mut index, &mut menus, &mut items)
+                    .map_err(|e| Error::Backend(format!("{}", e)))?;
+            } else {
+                let mut mi = nwg::MenuItem::default();
+                nwg::MenuItem::builder()
+                    .text(&format!("&{}", item.label))
+                    .parent(&window_handle)
+                    .build(&mut mi)
+                    .map_err(|e| Error::Backend(format!("{}", e)))?;
+                items.push(mi);
+            }
+        }
 
         // Bind raw event handler for WM_MENUCOMMAND
         // handler_id must be > 0xFFFF (NWG reserves lower IDs)
@@ -333,7 +1495,7 @@ mod nwg_adapter {
             RAW_MENU_ID,
             move |_hwnd, msg, wparam, lparam| {
                 if msg != winapi::um::winuser::WM_MENUCOMMAND { return None; }
-                let item_index = ((wparam & 0xFFFF) as u32) - 1; // local index is 0-based
+                let item_index = (wparam & 0xFFFF) as u32;
                 let hmenu = lparam as *mut c_void;
                 let key = (hmenu, item_index);
                 if let Some(action_name) = idx.get(&key) {
@@ -346,7 +1508,7 @@ mod nwg_adapter {
             },
         ).map_err(|e| Error::Backend(format!("{}", e)))?;
 
-        Ok(MenuBar { _menu: bar, _raw_handler: raw_handler, action_registry })
+        Ok(MenuBar { _menus: menus, _items: items, _raw_handler: raw_handler, action_registry })
     }
 
     // -- SimpleAction: stores callback by action name --
@@ -373,7 +1535,46 @@ mod nwg_adapter {
             registry,
         })
     }
+    // ---- File dialogs ----
+
+    pub fn open_file(title: &str, parent: *mut c_void) -> Result<Option<String>, Error> {
+        let mut dialog = nwg::FileDialog::default();
+        nwg::FileDialog::builder()
+            .title(title)
+            .action(nwg::FileDialogAction::Open)
+            .build(&mut dialog)
+            .map_err(|e| Error::Backend(format!("{}", e)))?;
+        let parent_handle = nwg::ControlHandle::Hwnd(parent as _);
+        if dialog.run(Some(&parent_handle)) {
+            match dialog.get_selected_item() {
+                Ok(path) => Ok(Some(path.to_string_lossy().into_owned())),
+                Err(_) => Ok(None),
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn save_file(title: &str, parent: *mut c_void) -> Result<Option<String>, Error> {
+        let mut dialog = nwg::FileDialog::default();
+        nwg::FileDialog::builder()
+            .title(title)
+            .action(nwg::FileDialogAction::Save)
+            .build(&mut dialog)
+            .map_err(|e| Error::Backend(format!("{}", e)))?;
+        let parent_handle = nwg::ControlHandle::Hwnd(parent as _);
+        if dialog.run(Some(&parent_handle)) {
+            match dialog.get_selected_item() {
+                Ok(path) => Ok(Some(path.to_string_lossy().into_owned())),
+                Err(_) => Ok(None),
+            }
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 #[cfg(windows)]
 pub use nwg_adapter::*;
+#[cfg(windows)]
+pub use crate::backends::nwg::Orientation;

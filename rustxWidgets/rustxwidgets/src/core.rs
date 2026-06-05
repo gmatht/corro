@@ -2,7 +2,6 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::os::raw::c_void;
 use std::rc::Rc;
-use std::sync::Arc;
 
 /// Opaque handler id returned when connecting signals
 pub type HandlerId = u64;
@@ -46,8 +45,9 @@ pub trait Widget {
 }
 
 /// Core App wrapper that holds a boxed backend application.
+#[derive(Clone)]
 pub struct App {
-    inner: Arc<Box<dyn crate::backends::BackendApp>>,
+    inner: Rc<RefCell<Option<Box<dyn crate::backends::BackendApp>>>>,
     #[cfg(windows)]
     parent_cell: Rc<RefCell<Option<*mut c_void>>>,
     #[cfg(windows)]
@@ -62,15 +62,24 @@ impl App {
             Err(e) => return Err(Error::Backend(format!("{}", e))),
         };
         #[cfg(not(feature = "pancurses"))]
-        return Ok(App {
-            inner: Arc::new(b),
+        {
             #[cfg(windows)]
-            parent_cell: Rc::new(RefCell::new(None)),
-            #[cfg(windows)]
-            action_registry: Rc::new(RefCell::new(HashMap::new())),
-        });
+            {
+                // Create a hidden parent window for child controls
+                let parent_hwnd = crate::backends::nwg::create_hidden_parent()?;
+                return Ok(App {
+                    inner: Rc::new(RefCell::new(Some(b))),
+                    parent_cell: Rc::new(RefCell::new(Some(parent_hwnd))),
+                    action_registry: Rc::new(RefCell::new(HashMap::new())),
+                });
+            }
+            #[cfg(not(windows))]
+            return Ok(App {
+                inner: Rc::new(RefCell::new(Some(b))),
+            });
+        }
         #[cfg(feature = "pancurses")]
-        return Ok(App { inner: Arc::new(b) });
+        return Ok(App { inner: Rc::new(RefCell::new(Some(b))) });
     }
 
     // -- Linux paths --
@@ -180,22 +189,23 @@ impl App {
     }
 
     #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
-    pub fn create_button(&self, _label: &str) -> Result<crate::backends_nwg_adapter::Button, Error> {
-        let parent = self.parent_cell.borrow().copied().unwrap_or(std::ptr::null_mut());
-        crate::backends_nwg_adapter::create_button(parent)
+    pub fn create_button(&self, label: &str) -> Result<crate::backends_nwg_adapter::Button, Error> {
+        let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
+        crate::backends_nwg_adapter::create_button(parent, label)
     }
 
     #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
     pub fn create_label(&self, text: &str) -> Result<crate::backends_nwg_adapter::Label, Error> {
-        let parent = self.parent_cell.borrow().copied().unwrap_or(std::ptr::null_mut());
+        let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
         let lbl = crate::backends_nwg_adapter::create_label(parent)?;
         lbl.set_text(text);
         Ok(lbl)
     }
 
     #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
-    pub fn create_box(&self, orientation: crate::backends_nwg_adapter::Orientation, spacing: i32) -> Result<crate::backends_nwg_adapter::BoxWidget, Error> {
-        crate::backends_nwg_adapter::create_box(orientation, spacing)
+    pub fn create_box(&self, orientation: crate::backends::nwg::Orientation, spacing: i32) -> Result<crate::backends_nwg_adapter::BoxWidget, Error> {
+        let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
+        crate::backends_nwg_adapter::create_box(orientation, spacing, parent)
     }
 
     #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
@@ -205,7 +215,7 @@ impl App {
 
     #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
     pub fn create_entry(&self) -> Result<crate::backends_nwg_adapter::Entry, Error> {
-        let parent = self.parent_cell.borrow().copied().unwrap_or(std::ptr::null_mut());
+        let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
         crate::backends_nwg_adapter::create_entry(parent)
     }
 
@@ -215,14 +225,78 @@ impl App {
     }
 
     #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
-    pub fn create_menubar(&self, model: &crate::backends_nwg_adapter::Menu) -> Result<crate::backends_nwg_adapter::MenuBar, Error> {
-        let win_hwnd = self.parent_cell.borrow().copied().unwrap_or(std::ptr::null_mut());
-        crate::backends_nwg_adapter::create_menubar(model, win_hwnd, self.action_registry.clone())
+    /// # Safety
+    /// `action_group` must be a valid pointer or null.
+    pub unsafe fn create_menubar(&self, model: &crate::backends_nwg_adapter::Menu, window_hwnd: *mut c_void) -> Result<crate::backends_nwg_adapter::MenuBar, Error> {
+        crate::backends_nwg_adapter::create_menubar(model, window_hwnd, self.action_registry.clone())
     }
 
     #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
     pub fn create_simple_action(&self, name: &str) -> Result<crate::backends_nwg_adapter::SimpleAction, Error> {
         crate::backends_nwg_adapter::create_simple_action(name, self.action_registry.clone())
+    }
+
+    #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+    pub fn create_dialog(&self) -> Result<crate::backends_nwg_adapter::Dialog, Error> {
+        crate::backends_nwg_adapter::create_dialog(&self.parent_cell)
+    }
+
+    #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+    pub fn create_dropdown(&self, items: &[&str]) -> Result<crate::backends_nwg_adapter::DropDown, Error> {
+        let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
+        crate::backends_nwg_adapter::create_dropdown(parent, items)
+    }
+
+    #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+    pub fn create_checkbutton(&self, label: &str) -> Result<crate::backends_nwg_adapter::CheckButton, Error> {
+        let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
+        let cb = crate::backends_nwg_adapter::create_checkbutton(parent)?;
+        cb.set_label(label);
+        Ok(cb)
+    }
+
+    #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+    pub fn create_radiobutton(&self, label: &str) -> Result<crate::backends_nwg_adapter::RadioButton, Error> {
+        let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
+        let rb = crate::backends_nwg_adapter::create_radiobutton(parent)?;
+        rb.set_label(label);
+        Ok(rb)
+    }
+
+    #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+    pub fn create_textview(&self) -> Result<crate::backends_nwg_adapter::TextView, Error> {
+        let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
+        crate::backends_nwg_adapter::create_textview(parent)
+    }
+
+    #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+    pub fn create_canvas(&self) -> Result<crate::backends_nwg_adapter::Canvas, Error> {
+        let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
+        crate::backends_nwg_adapter::create_canvas(parent)
+    }
+
+    #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+    pub fn create_overlay(&self) -> Result<crate::backends_nwg_adapter::Overlay, Error> {
+        let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
+        crate::backends_nwg_adapter::create_overlay(parent)
+    }
+
+    #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+    pub fn create_scrolled_window(&self) -> Result<crate::backends_nwg_adapter::ScrolledWindow, Error> {
+        let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
+        crate::backends_nwg_adapter::create_scrolled_window(parent)
+    }
+
+    #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+    pub fn open_file(&self, title: &str) -> Result<Option<String>, Error> {
+        let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
+        crate::backends_nwg_adapter::open_file(title, parent)
+    }
+
+    #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+    pub fn save_file(&self, title: &str) -> Result<Option<String>, Error> {
+        let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
+        crate::backends_nwg_adapter::save_file(title, parent)
     }
 
     // -- Pancurses paths --
@@ -495,7 +569,7 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
 
 /// Run the backend main loop
     pub fn run(self) -> Result<(), Error> {
-        let boxed = Arc::try_unwrap(self.inner).map_err(|_| Error::Backend("failed to take backend app ownership".into()))?;
+        let boxed = self.inner.borrow_mut().take().ok_or_else(|| Error::Backend("App::run already called".into()))?;
         boxed.run().map_err(|e| Error::Backend(format!("{}", e)))
     }
 }
@@ -503,7 +577,7 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
 impl From<Box<dyn crate::backends::BackendApp>> for App {
     fn from(b: Box<dyn crate::backends::BackendApp>) -> Self {
         App {
-            inner: Arc::new(b),
+            inner: Rc::new(RefCell::new(Some(b))),
             #[cfg(windows)]
             parent_cell: Rc::new(RefCell::new(None)),
             #[cfg(windows)]
