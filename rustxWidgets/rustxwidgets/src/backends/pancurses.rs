@@ -5,6 +5,42 @@ mod pancurses_backend {
     use std::collections::HashMap;
     use std::os::raw::c_void;
     use std::rc::Rc;
+    use std::io::Write;
+
+    // ── SGR escape sequences matching ratatui output ──────────────
+    const SGR_FG_BLACK: &str = "\x1b[38;5;0m";
+    const SGR_FG_CYAN: &str = "\x1b[38;5;6m";
+    const SGR_FG_YELLOW: &str = "\x1b[38;5;3m";
+    const SGR_FG_DARK_GRAY: &str = "\x1b[38;5;8m";
+    const SGR_BG_CYAN: &str = "\x1b[48;5;6m";
+    const SGR_BG_YELLOW: &str = "\x1b[48;5;3m";
+    const SGR_BG_DARK_GRAY: &str = "\x1b[48;5;8m";
+    const SGR_BOLD: &str = "\x1b[1m";
+    const SGR_UNDERLINE: &str = "\x1b[4m";
+    const SGR_RESET: &str = "\x1b[0m";
+    const SGR_FG_DEFAULT: &str = "\x1b[39m";
+    const SGR_BG_DEFAULT: &str = "\x1b[49m";
+
+    fn sgr_cup(y: i32, x: i32) -> String {
+        format!("\x1b[{};{}H", y + 1, x + 1)
+    }
+    fn sgr_menu() -> &'static str { "\x1b[38;5;0m\x1b[48;5;6m" }
+    fn sgr_formula() -> &'static str { "\x1b[38;5;6m\x1b[49m" }
+    fn sgr_header_active() -> &'static str { "\x1b[1m\x1b[38;5;0m\x1b[48;5;3m" }
+    fn sgr_header_inactive() -> &'static str { "\x1b[1m\x1b[38;5;6m" }
+    fn sgr_row_cursor() -> &'static str { "\x1b[1m\x1b[38;5;0m\x1b[48;5;3m" }
+    fn sgr_row_normal() -> &'static str { "\x1b[38;5;3m" }
+    fn sgr_row_footer() -> &'static str { "\x1b[1m\x1b[38;5;6m" }
+    fn sgr_row_underline() -> &'static str { "\x1b[4m\x1b[38;5;3m" }
+    fn sgr_sep() -> &'static str { "\x1b[38;5;8m" }
+    fn sgr_cell_cursor() -> &'static str { "\x1b[48;5;8m" }
+    fn sgr_cell_agg() -> &'static str { "\x1b[38;5;6m" }
+    fn sgr_cell_footer_agg() -> &'static str { "\x1b[1m\x1b[38;5;6m" }
+
+    fn emit_sgr(s: &str) {
+        let _ = std::io::stdout().write_all(s.as_bytes());
+        let _ = std::io::stdout().flush();
+    }
 
     pub type Callback = Box<dyn FnMut()>;
 
@@ -35,6 +71,7 @@ mod pancurses_backend {
         Spreadsheet {
             cells: Rc<RefCell<HashMap<(u32, u32), String>>>,
             raw_cells: Rc<RefCell<HashMap<(u32, u32), String>>>,
+            cell_styles: Rc<RefCell<HashMap<(u32, u32), u8>>>,
             total_rows: u32,
             total_cols: u32,
             top_row: u32,
@@ -50,6 +87,8 @@ mod pancurses_backend {
             formula_bar_address_id: Option<usize>,
             formula_bar_entry_id: Option<usize>,
             anchor: Option<(u32, u32)>,
+            header_row_count: u32,
+            main_row_count: u32,
             menu_text: String,
             status_text: String,
             border_title: String,
@@ -79,6 +118,7 @@ mod pancurses_backend {
         pub menu_open: bool,
         pub active_submenu: usize,
         pub active_item: usize,
+        pub spreadsheet_output: String,
         key_callbacks: Vec<(char, Box<dyn FnMut()>)>,
     }
 
@@ -93,6 +133,7 @@ mod pancurses_backend {
                 menu_open: false,
                 active_submenu: 0,
                 active_item: 0,
+                spreadsheet_output: String::new(),
                 key_callbacks: Vec::new(),
             }
         }
@@ -183,6 +224,8 @@ mod pancurses_backend {
             });
 
             while with_state(|s| s.running) {
+                // Clear direct-write spreadsheet output for this frame
+                with_state(|s| s.spreadsheet_output.clear());
                 // layout pass
                 with_state(|state| {
                     let ids: Vec<usize> = state.nodes.iter().map(|n| n.id).collect();
@@ -276,6 +319,12 @@ mod pancurses_backend {
                 });
 
                 root.refresh();
+                // Flush direct-write spreadsheet SGR output after ncurses flush
+                with_state(|s| {
+                    if !s.spreadsheet_output.is_empty() {
+                        emit_sgr(&s.spreadsheet_output);
+                    }
+                });
                 match root.getch() {
                     Some(Input::KeyResize) => {
                         let (my, mx) = root.get_max_yx();
@@ -1134,98 +1183,106 @@ mod pancurses_backend {
                     root.attroff(COLOR_PAIR(3));
                 }
             }
-            PcWidgetKind::Spreadsheet { ref cells, ref raw_cells, ref top_row, ref left_col, ref cursor_row, ref cursor_col, ref editing, ref edit_buf, ref edit_pos, ref col_width, ref margin_cols, ref main_cols, ref menu_text, ref status_text, ref border_title, ref formula_bar_trailing, ref column_layout, ref row_labels, ref total_rows, ref total_cols, ref tab_text, .. } => {
-                let cw = *col_width as i32;
-                let rh_w = 5i32;
+            PcWidgetKind::Spreadsheet { ref cells, ref raw_cells, ref cell_styles, ref top_row, ref left_col, ref cursor_row, ref cursor_col, ref editing, ref edit_buf, ref edit_pos, ref col_width, ref margin_cols, ref main_cols, ref menu_text, ref status_text, ref border_title, ref formula_bar_trailing, ref column_layout, ref row_labels, ref total_rows, ref total_cols, ref tab_text, header_row_count, main_row_count, .. } => {
+                // ── Direct SGR rendering ──
                 let lm = *margin_cols as usize;
                 let mc = *main_cols as usize;
                 let use_layout = !column_layout.is_empty();
-                for dy in 0..rect.h {
-                    for dx in 0..rect.w {
-                        root.mvaddch(rect.y + dy, rect.x + dx, ' ');
-                    }
-                }
+                let mut out = String::new();
                 let mut row_offset = rect.y;
 
-                // Menu bar
+                // Menu bar: black fg on cyan bg
                 if !menu_text.is_empty() {
-                    if has_colors() { root.attron(COLOR_PAIR(4)); }
                     let max_chars = rect.w as usize;
                     let end = menu_text.char_indices().nth(max_chars).map(|(i, _)| i).unwrap_or(menu_text.len());
-                    root.mvaddstr(row_offset, rect.x, &menu_text[..end]);
-                    if has_colors() { root.attroff(COLOR_PAIR(4)); }
+                    out.push_str(&sgr_cup(row_offset, rect.x));
+                    out.push_str(sgr_menu());
+                    out.push_str(&menu_text[..end]);
                     row_offset += 1;
                 }
 
-                // Formula bar
-                let addr_text = format!("{}{}", col_label(*cursor_col), *cursor_row + 1);
-                let cell_val = raw_cells.borrow().get(&(*cursor_row, *cursor_col)).cloned().unwrap_or_default();
-                let addr_vis = addr_text.chars().count();
-                let max_fb = (rect.w as usize).saturating_sub(addr_vis + 3).max(1);
-                let fb_text = if cell_val.chars().count() > max_fb {
-                    let trunc_end = cell_val.char_indices().nth(max_fb.saturating_sub(3)).map(|(i, _)| i).unwrap_or(cell_val.len());
-                    format!(" {}  {}…{}", addr_text, &cell_val[..trunc_end], formula_bar_trailing)
-                } else {
-                    format!(" {}  {}{}", addr_text, cell_val, formula_bar_trailing)
-                };
-                let fb_vis = fb_text.chars().count();
-                if has_colors() { root.attron(COLOR_PAIR(1)); }
-                let fb_end = fb_text.char_indices().nth(rect.w as usize).map(|(i, _)| i).unwrap_or(fb_text.len());
-                root.mvaddstr(row_offset, rect.x, &fb_text[..fb_end]);
-                if has_colors() { root.attroff(COLOR_PAIR(1)); }
-                row_offset += 1;
+                // Formula bar: cyan fg, default bg
+                {
+                    let addr_text = format!("{}{}", col_label(*cursor_col), *cursor_row + 1);
+                    let cell_val = raw_cells.borrow().get(&(*cursor_row, *cursor_col)).cloned().unwrap_or_default();
+                    let addr_vis = addr_text.chars().count();
+                    let max_fb = (rect.w as usize).saturating_sub(addr_vis + 3).max(1);
+                    let fb_text = if cell_val.chars().count() > max_fb {
+                        let trunc_end = cell_val.char_indices().nth(max_fb.saturating_sub(3)).map(|(i, _)| i).unwrap_or(cell_val.len());
+                        format!(" {}  {}…{}", addr_text, &cell_val[..trunc_end], formula_bar_trailing)
+                    } else {
+                        format!(" {}  {}{}", addr_text, cell_val, formula_bar_trailing)
+                    };
+                    let fb_end = fb_text.char_indices().nth(rect.w as usize).map(|(i, _)| i).unwrap_or(fb_text.len());
+                    out.push_str(&sgr_cup(row_offset, rect.x));
+                    out.push_str(sgr_formula());
+                    out.push_str(&fb_text[..fb_end]);
+                    out.push_str(SGR_FG_DEFAULT);
+                    row_offset += 1;
+                }
 
                 // Top border line: ┌ title ───┐
                 {
                     let br = row_offset;
                     let title = if !border_title.is_empty() {
-                        format!(" {}", border_title)
+                        format!("{}", border_title)
                     } else {
-                        format!(" corro  {}r × {}c ", *main_cols, *main_cols)
+                        format!("corro  {}r × {}c ", *main_cols, *main_cols)
                     };
-                    let title = title.trim_end().to_string();
                     let title_vis = title.chars().count();
-                    root.mvaddstr(br, rect.x, "┌");
                     let dash_fill = (rect.w as usize).saturating_sub(title_vis + 2);
-                    root.mvaddstr(br, rect.x + 1, &title);
-                    for i in 0..dash_fill {
-                        root.mvaddstr(br, rect.x + 1 + title_vis as i32 + i as i32, "─");
-                    }
-                    root.mvaddstr(br, rect.x + rect.w - 1, "┐");
+                    out.push_str(&sgr_cup(br, rect.x));
+                    out.push_str("┌");
+                    out.push_str(SGR_BOLD);
+                    out.push_str(" ");
+                    out.push_str(&title);
+                    out.push_str(SGR_RESET);
+                    out.push_str(&"─".repeat(dash_fill));
+                    out.push_str("┐");
                     row_offset += 1;
                 }
 
                 // Grid header row
                 {
                     let hr = row_offset;
-                    root.mvaddstr(hr, rect.x, "│");
+                    out.push_str(&sgr_cup(hr, rect.x));
+                    out.push_str("│");
                     if use_layout {
-                        // Pre-computed layout: draw each column header in its width with a space between
-                        // Reserve row label gutter (5 spaces) before the first column
+                        // Pre-computed layout
                         let mut hx = rect.x + 1;
-                        root.mvaddstr(hr, hx, &" ".repeat(5));
+                        out.push_str(&sgr_cup(hr, hx));
+                        out.push_str(SGR_BOLD);
+                        out.push_str(&" ".repeat(5));
+                        out.push_str(SGR_RESET);
                         hx += 5;
                         let n = column_layout.len();
-                        for (i, &(ref _ci, ref w, ref label)) in column_layout.iter().enumerate() {
+                        for (i, &(ref ci, ref w, ref label)) in column_layout.iter().enumerate() {
                             if hx + *w as i32 + 1 > rect.x + rect.w - 1 { break; }
                             let padded = format!("{:<1$}", label, *w as usize);
-                            root.mvaddstr(hr, hx, &padded);
+                            let active_col = *ci == *cursor_col;
+                            let style = if active_col { sgr_header_active() } else { sgr_header_inactive() };
+                            out.push_str(&sgr_cup(hr, hx));
+                            out.push_str(style);
+                            out.push_str(&padded);
+                            out.push_str(SGR_RESET);
                             hx += *w as i32;
                             if i + 1 < n {
-                                root.mvaddch(hr, hx, ' ');
+                                out.push_str(&sgr_cup(hr, hx));
+                                out.push_str(" ");
                                 hx += 1;
                             }
                         }
-                        // Right border
                         if hx <= rect.x + rect.w - 1 {
-                            root.mvaddstr(hr, rect.x + rect.w - 1, "│");
+                            out.push_str(&sgr_cup(hr, rect.x + rect.w - 1));
+                            out.push_str("│");
                         }
                     } else {
-                        if has_colors() { root.attron(COLOR_PAIR(4)); }
-                        // Row label gutter: 5 spaces, then columns
+                        let cw = *col_width as i32;
+                        let rh_w = 5i32;
                         let max_vis_cols = ((rect.w - rh_w - 2) / (cw + 1)).max(1).min(100);
                         let mut hx = rect.x + 1;
-                        root.mvaddstr(hr, hx, &" ".repeat(rh_w as usize));
+                        out.push_str(&sgr_cup(hr, hx));
+                        out.push_str(&" ".repeat(rh_w as usize));
                         hx += rh_w;
                         for vc in 0..max_vis_cols {
                             let col_idx = *left_col + vc as u32;
@@ -1236,75 +1293,141 @@ mod pancurses_backend {
                             } else {
                                 format!("]{}", col_label(col_idx - lm as u32 - mc as u32))
                             };
-                            if hx + *col_width as i32 + 6 > rect.x + rect.w { break; }
-                            let padded = format!("{:<1$}", label, *col_width as usize);
-                            root.mvaddstr(hr, hx, &padded);
-                            hx += *col_width as i32;
+                            if hx + cw + 6 > rect.x + rect.w { break; }
+                            let padded = format!("{:<1$}", label, cw as usize);
+                            let active_col = col_idx == *cursor_col;
+                            let style = if active_col { sgr_header_active() } else { sgr_header_inactive() };
+                            out.push_str(&sgr_cup(hr, hx));
+                            out.push_str(style);
+                            out.push_str(&padded);
+                            out.push_str(SGR_RESET);
+                            hx += cw;
                             if hx < rect.x + rect.w {
-                                root.mvaddch(hr, hx, ' '); hx += 1;
+                                out.push_str(&sgr_cup(hr, hx));
+                                out.push_str(" ");
+                                hx += 1;
                             }
                         }
-                        if has_colors() { root.attroff(COLOR_PAIR(4)); }
                     }
-                    // header separator — match ratatui: ││──...──│
+                    // header separator: dark gray fg
                     let sep_len = rect.w.saturating_sub(3).max(1) as usize;
-                    root.mvaddstr(hr + 1, rect.x, "││");
-                    for i in 0..sep_len {
-                        root.mvaddstr(hr + 1, rect.x + 2 + i as i32, "─");
-                    }
-                    root.mvaddstr(hr + 1, rect.x + 2 + sep_len as i32, "│");
+                    out.push_str(&sgr_cup(hr + 1, rect.x));
+                    out.push_str(sgr_sep());
+                    out.push_str("││");
+                    out.push_str(&"─".repeat(sep_len));
+                    out.push_str("│");
+                    out.push_str(SGR_FG_DEFAULT);
                     row_offset = hr + 2;
                 }
 
-                // Data rows — compute available rows, leaving room for bottom border + optional status/tab lines
+                // Data rows
                 let has_status = !status_text.is_empty();
                 let has_tabs = !tab_text.is_empty();
-                // Reserve lines below the grid: bottom border always gets one;
-                // status gets its own line (below the border) when tabs are absent,
-                // otherwise status overlays the border line (matching ratatui).
-                let extra_lines = 1 // bottom border
+                let extra_lines = 1
                     + if has_tabs { 1 } else if has_status { 1 } else { 0 };
                 let grid_bottom = rect.y + rect.h - extra_lines;
                 let max_data_rows = ((grid_bottom - row_offset) as i32).max(1) as u32;
                 for vr in 0..max_data_rows {
                     let row_idx = *top_row + vr as u32;
                     let ry = row_offset + vr as i32;
-                    root.mvaddstr(ry, rect.x, "│");
-                    let rx = rect.x + 1;
-                    // Row header: right-aligned in 4 chars + trailing space = 5 chars (match ratatui)
+                    let is_cursor_row = row_idx == *cursor_row;
+                    // Determine row label style
                     let label_str = row_labels.iter()
                         .find(|(r, _)| *r == row_idx)
                         .map(|(_, l)| l.as_str())
                         .unwrap_or("");
-                    root.mvaddstr(ry, rx, &format!("{:>4} ", label_str));
+                    // Row label styling matches ratatui:
+                    // - cursor row: bold + black fg + yellow bg
+                    // - footer rows: bold + cyan fg
+                    // - normal rows: yellow fg
+                    // - boundary (last main) row: underline + fg
+                    let is_footer = label_str.starts_with('_');
+                    let is_header = label_str.starts_with('~');
+                    // Check next row label to detect boundary (last main row before footers)
+                    let next_label = row_labels.iter()
+                        .find(|(r, _)| *r == row_idx + 1)
+                        .map(|(_, l)| l.as_str())
+                        .unwrap_or("");
+                    let is_boundary = !is_footer && !is_header && next_label.starts_with('_');
+                    let row_label_style = if is_cursor_row {
+                        sgr_row_cursor()
+                    } else if is_footer {
+                        sgr_row_footer()
+                    } else if is_boundary {
+                        sgr_row_underline()
+                    } else {
+                        sgr_row_normal()
+                    };
+                    // Left border
+                    out.push_str(&sgr_cup(ry, rect.x));
+                    out.push_str("│");
+                    // Row label (5 chars: right-aligned in 4 + trailing space)
+                    out.push_str(&sgr_cup(ry, rect.x + 1));
+                    out.push_str(row_label_style);
+                    out.push_str(&format!("{:>4} ", label_str));
+                    out.push_str(SGR_RESET);
+
+                    // Separator between row label and first data column (dark gray)
+                    // For the left margin gap: dark gray fg for 4 spaces
+                    if *margin_cols > 0 && !use_layout {
+                        let sep_x = rect.x + 1 + 5; // right after row label
+                        out.push_str(&sgr_cup(ry, sep_x));
+                        out.push_str(sgr_sep());
+                        out.push_str("    ");
+                        out.push_str(SGR_FG_DEFAULT);
+                        out.push_str(" ");
+                    }
+
                     let cells_ref = cells.borrow();
+                    let cell_styles_ref = cell_styles.borrow();
                     if use_layout {
-                        // Layout mode with overflow support: cells overflow into adjacent empty columns
                         let n = column_layout.len();
-                        let mut col_positions: Vec<(u32, i32)> = Vec::new(); // (col_idx, screen_x)
-                        let mut rx2 = rect.x + 1 + 5; // start right after row label (no extra space)
+                        let mut col_positions: Vec<(u32, i32)> = Vec::new();
+                        let mut rx2 = rect.x + 1 + 5;
                         for (idx, &(col_idx, w, _)) in column_layout.iter().enumerate() {
                             col_positions.push((col_idx, rx2));
                             rx2 += w as i32;
                             if idx + 1 < n {
-                                rx2 += 1; // space between columns
+                                rx2 += 1;
                             }
                         }
-                        // Draw cells with overflow
+                        // Draw separator (dark gray) for left margin column if empty
+                        if !col_positions.is_empty() {
+                            let (first_col, first_sx) = col_positions[0];
+                            let first_text = cells_ref.get(&(row_idx, first_col))
+                                .map(|s| s.as_str()).unwrap_or("");
+                            if first_text.is_empty() {
+                                let w = column_layout[0].1 as i32;
+                                out.push_str(&sgr_cup(ry, first_sx));
+                                out.push_str(sgr_sep());
+                                for _ in 0..w {
+                                    out.push(' ');
+                                }
+                                out.push_str(SGR_FG_DEFAULT);
+                                out.push(' ');
+                            }
+                        }
                         let mut vi = 0;
                         while vi < n {
                             let (col_idx, sx) = col_positions[vi];
-                            // Look up cells by global column index to match
-                            // storage in pnc_backend.rs (no margin/main collision).
                             let cell_text = cells_ref.get(&(row_idx, col_idx))
                                 .map(|s| s.as_str()).unwrap_or("");
+                            let cell_style = cell_styles_ref.get(&(row_idx, col_idx)).copied().unwrap_or(0);
+                            let is_cursor_cell = cell_style == 1;
                             if cell_text.is_empty() {
+                                // Empty cell: draw cursor highlight if needed
+                                if is_cursor_cell {
+                                    let cw = column_layout[vi].1 as i32;
+                                    out.push_str(&sgr_cup(ry, sx));
+                                    for _ in 0..cw {
+                                        out.push(' ');
+                                    }
+                                }
                                 vi += 1;
                                 continue;
                             }
                             let w = column_layout[vi].1 as usize;
                             let text_width = cell_text.chars().count();
-                            // Find overflow space into adjacent empty columns
                             let mut overflow_cols = 0usize;
                             if text_width > w {
                                 let mut scan = vi + 1;
@@ -1318,16 +1441,12 @@ mod pancurses_backend {
                                     } else { break; }
                                 }
                             }
-                            // Include gap after the last overflow column as available space
-                            // (ratatui treats the inter-column gap as overflow room).
-                            // When overflow_cols == 0 the gap is after the current column;
-                            // when overflow_cols > 0 it is after the last overflow column.
                             let gap_target = vi + overflow_cols;
                             let gap_after = if gap_target + 1 < n { 1 } else { 0 };
                             let total_avail: usize = column_layout[vi..=vi+overflow_cols].iter()
                                 .map(|&(_, w, _)| w as usize).sum::<usize>()
-                                + overflow_cols // spaces between overflow columns
-                                + gap_after;   // gap to next column
+                                + overflow_cols
+                                + gap_after;
                             let display = if text_width > total_avail {
                                 if overflow_cols == 0 {
                                     cell_text.chars().take(total_avail).collect::<String>()
@@ -1338,31 +1457,53 @@ mod pancurses_backend {
                                     s
                                 }
                             } else { cell_text.to_string() };
-                            root.mvaddstr(ry, sx, &display);
+                            // Cell SGR style matching ratatui
+                            let cell_sgr = if is_cursor_cell {
+                                sgr_cell_cursor()
+                            } else if cell_style == 3 {
+                                sgr_cell_footer_agg()
+                            } else if cell_style == 2 {
+                                sgr_cell_agg()
+                            } else {
+                                ""
+                            };
+                            out.push_str(&sgr_cup(ry, sx));
+                            if !cell_sgr.is_empty() {
+                                out.push_str(cell_sgr);
+                            }
+                            out.push_str(&display);
+                            if is_cursor_cell {
+                                out.push_str(SGR_BG_DEFAULT);
+                            } else if cell_style == 2 || cell_style == 3 {
+                                out.push_str(SGR_FG_DEFAULT);
+                            }
                             vi += 1 + overflow_cols as usize;
                         }
-                        root.mvaddstr(ry, rect.x + rect.w - 1, "│");
+                        out.push_str(&sgr_cup(ry, rect.x + rect.w - 1));
+                        out.push_str("│");
                     } else {
+                        let cw = *col_width as i32;
+                        let rh_w = 5i32;
                         let max_vis_cols = ((rect.w - rh_w - 2) / (cw + 1)).max(1).min((mc.saturating_add(lm)) as i32);
                         let mut vc = 0i32;
                         while vc < max_vis_cols {
                             let col_idx = *left_col + vc as u32;
                             let cell_text = cells_ref.get(&(row_idx, col_idx)).map(|s| s.as_str()).unwrap_or("");
-                            let is_cursor = row_idx == *cursor_row && col_idx == *cursor_col;
-                            let is_editing = is_cursor && *editing;
+                            let cell_style = cell_styles_ref.get(&(row_idx, col_idx)).copied().unwrap_or(0);
+                            let is_cursor_cell = cell_style == 1;
                             let col_screen_x = rect.x + 1 + rh_w + vc * (cw + 1);
-                            if cell_text.is_empty() && !is_editing {
-                                if is_cursor {
-                                    if has_colors() { root.attron(COLOR_PAIR(2)); }
-                                    for i in 0..cw { root.mvaddch(ry, col_screen_x + i, ' '); }
+                            if cell_text.is_empty() && !(*editing && is_cursor_cell) {
+                                if is_cursor_cell {
+                                    out.push_str(&sgr_cup(ry, col_screen_x));
+                                    for _ in 0..cw { out.push(' '); }
                                 }
                                 vc += 1;
                                 continue;
                             }
-                            let text = if is_editing { &edit_buf } else { cell_text };
+                            let text = if *editing && is_cursor_cell { &edit_buf } else { cell_text };
                             let text_width = text.chars().count();
                             let mut overflow_cols = 0i32;
-                            if !is_editing && text_width > cw as usize {
+                            if !(*editing && is_cursor_cell) && text_width > cw as usize {
                                 let mut scan = vc + 1;
                                 while scan < max_vis_cols {
                                     let sc = *left_col + scan as u32;
@@ -1384,83 +1525,73 @@ mod pancurses_backend {
                                     s
                                 }
                             } else { text.to_string() };
-                            if is_cursor && has_colors() { root.attron(COLOR_PAIR(2)); }
-                            for i in 0..(overflow_cols + 1) * cw {
-                                let cx = col_screen_x + i;
-                                if cx < rect.x + rect.w { root.mvaddch(ry, cx, ' '); }
+                            out.push_str(&sgr_cup(ry, col_screen_x));
+                            if is_cursor_cell {
+                                out.push_str(sgr_cell_cursor());
+                            } else if cell_style == 2 {
+                                out.push_str(sgr_cell_agg());
+                            } else if cell_style == 3 {
+                                out.push_str(sgr_cell_footer_agg());
                             }
-                            if is_cursor && has_colors() { root.attroff(COLOR_PAIR(2)); }
-                            if is_editing {
-                                let buf_len = edit_buf.len();
-                                let scroll = if *edit_pos > ((cw - 1) as usize) { *edit_pos - (cw as usize) + 1 } else { 0 };
-                                let start = scroll.min(buf_len);
-                                let visible: String = edit_buf.chars().skip(start).take(cw as usize).collect();
-                                if is_cursor && has_colors() { root.attron(COLOR_PAIR(2)); }
-                                root.mvaddstr(ry, col_screen_x, &visible);
-                                let cursor_col_pos = (*edit_pos - scroll) as i32;
-                                if cursor_col_pos < cw && cursor_col_pos >= 0 {
-                                    let ch = '_' as u32 | A_REVERSE as u32;
-                                    let cpos = col_screen_x + cursor_col_pos;
-                                    if cpos < rect.x + rect.w { root.mvaddch(ry, cpos, ch); }
-                                }
-                                if is_cursor && has_colors() { root.attroff(COLOR_PAIR(2)); }
-                            } else {
-                                if is_cursor && has_colors() { root.attron(COLOR_PAIR(2)); }
-                                root.mvaddstr(ry, col_screen_x, &display);
-                                if is_cursor && has_colors() { root.attroff(COLOR_PAIR(2)); }
+                            out.push_str(&display);
+                            if is_cursor_cell {
+                                out.push_str(SGR_BG_DEFAULT);
+                            } else if cell_style == 2 || cell_style == 3 {
+                                out.push_str(SGR_FG_DEFAULT);
                             }
                             vc += 1 + overflow_cols;
                         }
-                        root.mvaddstr(ry, rect.x + rect.w - 1, "│");
+                        out.push_str(&sgr_cup(ry, rect.x + rect.w - 1));
+                        out.push_str("│");
                     }
                 }
                 // Bottom border line
                 {
                     let br = row_offset + max_data_rows as i32;
-                    root.mvaddstr(br, rect.x, "└");
+                    out.push_str(&sgr_cup(br, rect.x));
+                    out.push_str("└");
                     for i in 1..rect.w - 1 {
-                        root.mvaddstr(br, rect.x + i, "─");
+                        out.push('─');
                     }
-                    root.mvaddstr(br, rect.x + rect.w - 1, "┘");
+                    out.push_str("┘");
                 }
-                // Status bar — on its own line below the bottom border (unless tabs are
-                // present, in which case it overlays the border line, matching ratatui).
+                // Status bar: dark gray fg
                 if has_status {
                     let sr = if has_tabs {
-                        // Overlay status on the border line
                         row_offset + max_data_rows as i32
                     } else {
-                        // Separate line below the border
                         row_offset + max_data_rows as i32 + 1
                     };
                     if sr < rect.y + rect.h {
-                        if has_colors() { root.attron(COLOR_PAIR(3)); }
                         let max_w = rect.w as usize;
                         let st_end = status_text.char_indices().nth(max_w).map(|(i, _)| i).unwrap_or(status_text.len());
-                        root.mvaddstr(sr, rect.x, &status_text[..st_end]);
-                        if has_colors() { root.attroff(COLOR_PAIR(3)); }
-                        // If tabs are present, fill the remainder of this line with ─ and ┘
-                        // (matching ratatui's overlay behavior).
+                        out.push_str(&sgr_cup(sr, rect.x));
+                        out.push_str(sgr_sep());
+                        out.push_str(&status_text[..st_end]);
                         if has_tabs {
                             let st_vis = status_text[..st_end].chars().count();
                             if st_vis < rect.w as usize - 1 {
                                 for i in st_vis as i32..rect.w - 1 {
-                                    root.mvaddstr(sr, rect.x + i, "─");
+                                    out.push('─');
                                 }
-                                root.mvaddstr(sr, rect.x + rect.w - 1, "┘");
+                                out.push_str("┘");
                             }
                         }
                     }
                 }
-                // Tab bar — below the bottom border
+                // Tab bar
                 if !tab_text.is_empty() {
                     let ty = row_offset + max_data_rows as i32 + 1;
                     if ty < rect.y + rect.h {
                         let max_w = rect.w as usize;
                         let tab_end = tab_text.char_indices().nth(max_w).map(|(i, _)| i).unwrap_or(tab_text.len());
-                        root.mvaddstr(ty, rect.x, &tab_text[..tab_end]);
+                        out.push_str(&sgr_cup(ty, rect.x));
+                        out.push_str(&tab_text[..tab_end]);
                     }
                 }
+
+                // Emit the complete styled output
+                emit_sgr(&out);
             }
         }
     }
@@ -1648,9 +1779,11 @@ mod pancurses_backend {
     pub fn create_spreadsheet(rows: u32, cols: u32) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
         let cells = Rc::new(RefCell::new(HashMap::new()));
         let raw_cells = Rc::new(RefCell::new(HashMap::new()));
+        let cell_styles = Rc::new(RefCell::new(HashMap::new()));
         let id = with_state(|s| s.add_node(PcWidgetKind::Spreadsheet {
             cells,
             raw_cells,
+            cell_styles,
             total_rows: rows,
             total_cols: cols,
             top_row: 0,
@@ -1666,6 +1799,8 @@ mod pancurses_backend {
             formula_bar_address_id: None,
             formula_bar_entry_id: None,
             anchor: None,
+            header_row_count: 0,
+            main_row_count: 0,
             menu_text: String::new(),
             status_text: String::new(),
             border_title: String::new(),
@@ -1682,6 +1817,16 @@ mod pancurses_backend {
             if let Some(n) = s.node_mut(id) {
                 if let PcWidgetKind::Spreadsheet { ref cells, .. } = n.kind {
                     cells.borrow_mut().insert((r, c), text.to_string());
+                }
+            }
+        });
+    }
+
+    pub fn spreadsheet_set_cell_style(id: usize, r: u32, c: u32, style: u8) {
+        with_state(|s| {
+            if let Some(n) = s.node_mut(id) {
+                if let PcWidgetKind::Spreadsheet { ref cell_styles, .. } = n.kind {
+                    cell_styles.borrow_mut().insert((r, c), style);
                 }
             }
         });
@@ -1814,16 +1959,36 @@ mod pancurses_backend {
         });
     }
 
+    pub fn spreadsheet_set_row_counts(spreadsheet_id: usize, header_rows: u32, main_rows: u32) {
+        with_state(|s| {
+            if let Some(n) = s.node_mut(spreadsheet_id) {
+                if let PcWidgetKind::Spreadsheet { ref mut header_row_count, ref mut main_row_count, .. } = n.kind {
+                    *header_row_count = header_rows;
+                    *main_row_count = main_rows;
+                }
+            }
+        });
+    }
+
     pub fn spreadsheet_cursor_position(id: usize) -> Option<(u32, u32)> {
         with_state(|s| {
             s.node(id).and_then(|n| {
                 if let PcWidgetKind::Spreadsheet { cursor_row, cursor_col, .. } = n.kind {
                     Some((cursor_row, cursor_col))
-                } else {
-                    None
-                }
+                } else { None }
             })
         })
+    }
+
+    pub fn spreadsheet_set_cursor(id: usize, row: u32, col: u32) {
+        with_state(|s| {
+            if let Some(n) = s.node_mut(id) {
+                if let PcWidgetKind::Spreadsheet { ref mut cursor_row, ref mut cursor_col, .. } = n.kind {
+                    *cursor_row = row;
+                    *cursor_col = col;
+                }
+            }
+        });
     }
 
     pub fn spreadsheet_commit_formula_bar(spreadsheet_id: usize) {
@@ -2481,6 +2646,7 @@ mod pancurses_backend {
                 PcWidgetKind::Spreadsheet {
                     cells: Rc::new(RefCell::new(HashMap::new())),
                     raw_cells: Rc::new(RefCell::new(HashMap::new())),
+                    cell_styles: Rc::new(RefCell::new(HashMap::new())),
                     total_rows: 100,
                     total_cols: 26,
                     top_row: 0,
@@ -2646,6 +2812,7 @@ mod pancurses_backend {
                 PcWidgetKind::Spreadsheet {
                     cells: Rc::new(RefCell::new(HashMap::new())),
                     raw_cells: Rc::new(RefCell::new(HashMap::new())),
+                    cell_styles: Rc::new(RefCell::new(HashMap::new())),
                     total_rows: 100,
                     total_cols: 3,
                     top_row: 0,
@@ -3235,6 +3402,7 @@ mod pancurses_backend {
                 PcWidgetKind::Spreadsheet {
                     cells: Rc::new(RefCell::new(HashMap::new())),
                     raw_cells: Rc::new(RefCell::new(HashMap::new())),
+                    cell_styles: Rc::new(RefCell::new(HashMap::new())),
                     total_rows: 10, total_cols: 3, top_row: 0, left_col: 0,
                     cursor_row: 0, cursor_col: 0, editing: false,
                     edit_buf: String::new(), edit_pos: 0, col_width: 12,
@@ -3269,6 +3437,7 @@ mod pancurses_backend {
                 PcWidgetKind::Spreadsheet {
                     cells: Rc::new(RefCell::new(HashMap::new())),
                     raw_cells: Rc::new(RefCell::new(HashMap::new())),
+                    cell_styles: Rc::new(RefCell::new(HashMap::new())),
                     total_rows: 10, total_cols: 2, top_row: 0, left_col: 0,
                     cursor_row: 0, cursor_col: 0, editing: false,
                     edit_buf: String::new(), edit_pos: 0, col_width: 12,
@@ -3300,6 +3469,7 @@ mod pancurses_backend {
                 PcWidgetKind::Spreadsheet {
                     cells: Rc::new(RefCell::new(HashMap::new())),
                     raw_cells: Rc::new(RefCell::new(HashMap::new())),
+                    cell_styles: Rc::new(RefCell::new(HashMap::new())),
                     total_rows: 10, total_cols: 1, top_row: 0, left_col: 0,
                     cursor_row: 0, cursor_col: 0, editing: false,
                     edit_buf: String::new(), edit_pos: 0, col_width: 12,

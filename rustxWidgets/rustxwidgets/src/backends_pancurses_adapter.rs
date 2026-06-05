@@ -480,6 +480,15 @@ mod pancurses_adapter {
         }
     }
 
+    // ── Cell style constants (match cell_style_to_attrs in pancurses.rs) ──
+    pub const CELL_STYLE_DEFAULT: u8 = 0;
+    pub const CELL_STYLE_CURSOR: u8 = 1;
+    pub const CELL_STYLE_AGGREGATE: u8 = 2;
+    pub const CELL_STYLE_FOOTER_AGGREGATE: u8 = 3;
+    pub const CELL_STYLE_SELECTED: u8 = 4;
+    pub const CELL_STYLE_ACTIVE_HEADER: u8 = 5;
+    pub const CELL_STYLE_INACTIVE_HEADER: u8 = 6;
+
     impl Spreadsheet {
         pub fn id(&self) -> usize { self.id }
         pub fn set_cell(&self, row: u32, col: u32, text: &str) {
@@ -491,11 +500,20 @@ mod pancurses_adapter {
         pub fn set_raw_cell(&self, row: u32, col: u32, text: &str) {
             crate::backends::pancurses::spreadsheet_set_raw_cell(self.id, row, col, text);
         }
+        pub fn set_cell_style(&self, row: u32, col: u32, style: u8) {
+            crate::backends::pancurses::spreadsheet_set_cell_style(self.id, row, col, style);
+        }
         pub fn cursor_position(&self) -> Option<(u32, u32)> {
             crate::backends::pancurses::spreadsheet_cursor_position(self.id)
         }
+        pub fn set_cursor(&self, row: u32, col: u32) {
+            crate::backends::pancurses::spreadsheet_set_cursor(self.id, row, col);
+        }
         pub fn set_grid_config(&self, margin_cols: u32, main_cols: u32) {
             crate::backends::pancurses::spreadsheet_set_grid_config(self.id, margin_cols, main_cols);
+        }
+        pub fn set_row_counts(&self, header_rows: u32, main_rows: u32) {
+            crate::backends::pancurses::spreadsheet_set_row_counts(self.id, header_rows, main_rows);
         }
         pub fn set_column_layout(&self, layout: Vec<(u32, u32, String)>) {
             crate::backends::pancurses::spreadsheet_set_column_layout(self.id, layout);
