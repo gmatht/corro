@@ -1496,7 +1496,11 @@ mod pancurses_backend {
                                         out.push(' ');
                                     }
                                     if use_gray {
-                                        out.push_str(SGR_FG_DEFAULT);
+                                        if is_boundary && vi + 1 >= n {
+                                            out.push_str(SGR_RESET);
+                                        } else {
+                                            out.push_str(SGR_FG_DEFAULT);
+                                        }
                                     }
                                     let gap_after = if vi + 1 < n { 1 } else { 0 };
                                     if gap_after > 0 {
@@ -1614,7 +1618,11 @@ mod pancurses_backend {
                             } else if cell_style == 2 || cell_style == 3 {
                                 out.push_str(SGR_FG_DEFAULT);
                             } else if is_left_margin_col || is_right_margin_col {
-                                out.push_str(SGR_FG_DEFAULT);
+                                if is_boundary && vi + 1 >= n {
+                                    out.push_str(SGR_RESET);
+                                } else {
+                                    out.push_str(SGR_FG_DEFAULT);
+                                }
                             } else if sgr_applied {
                                 out.push_str(SGR_FG_DEFAULT);
                             }
@@ -1715,6 +1723,9 @@ mod pancurses_backend {
                                 out.push_str(SGR_FG_DEFAULT);
                             }
                             vc += 1 + overflow_cols;
+                        }
+                        if is_boundary {
+                            out.push_str(SGR_RESET);
                         }
                         out.push_str(&sgr_cup(ry, rect.x + rect.w - 1));
                         out.push_str("│");
