@@ -1462,7 +1462,7 @@ mod pancurses_backend {
                             let cell_text = cells_ref.get(&(row_idx, col_idx))
                                 .map(|s| s.as_str()).unwrap_or("");
                             let cell_style = cell_styles_ref.get(&(row_idx, col_idx)).copied().unwrap_or(0);
-                            let is_cursor_cell = cell_style == 1;
+                            let is_cursor_cell = row_idx == *cursor_row && col_idx == *cursor_col;
                             if cell_text.is_empty() {
                                 // Empty cell: draw cursor highlight if needed
                                 let is_agg_empty = cell_style == 2 || cell_style == 3;
@@ -1756,7 +1756,7 @@ mod pancurses_backend {
                             let col_idx = *left_col + vc as u32;
                             let cell_text = cells_ref.get(&(row_idx, col_idx)).map(|s| s.as_str()).unwrap_or("");
                             let cell_style = cell_styles_ref.get(&(row_idx, col_idx)).copied().unwrap_or(0);
-                            let is_cursor_cell = cell_style == 1;
+                            let is_cursor_cell = row_idx == *cursor_row && col_idx == *cursor_col;
                             let col_screen_x = rect.x + 1 + rh_w + vc * (cw + 1);
                             if cell_text.is_empty() && !(*editing && is_cursor_cell) {
                                 if is_cursor_cell {
