@@ -271,12 +271,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let left = chw as i32 + c as i32 * CELL_W;
                 let top = CELL_H + compute_row_y(&rh_b, r);
                 drop(rh_b);
+                overlay_edit.add_overlay(&entry);
+                overlay_edit.set_overlay_pass_through(&entry, false);
                 entry.set_margin_start(left);
                 entry.set_margin_top(top);
                 entry.set_halign(1);
                 entry.set_valign(1);
-                overlay_edit.add_overlay(&entry);
-                overlay_edit.set_overlay_pass_through(&entry, false);
                 entry.set_visible(true);
                 overlay_edit.show_all();
                 entry.set_size_request(CELL_W, rh.borrow()[r]);
@@ -314,40 +314,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sel_draw = sel.clone();
     let edit_draw = editing_entry.clone();
     canvas.set_draw_callback(Box::new(move |ctx: &mut dyn DrawContext, _w: i32, _h: i32| {
-        // White background
-        ctx.clear(1.0, 1.0, 1.0, 1.0);
-
-        // Header area
-        ctx.fill_rect(0.0, 0.0, chw, ch, 0.91, 0.91, 0.91, 1.0);
-        ctx.fill_rect(chw, 0.0, COLS as f64 * cw, ch, 0.8, 0.8, 0.8, 1.0);
-        ctx.fill_rect(0.0, ch, chw, ROWS as f64 * ch, 0.8, 0.8, 0.8, 1.0);
-
-        // Grid lines
-        for c in 0..=COLS {
-            let x = chw + c as f64 * cw;
-            ctx.stroke_rect(x, 0.0, 0.0, total_h, 0.7, 0.7, 0.7, 1.0, 0.5);
-        }
-        for r in 0..=ROWS {
-            let y = ch + r as f64 * ch;
-            ctx.stroke_rect(0.0, y, total_w, 0.0, 0.7, 0.7, 0.7, 1.0, 0.5);
-        }
-
-        // Column headers
-        for c in 0..COLS {
-            let lbl = col_label(c);
-            let (xb, _, w, _) = ctx.text_extents_styled(&lbl, "monospace", 12.0, 0, 0);
-            let x = chw + c as f64 * cw + cw / 2.0 - xb - w / 2.0;
-            ctx.draw_text(x, ch / 2.0, &lbl, "monospace", 12.0, 0.0, 0.0, 0.0, 1.0);
-        }
-        // Row headers
-        for r in 0..ROWS {
-            let lbl = format!("{}", r + 1);
-            let (xb, _, w, _) = ctx.text_extents_styled(&lbl, "monospace", 12.0, 0, 0);
-            let x = chw / 2.0 - xb - w / 2.0;
-            ctx.draw_text(x, ch + r as f64 * ch + ch / 2.0, &lbl, "monospace", 12.0, 0.0, 0.0, 0.0, 1.0);
-        }
-
-        // Cell overflow computation
+        // Cell overflow computation (before any drawing, just measures text)
         let t = t_draw.borrow();
         let f = f_draw.borrow();
         let mut overflow_end_col = vec![vec![0usize; COLS]; ROWS];
@@ -370,13 +337,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // Redraw clean background (after overflow computation clears any overlap)
+        // White background
         ctx.clear(1.0, 1.0, 1.0, 1.0);
+
+        // Header area
         ctx.fill_rect(0.0, 0.0, chw, ch, 0.91, 0.91, 0.91, 1.0);
         ctx.fill_rect(chw, 0.0, COLS as f64 * cw, ch, 0.8, 0.8, 0.8, 1.0);
         ctx.fill_rect(0.0, ch, chw, ROWS as f64 * ch, 0.8, 0.8, 0.8, 1.0);
 
-        // Re-draw grid lines
+        // Column headers
+        for c in 0..COLS {
+            let lbl = col_label(c);
+            let (xb, _, w, _) = ctx.text_extents_styled(&lbl, "monospace", 12.0, 0, 0);
+            let x = chw + c as f64 * cw + cw / 2.0 - xb - w / 2.0;
+            ctx.draw_text(x, ch / 2.0, &lbl, "monospace", 12.0, 0.0, 0.0, 0.0, 1.0);
+        }
+        // Row headers
+        for r in 0..ROWS {
+            let lbl = format!("{}", r + 1);
+            let (xb, _, w, _) = ctx.text_extents_styled(&lbl, "monospace", 12.0, 0, 0);
+            let x = chw / 2.0 - xb - w / 2.0;
+            ctx.draw_text(x, ch + r as f64 * ch + ch / 2.0, &lbl, "monospace", 12.0, 0.0, 0.0, 0.0, 1.0);
+        }
+
+        // Grid lines (overflow-aware)
         for r in 0..=ROWS {
             let y = ch + r as f64 * ch;
             ctx.stroke_rect(0.0, y, total_w, 0.0, 0.7, 0.7, 0.7, 1.0, 0.5);

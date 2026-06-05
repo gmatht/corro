@@ -412,6 +412,8 @@ mod nwg_adapter {
         focus_out_cb: Rc<RefCell<Option<Box<dyn FnMut(*mut c_void) -> i32>>>>,
         _focus_in_handler: Option<nwg::RawEventHandler>,
         _focus_out_handler: Option<nwg::RawEventHandler>,
+        pub(crate) pos_x: std::cell::Cell<i32>,
+        pub(crate) pos_y: std::cell::Cell<i32>,
     }
 
     impl Clone for Entry {
@@ -424,6 +426,8 @@ mod nwg_adapter {
                 focus_out_cb: self.focus_out_cb.clone(),
                 _focus_in_handler: None,
                 _focus_out_handler: None,
+                pos_x: std::cell::Cell::new(self.pos_x.get()),
+                pos_y: std::cell::Cell::new(self.pos_y.get()),
             }
         }
     }
@@ -463,8 +467,30 @@ mod nwg_adapter {
         pub fn grab_focus(&self) { let _ = self.inner.set_focus(); }
         pub fn add_class(&self, _class: &str) {}
         pub fn remove_class(&self, _class: &str) {}
-        pub fn set_margin_start(&self, _px: i32) {}
-        pub fn set_margin_top(&self, _px: i32) {}
+        pub fn set_margin_start(&self, px: i32) {
+            self.pos_x.set(px);
+            if let Some(hwnd) = self.inner.handle.hwnd() {
+                unsafe {
+                    let result = winapi::um::winuser::SetWindowPos(
+                        hwnd as _, std::ptr::null_mut(), px, self.pos_y.get(), 0, 0,
+                        winapi::um::winuser::SWP_NOZORDER | winapi::um::winuser::SWP_NOSIZE | winapi::um::winuser::SWP_SHOWWINDOW,
+                    );
+                }
+            } else {
+            }
+        }
+        pub fn set_margin_top(&self, px: i32) {
+            self.pos_y.set(px);
+            if let Some(hwnd) = self.inner.handle.hwnd() {
+                unsafe {
+                    let result = winapi::um::winuser::SetWindowPos(
+                        hwnd as _, std::ptr::null_mut(), self.pos_x.get(), px, 0, 0,
+                        winapi::um::winuser::SWP_NOZORDER | winapi::um::winuser::SWP_NOSIZE | winapi::um::winuser::SWP_SHOWWINDOW,
+                    );
+                }
+            } else {
+            }
+        }
         pub fn set_halign(&self, _align: i32) {}
         pub fn set_valign(&self, _align: i32) {}
         pub fn connect_activate(&self, _f: impl FnMut(*mut c_void) + 'static) -> Result<u64, Error> { Ok(0) }
@@ -523,7 +549,7 @@ mod nwg_adapter {
             ).ok()
         } else { None };
 
-        Ok(Entry { inner: Rc::new(inner), _handler: Rc::new(handler), changed_cb, focus_in_cb, focus_out_cb, _focus_in_handler, _focus_out_handler })
+        Ok(Entry { inner: Rc::new(inner), _handler: Rc::new(handler), changed_cb, focus_in_cb, focus_out_cb, _focus_in_handler, _focus_out_handler, pos_x: std::cell::Cell::new(0), pos_y: std::cell::Cell::new(0) })
     }
 
     // ========== DropDown ==========
@@ -914,7 +940,7 @@ mod nwg_adapter {
         pub fn queue_redraw(&self) {
             if !self.hwnd.is_null() {
                 unsafe {
-                    winapi::um::winuser::InvalidateRect(self.hwnd as _, std::ptr::null_mut(), 1);
+                    winapi::um::winuser::InvalidateRect(self.hwnd as _, std::ptr::null_mut(), 0);
                 }
             }
         }
@@ -984,6 +1010,18 @@ mod nwg_adapter {
         if hwnd != std::ptr::null_mut() {
             let raw_hwnd: winapi::shared::windef::HWND = hwnd as _;
 
+            // Suppress WM_ERASEBKGND (prevent flash from class background brush)
+            {
+                static ERASE_ID: AtomicUsize = AtomicUsize::new(0x60000000);
+                let eid = ERASE_ID.fetch_add(1, Ordering::SeqCst);
+                if let Some(h) = nwg::bind_raw_event_handler(
+                    &nwg::ControlHandle::Hwnd(raw_hwnd), eid,
+                    move |_h, msg, _w, _l| {
+                        if msg == winapi::um::winuser::WM_ERASEBKGND { Some(1) } else { None }
+                    },
+                ).ok() { handlers.push(h); }
+            }
+
             // WM_PAINT handler
             {
                 let cb = draw_cb.clone();
@@ -1003,9 +1041,22 @@ mod nwg_adapter {
                             winapi::um::winuser::GetClientRect(hwnd as _, &mut rect);
                             let w = rect.right;
                             let h = rect.bottom;
-                            if let Some(ref mut draw_fn) = *cb.borrow_mut() {
-                                let mut ctx = NwgDrawContext { hdc, w, h };
-                                draw_fn(&mut ctx, w, h);
+                            if w > 0 && h > 0 {
+                                let mem_dc = winapi::um::wingdi::CreateCompatibleDC(hdc);
+                                if !mem_dc.is_null() {
+                                    let bmp = winapi::um::wingdi::CreateCompatibleBitmap(hdc, w, h);
+                                    if !bmp.is_null() {
+                                        let old = winapi::um::wingdi::SelectObject(mem_dc, bmp as _);
+                                        if let Some(ref mut draw_fn) = *cb.borrow_mut() {
+                                            let mut ctx = NwgDrawContext { hdc: mem_dc, w, h };
+                                            draw_fn(&mut ctx, w, h);
+                                        }
+                                        winapi::um::wingdi::BitBlt(hdc, 0, 0, w, h, mem_dc, 0, 0, winapi::um::wingdi::SRCCOPY);
+                                        winapi::um::wingdi::SelectObject(mem_dc, old);
+                                        winapi::um::wingdi::DeleteObject(bmp as _);
+                                    }
+                                    winapi::um::wingdi::DeleteDC(mem_dc);
+                                }
                             }
                             winapi::um::winuser::EndPaint(hwnd as _, &mut ps);
                         }
@@ -1081,10 +1132,28 @@ mod nwg_adapter {
                 }
             }
         }
-        pub fn add_overlay(&self, _child: &impl AsRef<*mut c_void>) {}
+        pub fn add_overlay(&self, child: &impl AsRef<*mut c_void>) {
+            let ptr = *child.as_ref();
+            if !ptr.is_null() && !self.hwnd.is_null() {
+                unsafe {
+                    winapi::um::winuser::SetParent(ptr as _, self.hwnd as _);
+                    winapi::um::winuser::SetWindowPos(
+                        ptr as _, winapi::um::winuser::HWND_TOP,
+                        0, 0, 0, 0,
+                        winapi::um::winuser::SWP_NOSIZE | winapi::um::winuser::SWP_SHOWWINDOW,
+                    );
+                }
+            }
+        }
         pub fn set_overlay_pass_through(&self, _child: &impl AsRef<*mut c_void>, _pass: bool) {}
         pub fn remove(&self, _child: &impl AsRef<*mut c_void>) {}
-        pub fn show_all(&self) {}
+        pub fn show_all(&self) {
+            if !self.hwnd.is_null() {
+                unsafe {
+                    winapi::um::winuser::ShowWindow(self.hwnd as _, winapi::um::winuser::SW_SHOW);
+                }
+            }
+        }
         pub fn set_vexpand(&self, _expand: bool) {}
         pub fn set_hexpand(&self, _expand: bool) {}
         pub fn set_size_request(&self, w: i32, h: i32) {
