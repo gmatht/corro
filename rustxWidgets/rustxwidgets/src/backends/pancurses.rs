@@ -1718,22 +1718,24 @@ mod pancurses_backend {
                         }
                         // Apply deferred SGR reset BEFORE the filler and right
                         // border so both use default styling, matching ratatui.
-                        // (No CUP to right border – the cursor is already at the
-                        // correct sequential position after the cell loop.)
                         if defer_sgr_reset {
                             out.push_str(&last_sgr);
                         }
-                        // Fill remaining row width before right border.
-                        // The cursor is at after_content-1 after the last cell
-                        // (the last column has no gap).  The fill needs to span
-                        // [after_content-1 .. right_border-1], then │ at right_border.
+                        // Use CUP to position at the right border, matching
+                        // the non-layout path at line 1820.  This works for
+                        // both normal rows (cursor at after_content) and
+                        // overflow rows (cursor past after_content).
+                        // Fill between after_content and right_border with
+                        // spaces to clear any stale characters.
+                        let right_border_x = rect.x + rect.w - 1;
                         let after_content = rect.x + 1 + 5 + column_layout.iter()
                             .map(|&(_, w, _)| w as i32).sum::<i32>()
-                            + (n.saturating_sub(1) as i32); // gaps between columns
-                        let gap = (rect.x + rect.w - after_content) as usize;
-                        if gap > 0 {
+                            + (n.saturating_sub(1) as i32);
+                        if after_content < right_border_x {
+                            let gap = (right_border_x - after_content) as usize;
                             out.push_str(&" ".repeat(gap));
                         }
+                        out.push_str(&sgr_cup(ry, right_border_x));
                         out.push_str("│");
                     } else {
                         let cw = *col_width as i32;
