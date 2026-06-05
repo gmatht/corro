@@ -1675,7 +1675,11 @@ mod pancurses_backend {
                             // has cursor or boundary styling, so the fill
                             // spaces and right border share the same styling.
                             let is_last = vi + 1 >= n;
-                            if is_last && (is_cursor_cell || is_boundary) {
+                            // When overflow consumes all remaining columns,
+                            // treat it as 'last' for SGR reset deferral so
+                            // boundary rows emit SGR_RESET before the border.
+                            let overflow_consumes_all = can_overflow && gap_target + 1 >= n;
+                            if (is_last || overflow_consumes_all) && (is_cursor_cell || is_boundary) {
                                 defer_sgr_reset = true;
                                 last_sgr = if is_cursor_cell {
                                     SGR_BG_DEFAULT.to_string()
