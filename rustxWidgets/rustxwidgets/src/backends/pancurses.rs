@@ -1294,13 +1294,10 @@ mod pancurses_backend {
                         let mut vi = 0;
                         while vi < n {
                             let (col_idx, sx) = col_positions[vi];
-                            let is_margin = *margin_cols > 0 && col_idx < *margin_cols;
-                            let cell_text = if !is_margin {
-                                let main_col = if col_idx < *margin_cols { col_idx } else { col_idx - *margin_cols };
-                                cells_ref.get(&(row_idx, main_col)).map(|s| s.as_str()).unwrap_or("")
-                            } else {
-                                cells_ref.get(&(row_idx, col_idx)).map(|s| s.as_str()).unwrap_or("")
-                            };
+                            // Look up cells by global column index to match
+                            // storage in pnc_backend.rs (no margin/main collision).
+                            let cell_text = cells_ref.get(&(row_idx, col_idx))
+                                .map(|s| s.as_str()).unwrap_or("");
                             if cell_text.is_empty() {
                                 vi += 1;
                                 continue;
@@ -1313,13 +1310,8 @@ mod pancurses_backend {
                                 let mut scan = vi + 1;
                                 while scan < n {
                                     let (sc_idx, _) = col_positions[scan];
-                                    let is_margin2 = *margin_cols > 0 && sc_idx < *margin_cols;
-                                    let sc_text = if !is_margin2 {
-                                        let main_sc = if sc_idx < *margin_cols { sc_idx } else { sc_idx - *margin_cols };
-                                        cells_ref.get(&(row_idx, main_sc)).map(|s| s.as_str()).unwrap_or("")
-                                    } else {
-                                        cells_ref.get(&(row_idx, sc_idx)).map(|s| s.as_str()).unwrap_or("")
-                                    };
+                                    let sc_text = cells_ref.get(&(row_idx, sc_idx))
+                                        .map(|s| s.as_str()).unwrap_or("");
                                     if sc_text.is_empty() {
                                         overflow_cols += 1;
                                         scan += 1;
