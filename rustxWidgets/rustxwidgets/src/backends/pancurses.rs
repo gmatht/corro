@@ -1206,22 +1206,14 @@ mod pancurses_backend {
                         root.mvaddstr(hr, hx, &" ".repeat(5));
                         hx += 5;
                         let n = column_layout.len();
-                        let mut hx_extra: i32 = 0;
                         for (i, &(ref _ci, ref w, ref label)) in column_layout.iter().enumerate() {
-                            // Need room for: column content + space + right border
-                            // Match ratatui's visible_cols_render_width which uses 2-char separators
-                            // at the left-margin/main and main/right-margin boundaries.
-                            if hx + hx_extra + *w as i32 + 1 > rect.x + rect.w - 1 { break; }
+                            if hx + *w as i32 + 1 > rect.x + rect.w - 1 { break; }
                             let padded = format!("{:<1$}", label, *w as usize);
                             root.mvaddstr(hr, hx, &padded);
                             hx += *w as i32;
                             if i + 1 < n {
                                 root.mvaddch(hr, hx, ' ');
                                 hx += 1;
-                            }
-                            // Consume extra budget at margin boundaries
-                            if *margin_cols > 0 && (*_ci == *margin_cols as u32 - 1 || *_ci == *margin_cols as u32 + *main_cols as u32 - 1) {
-                                hx_extra += 1;
                             }
                         }
                         // Right border
@@ -2270,9 +2262,14 @@ mod pancurses_backend {
                 let mut hdr = String::new();
                 hdr.push('│');
                 if use_layout {
-                    for &(col_idx, w, ref label) in &column_layout {
-                        let padded = format!(" {:<1$}", label, (w as usize).max(1));
+                    hdr.push_str(&" ".repeat(5));
+                    let n = column_layout.len();
+                    for (i, &(_, w, ref label)) in column_layout.iter().enumerate() {
+                        let padded = format!("{:<1$}", label, (w as usize).max(1));
                         hdr.push_str(&padded);
+                        if i + 1 < n {
+                            hdr.push(' ');
+                        }
                     }
                 } else {
                     let max_data_cols = ((width as i32 - rh_w as i32 - 2) / (cw as i32 + 1)).max(1) as usize;
