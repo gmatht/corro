@@ -1295,7 +1295,9 @@ mod pancurses_backend {
                             let cell_text = if !is_margin {
                                 let main_col = if col_idx < *margin_cols { col_idx } else { col_idx - *margin_cols };
                                 cells_ref.get(&(row_idx, main_col)).map(|s| s.as_str()).unwrap_or("")
-                            } else { "" };
+                            } else {
+                                cells_ref.get(&(row_idx, col_idx)).map(|s| s.as_str()).unwrap_or("")
+                            };
                             if cell_text.is_empty() {
                                 vi += 1;
                                 continue;
@@ -1312,7 +1314,9 @@ mod pancurses_backend {
                                     let sc_text = if !is_margin2 {
                                         let main_sc = if sc_idx < *margin_cols { sc_idx } else { sc_idx - *margin_cols };
                                         cells_ref.get(&(row_idx, main_sc)).map(|s| s.as_str()).unwrap_or("")
-                                    } else { "" };
+                                    } else {
+                                        cells_ref.get(&(row_idx, sc_idx)).map(|s| s.as_str()).unwrap_or("")
+                                    };
                                     if sc_text.is_empty() {
                                         overflow_cols += 1;
                                         scan += 1;
@@ -2336,7 +2340,9 @@ mod pancurses_backend {
                         let cell_text = if !is_margin {
                             let main_col = col_idx - lm;
                             cells_ref.get(&(row_idx, main_col)).map(|s| s.as_str()).unwrap_or("")
-                        } else { "" };
+                        } else {
+                            cells_ref.get(&(row_idx, col_idx)).map(|s| s.as_str()).unwrap_or("")
+                        };
                         let cell_w = w as usize;
                         if cell_text.is_empty() {
                             data_row.push_str(&format!("{:<1$}", "", cell_w));
@@ -2354,7 +2360,9 @@ mod pancurses_backend {
                                 let sc_text = if !is_margin2 {
                                     let main_sc = sc_idx - lm;
                                     cells_ref.get(&(row_idx, main_sc)).map(|s| s.as_str()).unwrap_or("")
-                                } else { "" };
+                                } else {
+                                    cells_ref.get(&(row_idx, sc_idx)).map(|s| s.as_str()).unwrap_or("")
+                                };
                                 if sc_text.is_empty() {
                                     overflow_cols += 1;
                                     scan += 1;
@@ -2473,6 +2481,7 @@ mod pancurses_backend {
                     formula_bar_trailing: String::new(),
                     column_layout: Vec::new(),
                     row_labels: Vec::new(),
+                    tab_text: String::new(),
                 },
                 Some(wid),
             ));
@@ -2637,6 +2646,7 @@ mod pancurses_backend {
                     formula_bar_trailing: String::new(),
                     column_layout: Vec::new(),
                     row_labels: Vec::new(),
+                    tab_text: String::new(),
                 },
                 Some(wid),
             ));
@@ -3216,6 +3226,7 @@ mod pancurses_backend {
                     formula_bar_trailing: String::new(),
                     column_layout: vec![(0,10,"A".into()),(1,10,"B".into()),(2,10,"C".into())],
                     row_labels: vec![(0,"   1".into()),(1,"   2".into())],
+                    tab_text: String::new(),
                 },
                 Some(wid),
             ));
@@ -3248,6 +3259,7 @@ mod pancurses_backend {
                     formula_bar_trailing: String::new(),
                     column_layout: vec![(0,5,"X".into()),(1,5,"Y".into())],
                     row_labels: vec![],
+                    tab_text: String::new(),
                 },
                 Some(wid),
             ));
@@ -3278,6 +3290,7 @@ mod pancurses_backend {
                     formula_bar_trailing: String::new(),
                     column_layout: vec![(0,8,"A".into())],
                     row_labels: vec![(0,"ROW0".into()),(1,"ROW1".into())],
+                    tab_text: String::new(),
                 },
                 Some(wid),
             ));
