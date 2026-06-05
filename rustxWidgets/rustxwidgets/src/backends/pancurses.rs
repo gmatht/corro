@@ -34,6 +34,7 @@ mod pancurses_backend {
         TextView { text: String },
         Spreadsheet {
             cells: Rc<RefCell<HashMap<(u32, u32), String>>>,
+            raw_cells: Rc<RefCell<HashMap<(u32, u32), String>>>,
             total_rows: u32,
             total_cols: u32,
             top_row: u32,
@@ -1132,7 +1133,7 @@ mod pancurses_backend {
                     root.attroff(COLOR_PAIR(3));
                 }
             }
-            PcWidgetKind::Spreadsheet { ref cells, ref top_row, ref left_col, ref cursor_row, ref cursor_col, ref editing, ref edit_buf, ref edit_pos, ref col_width, ref margin_cols, ref main_cols, ref menu_text, ref status_text, ref border_title, ref formula_bar_trailing, ref column_layout, ref row_labels, ref total_rows, ref total_cols, .. } => {
+            PcWidgetKind::Spreadsheet { ref cells, ref raw_cells, ref top_row, ref left_col, ref cursor_row, ref cursor_col, ref editing, ref edit_buf, ref edit_pos, ref col_width, ref margin_cols, ref main_cols, ref menu_text, ref status_text, ref border_title, ref formula_bar_trailing, ref column_layout, ref row_labels, ref total_rows, ref total_cols, .. } => {
                 let cw = *col_width as i32;
                 let rh_w = 5i32;
                 let lm = *margin_cols as usize;
@@ -1157,7 +1158,7 @@ mod pancurses_backend {
 
                 // Formula bar
                 let addr_text = format!("{}{}", col_label(*cursor_col), *cursor_row + 1);
-                let cell_val = cells.borrow().get(&(*cursor_row, *cursor_col)).cloned().unwrap_or_default();
+                let cell_val = raw_cells.borrow().get(&(*cursor_row, *cursor_col)).cloned().unwrap_or_default();
                 let addr_vis = addr_text.chars().count();
                 let max_fb = (rect.w as usize).saturating_sub(addr_vis + 3).max(1);
                 let fb_text = if cell_val.chars().count() > max_fb {
@@ -1616,8 +1617,10 @@ mod pancurses_backend {
 
     pub fn create_spreadsheet(rows: u32, cols: u32) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
         let cells = Rc::new(RefCell::new(HashMap::new()));
+        let raw_cells = Rc::new(RefCell::new(HashMap::new()));
         let id = with_state(|s| s.add_node(PcWidgetKind::Spreadsheet {
             cells,
+            raw_cells,
             total_rows: rows,
             total_cols: cols,
             top_row: 0,
@@ -1648,6 +1651,16 @@ mod pancurses_backend {
             if let Some(n) = s.node_mut(id) {
                 if let PcWidgetKind::Spreadsheet { ref cells, .. } = n.kind {
                     cells.borrow_mut().insert((r, c), text.to_string());
+                }
+            }
+        });
+    }
+
+    pub fn spreadsheet_set_raw_cell(id: usize, r: u32, c: u32, text: &str) {
+        with_state(|s| {
+            if let Some(n) = s.node_mut(id) {
+                if let PcWidgetKind::Spreadsheet { ref raw_cells, .. } = n.kind {
+                    raw_cells.borrow_mut().insert((r, c), text.to_string());
                 }
             }
         });
@@ -2167,13 +2180,13 @@ mod pancurses_backend {
                 Some(n) => n,
                 None => return,
             };
-            let (cells, top_row, left_col, cursor_row, cursor_col, editing, edit_buf, edit_pos,
+            let (cells, raw_cells, top_row, left_col, cursor_row, cursor_col, editing, edit_buf, edit_pos,
                  col_width, margin_cols, main_cols, menu_text, status_text,
                  column_layout, row_labels) = match &n.kind {
-                PcWidgetKind::Spreadsheet { cells, top_row, left_col, cursor_row, cursor_col,
+                PcWidgetKind::Spreadsheet { cells, raw_cells, top_row, left_col, cursor_row, cursor_col,
                     editing, edit_buf, edit_pos, col_width, margin_cols, main_cols,
                     menu_text, status_text, ref column_layout, ref row_labels, .. } => {
-                    (cells.clone(), *top_row, *left_col, *cursor_row, *cursor_col,
+                    (cells.clone(), raw_cells.clone(), *top_row, *left_col, *cursor_row, *cursor_col,
                      *editing, edit_buf.clone(), *edit_pos, *col_width,
                      *margin_cols, *main_cols, menu_text.clone(), status_text.clone(),
                      column_layout.clone(), row_labels.clone())
@@ -2199,7 +2212,7 @@ mod pancurses_backend {
             // Formula bar (matching ratatui: leading space)
             if row < height {
                 let addr_text = format!("{}{}", col_label(cursor_col), cursor_row + 1);
-                let cell_val = cells.borrow().get(&(cursor_row, cursor_col)).cloned().unwrap_or_default();
+                let cell_val = raw_cells.borrow().get(&(cursor_row, cursor_col)).cloned().unwrap_or_default();
                 let max_fb = width.saturating_sub(addr_text.chars().count() + 3).max(1);
                 let fb_text = if cell_val.chars().count() > max_fb {
                     let truncated: String = cell_val.chars().take(max_fb.saturating_sub(3)).collect();
@@ -2367,6 +2380,7 @@ mod pancurses_backend {
             let sid = with_state(|s| s.add_node(
                 PcWidgetKind::Spreadsheet {
                     cells: Rc::new(RefCell::new(HashMap::new())),
+                    raw_cells: Rc::new(RefCell::new(HashMap::new())),
                     total_rows: 100,
                     total_cols: 26,
                     top_row: 0,
@@ -2529,6 +2543,7 @@ mod pancurses_backend {
             let sid = with_state(|s| s.add_node(
                 PcWidgetKind::Spreadsheet {
                     cells: Rc::new(RefCell::new(HashMap::new())),
+                    raw_cells: Rc::new(RefCell::new(HashMap::new())),
                     total_rows: 100,
                     total_cols: 3,
                     top_row: 0,
@@ -2556,10 +2571,13 @@ mod pancurses_backend {
             with_state(|state| {
                 let n = state.node_mut(sid).unwrap();
                 match &mut n.kind {
-                    PcWidgetKind::Spreadsheet { ref cells, .. } => {
+                    PcWidgetKind::Spreadsheet { ref cells, ref raw_cells, .. } => {
                         cells.borrow_mut().insert((0, 0), "This Text is really long and should overflow.".into());
                         cells.borrow_mut().insert((1, 1), "This Text is really long and should overflow.".into());
                         cells.borrow_mut().insert((2, 2), "This Text is really long and should overflow.".into());
+                        raw_cells.borrow_mut().insert((0, 0), "This Text is really long and should overflow.".into());
+                        raw_cells.borrow_mut().insert((1, 1), "This Text is really long and should overflow.".into());
+                        raw_cells.borrow_mut().insert((2, 2), "This Text is really long and should overflow.".into());
                     }
                     _ => unreachable!(),
                 }
@@ -3112,6 +3130,7 @@ mod pancurses_backend {
             let sid = with_state(|s| s.add_node(
                 PcWidgetKind::Spreadsheet {
                     cells: Rc::new(RefCell::new(HashMap::new())),
+                    raw_cells: Rc::new(RefCell::new(HashMap::new())),
                     total_rows: 10, total_cols: 3, top_row: 0, left_col: 0,
                     cursor_row: 0, cursor_col: 0, editing: false,
                     edit_buf: String::new(), edit_pos: 0, col_width: 12,
@@ -3143,6 +3162,7 @@ mod pancurses_backend {
             let sid = with_state(|s| s.add_node(
                 PcWidgetKind::Spreadsheet {
                     cells: Rc::new(RefCell::new(HashMap::new())),
+                    raw_cells: Rc::new(RefCell::new(HashMap::new())),
                     total_rows: 10, total_cols: 2, top_row: 0, left_col: 0,
                     cursor_row: 0, cursor_col: 0, editing: false,
                     edit_buf: String::new(), edit_pos: 0, col_width: 12,
@@ -3171,6 +3191,7 @@ mod pancurses_backend {
             let sid = with_state(|s| s.add_node(
                 PcWidgetKind::Spreadsheet {
                     cells: Rc::new(RefCell::new(HashMap::new())),
+                    raw_cells: Rc::new(RefCell::new(HashMap::new())),
                     total_rows: 10, total_cols: 1, top_row: 0, left_col: 0,
                     cursor_row: 0, cursor_col: 0, editing: false,
                     edit_buf: String::new(), edit_pos: 0, col_width: 12,

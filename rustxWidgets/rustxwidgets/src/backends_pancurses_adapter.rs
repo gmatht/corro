@@ -488,6 +488,9 @@ mod pancurses_adapter {
         pub fn get_cell(&self, row: u32, col: u32) -> Option<String> {
             crate::backends::pancurses::spreadsheet_get_cell(self.id, row, col)
         }
+        pub fn set_raw_cell(&self, row: u32, col: u32, text: &str) {
+            crate::backends::pancurses::spreadsheet_set_raw_cell(self.id, row, col, text);
+        }
         pub fn cursor_position(&self) -> Option<(u32, u32)> {
             crate::backends::pancurses::spreadsheet_cursor_position(self.id)
         }
