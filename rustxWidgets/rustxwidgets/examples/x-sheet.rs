@@ -140,6 +140,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     canvas.set_size_request(total_w_i, total_h_i);
     canvas.set_content_size(total_w_i, total_h_i);
     overlay.set_child(&canvas);
+    overlay.set_size_request(total_w_i, total_h_i);
     #[cfg(feature = "gtk")]
     overlay.set_vexpand(true);
     #[cfg(feature = "gtk")]

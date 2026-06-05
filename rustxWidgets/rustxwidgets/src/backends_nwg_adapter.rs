@@ -207,9 +207,9 @@ mod nwg_adapter {
     pub struct BoxWidget {
         pub(crate) frame: Option<Rc<nwg::Frame>>,
         pub(crate) hwnd: *mut c_void,
-        pub(crate) children: Vec<*mut c_void>,
-        pub(crate) child_vexpand: Vec<bool>,
-        pub(crate) child_hexpand: Vec<bool>,
+        pub(crate) children: Rc<RefCell<Vec<*mut c_void>>>,
+        pub(crate) child_vexpand: Rc<RefCell<Vec<bool>>>,
+        pub(crate) child_hexpand: Rc<RefCell<Vec<bool>>>,
         pub(crate) orientation: crate::backends::nwg::Orientation,
         pub(crate) spacing: i32,
     }
@@ -255,25 +255,34 @@ mod nwg_adapter {
                     }
                 }
             }
-            let count = hwnds.iter().filter(|&&c| !c.is_null()).count();
-            self.children.extend(hwnds.into_iter().filter(|&c| !c.is_null()));
-            self.child_vexpand.resize(self.children.len(), false);
-            self.child_hexpand.resize(self.children.len(), false);
+            let mut children = self.children.borrow_mut();
+            let mut vex = self.child_vexpand.borrow_mut();
+            let mut hex = self.child_hexpand.borrow_mut();
+            children.extend(hwnds.into_iter().filter(|&c| !c.is_null()));
+            vex.resize(children.len(), false);
+            hex.resize(children.len(), false);
         }
-        pub fn set_child_vexpand(&mut self, child: &impl AsRef<*mut c_void>, expand: bool) {
+        pub fn set_child_vexpand(&self, child: &impl AsRef<*mut c_void>, expand: bool) {
             let ptr = *child.as_ref();
-            if let Some(idx) = self.children.iter().position(|&c| c == ptr) {
-                self.child_vexpand[idx] = expand;
+            let children = self.children.borrow();
+            let mut vex = self.child_vexpand.borrow_mut();
+            if let Some(idx) = children.iter().position(|&c| c == ptr) {
+                vex[idx] = expand;
             }
         }
-        pub fn set_child_hexpand(&mut self, child: &impl AsRef<*mut c_void>, expand: bool) {
+        pub fn set_child_hexpand(&self, child: &impl AsRef<*mut c_void>, expand: bool) {
             let ptr = *child.as_ref();
-            if let Some(idx) = self.children.iter().position(|&c| c == ptr) {
-                self.child_hexpand[idx] = expand;
+            let children = self.children.borrow();
+            let mut hex = self.child_hexpand.borrow_mut();
+            if let Some(idx) = children.iter().position(|&c| c == ptr) {
+                hex[idx] = expand;
             }
         }
         pub fn layout(&self, _x: i32, _y: i32, w: i32, h: i32) {
-            let n = self.children.len();
+            let children = self.children.borrow();
+            let vex = self.child_vexpand.borrow();
+            let hex = self.child_hexpand.borrow();
+            let n = children.len();
             if n == 0 { return; }
             let spacing_total = self.spacing * (n as i32 - 1).max(0);
             let (fixed_w, fixed_h) = match self.orientation {
@@ -284,18 +293,16 @@ mod nwg_adapter {
                     (w - 10, 0)
                 }
             };
-            // Count expandable children
             let expand_count = match self.orientation {
                 crate::backends::nwg::Orientation::Horizontal =>
-                    self.child_hexpand.iter().filter(|&&e| e).count(),
+                    hex.iter().filter(|&&e| e).count(),
                 crate::backends::nwg::Orientation::Vertical =>
-                    self.child_vexpand.iter().filter(|&&e| e).count(),
+                    vex.iter().filter(|&&e| e).count(),
             };
-            // Calculate fixed children size
             let fixed_total: i32 = (0..n).map(|i| {
                 let is_expand = match self.orientation {
-                    crate::backends::nwg::Orientation::Horizontal => self.child_hexpand[i],
-                    crate::backends::nwg::Orientation::Vertical => self.child_vexpand[i],
+                    crate::backends::nwg::Orientation::Horizontal => hex[i],
+                    crate::backends::nwg::Orientation::Vertical => vex[i],
                 };
                 if is_expand { 0 } else {
                     match self.orientation {
@@ -312,10 +319,10 @@ mod nwg_adapter {
             let expand_size = if expand_count > 0 { remaining / expand_count as i32 } else { 0 };
 
             for i in 0..n {
-                let child = self.children[i];
+                let child = children[i];
                 let is_expand = match self.orientation {
-                    crate::backends::nwg::Orientation::Horizontal => self.child_hexpand[i],
-                    crate::backends::nwg::Orientation::Vertical => self.child_vexpand[i],
+                    crate::backends::nwg::Orientation::Horizontal => hex[i],
+                    crate::backends::nwg::Orientation::Vertical => vex[i],
                 };
                 let (cw, ch) = match self.orientation {
                     crate::backends::nwg::Orientation::Horizontal => {
@@ -353,8 +360,17 @@ mod nwg_adapter {
                 .map_err(|e| Error::Backend(format!("{}", e)))?;
         }
         let hwnd = frame.handle.hwnd().unwrap_or(std::ptr::null_mut()) as *mut c_void;
-        let bw = BoxWidget { frame: Some(Rc::new(frame)), hwnd, children: Vec::new(), child_vexpand: Vec::new(), child_hexpand: Vec::new(), orientation, spacing };
-        // Auto-layout on WM_SIZE so nested boxes position their children
+        let children: Rc<RefCell<Vec<*mut c_void>>> = Rc::new(RefCell::new(Vec::new()));
+        let child_vexpand: Rc<RefCell<Vec<bool>>> = Rc::new(RefCell::new(Vec::new()));
+        let child_hexpand: Rc<RefCell<Vec<bool>>> = Rc::new(RefCell::new(Vec::new()));
+        let bw = BoxWidget {
+            frame: Some(Rc::new(frame)), hwnd,
+            children: children.clone(),
+            child_vexpand: child_vexpand.clone(),
+            child_hexpand: child_hexpand.clone(),
+            orientation, spacing,
+        };
+        // Auto-layout on WM_SIZE — now shares children via Rc<RefCell>
         if hwnd != std::ptr::null_mut() {
             let bw2 = bw.clone();
             static BOX_SIZE_ID: AtomicUsize = AtomicUsize::new(0xB0000000);
@@ -419,8 +435,30 @@ mod nwg_adapter {
             *self.changed_cb.borrow_mut() = Some(Box::new(f));
             Ok(0)
         }
-        pub fn set_width_chars(&self, _n: i32) {}
-        pub fn set_size_request(&self, _w: i32, _h: i32) {}
+        pub fn set_width_chars(&self, n: i32) {
+            if let Some(hwnd) = self.inner.handle.hwnd() {
+                unsafe {
+                    let mut rect: winapi::shared::windef::RECT = std::mem::zeroed();
+                    if winapi::um::winuser::GetWindowRect(hwnd as _, &mut rect) != 0 {
+                        let h = rect.bottom - rect.top;
+                        winapi::um::winuser::SetWindowPos(
+                            hwnd as _, std::ptr::null_mut(), 0, 0, n * 8, h,
+                            winapi::um::winuser::SWP_NOZORDER | winapi::um::winuser::SWP_NOMOVE | winapi::um::winuser::SWP_SHOWWINDOW,
+                        );
+                    }
+                }
+            }
+        }
+        pub fn set_size_request(&self, w: i32, h: i32) {
+            if let Some(hwnd) = self.inner.handle.hwnd() {
+                unsafe {
+                    winapi::um::winuser::SetWindowPos(
+                        hwnd as _, std::ptr::null_mut(), 0, 0, w, h,
+                        winapi::um::winuser::SWP_NOZORDER | winapi::um::winuser::SWP_NOMOVE | winapi::um::winuser::SWP_SHOWWINDOW,
+                    );
+                }
+            }
+        }
         pub fn set_visible(&self, v: bool) { self.inner.set_visible(v); }
         pub fn grab_focus(&self) { let _ = self.inner.set_focus(); }
         pub fn add_class(&self, _class: &str) {}
@@ -770,7 +808,7 @@ mod nwg_adapter {
         fn fill_rect(&mut self, x: f64, y: f64, w: f64, h: f64, r: f64, g: f64, b: f64, _a: f64) {
             unsafe {
                 let color: u32 = winapi::um::wingdi::RGB(
-                    (r as u8).min(255), (g as u8).min(255), (b as u8).min(255));
+                    (r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8);
                 let brush = winapi::um::wingdi::CreateSolidBrush(color);
                 if !brush.is_null() {
                     let mut rect = winapi::shared::windef::RECT {
@@ -785,15 +823,23 @@ mod nwg_adapter {
         fn stroke_rect(&mut self, x: f64, y: f64, w: f64, h: f64, r: f64, g: f64, b: f64, _a: f64, lw: f64) {
             unsafe {
                 let color: u32 = winapi::um::wingdi::RGB(
-                    (r as u8).min(255), (g as u8).min(255), (b as u8).min(255));
+                    (r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8);
                 let pen = winapi::um::wingdi::CreatePen(winapi::um::wingdi::PS_SOLID as i32, lw as i32, color);
                 if !pen.is_null() {
                     let old_pen = winapi::um::wingdi::SelectObject(self.hdc, pen as _);
-                    let null_brush = winapi::um::wingdi::GetStockObject(winapi::um::wingdi::NULL_BRUSH as i32);
-                    let old_brush = winapi::um::wingdi::SelectObject(self.hdc, null_brush);
-                    winapi::um::wingdi::Rectangle(self.hdc, x as i32, y as i32, (x + w) as i32, (y + h) as i32);
+                    if w == 0.0 && h != 0.0 {
+                        winapi::um::wingdi::MoveToEx(self.hdc, x as i32, y as i32, std::ptr::null_mut());
+                        winapi::um::wingdi::LineTo(self.hdc, x as i32, (y + h) as i32);
+                    } else if h == 0.0 && w != 0.0 {
+                        winapi::um::wingdi::MoveToEx(self.hdc, x as i32, y as i32, std::ptr::null_mut());
+                        winapi::um::wingdi::LineTo(self.hdc, (x + w) as i32, y as i32);
+                    } else {
+                        let null_brush = winapi::um::wingdi::GetStockObject(winapi::um::wingdi::NULL_BRUSH as i32);
+                        let old_brush = winapi::um::wingdi::SelectObject(self.hdc, null_brush);
+                        winapi::um::wingdi::Rectangle(self.hdc, x as i32, y as i32, (x + w) as i32, (y + h) as i32);
+                        winapi::um::wingdi::SelectObject(self.hdc, old_brush);
+                    }
                     winapi::um::wingdi::SelectObject(self.hdc, old_pen);
-                    winapi::um::wingdi::SelectObject(self.hdc, old_brush);
                     winapi::um::wingdi::DeleteObject(pen as _);
                 }
             }
@@ -803,8 +849,9 @@ mod nwg_adapter {
             unsafe {
                 let wide: Vec<u16> = text.encode_utf16().collect();
                 let color: u32 = winapi::um::wingdi::RGB(
-                    (r as u8).min(255), (g as u8).min(255), (b as u8).min(255));
+                    (r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8);
                 winapi::um::wingdi::SetTextColor(self.hdc, color);
+                let old_bkmode = winapi::um::wingdi::SetBkMode(self.hdc, winapi::um::wingdi::TRANSPARENT as i32);
                 let hfont = Self::make_font(font, size, if weight != 0 { winapi::um::wingdi::FW_BOLD as i32 } else { winapi::um::wingdi::FW_NORMAL as i32 }, false);
                 if !hfont.is_null() {
                     let old_font = winapi::um::wingdi::SelectObject(self.hdc, hfont as _);
@@ -817,6 +864,7 @@ mod nwg_adapter {
                     winapi::um::wingdi::SelectObject(self.hdc, old_font);
                     winapi::um::wingdi::DeleteObject(hfont as _);
                 }
+                winapi::um::wingdi::SetBkMode(self.hdc, old_bkmode);
             }
         }
         fn text_extents_styled(&self, text: &str, font: &str, size: f64, _slant: i32, weight: i32) -> (f64, f64, f64, f64) {
@@ -854,7 +902,7 @@ mod nwg_adapter {
         draw_cb: Rc<RefCell<Option<Box<dyn FnMut(&mut dyn crate::core::DrawContext, i32, i32)>>>>,
         click_cb: Rc<RefCell<Option<Box<dyn FnMut(f64, f64)>>>>,
         key_cb: Rc<RefCell<Option<Box<dyn FnMut(u32) -> bool>>>>,
-        _raw_handler: Option<nwg::RawEventHandler>,
+        _raw_handlers: Rc<Vec<nwg::RawEventHandler>>,
         painting: Rc<RefCell<bool>>,
     }
 
@@ -898,7 +946,7 @@ mod nwg_adapter {
                 draw_cb: self.draw_cb.clone(),
                 click_cb: self.click_cb.clone(),
                 key_cb: self.key_cb.clone(),
-                _raw_handler: None,
+                _raw_handlers: Rc::new(Vec::new()),
                 painting: self.painting.clone(),
             }
         }
@@ -928,49 +976,91 @@ mod nwg_adapter {
         let hwnd = frame.handle.hwnd().unwrap_or(std::ptr::null_mut()) as *mut c_void;
         let draw_cb: Rc<RefCell<Option<Box<dyn FnMut(&mut dyn DrawContext, i32, i32)>>>> = Rc::new(RefCell::new(None));
         let painting: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+        let click_cb: Rc<RefCell<Option<Box<dyn FnMut(f64, f64)>>>> = Rc::new(RefCell::new(None));
+        let key_cb: Rc<RefCell<Option<Box<dyn FnMut(u32) -> bool>>>> = Rc::new(RefCell::new(None));
 
-        // Bind WM_PAINT handler
-        let _raw_handler = if hwnd != std::ptr::null_mut() {
-            let cb = draw_cb.clone();
-            let paint_flag = painting.clone();
-            static CANVAS_RAW_HANDLER_ID: AtomicUsize = AtomicUsize::new(0x30000000);
-            let handler_id = CANVAS_RAW_HANDLER_ID.fetch_add(1, Ordering::SeqCst);
+        let mut handlers: Vec<nwg::RawEventHandler> = Vec::new();
+
+        if hwnd != std::ptr::null_mut() {
             let raw_hwnd: winapi::shared::windef::HWND = hwnd as _;
-            nwg::bind_raw_event_handler(
-                &nwg::ControlHandle::Hwnd(raw_hwnd),
-                handler_id,
-                move |_h, msg, _w, _l| {
-                    if msg != winapi::um::winuser::WM_PAINT { return None; }
-                    if *paint_flag.borrow() { return Some(0); }
-                    *paint_flag.borrow_mut() = true;
-                    unsafe {
-                        let mut ps: winapi::um::winuser::PAINTSTRUCT = std::mem::zeroed();
-                        let hdc = winapi::um::winuser::BeginPaint(hwnd as _, &mut ps);
-                        let mut rect: winapi::shared::windef::RECT = std::mem::zeroed();
-                        winapi::um::winuser::GetClientRect(hwnd as _, &mut rect);
-                        let w = rect.right;
-                        let h = rect.bottom;
-                        if let Some(ref mut draw_fn) = *cb.borrow_mut() {
-                            let mut ctx = NwgDrawContext { hdc, w, h };
-                            draw_fn(&mut ctx, w, h);
+
+            // WM_PAINT handler
+            {
+                let cb = draw_cb.clone();
+                let paint_flag = painting.clone();
+                static CANVAS_PAINT_ID: AtomicUsize = AtomicUsize::new(0x30000000);
+                let pid = CANVAS_PAINT_ID.fetch_add(1, Ordering::SeqCst);
+                if let Some(h) = nwg::bind_raw_event_handler(
+                    &nwg::ControlHandle::Hwnd(raw_hwnd), pid,
+                    move |_h, msg, _w, _l| {
+                        if msg != winapi::um::winuser::WM_PAINT { return None; }
+                        if *paint_flag.borrow() { return Some(0); }
+                        *paint_flag.borrow_mut() = true;
+                        unsafe {
+                            let mut ps: winapi::um::winuser::PAINTSTRUCT = std::mem::zeroed();
+                            let hdc = winapi::um::winuser::BeginPaint(hwnd as _, &mut ps);
+                            let mut rect: winapi::shared::windef::RECT = std::mem::zeroed();
+                            winapi::um::winuser::GetClientRect(hwnd as _, &mut rect);
+                            let w = rect.right;
+                            let h = rect.bottom;
+                            if let Some(ref mut draw_fn) = *cb.borrow_mut() {
+                                let mut ctx = NwgDrawContext { hdc, w, h };
+                                draw_fn(&mut ctx, w, h);
+                            }
+                            winapi::um::winuser::EndPaint(hwnd as _, &mut ps);
                         }
-                        winapi::um::winuser::EndPaint(hwnd as _, &mut ps);
-                    }
-                    *paint_flag.borrow_mut() = false;
-                    Some(0)
-                },
-            ).ok()
-        } else {
-            None
-        };
+                        *paint_flag.borrow_mut() = false;
+                        Some(0)
+                    },
+                ).ok() { handlers.push(h); }
+            }
+
+            // WM_LBUTTONDOWN handler
+            {
+                let cc = click_cb.clone();
+                static CLICK_ID: AtomicUsize = AtomicUsize::new(0x40000000);
+                let cid = CLICK_ID.fetch_add(1, Ordering::SeqCst);
+                if let Some(h) = nwg::bind_raw_event_handler(
+                    &nwg::ControlHandle::Hwnd(raw_hwnd), cid,
+                    move |_h, msg, _w, l| {
+                        if msg != winapi::um::winuser::WM_LBUTTONDOWN { return None; }
+                        unsafe {
+                            let x = (l & 0xFFFF) as i16 as f64;
+                            let y = ((l >> 16) & 0xFFFF) as i16 as f64;
+                            if let Some(ref mut f) = *cc.borrow_mut() {
+                                f(x, y);
+                            }
+                        }
+                        Some(0)
+                    },
+                ).ok() { handlers.push(h); }
+            }
+
+            // WM_KEYDOWN handler — need focus first; forward WM_SETFOCUS to force keyboard input
+            {
+                let kc = key_cb.clone();
+                static KEY_ID: AtomicUsize = AtomicUsize::new(0x50000000);
+                let kid = KEY_ID.fetch_add(1, Ordering::SeqCst);
+                if let Some(h) = nwg::bind_raw_event_handler(
+                    &nwg::ControlHandle::Hwnd(raw_hwnd), kid,
+                    move |_h, msg, w, _l| {
+                        if msg != winapi::um::winuser::WM_KEYDOWN && msg != winapi::um::winuser::WM_SYSKEYDOWN { return None; }
+                        if let Some(ref mut f) = *kc.borrow_mut() {
+                            if f(w as u32) { return Some(0); }
+                        }
+                        None
+                    },
+                ).ok() { handlers.push(h); }
+            }
+        }
 
         Ok(Canvas {
             frame: Some(Rc::new(frame)),
             hwnd,
             draw_cb,
-            click_cb: Rc::new(RefCell::new(None)),
-            key_cb: Rc::new(RefCell::new(None)),
-            _raw_handler,
+            click_cb,
+            key_cb,
+            _raw_handlers: Rc::new(handlers),
             painting,
         })
     }
@@ -1073,6 +1163,11 @@ mod nwg_adapter {
             if ptr.is_null() || self.hwnd.is_null() { return; }
             unsafe {
                 winapi::um::winuser::SetParent(ptr as _, self.hwnd as _);
+                winapi::um::winuser::SetWindowPos(
+                    ptr as _, std::ptr::null_mut(),
+                    0, 0, 0, 0,
+                    winapi::um::winuser::SWP_NOZORDER | winapi::um::winuser::SWP_NOSIZE | winapi::um::winuser::SWP_SHOWWINDOW,
+                );
             }
             *self.child.borrow_mut() = Some(ptr);
             // Get child size for scroll range
