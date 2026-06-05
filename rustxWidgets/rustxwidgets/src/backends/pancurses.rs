@@ -1203,7 +1203,8 @@ mod pancurses_backend {
 
                 // Formula bar: cyan fg, default bg
                 {
-                    let addr_text = format!("{}{}", col_label(*cursor_col), *cursor_row + 1);
+                    let display_col = if *cursor_col < *margin_cols { *cursor_col } else { *cursor_col - *margin_cols };
+                    let addr_text = format!("{}{}", col_label(display_col), *cursor_row + 1);
                     let cell_val = raw_cells.borrow().get(&(*cursor_row, *cursor_col)).cloned().unwrap_or_default();
                     let addr_vis = addr_text.chars().count();
                     let max_fb = (rect.w as usize).saturating_sub(addr_vis + 3).max(1);
@@ -1230,7 +1231,7 @@ mod pancurses_backend {
                         format!("corro  {}r × {}c ", *main_cols, *main_cols)
                     };
                     let title_vis = title.chars().count();
-                    let dash_fill = (rect.w as usize).saturating_sub(title_vis + 2);
+                    let dash_fill = (rect.w as usize).saturating_sub(title_vis + 3);
                     out.push_str(&sgr_cup(br, rect.x));
                     out.push_str("┌");
                     out.push_str(SGR_BOLD);
@@ -1309,14 +1310,15 @@ mod pancurses_backend {
                             }
                         }
                     }
-                    // header separator: dark gray fg
+                    // header separator: dark gray fg, matching ratatui
                     let sep_len = rect.w.saturating_sub(3).max(1) as usize;
                     out.push_str(&sgr_cup(hr + 1, rect.x));
-                    out.push_str(sgr_sep());
-                    out.push_str("││");
-                    out.push_str(&"─".repeat(sep_len));
                     out.push_str("│");
+                    out.push_str(sgr_sep());
+                    out.push_str("│");
+                    out.push_str(&"─".repeat(sep_len));
                     out.push_str(SGR_FG_DEFAULT);
+                    out.push_str("│");
                     row_offset = hr + 2;
                 }
 
@@ -2046,15 +2048,16 @@ mod pancurses_backend {
             Some(n) => n,
             None => return false,
         };
-        let (cells, cursor_row, cursor_col, addr_id, entry_id) = match &n.kind {
-            PcWidgetKind::Spreadsheet { cells, cursor_row, cursor_col, formula_bar_address_id, formula_bar_entry_id, .. } => {
-                (cells.clone(), *cursor_row, *cursor_col, *formula_bar_address_id, *formula_bar_entry_id)
+        let (cells, cursor_row, cursor_col, margin_cols, addr_id, entry_id) = match &n.kind {
+            PcWidgetKind::Spreadsheet { cells, cursor_row, cursor_col, margin_cols, formula_bar_address_id, formula_bar_entry_id, .. } => {
+                (cells.clone(), *cursor_row, *cursor_col, *margin_cols, *formula_bar_address_id, *formula_bar_entry_id)
             }
             _ => return false,
         };
         let mut changed = false;
         if let Some(aid) = addr_id {
-            let label = format!("{}{}", col_label(cursor_col), cursor_row + 1);
+            let display_col = if cursor_col < margin_cols { cursor_col } else { cursor_col - margin_cols };
+            let label = format!("{}{}", col_label(display_col), cursor_row + 1);
             if let Some(an) = state.node_mut(aid) {
                 if let PcWidgetKind::Label { ref mut text } = &mut an.kind {
                     if *text != label {
@@ -2417,7 +2420,8 @@ mod pancurses_backend {
 
             // Formula bar (matching ratatui: leading space, trailing text)
             if row < height {
-                let addr_text = format!("{}{}", col_label(cursor_col), cursor_row + 1);
+                let display_col = if cursor_col < margin_cols { cursor_col } else { cursor_col - margin_cols };
+                let addr_text = format!("{}{}", col_label(display_col), cursor_row + 1);
                 let cell_val = raw_cells.borrow().get(&(cursor_row, cursor_col)).cloned().unwrap_or_default();
                 let max_fb = width.saturating_sub(addr_text.chars().count() + 3 + formula_bar_trailing.chars().count()).max(1);
                 let fb_text = if cell_val.chars().count() > max_fb {
