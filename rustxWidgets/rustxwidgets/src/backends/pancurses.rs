@@ -121,6 +121,7 @@ mod pancurses_backend {
         pub active_item: usize,
         pub spreadsheet_output: String,
         key_callbacks: Vec<(char, Box<dyn FnMut()>)>,
+        pub cursor_move_callbacks: Vec<Box<dyn FnMut(u32, u32)>>,
     }
 
     impl PcState {
@@ -136,6 +137,7 @@ mod pancurses_backend {
                 active_item: 0,
                 spreadsheet_output: String::new(),
                 key_callbacks: Vec::new(),
+                cursor_move_callbacks: Vec::new(),
             }
         }
 
@@ -651,19 +653,21 @@ mod pancurses_backend {
                         });
                     }
                     Some(Input::KeyLeft) => {
-                        with_state(|state| {
+                        let new_pos = with_state(|state| {
                             if state.menu_open {
                                 if state.active_submenu > 0 {
                                     state.active_submenu -= 1;
                                     state.active_item = 0;
                                 }
+                                None
                             } else if let Some(fid) = state.focus_id {
                                 if is_spreadsheet_focused(state, fid) {
                                     spreadsheet_prepare_move(state, fid, false);
                                     spreadsheet_commit_edit(state, fid);
                                     if let Some(n) = state.node_mut(fid) {
-                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_col, .. } = n.kind {
+                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_col, ref cursor_row, .. } = n.kind {
                                             if *cursor_col > 0 { *cursor_col -= 1; }
+                                            return Some((*cursor_row, *cursor_col));
                                         }
                                     }
                                     spreadsheet_scroll_to_cursor(state, fid);
@@ -672,11 +676,19 @@ mod pancurses_backend {
                                         if *cursor > 0 { *cursor -= 1; }
                                     }
                                 }
+                                None
+                            } else {
+                                None
                             }
                         });
+                        if let Some((row, col)) = new_pos {
+                            let mut cbs = with_state(|state| std::mem::take(&mut state.cursor_move_callbacks));
+                            for cb in cbs.iter_mut() { cb(row, col); }
+                            with_state(|state| state.cursor_move_callbacks = cbs);
+                        }
                     }
                     Some(Input::KeyRight) => {
-                        with_state(|state| {
+                        let new_pos = with_state(|state| {
                             if state.menu_open {
                                 if let Some(mid) = state.menu_bar_id {
                                     if let Some(n) = state.node(mid) {
@@ -688,6 +700,7 @@ mod pancurses_backend {
                                         }
                                     }
                                 }
+                                None
                             } else if let Some(fid) = state.focus_id {
                                 if is_spreadsheet_focused(state, fid) {
                                     spreadsheet_prepare_move(state, fid, false);
@@ -696,6 +709,7 @@ mod pancurses_backend {
                                         if let PcWidgetKind::Spreadsheet { ref mut cursor_row, ref mut cursor_col, margin_cols, main_cols, .. } = n.kind {
                                             let max_global = margin_cols + main_cols + margin_cols;
                                             if *cursor_col + 1 < max_global { *cursor_col += 1; }
+                                            return Some((*cursor_row, *cursor_col));
                                         }
                                     }
                                     spreadsheet_scroll_to_cursor(state, fid);
@@ -704,11 +718,19 @@ mod pancurses_backend {
                                         if *cursor < buffer.len() { *cursor += 1; }
                                     }
                                 }
+                                None
+                            } else {
+                                None
                             }
                         });
+                        if let Some((row, col)) = new_pos {
+                            let mut cbs = with_state(|state| std::mem::take(&mut state.cursor_move_callbacks));
+                            for cb in cbs.iter_mut() { cb(row, col); }
+                            with_state(|state| state.cursor_move_callbacks = cbs);
+                        }
                     }
                     Some(Input::KeyUp) => {
-                        with_state(|state| {
+                        let new_pos = with_state(|state| {
                             if state.menu_open {
                                 if let Some(mid) = state.menu_bar_id {
                                     if let Some(n) = state.node(mid) {
@@ -720,22 +742,32 @@ mod pancurses_backend {
                                         }
                                     }
                                 }
+                                None
                             } else if let Some(fid) = state.focus_id {
                                 if is_spreadsheet_focused(state, fid) {
                                     spreadsheet_prepare_move(state, fid, false);
                                     spreadsheet_commit_edit(state, fid);
                                     if let Some(n) = state.node_mut(fid) {
-                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_row, .. } = n.kind {
+                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_row, ref cursor_col, .. } = n.kind {
                                             if *cursor_row > 0 { *cursor_row -= 1; }
+                                            return Some((*cursor_row, *cursor_col));
                                         }
                                     }
                                     spreadsheet_scroll_to_cursor(state, fid);
                                 }
+                                None
+                            } else {
+                                None
                             }
                         });
+                        if let Some((row, col)) = new_pos {
+                            let mut cbs = with_state(|state| std::mem::take(&mut state.cursor_move_callbacks));
+                            for cb in cbs.iter_mut() { cb(row, col); }
+                            with_state(|state| state.cursor_move_callbacks = cbs);
+                        }
                     }
                     Some(Input::KeyDown) => {
-                        with_state(|state| {
+                        let new_pos = with_state(|state| {
                             if state.menu_open {
                                 if let Some(mid) = state.menu_bar_id {
                                     if let Some(n) = state.node(mid) {
@@ -747,19 +779,28 @@ mod pancurses_backend {
                                         }
                                     }
                                 }
+                                None
                             } else if let Some(fid) = state.focus_id {
                                 if is_spreadsheet_focused(state, fid) {
                                     spreadsheet_commit_edit(state, fid);
                                     if let Some(n) = state.node_mut(fid) {
-                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_row, total_rows, .. } = n.kind {
-                                            // total_rows is the number of display rows, which is the correct upper bound
+                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_row, ref cursor_col, total_rows, .. } = n.kind {
                                             if *cursor_row + 1 < total_rows { *cursor_row += 1; }
+                                            return Some((*cursor_row, *cursor_col));
                                         }
                                     }
                                     spreadsheet_scroll_to_cursor(state, fid);
                                 }
+                                None
+                            } else {
+                                None
                             }
                         });
+                        if let Some((row, col)) = new_pos {
+                            let mut cbs = with_state(|state| std::mem::take(&mut state.cursor_move_callbacks));
+                            for cb in cbs.iter_mut() { cb(row, col); }
+                            with_state(|state| state.cursor_move_callbacks = cbs);
+                        }
                     }
                     Some(Input::KeyLeft) => {
                         with_state(|state| {
@@ -2379,6 +2420,12 @@ mod pancurses_backend {
                 } else { None }
             })
         })
+    }
+
+    pub fn spreadsheet_add_cursor_move_callback<F: FnMut(u32, u32) + 'static>(f: F) {
+        with_state(|state| {
+            state.cursor_move_callbacks.push(Box::new(f));
+        });
     }
 
     pub fn spreadsheet_set_cursor(id: usize, row: u32, col: u32) {

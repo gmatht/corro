@@ -645,6 +645,25 @@ mod pancurses_adapter {
     pub fn add_key_callback(key: char, cb: Box<dyn FnMut()>) {
         crate::backends::pancurses::add_key_callback(key, cb);
     }
+
+    pub fn add_cursor_move_callback<F: FnMut(u32, u32) + 'static>(f: F) {
+        crate::backends::pancurses::spreadsheet_add_cursor_move_callback(f);
+    }
+    pub fn spreadsheet_set_cell(id: usize, r: u32, c: u32, text: &str) {
+        crate::backends::pancurses::spreadsheet_set_cell(id, r, c, text);
+    }
+    pub fn spreadsheet_set_cell_style(id: usize, r: u32, c: u32, style: u8) {
+        crate::backends::pancurses::spreadsheet_set_cell_style(id, r, c, style);
+    }
+    pub fn spreadsheet_set_column_layout(id: usize, layout: Vec<(u32, u32, String)>) {
+        crate::backends::pancurses::spreadsheet_set_column_layout(id, layout);
+    }
+    pub fn spreadsheet_set_border_title(id: usize, text: &str) {
+        crate::backends::pancurses::spreadsheet_set_border_title(id, text);
+    }
+    pub fn spreadsheet_set_row_labels(id: usize, labels: Vec<(u32, String)>) {
+        crate::backends::pancurses::spreadsheet_set_row_labels(id, labels);
+    }
 }
 
 pub use pancurses_adapter::*;
