@@ -1323,7 +1323,8 @@ mod pancurses_backend {
                         for vc in 0..max_vis_cols {
                             let col_idx = *left_col + vc as u32;
                             let label = if col_idx < lm as u32 {
-                                format!("[{}", col_label(col_idx))
+                                let margin_idx = lm.saturating_sub(1).saturating_sub(col_idx as usize);
+                                format!("[{}", col_label(margin_idx as u32))
                             } else if col_idx < (lm + mc) as u32 {
                                 col_label(col_idx - lm as u32)
                             } else {
@@ -2884,11 +2885,12 @@ mod pancurses_backend {
                     for vc in 0..max_data_cols.min(mc.saturating_add(lm)) {
                         let col_idx = left_col + vc as u32;
                         let label = if col_idx < lm as u32 {
-                            format!("[{}", col_label(col_idx))
+                            let margin_idx = lm.saturating_sub(1).saturating_sub(col_idx as usize);
+                            format!("[{}", col_label(margin_idx as u32))
                         } else if col_idx < (lm + mc) as u32 {
-                            col_label(col_idx)
+                            col_label(col_idx - lm as u32)
                         } else {
-                            format!("]{}", col_label(col_idx))
+                            format!("]{}", col_label(col_idx - lm as u32 - mc as u32))
                         };
                         let padded = format!("{:<1$}", label, (cw as usize).max(label.len()));
                         hdr.push_str(&format!("{}{}", padded, sep));
