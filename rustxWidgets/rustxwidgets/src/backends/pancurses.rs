@@ -1353,8 +1353,13 @@ mod pancurses_backend {
                             out.push_str(SGR_RESET);
                             hx += *w as i32;
                             if i + 1 < n {
+                                let is_boundary = lm > 0 && (*ci == (lm - 1) as u32 || *ci == (lm + mc - 1) as u32);
                                 out.push_str(&sgr_cup(hr, hx));
-                                out.push_str(" ");
+                                if is_boundary {
+                                    out.push_str("│");
+                                } else {
+                                    out.push_str(" ");
+                                }
                                 hx += 1;
                             }
                         }
@@ -1401,15 +1406,46 @@ mod pancurses_backend {
                             }
                         }
                     }
-                    // header separator: dark gray fg, matching ratatui
-                    let sep_len = rect.w.saturating_sub(3).max(1) as usize;
+                    // header separator: dark gray fg with proper intersections
                     out.push_str(&sgr_cup(hr + 1, rect.x));
-                    out.push_str("│");
                     out.push_str(sgr_sep());
-                    out.push_str("│");
-                    out.push_str(&"─".repeat(sep_len));
+                    out.push_str("├");
+                    let right_border_x = rect.x + rect.w - 1;
+                    // Compute separator boundary screen positions from column layout
+                    let sep_boundaries = if use_layout && lm > 0 {
+                        let mut cx = rect.x + 1 + 5;
+                        let mut boundaries: Vec<i32> = Vec::new();
+                        for (idx, &(col_idx, w, _)) in column_layout.iter().enumerate() {
+                            cx += w as i32;
+                            if idx + 1 < column_layout.len() {
+                                if col_idx == (lm - 1) as u32 || col_idx == (lm + mc - 1) as u32 {
+                                    boundaries.push(cx);
+                                }
+                                cx += 1;
+                            }
+                        }
+                        boundaries
+                    } else {
+                        Vec::new()
+                    };
+                    let mut sx = rect.x + 1;
+                    for &bx in &sep_boundaries {
+                        let end = bx.min(right_border_x);
+                        while sx < end {
+                            out.push('─');
+                            sx += 1;
+                        }
+                        if sx < right_border_x {
+                            out.push_str("┼");
+                            sx += 1;
+                        }
+                    }
+                    while sx < right_border_x {
+                        out.push('─');
+                        sx += 1;
+                    }
                     out.push_str(SGR_FG_DEFAULT);
-                    out.push_str("│");
+                    out.push_str("┤");
                     row_offset = hr + 2;
                 }
 
@@ -1532,7 +1568,14 @@ mod pancurses_backend {
                                     out.push_str(SGR_BG_DEFAULT);
                                     let gap_after = if vi + 1 < n { 1 } else { 0 };
                                     if gap_after > 0 {
-                                        out.push(' ');
+                                        let is_sep_col = lm > 0 && ((col_idx as usize) == lm - 1 || (col_idx as usize) == lm + mc - 1);
+                                        if is_sep_col {
+                                            out.push_str(sgr_sep());
+                                            out.push('│');
+                                            out.push_str(SGR_FG_DEFAULT);
+                                        } else {
+                                            out.push(' ');
+                                        }
                                     }
                                 } else if is_agg_empty {
                                     // Empty aggregate cell: cyan foreground
@@ -1552,7 +1595,14 @@ mod pancurses_backend {
                                     out.push_str(SGR_FG_DEFAULT);
                                     let gap_after = if vi + 1 < n { 1 } else { 0 };
                                     if gap_after > 0 {
-                                        out.push(' ');
+                                        let is_sep_col = lm > 0 && ((col_idx as usize) == lm - 1 || (col_idx as usize) == lm + mc - 1);
+                                        if is_sep_col {
+                                            out.push_str(sgr_sep());
+                                            out.push('│');
+                                            out.push_str(SGR_FG_DEFAULT);
+                                        } else {
+                                            out.push(' ');
+                                        }
                                     }
                                 } else if (col_idx as usize) < lm {
                                     // Left-margin column: dark gray border or default.
@@ -1580,7 +1630,14 @@ mod pancurses_backend {
                                     }
                                     let gap_after = if vi + 1 < n { 1 } else { 0 };
                                     if gap_after > 0 {
-                                        out.push(' ');
+                                        let is_sep_col = lm > 0 && ((col_idx as usize) == lm - 1 || (col_idx as usize) == lm + mc - 1);
+                                        if is_sep_col {
+                                            out.push_str(sgr_sep());
+                                            out.push('│');
+                                            out.push_str(SGR_FG_DEFAULT);
+                                        } else {
+                                            out.push(' ');
+                                        }
                                     }
                                 } else if (col_idx as usize) >= lm + mc {
                                     // Right-margin column: dark gray border or default.
@@ -1615,7 +1672,14 @@ mod pancurses_backend {
                                 }
                                 let gap_after = if vi + 1 < n { 1 } else { 0 };
                                 if gap_after > 0 {
-                                    out.push(' ');
+                                    let is_sep_col = lm > 0 && ((col_idx as usize) == lm - 1 || (col_idx as usize) == lm + mc - 1);
+                                    if is_sep_col {
+                                        out.push_str(sgr_sep());
+                                        out.push('│');
+                                        out.push_str(SGR_FG_DEFAULT);
+                                    } else {
+                                        out.push(' ');
+                                    }
                                 }
                             } else {
                                 // Empty cell in main column: check style
@@ -1637,7 +1701,14 @@ mod pancurses_backend {
                                     }
                                     let gap_after = if vi + 1 < n { 1 } else { 0 };
                                     if gap_after > 0 {
-                                        out.push(' ');
+                                        let is_sep_col = lm > 0 && ((col_idx as usize) == lm - 1 || (col_idx as usize) == lm + mc - 1);
+                                        if is_sep_col {
+                                            out.push_str(sgr_sep());
+                                            out.push('│');
+                                            out.push_str(SGR_FG_DEFAULT);
+                                        } else {
+                                            out.push(' ');
+                                        }
                                     }
                                 }
                                 prev_overflowed = false;
@@ -1782,9 +1853,16 @@ mod pancurses_backend {
                                     out.push_str(SGR_FG_DEFAULT);
                                 }
                             }
-                            // Inter-column gap (1 space) – drawn in default style
+                            // Inter-column gap – separator │ at group boundaries, space otherwise
                             if real_gap > 0 {
-                                out.push(' ');
+                                let is_sep_col = lm > 0 && ((col_idx as usize) == lm - 1 || (col_idx as usize) == lm + mc - 1);
+                                if is_sep_col {
+                                    out.push_str(sgr_sep());
+                                    out.push('│');
+                                    out.push_str(SGR_FG_DEFAULT);
+                                } else {
+                                    out.push(' ');
+                                }
                             }
                             let overflowed_this = can_overflow && overflow_cols == 0;
                             if overflowed_this {
@@ -2945,11 +3023,16 @@ mod pancurses_backend {
                 if use_layout {
                     hdr.push_str(&" ".repeat(5));
                     let n = column_layout.len();
-                    for (i, &(_, w, ref label)) in column_layout.iter().enumerate() {
+                    for (i, &(ci, w, ref label)) in column_layout.iter().enumerate() {
                         let padded = format!("{:<1$}", label, (w as usize).max(1));
                         hdr.push_str(&padded);
                         if i + 1 < n {
-                            hdr.push(' ');
+                            let is_boundary = lm > 0 && (ci == (lm - 1) as u32 || ci == (lm + mc - 1) as u32);
+                            if is_boundary {
+                                hdr.push('│');
+                            } else {
+                                hdr.push(' ');
+                            }
                         }
                     }
                 } else {
@@ -2974,19 +3057,47 @@ mod pancurses_backend {
                 row += 1;
             }
 
-            // Header separator (matching ratatui: ││───│)
+            // Header separator (matching ratatui: ├───┼───┤)
             if row < height {
                 let mut sep_row = String::new();
-                sep_row.push('│');
-                sep_row.push('│');
-                let dash_len = width.saturating_sub(3).max(1);
-                for _ in 0..dash_len {
-                    sep_row.push('─');
+                sep_row.push('├');
+                // Compute separator boundary positions from column layout
+                let sep_boundaries = if use_layout && lm > 0 {
+                    let mut cx = 1 + 5;
+                    let mut boundaries: Vec<usize> = Vec::new();
+                    for (idx, &(col_idx, w, _)) in column_layout.iter().enumerate() {
+                        cx += w as usize;
+                        if idx + 1 < column_layout.len() {
+                            if col_idx == (lm - 1) as u32 || col_idx == (lm + mc - 1) as u32 {
+                                boundaries.push(cx);
+                            }
+                            cx += 1;
+                        }
+                    }
+                    boundaries
+                } else {
+                    Vec::new()
+                };
+                let max_x = width.saturating_sub(1);
+                let mut sx = 1;
+                for &bx in &sep_boundaries {
+                    let end = bx.min(max_x);
+                    while sx < end {
+                        sep_row.push('─');
+                        sx += 1;
+                    }
+                    if sx < max_x {
+                        sep_row.push('┼');
+                        sx += 1;
+                    }
                 }
-                sep_row.push('│');
-                let cut = sep_row.char_indices().take(width).last().map(|(i, _)| i).unwrap_or(0);
-                if cut > 0 { buf[row] = sep_row[..cut].to_string(); }
-                else { buf[row] = sep_row.chars().take(width).collect(); }
+                while sx < max_x {
+                    sep_row.push('─');
+                    sx += 1;
+                }
+                sep_row.push('┤');
+                let truncated: String = sep_row.chars().take(width).collect();
+                buf[row] = truncated;
                 row += 1;
             }
 
