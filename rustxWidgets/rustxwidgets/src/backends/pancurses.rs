@@ -1937,6 +1937,12 @@ mod pancurses_backend {
     fn spreadsheet_scroll_to_cursor(state: &mut PcState, fid: usize) {
         if let Some(n) = state.node_mut(fid) {
             if let PcWidgetKind::Spreadsheet { ref mut top_row, ref mut left_col, ref cursor_row, ref cursor_col, ref mut column_layout, ref cells, ref margin_cols, ref main_cols, .. } = n.kind {
+                // When a column layout was explicitly set (e.g. by corro's
+                // pnc_backend.rs), do not overwrite it — the application code
+                // has already computed the correct columns and widths.
+                if !column_layout.is_empty() {
+                    return;
+                }
                 let lm = *margin_cols as usize;
                 let mc = *main_cols as usize;
                 let total = lm + mc + lm;
@@ -2012,7 +2018,7 @@ mod pancurses_backend {
                         .filter(|&((_, cc), _)| *cc == c as u32)
                         .map(|(_, text)| text.chars().count())
                         .max()
-                        .unwrap_or(8).max(4);
+                        .unwrap_or(4);
                     let label = if c < lm {
                         format!("[{}", col_label((lm - 1 - c) as u32))
                     } else if c < lm + mc {
