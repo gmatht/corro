@@ -1407,7 +1407,10 @@ mod pancurses_backend {
                         }
                     }
                     // header separator: dark gray fg with proper intersections
+                    // Left border pipe first, then the ├ sign
                     out.push_str(&sgr_cup(hr + 1, rect.x));
+                    out.push_str("│");
+                    out.push_str(&sgr_cup(hr + 1, rect.x + 1));
                     out.push_str(sgr_sep());
                     out.push_str("├");
                     let right_border_x = rect.x + rect.w - 1;
@@ -1428,7 +1431,7 @@ mod pancurses_backend {
                     } else {
                         Vec::new()
                     };
-                    let mut sx = rect.x + 1;
+                    let mut sx = rect.x + 2;
                     for &bx in &sep_boundaries {
                         let end = bx.min(right_border_x);
                         while sx < end {
@@ -3057,9 +3060,10 @@ mod pancurses_backend {
                 row += 1;
             }
 
-            // Header separator (matching ratatui: ├───┼───┤)
+            // Header separator (matching ratatui: │├───┼───┤)
             if row < height {
                 let mut sep_row = String::new();
+                sep_row.push('│');
                 sep_row.push('├');
                 // Compute separator boundary positions from column layout
                 let sep_boundaries = if use_layout && lm > 0 {
@@ -3079,7 +3083,7 @@ mod pancurses_backend {
                     Vec::new()
                 };
                 let max_x = width.saturating_sub(1);
-                let mut sx = 1;
+                let mut sx = 2;
                 for &bx in &sep_boundaries {
                     let end = bx.min(max_x);
                     while sx < end {
