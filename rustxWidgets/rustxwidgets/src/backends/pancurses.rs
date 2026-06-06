@@ -1936,20 +1936,97 @@ mod pancurses_backend {
 
     fn spreadsheet_scroll_to_cursor(state: &mut PcState, fid: usize) {
         if let Some(n) = state.node_mut(fid) {
-            if let PcWidgetKind::Spreadsheet { ref mut top_row, ref mut left_col, ref cursor_row, ref cursor_col, ref col_width, .. } = n.kind {
-                let cw = *col_width as i32;
-                let rh_w = 4i32;
-                let max_data_cols = ((n.rect.w - rh_w - 1) / (cw + 1)).max(1);
-                let max_data_rows = (n.rect.h - 2).max(1) as u32;
-                if *cursor_row < *top_row {
-                    *top_row = *cursor_row;
-                } else if *cursor_row >= *top_row + max_data_rows {
-                    *top_row = *cursor_row - max_data_rows + 1;
+            if let PcWidgetKind::Spreadsheet { ref mut top_row, ref mut left_col, ref cursor_row, ref cursor_col, ref mut column_layout, ref cells, ref margin_cols, ref main_cols, .. } = n.kind {
+                let lm = *margin_cols as usize;
+                let mc = *main_cols as usize;
+                let total = lm + mc + lm;
+                // Build a dynamic column layout similar to ratatui's visible_col_indices.
+                let cur = (*cursor_col as usize).min(total.saturating_sub(1));
+                let mut col_ixs: Vec<usize> = Vec::new();
+                // Left-margin anchor (last left-margin column).
+                if lm > 0 {
+                    col_ixs.push(lm - 1);
                 }
-                if *cursor_col < *left_col {
-                    *left_col = *cursor_col;
-                } else if *cursor_col >= *left_col + max_data_cols as u32 {
-                    *left_col = *cursor_col - max_data_cols as u32 + 1;
+                // Left-margin band: when cursor is in left margin, show a window around it.
+                if cur < lm {
+                    let window = 7usize;
+                    let end = lm.saturating_sub(1);
+                    if end.saturating_sub(cur) <= window {
+                        for c in cur..=end { col_ixs.push(c); }
+                    } else {
+                        let half = window / 2;
+                        let lo = cur.saturating_sub(half);
+                        let hi = (lo + window).min(end);
+                        for c in lo..=hi { col_ixs.push(c); }
+                    }
+                }
+                // Always start main columns from the first main column.
+                let main_hi = {
+                    let cursor_main = if cur < lm { 0usize } else if cur < lm + mc { cur - lm } else { mc.saturating_sub(1) };
+                    (cursor_main + 4).min(mc.saturating_sub(1))
+                };
+                col_ixs.extend((0..=main_hi).map(|ci| lm + ci));
+                // Right-margin band: include blank right-margin columns plus non-blank ones.
+                let right_start = lm + mc;
+                // Fill remaining viewport with blank right-margin columns so the grid
+                // always fills the screen.
+                let blank_right = right_start;
+                col_ixs.push(blank_right);
+                // Also include any right-margin columns with content.
+                let cells_ref = cells.borrow();
+                let max_right = (0..lm).rev()
+                    .find(|&i| cells_ref.iter().any(|((_, c), _)| *c as usize == right_start + i))
+                    .unwrap_or(0);
+                for i in 0..=max_right {
+                    let gc = right_start + i;
+                    if !col_ixs.contains(&gc) { col_ixs.push(gc); }
+                }
+                col_ixs.sort_unstable();
+                col_ixs.dedup();
+                // Compute available screen width for columns
+                let rh_w = 5i32;
+                let available = (n.rect.w as i32 - rh_w - 2).max(1) as usize;
+                // Trim columns to fit available width (matching trim_visible_cols_to_width)
+                while col_ixs.len() > 1 {
+                    let total_w: usize = col_ixs.iter().enumerate().map(|(i, &c)| {
+                        let sep = if i + 1 >= col_ixs.len() { 0 } else { 1 };
+                        let col_max: usize = cells_ref.iter()
+                            .filter(|&((_, cc), _)| *cc == c as u32)
+                            .map(|(_, text)| text.chars().count())
+                            .max()
+                            .unwrap_or(1).max(1);
+                        col_max + sep
+                    }).sum();
+                    if total_w <= available { break; }
+                    let first = col_ixs.first().copied().unwrap_or(cur);
+                    let last = col_ixs.last().copied().unwrap_or(cur);
+                    if last > cur {
+                        col_ixs.pop();
+                    } else if first < cur {
+                        col_ixs.remove(0);
+                    } else { break; }
+                }
+                // Build the column layout
+                let new_layout: Vec<(u32, u32, String)> = col_ixs.iter().map(|&c| {
+                    let w: usize = cells_ref.iter()
+                        .filter(|&((_, cc), _)| *cc == c as u32)
+                        .map(|(_, text)| text.chars().count())
+                        .max()
+                        .unwrap_or(8).max(4);
+                    let label = if c < lm {
+                        format!("[{}", col_label((lm - 1 - c) as u32))
+                    } else if c < lm + mc {
+                        col_label((c - lm) as u32)
+                    } else {
+                        format!("]{}", col_label((c - lm - mc) as u32))
+                    };
+                    (c as u32, w as u32, label)
+                }).collect();
+                *column_layout = new_layout;
+                // Update left_col from updated column_layout
+                if !column_layout.is_empty() {
+                    let first_col = column_layout.first().map(|&(c, _, _)| c as usize).unwrap_or(0);
+                    *left_col = first_col as u32;
                 }
             }
         }
