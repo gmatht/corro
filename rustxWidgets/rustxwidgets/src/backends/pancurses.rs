@@ -749,7 +749,14 @@ mod pancurses_backend {
                                     spreadsheet_commit_edit(state, fid);
                                     if let Some(n) = state.node_mut(fid) {
                                         if let PcWidgetKind::Spreadsheet { ref mut cursor_row, ref cursor_col, .. } = n.kind {
-                                            if *cursor_row > 0 { *cursor_row -= 1; }
+                                            if *cursor_row > 0 {
+                                                *cursor_row -= 1;
+                                            } else {
+                                                // Fire sentinel for "scroll up" — the
+                                                // application callback will recompute the
+                                                // viewport and update the widget.
+                                                return Some((u32::MAX, *cursor_col));
+                                            }
                                             return Some((*cursor_row, *cursor_col));
                                         }
                                     }
@@ -785,7 +792,14 @@ mod pancurses_backend {
                                     spreadsheet_commit_edit(state, fid);
                                     if let Some(n) = state.node_mut(fid) {
                                         if let PcWidgetKind::Spreadsheet { ref mut cursor_row, ref cursor_col, total_rows, .. } = n.kind {
-                                            if *cursor_row + 1 < total_rows { *cursor_row += 1; }
+                                            if *cursor_row + 1 < total_rows {
+                                                *cursor_row += 1;
+                                            } else {
+                                                // Fire sentinel for "scroll down" — the
+                                                // application callback will recompute the
+                                                // viewport and update the widget.
+                                                return Some((u32::MAX - 1, *cursor_col));
+                                            }
                                             return Some((*cursor_row, *cursor_col));
                                         }
                                     }
