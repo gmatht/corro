@@ -1258,7 +1258,7 @@ mod pancurses_backend {
                     let title = if !border_title.is_empty() {
                         format!("{}", border_title)
                     } else {
-                        format!("corro  {}r × {}c ", *main_cols, *main_cols)
+                        format!("corro  {}r × {}c ", header_row_count + main_row_count, *main_cols)
                     };
                     let title_vis = title.chars().count();
                     let dash_fill = (rect.w as usize).saturating_sub(title_vis + 3);
@@ -2830,12 +2830,23 @@ mod pancurses_backend {
 
             // Formula bar (matching ratatui: leading space, trailing text)
             if row < height {
-                let display_col = if cursor_col < margin_cols { cursor_col } else { cursor_col - margin_cols };
+                let mc = main_cols as usize;
+                let lm = margin_cols as usize;
+                let cc = cursor_col as usize;
+                let col_part = if cc < lm {
+                    let margin_idx = lm.saturating_sub(1).saturating_sub(cc);
+                    format!("[{}", col_label(margin_idx as u32))
+                } else if cc < lm + mc {
+                    col_label((cc - lm) as u32)
+                } else {
+                    let right_idx = cc.saturating_sub(lm).saturating_sub(mc);
+                    format!("]{}", col_label(right_idx as u32))
+                };
                 let row_label = row_labels.iter()
                     .find(|(r, _)| *r == cursor_row)
                     .map(|(_, l)| l.as_str())
                     .unwrap_or("1");
-                let addr_text = format!("{}{}", col_label(display_col), row_label.trim());
+                let addr_text = format!("{}{}", col_part, row_label.trim());
                 let cell_val = raw_cells.borrow().get(&(cursor_row, cursor_col)).cloned().unwrap_or_default();
                 let max_fb = width.saturating_sub(addr_text.chars().count() + 3 + formula_bar_trailing.chars().count()).max(1);
                 let fb_text = if cell_val.chars().count() > max_fb {
