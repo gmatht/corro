@@ -1541,17 +1541,29 @@ mod pancurses_backend {
                                         out.push(' ');
                                     }
                                 } else if (col_idx as usize) < lm {
-                                    // Left-margin column: dark gray foreground
+                                    // Left-margin column: dark gray border or default.
+                                    // Match ratatui: only the last left-margin column
+                                    // (lm-1) gets dark gray in non-boundary rows; all
+                                    // left-margin columns get dark gray in boundary rows.
                                     let cw = column_layout[vi].1 as i32;
+                                    let is_last_left = (col_idx as usize) == lm - 1;
+                                    let use_gray = is_boundary || is_last_left;
                                     out.push_str(&sgr_cup(ry, sx));
                                     if is_boundary {
                                         out.push_str(SGR_UNDERLINE);
                                     }
-                                    out.push_str(sgr_sep());
+                                    if use_gray {
+                                        out.push_str(sgr_sep());
+                                    } else {
+                                        out.push_str(SGR_FG_DEFAULT);
+                                        out.push_str(SGR_BG_DEFAULT);
+                                    }
                                     for _ in 0..cw {
                                         out.push(' ');
                                     }
-                                    out.push_str(SGR_FG_DEFAULT);
+                                    if use_gray {
+                                        out.push_str(SGR_FG_DEFAULT);
+                                    }
                                     let gap_after = if vi + 1 < n { 1 } else { 0 };
                                     if gap_after > 0 {
                                         out.push(' ');
