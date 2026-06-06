@@ -664,6 +664,9 @@ mod pancurses_adapter {
     pub fn spreadsheet_set_row_labels(id: usize, labels: Vec<(u32, String)>) {
         crate::backends::pancurses::spreadsheet_set_row_labels(id, labels);
     }
+    pub fn spreadsheet_set_grid_config(id: usize, margin_cols: u32, main_cols: u32) {
+        crate::backends::pancurses::spreadsheet_set_grid_config(id, margin_cols, main_cols);
+    }
 }
 
 pub use pancurses_adapter::*;
