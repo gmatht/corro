@@ -1343,7 +1343,8 @@ mod pancurses_backend {
                         hx += 5;
                         let n = column_layout.len();
                         for (i, &(ref ci, ref w, ref label)) in column_layout.iter().enumerate() {
-                            if hx + *w as i32 + 1 > rect.x + rect.w - 1 { break; }
+                            let gap_after = if i + 1 < n { 1 } else { 0 };
+                            if hx + *w as i32 + gap_after > rect.x + rect.w - 1 { break; }
                             let padded = format!("{:<1$}", label, *w as usize);
                             let active_col = *ci == *cursor_col;
                             let style = if active_col { sgr_header_active() } else { sgr_header_inactive() };
@@ -1654,11 +1655,12 @@ mod pancurses_backend {
                                         }
                                     }
                                 } else if (col_idx as usize) >= lm + mc {
-                                    // Right-margin column: dark gray.
-                                    // Match ratatui: all reference columns use dark
-                                    // gray so they appear as inactive grid area.
+                                    // Right-margin column: dark gray only for the
+                                    // first ref column (col_idx == lm + mc), matching
+                                    // ratatui which applies dark gray only to the
+                                    // first right-margin column.
                                     let cw = column_layout[vi].1 as i32;
-                                    let use_gray = true;
+                                    let use_gray = (col_idx as usize) == lm + mc;
                                     out.push_str(&sgr_cup(ry, sx));
                                     if is_boundary {
                                         out.push_str(SGR_UNDERLINE);
