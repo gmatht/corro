@@ -1092,6 +1092,10 @@ mod pancurses_backend {
                 let pad = (inner_w - display.len() as i32).max(0);
                 let left_pad = pad / 2;
                 let right_pad = pad - left_pad;
+                // Fill entire button area with spaces so background spans the full width
+                for x in rect.x..rect.x + rect.w {
+                    root.mvaddch(rect.y, x, ' ');
+                }
                 root.mvaddch(rect.y, rect.x, '[');
                 root.mvaddstr(rect.y, rect.x + 1 + left_pad, &display);
                 root.mvaddch(rect.y, rect.x + 1 + left_pad + display.len() as i32 + right_pad, ']');
@@ -1224,13 +1228,13 @@ mod pancurses_backend {
                 let current = selected.and_then(|s| items.get(s)).map(|s| s.as_str()).unwrap_or("");
                 let max_w = (rect.w - 2) as usize;
                 let truncated = if current.len() > max_w { &current[..max_w] } else { current };
+                // Fill entire width so background spans the full dropdown
+                for x in rect.x..rect.x + rect.w {
+                    root.mvaddch(rect.y, x, ' ');
+                }
                 root.mvaddch(rect.y, rect.x, '[');
                 root.mvaddstr(rect.y, rect.x + 1, truncated);
-                root.mvaddch(rect.y, rect.x + 1 + truncated.len() as i32, 'v');
-                let rest = max_w.saturating_sub(truncated.len() + 1);
-                for i in 0..rest {
-                    root.mvaddch(rect.y, rect.x + 2 + truncated.len() as i32 + i as i32, ' ');
-                }
+                root.mvaddch(rect.y, rect.x + 1 + truncated.len() as i32, '▼');
                 root.mvaddch(rect.y, rect.x + rect.w - 1, ']');
                 if has_colors() {
                     root.attroff(COLOR_PAIR(1));
@@ -1716,7 +1720,7 @@ mod pancurses_backend {
                                 // Empty cell in main column: check style
                                     let cw = column_layout[vi].1 as i32;
                                     out.push_str(&sgr_cup(ry, sx));
-                                    if prev_overflowed {
+                                    if prev_overflowed || is_boundary {
                                         out.push_str(sgr_sep());
                                     } else {
                                         out.push_str(SGR_FG_DEFAULT);
@@ -1811,7 +1815,7 @@ mod pancurses_backend {
                                 sgr_cell_footer_agg()
                             } else if cell_style == 2 {
                                 sgr_cell_agg()
-                            } else if is_boundary && !can_overflow && (is_left_margin_col || is_right_margin_col || (col_idx as usize) == lm + mc - 1) {
+                            } else if is_boundary && !can_overflow {
                                 sgr_sep()
                             } else if is_left_margin_col {
                                 sgr_sep()
