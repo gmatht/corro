@@ -347,8 +347,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let ov = overlay.clone();
         let sc = sel.clone();
         move || {
-            if let Some(e) = ee.borrow_mut().take() {
+            let entry = ee.borrow_mut().take();
+            if entry.is_some() {
                 *ta.borrow_mut() = false;
+                let e = entry.unwrap();
                 let new_text = e.get_text().unwrap_or_default();
                 if let Some((r, c)) = *sc.borrow() {
                     if r < te.borrow().len()
@@ -849,6 +851,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut f = ff.borrow_mut();
             if r < f.len() && c < f[r].len() {
                 f[r][c].0 = !f[r][c].0;
+                drop(f);
                 cvf.queue_redraw();
             }
         }
@@ -869,6 +872,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut f = fi.borrow_mut();
             if r < f.len() && c < f[r].len() {
                 f[r][c].1 = !f[r][c].1;
+                drop(f);
                 cvi.queue_redraw();
             }
         }
@@ -951,6 +955,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     "#ffff00".into()
                 };
+                drop(f);
                 cvh.queue_redraw();
             }
         }
@@ -980,6 +985,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     "#000000".into()
                 };
+                drop(f);
                 cvfg.queue_redraw();
             }
         }

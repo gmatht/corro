@@ -194,17 +194,10 @@ impl App {
         crate::backends_nwg_adapter::create_window(&self.parent_cell)
     }
 
-<<<<<<< HEAD
-    #[cfg(all(windows, not(feature = "zork")))]
-    pub fn create_button(&self, _label: &str) -> Result<crate::backends_nwg_adapter::Button, Error> {
-        let parent = self.parent_cell.borrow().copied().unwrap_or(std::ptr::null_mut());
-        crate::backends_nwg_adapter::create_button(parent)
-=======
     #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
     pub fn create_button(&self, label: &str) -> Result<crate::backends_nwg_adapter::Button, Error> {
         let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
         crate::backends_nwg_adapter::create_button(parent, label)
->>>>>>> 84017f94ef91fdd1d24398a4b34d73edb69e19b8
     }
 
     #[cfg(all(windows, not(feature = "zork")))]
@@ -215,16 +208,10 @@ impl App {
         Ok(lbl)
     }
 
-<<<<<<< HEAD
-    #[cfg(all(windows, not(feature = "zork")))]
-    pub fn create_box(&self, orientation: crate::backends_nwg_adapter::Orientation, spacing: i32) -> Result<crate::backends_nwg_adapter::BoxWidget, Error> {
-        crate::backends_nwg_adapter::create_box(orientation, spacing)
-=======
     #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
     pub fn create_box(&self, orientation: crate::backends::nwg::Orientation, spacing: i32) -> Result<crate::backends_nwg_adapter::BoxWidget, Error> {
         let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
         crate::backends_nwg_adapter::create_box(orientation, spacing, parent)
->>>>>>> 84017f94ef91fdd1d24398a4b34d73edb69e19b8
     }
 
     #[cfg(all(windows, not(feature = "zork")))]
@@ -243,18 +230,11 @@ impl App {
         crate::backends_nwg_adapter::create_menu()
     }
 
-<<<<<<< HEAD
-    #[cfg(all(windows, not(feature = "zork")))]
-    pub fn create_menubar(&self, model: &crate::backends_nwg_adapter::Menu) -> Result<crate::backends_nwg_adapter::MenuBar, Error> {
-        let win_hwnd = self.parent_cell.borrow().copied().unwrap_or(std::ptr::null_mut());
-        crate::backends_nwg_adapter::create_menubar(model, win_hwnd, self.action_registry.clone())
-=======
     #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
     /// # Safety
-    /// `action_group` must be a valid pointer or null.
+    /// `window_hwnd` must be a valid HWND.
     pub unsafe fn create_menubar(&self, model: &crate::backends_nwg_adapter::Menu, window_hwnd: *mut c_void) -> Result<crate::backends_nwg_adapter::MenuBar, Error> {
         crate::backends_nwg_adapter::create_menubar(model, window_hwnd, self.action_registry.clone())
->>>>>>> 84017f94ef91fdd1d24398a4b34d73edb69e19b8
     }
 
     #[cfg(all(windows, not(feature = "zork")))]
@@ -262,9 +242,6 @@ impl App {
         crate::backends_nwg_adapter::create_simple_action(name, self.action_registry.clone())
     }
 
-<<<<<<< HEAD
-    // -- Pancurses paths (fallback, blocked when a platform-native backend applies) --
-=======
     #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
     pub fn create_dialog(&self) -> Result<crate::backends_nwg_adapter::Dialog, Error> {
         crate::backends_nwg_adapter::create_dialog(&self.parent_cell)
@@ -329,7 +306,6 @@ impl App {
     }
 
     // -- Pancurses paths --
->>>>>>> 84017f94ef91fdd1d24398a4b34d73edb69e19b8
 
     #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
     pub fn create_window(&self) -> Result<crate::backends_pancurses_adapter::Window, Error> {
@@ -545,12 +521,6 @@ impl App {
         crate::backends_wasm_adapter::create_radiobutton(None, label)
     }
 
-<<<<<<< HEAD
-#[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
-pub fn create_textview(&self) -> Result<crate::backends_wasm_adapter::TextView, Error> {
-    crate::backends_wasm_adapter::create_textview()
-}
-=======
     #[cfg(all(target_arch = "wasm32", not(feature = "pancurses"), not(feature = "zork")))]
     pub fn create_textview(&self) -> Result<crate::backends_wasm_adapter::TextView, Error> {
         crate::backends_wasm_adapter::create_textview()
@@ -570,7 +540,16 @@ pub fn create_textview(&self) -> Result<crate::backends_wasm_adapter::TextView, 
     pub fn create_scrolled_window(&self) -> Result<crate::backends_wasm_adapter::ScrolledWindow, Error> {
         crate::backends_wasm_adapter::create_scrolled_window()
     }
->>>>>>> 84017f94ef91fdd1d24398a4b34d73edb69e19b8
+
+    #[cfg(all(target_arch = "wasm32", not(feature = "pancurses"), not(feature = "zork")))]
+    pub fn open_file(&self, _title: &str) -> Result<Option<String>, Error> {
+        Ok(None) // File dialogs not available in WASM
+    }
+
+    #[cfg(all(target_arch = "wasm32", not(feature = "pancurses"), not(feature = "zork")))]
+    pub fn save_file(&self, _title: &str) -> Result<Option<String>, Error> {
+        Ok(None) // File dialogs not available in WASM
+    }
 
 // -- Android paths --
 

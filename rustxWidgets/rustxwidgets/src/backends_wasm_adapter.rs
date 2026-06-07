@@ -122,21 +122,26 @@ mod wasm_adapter {
         }
     }
 
-    impl Window {
-        pub fn set_title(&self, title: &str) {
-            document().set_title(title);
-        }
+impl Window {
+    pub fn set_title(&self, title: &str) {
+        self.elem.set_text_content(Some(title));
+    }
 
-        pub fn set_child(&self, child: &impl AsElement) {
-            while let Some(c) = self.elem.first_child() {
-                self.elem.remove_child(&c).ok();
-            }
-            self.elem.append_child(child.as_element()).ok();
-        }
+    pub fn set_child(&self, child: &impl AsElement) {
+        self.elem.append_child(child.as_element()).ok();
+    }
 
-        pub fn present(&self) {}
+    pub fn set_child_box(&self, child: &impl AsElement) {
+        self.elem.append_child(child.as_element()).ok();
+    }
 
-        pub fn set_default_size(&self, w: i32, h: i32) {
+    pub fn present(&self) {}
+
+    pub fn hwnd(&self) -> *mut c_void {
+        &self.elem as *const HtmlDivElement as *mut c_void
+    }
+
+    pub fn set_default_size(&self, w: i32, h: i32) {
             if w > 0 {
                 set_css(self.elem.as_ref(), "width", &format!("{}px", w));
             }
@@ -940,12 +945,14 @@ mod wasm_adapter {
     }
 
     impl DropDown {
-        pub fn set_active(&self, index: u32) {
-            self.elem.set_selected_index(index as i32);
+        pub fn set_active(&self, index: Option<u32>) {
+            if let Some(i) = index {
+                self.elem.set_selected_index(i as i32);
+            }
         }
 
-        pub fn get_active(&self) -> i32 {
-            self.elem.selected_index()
+        pub fn get_active(&self) -> u32 {
+            self.elem.selected_index() as u32
         }
 
         pub fn connect_changed(&self, f: impl FnMut() + 'static) -> Result<u64, Error> {
@@ -1192,10 +1199,10 @@ mod wasm_adapter {
 
         pub fn set_size_request(&self, w: i32, h: i32) {
             if w > 0 {
-                self.elem.set_cols(w as u32);
+                set_css(self.elem.as_ref(), "width", &format!("{}px", w));
             }
             if h > 0 {
-                self.elem.set_rows(h as u32);
+                set_css(self.elem.as_ref(), "height", &format!("{}px", h));
             }
         }
 
