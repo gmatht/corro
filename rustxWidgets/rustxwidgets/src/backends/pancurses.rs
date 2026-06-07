@@ -338,6 +338,7 @@ mod pancurses_backend {
                 match root.getch() {
                     Some(Input::KeyResize) => {
                         let (my, mx) = root.get_max_yx();
+                        root.clear();
                         with_state(|state| {
                             for node in &mut state.nodes {
                                 match &node.kind {
@@ -1711,9 +1712,7 @@ mod pancurses_backend {
                                 // Empty cell in main column: check style
                                     let cw = column_layout[vi].1 as i32;
                                     out.push_str(&sgr_cup(ry, sx));
-                                    if is_boundary {
-                                        out.push_str(sgr_sep());
-                                    } else if prev_overflowed {
+                                    if prev_overflowed {
                                         out.push_str(sgr_sep());
                                     } else {
                                         out.push_str(SGR_FG_DEFAULT);
@@ -1808,7 +1807,7 @@ mod pancurses_backend {
                                 sgr_cell_footer_agg()
                             } else if cell_style == 2 {
                                 sgr_cell_agg()
-                            } else if is_boundary && !can_overflow {
+                            } else if is_boundary && !can_overflow && (is_left_margin_col || is_right_margin_col) {
                                 sgr_sep()
                             } else if is_left_margin_col {
                                 sgr_sep()
