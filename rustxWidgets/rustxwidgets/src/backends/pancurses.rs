@@ -1656,11 +1656,12 @@ mod pancurses_backend {
                                         }
                                     }
                                 } else if (col_idx as usize) >= lm + mc {
-                                    // Right-margin column: all empty right-margin
-                                    // cells use dark gray foreground in empty rows
-                                    // (matching ratatui rendering).
+                                    // Right-margin column: match ratatui which only
+                                    // renders the first right-margin column with gray
+                                    // foreground for normal rows; boundary rows get
+                                    // gray for all columns.
                                     let cw = column_layout[vi].1 as i32;
-                                    let use_gray = true;
+                                    let use_gray = is_boundary || (col_idx as usize) == lm + mc;
                                     out.push_str(&sgr_cup(ry, sx));
                                     if is_boundary {
                                         out.push_str(SGR_UNDERLINE);
@@ -1801,7 +1802,8 @@ mod pancurses_backend {
                                 sgr_sep()
                             } else if is_left_margin_col {
                                 sgr_sep()
-                            } else if is_right_margin_col && cell_text.is_empty() {
+                            } else if is_right_margin_col && cell_text.is_empty()
+                                && (is_boundary || (col_idx as usize) == lm + mc) {
                                 sgr_sep()
                             } else if prev_overflowed && cell_text.is_empty() && !is_left_margin_col && !is_right_margin_col {
                                 sgr_sep()

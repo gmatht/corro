@@ -382,6 +382,31 @@ impl App {
         crate::backends_pancurses_adapter::create_spreadsheet(rows, cols)
     }
 
+    #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
+    pub fn create_canvas(&self) -> Result<crate::backends_pancurses_adapter::Canvas, Error> {
+        crate::backends_pancurses_adapter::create_canvas()
+    }
+
+    #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
+    pub fn create_overlay(&self) -> Result<crate::backends_pancurses_adapter::Overlay, Error> {
+        crate::backends_pancurses_adapter::create_overlay()
+    }
+
+    #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
+    pub fn create_scrolled_window(&self) -> Result<crate::backends_pancurses_adapter::ScrolledWindow, Error> {
+        crate::backends_pancurses_adapter::create_scrolled_window()
+    }
+
+    #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
+    pub fn open_file(&self, title: &str) -> Result<Option<String>, Error> {
+        crate::backends_pancurses_adapter::open_file(title)
+    }
+
+    #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
+    pub fn save_file(&self, title: &str) -> Result<Option<String>, Error> {
+        crate::backends_pancurses_adapter::save_file(title)
+    }
+
     // -- Zork paths --
 
     #[cfg(feature = "zork")]

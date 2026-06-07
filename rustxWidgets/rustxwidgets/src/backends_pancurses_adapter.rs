@@ -41,6 +41,10 @@ mod pancurses_adapter {
         pub fn insert_action_group(&self, _name: &str, _group_ptr: *mut c_void) {}
 
         pub fn set_default_size(&self, _width: i32, _height: i32) {}
+
+        pub fn hwnd(&self) -> *mut c_void {
+            std::ptr::null_mut()
+        }
     }
 
     // -- Button --
@@ -77,6 +81,7 @@ mod pancurses_adapter {
         }
 
         pub fn set_font_style(&self, _weight: i32, _italic: bool) {}
+        pub fn set_size_request(&self, _w: i32, _h: i32) {}
     }
 
     // -- Label --
@@ -143,6 +148,9 @@ mod pancurses_adapter {
         pub fn layout(&self, _x: i32, _y: i32, _w: i32, _h: i32) {
             crate::backends::pancurses::layout_box(self.id);
         }
+
+        pub fn set_child_vexpand(&self, _child: &impl AsRef<*mut c_void>, _expand: bool) {}
+        pub fn set_child_hexpand(&self, _child: &impl AsRef<*mut c_void>, _expand: bool) {}
     }
 
     // -- Grid --
@@ -200,6 +208,35 @@ mod pancurses_adapter {
 
         pub fn connect_changed(&self, f: impl FnMut() + 'static) -> Result<u64, Error> {
             crate::backends::pancurses::add_callback(self.id, Box::new(f));
+            Ok(0)
+        }
+
+        pub fn set_halign(&self, _align: i32) {}
+        pub fn set_valign(&self, _align: i32) {}
+        pub fn set_visible(&self, _visible: bool) {}
+        pub fn set_size_request(&self, _w: i32, _h: i32) {}
+        pub fn set_width_chars(&self, _w: i32) {}
+        pub fn set_margin_start(&self, _margin: i32) {}
+        pub fn set_margin_top(&self, _margin: i32) {}
+        pub fn add_class(&self, _class_name: &str) {}
+        pub fn remove_class(&self, _class_name: &str) {}
+        pub fn grab_focus(&self) {}
+
+        pub fn connect_activate<F: FnMut(*mut c_void) + 'static>(&self, f: F) -> Result<u64, Error> {
+            let mut f = f;
+            crate::backends::pancurses::add_callback(self.id, Box::new(move || f(std::ptr::null_mut())));
+            Ok(0)
+        }
+
+        pub fn connect_focus_in_event<F: FnMut(*mut c_void) -> i32 + 'static>(&self, f: F) -> Result<u64, Error> {
+            let mut f = f;
+            crate::backends::pancurses::add_callback(self.id, Box::new(move || { f(std::ptr::null_mut()); }));
+            Ok(0)
+        }
+
+        pub fn connect_focus_out_event<F: FnMut(*mut c_void) -> i32 + 'static>(&self, f: F) -> Result<u64, Error> {
+            let mut f = f;
+            crate::backends::pancurses::add_callback(self.id, Box::new(move || { f(std::ptr::null_mut()); }));
             Ok(0)
         }
     }
@@ -487,6 +524,91 @@ mod pancurses_adapter {
         }
     }
 
+    // -- Canvas --
+
+    pub struct Canvas {
+        pub(crate) id: usize,
+    }
+
+    impl Clone for Canvas {
+        fn clone(&self) -> Self { Canvas { id: self.id } }
+    }
+
+    impl AsRef<*mut c_void> for Canvas {
+        fn as_ref(&self) -> &*mut c_void {
+            unsafe { &*(&self.id as *const usize as *const *mut c_void) }
+        }
+    }
+
+    impl Widget for Canvas {
+        fn raw_handle(&self) -> *mut c_void {
+            &self.id as *const usize as *mut c_void
+        }
+    }
+
+    impl Canvas {
+        pub fn set_size_request(&self, _w: i32, _h: i32) {}
+        pub fn set_content_size(&self, _w: i32, _h: i32) {}
+        pub fn queue_redraw(&self) {}
+        pub fn set_draw_callback(&self, _cb: Box<dyn FnMut(&mut dyn crate::core::DrawContext, i32, i32)>) {}
+        pub fn on_click(&self, _cb: Box<dyn FnMut(f64, f64)>) {}
+        pub fn on_key(&self, _cb: Box<dyn FnMut(u32) -> bool>) {}
+    }
+
+    // -- Overlay --
+
+    pub struct Overlay {
+        pub(crate) id: usize,
+    }
+
+    impl Clone for Overlay {
+        fn clone(&self) -> Self { Overlay { id: self.id } }
+    }
+
+    impl AsRef<*mut c_void> for Overlay {
+        fn as_ref(&self) -> &*mut c_void {
+            unsafe { &*(&self.id as *const usize as *const *mut c_void) }
+        }
+    }
+
+    impl Widget for Overlay {
+        fn raw_handle(&self) -> *mut c_void {
+            &self.id as *const usize as *mut c_void
+        }
+    }
+
+    impl Overlay {
+        pub fn set_child(&self, _child: &impl AsRef<*mut c_void>) {}
+        pub fn add_overlay(&self, _child: &impl AsRef<*mut c_void>) {}
+        pub fn set_overlay_pass_through(&self, _child: &impl AsRef<*mut c_void>, _pass: bool) {}
+        pub fn remove(&self, _child: &impl AsRef<*mut c_void>) {}
+        pub fn show_all(&self) {}
+        pub fn set_size_request(&self, _w: i32, _h: i32) {}
+    }
+
+    // -- ScrolledWindow --
+
+    pub struct ScrolledWindow {
+        pub(crate) id: usize,
+    }
+
+    impl AsRef<*mut c_void> for ScrolledWindow {
+        fn as_ref(&self) -> &*mut c_void {
+            unsafe { &*(&self.id as *const usize as *const *mut c_void) }
+        }
+    }
+
+    impl Widget for ScrolledWindow {
+        fn raw_handle(&self) -> *mut c_void {
+            &self.id as *const usize as *mut c_void
+        }
+    }
+
+    impl ScrolledWindow {
+        pub fn set_child(&self, _child: &impl AsRef<*mut c_void>) {}
+        pub fn set_policy(&self, _hscroll: u32, _vscroll: u32) {}
+    }
+
     // ── Cell style constants (match cell_style_to_attrs in pancurses.rs) ──
     pub const CELL_STYLE_DEFAULT: u8 = 0;
     pub const CELL_STYLE_CURSOR: u8 = 1;
@@ -647,6 +769,32 @@ mod pancurses_adapter {
         crate::backends::pancurses::create_spreadsheet(rows, cols)
             .map(|id| Spreadsheet { id })
             .map_err(|e| Error::Backend(format!("{}", e)))
+    }
+
+    pub fn create_canvas() -> Result<Canvas, Error> {
+        static NEXT_CANVAS_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+        let id = NEXT_CANVAS_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(Canvas { id })
+    }
+
+    pub fn create_overlay() -> Result<Overlay, Error> {
+        static NEXT_OVERLAY_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+        let id = NEXT_OVERLAY_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(Overlay { id })
+    }
+
+    pub fn create_scrolled_window() -> Result<ScrolledWindow, Error> {
+        static NEXT_SCROLLED_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+        let id = NEXT_SCROLLED_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(ScrolledWindow { id })
+    }
+
+    pub fn open_file(_title: &str) -> Result<Option<String>, Error> {
+        Ok(None)
+    }
+
+    pub fn save_file(_title: &str) -> Result<Option<String>, Error> {
+        Ok(None)
     }
 
     pub fn add_key_callback(key: char, cb: Box<dyn FnMut()>) {

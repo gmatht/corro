@@ -220,7 +220,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut widget_panel = app.create_box(Orientation::Horizontal, 8)?;
 
     let dd = app.create_dropdown(&["Small", "Medium", "Large"])?;
-    dd.set_active(Some(1));
+    dd.set_active(1);
     let dd_cb = dd.clone();
     dd.connect_changed(move || {
         println!("  [widget] DropDown: active={}", dd_cb.get_active());
@@ -1323,7 +1323,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     vbox.append(&scrolled);
     vbox.set_child_vexpand(&scrolled, true);
     vbox.set_child_hexpand(&scrolled, true);
-    win.set_child_box(&vbox);
+    win.set_child(&vbox);
     win.present();
 
     println!("=== App: Spreadsheet with Menus, Dialogs && Widgets ===");
