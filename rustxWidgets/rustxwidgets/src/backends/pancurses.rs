@@ -1514,11 +1514,12 @@ mod pancurses_backend {
                     out.push_str(&sgr_cup(ry, rect.x + 1));
                     out.push_str(row_label_style);
                     out.push_str(&format!("{:>4} ", label_str));
-                    // Reset all attributes, then re-apply underline for boundary rows.
-                    // This prevents underline from leaking to the next row.
-                    out.push_str(SGR_RESET);
-                    if is_boundary {
-                        out.push_str(SGR_UNDERLINE);
+                    // Reset attributes that would leak (bold, background) for cursor
+                    // and footer rows.  Boundary rows keep their underline since
+                    // ratatui does not reset it; normal rows only set foreground
+                    // which the next cell's SGR overrides.
+                    if is_cursor_row || is_footer {
+                        out.push_str(SGR_RESET);
                     }
 
                     // Separator between row label and first data column (dark gray)
@@ -1655,12 +1656,11 @@ mod pancurses_backend {
                                         }
                                     }
                                 } else if (col_idx as usize) >= lm + mc {
-                                    // Right-margin column: dark gray only for the
-                                    // first ref column (col_idx == lm + mc), matching
-                                    // ratatui which applies dark gray only to the
-                                    // first right-margin column.
+                                    // Right-margin column: all empty right-margin
+                                    // cells use dark gray foreground in empty rows
+                                    // (matching ratatui rendering).
                                     let cw = column_layout[vi].1 as i32;
-                                    let use_gray = (col_idx as usize) == lm + mc;
+                                    let use_gray = true;
                                     out.push_str(&sgr_cup(ry, sx));
                                     if is_boundary {
                                         out.push_str(SGR_UNDERLINE);
