@@ -59,6 +59,7 @@ mod gtk_adapter {
         pub fn set_visible(&self, visible: bool) { self.0.set_visible(visible); }
         pub fn set_hexpand(&self, expand: bool) { self.0.set_hexpand(expand); }
         pub fn set_vexpand(&self, expand: bool) { self.0.set_vexpand(expand); }
+        pub fn set_font_style(&self, _weight: i32, _italic: bool) {}
     }
 
     impl Clone for Button { fn clone(&self) -> Self { Button(self.0.clone()) } }

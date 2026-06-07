@@ -93,6 +93,8 @@ mod android_adapter {
             });
             Ok(0)
         }
+
+        pub fn set_font_style(&self, _weight: i32, _italic: bool) {}
     }
 
     impl Clone for Button {

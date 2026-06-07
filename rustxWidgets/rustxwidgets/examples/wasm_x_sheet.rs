@@ -7,7 +7,7 @@ const COLS: usize = 26;
 const CELL_W: i32 = 150;
 const CELL_H: i32 = 28;
 
-type CellFormat = (bool, bool, u8, String, String); // bold, italic, align, fg_hex, bg_hex
+type CellFormat = (bool, bool, u8, String, String);
 
 fn col_label(n: usize) -> String {
     if n < 26 {
@@ -44,19 +44,18 @@ fn parse_hex(hex: &str) -> (f64, f64, f64) {
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() {
     let chw = 46f64;
     let cw = CELL_W as f64;
     let ch = CELL_H as f64;
     let total_w = chw + COLS as f64 * cw;
     let total_h = ch + ROWS as f64 * ch;
 
-    let app = App::init()?;
-    let win = app.create_window()?;
+    let app = App::init().expect("init");
+    let win = app.create_window().expect("window");
     win.set_title("Spreadsheet");
     win.set_default_size(1600, 1000);
 
-    // Data model
     let texts: Rc<RefCell<Vec<Vec<String>>>> = Rc::new(RefCell::new(
         (0..ROWS).map(|_| (0..COLS).map(|_| String::new()).collect()).collect()
     ));
@@ -68,10 +67,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let editing_entry: Rc<RefCell<Option<Entry>>> = Rc::new(RefCell::new(None));
     let text_input_active: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
 
-    // Seed demo data
     {
         let mut t = texts.borrow_mut();
-        let _f = fmts.borrow_mut();
         t[0][0] = "Short".into();
         t[1][0] = "VeryLongHeaderThatOverflows".into();
         t[2][0] = "CellWithAVeryLongWordThatWillSpanMultipleCells".into();
@@ -90,33 +87,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         t[8][3] = "=SUM(B9:C9)".into();
     }
 
-    // Layout
-    let mut vbox = app.create_box(Orientation::Vertical, 0)?;
+    let vbox = app.create_box(Orientation::Vertical, 0).expect("vbox");
 
-    // Toolbar
-    let mut toolbar = app.create_box(Orientation::Horizontal, 2)?;
-    let open_btn = app.create_button("Open")?;
-    let save_btn = app.create_button("Save As")?;
-    let quit_btn = app.create_button("Quit")?;
-    let bold_btn = app.create_button("B")?;
-    let italic_btn = app.create_button("I")?;
-    let al_l = app.create_button("AL")?;
-    let al_c = app.create_button("AC")?;
-    let al_r = app.create_button("AR")?;
-    let hl_btn = app.create_button("HL")?;
-    let fg_btn = app.create_button("FG")?;
+    let toolbar = app.create_box(Orientation::Horizontal, 2).expect("toolbar");
+    let bold_btn = app.create_button("B").expect("bold");
+    let italic_btn = app.create_button("I").expect("italic");
+    let al_l = app.create_button("AL").expect("al_l");
+    let al_c = app.create_button("AC").expect("al_c");
+    let al_r = app.create_button("AR").expect("al_r");
+    let hl_btn = app.create_button("HL").expect("hl");
+    let fg_btn = app.create_button("FG").expect("fg");
 
-    open_btn.set_size_request(60, 24);
-    save_btn.set_size_request(70, 24);
-    quit_btn.set_size_request(50, 24);
     for b in [&bold_btn, &italic_btn, &al_l, &al_c, &al_r, &hl_btn, &fg_btn] { b.set_size_request(28, 24); }
-    #[cfg(windows)]
-    bold_btn.set_font_style(700, false);
-    #[cfg(windows)]
-    italic_btn.set_font_style(400, true);
-    toolbar.append(&open_btn);
-    toolbar.append(&save_btn);
-    toolbar.append(&quit_btn);
     toolbar.append(&bold_btn);
     toolbar.append(&italic_btn);
     toolbar.append(&al_l);
@@ -124,78 +106,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     toolbar.append(&al_r);
     toolbar.append(&hl_btn);
     toolbar.append(&fg_btn);
-    let mut toolbar_box = app.create_box(Orientation::Vertical, 0)?;
+    let toolbar_box = app.create_box(Orientation::Vertical, 0).expect("toolbar_box");
     toolbar_box.append(&toolbar);
 
-    // Formula bar
-    let mut formula_bar = app.create_box(Orientation::Horizontal, 4)?;
-    let fx_label = app.create_label("  fx  ")?;
+    let formula_bar = app.create_box(Orientation::Horizontal, 4).expect("formula_bar");
+    let fx_label = app.create_label("  fx  ").expect("fx_label");
     formula_bar.append(&fx_label);
-    let formula_entry = app.create_entry()?;
+    let formula_entry = app.create_entry().expect("formula_entry");
     formula_entry.set_width_chars(40);
     formula_entry.set_size_request(400, 26);
     formula_bar.append(&formula_entry);
 
-    // Canvas + Overlay
-    let overlay = app.create_overlay()?;
-    let canvas = app.create_canvas()?;
+    let overlay = app.create_overlay().expect("overlay");
+    let canvas = app.create_canvas().expect("canvas");
     let total_w_i = total_w as i32;
     let total_h_i = total_h as i32;
     canvas.set_size_request(total_w_i, total_h_i);
     canvas.set_content_size(total_w_i, total_h_i);
     overlay.set_child(&canvas);
     overlay.set_size_request(total_w_i, total_h_i);
-    #[cfg(feature = "gtk")]
-    overlay.set_vexpand(true);
-    #[cfg(feature = "gtk")]
-    overlay.set_hexpand(true);
 
-    #[cfg(feature = "gtk")]
     let scrolled = {
-        let gtk_loader = rustxwidgets::backends::gtk::loader()
-            .expect("GTK loader not initialized");
-        let s = gtk_dynamic_loader::ScrolledWindow::new(gtk_loader.clone())?;
-        s.set_policy(0, 0);
-        s.set_child(&overlay);
-        let css = r#"
-        button { font-size: 11px; padding: 1px 8px; min-height: 20px; }
-        entry { padding: 0; border: none; font-family: monospace; font-size: 13px; min-height: 0; }
-        entry:focus { outline: none; }
-        .cell-bold { font-weight: bold; }
-        .cell-italic { font-style: italic; }
-        .cell-both { font-weight: bold; font-style: italic; }
-        .cell-fg-red { color: #cc0000; }
-        .cell-fg-blue { color: #0000cc; }
-        .cell-fg-green { color: #006600; }
-        "#;
-        if let Some(provider) = gtk_dynamic_loader::create_css_provider(&gtk_loader, css) {
-            gtk_dynamic_loader::add_css_provider_global(&gtk_loader, *win.as_ref(), provider, 600);
-        }
-        s
-    };
-    #[cfg(feature = "gtk")]
-    scrolled.set_hexpand(true);
-    #[cfg(feature = "gtk")]
-    scrolled.set_vexpand(true);
-    #[cfg(not(feature = "gtk"))]
-    let scrolled = {
-        let s = app.create_scrolled_window()?;
+        let s = app.create_scrolled_window().expect("scrolled");
         s.set_policy(0, 0);
         s.set_child(&overlay);
         s
     };
-    #[cfg(not(feature = "gtk"))]
-    scrolled.set_hexpand(true);
-    #[cfg(not(feature = "gtk"))]
-    scrolled.set_vexpand(true);
 
-    // Focus tracking for formula entry
     let text_input_active2 = text_input_active.clone();
     let _ = formula_entry.connect_focus_in_event(move |_| { *text_input_active2.borrow_mut() = true; 0 });
     let text_input_active3 = text_input_active.clone();
     let _ = formula_entry.connect_focus_out_event(move |_| { *text_input_active3.borrow_mut() = false; 0 });
 
-    // Commit edit and refresh selection helpers
     let commit_edit = {
         let text_commit = texts.clone();
         let edit_entry = editing_entry.clone();
@@ -235,7 +177,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // Start editing a cell (creates floating entry on overlay)
     let start_edit: Rc<dyn Fn(usize, usize)> = {
         let texts_edit = texts.clone();
         let fmts_edit = fmts.clone();
@@ -251,16 +192,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let self_ref2 = self_ref.clone();
         let start: Rc<dyn Fn(usize, usize)> = Rc::new(move |r: usize, c: usize| {
             if edit_entry.borrow().is_some() { return; }
-            let created = {
-                #[cfg(not(windows))]
-                { gtk::create_entry() }
-                #[cfg(windows)]
-                { app_for_edit.create_entry() }
-            };
-            if let Ok(entry) = created {
+            if let Ok(entry) = app_for_edit.create_entry() {
                 *text_active.borrow_mut() = true;
                 entry.set_text(&texts_edit.borrow()[r][c]);
-                // Apply cell formatting to the entry widget
                 let fmt = &fmts_edit.borrow()[r][c];
                 if fmt.0 && fmt.1 { entry.add_class("cell-both"); }
                 else if fmt.0 { entry.add_class("cell-bold"); }
@@ -312,13 +246,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         start
     };
 
-    // Draw callback
     let t_draw = texts.clone();
     let f_draw = fmts.clone();
     let sel_draw = sel.clone();
     let edit_draw = editing_entry.clone();
     canvas.set_draw_callback(Box::new(move |ctx: &mut dyn DrawContext, _w: i32, _h: i32| {
-        // Cell overflow computation (before any drawing, just measures text)
         let t = t_draw.borrow();
         let f = f_draw.borrow();
         let mut overflow_end_col = vec![vec![0usize; COLS]; ROWS];
@@ -341,22 +273,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // White background
         ctx.clear(1.0, 1.0, 1.0, 1.0);
 
-        // Header area
         ctx.fill_rect(0.0, 0.0, chw, ch, 0.91, 0.91, 0.91, 1.0);
         ctx.fill_rect(chw, 0.0, COLS as f64 * cw, ch, 0.8, 0.8, 0.8, 1.0);
         ctx.fill_rect(0.0, ch, chw, ROWS as f64 * ch, 0.8, 0.8, 0.8, 1.0);
 
-        // Column headers
         for c in 0..COLS {
             let lbl = col_label(c);
             let (xb, _, w, _) = ctx.text_extents_styled(&lbl, "monospace", 12.0, 0, 0);
             let x = chw + c as f64 * cw + cw / 2.0 - xb - w / 2.0;
             ctx.draw_text(x, ch / 2.0, &lbl, "monospace", 12.0, 0.0, 0.0, 0.0, 1.0);
         }
-        // Row headers
         for r in 0..ROWS {
             let lbl = format!("{}", r + 1);
             let (xb, _, w, _) = ctx.text_extents_styled(&lbl, "monospace", 12.0, 0, 0);
@@ -364,7 +292,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ctx.draw_text(x, ch + r as f64 * ch + ch / 2.0, &lbl, "monospace", 12.0, 0.0, 0.0, 0.0, 1.0);
         }
 
-        // Grid lines (overflow-aware)
         for r in 0..=ROWS {
             let y = ch + r as f64 * ch;
             ctx.stroke_rect(0.0, y, total_w, 0.0, 0.7, 0.7, 0.7, 1.0, 0.5);
@@ -382,7 +309,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // Cell text
         let editing = edit_draw.borrow().is_some();
         let edit_target = if editing { *sel_draw.borrow() } else { None };
         for r in 0..ROWS {
@@ -431,7 +357,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // Selection highlight
         if let Some((sr, sc)) = *sel_draw.borrow() {
             let sx = chw + sc as f64 * cw;
             let sy = ch + sr as f64 * ch;
@@ -440,7 +365,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }));
 
-    // Click to select and edit
     let sel_click = sel.clone();
     let fe_click = formula_entry.clone();
     let txt_click = texts.clone();
@@ -472,12 +396,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             (ri + 1).min(ROWS)
         };
 
-        if grid_row == 0 && col < COLS { println!("Header: col={}", col_label(col)); return; }
-        if x < chw && grid_row >= 1 && grid_row <= ROWS { println!("Row header: row={}", grid_row); return; }
+        if grid_row == 0 && col < COLS { return; }
+        if x < chw && grid_row >= 1 && grid_row <= ROWS { return; }
 
         let data_row = grid_row.saturating_sub(1);
         if col < COLS && data_row < ROWS {
-            println!("Cell: row={}, col={}", data_row + 1, col_label(col));
             commit_click();
             *sel_click.borrow_mut() = Some((data_row, col));
             let t = txt_click.borrow();
@@ -499,7 +422,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }));
 
-    // Keyboard navigation
     let sel_kb = sel.clone();
     let edit_kb = editing_entry.clone();
     let text_active_kb = text_input_active.clone();
@@ -509,10 +431,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     canvas.on_key(Box::new(move |keyval: u32| -> bool {
         if *text_active_kb.borrow() { return false; }
         if edit_kb.borrow().is_some() {
-            if keyval == 0xFF1B { // Escape
+            if keyval == 27 { // Escape
                 let _ = edit_kb.borrow_mut().take();
                 return true;
-            } else if keyval == 0xFF0D || keyval == 0xFF8D { // Enter
+            } else if keyval == 13 || keyval == 10 { // Enter
                 commit_kb();
                 if let Some((r, c)) = sel_kb.borrow().map(|(r, c)| (r + 1, c)).filter(|(r, _)| *r < ROWS) {
                     *sel_kb.borrow_mut() = Some((r, c));
@@ -526,18 +448,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut coord = sel_kb.borrow_mut();
         if let Some((r, c)) = *coord {
             match keyval {
-                0xFF52 | 0xFE52 => { if r > 0 { *coord = Some((r - 1, c)); } }
-                0xFF54 | 0xFE54 => { if r + 1 < ROWS { *coord = Some((r + 1, c)); } }
-                0xFF51 | 0xFE51 => { if c > 0 { *coord = Some((r, c - 1)); } }
-                0xFF53 | 0xFE53 => { if c + 1 < COLS { *coord = Some((r, c + 1)); } }
-                0xFF0D | 0xFF8D => {
+                38 | 119 => { if r > 0 { *coord = Some((r - 1, c)); } }
+                40 | 115 => { if r + 1 < ROWS { *coord = Some((r + 1, c)); } }
+                37 | 97 => { if c > 0 { *coord = Some((r, c - 1)); } }
+                39 | 100 => { if c + 1 < COLS { *coord = Some((r, c + 1)); } }
+                13 | 10 => {
                     drop(coord);
                     commit_kb();
                     start_kb(r, c);
                     return true;
                 }
                 _ => {
-                    if keyval >= 0x20 && keyval <= 0x7E {
+                    if keyval >= 32 && keyval <= 126 {
                         drop(coord);
                         commit_kb();
                         start_kb(r, c);
@@ -556,7 +478,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         false
     }));
 
-    // Helper: apply cell formatting CSS classes to an entry widget
     fn apply_fmt(entry: &Entry, r: usize, c: usize, fmts: &RefCell<Vec<Vec<CellFormat>>>) {
         let b = fmts.borrow();
         if r >= b.len() || c >= b[r].len() { return; }
@@ -578,7 +499,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Formatting buttons — each also updates the active editing entry's appearance
     let edit_entry_fmt = editing_entry.clone();
     let sel_fmt = sel.clone();
     let fmts_fmt = fmts.clone();
@@ -613,7 +533,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let _edit_entry_al = editing_entry.clone();
     let _ = al_l.on_click({
         let sel_al = sel.clone(); let fmts_al = fmts.clone(); let cv_al = canvas.clone();
         let ed_al = editing_entry.clone();
@@ -689,55 +608,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // File operations
-    let app_open = app.clone();
-    let texts_open = texts.clone();
-    let cv_open = canvas.clone();
-    let _ = open_btn.on_click(move || {
-        if let Ok(Some(path)) = app_open.open_file("Open spreadsheet") {
-            if let Ok(data) = std::fs::read_to_string(&path) {
-                if let Ok(mut t) = texts_open.try_borrow_mut() {
-                    for row in t.iter_mut() { for cell in row.iter_mut() { *cell = String::new(); } }
-                    for (i, line) in data.lines().enumerate() {
-                        if i >= ROWS { break; }
-                        for (j, val) in line.split('\t').enumerate() {
-                            if j >= COLS { break; }
-                            t[i][j] = val.to_string();
-                        }
-                    }
-                }
-                cv_open.queue_redraw();
-            }
-        }
-    });
-    let app_save = app.clone();
-    let texts_save = texts.clone();
-    let _ = save_btn.on_click(move || {
-        if let Ok(Some(path)) = app_save.save_file("Save spreadsheet as") {
-            let mut out = String::new();
-            if let Ok(t) = texts_save.try_borrow() {
-                for row in t.iter() {
-                    for (j, val) in row.iter().enumerate() {
-                        if j > 0 { out.push('\t'); }
-                        out.push_str(val);
-                    }
-                    out.push('\n');
-                }
-            }
-            let _ = std::fs::write(&path, &out);
-        }
-    });
-
-    let _ = quit_btn.on_click(|| std::process::exit(0));
-
-    // Assemble layout
     vbox.append(&toolbar_box);
     vbox.append(&formula_bar);
     vbox.append(&scrolled);
     vbox.set_child_vexpand(&scrolled, true);
     vbox.set_child_hexpand(&scrolled, true);
-    win.set_child_box(&vbox);
+    win.set_child(&vbox);
     win.present();
 
-    app.run().map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+    web_sys::console::log_1(&"WASM x-sheet running".into());
+    app.run().expect("run");
 }

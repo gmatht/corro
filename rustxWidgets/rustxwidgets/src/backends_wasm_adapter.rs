@@ -220,6 +220,11 @@ mod wasm_adapter {
                 set_css(self.elem.as_ref(), "height", &format!("{}px", h));
             }
         }
+
+        pub fn set_font_style(&self, weight: i32, italic: bool) {
+            set_css(self.elem.as_ref(), "font-weight", &weight.to_string());
+            set_css(self.elem.as_ref(), "font-style", if italic { "italic" } else { "normal" });
+        }
     }
 
     pub fn create_button(label: &str) -> Result<Button, Error> {

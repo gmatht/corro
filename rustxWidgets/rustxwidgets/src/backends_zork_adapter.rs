@@ -70,6 +70,8 @@ impl Button {
     pub fn emit_clicked(&self) -> Result<u64, Error> {
         Ok(0)
     }
+
+    pub fn set_font_style(&self, _weight: i32, _italic: bool) {}
 }
 
 // -- Label --

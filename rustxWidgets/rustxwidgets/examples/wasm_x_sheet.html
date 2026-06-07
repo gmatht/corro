@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>rustxwidgets WASM x-sheet</title>
+  <style>
+    body { margin: 0; font-family: sans-serif; background: #fff; }
+    .cell-bold { font-weight: bold; }
+    .cell-italic { font-style: italic; }
+    .cell-both { font-weight: bold; font-style: italic; }
+    .cell-fg-red { color: #cc0000; }
+    .cell-fg-blue { color: #0000cc; }
+    .cell-fg-green { color: #006600; }
+  </style>
+</head>
+<body>
+  <script type="module">
+    import init from './wasm_x_sheet.js';
+    init();
+  </script>
+</body>
+</html>
