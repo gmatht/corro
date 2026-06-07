@@ -1356,11 +1356,12 @@ mod pancurses_backend {
                                 let is_boundary = lm > 0 && (*ci == (lm - 1) as u32 || *ci == (lm + mc - 1) as u32);
                                 out.push_str(&sgr_cup(hr, hx));
                                 if is_boundary {
-                                    out.push_str("│");
+                                    out.push_str("│ ");
+                                    hx += 2;
                                 } else {
                                     out.push_str(" ");
+                                    hx += 1;
                                 }
-                                hx += 1;
                             }
                         }
                         if hx <= rect.x + rect.w - 1 {
@@ -1421,10 +1422,11 @@ mod pancurses_backend {
                         for (idx, &(col_idx, w, _)) in column_layout.iter().enumerate() {
                             cx += w as i32;
                             if idx + 1 < column_layout.len() {
-                                if col_idx == (lm - 1) as u32 || col_idx == (lm + mc - 1) as u32 {
+                                let is_boundary = col_idx == (lm - 1) as u32 || col_idx == (lm + mc - 1) as u32;
+                                if is_boundary {
                                     boundaries.push(cx);
                                 }
-                                cx += 1;
+                                cx += if is_boundary { 2 } else { 1 };
                             }
                         }
                         boundaries
@@ -1447,8 +1449,8 @@ mod pancurses_backend {
                         out.push('─');
                         sx += 1;
                     }
-                    out.push_str(SGR_FG_DEFAULT);
                     out.push_str("┤");
+                    out.push_str(SGR_FG_DEFAULT);
                     out.push_str("│");
                     row_offset = hr + 2;
                 }
@@ -3082,10 +3084,11 @@ mod pancurses_backend {
                     for (idx, &(col_idx, w, _)) in column_layout.iter().enumerate() {
                         cx += w as usize;
                         if idx + 1 < column_layout.len() {
-                            if col_idx == (lm - 1) as u32 || col_idx == (lm + mc - 1) as u32 {
+                            let is_boundary = col_idx == (lm - 1) as u32 || col_idx == (lm + mc - 1) as u32;
+                            if is_boundary {
                                 boundaries.push(cx);
                             }
-                            cx += 1;
+                            cx += if is_boundary { 2 } else { 1 };
                         }
                     }
                     boundaries
