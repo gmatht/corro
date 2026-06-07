@@ -1234,7 +1234,7 @@ mod pancurses_backend {
                 }
                 root.mvaddch(rect.y, rect.x, '[');
                 root.mvaddstr(rect.y, rect.x + 1, truncated);
-                root.mvaddch(rect.y, rect.x + 1 + truncated.len() as i32, '▼');
+                root.mvaddstr(rect.y, rect.x + 1 + truncated.len() as i32, "▼");
                 root.mvaddch(rect.y, rect.x + rect.w - 1, ']');
                 if has_colors() {
                     root.attroff(COLOR_PAIR(1));
