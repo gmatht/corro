@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+#[cfg(windows)]
 use std::collections::HashMap;
 use std::os::raw::c_void;
 use std::rc::Rc;
@@ -232,7 +233,7 @@ impl App {
 
     #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
     /// # Safety
-    /// `action_group` must be a valid pointer or null.
+    /// `window_hwnd` must be a valid HWND.
     pub unsafe fn create_menubar(&self, model: &crate::backends_nwg_adapter::Menu, window_hwnd: *mut c_void) -> Result<crate::backends_nwg_adapter::MenuBar, Error> {
         crate::backends_nwg_adapter::create_menubar(model, window_hwnd, self.action_registry.clone())
     }
@@ -589,6 +590,15 @@ impl App {
     #[cfg(all(target_arch = "wasm32", not(feature = "pancurses"), not(feature = "zork")))]
     pub fn create_scrolled_window(&self) -> Result<crate::backends_wasm_adapter::ScrolledWindow, Error> {
         crate::backends_wasm_adapter::create_scrolled_window()
+    }
+    #[cfg(all(target_arch = "wasm32", not(feature = "pancurses"), not(feature = "zork")))]
+    pub fn open_file(&self, _title: &str) -> Result<Option<String>, Error> {
+        Ok(None) // File dialogs not available in WASM
+    }
+
+    #[cfg(all(target_arch = "wasm32", not(feature = "pancurses"), not(feature = "zork")))]
+    pub fn save_file(&self, _title: &str) -> Result<Option<String>, Error> {
+        Ok(None) // File dialogs not available in WASM
     }
 
 // -- Android paths --
