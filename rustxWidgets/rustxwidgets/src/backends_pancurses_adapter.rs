@@ -75,6 +75,8 @@ mod pancurses_adapter {
             // fire synchronously
             Ok(0)
         }
+
+        pub fn set_font_style(&self, _weight: i32, _italic: bool) {}
     }
 
     // -- Label --
@@ -282,6 +284,10 @@ mod pancurses_adapter {
         pub(crate) id: usize,
     }
 
+    impl Clone for Dialog {
+        fn clone(&self) -> Self { Dialog { id: self.id } }
+    }
+
     impl Widget for Dialog {
         fn raw_handle(&self) -> *mut c_void {
             &self.id as *const usize as *mut c_void
@@ -307,6 +313,7 @@ mod pancurses_adapter {
         pub fn add_button(&self, _label: &str, _response_id: i32) {}
         pub fn connect_response(&self, _f: impl FnMut(i32) + 'static) -> Result<u64, Error> { Ok(0) }
         pub fn present(&self) {}
+        pub fn close(&self) {}
     }
 
     // -- DropDown --

@@ -35,7 +35,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     vbox.append(&menubar);
     vbox.append(&status_label);
 
-    window.set_child_box(&vbox);
+    window.set_child(&vbox);
     window.present();
 
     println!("Running topmenu demo. Press ESC to quit.");
