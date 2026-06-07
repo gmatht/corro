@@ -2892,6 +2892,7 @@ mod pancurses_backend {
         if children.is_empty() { return 0; }
 
         let parent_rect = s.node(id).map(|n| n.rect).unwrap_or(Rect::default());
+        let spacing = spacing.min(2);
         let total_children = children.len() as i32;
         let total_spacing = spacing * (total_children - 1).max(0);
 
@@ -2917,28 +2918,46 @@ mod pancurses_backend {
             }).collect();
             let total_natural: i32 = natural_widths.iter().sum();
             if total_natural <= total_w {
-                // Natural fit: give each its natural width, extra to last
+                // Give each child its natural width then distribute extra proportionally
+                let extra = total_w - total_natural;
                 let mut x = parent_rect.x;
+                let mut remaining = extra;
                 for (i, child_id) in children.iter().enumerate() {
-                    let mut w = natural_widths[i];
-                    if i == children.len() - 1 {
-                        let used: i32 = natural_widths[..children.len() - 1].iter().sum();
-                        w = (total_w - used).max(1);
-                    }
+                    let extra_share = if i == children.len() - 1 {
+                        remaining
+                    } else {
+                        let share = extra * natural_widths[i] / total_natural;
+                        remaining -= share;
+                        share
+                    };
+                    let w = natural_widths[i] + extra_share;
                     if let Some(n) = s.node_mut(*child_id) {
                         n.rect = Rect { x, y: parent_rect.y, w, h: parent_rect.h.max(1) };
                     }
-                    x += w + spacing;
+                    x += w;
+                    if i + 1 < children.len() { x += spacing; }
                 }
             } else {
-                // Scale proportionally to fit
+                // Shrink longest-first: give each child its natural width,
+                // then repeatedly shrink the widest by 1 until everything fits.
+                let mut widths: Vec<i32> = natural_widths.iter().map(|&w| w.max(1)).collect();
+                let mut total: i32 = widths.iter().sum();
+                while total > total_w {
+                    // Find the widest child and shrink it by 1
+                    let mut max_i = 0;
+                    for i in 1..widths.len() {
+                        if widths[i] > widths[max_i] { max_i = i; }
+                    }
+                    widths[max_i] -= 1;
+                    total -= 1;
+                }
                 let mut x = parent_rect.x;
                 for (i, child_id) in children.iter().enumerate() {
-                    let w = (natural_widths[i] * total_w / total_natural).max(1);
                     if let Some(n) = s.node_mut(*child_id) {
-                        n.rect = Rect { x, y: parent_rect.y, w, h: parent_rect.h.max(1) };
+                        n.rect = Rect { x, y: parent_rect.y, w: widths[i], h: parent_rect.h.max(1) };
                     }
-                    x += w + spacing;
+                    x += widths[i];
+                    if i + 1 < children.len() { x += spacing; }
                 }
             }
         } else {
