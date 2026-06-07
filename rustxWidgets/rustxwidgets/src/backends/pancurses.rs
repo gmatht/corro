@@ -1234,7 +1234,7 @@ mod pancurses_backend {
                 }
                 root.mvaddch(rect.y, rect.x, '[');
                 root.mvaddstr(rect.y, rect.x + 1, truncated);
-                root.mvaddstr(rect.y, rect.x + 1 + truncated.len() as i32, "▼");
+                root.mvaddstr(rect.y, rect.x + rect.w - 2, "▼");
                 root.mvaddch(rect.y, rect.x + rect.w - 1, ']');
                 if has_colors() {
                     root.attroff(COLOR_PAIR(1));
@@ -2897,13 +2897,49 @@ mod pancurses_backend {
 
         if horizontal {
             let total_w = parent_rect.w.saturating_sub(total_spacing).max(1);
-            let per_child = if total_children > 0 { (total_w / total_children).max(1) } else { 1 };
-            let mut x = parent_rect.x;
-            for child_id in &children {
-                if let Some(n) = s.node_mut(*child_id) {
-                    n.rect = Rect { x, y: parent_rect.y, w: per_child, h: parent_rect.h.max(1) };
+            // Compute natural widths for each child based on content
+            let natural_widths: Vec<i32> = children.iter().map(|&cid| {
+                match s.node(cid).map(|n| &n.kind) {
+                    Some(PcWidgetKind::Button { label }) => (label.len() + 2) as i32,
+                    Some(PcWidgetKind::Label { text }) => (text.len() + 0) as i32,
+                    Some(PcWidgetKind::CheckButton { label, .. }) => (label.len() + 4) as i32,
+                    Some(PcWidgetKind::RadioButton { label, .. }) => (label.len() + 4) as i32,
+                    Some(PcWidgetKind::DropDown { items, .. }) => {
+                        let max_item = items.iter().map(|s| s.len()).max().unwrap_or(0);
+                        (max_item + 3) as i32 // [text▼]
+                    }
+                    Some(PcWidgetKind::Entry { buffer, .. }) => (buffer.len() + 4).max(6) as i32,
+                    Some(PcWidgetKind::TextView { text }) => {
+                        text.lines().next().map(|l| l.len()).unwrap_or(0).max(6) as i32
+                    }
+                    _ => 4,
                 }
-                x += per_child + spacing;
+            }).collect();
+            let total_natural: i32 = natural_widths.iter().sum();
+            if total_natural <= total_w {
+                // Natural fit: give each its natural width, extra to last
+                let mut x = parent_rect.x;
+                for (i, child_id) in children.iter().enumerate() {
+                    let mut w = natural_widths[i];
+                    if i == children.len() - 1 {
+                        let used: i32 = natural_widths[..children.len() - 1].iter().sum();
+                        w = (total_w - used).max(1);
+                    }
+                    if let Some(n) = s.node_mut(*child_id) {
+                        n.rect = Rect { x, y: parent_rect.y, w, h: parent_rect.h.max(1) };
+                    }
+                    x += w + spacing;
+                }
+            } else {
+                // Scale proportionally to fit
+                let mut x = parent_rect.x;
+                for (i, child_id) in children.iter().enumerate() {
+                    let w = (natural_widths[i] * total_w / total_natural).max(1);
+                    if let Some(n) = s.node_mut(*child_id) {
+                        n.rect = Rect { x, y: parent_rect.y, w, h: parent_rect.h.max(1) };
+                    }
+                    x += w + spacing;
+                }
             }
         } else {
             // Natural-height vertical layout: each child gets 1 row by default,
