@@ -1530,7 +1530,11 @@ mod pancurses_backend {
                     // ratatui does not reset it; normal rows only set foreground
                     // which the next cell's SGR overrides.
                     if is_cursor_row || is_footer {
-                        out.push_str(SGR_RESET);
+                        if is_boundary {
+                            out.push_str("\x1b[0;4m");
+                        } else {
+                            out.push_str(SGR_RESET);
+                        }
                     }
 
                     // Separator between row label and first data column (dark gray)
@@ -1807,7 +1811,7 @@ mod pancurses_backend {
                                 sgr_cell_footer_agg()
                             } else if cell_style == 2 {
                                 sgr_cell_agg()
-                            } else if is_boundary && !can_overflow && (is_left_margin_col || is_right_margin_col) {
+                            } else if is_boundary && !can_overflow && (is_left_margin_col || is_right_margin_col || (col_idx as usize) == lm + mc - 1) {
                                 sgr_sep()
                             } else if is_left_margin_col {
                                 sgr_sep()
