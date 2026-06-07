@@ -68,6 +68,9 @@ mod pancurses_backend {
         SimpleAction,
         DropDown { items: Vec<String>, selected: Option<usize> },
         TextView { text: String },
+        Canvas,
+        Overlay,
+        ScrolledWindow,
         Spreadsheet {
             cells: Rc<RefCell<HashMap<(u32, u32), String>>>,
             raw_cells: Rc<RefCell<HashMap<(u32, u32), String>>>,
@@ -263,14 +266,18 @@ mod pancurses_backend {
                     for id in &ids {
                         if let Some(rect) = state.node(*id).map(|n| n.rect) {
                             if let Some(pid) = state.node(*id).and_then(|n| n.parent) {
-                                let pw = state.node(pid).map(|p| p.rect.w).unwrap_or(1).max(1);
-                                let ph = state.node(pid).map(|p| p.rect.h).unwrap_or(1).max(1);
-                                let mut nr = rect;
-                                nr.x = rect.x.clamp(0, pw - 1);
-                                nr.y = rect.y.clamp(0, ph - 1);
-                                nr.w = rect.w.min(pw - nr.x);
-                                nr.h = rect.h.min(ph - nr.y);
-                                if let Some(n) = state.node_mut(*id) { n.rect = nr; }
+                                if let Some(p) = state.node(pid) {
+                                    let px = p.rect.x;
+                                    let py = p.rect.y;
+                                    let pw = p.rect.w.max(1);
+                                    let ph = p.rect.h.max(1);
+                                    let mut nr = rect;
+                                    nr.x = rect.x.clamp(px, px + pw - 1);
+                                    nr.y = rect.y.clamp(py, py + ph - 1);
+                                    nr.w = rect.w.min(px + pw - nr.x);
+                                    nr.h = rect.h.min(py + ph - nr.y);
+                                    if let Some(n) = state.node_mut(*id) { n.rect = nr; }
+                                }
                             }
                         }
                     }
@@ -337,7 +344,9 @@ mod pancurses_backend {
                                     PcWidgetKind::Window { .. } | PcWidgetKind::Dialog { .. } => {
                                         node.rect = Rect { x: 0, y: 0, w: mx, h: my };
                                     }
-                                    _ => {}
+                                    _ => {
+                                        node.rect = Rect::default();
+                                    }
                                 }
                             }
                         });
@@ -1241,6 +1250,7 @@ mod pancurses_backend {
                     root.attroff(COLOR_PAIR(3));
                 }
             }
+            PcWidgetKind::Canvas | PcWidgetKind::Overlay | PcWidgetKind::ScrolledWindow => {}
             PcWidgetKind::Spreadsheet { ref cells, ref raw_cells, ref cell_styles, ref top_row, ref left_col, ref cursor_row, ref cursor_col, ref editing, ref edit_buf, ref edit_pos, ref col_width, ref margin_cols, ref main_cols, ref menu_text, ref status_text, ref border_title, ref formula_bar_trailing, ref column_layout, ref row_labels, ref total_rows, ref total_cols, ref tab_titles, ref tab_active, header_row_count, main_row_count, .. } => {
                 // ── Direct SGR rendering ──
                 let lm = *margin_cols as usize;
@@ -2337,6 +2347,18 @@ mod pancurses_backend {
 
     pub fn create_textview() -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
         Ok(with_state(|s| s.add_node(PcWidgetKind::TextView { text: String::new() }, find_window_id(s))))
+    }
+
+    pub fn create_canvas() -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(with_state(|s| s.add_node(PcWidgetKind::Canvas, find_window_id(s))))
+    }
+
+    pub fn create_overlay() -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(with_state(|s| s.add_node(PcWidgetKind::Overlay, find_window_id(s))))
+    }
+
+    pub fn create_scrolled_window() -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(with_state(|s| s.add_node(PcWidgetKind::ScrolledWindow, find_window_id(s))))
     }
 
     pub fn create_spreadsheet(rows: u32, cols: u32) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {

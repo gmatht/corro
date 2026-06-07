@@ -578,8 +578,16 @@ mod pancurses_adapter {
     }
 
     impl Overlay {
-        pub fn set_child(&self, _child: &impl AsRef<*mut c_void>) {}
-        pub fn add_overlay(&self, _child: &impl AsRef<*mut c_void>) {}
+        pub fn set_child(&self, child: &impl AsRef<*mut c_void>) {
+            let child_ptr = *child.as_ref();
+            let child_id = child_ptr as usize;
+            crate::backends::pancurses::set_child(self.id, child_id);
+        }
+        pub fn add_overlay(&self, child: &impl AsRef<*mut c_void>) {
+            let child_ptr = *child.as_ref();
+            let child_id = child_ptr as usize;
+            crate::backends::pancurses::set_child(self.id, child_id);
+        }
         pub fn set_overlay_pass_through(&self, _child: &impl AsRef<*mut c_void>, _pass: bool) {}
         pub fn remove(&self, _child: &impl AsRef<*mut c_void>) {}
         pub fn show_all(&self) {}
@@ -605,7 +613,11 @@ mod pancurses_adapter {
     }
 
     impl ScrolledWindow {
-        pub fn set_child(&self, _child: &impl AsRef<*mut c_void>) {}
+        pub fn set_child(&self, child: &impl AsRef<*mut c_void>) {
+            let child_ptr = *child.as_ref();
+            let child_id = child_ptr as usize;
+            crate::backends::pancurses::set_child(self.id, child_id);
+        }
         pub fn set_policy(&self, _hscroll: u32, _vscroll: u32) {}
     }
 
@@ -772,21 +784,21 @@ mod pancurses_adapter {
     }
 
     pub fn create_canvas() -> Result<Canvas, Error> {
-        static NEXT_CANVAS_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
-        let id = NEXT_CANVAS_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(Canvas { id })
+        crate::backends::pancurses::create_canvas()
+            .map(|id| Canvas { id })
+            .map_err(|e| Error::Backend(format!("{}", e)))
     }
 
     pub fn create_overlay() -> Result<Overlay, Error> {
-        static NEXT_OVERLAY_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
-        let id = NEXT_OVERLAY_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(Overlay { id })
+        crate::backends::pancurses::create_overlay()
+            .map(|id| Overlay { id })
+            .map_err(|e| Error::Backend(format!("{}", e)))
     }
 
     pub fn create_scrolled_window() -> Result<ScrolledWindow, Error> {
-        static NEXT_SCROLLED_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
-        let id = NEXT_SCROLLED_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(ScrolledWindow { id })
+        crate::backends::pancurses::create_scrolled_window()
+            .map(|id| ScrolledWindow { id })
+            .map_err(|e| Error::Backend(format!("{}", e)))
     }
 
     pub fn open_file(_title: &str) -> Result<Option<String>, Error> {
