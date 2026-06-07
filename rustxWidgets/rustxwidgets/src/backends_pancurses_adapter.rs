@@ -80,7 +80,9 @@ mod pancurses_adapter {
             Ok(0)
         }
 
-        pub fn set_font_style(&self, _weight: i32, _italic: bool) {}
+        pub fn set_font_style(&self, w: i32, it: bool) {
+            crate::backends::pancurses::set_button_font_style(self.id, w, it);
+        }
         pub fn set_size_request(&self, _w: i32, _h: i32) {}
     }
 

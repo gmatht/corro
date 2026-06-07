@@ -1022,3 +1022,15 @@ pub fn set_focus(_id: usize) {}
 pub fn quit() {
     with_state(|s| s.running = false);
 }
+
+pub fn create_canvas() -> usize {
+    with_state(|s| s.add_node(ZorkKind::Label { text: "Canvas".into() }, Some(s.current_id)))
+}
+
+pub fn create_overlay() -> usize {
+    with_state(|s| s.add_node(ZorkKind::Label { text: "Overlay".into() }, Some(s.current_id)))
+}
+
+pub fn create_scrolled_window() -> usize {
+    with_state(|s| s.add_node(ZorkKind::Label { text: "ScrolledWindow".into() }, Some(s.current_id)))
+}

@@ -55,7 +55,7 @@ mod pancurses_backend {
     #[derive(Clone)]
     pub enum PcWidgetKind {
         Window { title: String },
-        Button { label: String },
+        Button { label: String, weight: i32, italic: bool },
         Label { text: String },
         BoxWidget { horizontal: bool, spacing: i32 },
         Grid { cols: usize, rows: usize },
@@ -1075,12 +1075,23 @@ mod pancurses_backend {
                     root.mvaddstr(rect.y, title_x, title);
                 }
             }
-            PcWidgetKind::Button { label } => {
+            PcWidgetKind::Button { label, weight, italic } => {
                 let focused = focus_id == Some(id);
                 if focused && has_colors() {
                     root.attron(COLOR_PAIR(2));
                 } else if has_colors() {
                     root.attron(COLOR_PAIR(1));
+                }
+                if *weight >= 600 {
+                    root.attron(A_BOLD);
+                }
+                if *italic {
+                    root.attron(A_ITALIC);
+                }
+                // HL button gets reverse video for highlight effect
+                let is_highlight = *weight >= 600 && label.len() >= 2;
+                if is_highlight {
+                    root.attron(A_REVERSE);
                 }
                 let inner_w = rect.w - 2;
                 let display = if label.len() as i32 > inner_w {
@@ -1099,6 +1110,15 @@ mod pancurses_backend {
                 root.mvaddch(rect.y, rect.x, '[');
                 root.mvaddstr(rect.y, rect.x + 1 + left_pad, &display);
                 root.mvaddch(rect.y, rect.x + 1 + left_pad + display.len() as i32 + right_pad, ']');
+                if *italic {
+                    root.attroff(A_ITALIC);
+                }
+                if *weight >= 600 {
+                    root.attroff(A_BOLD);
+                }
+                if is_highlight {
+                    root.attroff(A_REVERSE);
+                }
                 if has_colors() {
                     root.attroff(COLOR_PAIR(1) | COLOR_PAIR(2));
                 }
@@ -2302,7 +2322,7 @@ mod pancurses_backend {
     }
 
     pub fn create_button(label: &str) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(with_state(|s| s.add_node(PcWidgetKind::Button { label: label.to_string() }, find_window_id(s))))
+        Ok(with_state(|s| s.add_node(PcWidgetKind::Button { label: label.to_string(), weight: 400, italic: false }, find_window_id(s))))
     }
 
     pub fn create_label(text: &str) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
@@ -2901,7 +2921,7 @@ mod pancurses_backend {
             // Compute natural widths for each child based on content
             let natural_widths: Vec<i32> = children.iter().map(|&cid| {
                 match s.node(cid).map(|n| &n.kind) {
-                    Some(PcWidgetKind::Button { label }) => (label.len() + 2) as i32,
+                    Some(PcWidgetKind::Button { label, .. }) => (label.len() + 2) as i32,
                     Some(PcWidgetKind::Label { text }) => (text.len() + 0) as i32,
                     Some(PcWidgetKind::CheckButton { label, .. }) => (label.len() + 4) as i32,
                     Some(PcWidgetKind::RadioButton { label, .. }) => (label.len() + 4) as i32,
@@ -3030,6 +3050,17 @@ mod pancurses_backend {
 
     pub fn entry_text(id: usize) -> Option<String> {
         get_entry_text(id)
+    }
+
+    pub fn set_button_font_style(id: usize, w: i32, it: bool) {
+        with_state(|s| {
+            if let Some(n) = s.node_mut(id) {
+                if let PcWidgetKind::Button { ref mut weight, ref mut italic, .. } = n.kind {
+                    *weight = w;
+                    *italic = it;
+                }
+            }
+        });
     }
 
     pub fn set_focus(id: usize) {

@@ -410,6 +410,31 @@ impl App {
     // -- Zork paths --
 
     #[cfg(feature = "zork")]
+    pub fn create_canvas(&self) -> Result<crate::backends_zork_adapter::Canvas, Error> {
+        crate::backends_zork_adapter::create_canvas()
+    }
+
+    #[cfg(feature = "zork")]
+    pub fn create_overlay(&self) -> Result<crate::backends_zork_adapter::Overlay, Error> {
+        crate::backends_zork_adapter::create_overlay()
+    }
+
+    #[cfg(feature = "zork")]
+    pub fn create_scrolled_window(&self) -> Result<crate::backends_zork_adapter::ScrolledWindow, Error> {
+        crate::backends_zork_adapter::create_scrolled_window()
+    }
+
+    #[cfg(feature = "zork")]
+    pub fn open_file(&self, title: &str) -> Result<Option<String>, Error> {
+        crate::backends_zork_adapter::open_file(title)
+    }
+
+    #[cfg(feature = "zork")]
+    pub fn save_file(&self, title: &str) -> Result<Option<String>, Error> {
+        crate::backends_zork_adapter::save_file(title)
+    }
+
+    #[cfg(feature = "zork")]
     pub fn create_window(&self) -> Result<crate::backends_zork_adapter::Window, Error> {
         crate::backends_zork_adapter::create_window()
     }
