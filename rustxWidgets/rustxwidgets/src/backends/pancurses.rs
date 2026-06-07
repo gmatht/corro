@@ -1443,12 +1443,13 @@ mod pancurses_backend {
                             sx += 1;
                         }
                     }
-                    while sx < right_border_x {
+                    while sx < right_border_x - 1 {
                         out.push('─');
                         sx += 1;
                     }
                     out.push_str(SGR_FG_DEFAULT);
                     out.push_str("┤");
+                    out.push_str("│");
                     row_offset = hr + 2;
                 }
 
@@ -1538,7 +1539,12 @@ mod pancurses_backend {
                             col_positions.push((col_idx, rx2));
                             rx2 += w as i32;
                             if idx + 1 < n {
-                                rx2 += 1;
+                                let is_boundary = lm > 0 && ((col_idx as usize) == lm - 1 || (col_idx as usize) == lm + mc - 1);
+                                if is_boundary {
+                                    rx2 += 2;
+                                } else {
+                                    rx2 += 1;
+                                }
                             }
                         }
                         // Determine last rendered x position for row-fill detection
@@ -1576,6 +1582,7 @@ mod pancurses_backend {
                                             out.push_str(sgr_sep());
                                             out.push('│');
                                             out.push_str(SGR_FG_DEFAULT);
+                                            out.push(' ');
                                         } else {
                                             out.push(' ');
                                         }
@@ -1603,6 +1610,7 @@ mod pancurses_backend {
                                             out.push_str(sgr_sep());
                                             out.push('│');
                                             out.push_str(SGR_FG_DEFAULT);
+                                            out.push(' ');
                                         } else {
                                             out.push(' ');
                                         }
@@ -1638,18 +1646,17 @@ mod pancurses_backend {
                                             out.push_str(sgr_sep());
                                             out.push('│');
                                             out.push_str(SGR_FG_DEFAULT);
+                                            out.push(' ');
                                         } else {
                                             out.push(' ');
                                         }
                                     }
                                 } else if (col_idx as usize) >= lm + mc {
-                                    // Right-margin column: dark gray border or default.
-                                    // Match ratatui: only the first right-margin column
-                                    // (lm+mc) gets a dark gray border; all other
-                                    // right-margin columns get default styling.
+                                    // Right-margin column: dark gray.
+                                    // Match ratatui: all reference columns use dark
+                                    // gray so they appear as inactive grid area.
                                     let cw = column_layout[vi].1 as i32;
-                                    let is_right_border = (col_idx as usize) == lm + mc;
-                                    let use_gray = is_boundary || is_right_border;
+                                    let use_gray = true;
                                     out.push_str(&sgr_cup(ry, sx));
                                     if is_boundary {
                                         out.push_str(SGR_UNDERLINE);
@@ -1680,6 +1687,7 @@ mod pancurses_backend {
                                         out.push_str(sgr_sep());
                                         out.push('│');
                                         out.push_str(SGR_FG_DEFAULT);
+                                        out.push(' ');
                                     } else {
                                         out.push(' ');
                                     }
@@ -1709,6 +1717,7 @@ mod pancurses_backend {
                                             out.push_str(sgr_sep());
                                             out.push('│');
                                             out.push_str(SGR_FG_DEFAULT);
+                                            out.push(' ');
                                         } else {
                                             out.push(' ');
                                         }
@@ -1863,6 +1872,7 @@ mod pancurses_backend {
                                     out.push_str(sgr_sep());
                                     out.push('│');
                                     out.push_str(SGR_FG_DEFAULT);
+                                    out.push(' ');
                                 } else {
                                     out.push(' ');
                                 }
