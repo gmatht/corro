@@ -83,6 +83,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let total_h = ch + ROWS as f64 * ch;
 
     let app = App::init()?;
+
+    #[cfg(feature = "gtk")]
+    if let Some(loader) = rustxwidgets::backends::gtk::loader() {
+        println!("GTK version: {:?}", loader.version());
+    }
+
     let win = app.create_window()?;
     win.set_title("App Demo \u{2014} Spreadsheet with Menus and Dialogs");
     win.set_default_size(1600, 1000);
@@ -187,6 +193,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ] {
         b.set_size_request(28, 24);
     }
+    bold_btn.set_font_style(700, false);
+    italic_btn.set_font_style(400, true);
+    hl_btn.add_class("hl-btn");
     toolbar.append(&open_btn);
     toolbar.append(&save_btn);
     toolbar.append(&quit_btn);
@@ -241,6 +250,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .cell-fg-red { color: #cc0000; }
         .cell-fg-blue { color: #0000cc; }
         .cell-fg-green { color: #006600; }
+        .hl-btn { background: #ffff00; }
         "#;
         if let Some(provider) =
             gtk_dynamic_loader::create_css_provider(&gtk_loader, css)

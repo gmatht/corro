@@ -40,6 +40,9 @@ mod gtk_adapter {
             self.0.insert_action_group(name, group_ptr);
         }
 
+        pub fn hwnd(&self) -> *mut c_void {
+            *self.0.as_ref()
+        }
     }
 
     #[repr(transparent)]
@@ -60,7 +63,9 @@ mod gtk_adapter {
         pub fn set_visible(&self, visible: bool) { self.0.set_visible(visible); }
         pub fn set_hexpand(&self, expand: bool) { self.0.set_hexpand(expand); }
         pub fn set_vexpand(&self, expand: bool) { self.0.set_vexpand(expand); }
-        pub fn set_font_style(&self, _weight: i32, _italic: bool) {}
+        pub fn set_font_style(&self, weight: i32, italic: bool) { self.0.set_font_style(weight, italic); }
+        pub fn add_class(&self, class_name: &str) { self.0.add_class(class_name); }
+        pub fn remove_class(&self, class_name: &str) { self.0.remove_class(class_name); }
     }
 
     impl Clone for Button { fn clone(&self) -> Self { Button(self.0.clone()) } }
@@ -631,6 +636,7 @@ mod gtk_adapter {
         pub fn show_all(&self) {
             self.0.show_all();
         }
+        pub fn set_size_request(&self, w: i32, h: i32) { self.0.set_size_request(w, h); }
         pub fn set_hexpand(&self, expand: bool) { self.0.set_hexpand(expand); }
         pub fn set_vexpand(&self, expand: bool) { self.0.set_vexpand(expand); }
     }

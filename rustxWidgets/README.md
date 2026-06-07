@@ -15,7 +15,7 @@ Currently a prototype. Code AND API may change on whim.
 | **Windows**   | Windows (native)       | _(default)_     | ![Win](img/out/Win.png) |
 | **Pancurses** | Linux/macOS (terminal) | `pancurses`     | ![Pancurses](img/out/Pancurses.png) |
 | **WASM**      | Browser (web-sys)      | _(wasm32 arch)_ | ![WASM](img/out/WASM.png) |
-| **Zork**      | Any (readline-style)   | `zork`          | — |
+| **Zork**      | Any (readline-style)   | `zork`          | ![Zork](img/out/Zork.png) |
 
 ## Backend auto-selection priority
 

@@ -301,6 +301,42 @@ impl Button {
             unsafe { set(self.inner, if expand { 1 } else { 0 }); }
         }
     }
+
+    pub fn set_font_style(&self, weight: i32, italic: bool) {
+        guard_widget!(self, "Button", "set_font_style");
+        let weight_str = if weight >= 600 { "bold" } else { "normal" };
+        let style_str = if italic { "italic" } else { "normal" };
+        let css = format!("button {{ font-weight: {}; font-style: {}; }}", weight_str, style_str);
+        if let Some(provider) = crate::wrappers::create_css_provider(&self.loader, &css) {
+            crate::wrappers::add_provider_to_widget(&self.loader, self.inner, provider, 800);
+        }
+    }
+
+    pub fn add_class(&self, class_name: &str) {
+        guard_widget!(self, "Button", "add_class");
+        if let Some(get_ctx) = self.loader.symbols.gtk_widget_get_style_context {
+            if let Some(add_class) = self.loader.symbols.gtk_style_context_add_class {
+                let c = CString::new(class_name).unwrap();
+                unsafe {
+                    let ctx = get_ctx(self.inner);
+                    if !ctx.is_null() { add_class(ctx, c.as_ptr()); }
+                }
+            }
+        }
+    }
+
+    pub fn remove_class(&self, class_name: &str) {
+        guard_widget!(self, "Button", "remove_class");
+        if let Some(get_ctx) = self.loader.symbols.gtk_widget_get_style_context {
+            if let Some(remove_class) = self.loader.symbols.gtk_style_context_remove_class {
+                let c = CString::new(class_name).unwrap();
+                unsafe {
+                    let ctx = get_ctx(self.inner);
+                    if !ctx.is_null() { remove_class(ctx, c.as_ptr()); }
+                }
+            }
+        }
+    }
 }
 
 impl AsRef<*mut c_void> for Button { fn as_ref(&self) -> &*mut c_void { &self.inner } }
@@ -2182,6 +2218,15 @@ impl Dialog {
         }
     }
 
+    pub fn close(&self) {
+        guard_widget!(self, "Dialog", "close");
+        if let Some(window_close) = self.loader.symbols.gtk_window_close {
+            unsafe { window_close(self.inner); }
+        } else if let Some(widget_destroy) = self.loader.symbols.gtk_widget_destroy {
+            unsafe { widget_destroy(self.inner); }
+        }
+    }
+
     pub fn response(&self, _response_id: i32) {
         guard_widget!(self, "Dialog", "response");
         if let Some(emit) = self.loader.symbols.g_signal_emit_by_name {
@@ -2190,6 +2235,15 @@ impl Dialog {
             // instance and name. For simplicity, just emit the signal without the param.
             unsafe { emit(self.inner, name.as_ptr()); }
         }
+    }
+}
+
+impl Clone for Dialog {
+    fn clone(&self) -> Self {
+        if let Some(gref) = self.loader.symbols.g_object_ref {
+            unsafe { gref(self.inner); }
+        }
+        Dialog { inner: self.inner, loader: self.loader.clone(), _not_send: PhantomData }
     }
 }
 
