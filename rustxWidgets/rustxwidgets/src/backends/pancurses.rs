@@ -1808,6 +1808,12 @@ mod pancurses_backend {
                                 let mut scan = vi + 1;
                                 while scan < n {
                                     let (sc_idx, _) = col_positions[scan];
+                                    // Stop at section boundaries so │ separators are preserved
+                                    let boundary_lm = lm as usize;
+                                    let boundary_rm = (lm + mc) as usize;
+                                    if lm > 0 && ((sc_idx as usize) == boundary_lm || (sc_idx as usize) == boundary_rm) {
+                                        break;
+                                    }
                                     let sc_text = cells_ref.get(&(row_idx, sc_idx))
                                         .map(|s| s.as_str()).unwrap_or("");
                                     if sc_text.is_empty() {
@@ -3318,6 +3324,10 @@ mod pancurses_backend {
                             let mut scan = vi + 1;
                             while scan < n {
                                 let (sc_idx, _, _) = column_layout[scan];
+                                // Stop at section boundaries so │ separators are preserved
+                                if lm > 0 && ((sc_idx as usize) == lm as usize || (sc_idx as usize) == lm as usize + mc) {
+                                    break;
+                                }
                                 let sc_text = cells_ref.get(&(row_idx, sc_idx)).map(|s| s.as_str()).unwrap_or("");
                                 if sc_text.is_empty() {
                                     overflow_cols += 1;
