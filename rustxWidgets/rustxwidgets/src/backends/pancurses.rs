@@ -1526,13 +1526,12 @@ mod pancurses_backend {
                     // - boundary (last main) row: underline + fg
                     let is_footer = label_str.starts_with('_');
                     let is_header = label_str.starts_with('~');
-                    // Check next row label to detect boundary (last main row before footers)
-                    let next_label = row_labels.iter()
-                        .find(|(r, _)| *r == row_idx + 1)
-                        .map(|(_, l)| l.as_str())
-                        .unwrap_or("");
-                    let is_boundary = (is_header && !next_label.starts_with('~'))
-                        || (!is_footer && !is_header && next_label.starts_with('_'));
+                    // Boundary rows: last header row and last main row before footers.
+                    // Uses header_row_count/main_row_count directly (matching ratatui's
+                    // last_display_main_row logic) instead of next-label heuristics
+                    // that can fail when row_labels have gaps.
+                    let is_boundary = (*header_row_count > 0 && row_idx == *header_row_count - 1)
+                        || (row_idx == header_row_count + main_row_count - 1);
                     let row_label_style = if is_cursor_row {
                         if is_boundary { sgr_row_cursor() } else { sgr_header_active() }
                     } else if is_footer {
@@ -1749,7 +1748,13 @@ mod pancurses_backend {
                                     for _ in 0..cw {
                                         out.push(' ');
                                     }
-                                    if is_boundary || prev_overflowed {
+                                    if is_boundary {
+                                        if vi + 1 >= n {
+                                            out.push_str(SGR_RESET);
+                                        } else {
+                                            out.push_str(SGR_FG_DEFAULT);
+                                        }
+                                    } else if prev_overflowed {
                                         out.push_str(SGR_FG_DEFAULT);
                                     }
                                     let gap_after = if vi + 1 < n { 1 } else { 0 };
