@@ -4222,6 +4222,189 @@ mod pancurses_backend {
             assert!(buf[1].contains("Y"), "header missing Y in {:?}", &buf[1]);
         }
 
+        /// Reproduce blank spreadsheet: test with margin columns, header rows,
+        /// and cell data stored via `set_cell` (like `fill_cells` does).
+        #[test]
+        fn pnc_fill_cells_simulation() {
+            let wid = with_state(|s| s.add_node(
+                PcWidgetKind::Window { title: "corro".into() }, None,
+            ));
+            let total_rows = 24u32;
+            let total_cols = 5u32;
+            let sid = with_state(|s| s.add_node(
+                PcWidgetKind::Spreadsheet {
+                    cells: Rc::new(RefCell::new(HashMap::new())),
+                    raw_cells: Rc::new(RefCell::new(HashMap::new())),
+                    cell_styles: Rc::new(RefCell::new(HashMap::new())),
+                    total_rows, total_cols,
+                    top_row: 0, left_col: 0,
+                    cursor_row: 0, cursor_col: 0,
+                    editing: false, edit_buf: String::new(), edit_pos: 0,
+                    col_width: 12, margin_cols: 0, main_cols: total_cols,
+                    formula_bar_address_id: None, formula_bar_entry_id: None,
+                    anchor: None,
+                    menu_text: " [File]   Edit    Insert    Format    Sheet    Help".into(),
+                    status_text: "status bar".into(),
+                    border_title: "corro  24r × 3c  ops 0".into(),
+                    formula_bar_trailing: String::new(),
+                    column_layout: Vec::new(),
+                    row_labels: Vec::new(),
+                    tab_titles: Vec::new(),
+                    tab_active: 0,
+                    header_row_count: 2,
+                    main_row_count: 24,
+                },
+                Some(wid),
+            ));
+
+            // Simulate what pnc_backend.rs does: margin_cols=2, main_cols=3, total 5 columns
+            let lm = 2u32;
+            let mc = 3u32;
+            let col_ixs: Vec<usize> = (0..5).collect();
+            let layout: Vec<(u32, u32, String)> = col_ixs.iter().map(|&c| {
+                (c as u32, 10u32, format!("C{}", c))
+            }).collect();
+            let row_labels: Vec<(u32, String)> = (0..total_rows)
+                .map(|i| (i, format!("{:>4}", i + 1)))
+                .collect();
+            with_state(|state| {
+                let n = state.node_mut(sid).unwrap();
+                match &mut n.kind {
+                    PcWidgetKind::Spreadsheet { ref mut column_layout, .. } => {
+                        *column_layout = layout;
+                    }
+                    _ => unreachable!(),
+                }
+            });
+            spreadsheet_set_row_labels(sid, row_labels);
+            spreadsheet_set_grid_config(sid, lm, mc);
+            spreadsheet_set_cursor(sid, 0, 0);
+
+            // Store cell data at (display_row_idx, global_col_idx) like fill_cells
+            // Set both margin (col 0,1) and main (col 2,3,4) cells
+            spreadsheet_set_cell(sid, 0, 2, "hello"); // main col
+            spreadsheet_set_cell(sid, 0, 3, "world"); // main col
+            spreadsheet_set_cell(sid, 1, 2, "foo");
+            spreadsheet_set_cell(sid, 1, 3, "bar");
+
+            let buf = render_spreadsheet_to_buffer(sid, 120, 40);
+
+            // Data rows start at index 4
+            // Row 1 should contain "hello" in the first main column
+            assert!(buf[4].contains("hello"),
+                "row 1 missing 'hello'. line={:?}", &buf[4]);
+            assert!(buf[4].contains("world"),
+                "row 1 missing 'world'. line={:?}", &buf[4]);
+
+            assert!(buf[5].contains("foo"),
+                "row 2 missing 'foo'. line={:?}", &buf[5]);
+            assert!(buf[5].contains("bar"),
+                "row 2 missing 'bar'. line={:?}", &buf[5]);
+
+            assert!(buf[4].starts_with("│   1"),
+                "row 1 should start with │   1. got={:?}", &buf[4]);
+        }
+
+        /// Diagnose blank rows: check row_idx computation and label lookup
+        /// for the exact same flow as render_widget during app startup.
+        #[test]
+        fn diagnose_row_label_lookup() {
+            let wid = with_state(|s| s.add_node(
+                PcWidgetKind::Window { title: "corro".into() }, None,
+            ));
+            let total_rows = 10u32;
+            let total_cols = 3u32;
+            let sid = with_state(|s| s.add_node(
+                PcWidgetKind::Spreadsheet {
+                    cells: Rc::new(RefCell::new(HashMap::new())),
+                    raw_cells: Rc::new(RefCell::new(HashMap::new())),
+                    cell_styles: Rc::new(RefCell::new(HashMap::new())),
+                    total_rows, total_cols,
+                    top_row: 0, left_col: 0,
+                    cursor_row: 0, cursor_col: 2,
+                    editing: false, edit_buf: String::new(), edit_pos: 0,
+                    col_width: 12, margin_cols: 0, main_cols: total_cols,
+                    formula_bar_address_id: None, formula_bar_entry_id: None,
+                    anchor: None,
+                    menu_text: "Menu".into(),
+                    status_text: "Status".into(),
+                    border_title: "Test".into(),
+                    formula_bar_trailing: String::new(),
+                    column_layout: vec![(0,10,"A".into()),(1,10,"B".into()),(2,10,"C".into())],
+                    row_labels: (0..total_rows).map(|i| (i, format!("{:>4}", i + 1))).collect(),
+                    tab_titles: Vec::new(),
+                    tab_active: 0,
+                    header_row_count: 2,
+                    main_row_count: 24,
+                },
+                Some(wid),
+            ));
+            spreadsheet_set_cursor(sid, 0, 2);
+
+            // Replicate fill_cells: store cell text at (display_row_idx, global_col_idx)
+            spreadsheet_set_cell(sid, 0, 2, "A1_data");
+            spreadsheet_set_cell(sid, 1, 2, "A2_data");
+
+            let buf = render_spreadsheet_to_buffer(sid, 80, 20);
+            for (i, line) in buf.iter().enumerate() {
+                eprintln!("buf[{}]: {:?}", i, line);
+            }
+            // Data rows start at index 4 (menu=0 formula=1 header=2 sep=3)
+            assert!(buf[4].contains("A1_data"),
+                "buf[4] missing cell data: {:?}", &buf[4]);
+            assert!(buf[4].contains("   1"),
+                "buf[4] missing row label: {:?}", &buf[4]);
+            assert!(buf[5].contains("A2_data"),
+                "buf[5] missing cell data: {:?}", &buf[5]);
+        }
+
+        /// Test rendering with empty cell data that fill_cells would produce
+        /// for an empty grid (no content at any address).
+        #[test]
+        fn pnc_fill_cells_empty_grid_renders_structure() {
+            let wid = with_state(|s| s.add_node(
+                PcWidgetKind::Window { title: "corro".into() }, None,
+            ));
+            let total_rows = 10u32;
+            let total_cols = 5u32;
+            let sid = with_state(|s| s.add_node(
+                PcWidgetKind::Spreadsheet {
+                    cells: Rc::new(RefCell::new(HashMap::new())),
+                    raw_cells: Rc::new(RefCell::new(HashMap::new())),
+                    cell_styles: Rc::new(RefCell::new(HashMap::new())),
+                    total_rows, total_cols,
+                    top_row: 0, left_col: 0,
+                    cursor_row: 0, cursor_col: 0,
+                    editing: false, edit_buf: String::new(), edit_pos: 0,
+                    col_width: 12, margin_cols: 2, main_cols: 3,
+                    formula_bar_address_id: None, formula_bar_entry_id: None,
+                    anchor: None,
+                    menu_text: " [File]   Edit".into(),
+                    status_text: "status".into(),
+                    border_title: "test".into(),
+                    formula_bar_trailing: String::new(),
+                    column_layout: vec![(0,6,"L0".into()),(1,6,"L1".into()),(2,10,"A".into()),(3,10,"B".into()),(4,10,"C".into())],
+                    row_labels: (0..total_rows).map(|i| (i, format!("{:>4}", i + 1))).collect(),
+                    tab_titles: Vec::new(),
+                    tab_active: 0,
+                    header_row_count: 2,
+                    main_row_count: 24,
+                },
+                Some(wid),
+            ));
+            spreadsheet_set_cursor(sid, 0, 2);
+
+            // Do NOT set any cell data — test what an empty grid renders like
+            let buf = render_spreadsheet_to_buffer(sid, 120, 40);
+
+            // Structure should still be present: menu, formula bar, headers, data rows
+            assert!(buf[0].contains("File"), "menu missing: {:?}", &buf[0]);
+            assert!(buf[2].contains("A"), "header missing A: {:?}", &buf[2]);
+
+            // Data rows should have proper structure even if empty
+            assert!(buf[4].starts_with("│"), "data row missing │: {:?}", &buf[4]);
+        }
+
         /// Rendering: pre-computed row labels appear in data rows.
         #[test]
         fn render_row_labels_from_layout() {

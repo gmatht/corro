@@ -774,7 +774,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ck = commit_edit.clone();
     let stk = start_edit.clone();
     let rk = refresh_selection.clone();
-    canvas.on_key(Box::new(move |keyval: u32, _state: u32| -> bool {
+    canvas.on_key(Box::new(move |keyval: u32| -> bool {
         if *tak.borrow() {
             return false;
         }
@@ -1176,7 +1176,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    connect_action!(sa_quit, { || std::process::exit(0) });
+    connect_action!(sa_quit, || std::process::exit(0));
 
     let tc2 = texts.clone();
     let sc2 = sel.clone();

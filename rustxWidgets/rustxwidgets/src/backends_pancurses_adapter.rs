@@ -84,6 +84,8 @@ mod pancurses_adapter {
             crate::backends::pancurses::set_button_font_style(self.id, w, it);
         }
         pub fn set_size_request(&self, _w: i32, _h: i32) {}
+        pub fn add_class(&self, _class_name: &str) {}
+        pub fn remove_class(&self, _class_name: &str) {}
     }
 
     // -- Label --
@@ -621,6 +623,8 @@ mod pancurses_adapter {
             crate::backends::pancurses::set_child(self.id, child_id);
         }
         pub fn set_policy(&self, _hscroll: u32, _vscroll: u32) {}
+        pub fn set_vexpand(&self, _expand: bool) {}
+        pub fn set_hexpand(&self, _expand: bool) {}
     }
 
     // ── Cell style constants (match cell_style_to_attrs in pancurses.rs) ──
