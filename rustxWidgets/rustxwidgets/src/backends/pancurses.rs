@@ -1498,6 +1498,26 @@ mod pancurses_backend {
                     + if has_tabs { 1 } else if has_status { 1 } else { 0 };
                 let grid_bottom = rect.y + rect.h - extra_lines;
                 let max_data_rows = ((grid_bottom - row_offset) as i32).max(1) as u32;
+                // Determine boundary row indices from row labels instead of
+                // using header_row_count/main_row_count (which are logical counts
+                // like HEADER_ROWS=999_999_999, not display indices).
+                let boundary_row_indices: Vec<u32> = {
+                    let mut last_header: Option<u32> = None;
+                    let mut last_main: Option<u32> = None;
+                    for &(idx, ref label) in row_labels.iter() {
+                        if label.starts_with('~') {
+                            last_header = Some(idx);
+                        } else if label.starts_with('_') {
+                            // Footer rows don't affect main boundary
+                        } else if !label.trim().is_empty() {
+                            last_main = Some(idx);
+                        }
+                    }
+                    let mut result = Vec::new();
+                    if let Some(idx) = last_header { result.push(idx); }
+                    if let Some(idx) = last_main { result.push(idx); }
+                    result
+                };
                 for vr in 0..max_data_rows {
                     let row_idx = *top_row + vr as u32;
                     let ry = row_offset + vr as i32;
@@ -1530,8 +1550,7 @@ mod pancurses_backend {
                     // Uses header_row_count/main_row_count directly (matching ratatui's
                     // last_display_main_row logic) instead of next-label heuristics
                     // that can fail when row_labels have gaps.
-                    let is_boundary = (*header_row_count > 0 && row_idx == *header_row_count - 1)
-                        || (row_idx == header_row_count + main_row_count - 1);
+                    let is_boundary = boundary_row_indices.contains(&row_idx);
                     let row_label_style = if is_cursor_row {
                         if is_boundary { sgr_row_cursor() } else { sgr_header_active() }
                     } else if is_footer {
@@ -1612,6 +1631,9 @@ mod pancurses_backend {
                                 if is_cursor_cell {
                                     let cw = column_layout[vi].1 as i32;
                                     out.push_str(&sgr_cup(ry, sx));
+                                    if is_boundary {
+                                        out.push_str(SGR_UNDERLINE);
+                                    }
                                     out.push_str(sgr_cell_cursor());
                                     for _ in 0..cw {
                                         out.push(' ');
@@ -1739,7 +1761,10 @@ mod pancurses_backend {
                                 // Empty cell in main column: check style
                                     let cw = column_layout[vi].1 as i32;
                                     out.push_str(&sgr_cup(ry, sx));
-                                    if prev_overflowed || is_boundary {
+                                    if is_boundary {
+                                        out.push_str(SGR_UNDERLINE);
+                                        out.push_str(sgr_sep());
+                                    } else if prev_overflowed {
                                         out.push_str(sgr_sep());
                                     } else {
                                         out.push_str(SGR_FG_DEFAULT);
@@ -1855,7 +1880,15 @@ mod pancurses_backend {
                             // When the cell overflows, skip the boundary SGR reset
                             // too so the overflow text stays in default style.
                             let is_overflowing = can_overflow;
+                            let underline_prefix = if is_boundary && !can_overflow {
+                                SGR_UNDERLINE
+                            } else {
+                                ""
+                            };
                             out.push_str(&sgr_cup(ry, sx));
+                            if !underline_prefix.is_empty() {
+                                out.push_str(underline_prefix);
+                            }
                             if !cell_sgr.is_empty() {
                                 out.push_str(cell_sgr);
                             }
@@ -1889,7 +1922,7 @@ mod pancurses_backend {
                             let overflow_consumes_all = can_overflow && gap_target + 1 >= n;
                             if (is_last || overflow_consumes_all) && (is_cursor_cell || is_boundary) {
                                 defer_sgr_reset = true;
-                                last_sgr = if is_cursor_cell {
+                                last_sgr = if is_cursor_cell && !is_boundary {
                                     SGR_BG_DEFAULT.to_string()
                                 } else {
                                     SGR_RESET.to_string()
@@ -1980,6 +2013,7 @@ mod pancurses_backend {
                                 } else {
                                     out.push_str(&sgr_cup(ry, col_screen_x));
                                     if is_boundary {
+                                        out.push_str(SGR_UNDERLINE);
                                         out.push_str(sgr_sep());
                                     } else {
                                         out.push_str(SGR_FG_DEFAULT);
@@ -2016,6 +2050,9 @@ mod pancurses_backend {
                                 }
                             } else { text.to_string() };
                             out.push_str(&sgr_cup(ry, col_screen_x));
+                            if is_boundary {
+                                out.push_str(SGR_UNDERLINE);
+                            }
                             if is_cursor_cell {
                                 out.push_str(sgr_cell_cursor());
                             } else if cell_style == 2 {
