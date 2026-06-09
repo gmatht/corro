@@ -1657,7 +1657,7 @@ mod pancurses_backend {
                                             out.push(' ');
                                         }
                                     }
-                                } else if is_agg_empty {
+                                } else if is_agg_empty && !prev_overflowed {
                                     // Empty aggregate cell: cyan foreground
                                     let cw = column_layout[vi].1 as i32;
                                     out.push_str(&sgr_cup(ry, sx));
@@ -1821,14 +1821,28 @@ mod pancurses_backend {
                                 let mut scan = vi + 1;
                                 while scan < n {
                                     let (sc_idx, _) = col_positions[scan];
-                                    // Stop at section boundaries so │ separators are preserved
-                                    let boundary_lm = lm as usize;
-                                    let boundary_rm = (lm + mc) as usize;
-
-                                    // Continue scanning into right-margin area,
-                                    // allowing section-header text like "--- Belmont ---"
-                                    // to fill the full viewport width. The empty-cell
-                                    // check below stops at the first non-empty column.
+                                    // Stop at the right-margin boundary when the
+                                    // text fits within the left-margin + main
+                                    // columns, so structural separators (pipes)
+                                    // are preserved.  When the text is longer,
+                                    // let it overflow into right-margin so it
+                                    // can fill the full viewport width.
+                                    if lm > 0 && (sc_idx as usize) >= lm + mc {
+                                        // Compute total width up to this column,
+                                        // including appropriate gaps.
+                                        let mut avail_up_to = column_layout[vi..scan]
+                                            .iter().map(|&(_, w, _)| w as usize).sum::<usize>();
+                                        let idx_span = scan - vi;
+                                        avail_up_to += idx_span; // AsciiSpace gaps
+                                        // Add +1 for PipeAndSpace at lm→main boundary
+                                        let vi_col = column_layout[vi].0 as usize;
+                                        if vi_col == lm - 1 {
+                                            avail_up_to += 1;
+                                        }
+                                        if text_width <= avail_up_to {
+                                            break;
+                                        }
+                                    }
                                     let sc_text = cells_ref.get(&(row_idx, sc_idx))
                                         .map(|s| s.as_str()).unwrap_or("");
                                     if sc_text.is_empty() {
@@ -1859,6 +1873,13 @@ mod pancurses_backend {
                                 let vi_col = column_layout[vi].0 as usize;
                                 let last_ov = column_layout[(vi + overflow_cols).min(n.saturating_sub(1))].0 as usize;
                                 if vi_col < lm + mc && last_ov >= lm + mc {
+                                    total_avail = total_avail.saturating_add(1);
+                                }
+                                // When the source column is the last left-margin
+                                // column, the PipeAndSpace (2) at the
+                                // left-margin→main boundary is counted as only 1
+                                // in overflow_cols; add the extra 1.
+                                if vi_col == lm - 1 {
                                     total_avail = total_avail.saturating_add(1);
                                 }
                             }
@@ -1948,10 +1969,19 @@ mod pancurses_backend {
                             // avail_w = width within the cell's column(s), excluding
                             // the trailing gap to the next column (gap_after is written
                             // separately so it uses default style, matching ratatui).
+                            // Include PipeAndSpace boundary corrections (same as
+                            // total_avail above) so padding is correct.
                             let avail_w = if overflow_cols > 0 {
-                                column_layout[vi..=vi+overflow_cols].iter()
+                                let mut a = column_layout[vi..=vi+overflow_cols].iter()
                                     .map(|&(_, w, _)| w as usize).sum::<usize>()
-                                    + overflow_cols
+                                    + overflow_cols;
+                                if lm > 0 && overflow_cols > 0 {
+                                    let vi_col = column_layout[vi].0 as usize;
+                                    if vi_col == lm - 1 {
+                                        a = a.saturating_add(1);
+                                    }
+                                }
+                                a
                             } else {
                                 w
                             };
@@ -1961,8 +1991,10 @@ mod pancurses_backend {
                                 out.push_str(&" ".repeat(pad));
                             }
                             // If the display text overflows past the column
-                            // width into the gap area, suppress the gap.
-                            let real_gap = if display_w > avail_w { 0 } else { gap_after };
+                            // width into the gap area, only suppress the
+                            // part already consumed, not the whole gap.
+                            let overflow_into_gap = display_w.saturating_sub(avail_w);
+                            let real_gap = gap_after.saturating_sub(overflow_into_gap);
                             let sgr_applied = !cell_sgr.is_empty();
                             // Defer SGR reset for last cell in row when it
                             // has cursor or boundary styling, so the fill
@@ -2016,13 +2048,18 @@ mod pancurses_backend {
                                 } else {
                                     lm > 0 && ((col_idx as usize) == lm - 1 || (col_idx as usize) == lm + mc - 1)
                                 };
-                                if is_sep_col {
+                                // When overflow text partially fills the gap and
+                                // consumed the pipe position, only draw spaces
+                                // (no pipe) for the remaining gap characters.
+                                if is_sep_col && overflow_into_gap == 0 {
                                     out.push_str(sgr_sep());
                                     out.push('│');
                                     out.push_str(SGR_FG_DEFAULT);
                                     out.push(' ');
                                 } else {
-                                    out.push(' ');
+                                    for _ in 0..real_gap {
+                                        out.push(' ');
+                                    }
                                 }
                             }
                             let overflowed_this = can_overflow;
@@ -2059,6 +2096,8 @@ mod pancurses_backend {
                                 .sum::<i32>();
                             if after_content < right_border_x {
                                 let gap = (right_border_x - after_content) as usize;
+                                out.push_str(SGR_FG_DEFAULT);
+                                out.push_str(SGR_BG_DEFAULT);
                                 out.push_str(&" ".repeat(gap));
                             }
                         }
