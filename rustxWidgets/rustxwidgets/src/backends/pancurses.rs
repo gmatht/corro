@@ -716,9 +716,8 @@ mod pancurses_backend {
                                     spreadsheet_prepare_move(state, fid, false);
                                     spreadsheet_commit_edit(state, fid);
                                     if let Some(n) = state.node_mut(fid) {
-                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_row, ref mut cursor_col, margin_cols, main_cols, .. } = n.kind {
-                                            let max_global = margin_cols + main_cols + margin_cols;
-                                            if *cursor_col + 1 < max_global { *cursor_col += 1; }
+                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_row, ref mut cursor_col, .. } = n.kind {
+                                            *cursor_col += 1;
                                             return Some((*cursor_row, *cursor_col));
                                         }
                                     }
