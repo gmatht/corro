@@ -1814,8 +1814,21 @@ mod pancurses_backend {
                                     // Stop at section boundaries so │ separators are preserved
                                     let boundary_lm = lm as usize;
                                     let boundary_rm = (lm + mc) as usize;
-                                    if lm > 0 && ((sc_idx as usize) == boundary_lm || (sc_idx as usize) == boundary_rm) {
+                                    // Always stop at left-margin boundary.
+                                    if lm > 0 && (sc_idx as usize) == boundary_lm {
                                         break;
+                                    }
+                                    // At right-margin boundary: stop if text fits
+                                    // within the main columns + PipeAndSpace,
+                                    // otherwise continue into right-margin cols.
+                                    if lm > 0 && (sc_idx as usize) == boundary_rm {
+                                        let boundary_total = column_layout[vi..scan].iter()
+                                            .map(|&(_, w, _)| w as usize).sum::<usize>()
+                                            + (scan.saturating_sub(vi + 1))
+                                            + 2; // PipeAndSpace
+                                        if text_width <= boundary_total {
+                                            break;
+                                        }
                                     }
                                     let sc_text = cells_ref.get(&(row_idx, sc_idx))
                                         .map(|s| s.as_str()).unwrap_or("");
@@ -1840,6 +1853,16 @@ mod pancurses_backend {
                                 .map(|&(_, w, _)| w as usize).sum::<usize>()
                                 + overflow_cols
                                 + gap_after;
+                            // When overflow spans past the main→right-margin
+                            // boundary, the PipeAndSpace (2) at the boundary is
+                            // counted as only 1 in overflow_cols; add the extra 1.
+                            if lm > 0 && overflow_cols > 0 {
+                                let vi_col = column_layout[vi].0 as usize;
+                                let last_ov = column_layout[(vi + overflow_cols).min(n.saturating_sub(1))].0 as usize;
+                                if vi_col < lm + mc && last_ov >= lm + mc {
+                                    total_avail = total_avail.saturating_add(1);
+                                }
+                            }
                             // Include remaining viewport space (right gap) so
                             // cell style/background fills to the right border,
                             // matching ratatui.
