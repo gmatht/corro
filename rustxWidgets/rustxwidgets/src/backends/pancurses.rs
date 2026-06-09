@@ -1319,7 +1319,7 @@ mod pancurses_backend {
                     let addr_text = format!("{}{}", col_part, row_label.trim());
                     let cell_val = raw_cells.borrow().get(&(*cursor_row, *cursor_col)).cloned().unwrap_or_default();
                     let addr_vis = addr_text.chars().count();
-                    let max_fb = (rect.w as usize).saturating_sub(addr_vis + 3).max(1);
+                    let max_fb = (rect.w as usize).saturating_sub(addr_vis + 3 + formula_bar_trailing.chars().count()).max(1);
                     let fb_text = if cell_val.chars().count() > max_fb {
                         let trunc_end = cell_val.char_indices().nth(max_fb.saturating_sub(3)).map(|(i, _)| i).unwrap_or(cell_val.len());
                         format!(" {}  {}…{}", addr_text, &cell_val[..trunc_end], formula_bar_trailing)
