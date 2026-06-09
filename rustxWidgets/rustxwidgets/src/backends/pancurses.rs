@@ -1720,8 +1720,11 @@ mod pancurses_backend {
                                     // renders the first right-margin column with gray
                                     // foreground for normal rows; boundary rows get
                                     // gray for all columns.
+                                    // When a preceding cell overflowed into this
+                                    // area, use default style (matching ratatui's
+                                    // paragraph auto-fill behavior).
                                     let cw = column_layout[vi].1 as i32;
-                                    let use_gray = is_boundary || (col_idx as usize) == lm + mc;
+                                    let use_gray = is_boundary || ((col_idx as usize) == lm + mc && !prev_overflowed);
                                     out.push_str(&sgr_cup(ry, sx));
                                     if is_boundary {
                                         out.push_str(SGR_UNDERLINE);
@@ -1823,7 +1826,16 @@ mod pancurses_backend {
                                 }
                             }
                             let gap_target = vi + overflow_cols;
-                            let gap_after = if gap_target + 1 < n { 1 } else { 0 };
+                            let gap_after = if gap_target + 1 < n {
+                                let last_ov_col = column_layout[gap_target].0 as usize;
+                                if lm > 0 && (last_ov_col == lm - 1 || last_ov_col == lm + mc - 1) {
+                                    2
+                                } else {
+                                    1
+                                }
+                            } else {
+                                0
+                            };
                             let mut total_avail: usize = column_layout[vi..=vi+overflow_cols].iter()
                                 .map(|&(_, w, _)| w as usize).sum::<usize>()
                                 + overflow_cols
@@ -1831,15 +1843,26 @@ mod pancurses_backend {
                             // Include remaining viewport space (right gap) so
                             // cell style/background fills to the right border,
                             // matching ratatui.
-                            if gap_target + 1 >= n {
-                                let used_w: usize = column_layout.iter()
-                                    .map(|&(_, w, _)| w as usize).sum::<usize>()
-                                    + n.saturating_sub(1);
-                                // Leave 1-char gap before the right border
-                                // (matching ratatui filler behavior).
+                            let overflow_ends_at_boundary = overflow_cols > 0 && gap_target < n && {
+                                let last_ov_col = column_layout[gap_target].0 as usize;
+                                lm > 0 && (last_ov_col == lm - 1 || last_ov_col == lm + mc - 1)
+                            };
+                            if gap_target + 1 >= n || overflow_ends_at_boundary {
+                                // Compute render width with boundary-aware gaps,
+                                // matching visible_cols_render_width.
+                                let mut render_w: usize = column_layout.iter()
+                                    .map(|&(_, w, _)| w as usize).sum::<usize>();
+                                for idx in 0..n.saturating_sub(1) {
+                                    let col_idx = column_layout[idx].0 as usize;
+                                    if lm > 0 && (col_idx == lm - 1 || col_idx == lm + mc - 1) {
+                                        render_w += 2;
+                                    } else {
+                                        render_w += 1;
+                                    }
+                                }
                                 let total_w = (rect.w as usize).saturating_sub(8);
-                                if total_w > used_w {
-                                    total_avail = total_avail.saturating_add(total_w - used_w);
+                                if total_w > render_w {
+                                    total_avail = total_avail.saturating_add(total_w - render_w);
                                 }
                             }
                             let display = if text_width > total_avail {
@@ -1876,7 +1899,7 @@ mod pancurses_backend {
                             } else if is_left_margin_col {
                                 sgr_sep()
                             } else if is_right_margin_col && cell_text.is_empty()
-                                && (is_boundary || (col_idx as usize) == lm + mc) {
+                                && (is_boundary || ((col_idx as usize) == lm + mc && !prev_overflowed)) {
                                 sgr_sep()
                             } else if prev_overflowed && cell_text.is_empty() && !is_left_margin_col && !is_right_margin_col {
                                 sgr_sep()
@@ -1946,15 +1969,27 @@ mod pancurses_backend {
                                     } else {
                                         out.push_str(SGR_FG_DEFAULT);
                                     }
-                                } else if is_left_margin_col || is_right_margin_col {
+                                } else if (is_left_margin_col || is_right_margin_col) && !prev_overflowed {
                                     out.push_str(SGR_FG_DEFAULT);
                                 } else if sgr_applied {
                                     out.push_str(SGR_FG_DEFAULT);
                                 }
                             }
                             // Inter-column gap – separator │ at group boundaries, space otherwise
-                            if real_gap > 0 {
-                                let is_sep_col = lm > 0 && ((col_idx as usize) == lm - 1 || (col_idx as usize) == lm + mc - 1);
+                            // When overflow spans multiple columns the boundary check
+                            // must consider the last overflowed column, not just the
+                            // current column.  Structural separators are always drawn
+                            // at section boundaries even when the gap is consumed.
+                            let overflow_boundary = overflow_cols > 0 && gap_target < n && {
+                                let last_ov_col = column_layout[gap_target].0 as usize;
+                                lm > 0 && (last_ov_col == lm - 1 || last_ov_col == lm + mc - 1)
+                            };
+                            if real_gap > 0 || overflow_boundary {
+                                let is_sep_col = if overflow_boundary {
+                                    true
+                                } else {
+                                    lm > 0 && ((col_idx as usize) == lm - 1 || (col_idx as usize) == lm + mc - 1)
+                                };
                                 if is_sep_col {
                                     out.push_str(sgr_sep());
                                     out.push('│');
@@ -1964,7 +1999,7 @@ mod pancurses_backend {
                                     out.push(' ');
                                 }
                             }
-                            let overflowed_this = can_overflow && overflow_cols == 0;
+                            let overflowed_this = can_overflow;
                             if overflowed_this {
                                 prev_overflowed = true;
                             } else {
