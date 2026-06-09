@@ -1818,10 +1818,7 @@ mod pancurses_backend {
                                     // Stop at section boundaries so │ separators are preserved
                                     let boundary_lm = lm as usize;
                                     let boundary_rm = (lm + mc) as usize;
-                                    // Always stop at left-margin boundary.
-                                    if lm > 0 && (sc_idx as usize) == boundary_lm {
-                                        break;
-                                    }
+
                                     // At right-margin boundary: stop if text fits
                                     // within the main columns + PipeAndSpace,
                                     // otherwise continue into right-margin cols.
@@ -1924,7 +1921,7 @@ mod pancurses_backend {
                                 sgr_cell_agg()
                             } else if is_boundary && !can_overflow {
                                 sgr_sep()
-                            } else if is_left_margin_col {
+                            } else if is_left_margin_col && !can_overflow {
                                 sgr_sep()
                             } else if is_right_margin_col && cell_text.is_empty()
                                 && (is_boundary || ((col_idx as usize) == lm + mc && !prev_overflowed)) {
