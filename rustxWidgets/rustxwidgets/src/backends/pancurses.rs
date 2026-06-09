@@ -1618,6 +1618,7 @@ mod pancurses_backend {
                         let mut prev_overflowed = false;
                         let mut defer_sgr_reset = false;
                         let mut last_sgr = String::new();
+                        let mut overflow_consumed_all = false;
                         while vi < n {
                             let (col_idx, sx) = col_positions[vi];
                             let cell_text = cells_ref.get(&(row_idx, col_idx))
@@ -1971,6 +1972,9 @@ mod pancurses_backend {
                             // treat it as 'last' for SGR reset deferral so
                             // boundary rows emit SGR_RESET before the border.
                             let overflow_consumes_all = can_overflow && gap_target + 1 >= n;
+                            if overflow_consumes_all {
+                                overflow_consumed_all = true;
+                            }
                             if (is_last || overflow_consumes_all) && (is_cursor_cell || is_boundary) {
                                 defer_sgr_reset = true;
                                 last_sgr = if is_cursor_cell && !is_boundary {
@@ -2034,19 +2038,29 @@ mod pancurses_backend {
                         if defer_sgr_reset {
                             out.push_str(&last_sgr);
                         }
-                        // Use CUP to position at the right border, matching
-                        // the non-layout path at line 1820.  This works for
-                        // both normal rows (cursor at after_content) and
-                        // overflow rows (cursor past after_content).
                         // Fill between after_content and right_border with
                         // spaces to clear any stale characters.
+                        // When overflow fills all columns to the right border,
+                        // skip the fill since the text already occupies that space.
                         let right_border_x = rect.x + rect.w - 1;
-                        let after_content = rect.x + 1 + 5 + column_layout.iter()
-                            .map(|&(_, w, _)| w as i32).sum::<i32>()
-                            + (n.saturating_sub(1) as i32);
-                        if after_content < right_border_x {
-                            let gap = (right_border_x - after_content) as usize;
-                            out.push_str(&" ".repeat(gap));
+                        if !overflow_consumed_all {
+                            let after_content: i32 = rect.x + 1 + 5 + column_layout.iter()
+                                .enumerate()
+                                .map(|(idx, &(col_idx, w, _))| {
+                                    let gap = if idx + 1 < n {
+                                        if lm > 0 && ((col_idx as usize) == lm - 1 || (col_idx as usize) == lm + mc - 1) {
+                                            2
+                                        } else {
+                                            1
+                                        }
+                                    } else { 0 };
+                                    w as i32 + gap
+                                })
+                                .sum::<i32>();
+                            if after_content < right_border_x {
+                                let gap = (right_border_x - after_content) as usize;
+                                out.push_str(&" ".repeat(gap));
+                            }
                         }
                         out.push_str(&sgr_cup(ry, right_border_x));
                         out.push_str("│");
