@@ -1877,13 +1877,14 @@ mod pancurses_backend {
                                     .map(|&(_, w, _)| w as usize).sum::<usize>();
                                 for idx in 0..n.saturating_sub(1) {
                                     let col_idx = column_layout[idx].0 as usize;
-                                    if lm > 0 && (col_idx == lm - 1 || col_idx == lm + mc - 1) {
+                                let lm_u = lm as usize;
+                                if lm_u > 0 && (col_idx == lm_u - 1 || col_idx == lm_u + mc as usize - 1) {
                                         render_w += 2;
                                     } else {
                                         render_w += 1;
                                     }
                                 }
-                                let total_w = (rect.w as usize).saturating_sub(8);
+                                let total_w = (rect.w as usize).saturating_sub(7);
                                 if total_w > render_w {
                                     total_avail = total_avail.saturating_add(total_w - render_w);
                                 }
@@ -3395,9 +3396,21 @@ mod pancurses_backend {
                             let mut scan = vi + 1;
                             while scan < n {
                                 let (sc_idx, _, _) = column_layout[scan];
-                                // Stop at section boundaries so │ separators are preserved
-                                if lm > 0 && ((sc_idx as usize) == lm as usize || (sc_idx as usize) == lm as usize + mc) {
+                                // Stop at left-margin boundary unconditionally.
+                                if lm > 0 && (sc_idx as usize) == lm as usize {
                                     break;
+                                }
+                                // At right-margin boundary: stop if text fits
+                                // within the main columns + PipeAndSpace,
+                                // otherwise continue into right-margin cols.
+                                if lm > 0 && (sc_idx as usize) == lm as usize + mc {
+                                    let boundary_total: usize = column_layout[vi..scan].iter()
+                                        .map(|&(_, w, _)| w as usize).sum::<usize>()
+                                        + (scan.saturating_sub(vi + 1))
+                                        + 2;
+                                    if text_width <= boundary_total {
+                                        break;
+                                    }
                                 }
                                 let sc_text = cells_ref.get(&(row_idx, sc_idx)).map(|s| s.as_str()).unwrap_or("");
                                 if sc_text.is_empty() {
@@ -3407,10 +3420,28 @@ mod pancurses_backend {
                             }
                         }
                         let gap_after = if overflow_cols == 0 && vi + 1 < n { 1 } else { 0 };
-                        let total_avail: usize = column_layout[vi..=vi+overflow_cols].iter()
+                        let mut total_avail: usize = column_layout[vi..=vi+overflow_cols].iter()
                             .map(|&(_, w, _)| w as usize).sum::<usize>()
                             + overflow_cols // spaces between overflow columns
                             + gap_after;   // gap to next column
+                        // Include right-gap for consistent overflow width
+                        if vi + overflow_cols + 1 >= n {
+                            let mut render_w: usize = column_layout.iter()
+                                .map(|&(_, w, _)| w as usize).sum::<usize>();
+                            for idx in 0..n.saturating_sub(1) {
+                                let col_idx = column_layout[idx].0 as usize;
+                                let lm_u = lm as usize;
+                                if lm_u > 0 && (col_idx == lm_u - 1 || col_idx == lm_u + mc as usize - 1) {
+                                    render_w += 2;
+                                } else {
+                                    render_w += 1;
+                                }
+                            }
+                            let total_w = (width as usize).saturating_sub(7);
+                            if total_w > render_w {
+                                total_avail = total_avail.saturating_add(total_w - render_w);
+                            }
+                        }
                         let display = if text_width > total_avail {
                             if overflow_cols == 0 {
                                 cell_text.chars().take(total_avail).collect()
