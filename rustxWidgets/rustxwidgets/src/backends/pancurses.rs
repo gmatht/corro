@@ -1568,14 +1568,20 @@ mod pancurses_backend {
                     out.push_str(&format!("{:>4} ", label_str));
                     // Reset attributes that would leak (bold, background) for cursor
                     // and footer rows.  Boundary rows keep their underline since
-                    // ratatui does not reset it; normal rows only set foreground
-                    // which the next cell's SGR overrides.
+                    // ratatui does not reset it; normal rows reset foreground so
+                    // text without a cell SGR (e.g. section headers) renders in
+                    // the default color instead of inheriting the row-label yellow.
                     if is_cursor_row || is_footer {
                         if is_boundary {
                             out.push_str("\x1b[0;4m");
                         } else {
                             out.push_str(SGR_RESET);
                         }
+                    } else if is_boundary {
+                        out.push_str("\x1b[0;4m");
+                    } else {
+                        out.push_str(SGR_FG_DEFAULT);
+                        out.push_str(SGR_BG_DEFAULT);
                     }
 
                     // Separator between row label and first data column (dark gray)
@@ -1819,18 +1825,10 @@ mod pancurses_backend {
                                     let boundary_lm = lm as usize;
                                     let boundary_rm = (lm + mc) as usize;
 
-                                    // At right-margin boundary: stop if text fits
-                                    // within the main columns + PipeAndSpace,
-                                    // otherwise continue into right-margin cols.
-                                    if lm > 0 && (sc_idx as usize) == boundary_rm {
-                                        let boundary_total = column_layout[vi..scan].iter()
-                                            .map(|&(_, w, _)| w as usize).sum::<usize>()
-                                            + (scan.saturating_sub(vi + 1))
-                                            + 2; // PipeAndSpace
-                                        if text_width <= boundary_total {
-                                            break;
-                                        }
-                                    }
+                                    // Continue scanning into right-margin area,
+                                    // allowing section-header text like "--- Belmont ---"
+                                    // to fill the full viewport width. The empty-cell
+                                    // check below stops at the first non-empty column.
                                     let sc_text = cells_ref.get(&(row_idx, sc_idx))
                                         .map(|s| s.as_str()).unwrap_or("");
                                     if sc_text.is_empty() {
