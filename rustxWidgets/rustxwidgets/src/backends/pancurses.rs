@@ -1666,7 +1666,11 @@ mod pancurses_backend {
                                     for _ in 0..cw {
                                         out.push(' ');
                                     }
-                                    out.push_str(SGR_FG_DEFAULT);
+                                    if cell_style == 3 {
+                                        out.push_str(SGR_RESET);
+                                    } else {
+                                        out.push_str(SGR_FG_DEFAULT);
+                                    }
                                     let gap_after = if vi + 1 < n { 1 } else { 0 };
                                     if gap_after > 0 {
                                         let is_sep_col = lm > 0 && ((col_idx as usize) == lm - 1 || (col_idx as usize) == lm + mc - 1);
