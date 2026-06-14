@@ -526,9 +526,10 @@ mod pancurses_backend {
                                         if let Some(fid) = state.focus_id {
                                             if is_spreadsheet_focused(state, fid) {
                                                 if let Some(n) = state.node_mut(fid) {
-                                                    if let PcWidgetKind::Spreadsheet { ref mut editing, .. } = n.kind {
+                                                    if let PcWidgetKind::Spreadsheet { ref mut editing, ref mut edit_buf, .. } = n.kind {
                                                         if *editing {
                                                             *editing = false; // cancel edit
+                                                            edit_buf.clear();
                                                             return;
                                                         }
                                                     }
@@ -1391,7 +1392,9 @@ mod pancurses_backend {
                         .map(|(_, l)| l.as_str())
                         .unwrap_or("1");
                     let addr_text = format!("{}{}", col_part, row_label.trim());
-                    if *editing {
+                    // Use edit mode when explicitly editing OR when edit_buf
+                    // contains pending input (handles timing edge cases).
+                    if *editing || !edit_buf.is_empty() {
                         // Edit mode: white on dark gray (prompt_style), edit_buf, caret cursor
                         let addr_str = format!(" {}  ", addr_text);
                         let chars: Vec<char> = edit_buf.chars().collect();
@@ -1453,11 +1456,9 @@ mod pancurses_backend {
                     let title_vis = title.chars().count();
                     let dash_fill = (rect.w as usize).saturating_sub(title_vis + 3);
                     out.push_str(&sgr_cup(br, rect.x));
-                    // Reset bg/fg after formula bar (needed when edit mode uses dark gray bg)
-                    if *editing {
-                        out.push_str(SGR_FG_DEFAULT);
-                        out.push_str(SGR_BG_DEFAULT);
-                    }
+                    // Always reset bg/fg after formula bar (matching ratatui behavior).
+                    out.push_str(SGR_FG_DEFAULT);
+                    out.push_str(SGR_BG_DEFAULT);
                     out.push_str("┌");
                     out.push_str(SGR_BOLD);
                     out.push_str(" ");
@@ -1597,7 +1598,7 @@ mod pancurses_backend {
                 }
 
                 // Data rows
-                let has_status = !status_text.is_empty() || *editing;
+                let has_status = !status_text.is_empty() || *editing || !edit_buf.is_empty();
                 let has_tabs = !tab_titles.is_empty();
                 let extra_lines = 1
                     + if has_tabs { 1 } else if has_status { 1 } else { 0 };
@@ -2312,7 +2313,7 @@ mod pancurses_backend {
                     out.push_str("┘");
                 }
                 // Status bar: dark gray fg (matching ratatui).
-                let display_status: &str = if *editing {
+                let display_status: &str = if *editing || !edit_buf.is_empty() {
                     "  type to edit (or addr: val)   Enter·confirm   Esc·discard"
                 } else {
                     status_text
@@ -2400,6 +2401,7 @@ mod pancurses_backend {
                         let c = *cursor_col;
                         cells.borrow_mut().insert((r, c), val.clone());
                         *editing = false;
+                        edit_buf.clear();
                         if r + 1 < u32::MAX { *cursor_row = r + 1; }
                         Some((r, c, val))
                     } else {
@@ -2532,11 +2534,12 @@ mod pancurses_backend {
         let (r, c, val) = {
             let n = state.node_mut(fid);
             if let Some(n) = n {
-                if let PcWidgetKind::Spreadsheet { ref cells, cursor_row, cursor_col, ref edit_buf, ref mut editing, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref cells, cursor_row, cursor_col, ref mut edit_buf, ref mut editing, .. } = n.kind {
                     if *editing {
                         let val = edit_buf.clone();
                         cells.borrow_mut().insert((cursor_row, cursor_col), val.clone());
                         *editing = false;
+                        edit_buf.clear();
                         (cursor_row, cursor_col, val)
                     } else {
                         return;
@@ -3448,16 +3451,33 @@ mod pancurses_backend {
                     .map(|(_, l)| l.as_str())
                     .unwrap_or("1");
                 let addr_text = format!("{}{}", col_part, row_label.trim());
-                let cell_val = raw_cells.borrow().get(&(cursor_row, cursor_col)).cloned().unwrap_or_default();
-                let max_fb = width.saturating_sub(addr_text.chars().count() + 3 + formula_bar_trailing.chars().count()).max(1);
-                let fb_text = if cell_val.chars().count() > max_fb {
-                    let truncated: String = cell_val.chars().take(max_fb.saturating_sub(3)).collect();
-                    format!(" {}  {}…{}", addr_text, truncated, formula_bar_trailing)
+                let addr_str = format!(" {}  ", addr_text);
+                if editing || !edit_buf.is_empty() {
+                    // Edit mode: show edit buffer with cursor
+                    let chars: Vec<char> = edit_buf.chars().collect();
+                    let cpos = edit_pos.min(chars.len());
+                    let before: String = chars[..cpos].iter().collect();
+                    let after: String = if cpos < chars.len() {
+                        chars[cpos + 1..].iter().collect()
+                    } else {
+                        String::new()
+                    };
+                    let cursor_ch = chars.get(cpos).map(|c| c.to_string()).unwrap_or_else(|| " ".to_string());
+                    let fb_text = format!("{}{}{}{}", addr_str, before, cursor_ch, after);
+                    let truncated: String = fb_text.chars().take(width).collect();
+                    buf[row] = truncated;
                 } else {
-                    format!(" {}  {}{}", addr_text, cell_val, formula_bar_trailing)
-                };
-                let truncated: String = fb_text.chars().take(width).collect();
-                buf[row] = truncated;
+                    let cell_val = raw_cells.borrow().get(&(cursor_row, cursor_col)).cloned().unwrap_or_default();
+                    let max_fb = width.saturating_sub(addr_text.chars().count() + 3 + formula_bar_trailing.chars().count()).max(1);
+                    let fb_text = if cell_val.chars().count() > max_fb {
+                        let truncated: String = cell_val.chars().take(max_fb.saturating_sub(3)).collect();
+                        format!(" {}  {}…{}", addr_text, truncated, formula_bar_trailing)
+                    } else {
+                        format!(" {}  {}{}", addr_text, cell_val, formula_bar_trailing)
+                    };
+                    let truncated: String = fb_text.chars().take(width).collect();
+                    buf[row] = truncated;
+                }
                 row += 1;
             }
 
@@ -3553,7 +3573,7 @@ mod pancurses_backend {
             }
 
             // Data rows (with │ border)
-            let has_status_bar = !status_text.is_empty() || editing;
+            let has_status_bar = !status_text.is_empty() || editing || !edit_buf.is_empty();
             let grid_bottom = height - if has_status_bar { 2 } else { 0 };
             while row < grid_bottom && row < height {
                 let row_idx = top_row + (row.saturating_sub(4)) as u32;
@@ -3726,7 +3746,7 @@ mod pancurses_backend {
             }
 
             // Status bar (always on its own line below the bottom border)
-            let display_status = if editing {
+            let display_status = if editing || !edit_buf.is_empty() {
                 "  type to edit (or addr: val)   Enter·confirm   Esc·discard".to_string()
             } else {
                 status_text.clone()
