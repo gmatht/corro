@@ -1423,27 +1423,16 @@ mod pancurses_backend {
                             out.push_str(&" ".repeat(rect.w as usize - content_w));
                         }
                     } else {
-                        // Normal mode: always show cell with content using
-                        // prompt_style (white on gray) + bold value, matching
-                        // ratatui's formula bar when cursor is on a data cell.
-                        // This ensures the formula bar matches the reference
-                        // output even when editing is not active.
+                        // Normal mode: formula_style (cyan fg, default bg) with
+                        // address, cell value, and trailing text, matching ratatui.
                         let cell_val = raw_cells.borrow().get(&(*cursor_row, *cursor_col)).cloned().unwrap_or_default();
                         let addr_str = format!(" {}  ", addr_text);
-                        let display_val = if *editing { edit_buf.clone() } else { cell_val.clone() };
-                        let content_w = addr_str.chars().count() + display_val.chars().count();
+                        let fb_text = format!("{}{}", cell_val, formula_bar_trailing);
+                        let full_line = format!("{}{}", addr_str, fb_text);
                         out.push_str(&sgr_cup(row_offset, rect.x));
-                        out.push_str(sgr_prompt());
-                        out.push_str(&addr_str);
-                        if !display_val.is_empty() {
-                            out.push_str(SGR_BOLD);
-                            out.push_str(&display_val);
-                        }
-                        out.push_str(SGR_RESET);
-                        if content_w < rect.w as usize {
-                            out.push_str(sgr_prompt());
-                            out.push_str(&" ".repeat(rect.w as usize - content_w));
-                        }
+                        out.push_str(sgr_formula());
+                        out.push_str(&full_line);
+                        out.push_str(SGR_FG_DEFAULT);
                     }
                     row_offset += 1;
                 }
@@ -1460,8 +1449,10 @@ mod pancurses_backend {
                     let dash_fill = (rect.w as usize).saturating_sub(title_vis + 3);
                     out.push_str(&sgr_cup(br, rect.x));
                     // Reset bg/fg after formula bar (needed when edit mode uses dark gray bg)
-                    out.push_str(SGR_FG_DEFAULT);
-                    out.push_str(SGR_BG_DEFAULT);
+                    if *editing {
+                        out.push_str(SGR_FG_DEFAULT);
+                        out.push_str(SGR_BG_DEFAULT);
+                    }
                     out.push_str("┌");
                     out.push_str(SGR_BOLD);
                     out.push_str(" ");
@@ -2315,28 +2306,20 @@ mod pancurses_backend {
                     }
                     out.push_str("┘");
                 }
-                // Status bar: dark gray fg
-                // Check if cursor cell has content (to show edit-mode hint even
-                // when editing is not active — matches ratatui behavior).
-                let cursor_has_content = raw_cells.borrow().get(&(*cursor_row, *cursor_col)).map_or(false, |v| !v.is_empty());
-                if has_status || *editing || cursor_has_content {
+                // Status bar: dark gray fg, always shows status_text (matching ratatui).
+                if has_status {
                     let sr = if has_tabs {
                         row_offset + max_data_rows as i32
                     } else {
                         row_offset + max_data_rows as i32 + 1
                     };
                     if sr < rect.y + rect.h {
-                        let hint_text = if *editing || cursor_has_content {
-                            "  type to edit (or addr: val)   Enter·confirm   Esc·discard"
-                        } else {
-                            &status_text
-                        };
                         let max_w = rect.w as usize;
-                        let st_end = hint_text.char_indices().nth(max_w).map(|(i, _)| i).unwrap_or(hint_text.len());
+                        let st_end = status_text.char_indices().nth(max_w).map(|(i, _)| i).unwrap_or(status_text.len());
                         out.push_str(&sgr_cup(sr, rect.x));
                         out.push_str(sgr_sep());
-                        out.push_str(&hint_text[..st_end]);
-                        let st_vis = hint_text[..st_end].chars().count();
+                        out.push_str(&status_text[..st_end]);
+                        let st_vis = status_text[..st_end].chars().count();
                         if has_tabs {
                             if st_vis < rect.w as usize - 1 {
                                 for _ in st_vis..rect.w as usize - 1 {
