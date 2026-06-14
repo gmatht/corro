@@ -1556,18 +1556,24 @@ mod pancurses_backend {
                             out.push_str(&" ".repeat(rect.w as usize - content_w));
                         }
                     } else {
-                        // Normal mode: formula_style (cyan fg, default bg) with
-                        // address, cell value, and trailing text, matching ratatui.
+                        // Normal mode: prompt style (white on dark gray) with
+                        // address, bold cell value, caret indicator, and trailing
+                        // text, matching ratatui's mode_prompt_widget.
                         let cell_val = raw_cells.borrow().get(&(*cursor_row, *cursor_col)).cloned().unwrap_or_default();
                         let addr_str = format!(" {}  ", addr_text);
-                        let fb_text = format!("{}{}", cell_val, formula_bar_trailing);
-                        let full_line = format!("{}{}", addr_str, fb_text);
+                        let cell_bold = if cell_val.is_empty() {
+                            String::new()
+                        } else {
+                            format!("\x1b[1m{}", cell_val)
+                        };
+                        // Caret indicator: a single space with black-on-yellow
+                        // (matching ratatui's caret symbol rendered as inverted block)
+                        let content = format!("{}{}\x1b[38;5;0m\x1b[48;5;3m \x1b[0m{}",
+                            addr_str, cell_bold, formula_bar_trailing);
                         out.push_str(&sgr_cup(row_offset, rect.x));
-                        out.push_str(sgr_formula());
-                        out.push_str(&full_line);
-                        out.push_str(SGR_FG_DEFAULT);
-                        out.push_str(SGR_BG_DEFAULT);
-                        let remaining = (rect.w as usize).saturating_sub(full_line.chars().count());
+                        out.push_str(sgr_prompt());
+                        out.push_str(&content);
+                        let remaining = (rect.w as usize).saturating_sub(content.chars().count());
                         if remaining > 0 {
                             out.push_str(&" ".repeat(remaining));
                         }
@@ -3541,14 +3547,14 @@ mod pancurses_backend {
             };
             let (cells, raw_cells, top_row, left_col, cursor_row, cursor_col, editing, edit_buf, edit_pos,
                  col_width, margin_cols, main_cols, menu_text, status_text,
-                 formula_bar_trailing, column_layout, row_labels) = match &n.kind {
+                 border_title, formula_bar_trailing, column_layout, row_labels) = match &n.kind {
                 PcWidgetKind::Spreadsheet { cells, raw_cells, top_row, left_col, cursor_row, cursor_col,
                     editing, edit_buf, edit_pos, col_width, margin_cols, main_cols,
-                    menu_text, status_text, ref formula_bar_trailing, ref column_layout, ref row_labels, .. } => {
+                    menu_text, status_text, ref border_title, ref formula_bar_trailing, ref column_layout, ref row_labels, .. } => {
                     (cells.clone(), raw_cells.clone(), *top_row, *left_col, *cursor_row, *cursor_col,
                      *editing, edit_buf.clone(), *edit_pos, *col_width,
                      *margin_cols, *main_cols, menu_text.clone(), status_text.clone(),
-                     formula_bar_trailing.clone(), column_layout.clone(), row_labels.clone())
+                     border_title.clone(), formula_bar_trailing.clone(), column_layout.clone(), row_labels.clone())
                 }
                 _ => return,
             };
@@ -3614,6 +3620,25 @@ mod pancurses_backend {
                     let truncated: String = fb_text.chars().take(width).collect();
                     buf[row] = truncated;
                 }
+                row += 1;
+            }
+
+            // Border title line (matching ratatui: ┌ title ───┐)
+            if row < height {
+                let title = if !border_title.is_empty() {
+                    border_title.clone()
+                } else {
+                    format!("corro  {}r × {}c ", mc, mc)
+                };
+                let title_vis = title.chars().count();
+                let dash_fill = width.saturating_sub(title_vis + 3);
+                let mut border_line = String::from("┌");
+                border_line.push(' ');
+                border_line.push_str(&title);
+                border_line.push_str(&"─".repeat(dash_fill));
+                border_line.push('┐');
+                let truncated: String = border_line.chars().take(width).collect();
+                buf[row] = truncated;
                 row += 1;
             }
 
