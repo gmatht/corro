@@ -457,6 +457,17 @@ mod pancurses_backend {
                                 if is_spreadsheet_focused(state, fid) {
                                     spreadsheet_enter(state, fid);
                                     spreadsheet_scroll_to_cursor(state, fid);
+                                    // Fire cursor-move callbacks so the application can
+                                    // refresh cell display (fill_cells) after a commit.
+                                    let mut cbs = std::mem::take(&mut state.cursor_move_callbacks);
+                                    let (row, col) = {
+                                        let n = state.node(fid).unwrap();
+                                        if let PcWidgetKind::Spreadsheet { cursor_row, cursor_col, .. } = &n.kind {
+                                            (*cursor_row, *cursor_col)
+                                        } else { (0, 0) }
+                                    };
+                                    for cb in cbs.iter_mut() { cb(row, col); }
+                                    state.cursor_move_callbacks = cbs;
                                     vec![]
                                 } else {
                                     toggle_focused(state, fid).1
@@ -783,15 +794,28 @@ mod pancurses_backend {
                                 None
                             } else if let Some(fid) = state.focus_id {
                                 if is_spreadsheet_focused(state, fid) {
+                                    let was_editing = {
+                                        let n = state.node(fid).unwrap();
+                                        matches!(&n.kind, PcWidgetKind::Spreadsheet { editing: true, .. })
+                                    };
                                     spreadsheet_prepare_move(state, fid, false);
                                     spreadsheet_commit_edit(state, fid);
                                     if let Some(n) = state.node_mut(fid) {
                                         if let PcWidgetKind::Spreadsheet { ref mut cursor_col, ref cursor_row, .. } = n.kind {
                                             if *cursor_col > 0 { *cursor_col -= 1; }
-                                            return Some((*cursor_row, *cursor_col));
                                         }
                                     }
-                                    spreadsheet_scroll_to_cursor(state, fid);
+                                    // Re-enter edit mode if we were editing before (like ratatui)
+                                    if was_editing {
+                                        spreadsheet_enter(state, fid);
+                                    }
+                                    let (row, col) = {
+                                        let n = state.node(fid).unwrap();
+                                        if let PcWidgetKind::Spreadsheet { cursor_row, cursor_col, .. } = &n.kind {
+                                            (*cursor_row, *cursor_col)
+                                        } else { (0, 0) }
+                                    };
+                                    return Some((row, col));
                                 } else if let Some(n) = state.node_mut(fid) {
                                     if let PcWidgetKind::Entry { ref mut cursor, .. } = n.kind {
                                         if *cursor > 0 { *cursor -= 1; }
@@ -825,15 +849,27 @@ mod pancurses_backend {
                                 None
                             } else if let Some(fid) = state.focus_id {
                                 if is_spreadsheet_focused(state, fid) {
+                                    let was_editing = {
+                                        let n = state.node(fid).unwrap();
+                                        matches!(&n.kind, PcWidgetKind::Spreadsheet { editing: true, .. })
+                                    };
                                     spreadsheet_prepare_move(state, fid, false);
                                     spreadsheet_commit_edit(state, fid);
                                     if let Some(n) = state.node_mut(fid) {
                                         if let PcWidgetKind::Spreadsheet { ref mut cursor_row, ref mut cursor_col, .. } = n.kind {
                                             *cursor_col += 1;
-                                            return Some((*cursor_row, *cursor_col));
                                         }
                                     }
-                                    spreadsheet_scroll_to_cursor(state, fid);
+                                    if was_editing {
+                                        spreadsheet_enter(state, fid);
+                                    }
+                                    let (row, col) = {
+                                        let n = state.node(fid).unwrap();
+                                        if let PcWidgetKind::Spreadsheet { cursor_row, cursor_col, .. } = &n.kind {
+                                            (*cursor_row, *cursor_col)
+                                        } else { (0, 0) }
+                                    };
+                                    return Some((row, col));
                                 } else if let Some(n) = state.node_mut(fid) {
                                     if let PcWidgetKind::Entry { ref mut cursor, ref buffer } = n.kind {
                                         if *cursor < buffer.len() { *cursor += 1; }
@@ -867,22 +903,33 @@ mod pancurses_backend {
                                 None
                             } else if let Some(fid) = state.focus_id {
                                 if is_spreadsheet_focused(state, fid) {
+                                    let was_editing = {
+                                        let n = state.node(fid).unwrap();
+                                        matches!(&n.kind, PcWidgetKind::Spreadsheet { editing: true, .. })
+                                    };
                                     spreadsheet_prepare_move(state, fid, false);
                                     spreadsheet_commit_edit(state, fid);
-                                    if let Some(n) = state.node_mut(fid) {
-                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_row, ref cursor_col, .. } = n.kind {
-                                            if *cursor_row > 0 {
-                                                *cursor_row -= 1;
-                                            } else {
-                                                // Fire sentinel for "scroll up" — the
-                                                // application callback will recompute the
-                                                // viewport and update the widget.
-                                                return Some((u32::MAX, *cursor_col));
+                                    {
+                                        if let Some(n) = state.node_mut(fid) {
+                                            if let PcWidgetKind::Spreadsheet { ref mut cursor_row, ref cursor_col, .. } = n.kind {
+                                                if *cursor_row > 0 {
+                                                    *cursor_row -= 1;
+                                                } else {
+                                                    return Some((u32::MAX, *cursor_col));
+                                                }
                                             }
-                                            return Some((*cursor_row, *cursor_col));
                                         }
                                     }
-                                    spreadsheet_scroll_to_cursor(state, fid);
+                                    if was_editing {
+                                        spreadsheet_enter(state, fid);
+                                    }
+                                    let (row, col) = {
+                                        let n = state.node(fid).unwrap();
+                                        if let PcWidgetKind::Spreadsheet { cursor_row, cursor_col, .. } = &n.kind {
+                                            (*cursor_row, *cursor_col)
+                                        } else { (0, 0) }
+                                    };
+                                    return Some((row, col));
                                 }
                                 None
                             } else {
@@ -912,21 +959,32 @@ mod pancurses_backend {
                                 None
                             } else if let Some(fid) = state.focus_id {
                                 if is_spreadsheet_focused(state, fid) {
+                                    let was_editing = {
+                                        let n = state.node(fid).unwrap();
+                                        matches!(&n.kind, PcWidgetKind::Spreadsheet { editing: true, .. })
+                                    };
                                     spreadsheet_commit_edit(state, fid);
-                                    if let Some(n) = state.node_mut(fid) {
-                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_row, ref cursor_col, total_rows, .. } = n.kind {
-                                            if *cursor_row + 1 < total_rows {
-                                                *cursor_row += 1;
-                                            } else {
-                                                // Fire sentinel for "scroll down" — the
-                                                // application callback will recompute the
-                                                // viewport and update the widget.
-                                                return Some((u32::MAX - 1, *cursor_col));
+                                    {
+                                        if let Some(n) = state.node_mut(fid) {
+                                            if let PcWidgetKind::Spreadsheet { ref mut cursor_row, ref cursor_col, total_rows, .. } = n.kind {
+                                                if *cursor_row + 1 < total_rows {
+                                                    *cursor_row += 1;
+                                                } else {
+                                                    return Some((u32::MAX - 1, *cursor_col));
+                                                }
                                             }
-                                            return Some((*cursor_row, *cursor_col));
                                         }
                                     }
-                                    spreadsheet_scroll_to_cursor(state, fid);
+                                    if was_editing {
+                                        spreadsheet_enter(state, fid);
+                                    }
+                                    let (row, col) = {
+                                        let n = state.node(fid).unwrap();
+                                        if let PcWidgetKind::Spreadsheet { cursor_row, cursor_col, .. } = &n.kind {
+                                            (*cursor_row, *cursor_col)
+                                        } else { (0, 0) }
+                                    };
+                                    return Some((row, col));
                                 }
                                 None
                             } else {
@@ -2466,19 +2524,24 @@ mod pancurses_backend {
         let result = {
             let n = state.node_mut(fid);
             if let Some(n) = n {
-                if let PcWidgetKind::Spreadsheet { ref cells, ref mut cursor_row, ref mut cursor_col, ref mut editing, ref mut edit_buf, ref mut edit_pos, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref cells, ref raw_cells, ref mut cursor_row, ref mut cursor_col, ref mut editing, ref mut edit_buf, ref mut edit_pos, .. } = n.kind {
                     if *editing {
                         let val = edit_buf.clone();
                         let r = *cursor_row;
                         let c = *cursor_col;
                         cells.borrow_mut().insert((r, c), val.clone());
+                        raw_cells.borrow_mut().insert((r, c), val.clone());
                         *editing = false;
                         edit_buf.clear();
                         if r + 1 < u32::MAX { *cursor_row = r + 1; }
                         Some((r, c, val))
                     } else {
                         *editing = true;
-                        let existing = cells.borrow().get(&(*cursor_row, *cursor_col)).cloned().unwrap_or_default();
+                        // Load the raw cell value (not formatted display) so the
+                        // edit buffer matches ratatui's formula_bar_value.
+                        let existing = raw_cells.borrow().get(&(*cursor_row, *cursor_col)).cloned()
+                            .or_else(|| cells.borrow().get(&(*cursor_row, *cursor_col)).cloned())
+                            .unwrap_or_default();
                         *edit_buf = existing;
                         *edit_pos = edit_buf.len();
                         None
@@ -2606,10 +2669,11 @@ mod pancurses_backend {
         let (r, c, val) = {
             let n = state.node_mut(fid);
             if let Some(n) = n {
-                if let PcWidgetKind::Spreadsheet { ref cells, cursor_row, cursor_col, ref mut edit_buf, ref mut editing, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref cells, ref raw_cells, cursor_row, cursor_col, ref mut edit_buf, ref mut editing, .. } = n.kind {
                     if *editing {
                         let val = edit_buf.clone();
                         cells.borrow_mut().insert((cursor_row, cursor_col), val.clone());
+                        raw_cells.borrow_mut().insert((cursor_row, cursor_col), val.clone());
                         *editing = false;
                         edit_buf.clear();
                         (cursor_row, cursor_col, val)
