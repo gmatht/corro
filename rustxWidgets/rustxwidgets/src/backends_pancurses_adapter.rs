@@ -822,6 +822,9 @@ mod pancurses_adapter {
     pub fn add_cursor_move_callback<F: FnMut(u32, u32) + 'static>(f: F) {
         crate::backends::pancurses::spreadsheet_add_cursor_move_callback(f);
     }
+    pub fn add_commit_edit_callback<F: FnMut(u32, u32, String) + 'static>(f: F) {
+        crate::backends::pancurses::spreadsheet_add_commit_edit_callback(f);
+    }
     pub fn spreadsheet_set_cell(id: usize, r: u32, c: u32, text: &str) {
         crate::backends::pancurses::spreadsheet_set_cell(id, r, c, text);
     }

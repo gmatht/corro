@@ -36,6 +36,8 @@ mod pancurses_backend {
     fn sgr_cell_cursor() -> &'static str { "\x1b[48;5;8m" }
     fn sgr_cell_agg() -> &'static str { "\x1b[38;5;6m" }
     fn sgr_cell_footer_agg() -> &'static str { "\x1b[1m\x1b[38;5;6m" }
+    fn sgr_prompt() -> &'static str { "\x1b[38;5;15m\x1b[48;5;8m" }
+    fn sgr_caret() -> &'static str { "\x1b[38;5;0m\x1b[48;5;3m" }
 
     fn emit_sgr(s: &str) {
         let _ = std::io::stdout().write_all(s.as_bytes());
@@ -117,6 +119,7 @@ mod pancurses_backend {
         pub nodes: Vec<PcWidgetNode>,
         pub next_id: usize,
         pub running: bool,
+        pub pending_quit: bool,
         pub focus_id: Option<usize>,
         pub menu_bar_id: Option<usize>,
         pub menu_open: bool,
@@ -125,6 +128,7 @@ mod pancurses_backend {
         pub spreadsheet_output: String,
         key_callbacks: Vec<(char, Box<dyn FnMut()>)>,
         pub cursor_move_callbacks: Vec<Box<dyn FnMut(u32, u32)>>,
+        pub commit_edit_callbacks: Vec<Box<dyn FnMut(u32, u32, String)>>,
     }
 
     impl PcState {
@@ -133,6 +137,7 @@ mod pancurses_backend {
                 nodes: Vec::new(),
                 next_id: 1,
                 running: true,
+                pending_quit: false,
                 focus_id: None,
                 menu_bar_id: None,
                 menu_open: false,
@@ -141,6 +146,7 @@ mod pancurses_backend {
                 spreadsheet_output: String::new(),
                 key_callbacks: Vec::new(),
                 cursor_move_callbacks: Vec::new(),
+                commit_edit_callbacks: Vec::new(),
             }
         }
 
@@ -197,6 +203,32 @@ mod pancurses_backend {
             raw();
             noecho();
             root.keypad(true);
+            // Register CSI-form arrow keys so that \x1b[A etc. are
+            // recognized even when terminfo uses SS3 (\x1bOA etc.).
+            // screen-256color lacks kri/kind/kLFT/kRIT, so also register
+            // \x1b[1;2{A,B,C,D} as the corresponding plain arrow keys.
+            {
+                use std::os::raw::{c_char, c_int};
+                extern "C" {
+                    fn define_key(definition: *const c_char, keycode: c_int) -> c_int;
+                }
+                const KUP: c_int = 259;
+                const KDOWN: c_int = 258;
+                const KLEFT: c_int = 260;
+                const KRIGHT: c_int = 261;
+                for (seq, code) in [
+                    (&b"\x1b[A\x00"[..], KUP),
+                    (&b"\x1b[B\x00"[..], KDOWN),
+                    (&b"\x1b[D\x00"[..], KLEFT),
+                    (&b"\x1b[C\x00"[..], KRIGHT),
+                    (&b"\x1b[1;2A\x00"[..], KUP),
+                    (&b"\x1b[1;2B\x00"[..], KDOWN),
+                    (&b"\x1b[1;2D\x00"[..], KLEFT),
+                    (&b"\x1b[1;2C\x00"[..], KRIGHT),
+                ] {
+                    unsafe { define_key(seq.as_ptr() as *const c_char, code); }
+                }
+            }
             mousemask(ALL_MOUSE_EVENTS | REPORT_MOUSE_POSITION, None);
             // Use `root.timeout(100)` so we can temporarily change it for Alt+key detection
             root.timeout(100);
@@ -416,6 +448,7 @@ mod pancurses_backend {
                         }
                     }
                     Some(Input::Character('\n')) | Some(Input::Character('\r')) => {
+                        with_state(|state| state.pending_quit = false);
                         let callbacks = with_state(|state| {
                             if state.menu_open {
                                 state.menu_open = false;
@@ -435,6 +468,7 @@ mod pancurses_backend {
                         fire_callbacks(callbacks);
                     }
                     Some(Input::Character(c)) => {
+                        with_state(|state| state.pending_quit = false);
                         if c == '\t' {
                             with_state(|state| {
                                 if state.menu_open {
@@ -469,6 +503,7 @@ mod pancurses_backend {
                             root.timeout(100);
                             match alt_key {
                                 Some(Input::Character(ac)) => {
+                                    with_state(|state| state.pending_quit = false);
                                     // Alt+key — activate matching submenu
                                     with_state(|state| {
                                         if let Some(mid) = state.menu_bar_id {
@@ -486,7 +521,7 @@ mod pancurses_backend {
                                     });
                                 }
                                 _ => {
-                                    // No following char within 300ms → bare Escape → close edit/menu or quit
+                                    // No following char within 300ms → bare Escape
                                     with_state(|state| {
                                         if let Some(fid) = state.focus_id {
                                             if is_spreadsheet_focused(state, fid) {
@@ -502,8 +537,10 @@ mod pancurses_backend {
                                         }
                                         if state.menu_open {
                                             state.menu_open = false;
-                                        } else {
+                                        } else if state.pending_quit {
                                             state.running = false;
+                                        } else {
+                                            state.pending_quit = true;
                                         }
                                     });
                                 }
@@ -663,6 +700,7 @@ mod pancurses_backend {
                         });
                     }
                     Some(Input::KeyLeft) => {
+                        with_state(|state| state.pending_quit = false);
                         let new_pos = with_state(|state| {
                             if state.menu_open {
                                 if state.active_submenu > 0 {
@@ -698,6 +736,7 @@ mod pancurses_backend {
                         }
                     }
                     Some(Input::KeyRight) => {
+                        with_state(|state| state.pending_quit = false);
                         let new_pos = with_state(|state| {
                             if state.menu_open {
                                 if let Some(mid) = state.menu_bar_id {
@@ -739,6 +778,7 @@ mod pancurses_backend {
                         }
                     }
                     Some(Input::KeyUp) => {
+                        with_state(|state| state.pending_quit = false);
                         let new_pos = with_state(|state| {
                             if state.menu_open {
                                 if let Some(mid) = state.menu_bar_id {
@@ -783,6 +823,7 @@ mod pancurses_backend {
                         }
                     }
                     Some(Input::KeyDown) => {
+                        with_state(|state| state.pending_quit = false);
                         let new_pos = with_state(|state| {
                             if state.menu_open {
                                 if let Some(mid) = state.menu_bar_id {
@@ -1033,6 +1074,39 @@ mod pancurses_backend {
                                 state.focus_id = Some(focusable[prev]);
                             } else {
                                 state.focus_id = focusable.last().copied();
+                            }
+                        });
+                    }
+                    Some(Input::KeySR) => {
+                        with_state(|state| state.pending_quit = false);
+                        with_state(|state| {
+                            if let Some(fid) = state.focus_id {
+                                if is_spreadsheet_focused(state, fid) {
+                                    spreadsheet_prepare_move(state, fid, false);
+                                    spreadsheet_commit_edit(state, fid);
+                                    if let Some(n) = state.node_mut(fid) {
+                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_row, .. } = n.kind {
+                                            if *cursor_row > 0 { *cursor_row -= 1; }
+                                        }
+                                    }
+                                    spreadsheet_scroll_to_cursor(state, fid);
+                                }
+                            }
+                        });
+                    }
+                    Some(Input::KeySF) => {
+                        with_state(|state| state.pending_quit = false);
+                        with_state(|state| {
+                            if let Some(fid) = state.focus_id {
+                                if is_spreadsheet_focused(state, fid) {
+                                    spreadsheet_commit_edit(state, fid);
+                                    if let Some(n) = state.node_mut(fid) {
+                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_row, total_rows, .. } = n.kind {
+                                            if *cursor_row + 1 < total_rows { *cursor_row += 1; }
+                                        }
+                                    }
+                                    spreadsheet_scroll_to_cursor(state, fid);
+                                }
                             }
                         });
                     }
@@ -1298,7 +1372,7 @@ mod pancurses_backend {
                     row_offset += 1;
                 }
 
-                // Formula bar: cyan fg, default bg
+                // Formula bar: cyan fg, default bg (Normal) / white on dark gray (Edit)
                 {
                     let cc = *cursor_col;
                     let mc = *main_cols;
@@ -1317,26 +1391,60 @@ mod pancurses_backend {
                         .map(|(_, l)| l.as_str())
                         .unwrap_or("1");
                     let addr_text = format!("{}{}", col_part, row_label.trim());
-                    let cell_val = raw_cells.borrow().get(&(*cursor_row, *cursor_col)).cloned().unwrap_or_default();
-                    let addr_vis = addr_text.chars().count();
-                    let max_fb = (rect.w as usize).saturating_sub(addr_vis + 3 + formula_bar_trailing.chars().count()).max(1);
-                    let fb_text = if cell_val.chars().count() > max_fb {
-                        let trunc_end = cell_val.char_indices().nth(max_fb.saturating_sub(3)).map(|(i, _)| i).unwrap_or(cell_val.len());
-                        format!(" {}  {}…{}", addr_text, &cell_val[..trunc_end], formula_bar_trailing)
+                    if *editing {
+                        // Edit mode: white on dark gray (prompt_style), edit_buf, caret cursor
+                        let addr_str = format!(" {}  ", addr_text);
+                        let chars: Vec<char> = edit_buf.chars().collect();
+                        let cursor = (*edit_pos).min(chars.len());
+                        let before: String = chars[..cursor].iter().collect();
+                        let after: String = if cursor < chars.len() {
+                            chars[cursor + 1..].iter().collect()
+                        } else {
+                            String::new()
+                        };
+                        let cursor_ch = chars.get(cursor).map(|c| c.to_string()).unwrap_or_else(|| " ".to_string());
+                        let content_w = addr_str.chars().count() + before.chars().count() + cursor_ch.chars().count() + after.chars().count();
+                        out.push_str(&sgr_cup(row_offset, rect.x));
+                        out.push_str(sgr_prompt());
+                        out.push_str(&addr_str);
+                        if !before.is_empty() {
+                            out.push_str(SGR_BOLD);
+                            out.push_str(&before);
+                        }
+                        out.push_str(sgr_caret());
+                        out.push_str(&cursor_ch);
+                        if !after.is_empty() {
+                            out.push_str(SGR_BOLD);
+                            out.push_str(&after);
+                        }
+                        out.push_str(SGR_RESET);
+                        if content_w < rect.w as usize {
+                            out.push_str(sgr_prompt());
+                            out.push_str(&" ".repeat(rect.w as usize - content_w));
+                        }
                     } else {
-                        format!(" {}  {}{}", addr_text, cell_val, formula_bar_trailing)
-                    };
-                    let fb_end = fb_text.char_indices().nth(rect.w as usize).map(|(i, _)| i).unwrap_or(fb_text.len());
-                    out.push_str(&sgr_cup(row_offset, rect.x));
-                    out.push_str(sgr_formula());
-                    out.push_str(&fb_text[..fb_end]);
-                    out.push_str(SGR_FG_DEFAULT);
-                    out.push_str(SGR_BG_DEFAULT);
-                    // Fill rest of formula bar line with spaces to prevent
-                    // ncurses background from bleeding through.
-                    let fb_vis = fb_text[..fb_end].chars().count();
-                    if fb_vis < rect.w as usize {
-                        out.push_str(&" ".repeat(rect.w as usize - fb_vis));
+                        // Normal mode: cyan fg, default bg (existing behavior)
+                        let cell_val = raw_cells.borrow().get(&(*cursor_row, *cursor_col)).cloned().unwrap_or_default();
+                        let addr_vis = addr_text.chars().count();
+                        let max_fb = (rect.w as usize).saturating_sub(addr_vis + 3 + formula_bar_trailing.chars().count()).max(1);
+                        let fb_text = if cell_val.chars().count() > max_fb {
+                            let trunc_end = cell_val.char_indices().nth(max_fb.saturating_sub(3)).map(|(i, _)| i).unwrap_or(cell_val.len());
+                            format!(" {}  {}…{}", addr_text, &cell_val[..trunc_end], formula_bar_trailing)
+                        } else {
+                            format!(" {}  {}{}", addr_text, cell_val, formula_bar_trailing)
+                        };
+                        let fb_end = fb_text.char_indices().nth(rect.w as usize).map(|(i, _)| i).unwrap_or(fb_text.len());
+                        out.push_str(&sgr_cup(row_offset, rect.x));
+                        out.push_str(sgr_formula());
+                        out.push_str(&fb_text[..fb_end]);
+                        out.push_str(SGR_FG_DEFAULT);
+                        out.push_str(SGR_BG_DEFAULT);
+                        // Fill rest of formula bar line with spaces to prevent
+                        // ncurses background from bleeding through.
+                        let fb_vis = fb_text[..fb_end].chars().count();
+                        if fb_vis < rect.w as usize {
+                            out.push_str(&" ".repeat(rect.w as usize - fb_vis));
+                        }
                     }
                     row_offset += 1;
                 }
@@ -1352,6 +1460,9 @@ mod pancurses_backend {
                     let title_vis = title.chars().count();
                     let dash_fill = (rect.w as usize).saturating_sub(title_vis + 3);
                     out.push_str(&sgr_cup(br, rect.x));
+                    // Reset bg/fg after formula bar (needed when edit mode uses dark gray bg)
+                    out.push_str(SGR_FG_DEFAULT);
+                    out.push_str(SGR_BG_DEFAULT);
                     out.push_str("┌");
                     out.push_str(SGR_BOLD);
                     out.push_str(" ");
@@ -2206,19 +2317,24 @@ mod pancurses_backend {
                     out.push_str("┘");
                 }
                 // Status bar: dark gray fg
-                if has_status {
+                if has_status || *editing {
                     let sr = if has_tabs {
                         row_offset + max_data_rows as i32
                     } else {
                         row_offset + max_data_rows as i32 + 1
                     };
                     if sr < rect.y + rect.h {
+                        let hint_text = if *editing {
+                            "  type to edit (or addr: val)   Enter·confirm   Esc·discard"
+                        } else {
+                            &status_text
+                        };
                         let max_w = rect.w as usize;
-                        let st_end = status_text.char_indices().nth(max_w).map(|(i, _)| i).unwrap_or(status_text.len());
+                        let st_end = hint_text.char_indices().nth(max_w).map(|(i, _)| i).unwrap_or(hint_text.len());
                         out.push_str(&sgr_cup(sr, rect.x));
                         out.push_str(sgr_sep());
-                        out.push_str(&status_text[..st_end]);
-                        let st_vis = status_text[..st_end].chars().count();
+                        out.push_str(&hint_text[..st_end]);
+                        let st_vis = hint_text[..st_end].chars().count();
                         if has_tabs {
                             if st_vis < rect.w as usize - 1 {
                                 for _ in st_vis..rect.w as usize - 1 {
@@ -2278,19 +2394,36 @@ mod pancurses_backend {
     }
 
     fn spreadsheet_enter(state: &mut PcState, fid: usize) {
-        if let Some(n) = state.node_mut(fid) {
-            if let PcWidgetKind::Spreadsheet { ref cells, ref mut cursor_row, ref mut cursor_col, ref mut editing, ref mut edit_buf, ref mut edit_pos, .. } = n.kind {
-                if *editing {
-                    cells.borrow_mut().insert((*cursor_row, *cursor_col), edit_buf.clone());
-                    *editing = false;
-                    if *cursor_row + 1 < u32::MAX { *cursor_row += 1; }
+        let result = {
+            let n = state.node_mut(fid);
+            if let Some(n) = n {
+                if let PcWidgetKind::Spreadsheet { ref cells, ref mut cursor_row, ref mut cursor_col, ref mut editing, ref mut edit_buf, ref mut edit_pos, .. } = n.kind {
+                    if *editing {
+                        let val = edit_buf.clone();
+                        let r = *cursor_row;
+                        let c = *cursor_col;
+                        cells.borrow_mut().insert((r, c), val.clone());
+                        *editing = false;
+                        if r + 1 < u32::MAX { *cursor_row = r + 1; }
+                        Some((r, c, val))
+                    } else {
+                        *editing = true;
+                        let existing = cells.borrow().get(&(*cursor_row, *cursor_col)).cloned().unwrap_or_default();
+                        *edit_buf = existing;
+                        *edit_pos = edit_buf.len();
+                        None
+                    }
                 } else {
-                    *editing = true;
-                    let existing = cells.borrow().get(&(*cursor_row, *cursor_col)).cloned().unwrap_or_default();
-                    *edit_buf = existing;
-                    *edit_pos = edit_buf.len();
+                    None
                 }
+            } else {
+                None
             }
+        };
+        if let Some((r, c, val)) = result {
+            let mut cbs = std::mem::take(&mut state.commit_edit_callbacks);
+            for cb in cbs.iter_mut() { cb(r, c, val.clone()); }
+            state.commit_edit_callbacks = cbs;
         }
     }
 
@@ -2400,14 +2533,28 @@ mod pancurses_backend {
     }
 
     fn spreadsheet_commit_edit(state: &mut PcState, fid: usize) {
-        if let Some(n) = state.node_mut(fid) {
-            if let PcWidgetKind::Spreadsheet { ref cells, cursor_row, cursor_col, ref edit_buf, ref mut editing, .. } = n.kind {
-                if *editing {
-                    cells.borrow_mut().insert((cursor_row, cursor_col), edit_buf.clone());
-                    *editing = false;
+        let (r, c, val) = {
+            let n = state.node_mut(fid);
+            if let Some(n) = n {
+                if let PcWidgetKind::Spreadsheet { ref cells, cursor_row, cursor_col, ref edit_buf, ref mut editing, .. } = n.kind {
+                    if *editing {
+                        let val = edit_buf.clone();
+                        cells.borrow_mut().insert((cursor_row, cursor_col), val.clone());
+                        *editing = false;
+                        (cursor_row, cursor_col, val)
+                    } else {
+                        return;
+                    }
+                } else {
+                    return;
                 }
+            } else {
+                return;
             }
-        }
+        };
+        let mut cbs = std::mem::take(&mut state.commit_edit_callbacks);
+        for cb in cbs.iter_mut() { cb(r, c, val.clone()); }
+        state.commit_edit_callbacks = cbs;
     }
 
     fn col_label(idx: u32) -> String {
@@ -2758,6 +2905,12 @@ mod pancurses_backend {
         });
     }
 
+    pub fn spreadsheet_add_commit_edit_callback<F: FnMut(u32, u32, String) + 'static>(f: F) {
+        with_state(|state| {
+            state.commit_edit_callbacks.push(Box::new(f));
+        });
+    }
+
     pub fn spreadsheet_set_cursor(id: usize, row: u32, col: u32) {
         with_state(|s| {
             if let Some(n) = s.node_mut(id) {
@@ -2770,30 +2923,38 @@ mod pancurses_backend {
     }
 
     pub fn spreadsheet_commit_formula_bar(spreadsheet_id: usize) {
-        with_state(|s| {
+        let result = with_state(|s| {
             let (entry_id, cursor_row, cursor_col) = match s.node(spreadsheet_id) {
                 Some(n) => match &n.kind {
                     PcWidgetKind::Spreadsheet { formula_bar_entry_id, cursor_row, cursor_col, .. } => {
                         (*formula_bar_entry_id, *cursor_row, *cursor_col)
                     }
-                    _ => return,
+                    _ => return None,
                 },
-                None => return,
+                None => return None,
             };
-            let Some(eid) = entry_id else { return };
+            let Some(eid) = entry_id else { return None };
             let text = match s.node(eid) {
                 Some(en) => match &en.kind {
                     PcWidgetKind::Entry { buffer, .. } => buffer.clone(),
-                    _ => return,
+                    _ => return None,
                 },
-                None => return,
+                None => return None,
             };
             if let Some(n) = s.node_mut(spreadsheet_id) {
                 if let PcWidgetKind::Spreadsheet { ref cells, .. } = n.kind {
-                    cells.borrow_mut().insert((cursor_row, cursor_col), text);
+                    cells.borrow_mut().insert((cursor_row, cursor_col), text.clone());
                 }
             }
+            Some((cursor_row, cursor_col, text))
         });
+        if let Some((r, c, text)) = result {
+            with_state(|s| {
+                let mut cbs = std::mem::take(&mut s.commit_edit_callbacks);
+                for cb in cbs.iter_mut() { cb(r, c, text.clone()); }
+                s.commit_edit_callbacks = cbs;
+            });
+        }
     }
 
     pub fn spreadsheet_set_formula_bar(spreadsheet_id: usize, address_label_id: usize, entry_id: usize) {
