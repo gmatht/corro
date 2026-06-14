@@ -502,6 +502,78 @@ mod pancurses_backend {
                             let alt_key = root.getch();
                             root.timeout(100);
                             match alt_key {
+                                Some(Input::Character('[')) => {
+                                    // Could be CSI sequence: [1;2A (Shift+Up), [1;2B (Shift+Down),
+                                    // [1;2C (Shift+Right), [1;2D (Shift+Left).
+                                    // Read the remaining bytes to check.
+                                    with_state(|state| state.pending_quit = false);
+                                    root.timeout(50);
+                                    let seq = (
+                                        root.getch(),
+                                        root.getch(),
+                                        root.getch(),
+                                        root.getch(),
+                                    );
+                                    root.timeout(100);
+                                    match seq {
+                                        (Some(Input::Character('1')), Some(Input::Character(';')), Some(Input::Character('2')), dir) => {
+                                            let dir_char = match dir {
+                                                Some(Input::Character(d)) => d,
+                                                _ => '\0',
+                                            };
+                                            match dir_char {
+                                                'A' | 'B' | 'C' | 'D' => {
+                                                    // Shift+Arrow — process as regular arrow key
+                                                    let new_pos = with_state(|state| {
+                                                        if state.menu_open { return None; }
+                                                        if let Some(fid) = state.focus_id {
+                                                            if is_spreadsheet_focused(state, fid) {
+                                                                spreadsheet_prepare_move(state, fid, false);
+                                                                spreadsheet_commit_edit(state, fid);
+                                                                if let Some(n) = state.node_mut(fid) {
+                                                                    if let PcWidgetKind::Spreadsheet { ref mut cursor_row, ref mut cursor_col, total_rows, total_cols, .. } = n.kind {
+                                                                        match dir_char {
+                                                                            'A' => { // Up
+                                                                                if *cursor_row > 0 { *cursor_row -= 1; }
+                                                                                else { return Some((u32::MAX, *cursor_col)); }
+                                                                            }
+                                                                            'B' => { // Down
+                                                                                if *cursor_row + 1 < total_rows { *cursor_row += 1; }
+                                                                                else { return Some((u32::MAX - 1, *cursor_col)); }
+                                                                            }
+                                                                            'C' => { // Right
+                                                                                if *cursor_col + 1 < total_cols { *cursor_col += 1; }
+                                                                            }
+                                                                            'D' => { // Left
+                                                                                if *cursor_col > 0 { *cursor_col -= 1; }
+                                                                            }
+                                                                            _ => {}
+                                                                        }
+                                                                        return Some((*cursor_row, *cursor_col));
+                                                                    }
+                                                                }
+                                                                spreadsheet_scroll_to_cursor(state, fid);
+                                                            }
+                                                        }
+                                                        None
+                                                    });
+                                                    if let Some((row, col)) = new_pos {
+                                                        let mut cbs = with_state(|state| std::mem::take(&mut state.cursor_move_callbacks));
+                                                        for cb in cbs.iter_mut() { cb(row, col); }
+                                                        with_state(|state| state.cursor_move_callbacks = cbs);
+                                                    }
+                                                }
+                                                _ => {
+                                                    // Consumed bytes but pattern didn't match — ignore.
+                                                }
+                                            }
+                                        }
+                                        _ => {
+                                            // Not a Shift+Arrow CSI sequence; consumed bytes are lost.
+                                            // This is acceptable since Alt+[ followed by 1;2A is rare.
+                                        }
+                                    }
+                                }
                                 Some(Input::Character(ac)) => {
                                     with_state(|state| state.pending_quit = false);
                                     // Alt+key — activate matching submenu
