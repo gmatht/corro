@@ -1597,7 +1597,7 @@ mod pancurses_backend {
                 }
 
                 // Data rows
-                let has_status = !status_text.is_empty();
+                let has_status = !status_text.is_empty() || *editing;
                 let has_tabs = !tab_titles.is_empty();
                 let extra_lines = 1
                     + if has_tabs { 1 } else if has_status { 1 } else { 0 };
@@ -2311,7 +2311,13 @@ mod pancurses_backend {
                     }
                     out.push_str("┘");
                 }
-                // Status bar: dark gray fg, always shows status_text (matching ratatui).
+                // Status bar: dark gray fg (matching ratatui).
+                let display_status: &str = if *editing {
+                    "  type to edit (or addr: val)   Enter·confirm   Esc·discard"
+                } else {
+                    status_text
+                };
+                let ds_len = display_status.len();
                 if has_status {
                     let sr = if has_tabs {
                         row_offset + max_data_rows as i32
@@ -2320,11 +2326,11 @@ mod pancurses_backend {
                     };
                     if sr < rect.y + rect.h {
                         let max_w = rect.w as usize;
-                        let st_end = status_text.char_indices().nth(max_w).map(|(i, _)| i).unwrap_or(status_text.len());
+                        let st_end = display_status.char_indices().nth(max_w).map(|(i, _)| i).unwrap_or(ds_len);
                         out.push_str(&sgr_cup(sr, rect.x));
                         out.push_str(sgr_sep());
-                        out.push_str(&status_text[..st_end]);
-                        let st_vis = status_text[..st_end].chars().count();
+                        out.push_str(&display_status[..st_end]);
+                        let st_vis = display_status[..st_end].chars().count();
                         if has_tabs {
                             if st_vis < rect.w as usize - 1 {
                                 for _ in st_vis..rect.w as usize - 1 {
@@ -3547,7 +3553,8 @@ mod pancurses_backend {
             }
 
             // Data rows (with │ border)
-            let grid_bottom = height - if status_text.is_empty() { 0 } else { 2 };
+            let has_status_bar = !status_text.is_empty() || editing;
+            let grid_bottom = height - if has_status_bar { 2 } else { 0 };
             while row < grid_bottom && row < height {
                 let row_idx = top_row + (row.saturating_sub(4)) as u32;
                 let mut data_row = String::new();
@@ -3719,8 +3726,13 @@ mod pancurses_backend {
             }
 
             // Status bar (always on its own line below the bottom border)
-            if !status_text.is_empty() && row < height {
-                let display = &status_text[..status_text.len().min(width)];
+            let display_status = if editing {
+                "  type to edit (or addr: val)   Enter·confirm   Esc·discard".to_string()
+            } else {
+                status_text.clone()
+            };
+            if !display_status.is_empty() && row < height {
+                let display = &display_status[..display_status.len().min(width)];
                 buf[row] = display.to_string();
             }
         });
