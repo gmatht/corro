@@ -1556,23 +1556,16 @@ mod pancurses_backend {
                             out.push_str(&" ".repeat(rect.w as usize - content_w));
                         }
                     } else {
-                        // Normal mode: prompt style (white on dark gray) with
-                        // address, bold cell value, caret indicator, and trailing
-                        // text, matching ratatui's mode_prompt_widget.
+                        // Normal mode: cyan fg, default bg (matching ratatui's
+                        // mode_prompt_widget).  Shows address, cell value, and
+                        // trailing status — no caret or bold (those are edit-mode only).
                         let cell_val = raw_cells.borrow().get(&(*cursor_row, *cursor_col)).cloned().unwrap_or_default();
                         let addr_str = format!(" {}  ", addr_text);
-                        let cell_bold = if cell_val.is_empty() {
-                            String::new()
-                        } else {
-                            format!("\x1b[1m{}", cell_val)
-                        };
-                        // Caret indicator: a single space with black-on-yellow
-                        // (matching ratatui's caret symbol rendered as inverted block)
-                        let content = format!("{}{}\x1b[38;5;0m\x1b[48;5;3m \x1b[0m{}",
-                            addr_str, cell_bold, formula_bar_trailing);
+                        let content = format!("{}{}{}", addr_str, cell_val, formula_bar_trailing);
                         out.push_str(&sgr_cup(row_offset, rect.x));
-                        out.push_str(sgr_prompt());
+                        out.push_str(sgr_formula());
                         out.push_str(&content);
+                        out.push_str(SGR_FG_DEFAULT);
                         let remaining = (rect.w as usize).saturating_sub(content.chars().count());
                         if remaining > 0 {
                             out.push_str(&" ".repeat(remaining));
