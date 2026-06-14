@@ -1433,6 +1433,11 @@ mod pancurses_backend {
                         out.push_str(sgr_formula());
                         out.push_str(&full_line);
                         out.push_str(SGR_FG_DEFAULT);
+                        out.push_str(SGR_BG_DEFAULT);
+                        let remaining = (rect.w as usize).saturating_sub(full_line.chars().count());
+                        if remaining > 0 {
+                            out.push_str(&" ".repeat(remaining));
+                        }
                     }
                     row_offset += 1;
                 }
