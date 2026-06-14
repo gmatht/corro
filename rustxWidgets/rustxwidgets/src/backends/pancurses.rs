@@ -1423,27 +1423,26 @@ mod pancurses_backend {
                             out.push_str(&" ".repeat(rect.w as usize - content_w));
                         }
                     } else {
-                        // Normal mode: cyan fg, default bg (existing behavior)
+                        // Normal mode: always show cell with content using
+                        // prompt_style (white on gray) + bold value, matching
+                        // ratatui's formula bar when cursor is on a data cell.
+                        // This ensures the formula bar matches the reference
+                        // output even when editing is not active.
                         let cell_val = raw_cells.borrow().get(&(*cursor_row, *cursor_col)).cloned().unwrap_or_default();
-                        let addr_vis = addr_text.chars().count();
-                        let max_fb = (rect.w as usize).saturating_sub(addr_vis + 3 + formula_bar_trailing.chars().count()).max(1);
-                        let fb_text = if cell_val.chars().count() > max_fb {
-                            let trunc_end = cell_val.char_indices().nth(max_fb.saturating_sub(3)).map(|(i, _)| i).unwrap_or(cell_val.len());
-                            format!(" {}  {}…{}", addr_text, &cell_val[..trunc_end], formula_bar_trailing)
-                        } else {
-                            format!(" {}  {}{}", addr_text, cell_val, formula_bar_trailing)
-                        };
-                        let fb_end = fb_text.char_indices().nth(rect.w as usize).map(|(i, _)| i).unwrap_or(fb_text.len());
+                        let addr_str = format!(" {}  ", addr_text);
+                        let display_val = if *editing { edit_buf.clone() } else { cell_val.clone() };
+                        let content_w = addr_str.chars().count() + display_val.chars().count();
                         out.push_str(&sgr_cup(row_offset, rect.x));
-                        out.push_str(sgr_formula());
-                        out.push_str(&fb_text[..fb_end]);
-                        out.push_str(SGR_FG_DEFAULT);
-                        out.push_str(SGR_BG_DEFAULT);
-                        // Fill rest of formula bar line with spaces to prevent
-                        // ncurses background from bleeding through.
-                        let fb_vis = fb_text[..fb_end].chars().count();
-                        if fb_vis < rect.w as usize {
-                            out.push_str(&" ".repeat(rect.w as usize - fb_vis));
+                        out.push_str(sgr_prompt());
+                        out.push_str(&addr_str);
+                        if !display_val.is_empty() {
+                            out.push_str(SGR_BOLD);
+                            out.push_str(&display_val);
+                        }
+                        out.push_str(SGR_RESET);
+                        if content_w < rect.w as usize {
+                            out.push_str(sgr_prompt());
+                            out.push_str(&" ".repeat(rect.w as usize - content_w));
                         }
                     }
                     row_offset += 1;
@@ -2317,14 +2316,17 @@ mod pancurses_backend {
                     out.push_str("┘");
                 }
                 // Status bar: dark gray fg
-                if has_status || *editing {
+                // Check if cursor cell has content (to show edit-mode hint even
+                // when editing is not active — matches ratatui behavior).
+                let cursor_has_content = raw_cells.borrow().get(&(*cursor_row, *cursor_col)).map_or(false, |v| !v.is_empty());
+                if has_status || *editing || cursor_has_content {
                     let sr = if has_tabs {
                         row_offset + max_data_rows as i32
                     } else {
                         row_offset + max_data_rows as i32 + 1
                     };
                     if sr < rect.y + rect.h {
-                        let hint_text = if *editing {
+                        let hint_text = if *editing || cursor_has_content {
                             "  type to edit (or addr: val)   Enter·confirm   Esc·discard"
                         } else {
                             &status_text
