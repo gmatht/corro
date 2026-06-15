@@ -973,10 +973,6 @@ mod pancurses_backend {
                                 None
                             } else if let Some(fid) = state.focus_id {
                                 if is_spreadsheet_focused(state, fid) {
-                                    let was_editing = {
-                                        let n = state.node(fid).unwrap();
-                                        matches!(&n.kind, PcWidgetKind::Spreadsheet { editing: true, .. })
-                                    };
                                     spreadsheet_commit_edit(state, fid);
                                     {
                                         if let Some(n) = state.node_mut(fid) {
@@ -988,9 +984,6 @@ mod pancurses_backend {
                                                 }
                                             }
                                         }
-                                    }
-                                    if was_editing {
-                                        spreadsheet_enter(state, fid);
                                     }
                                     let (row, col) = {
                                         let n = state.node(fid).unwrap();
@@ -2546,7 +2539,6 @@ mod pancurses_backend {
                         raw_cells.borrow_mut().insert((r, c), val.clone());
                         *editing = false;
                         edit_buf.clear();
-                        if r + 1 < u32::MAX { *cursor_row = r + 1; }
                         Some((r, c, val))
                     } else {
                         *editing = true;
