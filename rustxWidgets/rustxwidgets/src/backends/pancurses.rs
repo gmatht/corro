@@ -2625,8 +2625,19 @@ mod pancurses_backend {
                             }
                             Some((r, c, val))
                         } else {
-                            *editing = false;
-                            edit_buf.clear();
+                            // Value unchanged — still advance cursor (matching ratatui)
+                            if *cursor_row + 1 < total_rows {
+                                *cursor_row += 1;
+                                let existing = raw_cells.borrow().get(&(*cursor_row, *cursor_col)).cloned()
+                                    .or_else(|| cells.borrow().get(&(*cursor_row, *cursor_col)).cloned())
+                                    .unwrap_or_default();
+                                *edit_buf = existing;
+                                *edit_pos = edit_buf.len();
+                                *editing = true;
+                            } else {
+                                *editing = false;
+                                edit_buf.clear();
+                            }
                             None
                         }
                     } else {
