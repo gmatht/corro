@@ -1566,23 +1566,23 @@ mod pancurses_backend {
                             out.push_str(SGR_RESET);
                         }
                     } else {
-                        // Normal mode: cyan fg on default bg, show cell value + trailing text
+                        // Normal mode: white fg on dark gray bg (prompt style), bold cell value, caret cursor
                         let cell_val = raw_cells.borrow().get(&(*cursor_row, *cursor_col)).cloned().unwrap_or_default();
-                        let fb_text = format!(" {}  {}{}", addr_text, cell_val, formula_bar_trailing);
-                        let fw = fb_text.chars().count();
                         out.push_str(&sgr_cup(row_offset, rect.x));
-                        out.push_str(sgr_formula());
-                        if fw <= rect.w as usize {
-                            out.push_str(&fb_text);
-                            if fw < rect.w as usize {
-                                out.push_str(SGR_FG_DEFAULT);
-                                out.push_str(&" ".repeat(rect.w as usize - fw));
+                        out.push_str(sgr_prompt());
+                        out.push_str(&format!(" {}  ", addr_text));
+                        out.push_str(SGR_BOLD);
+                        out.push_str(&cell_val);
+                        out.push_str(sgr_caret());
+                        out.push_str(" ");
+                        let content_w = addr_text.chars().count() + cell_val.chars().count() + 4;
+                        if content_w <= rect.w as usize {
+                            out.push_str(SGR_RESET);
+                            out.push_str(sgr_prompt());
+                            if content_w < rect.w as usize {
+                                out.push_str(&" ".repeat(rect.w as usize - content_w));
                             }
-                        } else {
-                            let truncated: String = fb_text.chars().take(rect.w as usize).collect();
-                            out.push_str(&truncated);
                         }
-                        out.push_str(SGR_FG_DEFAULT);
                     }
                     row_offset += 1;
                 }
@@ -1598,6 +1598,8 @@ mod pancurses_backend {
                     let title_vis = title.chars().count();
                     let dash_fill = (rect.w as usize).saturating_sub(title_vis + 3);
                     out.push_str(&sgr_cup(br, rect.x));
+                    out.push_str(SGR_FG_DEFAULT);
+                    out.push_str(SGR_BG_DEFAULT);
                     out.push_str("┌");
                     out.push_str(SGR_BOLD);
                     out.push_str(" ");
@@ -2451,11 +2453,14 @@ mod pancurses_backend {
                     }
                     out.push_str("┘");
                 }
-                // Status bar: dark gray fg — show status_text when not editing, edit hint when editing.
+                // Status bar: dark gray fg — show status_text when set, edit hint otherwise.
+                let default_hint = "  type to edit (or addr: val)   Enter·confirm   Esc·discard";
                 let display_status = if *editing || !edit_buf.is_empty() {
-                    "  type to edit (or addr: val)   Enter·confirm   Esc·discard".to_string()
-                } else {
+                    default_hint.to_string()
+                } else if !status_text.is_empty() {
                     status_text.clone()
+                } else {
+                    default_hint.to_string()
                 };
                 let ds_len = display_status.len();
                 if has_status {
@@ -3628,13 +3633,7 @@ mod pancurses_backend {
                     buf[row] = truncated;
                 } else {
                     let cell_val = raw_cells.borrow().get(&(cursor_row, cursor_col)).cloned().unwrap_or_default();
-                    let max_fb = width.saturating_sub(addr_text.chars().count() + 3 + formula_bar_trailing.chars().count()).max(1);
-                    let fb_text = if cell_val.chars().count() > max_fb {
-                        let truncated: String = cell_val.chars().take(max_fb.saturating_sub(3)).collect();
-                        format!(" {}  {}…{}", addr_text, truncated, formula_bar_trailing)
-                    } else {
-                        format!(" {}  {}{}", addr_text, cell_val, formula_bar_trailing)
-                    };
+                    let fb_text = format!(" {}  {}", addr_text, cell_val);
                     let truncated: String = fb_text.chars().take(width).collect();
                     buf[row] = truncated;
                 }
@@ -3925,10 +3924,13 @@ mod pancurses_backend {
             }
 
             // Status bar (always on its own line below the bottom border)
+            let default_hint = "  type to edit (or addr: val)   Enter·confirm   Esc·discard";
             let display_status = if editing || !edit_buf.is_empty() {
-                "  type to edit (or addr: val)   Enter·confirm   Esc·discard".to_string()
-            } else {
+                default_hint.to_string()
+            } else if !status_text.is_empty() {
                 status_text.clone()
+            } else {
+                default_hint.to_string()
             };
             if !display_status.is_empty() && row < height {
                 let display = &display_status[..display_status.len().min(width)];
