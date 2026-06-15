@@ -1627,7 +1627,6 @@ mod pancurses_backend {
                             out.push_str(SGR_RESET);
                             out.push_str(sgr_prompt());
                             out.push_str(&" ".repeat(rect.w as usize - content_w));
-                            out.push_str(SGR_RESET);
                         } else {
                             out.push_str(SGR_RESET);
                         }
@@ -1658,6 +1657,8 @@ mod pancurses_backend {
                     let title_vis = title.chars().count();
                     let dash_fill = (rect.w as usize).saturating_sub(title_vis + 3);
                     out.push_str(&sgr_cup(br, rect.x));
+                    out.push_str(SGR_FG_DEFAULT);
+                    out.push_str(SGR_BG_DEFAULT);
                     out.push_str("┌");
                     out.push_str(SGR_BOLD);
                     out.push_str(" ");
@@ -2610,11 +2611,24 @@ mod pancurses_backend {
                             // Advance cursor down (matching ratatui's commit_edit_and_move_down)
                             if *cursor_row + 1 < total_rows {
                                 *cursor_row += 1;
+                                // Re-enter edit mode at the new cursor position
+                                // (matching ratatui's reference behavior)
+                                let existing = raw_cells.borrow().get(&(*cursor_row, *cursor_col)).cloned()
+                                    .or_else(|| cells.borrow().get(&(*cursor_row, *cursor_col)).cloned())
+                                    .unwrap_or_default();
+                                *edit_buf = existing;
+                                *edit_pos = edit_buf.len();
+                                *editing = true;
+                            } else {
+                                *editing = false;
+                                edit_buf.clear();
                             }
+                            Some((r, c, val))
+                        } else {
+                            *editing = false;
+                            edit_buf.clear();
+                            None
                         }
-                        *editing = false;
-                        edit_buf.clear();
-                        if val != original { Some((r, c, val)) } else { None }
                     } else {
                         *editing = true;
                         // Load the raw cell value (not formatted display) so the
