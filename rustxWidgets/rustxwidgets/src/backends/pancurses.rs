@@ -430,22 +430,21 @@ mod pancurses_backend {
                         }
                     }
                     Some(Input::Character('q')) | Some(Input::Character('Q')) => {
-                        // Only quit when spreadsheet is not editing
-                        let editing = with_state(|state| {
+                        // Cancel any active edit and quit
+                        with_state(|state| state.pending_quit = false);
+                        with_state(|state| {
                             if let Some(fid) = state.focus_id {
                                 if is_spreadsheet_focused(state, fid) {
-                                    if let Some(n) = state.node(fid) {
-                                        if let PcWidgetKind::Spreadsheet { editing, .. } = &n.kind {
-                                            return *editing;
+                                    if let Some(n) = state.node_mut(fid) {
+                                        if let PcWidgetKind::Spreadsheet { ref mut editing, ref mut edit_buf, .. } = n.kind {
+                                            *editing = false;
+                                            edit_buf.clear();
                                         }
                                     }
                                 }
                             }
-                            false
                         });
-                        if !editing {
-                            with_state(|state| state.running = false);
-                        }
+                        with_state(|state| state.running = false);
                     }
                     Some(Input::Character('\n')) | Some(Input::Character('\r')) => {
                         with_state(|state| state.pending_quit = false);
@@ -2601,15 +2600,21 @@ mod pancurses_backend {
                         let val = edit_buf.clone();
                         let r = *cursor_row;
                         let c = *cursor_col;
-                        cells.borrow_mut().insert((r, c), val.clone());
-                        raw_cells.borrow_mut().insert((r, c), val.clone());
-                        // Advance cursor down (matching ratatui's commit_edit_and_move_down)
-                        if *cursor_row + 1 < total_rows {
-                            *cursor_row += 1;
+                        // Only commit+move if buffer differs from original
+                        let original = raw_cells.borrow().get(&(r, c)).cloned()
+                            .or_else(|| cells.borrow().get(&(r, c)).cloned())
+                            .unwrap_or_default();
+                        if val != original {
+                            cells.borrow_mut().insert((r, c), val.clone());
+                            raw_cells.borrow_mut().insert((r, c), val.clone());
+                            // Advance cursor down (matching ratatui's commit_edit_and_move_down)
+                            if *cursor_row + 1 < total_rows {
+                                *cursor_row += 1;
+                            }
                         }
                         *editing = false;
                         edit_buf.clear();
-                        Some((r, c, val))
+                        if val != original { Some((r, c, val)) } else { None }
                     } else {
                         *editing = true;
                         // Load the raw cell value (not formatted display) so the
@@ -2741,30 +2746,41 @@ mod pancurses_backend {
     }
 
     fn spreadsheet_commit_edit(state: &mut PcState, fid: usize) {
-        let (r, c, val) = {
+        let result = {
             let n = state.node_mut(fid);
             if let Some(n) = n {
                 if let PcWidgetKind::Spreadsheet { ref cells, ref raw_cells, cursor_row, cursor_col, ref mut edit_buf, ref mut editing, .. } = n.kind {
                     if *editing {
                         let val = edit_buf.clone();
-                        cells.borrow_mut().insert((cursor_row, cursor_col), val.clone());
-                        raw_cells.borrow_mut().insert((cursor_row, cursor_col), val.clone());
-                        *editing = false;
-                        edit_buf.clear();
-                        (cursor_row, cursor_col, val)
+                        let original = raw_cells.borrow().get(&(cursor_row, cursor_col)).cloned()
+                            .or_else(|| cells.borrow().get(&(cursor_row, cursor_col)).cloned())
+                            .unwrap_or_default();
+                        if val != original {
+                            cells.borrow_mut().insert((cursor_row, cursor_col), val.clone());
+                            raw_cells.borrow_mut().insert((cursor_row, cursor_col), val.clone());
+                            *editing = false;
+                            edit_buf.clear();
+                            Some((cursor_row, cursor_col, val))
+                        } else {
+                            *editing = false;
+                            edit_buf.clear();
+                            None
+                        }
                     } else {
-                        return;
+                        None
                     }
                 } else {
-                    return;
+                    None
                 }
             } else {
-                return;
+                None
             }
         };
-        let mut cbs = std::mem::take(&mut state.commit_edit_callbacks);
-        for cb in cbs.iter_mut() { cb(r, c, val.clone()); }
-        state.commit_edit_callbacks = cbs;
+        if let Some((r, c, val)) = result {
+            let mut cbs = std::mem::take(&mut state.commit_edit_callbacks);
+            for cb in cbs.iter_mut() { cb(r, c, val.clone()); }
+            state.commit_edit_callbacks = cbs;
+        }
     }
 
     fn col_label(idx: u32) -> String {
@@ -3982,13 +3998,14 @@ mod pancurses_backend {
             }
 
             // Status bar (always on its own line below the bottom border)
-            let default_hint = "  type to edit (or addr: val)   Enter·confirm   Esc·discard";
+            let edit_hint = "  type to edit (or addr: val)   Enter·confirm   Esc·discard";
+            let normal_hint = "  type/F2·edit; Ctrl+C·copy; Ctrl+X·cut; Ctrl+V·paste; Ctrl+;·date; Ctrl+:·time; Ctrl+S·save; F1·help";
             let display_status = if editing || !edit_buf.is_empty() {
-                default_hint.to_string()
+                edit_hint.to_string()
             } else if !status_text.is_empty() {
                 status_text.clone()
             } else {
-                default_hint.to_string()
+                normal_hint.to_string()
             };
             if !display_status.is_empty() && row < height {
                 let display = &display_status[..display_status.len().min(width)];
