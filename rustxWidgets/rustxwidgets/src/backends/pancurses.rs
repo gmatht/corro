@@ -2530,13 +2530,17 @@ mod pancurses_backend {
         let result = {
             let n = state.node_mut(fid);
             if let Some(n) = n {
-                if let PcWidgetKind::Spreadsheet { ref cells, ref raw_cells, ref mut cursor_row, ref mut cursor_col, ref mut editing, ref mut edit_buf, ref mut edit_pos, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref cells, ref raw_cells, ref mut cursor_row, ref mut cursor_col, ref mut editing, ref mut edit_buf, ref mut edit_pos, total_rows, .. } = n.kind {
                     if *editing {
                         let val = edit_buf.clone();
                         let r = *cursor_row;
                         let c = *cursor_col;
                         cells.borrow_mut().insert((r, c), val.clone());
                         raw_cells.borrow_mut().insert((r, c), val.clone());
+                        // Advance cursor down (matching ratatui's commit_edit_and_move_down)
+                        if *cursor_row + 1 < total_rows {
+                            *cursor_row += 1;
+                        }
                         *editing = false;
                         edit_buf.clear();
                         Some((r, c, val))
