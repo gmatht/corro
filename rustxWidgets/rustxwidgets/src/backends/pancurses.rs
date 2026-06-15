@@ -1558,10 +1558,12 @@ mod pancurses_backend {
                             out.push_str(&after);
                         }
                         if content_w < rect.w as usize {
+                            out.push_str(SGR_RESET);
                             out.push_str(sgr_prompt());
                             out.push_str(&" ".repeat(rect.w as usize - content_w));
                         }
-                        out.push_str(SGR_RESET);
+                        out.push_str(SGR_FG_DEFAULT);
+                        out.push_str(SGR_BG_DEFAULT);
                     } else {
                         // Normal mode: cyan fg, default bg (matching ratatui's
                         // mode_prompt_widget).  Shows address, cell value, and
