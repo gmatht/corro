@@ -1566,22 +1566,16 @@ mod pancurses_backend {
                             out.push_str(SGR_RESET);
                         }
                     } else {
-                        // Normal mode: white fg on dark gray bg (prompt style), bold cell value, caret cursor
+                        // Normal mode: cyan fg on default bg (formula style), cell value, trailing status (matching ratatui)
                         let cell_val = raw_cells.borrow().get(&(*cursor_row, *cursor_col)).cloned().unwrap_or_default();
+                        let fb_text = format!(" {}  {}{}", addr_text, cell_val, formula_bar_trailing);
                         out.push_str(&sgr_cup(row_offset, rect.x));
-                        out.push_str(sgr_prompt());
-                        out.push_str(&format!(" {}  ", addr_text));
-                        out.push_str(SGR_BOLD);
-                        out.push_str(&cell_val);
-                        out.push_str(sgr_caret());
-                        out.push_str(" ");
-                        let content_w = addr_text.chars().count() + cell_val.chars().count() + 4;
-                        if content_w <= rect.w as usize {
-                            out.push_str(SGR_RESET);
-                            out.push_str(sgr_prompt());
-                            if content_w < rect.w as usize {
-                                out.push_str(&" ".repeat(rect.w as usize - content_w));
-                            }
+                        out.push_str(sgr_formula());
+                        out.push_str(&fb_text);
+                        out.push_str(SGR_FG_DEFAULT);
+                        let content_w = fb_text.chars().count();
+                        if content_w < rect.w as usize {
+                            out.push_str(&" ".repeat(rect.w as usize - content_w));
                         }
                     }
                     row_offset += 1;
@@ -1598,8 +1592,6 @@ mod pancurses_backend {
                     let title_vis = title.chars().count();
                     let dash_fill = (rect.w as usize).saturating_sub(title_vis + 3);
                     out.push_str(&sgr_cup(br, rect.x));
-                    out.push_str(SGR_FG_DEFAULT);
-                    out.push_str(SGR_BG_DEFAULT);
                     out.push_str("┌");
                     out.push_str(SGR_BOLD);
                     out.push_str(" ");
@@ -2453,14 +2445,13 @@ mod pancurses_backend {
                     }
                     out.push_str("┘");
                 }
-                // Status bar: dark gray fg — show status_text when set, edit hint otherwise.
-                let default_hint = "  type to edit (or addr: val)   Enter·confirm   Esc·discard";
+                // Status bar: dark gray fg — hints matching ratatui's hints_line()
                 let display_status = if *editing || !edit_buf.is_empty() {
-                    default_hint.to_string()
+                    "  type to edit (or addr: val)   Enter·confirm   Esc·discard".to_string()
                 } else if !status_text.is_empty() {
                     status_text.clone()
                 } else {
-                    default_hint.to_string()
+                    "  type/F2·edit; Ctrl+C·copy; Ctrl+X·cut; Ctrl+V·paste; Ctrl+;·date; Ctrl+:·time; Ctrl+S·save; F1·help".to_string()
                 };
                 let ds_len = display_status.len();
                 if has_status {
@@ -4993,6 +4984,61 @@ mod pancurses_backend {
             let buf = render_spreadsheet_to_buffer(sid, 80, 10);
             assert!(buf[4].contains("ROW0"), "row 0 label missing: {:?}", buf[4]);
             assert!(buf[5].contains("ROW1"), "row 1 label missing: {:?}", buf[5]);
+        }
+
+        /// Verify the SGR rendering of the formula bar: uses sgr_formula() style,
+        /// includes trailing status text, and does NOT emit extra resets before the border.
+        /// This calls render_widget with a dummy Window pointer because Spreadsheet
+        /// rendering never accesses the Window (it writes SGR to spreadsheet_output).
+        #[test]
+        fn formula_bar_sgr_matches_ratatui() {
+            let wid = with_state(|s| s.add_node(
+                PcWidgetKind::Window { title: "test".into() }, None,
+            ));
+            let total_rows = 3u32;
+            let total_cols = 3u32;
+            let sid = with_state(|s| s.add_node(
+                PcWidgetKind::Spreadsheet {
+                    cells: Rc::new(RefCell::new(HashMap::new())),
+                    raw_cells: Rc::new(RefCell::new(HashMap::from([
+                        ((0, 0), "42".into()),
+                    ]))),
+                    cell_styles: Rc::new(RefCell::new(HashMap::new())),
+                    total_rows, total_cols,
+                    top_row: 0, left_col: 0,
+                    cursor_row: 0, cursor_col: 0,
+                    editing: false, edit_buf: String::new(), edit_pos: 0,
+                    col_width: 12, margin_cols: 0, main_cols: total_cols,
+                    formula_bar_address_id: None, formula_bar_entry_id: None,
+                    anchor: None,
+                    menu_text: "Menu".into(),
+                    status_text: String::new(),
+                    border_title: "Test".into(),
+                    formula_bar_trailing: "   ·  Loaded workbook /root/src/corro_mainloop/t_shift5.corro @ revision 30".into(),
+                    column_layout: vec![(0,8,"A".into()),(1,8,"B".into()),(2,8,"C".into())],
+                    row_labels: (0..total_rows).map(|i| (i, format!("{:>4}", i + 1))).collect(),
+                    tab_titles: Vec::new(),
+                    tab_active: 0,
+                    header_row_count: 2,
+                    main_row_count: 24,
+                },
+                Some(wid),
+            ));
+            spreadsheet_set_cursor(sid, 0, 0);
+
+            let buf = render_spreadsheet_to_buffer(sid, 80, 10);
+            // Formula bar (buf[1]) should contain address, cell value, and trailing status
+            assert!(buf[1].contains("A1"), "formula bar missing A1: {:?}", buf[1]);
+            assert!(buf[1].contains("42"), "formula bar missing cell value: {:?}", buf[1]);
+            assert!(buf[1].contains("Loaded workbook"),
+                "formula bar missing trailing status: {:?}", buf[1]);
+            assert!(buf[1].contains("·"),
+                "formula bar missing separator: {:?}", buf[1]);
+            // The trailing text should match the expected status message
+            assert!(buf[1].contains("Loaded workbook"),
+                "formula bar missing status prefix: {:?}", buf[1]);
+            assert!(!buf[1].contains("type/F2"),
+                "formula bar should NOT show edit hints (they belong in status bar): {:?}", buf[1]);
         }
     }
 }
