@@ -1557,11 +1557,11 @@ mod pancurses_backend {
                             out.push_str(SGR_BOLD);
                             out.push_str(&after);
                         }
-                        out.push_str(SGR_RESET);
                         if content_w < rect.w as usize {
                             out.push_str(sgr_prompt());
                             out.push_str(&" ".repeat(rect.w as usize - content_w));
                         }
+                        out.push_str(SGR_RESET);
                     } else {
                         // Normal mode: cyan fg, default bg (matching ratatui's
                         // mode_prompt_widget).  Shows address, cell value, and
@@ -1592,9 +1592,6 @@ mod pancurses_backend {
                     let title_vis = title.chars().count();
                     let dash_fill = (rect.w as usize).saturating_sub(title_vis + 3);
                     out.push_str(&sgr_cup(br, rect.x));
-                    // Always reset bg/fg after formula bar (matching ratatui behavior).
-                    out.push_str(SGR_FG_DEFAULT);
-                    out.push_str(SGR_BG_DEFAULT);
                     out.push_str("┌");
                     out.push_str(SGR_BOLD);
                     out.push_str(" ");
