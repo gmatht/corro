@@ -1566,17 +1566,22 @@ mod pancurses_backend {
                             out.push_str(SGR_RESET);
                         }
                     } else {
-                        // Normal mode: cyan fg on default bg, cell value, optional trailing text (matching ratatui)
+                        // Normal mode: white fg on dark gray bg (prompt style), bold cell value, caret cursor
                         let cell_val = raw_cells.borrow().get(&(*cursor_row, *cursor_col)).cloned().unwrap_or_default();
-                        let trailing = formula_bar_trailing.clone();
-                        let content = format!(" {}  {}{}", addr_text, cell_val, trailing);
-                        let content_cw = content.chars().count();
                         out.push_str(&sgr_cup(row_offset, rect.x));
-                        out.push_str(sgr_formula());
-                        out.push_str(&content);
-                        out.push_str(SGR_RESET);
-                        if content_cw < rect.w as usize {
-                            out.push_str(&" ".repeat(rect.w as usize - content_cw));
+                        out.push_str(sgr_prompt());
+                        out.push_str(&format!(" {}  ", addr_text));
+                        out.push_str(SGR_BOLD);
+                        out.push_str(&cell_val);
+                        out.push_str(sgr_caret());
+                        out.push_str(" ");
+                        let content_w = addr_text.chars().count() + cell_val.chars().count() + 4;
+                        if content_w <= rect.w as usize {
+                            out.push_str(SGR_RESET);
+                            out.push_str(sgr_prompt());
+                            if content_w < rect.w as usize {
+                                out.push_str(&" ".repeat(rect.w as usize - content_w));
+                            }
                         }
                     }
                     row_offset += 1;
@@ -1593,6 +1598,8 @@ mod pancurses_backend {
                     let title_vis = title.chars().count();
                     let dash_fill = (rect.w as usize).saturating_sub(title_vis + 3);
                     out.push_str(&sgr_cup(br, rect.x));
+                    out.push_str(SGR_FG_DEFAULT);
+                    out.push_str(SGR_BG_DEFAULT);
                     out.push_str("┌");
                     out.push_str(SGR_BOLD);
                     out.push_str(" ");
