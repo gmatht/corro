@@ -3626,7 +3626,7 @@ mod pancurses_backend {
                     buf[row] = truncated;
                 } else {
                     let cell_val = raw_cells.borrow().get(&(cursor_row, cursor_col)).cloned().unwrap_or_default();
-                    let fb_text = format!(" {}  {}", addr_text, cell_val);
+                    let fb_text = format!(" {}  {}{}", addr_text, cell_val, formula_bar_trailing);
                     let truncated: String = fb_text.chars().take(width).collect();
                     buf[row] = truncated;
                 }
