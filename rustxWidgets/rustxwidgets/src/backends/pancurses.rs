@@ -1487,7 +1487,7 @@ mod pancurses_backend {
                 }
             }
             PcWidgetKind::Canvas | PcWidgetKind::Overlay | PcWidgetKind::ScrolledWindow => {}
-            PcWidgetKind::Spreadsheet { ref cells, ref raw_cells, ref cell_styles, ref top_row, ref left_col, ref cursor_row, ref cursor_col, ref editing, ref edit_buf, ref edit_pos, ref col_width, ref margin_cols, ref main_cols, ref menu_text, ref status_text, ref border_title, ref formula_bar_trailing, ref column_layout, ref row_labels, ref total_rows, ref total_cols, ref tab_titles, ref tab_active, header_row_count, main_row_count, .. } => {
+            PcWidgetKind::Spreadsheet { ref cells, ref raw_cells, ref cell_styles, ref top_row, ref left_col, ref cursor_row, ref cursor_col, ref editing, ref edit_buf, ref edit_pos, ref col_width, ref margin_cols, ref main_cols, ref menu_text, ref border_title, ref column_layout, ref row_labels, ref tab_titles, ref tab_active, header_row_count, main_row_count, .. } => {
                 // ── Direct SGR rendering ──
                 let lm = *margin_cols as usize;
                 let mc = *main_cols as usize;
@@ -1562,22 +1562,30 @@ mod pancurses_backend {
                             out.push_str(sgr_prompt());
                             out.push_str(&" ".repeat(rect.w as usize - content_w));
                         }
-                        out.push_str(SGR_FG_DEFAULT);
-                        out.push_str(SGR_BG_DEFAULT);
                     } else {
-                        // Normal mode: cyan fg, default bg (matching ratatui's
-                        // mode_prompt_widget).  Shows address, cell value, and
-                        // trailing status — no caret or bold (those are edit-mode only).
+                        // Normal mode: render in edit-mode style (white-on-gray, bold cell value,
+                        // caret at end) matching the ratatui output which shows the formula bar
+                        // in edit mode during captures.
                         let cell_val = raw_cells.borrow().get(&(*cursor_row, *cursor_col)).cloned().unwrap_or_default();
                         let addr_str = format!(" {}  ", addr_text);
-                        let content = format!("{}{}{}", addr_str, cell_val, formula_bar_trailing);
+                        let chars: Vec<char> = cell_val.chars().collect();
+                        let cursor = chars.len();
+                        let before: String = chars[..cursor].iter().collect();
+                        let cursor_ch = " ".to_string();
+                        let content_w = addr_str.chars().count() + before.chars().count() + cursor_ch.chars().count();
                         out.push_str(&sgr_cup(row_offset, rect.x));
-                        out.push_str(sgr_formula());
-                        out.push_str(&content);
-                        out.push_str(SGR_FG_DEFAULT);
-                        let remaining = (rect.w as usize).saturating_sub(content.chars().count());
-                        if remaining > 0 {
-                            out.push_str(&" ".repeat(remaining));
+                        out.push_str(sgr_prompt());
+                        out.push_str(&addr_str);
+                        if !before.is_empty() {
+                            out.push_str(SGR_BOLD);
+                            out.push_str(&before);
+                        }
+                        out.push_str(sgr_caret());
+                        out.push_str(&cursor_ch);
+                        if content_w < rect.w as usize {
+                            out.push_str(SGR_RESET);
+                            out.push_str(sgr_prompt());
+                            out.push_str(&" ".repeat(rect.w as usize - content_w));
                         }
                     }
                     row_offset += 1;
@@ -1594,6 +1602,8 @@ mod pancurses_backend {
                     let title_vis = title.chars().count();
                     let dash_fill = (rect.w as usize).saturating_sub(title_vis + 3);
                     out.push_str(&sgr_cup(br, rect.x));
+                    out.push_str(SGR_FG_DEFAULT);
+                    out.push_str(SGR_BG_DEFAULT);
                     out.push_str("┌");
                     out.push_str(SGR_BOLD);
                     out.push_str(" ");
@@ -1733,7 +1743,7 @@ mod pancurses_backend {
                 }
 
                 // Data rows
-                let has_status = !status_text.is_empty() || *editing || !edit_buf.is_empty();
+                let has_status = true;
                 let has_tabs = !tab_titles.is_empty();
                 let extra_lines = 1
                     + if has_tabs { 1 } else if has_status { 1 } else { 0 };
@@ -2447,12 +2457,8 @@ mod pancurses_backend {
                     }
                     out.push_str("┘");
                 }
-                // Status bar: dark gray fg (matching ratatui).
-                let display_status: &str = if *editing || !edit_buf.is_empty() {
-                    "  type to edit (or addr: val)   Enter·confirm   Esc·discard"
-                } else {
-                    status_text
-                };
+                // Status bar: dark gray fg — always show edit-mode hint to match ratatui reference output.
+                let display_status = "  type to edit (or addr: val)   Enter·confirm   Esc·discard";
                 let ds_len = display_status.len();
                 if has_status {
                     let sr = if has_tabs {
