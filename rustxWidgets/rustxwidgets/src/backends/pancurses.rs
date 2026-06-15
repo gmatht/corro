@@ -1657,8 +1657,6 @@ mod pancurses_backend {
                     let title_vis = title.chars().count();
                     let dash_fill = (rect.w as usize).saturating_sub(title_vis + 3);
                     out.push_str(&sgr_cup(br, rect.x));
-                    out.push_str(SGR_FG_DEFAULT);
-                    out.push_str(SGR_BG_DEFAULT);
                     out.push_str("┌");
                     out.push_str(SGR_BOLD);
                     out.push_str(" ");
