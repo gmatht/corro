@@ -3852,8 +3852,9 @@ mod pancurses_backend {
             // Data rows (with │ border)
             let has_status_bar = !status_text.is_empty() || editing || !edit_buf.is_empty();
             let grid_bottom = height - if has_status_bar { 2 } else { 0 };
+            let header_row_count = if !menu_text.is_empty() { 5 } else { 4 };
             while row < grid_bottom && row < height {
-                let row_idx = top_row + (row.saturating_sub(4)) as u32;
+                let row_idx = top_row + (row.saturating_sub(header_row_count)) as u32;
                 let mut data_row = String::new();
                 data_row.push('│');
                 // Row header
@@ -4312,27 +4313,22 @@ mod pancurses_backend {
             assert!(buf[1].contains("A1"), "formula bar missing A1: {:?}", &buf[1]);
             assert!(buf[1].contains("This Text is really long"), "formula bar missing text");
 
-            // Line 2: Grid header starts with │ border, then column labels
-            assert!(buf[2].starts_with("│"), "grid header missing border: {:?}", &buf[2]);
-            assert!(buf[2].contains("A"), "header missing A");
-            assert!(buf[2].contains("B"), "header missing B");
-            assert!(buf[2].contains("C"), "header missing C");
+            // Line 3: Grid header starts with │ border, then column labels
+            // (Line 0=menu, 1=formula bar, 2=border ┌─, 3=header)
+            assert!(buf[3].starts_with("│"), "grid header missing border: {:?}", &buf[3]);
+            assert!(buf[3].contains("A"), "header missing A");
+            assert!(buf[3].contains("B"), "header missing B");
+            assert!(buf[3].contains("C"), "header missing C");
 
-            // Note: ratatui shows a border box around the grid:
-            //   ┌ corro  3r × 3c  ops 3─────┐   (top border)
-            //   │     [A  │ A     B     C   │   (column headers)
-            // Our pancurses buffer may not match the border format exactly
-            // but the cell content and structural elements should match.
-
-            // Data rows: each should contain the overflow text
-            assert!(buf[4].contains("This Text is really long"), "row 1 missing overflow text");
-            assert!(buf[4].starts_with("│   1"), "row 1 label wrong: {:?}", &buf[4]);
+            // Data rows: start at line 5 (menu=0 formula=1 border=2 header=3 sep=4)
+            assert!(buf[5].contains("This Text is really long"), "row 1 missing overflow text");
+            assert!(buf[5].starts_with("│   1"), "row 1 label wrong: {:?}", &buf[5]);
 
             // Row 2 should start with │   2
-            assert!(buf[5].starts_with("│   2"), "row 2 label wrong: {:?}", &buf[5]);
+            assert!(buf[6].starts_with("│   2"), "row 2 label wrong: {:?}", &buf[6]);
 
             // Row 3 should start with │   3
-            assert!(buf[6].starts_with("│   3"), "row 3 label wrong: {:?}", &buf[6]);
+            assert!(buf[7].starts_with("│   3"), "row 3 label wrong: {:?}", &buf[7]);
 
             // Status bar
             let last = &buf[buf.len() - 1];
@@ -4873,9 +4869,9 @@ mod pancurses_backend {
                 Some(wid),
             ));
             let buf = render_spreadsheet_to_buffer(sid, 80, 10);
-            // Header is at index 1 (index 0 = formula bar, since menu_text is empty)
-            assert!(buf[1].contains("X"), "header missing X in {:?}", &buf[1]);
-            assert!(buf[1].contains("Y"), "header missing Y in {:?}", &buf[1]);
+            // Header is at index 2 (index 0 = formula bar, index 1 = border, since menu_text is empty)
+            assert!(buf[2].contains("X"), "header missing X in {:?}", &buf[2]);
+            assert!(buf[2].contains("Y"), "header missing Y in {:?}", &buf[2]);
         }
 
         /// Reproduce blank spreadsheet: test with margin columns, header rows,
@@ -4945,20 +4941,20 @@ mod pancurses_backend {
 
             let buf = render_spreadsheet_to_buffer(sid, 120, 40);
 
-            // Data rows start at index 4
+            // Data rows start at index 5 (menu+formula+border+header+separator=5)
             // Row 1 should contain "hello" in the first main column
-            assert!(buf[4].contains("hello"),
-                "row 1 missing 'hello'. line={:?}", &buf[4]);
-            assert!(buf[4].contains("world"),
-                "row 1 missing 'world'. line={:?}", &buf[4]);
+            assert!(buf[5].contains("hello"),
+                "row 1 missing 'hello'. line={:?}", &buf[5]);
+            assert!(buf[5].contains("world"),
+                "row 1 missing 'world'. line={:?}", &buf[5]);
 
-            assert!(buf[5].contains("foo"),
-                "row 2 missing 'foo'. line={:?}", &buf[5]);
-            assert!(buf[5].contains("bar"),
-                "row 2 missing 'bar'. line={:?}", &buf[5]);
+            assert!(buf[6].contains("foo"),
+                "row 2 missing 'foo'. line={:?}", &buf[6]);
+            assert!(buf[6].contains("bar"),
+                "row 2 missing 'bar'. line={:?}", &buf[6]);
 
-            assert!(buf[4].starts_with("│   1"),
-                "row 1 should start with │   1. got={:?}", &buf[4]);
+            assert!(buf[5].starts_with("│   1"),
+                "row 1 should start with │   1. got={:?}", &buf[5]);
         }
 
         /// Diagnose blank rows: check row_idx computation and label lookup
@@ -5002,16 +4998,13 @@ mod pancurses_backend {
             spreadsheet_set_cell(sid, 1, 2, "A2_data");
 
             let buf = render_spreadsheet_to_buffer(sid, 80, 20);
-            for (i, line) in buf.iter().enumerate() {
-                eprintln!("buf[{}]: {:?}", i, line);
-            }
-            // Data rows start at index 4 (menu=0 formula=1 header=2 sep=3)
-            assert!(buf[4].contains("A1_data"),
-                "buf[4] missing cell data: {:?}", &buf[4]);
-            assert!(buf[4].contains("   1"),
-                "buf[4] missing row label: {:?}", &buf[4]);
-            assert!(buf[5].contains("A2_data"),
+            // Data rows start at index 5 (menu=0 formula=1 border=2 header=3 sep=4)
+            assert!(buf[5].contains("A1_data"),
                 "buf[5] missing cell data: {:?}", &buf[5]);
+            assert!(buf[5].contains("   1"),
+                "buf[5] missing row label: {:?}", &buf[5]);
+            assert!(buf[6].contains("A2_data"),
+                "buf[6] missing cell data: {:?}", &buf[6]);
         }
 
         /// Test rendering with empty cell data that fill_cells would produce
@@ -5055,10 +5048,10 @@ mod pancurses_backend {
 
             // Structure should still be present: menu, formula bar, headers, data rows
             assert!(buf[0].contains("File"), "menu missing: {:?}", &buf[0]);
-            assert!(buf[2].contains("A"), "header missing A: {:?}", &buf[2]);
+            assert!(buf[3].contains("A"), "header missing A: {:?}", &buf[3]);
 
             // Data rows should have proper structure even if empty
-            assert!(buf[4].starts_with("│"), "data row missing │: {:?}", &buf[4]);
+            assert!(buf[5].starts_with("│"), "data row missing │: {:?}", &buf[5]);
         }
 
         /// Rendering: pre-computed row labels appear in data rows.
