@@ -656,6 +656,9 @@ mod pancurses_adapter {
         pub fn set_cursor(&self, row: u32, col: u32) {
             crate::backends::pancurses::spreadsheet_set_cursor(self.id, row, col);
         }
+        pub fn set_editing(&self, editing: bool, edit_buf: &str, edit_pos: usize) {
+            crate::backends::pancurses::spreadsheet_set_edit_state(self.id, editing, edit_buf, edit_pos);
+        }
         pub fn set_grid_config(&self, margin_cols: u32, main_cols: u32) {
             crate::backends::pancurses::spreadsheet_set_grid_config(self.id, margin_cols, main_cols);
         }
@@ -842,6 +845,9 @@ mod pancurses_adapter {
     }
     pub fn spreadsheet_set_grid_config(id: usize, margin_cols: u32, main_cols: u32) {
         crate::backends::pancurses::spreadsheet_set_grid_config(id, margin_cols, main_cols);
+    }
+    pub fn spreadsheet_set_edit_state(id: usize, editing: bool, edit_buf: &str, edit_pos: usize) {
+        crate::backends::pancurses::spreadsheet_set_edit_state(id, editing, edit_buf, edit_pos);
     }
 }
 

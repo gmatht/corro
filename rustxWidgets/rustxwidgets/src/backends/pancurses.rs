@@ -449,7 +449,8 @@ mod pancurses_backend {
                     }
                     Some(Input::Character('\n')) | Some(Input::Character('\r')) => {
                         with_state(|state| state.pending_quit = false);
-                        let callbacks = with_state(|state| {
+                        // Process Enter action and collect toggle callbacks
+                        let toggle_callbacks: Vec<Callback> = with_state(|state| {
                             if state.menu_open {
                                 state.menu_open = false;
                                 vec![]
@@ -457,17 +458,6 @@ mod pancurses_backend {
                                 if is_spreadsheet_focused(state, fid) {
                                     spreadsheet_enter(state, fid);
                                     spreadsheet_scroll_to_cursor(state, fid);
-                                    // Fire cursor-move callbacks so the application can
-                                    // refresh cell display (fill_cells) after a commit.
-                                    let mut cbs = std::mem::take(&mut state.cursor_move_callbacks);
-                                    let (row, col) = {
-                                        let n = state.node(fid).unwrap();
-                                        if let PcWidgetKind::Spreadsheet { cursor_row, cursor_col, .. } = &n.kind {
-                                            (*cursor_row, *cursor_col)
-                                        } else { (0, 0) }
-                                    };
-                                    for cb in cbs.iter_mut() { cb(row, col); }
-                                    state.cursor_move_callbacks = cbs;
                                     vec![]
                                 } else {
                                     toggle_focused(state, fid).1
@@ -476,7 +466,31 @@ mod pancurses_backend {
                                 vec![]
                             }
                         });
-                        fire_callbacks(callbacks);
+                        fire_callbacks(toggle_callbacks);
+                        // Fire cursor-move callbacks OUTSIDE with_state to avoid
+                        // double-borrow panic when callbacks call with_state (e.g.
+                        // fill_cells → spreadsheet.set_cell → with_state).
+                        let cursor_pos = with_state(|state| {
+                            if let Some(fid) = state.focus_id {
+                                if is_spreadsheet_focused(state, fid) {
+                                    let n = state.node(fid).unwrap();
+                                    if let PcWidgetKind::Spreadsheet { cursor_row, cursor_col, .. } = &n.kind {
+                                        Some((*cursor_row, *cursor_col))
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        });
+                        if let Some((row, col)) = cursor_pos {
+                            let mut cbs = with_state(|state| std::mem::take(&mut state.cursor_move_callbacks));
+                            for cb in cbs.iter_mut() { cb(row, col); }
+                            with_state(|state| state.cursor_move_callbacks = cbs);
+                        }
                     }
                     Some(Input::Character(c)) => {
                         with_state(|state| state.pending_quit = false);
@@ -3051,6 +3065,18 @@ mod pancurses_backend {
                 if let PcWidgetKind::Spreadsheet { ref mut cursor_row, ref mut cursor_col, .. } = n.kind {
                     *cursor_row = row;
                     *cursor_col = col;
+                }
+            }
+        });
+    }
+
+    pub fn spreadsheet_set_edit_state(id: usize, is_editing: bool, buf: &str, pos: usize) {
+        with_state(|s| {
+            if let Some(n) = s.node_mut(id) {
+                if let PcWidgetKind::Spreadsheet { ref mut editing, ref mut edit_buf, ref mut edit_pos, .. } = n.kind {
+                    *editing = is_editing;
+                    *edit_buf = buf.to_string();
+                    *edit_pos = pos;
                 }
             }
         });
