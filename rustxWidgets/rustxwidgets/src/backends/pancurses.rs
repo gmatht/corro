@@ -738,22 +738,23 @@ mod pancurses_backend {
                                         if is_spreadsheet_focused(state, fid) {
                                             if let Some(n) = state.node_mut(fid) {
                                                 if let PcWidgetKind::Spreadsheet { ref mut editing, ref mut cursor_col, ref mut cursor_row, total_cols, total_rows, ref mut edit_buf, ref mut edit_pos, .. } = n.kind {
-                                                    if !*editing {
-                                                        // Not in edit mode — check for special keys
-                                                        if c == 'c' || c == 'C' {
-                                                            if *cursor_col < total_cols - 1 { *cursor_col = total_cols - 1; }
-                                                            spreadsheet_scroll_to_cursor(state, fid);
-                                                            return;
-                                                        }
-                                                        if c == 'r' || c == 'R' {
-                                                            if *cursor_row < total_rows - 1 { *cursor_row = total_rows - 1; }
-                                                            spreadsheet_scroll_to_cursor(state, fid);
-                                                            return;
-                                                        }
-                                                        // Start editing with this character
-                                                        *editing = true;
-                                                        *edit_buf = c.to_string();
-                                                        *edit_pos = 1;
+                                                if !*editing {
+                                                            // Not in edit mode — check for special keys
+                                                            if c == 'c' || c == 'C' {
+                                                                if *cursor_col < total_cols - 1 { *cursor_col = total_cols - 1; }
+                                                                spreadsheet_scroll_to_cursor(state, fid);
+                                                                return;
+                                                            }
+                                                            if c == 'r' || c == 'R' {
+                                                                if *cursor_row < total_rows - 1 { *cursor_row = total_rows - 1; }
+                                                                spreadsheet_scroll_to_cursor(state, fid);
+                                                                return;
+                                                            }
+                                                            // Do NOT auto-start edit mode for arbitrary characters.
+                                                            // Only Enter (handled elsewhere) starts editing, matching
+                                                            // the ratatui backend where digits are no-ops in Normal
+                                                            // mode.  This avoids desynchronising grid state when
+                                                            // recording replays send digit keystrokes (rec5).
                                                     } else {
                                                         // In edit mode — append character
                                                         edit_buf.insert(*edit_pos, c);
