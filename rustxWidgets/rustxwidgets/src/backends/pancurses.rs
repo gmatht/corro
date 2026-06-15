@@ -750,12 +750,14 @@ mod pancurses_backend {
                                                                 spreadsheet_scroll_to_cursor(state, fid);
                                                                 return;
                                                             }
-                                                            // Do NOT auto-start edit mode for arbitrary characters.
-                                                            // Only Enter (handled elsewhere) starts editing, matching
-                                                            // the ratatui backend where digits are no-ops in Normal
-                                                            // mode.  This avoids desynchronising grid state when
-                                                            // recording replays send digit keystrokes (rec5).
-                                                    } else {
+                                                             // Auto-start edit mode & insert character,
+                                                             // matching the ratatui backend.
+                                                             *editing = true;
+                                                             edit_buf.clear();
+                                                             *edit_pos = 0;
+                                                     }
+                                                     if *editing {
+                                                         // Still check editing in case we just entered edit mode above
                                                         // In edit mode — append character
                                                         edit_buf.insert(*edit_pos, c);
                                                         *edit_pos += 1;
