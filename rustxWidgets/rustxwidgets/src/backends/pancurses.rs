@@ -553,31 +553,51 @@ mod pancurses_backend {
                                                         if state.menu_open { return None; }
                                                         if let Some(fid) = state.focus_id {
                                                             if is_spreadsheet_focused(state, fid) {
+                                                                let was_editing = {
+                                                                    let n = state.node(fid).unwrap();
+                                                                    matches!(&n.kind, PcWidgetKind::Spreadsheet { editing: true, .. })
+                                                                };
                                                                 spreadsheet_prepare_move(state, fid, false);
                                                                 spreadsheet_commit_edit(state, fid);
-                                                                if let Some(n) = state.node_mut(fid) {
-                                                                    if let PcWidgetKind::Spreadsheet { ref mut cursor_row, ref mut cursor_col, total_rows, total_cols, .. } = n.kind {
-                                                                        match dir_char {
-                                                                            'A' => { // Up
-                                                                                if *cursor_row > 0 { *cursor_row -= 1; }
-                                                                                else { return Some((u32::MAX, *cursor_col)); }
+                                                                let needs_sentinel = {
+                                                                    if let Some(n) = state.node_mut(fid) {
+                                                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_row, ref mut cursor_col, total_rows, total_cols, .. } = n.kind {
+                                                                            match dir_char {
+                                                                                'A' => { if *cursor_row > 0 { *cursor_row -= 1; None } else { Some(u32::MAX) } }
+                                                                                'B' => { if *cursor_row + 1 < total_rows { *cursor_row += 1; None } else { Some(u32::MAX - 1) } }
+                                                                                'C' => { *cursor_col += 1; None }
+                                                                                'D' => { if *cursor_col > 0 { *cursor_col -= 1; } None }
+                                                                                _ => None,
                                                                             }
-                                                                            'B' => { // Down
-                                                                                if *cursor_row + 1 < total_rows { *cursor_row += 1; }
-                                                                                else { return Some((u32::MAX - 1, *cursor_col)); }
-                                                                            }
-                                                                            'C' => { // Right
-                                                                                if *cursor_col + 1 < total_cols { *cursor_col += 1; }
-                                                                            }
-                                                                            'D' => { // Left
-                                                                                if *cursor_col > 0 { *cursor_col -= 1; }
-                                                                            }
-                                                                            _ => {}
+                                                                        } else {
+                                                                            None
                                                                         }
-                                                                        return Some((*cursor_row, *cursor_col));
+                                                                    } else {
+                                                                        None
                                                                     }
+                                                                };
+                                                                if let Some(sentinel) = needs_sentinel {
+                                                                    if was_editing {
+                                                                        spreadsheet_enter(state, fid);
+                                                                    }
+                                                                    let col = {
+                                                                        let n = state.node(fid).unwrap();
+                                                                        if let PcWidgetKind::Spreadsheet { cursor_col, .. } = &n.kind {
+                                                                            *cursor_col
+                                                                        } else { 0 }
+                                                                    };
+                                                                    return Some((sentinel, col));
                                                                 }
-                                                                spreadsheet_scroll_to_cursor(state, fid);
+                                                                if was_editing {
+                                                                    spreadsheet_enter(state, fid);
+                                                                }
+                                                                let (row, col) = {
+                                                                    let n = state.node(fid).unwrap();
+                                                                    if let PcWidgetKind::Spreadsheet { cursor_row, cursor_col, .. } = &n.kind {
+                                                                        (*cursor_row, *cursor_col)
+                                                                    } else { (0, 0) }
+                                                                };
+                                                                return Some((row, col));
                                                             }
                                                         }
                                                         None
@@ -923,16 +943,33 @@ mod pancurses_backend {
                                     };
                                     spreadsheet_prepare_move(state, fid, false);
                                     spreadsheet_commit_edit(state, fid);
-                                    {
+                                    let needs_sentinel = {
                                         if let Some(n) = state.node_mut(fid) {
-                                            if let PcWidgetKind::Spreadsheet { ref mut cursor_row, ref cursor_col, .. } = n.kind {
+                                            if let PcWidgetKind::Spreadsheet { ref mut cursor_row, .. } = n.kind {
                                                 if *cursor_row > 0 {
                                                     *cursor_row -= 1;
+                                                    false
                                                 } else {
-                                                    return Some((u32::MAX, *cursor_col));
+                                                    true
                                                 }
+                                            } else {
+                                                false
                                             }
+                                        } else {
+                                            false
                                         }
+                                    };
+                                    if needs_sentinel {
+                                        if was_editing {
+                                            spreadsheet_enter(state, fid);
+                                        }
+                                        let sentinel_col = {
+                                            let n = state.node(fid).unwrap();
+                                            if let PcWidgetKind::Spreadsheet { cursor_col, .. } = &n.kind {
+                                                *cursor_col
+                                            } else { 0 }
+                                        };
+                                        return Some((u32::MAX, sentinel_col));
                                     }
                                     if was_editing {
                                         spreadsheet_enter(state, fid);
@@ -973,17 +1010,47 @@ mod pancurses_backend {
                                 None
                             } else if let Some(fid) = state.focus_id {
                                 if is_spreadsheet_focused(state, fid) {
+                                    let was_editing = {
+                                        let n = state.node(fid).unwrap();
+                                        matches!(&n.kind, PcWidgetKind::Spreadsheet { editing: true, .. })
+                                    };
                                     spreadsheet_commit_edit(state, fid);
-                                    {
+                                    let max_row = {
+                                        let n = state.node(fid).unwrap();
+                                        if let PcWidgetKind::Spreadsheet { total_rows, .. } = &n.kind {
+                                            *total_rows
+                                        } else { 0 }
+                                    };
+                                    let needs_sentinel = {
                                         if let Some(n) = state.node_mut(fid) {
-                                            if let PcWidgetKind::Spreadsheet { ref mut cursor_row, ref cursor_col, total_rows, .. } = n.kind {
-                                                if *cursor_row + 1 < total_rows {
+                                            if let PcWidgetKind::Spreadsheet { ref mut cursor_row, .. } = n.kind {
+                                                if *cursor_row + 1 < max_row {
                                                     *cursor_row += 1;
+                                                    false
                                                 } else {
-                                                    return Some((u32::MAX - 1, *cursor_col));
+                                                    true
                                                 }
+                                            } else {
+                                                false
                                             }
+                                        } else {
+                                            false
                                         }
+                                    };
+                                    if needs_sentinel {
+                                        if was_editing {
+                                            spreadsheet_enter(state, fid);
+                                        }
+                                        let sentinel_col = {
+                                            let n = state.node(fid).unwrap();
+                                            if let PcWidgetKind::Spreadsheet { cursor_col, .. } = &n.kind {
+                                                *cursor_col
+                                            } else { 0 }
+                                        };
+                                        return Some((u32::MAX - 1, sentinel_col));
+                                    }
+                                    if was_editing {
+                                        spreadsheet_enter(state, fid);
                                     }
                                     let (row, col) = {
                                         let n = state.node(fid).unwrap();
@@ -1592,6 +1659,8 @@ mod pancurses_backend {
                     let title_vis = title.chars().count();
                     let dash_fill = (rect.w as usize).saturating_sub(title_vis + 3);
                     out.push_str(&sgr_cup(br, rect.x));
+                    out.push_str(SGR_FG_DEFAULT);
+                    out.push_str(SGR_BG_DEFAULT);
                     out.push_str("┌");
                     out.push_str(SGR_BOLD);
                     out.push_str(" ");
