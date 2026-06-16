@@ -3805,14 +3805,14 @@ mod pancurses_backend {
                     for (i, &(ci, w, ref label)) in column_layout.iter().enumerate() {
                         let padded = format!("{:<1$}", label, (w as usize).max(1));
                         hdr.push_str(&padded);
-                        if i + 1 < n {
-                            let is_boundary = lm > 0 && (ci == (lm - 1) as u32 || ci == (lm + mc - 1) as u32);
-                            if is_boundary {
-                                hdr.push('│');
-                            } else {
-                                hdr.push(' ');
-                            }
+                    if i + 1 < n {
+                        let is_boundary = lm > 0 && (ci == (lm - 1) as u32 || ci == (lm + mc - 1) as u32);
+                        if is_boundary {
+                            hdr.push_str("│ ");
+                        } else {
+                            hdr.push(' ');
                         }
+                    }
                     }
                 } else {
                     let max_data_cols = ((width as i32 - rh_w as i32 - 2) / (cw as i32 + 1)).max(1) as usize;
@@ -3893,27 +3893,31 @@ mod pancurses_backend {
                 // Row header
                 if use_row_labels {
                     if let Some((_, label)) = row_labels.iter().find(|(r, _)| *r == row_idx) {
-                        data_row.push_str(label);
+                        data_row.push_str(&format!("{:>4} ", label.trim()));
                     } else {
-                        data_row.push_str(&format!("{:>4}", row_idx + 1));
+                        data_row.push_str(&format!("{:>4} ", row_idx + 1));
                     }
                 } else {
-                    data_row.push_str(&format!("{:>4}", row_idx + 1));
+                    data_row.push_str(&format!("{:>4} ", row_idx + 1));
                 }
-                data_row.push(sep);
                 // Data cells
                 let cells_ref = cells.borrow();
                 if use_layout {
                     let lm = margin_cols;
+                    let mc = main_cols;
                     let n = column_layout.len();
                     let mut vi = 0usize;
                     while vi < n {
                         let (col_idx, w, _) = column_layout[vi];
                         let cell_text = cells_ref.get(&(row_idx, col_idx)).map(|s| s.as_str()).unwrap_or("");
                         let cell_w = w as usize;
+                        let is_boundary = lm > 0 && (col_idx == lm - 1 || col_idx == lm + mc - 1);
                         if cell_text.is_empty() {
                             data_row.push_str(&format!("{:<1$}", "", cell_w));
                             vi += 1;
+                            if vi < n && is_boundary {
+                                data_row.push_str("│ ");
+                            }
                             continue;
                         }
                         let text_width = cell_text.chars().count();
@@ -3930,7 +3934,7 @@ mod pancurses_backend {
                                 // At right-margin boundary: stop if text fits
                                 // within the main columns + PipeAndSpace,
                                 // otherwise continue into right-margin cols.
-                                if lm > 0 && (sc_idx as usize) == lm as usize + mc {
+                                if lm > 0 && (sc_idx as usize) == lm as usize + mc as usize {
                                     let boundary_total: usize = column_layout[vi..scan].iter()
                                         .map(|&(_, w, _)| w as usize).sum::<usize>()
                                         + (scan.saturating_sub(vi + 1))
@@ -3946,7 +3950,7 @@ mod pancurses_backend {
                                 } else { break; }
                             }
                         }
-                        let gap_after = if overflow_cols == 0 && vi + 1 < n { 1 } else { 0 };
+                        let gap_after = if overflow_cols == 0 && vi + 1 < n && !is_boundary { 1 } else { 0 };
                         let mut total_avail: usize = column_layout[vi..=vi+overflow_cols].iter()
                             .map(|&(_, w, _)| w as usize).sum::<usize>()
                             + overflow_cols // spaces between overflow columns
@@ -3991,6 +3995,9 @@ mod pancurses_backend {
                         };
                         data_row.push_str(&format!("{:<1$}", display, total_width));
                         vi += 1 + overflow_cols;
+                        if vi < n && is_boundary {
+                            data_row.push_str("│ ");
+                        }
                     }
                 } else {
                     let max_data_cols = ((width as i32 - rh_w as i32 - 2) / (cw as i32 + 1)).max(1) as usize;
