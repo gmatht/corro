@@ -2124,7 +2124,33 @@ mod pancurses_backend {
                                 continue;
                             }
                             let w = column_layout[vi].1 as usize;
-                            let text_width = cell_text.chars().count();
+                            // When editing, show the edit buffer for the cursor cell.
+                            // The edit buffer holds the raw value; align it to
+                            // the column width (right for numeric, left otherwise).
+                            let display_source: String = if *editing && is_cursor_cell {
+                                let raw = &**edit_buf;
+                                let raw_w = raw.chars().count();
+                                if raw_w < w {
+                                    if raw.starts_with(|c: char| c.is_ascii_digit() || c == '-') {
+                                        // Right-align numeric edit buffer
+                                        let pad = w - raw_w;
+                                        let mut s = String::with_capacity(w);
+                                        for _ in 0..pad { s.push(' '); }
+                                        s.push_str(raw);
+                                        s
+                                    } else {
+                                        // Left-align text edit buffer
+                                        let mut s = raw.to_string();
+                                        for _ in raw_w..w { s.push(' '); }
+                                        s
+                                    }
+                                } else {
+                                    raw.to_string()
+                                }
+                            } else {
+                                cell_text.to_string()
+                            };
+                            let text_width = display_source.chars().count();
                             let mut overflow_cols = 0usize;
                             let mut can_overflow = false;
                             if text_width > w {
@@ -2222,14 +2248,14 @@ mod pancurses_backend {
                             }
                             let display = if text_width > total_avail {
                                 if overflow_cols == 0 {
-                                    cell_text.chars().take(total_avail).collect::<String>()
+                                    display_source.chars().take(total_avail).collect::<String>()
                                 } else {
                                     let trunc = total_avail.saturating_sub(1).max(1);
-                                    let mut s: String = cell_text.chars().take(trunc).collect();
+                                    let mut s: String = display_source.chars().take(trunc).collect();
                                     if text_width > trunc { s.push('…'); }
                                     s
                                 }
-                            } else { cell_text.to_string() };
+                            } else { display_source.to_string() };
                             // Cell SGR style matching ratatui priority:
                             //   1. cursor cell → bg(DarkGray)
                             //   2. footer agg  → bold + fg(Cyan)
