@@ -1941,6 +1941,7 @@ mod pancurses_backend {
                                 .map(|s| s.as_str()).unwrap_or("");
                             let cell_style = cell_styles_ref.get(&(row_idx, col_idx)).copied().unwrap_or(0);
                             let is_cursor_cell = row_idx == *cursor_row && col_idx == *cursor_col;
+
                             if cell_text.is_empty() {
                                 // Empty cell: draw cursor highlight if needed
                                 let is_agg_empty = cell_style == 2 || cell_style == 3;
@@ -2036,21 +2037,20 @@ mod pancurses_backend {
                                         }
                                     }
                                 } else if (col_idx as usize) >= lm + mc {
-                                    // Right-margin column: match ratatui which only
-                                    // renders the first right-margin column with gray
-                                    // foreground for normal rows; boundary rows get
-                                    // gray for all columns.
+                                    // Right-margin column: match ratatui which uses
+                                    // gray foreground for all columns in both normal
+                                    // and boundary rows.
                                     // When a preceding cell overflowed into this
                                     // area, use default style (matching ratatui's
                                     // paragraph auto-fill behavior).
                                     let cw = column_layout[vi].1 as i32;
                                     let use_gray = is_boundary || ((col_idx as usize) == lm + mc && !prev_overflowed);
                                     out.push_str(&sgr_cup(ry, sx));
-                                    if is_boundary {
-                                        out.push_str(SGR_UNDERLINE);
-                                    }
                                     if use_gray {
                                         out.push_str(sgr_sep());
+                                    } else if prev_overflowed {
+                                        out.push_str(SGR_FG_DEFAULT);
+                                        out.push_str(SGR_BG_DEFAULT);
                                     } else {
                                         out.push_str(SGR_FG_DEFAULT);
                                         out.push_str(SGR_BG_DEFAULT);
@@ -2059,15 +2059,15 @@ mod pancurses_backend {
                                         out.push(' ');
                                     }
                                     if use_gray {
-                                    if is_boundary && vi + 1 >= n {
-                                        out.push_str(SGR_RESET);
+                                        if is_boundary && vi + 1 >= n {
+                                            out.push_str(SGR_RESET);
+                                        } else {
+                                            out.push_str(SGR_FG_DEFAULT);
+                                        }
                                     } else {
                                         out.push_str(SGR_FG_DEFAULT);
+                                        out.push_str(SGR_BG_DEFAULT);
                                     }
-                                } else {
-                                    out.push_str(SGR_FG_DEFAULT);
-                                    out.push_str(SGR_BG_DEFAULT);
-                                }
                                 let gap_after = if vi + 1 < n { 1 } else { 0 };
                                 if gap_after > 0 {
                                     let is_sep_col = lm > 0 && ((col_idx as usize) == lm - 1 || (col_idx as usize) == lm + mc - 1);
@@ -2084,8 +2084,7 @@ mod pancurses_backend {
                                 // Empty cell in main column: check style
                                     let cw = column_layout[vi].1 as i32;
                                     out.push_str(&sgr_cup(ry, sx));
-                                    if is_boundary {
-                                        out.push_str(SGR_UNDERLINE);
+                                    if is_boundary && !prev_overflowed {
                                         out.push_str(sgr_sep());
                                     } else if prev_overflowed {
                                         out.push_str(sgr_sep());
@@ -2096,7 +2095,9 @@ mod pancurses_backend {
                                     for _ in 0..cw {
                                         out.push(' ');
                                     }
-                                    if is_boundary {
+                                    if is_boundary && !prev_overflowed {
+                                        out.push_str(SGR_FG_DEFAULT);
+                                    } else if is_boundary {
                                         if vi + 1 >= n {
                                             out.push_str(SGR_RESET);
                                         } else {
@@ -2248,14 +2249,16 @@ mod pancurses_backend {
                                 sgr_cell_footer_agg()
                             } else if cell_style == 2 {
                                 sgr_cell_agg()
-                            } else if is_boundary && !can_overflow {
-                                sgr_sep()
-                            } else if is_left_margin_col && !can_overflow {
+                            } else if is_left_margin_col && cell_text.is_empty() {
                                 sgr_sep()
                             } else if is_right_margin_col && cell_text.is_empty()
                                 && (is_boundary || ((col_idx as usize) == lm + mc && !prev_overflowed)) {
                                 sgr_sep()
                             } else if prev_overflowed && cell_text.is_empty() && !is_left_margin_col && !is_right_margin_col {
+                                sgr_sep()
+                            } else if is_left_margin_col {
+                                ""
+                            } else if is_boundary {
                                 sgr_sep()
                             } else {
                                 ""
@@ -2263,7 +2266,7 @@ mod pancurses_backend {
                             // When the cell overflows, skip the boundary SGR reset
                             // too so the overflow text stays in default style.
                             let is_overflowing = can_overflow;
-                            let underline_prefix = if is_boundary && !can_overflow {
+                            let underline_prefix = if is_boundary && !can_overflow && is_left_margin_col {
                                 SGR_UNDERLINE
                             } else {
                                 ""
@@ -2340,6 +2343,7 @@ mod pancurses_backend {
                                 } else if (is_left_margin_col || is_right_margin_col) && !prev_overflowed {
                                     out.push_str(SGR_FG_DEFAULT);
                                 } else if sgr_applied {
+                                    out.push_str(SGR_BG_DEFAULT);
                                     out.push_str(SGR_FG_DEFAULT);
                                 }
                             }
