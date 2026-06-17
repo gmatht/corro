@@ -3913,7 +3913,8 @@ mod pancurses_backend {
                         let cell_w = w as usize;
                         let is_boundary = lm > 0 && (col_idx == lm - 1 || col_idx == lm + mc - 1);
                         if cell_text.is_empty() {
-                            data_row.push_str(&format!("{:<1$}", "", cell_w));
+                            let gap_extra = if vi + 1 < n && !is_boundary { 1 } else { 0 };
+                            data_row.push_str(&format!("{:<1$}", "", cell_w + gap_extra));
                             vi += 1;
                             if vi < n && is_boundary {
                                 data_row.push_str("│ ");
