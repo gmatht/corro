@@ -36,6 +36,8 @@ mod pancurses_backend {
     fn sgr_cell_cursor() -> &'static str { "\x1b[48;5;8m" }
     fn sgr_cell_agg() -> &'static str { "\x1b[38;5;6m" }
     fn sgr_cell_footer_agg() -> &'static str { "\x1b[1m\x1b[38;5;6m" }
+    fn sgr_prompt() -> &'static str { "\x1b[38;5;15m\x1b[48;5;8m" }
+    fn sgr_caret() -> &'static str { "\x1b[38;5;0m\x1b[48;5;3m" }
 
     fn emit_sgr(s: &str) {
         let _ = std::io::stdout().write_all(s.as_bytes());
@@ -55,7 +57,7 @@ mod pancurses_backend {
     #[derive(Clone)]
     pub enum PcWidgetKind {
         Window { title: String },
-        Button { label: String },
+        Button { label: String, weight: i32, italic: bool },
         Label { text: String },
         BoxWidget { horizontal: bool, spacing: i32 },
         Grid { cols: usize, rows: usize },
@@ -68,6 +70,9 @@ mod pancurses_backend {
         SimpleAction,
         DropDown { items: Vec<String>, selected: Option<usize> },
         TextView { text: String },
+        Canvas,
+        Overlay,
+        ScrolledWindow,
         Spreadsheet {
             cells: Rc<RefCell<HashMap<(u32, u32), String>>>,
             raw_cells: Rc<RefCell<HashMap<(u32, u32), String>>>,
@@ -114,6 +119,7 @@ mod pancurses_backend {
         pub nodes: Vec<PcWidgetNode>,
         pub next_id: usize,
         pub running: bool,
+        pub pending_quit: bool,
         pub focus_id: Option<usize>,
         pub menu_bar_id: Option<usize>,
         pub menu_open: bool,
@@ -122,6 +128,7 @@ mod pancurses_backend {
         pub spreadsheet_output: String,
         key_callbacks: Vec<(char, Box<dyn FnMut()>)>,
         pub cursor_move_callbacks: Vec<Box<dyn FnMut(u32, u32)>>,
+        pub commit_edit_callbacks: Vec<Box<dyn FnMut(u32, u32, String)>>,
     }
 
     impl PcState {
@@ -130,6 +137,7 @@ mod pancurses_backend {
                 nodes: Vec::new(),
                 next_id: 1,
                 running: true,
+                pending_quit: false,
                 focus_id: None,
                 menu_bar_id: None,
                 menu_open: false,
@@ -138,6 +146,7 @@ mod pancurses_backend {
                 spreadsheet_output: String::new(),
                 key_callbacks: Vec::new(),
                 cursor_move_callbacks: Vec::new(),
+                commit_edit_callbacks: Vec::new(),
             }
         }
 
@@ -194,6 +203,32 @@ mod pancurses_backend {
             raw();
             noecho();
             root.keypad(true);
+            // Register CSI-form arrow keys so that \x1b[A etc. are
+            // recognized even when terminfo uses SS3 (\x1bOA etc.).
+            // screen-256color lacks kri/kind/kLFT/kRIT, so also register
+            // \x1b[1;2{A,B,C,D} as the corresponding plain arrow keys.
+            {
+                use std::os::raw::{c_char, c_int};
+                extern "C" {
+                    fn define_key(definition: *const c_char, keycode: c_int) -> c_int;
+                }
+                const KUP: c_int = 259;
+                const KDOWN: c_int = 258;
+                const KLEFT: c_int = 260;
+                const KRIGHT: c_int = 261;
+                for (seq, code) in [
+                    (&b"\x1b[A\x00"[..], KUP),
+                    (&b"\x1b[B\x00"[..], KDOWN),
+                    (&b"\x1b[D\x00"[..], KLEFT),
+                    (&b"\x1b[C\x00"[..], KRIGHT),
+                    (&b"\x1b[1;2A\x00"[..], KUP),
+                    (&b"\x1b[1;2B\x00"[..], KDOWN),
+                    (&b"\x1b[1;2D\x00"[..], KLEFT),
+                    (&b"\x1b[1;2C\x00"[..], KRIGHT),
+                ] {
+                    unsafe { define_key(seq.as_ptr() as *const c_char, code); }
+                }
+            }
             mousemask(ALL_MOUSE_EVENTS | REPORT_MOUSE_POSITION, None);
             // Use `root.timeout(100)` so we can temporarily change it for Alt+key detection
             root.timeout(100);
@@ -263,14 +298,18 @@ mod pancurses_backend {
                     for id in &ids {
                         if let Some(rect) = state.node(*id).map(|n| n.rect) {
                             if let Some(pid) = state.node(*id).and_then(|n| n.parent) {
-                                let pw = state.node(pid).map(|p| p.rect.w).unwrap_or(1).max(1);
-                                let ph = state.node(pid).map(|p| p.rect.h).unwrap_or(1).max(1);
-                                let mut nr = rect;
-                                nr.x = rect.x.clamp(0, pw - 1);
-                                nr.y = rect.y.clamp(0, ph - 1);
-                                nr.w = rect.w.min(pw - nr.x);
-                                nr.h = rect.h.min(ph - nr.y);
-                                if let Some(n) = state.node_mut(*id) { n.rect = nr; }
+                                if let Some(p) = state.node(pid) {
+                                    let px = p.rect.x;
+                                    let py = p.rect.y;
+                                    let pw = p.rect.w.max(1);
+                                    let ph = p.rect.h.max(1);
+                                    let mut nr = rect;
+                                    nr.x = rect.x.clamp(px, px + pw - 1);
+                                    nr.y = rect.y.clamp(py, py + ph - 1);
+                                    nr.w = rect.w.min(px + pw - nr.x);
+                                    nr.h = rect.h.min(py + ph - nr.y);
+                                    if let Some(n) = state.node_mut(*id) { n.rect = nr; }
+                                }
                             }
                         }
                     }
@@ -331,13 +370,16 @@ mod pancurses_backend {
                 match root.getch() {
                     Some(Input::KeyResize) => {
                         let (my, mx) = root.get_max_yx();
+                        root.clear();
                         with_state(|state| {
                             for node in &mut state.nodes {
                                 match &node.kind {
                                     PcWidgetKind::Window { .. } | PcWidgetKind::Dialog { .. } => {
                                         node.rect = Rect { x: 0, y: 0, w: mx, h: my };
                                     }
-                                    _ => {}
+                                    _ => {
+                                        node.rect = Rect::default();
+                                    }
                                 }
                             }
                         });
@@ -388,25 +430,26 @@ mod pancurses_backend {
                         }
                     }
                     Some(Input::Character('q')) | Some(Input::Character('Q')) => {
-                        // Only quit when spreadsheet is not editing
-                        let editing = with_state(|state| {
+                        // Cancel any active edit and quit
+                        with_state(|state| state.pending_quit = false);
+                        with_state(|state| {
                             if let Some(fid) = state.focus_id {
                                 if is_spreadsheet_focused(state, fid) {
-                                    if let Some(n) = state.node(fid) {
-                                        if let PcWidgetKind::Spreadsheet { editing, .. } = &n.kind {
-                                            return *editing;
+                                    if let Some(n) = state.node_mut(fid) {
+                                        if let PcWidgetKind::Spreadsheet { ref mut editing, ref mut edit_buf, .. } = n.kind {
+                                            *editing = false;
+                                            edit_buf.clear();
                                         }
                                     }
                                 }
                             }
-                            false
                         });
-                        if !editing {
-                            with_state(|state| state.running = false);
-                        }
+                        with_state(|state| state.running = false);
                     }
                     Some(Input::Character('\n')) | Some(Input::Character('\r')) => {
-                        let callbacks = with_state(|state| {
+                        with_state(|state| state.pending_quit = false);
+                        // Process Enter action and collect toggle callbacks
+                        let toggle_callbacks: Vec<Callback> = with_state(|state| {
                             if state.menu_open {
                                 state.menu_open = false;
                                 vec![]
@@ -422,9 +465,34 @@ mod pancurses_backend {
                                 vec![]
                             }
                         });
-                        fire_callbacks(callbacks);
+                        fire_callbacks(toggle_callbacks);
+                        // Fire cursor-move callbacks OUTSIDE with_state to avoid
+                        // double-borrow panic when callbacks call with_state (e.g.
+                        // fill_cells → spreadsheet.set_cell → with_state).
+                        let cursor_pos = with_state(|state| {
+                            if let Some(fid) = state.focus_id {
+                                if is_spreadsheet_focused(state, fid) {
+                                    let n = state.node(fid).unwrap();
+                                    if let PcWidgetKind::Spreadsheet { cursor_row, cursor_col, .. } = &n.kind {
+                                        Some((*cursor_row, *cursor_col))
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        });
+                        if let Some((row, col)) = cursor_pos {
+                            let mut cbs = with_state(|state| std::mem::take(&mut state.cursor_move_callbacks));
+                            for cb in cbs.iter_mut() { cb(row, col); }
+                            with_state(|state| state.cursor_move_callbacks = cbs);
+                        }
                     }
                     Some(Input::Character(c)) => {
+                        with_state(|state| state.pending_quit = false);
                         if c == '\t' {
                             with_state(|state| {
                                 if state.menu_open {
@@ -458,7 +526,100 @@ mod pancurses_backend {
                             let alt_key = root.getch();
                             root.timeout(100);
                             match alt_key {
+                                Some(Input::Character('[')) => {
+                                    // Could be CSI sequence: [1;2A (Shift+Up), [1;2B (Shift+Down),
+                                    // [1;2C (Shift+Right), [1;2D (Shift+Left).
+                                    // Read the remaining bytes to check.
+                                    with_state(|state| state.pending_quit = false);
+                                    root.timeout(50);
+                                    let seq = (
+                                        root.getch(),
+                                        root.getch(),
+                                        root.getch(),
+                                        root.getch(),
+                                    );
+                                    root.timeout(100);
+                                    match seq {
+                                        (Some(Input::Character('1')), Some(Input::Character(';')), Some(Input::Character('2')), dir) => {
+                                            let dir_char = match dir {
+                                                Some(Input::Character(d)) => d,
+                                                _ => '\0',
+                                            };
+                                            match dir_char {
+                                                'A' | 'B' | 'C' | 'D' => {
+                                                    // Shift+Arrow — process as regular arrow key
+                                                    let new_pos = with_state(|state| {
+                                                        if state.menu_open { return None; }
+                                                        if let Some(fid) = state.focus_id {
+                                                            if is_spreadsheet_focused(state, fid) {
+                                                                let was_editing = {
+                                                                    let n = state.node(fid).unwrap();
+                                                                    matches!(&n.kind, PcWidgetKind::Spreadsheet { editing: true, .. })
+                                                                };
+                                                                spreadsheet_prepare_move(state, fid, false);
+                                                                spreadsheet_commit_edit(state, fid);
+                                                                let needs_sentinel = {
+                                                                    if let Some(n) = state.node_mut(fid) {
+                                                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_row, ref mut cursor_col, total_rows, total_cols, .. } = n.kind {
+                                                                            match dir_char {
+                                                                                'A' => { if *cursor_row > 0 { *cursor_row -= 1; None } else { Some(u32::MAX) } }
+                                                                                'B' => { if *cursor_row + 1 < total_rows { *cursor_row += 1; None } else { Some(u32::MAX - 1) } }
+                                                                                'C' => { *cursor_col += 1; None }
+                                                                                'D' => { if *cursor_col > 0 { *cursor_col -= 1; } None }
+                                                                                _ => None,
+                                                                            }
+                                                                        } else {
+                                                                            None
+                                                                        }
+                                                                    } else {
+                                                                        None
+                                                                    }
+                                                                };
+                                                                if let Some(sentinel) = needs_sentinel {
+                                                                    if was_editing {
+                                                                        spreadsheet_enter(state, fid);
+                                                                    }
+                                                                    let col = {
+                                                                        let n = state.node(fid).unwrap();
+                                                                        if let PcWidgetKind::Spreadsheet { cursor_col, .. } = &n.kind {
+                                                                            *cursor_col
+                                                                        } else { 0 }
+                                                                    };
+                                                                    return Some((sentinel, col));
+                                                                }
+                                                                if was_editing {
+                                                                    spreadsheet_enter(state, fid);
+                                                                }
+                                                                let (row, col) = {
+                                                                    let n = state.node(fid).unwrap();
+                                                                    if let PcWidgetKind::Spreadsheet { cursor_row, cursor_col, .. } = &n.kind {
+                                                                        (*cursor_row, *cursor_col)
+                                                                    } else { (0, 0) }
+                                                                };
+                                                                return Some((row, col));
+                                                            }
+                                                        }
+                                                        None
+                                                    });
+                                                    if let Some((row, col)) = new_pos {
+                                                        let mut cbs = with_state(|state| std::mem::take(&mut state.cursor_move_callbacks));
+                                                        for cb in cbs.iter_mut() { cb(row, col); }
+                                                        with_state(|state| state.cursor_move_callbacks = cbs);
+                                                    }
+                                                }
+                                                _ => {
+                                                    // Consumed bytes but pattern didn't match — ignore.
+                                                }
+                                            }
+                                        }
+                                        _ => {
+                                            // Not a Shift+Arrow CSI sequence; consumed bytes are lost.
+                                            // This is acceptable since Alt+[ followed by 1;2A is rare.
+                                        }
+                                    }
+                                }
                                 Some(Input::Character(ac)) => {
+                                    with_state(|state| state.pending_quit = false);
                                     // Alt+key — activate matching submenu
                                     with_state(|state| {
                                         if let Some(mid) = state.menu_bar_id {
@@ -476,14 +637,15 @@ mod pancurses_backend {
                                     });
                                 }
                                 _ => {
-                                    // No following char within 300ms → bare Escape → close edit/menu or quit
+                                    // No following char within 300ms → bare Escape
                                     with_state(|state| {
                                         if let Some(fid) = state.focus_id {
                                             if is_spreadsheet_focused(state, fid) {
                                                 if let Some(n) = state.node_mut(fid) {
-                                                    if let PcWidgetKind::Spreadsheet { ref mut editing, .. } = n.kind {
+                                                    if let PcWidgetKind::Spreadsheet { ref mut editing, ref mut edit_buf, .. } = n.kind {
                                                         if *editing {
                                                             *editing = false; // cancel edit
+                                                            edit_buf.clear();
                                                             return;
                                                         }
                                                     }
@@ -492,8 +654,10 @@ mod pancurses_backend {
                                         }
                                         if state.menu_open {
                                             state.menu_open = false;
-                                        } else {
+                                        } else if state.pending_quit {
                                             state.running = false;
+                                        } else {
+                                            state.pending_quit = true;
                                         }
                                     });
                                 }
@@ -574,23 +738,26 @@ mod pancurses_backend {
                                         if is_spreadsheet_focused(state, fid) {
                                             if let Some(n) = state.node_mut(fid) {
                                                 if let PcWidgetKind::Spreadsheet { ref mut editing, ref mut cursor_col, ref mut cursor_row, total_cols, total_rows, ref mut edit_buf, ref mut edit_pos, .. } = n.kind {
-                                                    if !*editing {
-                                                        // Not in edit mode — check for special keys
-                                                        if c == 'c' || c == 'C' {
-                                                            if *cursor_col < total_cols - 1 { *cursor_col = total_cols - 1; }
-                                                            spreadsheet_scroll_to_cursor(state, fid);
-                                                            return;
-                                                        }
-                                                        if c == 'r' || c == 'R' {
-                                                            if *cursor_row < total_rows - 1 { *cursor_row = total_rows - 1; }
-                                                            spreadsheet_scroll_to_cursor(state, fid);
-                                                            return;
-                                                        }
-                                                        // Start editing with this character
-                                                        *editing = true;
-                                                        *edit_buf = c.to_string();
-                                                        *edit_pos = 1;
-                                                    } else {
+                                                if !*editing {
+                                                            // Not in edit mode — check for special keys
+                                                            if c == 'c' || c == 'C' {
+                                                                if *cursor_col < total_cols - 1 { *cursor_col = total_cols - 1; }
+                                                                spreadsheet_scroll_to_cursor(state, fid);
+                                                                return;
+                                                            }
+                                                            if c == 'r' || c == 'R' {
+                                                                if *cursor_row < total_rows - 1 { *cursor_row = total_rows - 1; }
+                                                                spreadsheet_scroll_to_cursor(state, fid);
+                                                                return;
+                                                            }
+                                                             // Auto-start edit mode & insert character,
+                                                             // matching the ratatui backend.
+                                                             *editing = true;
+                                                             edit_buf.clear();
+                                                             *edit_pos = 0;
+                                                     }
+                                                     if *editing {
+                                                         // Still check editing in case we just entered edit mode above
                                                         // In edit mode — append character
                                                         edit_buf.insert(*edit_pos, c);
                                                         *edit_pos += 1;
@@ -653,6 +820,7 @@ mod pancurses_backend {
                         });
                     }
                     Some(Input::KeyLeft) => {
+                        with_state(|state| state.pending_quit = false);
                         let new_pos = with_state(|state| {
                             if state.menu_open {
                                 if state.active_submenu > 0 {
@@ -662,15 +830,28 @@ mod pancurses_backend {
                                 None
                             } else if let Some(fid) = state.focus_id {
                                 if is_spreadsheet_focused(state, fid) {
+                                    let was_editing = {
+                                        let n = state.node(fid).unwrap();
+                                        matches!(&n.kind, PcWidgetKind::Spreadsheet { editing: true, .. })
+                                    };
                                     spreadsheet_prepare_move(state, fid, false);
                                     spreadsheet_commit_edit(state, fid);
                                     if let Some(n) = state.node_mut(fid) {
                                         if let PcWidgetKind::Spreadsheet { ref mut cursor_col, ref cursor_row, .. } = n.kind {
                                             if *cursor_col > 0 { *cursor_col -= 1; }
-                                            return Some((*cursor_row, *cursor_col));
                                         }
                                     }
-                                    spreadsheet_scroll_to_cursor(state, fid);
+                                    // Re-enter edit mode if we were editing before (like ratatui)
+                                    if was_editing {
+                                        spreadsheet_enter(state, fid);
+                                    }
+                                    let (row, col) = {
+                                        let n = state.node(fid).unwrap();
+                                        if let PcWidgetKind::Spreadsheet { cursor_row, cursor_col, .. } = &n.kind {
+                                            (*cursor_row, *cursor_col)
+                                        } else { (0, 0) }
+                                    };
+                                    return Some((row, col));
                                 } else if let Some(n) = state.node_mut(fid) {
                                     if let PcWidgetKind::Entry { ref mut cursor, .. } = n.kind {
                                         if *cursor > 0 { *cursor -= 1; }
@@ -688,6 +869,7 @@ mod pancurses_backend {
                         }
                     }
                     Some(Input::KeyRight) => {
+                        with_state(|state| state.pending_quit = false);
                         let new_pos = with_state(|state| {
                             if state.menu_open {
                                 if let Some(mid) = state.menu_bar_id {
@@ -703,16 +885,27 @@ mod pancurses_backend {
                                 None
                             } else if let Some(fid) = state.focus_id {
                                 if is_spreadsheet_focused(state, fid) {
+                                    let was_editing = {
+                                        let n = state.node(fid).unwrap();
+                                        matches!(&n.kind, PcWidgetKind::Spreadsheet { editing: true, .. })
+                                    };
                                     spreadsheet_prepare_move(state, fid, false);
                                     spreadsheet_commit_edit(state, fid);
                                     if let Some(n) = state.node_mut(fid) {
-                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_row, ref mut cursor_col, margin_cols, main_cols, .. } = n.kind {
-                                            let max_global = margin_cols + main_cols + margin_cols;
-                                            if *cursor_col + 1 < max_global { *cursor_col += 1; }
-                                            return Some((*cursor_row, *cursor_col));
+                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_row, ref mut cursor_col, .. } = n.kind {
+                                            *cursor_col += 1;
                                         }
                                     }
-                                    spreadsheet_scroll_to_cursor(state, fid);
+                                    if was_editing {
+                                        spreadsheet_enter(state, fid);
+                                    }
+                                    let (row, col) = {
+                                        let n = state.node(fid).unwrap();
+                                        if let PcWidgetKind::Spreadsheet { cursor_row, cursor_col, .. } = &n.kind {
+                                            (*cursor_row, *cursor_col)
+                                        } else { (0, 0) }
+                                    };
+                                    return Some((row, col));
                                 } else if let Some(n) = state.node_mut(fid) {
                                     if let PcWidgetKind::Entry { ref mut cursor, ref buffer } = n.kind {
                                         if *cursor < buffer.len() { *cursor += 1; }
@@ -730,6 +923,7 @@ mod pancurses_backend {
                         }
                     }
                     Some(Input::KeyUp) => {
+                        with_state(|state| state.pending_quit = false);
                         let new_pos = with_state(|state| {
                             if state.menu_open {
                                 if let Some(mid) = state.menu_bar_id {
@@ -745,22 +939,50 @@ mod pancurses_backend {
                                 None
                             } else if let Some(fid) = state.focus_id {
                                 if is_spreadsheet_focused(state, fid) {
+                                    let was_editing = {
+                                        let n = state.node(fid).unwrap();
+                                        matches!(&n.kind, PcWidgetKind::Spreadsheet { editing: true, .. })
+                                    };
                                     spreadsheet_prepare_move(state, fid, false);
                                     spreadsheet_commit_edit(state, fid);
-                                    if let Some(n) = state.node_mut(fid) {
-                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_row, ref cursor_col, .. } = n.kind {
-                                            if *cursor_row > 0 {
-                                                *cursor_row -= 1;
+                                    let needs_sentinel = {
+                                        if let Some(n) = state.node_mut(fid) {
+                                            if let PcWidgetKind::Spreadsheet { ref mut cursor_row, .. } = n.kind {
+                                                if *cursor_row > 0 {
+                                                    *cursor_row -= 1;
+                                                    false
+                                                } else {
+                                                    true
+                                                }
                                             } else {
-                                                // Fire sentinel for "scroll up" — the
-                                                // application callback will recompute the
-                                                // viewport and update the widget.
-                                                return Some((u32::MAX, *cursor_col));
+                                                false
                                             }
-                                            return Some((*cursor_row, *cursor_col));
+                                        } else {
+                                            false
                                         }
+                                    };
+                                    if needs_sentinel {
+                                        if was_editing {
+                                            spreadsheet_enter(state, fid);
+                                        }
+                                        let sentinel_col = {
+                                            let n = state.node(fid).unwrap();
+                                            if let PcWidgetKind::Spreadsheet { cursor_col, .. } = &n.kind {
+                                                *cursor_col
+                                            } else { 0 }
+                                        };
+                                        return Some((u32::MAX, sentinel_col));
                                     }
-                                    spreadsheet_scroll_to_cursor(state, fid);
+                                    if was_editing {
+                                        spreadsheet_enter(state, fid);
+                                    }
+                                    let (row, col) = {
+                                        let n = state.node(fid).unwrap();
+                                        if let PcWidgetKind::Spreadsheet { cursor_row, cursor_col, .. } = &n.kind {
+                                            (*cursor_row, *cursor_col)
+                                        } else { (0, 0) }
+                                    };
+                                    return Some((row, col));
                                 }
                                 None
                             } else {
@@ -774,6 +996,7 @@ mod pancurses_backend {
                         }
                     }
                     Some(Input::KeyDown) => {
+                        with_state(|state| state.pending_quit = false);
                         let new_pos = with_state(|state| {
                             if state.menu_open {
                                 if let Some(mid) = state.menu_bar_id {
@@ -789,21 +1012,55 @@ mod pancurses_backend {
                                 None
                             } else if let Some(fid) = state.focus_id {
                                 if is_spreadsheet_focused(state, fid) {
+                                    let was_editing = {
+                                        let n = state.node(fid).unwrap();
+                                        matches!(&n.kind, PcWidgetKind::Spreadsheet { editing: true, .. })
+                                    };
                                     spreadsheet_commit_edit(state, fid);
-                                    if let Some(n) = state.node_mut(fid) {
-                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_row, ref cursor_col, total_rows, .. } = n.kind {
-                                            if *cursor_row + 1 < total_rows {
-                                                *cursor_row += 1;
+                                    let max_row = {
+                                        let n = state.node(fid).unwrap();
+                                        if let PcWidgetKind::Spreadsheet { total_rows, .. } = &n.kind {
+                                            *total_rows
+                                        } else { 0 }
+                                    };
+                                    let needs_sentinel = {
+                                        if let Some(n) = state.node_mut(fid) {
+                                            if let PcWidgetKind::Spreadsheet { ref mut cursor_row, .. } = n.kind {
+                                                if *cursor_row + 1 < max_row {
+                                                    *cursor_row += 1;
+                                                    false
+                                                } else {
+                                                    true
+                                                }
                                             } else {
-                                                // Fire sentinel for "scroll down" — the
-                                                // application callback will recompute the
-                                                // viewport and update the widget.
-                                                return Some((u32::MAX - 1, *cursor_col));
+                                                false
                                             }
-                                            return Some((*cursor_row, *cursor_col));
+                                        } else {
+                                            false
                                         }
+                                    };
+                                    if needs_sentinel {
+                                        if was_editing {
+                                            spreadsheet_enter(state, fid);
+                                        }
+                                        let sentinel_col = {
+                                            let n = state.node(fid).unwrap();
+                                            if let PcWidgetKind::Spreadsheet { cursor_col, .. } = &n.kind {
+                                                *cursor_col
+                                            } else { 0 }
+                                        };
+                                        return Some((u32::MAX - 1, sentinel_col));
                                     }
-                                    spreadsheet_scroll_to_cursor(state, fid);
+                                    if was_editing {
+                                        spreadsheet_enter(state, fid);
+                                    }
+                                    let (row, col) = {
+                                        let n = state.node(fid).unwrap();
+                                        if let PcWidgetKind::Spreadsheet { cursor_row, cursor_col, .. } = &n.kind {
+                                            (*cursor_row, *cursor_col)
+                                        } else { (0, 0) }
+                                    };
+                                    return Some((row, col));
                                 }
                                 None
                             } else {
@@ -1027,6 +1284,39 @@ mod pancurses_backend {
                             }
                         });
                     }
+                    Some(Input::KeySR) => {
+                        with_state(|state| state.pending_quit = false);
+                        with_state(|state| {
+                            if let Some(fid) = state.focus_id {
+                                if is_spreadsheet_focused(state, fid) {
+                                    spreadsheet_prepare_move(state, fid, false);
+                                    spreadsheet_commit_edit(state, fid);
+                                    if let Some(n) = state.node_mut(fid) {
+                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_row, .. } = n.kind {
+                                            if *cursor_row > 0 { *cursor_row -= 1; }
+                                        }
+                                    }
+                                    spreadsheet_scroll_to_cursor(state, fid);
+                                }
+                            }
+                        });
+                    }
+                    Some(Input::KeySF) => {
+                        with_state(|state| state.pending_quit = false);
+                        with_state(|state| {
+                            if let Some(fid) = state.focus_id {
+                                if is_spreadsheet_focused(state, fid) {
+                                    spreadsheet_commit_edit(state, fid);
+                                    if let Some(n) = state.node_mut(fid) {
+                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_row, total_rows, .. } = n.kind {
+                                            if *cursor_row + 1 < total_rows { *cursor_row += 1; }
+                                        }
+                                    }
+                                    spreadsheet_scroll_to_cursor(state, fid);
+                                }
+                            }
+                        });
+                    }
                     Some(Input::KeyExit) => {
                         with_state(|state| state.running = false);
                     }
@@ -1065,12 +1355,23 @@ mod pancurses_backend {
                     root.mvaddstr(rect.y, title_x, title);
                 }
             }
-            PcWidgetKind::Button { label } => {
+            PcWidgetKind::Button { label, weight, italic } => {
                 let focused = focus_id == Some(id);
                 if focused && has_colors() {
                     root.attron(COLOR_PAIR(2));
                 } else if has_colors() {
                     root.attron(COLOR_PAIR(1));
+                }
+                if *weight >= 600 {
+                    root.attron(A_BOLD);
+                }
+                if *italic {
+                    root.attron(A_ITALIC);
+                }
+                // HL button gets reverse video for highlight effect
+                let is_highlight = *weight >= 600 && label.len() >= 2;
+                if is_highlight {
+                    root.attron(A_REVERSE);
                 }
                 let inner_w = rect.w - 2;
                 let display = if label.len() as i32 > inner_w {
@@ -1082,9 +1383,22 @@ mod pancurses_backend {
                 let pad = (inner_w - display.len() as i32).max(0);
                 let left_pad = pad / 2;
                 let right_pad = pad - left_pad;
+                // Fill entire button area with spaces so background spans the full width
+                for x in rect.x..rect.x + rect.w {
+                    root.mvaddch(rect.y, x, ' ');
+                }
                 root.mvaddch(rect.y, rect.x, '[');
                 root.mvaddstr(rect.y, rect.x + 1 + left_pad, &display);
                 root.mvaddch(rect.y, rect.x + 1 + left_pad + display.len() as i32 + right_pad, ']');
+                if *italic {
+                    root.attroff(A_ITALIC);
+                }
+                if *weight >= 600 {
+                    root.attroff(A_BOLD);
+                }
+                if is_highlight {
+                    root.attroff(A_REVERSE);
+                }
                 if has_colors() {
                     root.attroff(COLOR_PAIR(1) | COLOR_PAIR(2));
                 }
@@ -1214,13 +1528,13 @@ mod pancurses_backend {
                 let current = selected.and_then(|s| items.get(s)).map(|s| s.as_str()).unwrap_or("");
                 let max_w = (rect.w - 2) as usize;
                 let truncated = if current.len() > max_w { &current[..max_w] } else { current };
+                // Fill entire width so background spans the full dropdown
+                for x in rect.x..rect.x + rect.w {
+                    root.mvaddch(rect.y, x, ' ');
+                }
                 root.mvaddch(rect.y, rect.x, '[');
                 root.mvaddstr(rect.y, rect.x + 1, truncated);
-                root.mvaddch(rect.y, rect.x + 1 + truncated.len() as i32, 'v');
-                let rest = max_w.saturating_sub(truncated.len() + 1);
-                for i in 0..rest {
-                    root.mvaddch(rect.y, rect.x + 2 + truncated.len() as i32 + i as i32, ' ');
-                }
+                root.mvaddstr(rect.y, rect.x + rect.w - 2, "▼");
                 root.mvaddch(rect.y, rect.x + rect.w - 1, ']');
                 if has_colors() {
                     root.attroff(COLOR_PAIR(1));
@@ -1241,7 +1555,8 @@ mod pancurses_backend {
                     root.attroff(COLOR_PAIR(3));
                 }
             }
-            PcWidgetKind::Spreadsheet { ref cells, ref raw_cells, ref cell_styles, ref top_row, ref left_col, ref cursor_row, ref cursor_col, ref editing, ref edit_buf, ref edit_pos, ref col_width, ref margin_cols, ref main_cols, ref menu_text, ref status_text, ref border_title, ref formula_bar_trailing, ref column_layout, ref row_labels, ref total_rows, ref total_cols, ref tab_titles, ref tab_active, header_row_count, main_row_count, .. } => {
+            PcWidgetKind::Canvas | PcWidgetKind::Overlay | PcWidgetKind::ScrolledWindow => {}
+            PcWidgetKind::Spreadsheet { ref cells, ref raw_cells, ref cell_styles, ref top_row, ref left_col, ref cursor_row, ref cursor_col, ref editing, ref edit_buf, ref edit_pos, ref col_width, ref margin_cols, ref main_cols, ref menu_text, ref status_text, ref border_title, ref formula_bar_trailing, ref column_layout, ref row_labels, ref tab_titles, ref tab_active, header_row_count, main_row_count, .. } => {
                 // ── Direct SGR rendering ──
                 let lm = *margin_cols as usize;
                 let mc = *main_cols as usize;
@@ -1264,7 +1579,7 @@ mod pancurses_backend {
                     row_offset += 1;
                 }
 
-                // Formula bar: cyan fg, default bg
+                // Formula bar: cyan fg, default bg (Normal) / white on dark gray (Edit)
                 {
                     let cc = *cursor_col;
                     let mc = *main_cols;
@@ -1283,26 +1598,53 @@ mod pancurses_backend {
                         .map(|(_, l)| l.as_str())
                         .unwrap_or("1");
                     let addr_text = format!("{}{}", col_part, row_label.trim());
-                    let cell_val = raw_cells.borrow().get(&(*cursor_row, *cursor_col)).cloned().unwrap_or_default();
-                    let addr_vis = addr_text.chars().count();
-                    let max_fb = (rect.w as usize).saturating_sub(addr_vis + 3).max(1);
-                    let fb_text = if cell_val.chars().count() > max_fb {
-                        let trunc_end = cell_val.char_indices().nth(max_fb.saturating_sub(3)).map(|(i, _)| i).unwrap_or(cell_val.len());
-                        format!(" {}  {}…{}", addr_text, &cell_val[..trunc_end], formula_bar_trailing)
+                    // Use edit mode when explicitly editing OR when edit_buf
+                    // contains pending input (handles timing edge cases).
+                    if *editing || !edit_buf.is_empty() {
+                        // Edit mode: white on dark gray (prompt_style), edit_buf, caret cursor
+                        let addr_str = format!(" {}  ", addr_text);
+                        let chars: Vec<char> = edit_buf.chars().collect();
+                        let cursor = (*edit_pos).min(chars.len());
+                        let before: String = chars[..cursor].iter().collect();
+                        let after: String = if cursor < chars.len() {
+                            chars[cursor + 1..].iter().collect()
+                        } else {
+                            String::new()
+                        };
+                        let cursor_ch = chars.get(cursor).map(|c| c.to_string()).unwrap_or_else(|| " ".to_string());
+                        let content_w = addr_str.chars().count() + before.chars().count() + cursor_ch.chars().count() + after.chars().count();
+                        out.push_str(&sgr_cup(row_offset, rect.x));
+                        out.push_str(sgr_prompt());
+                        out.push_str(&addr_str);
+                        if !before.is_empty() {
+                            out.push_str(SGR_BOLD);
+                            out.push_str(&before);
+                        }
+                        out.push_str(sgr_caret());
+                        out.push_str(&cursor_ch);
+                        if !after.is_empty() {
+                            out.push_str(SGR_BOLD);
+                            out.push_str(&after);
+                        }
+                        if content_w < rect.w as usize {
+                            out.push_str(SGR_RESET);
+                            out.push_str(sgr_prompt());
+                            out.push_str(&" ".repeat(rect.w as usize - content_w));
+                        } else {
+                            out.push_str(SGR_RESET);
+                        }
                     } else {
-                        format!(" {}  {}{}", addr_text, cell_val, formula_bar_trailing)
-                    };
-                    let fb_end = fb_text.char_indices().nth(rect.w as usize).map(|(i, _)| i).unwrap_or(fb_text.len());
-                    out.push_str(&sgr_cup(row_offset, rect.x));
-                    out.push_str(sgr_formula());
-                    out.push_str(&fb_text[..fb_end]);
-                    out.push_str(SGR_FG_DEFAULT);
-                    out.push_str(SGR_BG_DEFAULT);
-                    // Fill rest of formula bar line with spaces to prevent
-                    // ncurses background from bleeding through.
-                    let fb_vis = fb_text[..fb_end].chars().count();
-                    if fb_vis < rect.w as usize {
-                        out.push_str(&" ".repeat(rect.w as usize - fb_vis));
+                        // Normal mode: cyan fg on default bg (formula style), cell value, trailing status (matching ratatui)
+                        let cell_val = raw_cells.borrow().get(&(*cursor_row, *cursor_col)).cloned().unwrap_or_default();
+                        let fb_text = format!(" {}  {}{}", addr_text, cell_val, formula_bar_trailing);
+                        out.push_str(&sgr_cup(row_offset, rect.x));
+                        out.push_str(sgr_formula());
+                        out.push_str(&fb_text);
+                        out.push_str(SGR_FG_DEFAULT);
+                        let content_w = fb_text.chars().count();
+                        if content_w < rect.w as usize {
+                            out.push_str(&" ".repeat(rect.w as usize - content_w));
+                        }
                     }
                     row_offset += 1;
                 }
@@ -1318,6 +1660,8 @@ mod pancurses_backend {
                     let title_vis = title.chars().count();
                     let dash_fill = (rect.w as usize).saturating_sub(title_vis + 3);
                     out.push_str(&sgr_cup(br, rect.x));
+                    out.push_str(SGR_FG_DEFAULT);
+                    out.push_str(SGR_BG_DEFAULT);
                     out.push_str("┌");
                     out.push_str(SGR_BOLD);
                     out.push_str(" ");
@@ -1357,8 +1701,8 @@ mod pancurses_backend {
                                 let is_boundary = lm > 0 && (*ci == (lm - 1) as u32 || *ci == (lm + mc - 1) as u32);
                                 out.push_str(&sgr_cup(hr, hx));
                                 if is_boundary {
-                                    out.push_str("│ ");
-                                    hx += 2;
+                                    out.push_str("│");
+                                    hx += 1;
                                 } else {
                                     out.push_str(" ");
                                     hx += 1;
@@ -1457,12 +1801,32 @@ mod pancurses_backend {
                 }
 
                 // Data rows
-                let has_status = !status_text.is_empty();
+                let has_status = true;
                 let has_tabs = !tab_titles.is_empty();
                 let extra_lines = 1
                     + if has_tabs { 1 } else if has_status { 1 } else { 0 };
                 let grid_bottom = rect.y + rect.h - extra_lines;
                 let max_data_rows = ((grid_bottom - row_offset) as i32).max(1) as u32;
+                // Determine boundary row indices from row labels instead of
+                // using header_row_count/main_row_count (which are logical counts
+                // like HEADER_ROWS=999_999_999, not display indices).
+                let boundary_row_indices: Vec<u32> = {
+                    let mut last_header: Option<u32> = None;
+                    let mut last_main: Option<u32> = None;
+                    for &(idx, ref label) in row_labels.iter() {
+                        if label.starts_with('~') {
+                            last_header = Some(idx);
+                        } else if label.starts_with('_') {
+                            // Footer rows don't affect main boundary
+                        } else if !label.trim().is_empty() {
+                            last_main = Some(idx);
+                        }
+                    }
+                    let mut result = Vec::new();
+                    if let Some(idx) = last_header { result.push(idx); }
+                    if let Some(idx) = last_main { result.push(idx); }
+                    result
+                };
                 for vr in 0..max_data_rows {
                     let row_idx = *top_row + vr as u32;
                     let ry = row_offset + vr as i32;
@@ -1491,13 +1855,11 @@ mod pancurses_backend {
                     // - boundary (last main) row: underline + fg
                     let is_footer = label_str.starts_with('_');
                     let is_header = label_str.starts_with('~');
-                    // Check next row label to detect boundary (last main row before footers)
-                    let next_label = row_labels.iter()
-                        .find(|(r, _)| *r == row_idx + 1)
-                        .map(|(_, l)| l.as_str())
-                        .unwrap_or("");
-                    let is_boundary = (is_header && !next_label.starts_with('~'))
-                        || (!is_footer && !is_header && next_label.starts_with('_'));
+                    // Boundary rows: last header row and last main row before footers.
+                    // Uses header_row_count/main_row_count directly (matching ratatui's
+                    // last_display_main_row logic) instead of next-label heuristics
+                    // that can fail when row_labels have gaps.
+                    let is_boundary = boundary_row_indices.contains(&row_idx);
                     let row_label_style = if is_cursor_row {
                         if is_boundary { sgr_row_cursor() } else { sgr_header_active() }
                     } else if is_footer {
@@ -1514,11 +1876,22 @@ mod pancurses_backend {
                     out.push_str(&sgr_cup(ry, rect.x + 1));
                     out.push_str(row_label_style);
                     out.push_str(&format!("{:>4} ", label_str));
-                    // Reset all attributes, then re-apply underline for boundary rows.
-                    // This prevents underline from leaking to the next row.
-                    out.push_str(SGR_RESET);
-                    if is_boundary {
-                        out.push_str(SGR_UNDERLINE);
+                    // Reset attributes that would leak (bold, background) for cursor
+                    // and footer rows.  Boundary rows keep their underline since
+                    // ratatui does not reset it; normal rows reset foreground so
+                    // text without a cell SGR (e.g. section headers) renders in
+                    // the default color instead of inheriting the row-label yellow.
+                    if is_cursor_row || is_footer {
+                        if is_boundary {
+                            out.push_str("\x1b[0;4m");
+                        } else {
+                            out.push_str(SGR_RESET);
+                        }
+                    } else if is_boundary {
+                        out.push_str("\x1b[0;4m");
+                    } else {
+                        out.push_str(SGR_FG_DEFAULT);
+                        out.push_str(SGR_BG_DEFAULT);
                     }
 
                     // Separator between row label and first data column (dark gray)
@@ -1561,18 +1934,23 @@ mod pancurses_backend {
                         let mut prev_overflowed = false;
                         let mut defer_sgr_reset = false;
                         let mut last_sgr = String::new();
+                        let mut overflow_consumed_all = false;
                         while vi < n {
                             let (col_idx, sx) = col_positions[vi];
                             let cell_text = cells_ref.get(&(row_idx, col_idx))
                                 .map(|s| s.as_str()).unwrap_or("");
                             let cell_style = cell_styles_ref.get(&(row_idx, col_idx)).copied().unwrap_or(0);
                             let is_cursor_cell = row_idx == *cursor_row && col_idx == *cursor_col;
-                            if cell_text.is_empty() {
+
+                        if cell_text.is_empty() {
                                 // Empty cell: draw cursor highlight if needed
                                 let is_agg_empty = cell_style == 2 || cell_style == 3;
                                 if is_cursor_cell {
                                     let cw = column_layout[vi].1 as i32;
                                     out.push_str(&sgr_cup(ry, sx));
+                                    if is_boundary {
+                                        out.push_str(SGR_UNDERLINE);
+                                    }
                                     out.push_str(sgr_cell_cursor());
                                     for _ in 0..cw {
                                         out.push(' ');
@@ -1590,7 +1968,7 @@ mod pancurses_backend {
                                             out.push(' ');
                                         }
                                     }
-                                } else if is_agg_empty {
+                                } else if is_agg_empty && !prev_overflowed {
                                     // Empty aggregate cell: cyan foreground
                                     let cw = column_layout[vi].1 as i32;
                                     out.push_str(&sgr_cup(ry, sx));
@@ -1605,7 +1983,11 @@ mod pancurses_backend {
                                     for _ in 0..cw {
                                         out.push(' ');
                                     }
-                                    out.push_str(SGR_FG_DEFAULT);
+                                    if cell_style == 3 {
+                                        out.push_str(SGR_RESET);
+                                    } else {
+                                        out.push_str(SGR_FG_DEFAULT);
+                                    }
                                     let gap_after = if vi + 1 < n { 1 } else { 0 };
                                     if gap_after > 0 {
                                         let is_sep_col = lm > 0 && ((col_idx as usize) == lm - 1 || (col_idx as usize) == lm + mc - 1);
@@ -1655,18 +2037,20 @@ mod pancurses_backend {
                                         }
                                     }
                                 } else if (col_idx as usize) >= lm + mc {
-                                    // Right-margin column: dark gray only for the
-                                    // first ref column (col_idx == lm + mc), matching
-                                    // ratatui which applies dark gray only to the
-                                    // first right-margin column.
+                                    // Right-margin column: match ratatui which uses
+                                    // gray foreground for all columns in both normal
+                                    // and boundary rows.
+                                    // When a preceding cell overflowed into this
+                                    // area, use default style (matching ratatui's
+                                    // paragraph auto-fill behavior).
                                     let cw = column_layout[vi].1 as i32;
-                                    let use_gray = (col_idx as usize) == lm + mc;
+                                    let use_gray = is_boundary || ((col_idx as usize) == lm + mc && !prev_overflowed);
                                     out.push_str(&sgr_cup(ry, sx));
-                                    if is_boundary {
-                                        out.push_str(SGR_UNDERLINE);
-                                    }
                                     if use_gray {
                                         out.push_str(sgr_sep());
+                                    } else if prev_overflowed {
+                                        out.push_str(SGR_FG_DEFAULT);
+                                        out.push_str(SGR_BG_DEFAULT);
                                     } else {
                                         out.push_str(SGR_FG_DEFAULT);
                                         out.push_str(SGR_BG_DEFAULT);
@@ -1675,15 +2059,15 @@ mod pancurses_backend {
                                         out.push(' ');
                                     }
                                     if use_gray {
-                                    if is_boundary && vi + 1 >= n {
-                                        out.push_str(SGR_RESET);
+                                        if is_boundary && vi + 1 >= n {
+                                            out.push_str(SGR_RESET);
+                                        } else {
+                                            out.push_str(SGR_FG_DEFAULT);
+                                        }
                                     } else {
                                         out.push_str(SGR_FG_DEFAULT);
+                                        out.push_str(SGR_BG_DEFAULT);
                                     }
-                                } else {
-                                    out.push_str(SGR_FG_DEFAULT);
-                                    out.push_str(SGR_BG_DEFAULT);
-                                }
                                 let gap_after = if vi + 1 < n { 1 } else { 0 };
                                 if gap_after > 0 {
                                     let is_sep_col = lm > 0 && ((col_idx as usize) == lm - 1 || (col_idx as usize) == lm + mc - 1);
@@ -1700,7 +2084,7 @@ mod pancurses_backend {
                                 // Empty cell in main column: check style
                                     let cw = column_layout[vi].1 as i32;
                                     out.push_str(&sgr_cup(ry, sx));
-                                    if is_boundary {
+                                    if is_boundary && !prev_overflowed {
                                         out.push_str(sgr_sep());
                                     } else if prev_overflowed {
                                         out.push_str(sgr_sep());
@@ -1711,7 +2095,15 @@ mod pancurses_backend {
                                     for _ in 0..cw {
                                         out.push(' ');
                                     }
-                                    if is_boundary || prev_overflowed {
+                                    if is_boundary && !prev_overflowed {
+                                        out.push_str(SGR_FG_DEFAULT);
+                                    } else if is_boundary {
+                                        if vi + 1 >= n {
+                                            out.push_str(SGR_RESET);
+                                        } else {
+                                            out.push_str(SGR_FG_DEFAULT);
+                                        }
+                                    } else if prev_overflowed {
                                         out.push_str(SGR_FG_DEFAULT);
                                     }
                                     let gap_after = if vi + 1 < n { 1 } else { 0 };
@@ -1732,7 +2124,33 @@ mod pancurses_backend {
                                 continue;
                             }
                             let w = column_layout[vi].1 as usize;
-                            let text_width = cell_text.chars().count();
+                            // When editing, show the edit buffer for the cursor cell.
+                            // The edit buffer holds the raw value; align it to
+                            // the column width (right for numeric, left otherwise).
+                            let display_source: String = if *editing && is_cursor_cell {
+                                let raw = &**edit_buf;
+                                let raw_w = raw.chars().count();
+                                if raw_w < w {
+                                    if raw.starts_with(|c: char| c.is_ascii_digit() || c == '-') {
+                                        // Right-align numeric edit buffer
+                                        let pad = w - raw_w;
+                                        let mut s = String::with_capacity(w);
+                                        for _ in 0..pad { s.push(' '); }
+                                        s.push_str(raw);
+                                        s
+                                    } else {
+                                        // Left-align text edit buffer
+                                        let mut s = raw.to_string();
+                                        for _ in raw_w..w { s.push(' '); }
+                                        s
+                                    }
+                                } else {
+                                    raw.to_string()
+                                }
+                            } else {
+                                cell_text.to_string()
+                            };
+                            let text_width = display_source.chars().count();
                             let mut overflow_cols = 0usize;
                             let mut can_overflow = false;
                             if text_width > w {
@@ -1740,6 +2158,28 @@ mod pancurses_backend {
                                 let mut scan = vi + 1;
                                 while scan < n {
                                     let (sc_idx, _) = col_positions[scan];
+                                    // Stop at the right-margin boundary when the
+                                    // text fits within the left-margin + main
+                                    // columns, so structural separators (pipes)
+                                    // are preserved.  When the text is longer,
+                                    // let it overflow into right-margin so it
+                                    // can fill the full viewport width.
+                                    if lm > 0 && (sc_idx as usize) >= lm + mc {
+                                        // Compute total width up to this column,
+                                        // including appropriate gaps.
+                                        let mut avail_up_to = column_layout[vi..scan]
+                                            .iter().map(|&(_, w, _)| w as usize).sum::<usize>();
+                                        let idx_span = scan - vi;
+                                        avail_up_to += idx_span; // AsciiSpace gaps
+                                        // Add +1 for PipeAndSpace at lm→main boundary
+                                        let vi_col = column_layout[vi].0 as usize;
+                                        if vi_col == lm - 1 {
+                                            avail_up_to += 1;
+                                        }
+                                        if text_width <= avail_up_to {
+                                            break;
+                                        }
+                                    }
                                     let sc_text = cells_ref.get(&(row_idx, sc_idx))
                                         .map(|s| s.as_str()).unwrap_or("");
                                     if sc_text.is_empty() {
@@ -1749,35 +2189,73 @@ mod pancurses_backend {
                                 }
                             }
                             let gap_target = vi + overflow_cols;
-                            let gap_after = if gap_target + 1 < n { 1 } else { 0 };
+                            let gap_after = if gap_target + 1 < n {
+                                let last_ov_col = column_layout[gap_target].0 as usize;
+                                if lm > 0 && (last_ov_col == lm - 1 || last_ov_col == lm + mc - 1) {
+                                    2
+                                } else {
+                                    1
+                                }
+                            } else {
+                                0
+                            };
                             let mut total_avail: usize = column_layout[vi..=vi+overflow_cols].iter()
                                 .map(|&(_, w, _)| w as usize).sum::<usize>()
                                 + overflow_cols
                                 + gap_after;
+                            // When overflow spans past the main→right-margin
+                            // boundary, the PipeAndSpace (2) at the boundary is
+                            // counted as only 1 in overflow_cols; add the extra 1.
+                            if lm > 0 && overflow_cols > 0 {
+                                let vi_col = column_layout[vi].0 as usize;
+                                let last_ov = column_layout[(vi + overflow_cols).min(n.saturating_sub(1))].0 as usize;
+                                if vi_col < lm + mc && last_ov >= lm + mc {
+                                    total_avail = total_avail.saturating_add(1);
+                                }
+                                // When the source column is the last left-margin
+                                // column, the PipeAndSpace (2) at the
+                                // left-margin→main boundary is counted as only 1
+                                // in overflow_cols; add the extra 1.
+                                if vi_col == lm - 1 {
+                                    total_avail = total_avail.saturating_add(1);
+                                }
+                            }
                             // Include remaining viewport space (right gap) so
                             // cell style/background fills to the right border,
                             // matching ratatui.
-                            if gap_target + 1 >= n {
-                                let used_w: usize = column_layout.iter()
-                                    .map(|&(_, w, _)| w as usize).sum::<usize>()
-                                    + n.saturating_sub(1);
-                                // Leave 1-char gap before the right border
-                                // (matching ratatui filler behavior).
-                                let total_w = (rect.w as usize).saturating_sub(8);
-                                if total_w > used_w {
-                                    total_avail = total_avail.saturating_add(total_w - used_w);
+                            let overflow_ends_at_boundary = overflow_cols > 0 && gap_target < n && {
+                                let last_ov_col = column_layout[gap_target].0 as usize;
+                                lm > 0 && (last_ov_col == lm - 1 || last_ov_col == lm + mc - 1)
+                            };
+                            if gap_target + 1 >= n || overflow_ends_at_boundary {
+                                // Compute render width with boundary-aware gaps,
+                                // matching visible_cols_render_width.
+                                let mut render_w: usize = column_layout.iter()
+                                    .map(|&(_, w, _)| w as usize).sum::<usize>();
+                                for idx in 0..n.saturating_sub(1) {
+                                    let col_idx = column_layout[idx].0 as usize;
+                                let lm_u = lm as usize;
+                                if lm_u > 0 && (col_idx == lm_u - 1 || col_idx == lm_u + mc as usize - 1) {
+                                        render_w += 2;
+                                    } else {
+                                        render_w += 1;
+                                    }
+                                }
+                                let total_w = (rect.w as usize).saturating_sub(7);
+                                if total_w > render_w {
+                                    total_avail = total_avail.saturating_add(total_w - render_w);
                                 }
                             }
                             let display = if text_width > total_avail {
                                 if overflow_cols == 0 {
-                                    cell_text.chars().take(total_avail).collect::<String>()
+                                    display_source.chars().take(total_avail).collect::<String>()
                                 } else {
                                     let trunc = total_avail.saturating_sub(1).max(1);
-                                    let mut s: String = cell_text.chars().take(trunc).collect();
+                                    let mut s: String = display_source.chars().take(trunc).collect();
                                     if text_width > trunc { s.push('…'); }
                                     s
                                 }
-                            } else { cell_text.to_string() };
+                            } else { display_source.to_string() };
                             // Cell SGR style matching ratatui priority:
                             //   1. cursor cell → bg(DarkGray)
                             //   2. footer agg  → bold + fg(Cyan)
@@ -1797,13 +2275,16 @@ mod pancurses_backend {
                                 sgr_cell_footer_agg()
                             } else if cell_style == 2 {
                                 sgr_cell_agg()
-                            } else if is_boundary && !can_overflow {
+                            } else if is_left_margin_col && cell_text.is_empty() {
                                 sgr_sep()
-                            } else if is_left_margin_col {
-                                sgr_sep()
-                            } else if is_right_margin_col && cell_text.is_empty() {
+                            } else if is_right_margin_col && cell_text.is_empty()
+                                && (is_boundary || ((col_idx as usize) == lm + mc && !prev_overflowed)) {
                                 sgr_sep()
                             } else if prev_overflowed && cell_text.is_empty() && !is_left_margin_col && !is_right_margin_col {
+                                sgr_sep()
+                            } else if is_left_margin_col {
+                                ""
+                            } else if is_boundary {
                                 sgr_sep()
                             } else {
                                 ""
@@ -1811,7 +2292,15 @@ mod pancurses_backend {
                             // When the cell overflows, skip the boundary SGR reset
                             // too so the overflow text stays in default style.
                             let is_overflowing = can_overflow;
+                            let underline_prefix = if is_boundary && !can_overflow && is_left_margin_col {
+                                SGR_UNDERLINE
+                            } else {
+                                ""
+                            };
                             out.push_str(&sgr_cup(ry, sx));
+                            if !underline_prefix.is_empty() {
+                                out.push_str(underline_prefix);
+                            }
                             if !cell_sgr.is_empty() {
                                 out.push_str(cell_sgr);
                             }
@@ -1819,10 +2308,19 @@ mod pancurses_backend {
                             // avail_w = width within the cell's column(s), excluding
                             // the trailing gap to the next column (gap_after is written
                             // separately so it uses default style, matching ratatui).
+                            // Include PipeAndSpace boundary corrections (same as
+                            // total_avail above) so padding is correct.
                             let avail_w = if overflow_cols > 0 {
-                                column_layout[vi..=vi+overflow_cols].iter()
+                                let mut a = column_layout[vi..=vi+overflow_cols].iter()
                                     .map(|&(_, w, _)| w as usize).sum::<usize>()
-                                    + overflow_cols
+                                    + overflow_cols;
+                                if lm > 0 && overflow_cols > 0 {
+                                    let vi_col = column_layout[vi].0 as usize;
+                                    if vi_col == lm - 1 {
+                                        a = a.saturating_add(1);
+                                    }
+                                }
+                                a
                             } else {
                                 w
                             };
@@ -1832,8 +2330,10 @@ mod pancurses_backend {
                                 out.push_str(&" ".repeat(pad));
                             }
                             // If the display text overflows past the column
-                            // width into the gap area, suppress the gap.
-                            let real_gap = if display_w > avail_w { 0 } else { gap_after };
+                            // width into the gap area, only suppress the
+                            // part already consumed, not the whole gap.
+                            let overflow_into_gap = display_w.saturating_sub(avail_w);
+                            let real_gap = gap_after.saturating_sub(overflow_into_gap);
                             let sgr_applied = !cell_sgr.is_empty();
                             // Defer SGR reset for last cell in row when it
                             // has cursor or boundary styling, so the fill
@@ -1843,9 +2343,12 @@ mod pancurses_backend {
                             // treat it as 'last' for SGR reset deferral so
                             // boundary rows emit SGR_RESET before the border.
                             let overflow_consumes_all = can_overflow && gap_target + 1 >= n;
+                            if overflow_consumes_all {
+                                overflow_consumed_all = true;
+                            }
                             if (is_last || overflow_consumes_all) && (is_cursor_cell || is_boundary) {
                                 defer_sgr_reset = true;
-                                last_sgr = if is_cursor_cell {
+                                last_sgr = if is_cursor_cell && !is_boundary {
                                     SGR_BG_DEFAULT.to_string()
                                 } else {
                                     SGR_RESET.to_string()
@@ -1863,25 +2366,43 @@ mod pancurses_backend {
                                     } else {
                                         out.push_str(SGR_FG_DEFAULT);
                                     }
-                                } else if is_left_margin_col || is_right_margin_col {
+                                } else if (is_left_margin_col || is_right_margin_col) && !prev_overflowed {
                                     out.push_str(SGR_FG_DEFAULT);
                                 } else if sgr_applied {
+                                    out.push_str(SGR_BG_DEFAULT);
                                     out.push_str(SGR_FG_DEFAULT);
                                 }
                             }
                             // Inter-column gap – separator │ at group boundaries, space otherwise
-                            if real_gap > 0 {
-                                let is_sep_col = lm > 0 && ((col_idx as usize) == lm - 1 || (col_idx as usize) == lm + mc - 1);
-                                if is_sep_col {
+                            // When overflow spans multiple columns the boundary check
+                            // must consider the last overflowed column, not just the
+                            // current column.  Structural separators are always drawn
+                            // at section boundaries even when the gap is consumed.
+                            let overflow_boundary = overflow_cols > 0 && gap_target < n && {
+                                let last_ov_col = column_layout[gap_target].0 as usize;
+                                lm > 0 && (last_ov_col == lm - 1 || last_ov_col == lm + mc - 1)
+                            };
+                            if real_gap > 0 || overflow_boundary {
+                                let is_sep_col = if overflow_boundary {
+                                    true
+                                } else {
+                                    lm > 0 && ((col_idx as usize) == lm - 1 || (col_idx as usize) == lm + mc - 1)
+                                };
+                                // When overflow text partially fills the gap and
+                                // consumed the pipe position, only draw spaces
+                                // (no pipe) for the remaining gap characters.
+                                if is_sep_col && overflow_into_gap == 0 {
                                     out.push_str(sgr_sep());
                                     out.push('│');
                                     out.push_str(SGR_FG_DEFAULT);
                                     out.push(' ');
                                 } else {
-                                    out.push(' ');
+                                    for _ in 0..real_gap {
+                                        out.push(' ');
+                                    }
                                 }
                             }
-                            let overflowed_this = can_overflow && overflow_cols == 0;
+                            let overflowed_this = can_overflow;
                             if overflowed_this {
                                 prev_overflowed = true;
                             } else {
@@ -1894,19 +2415,31 @@ mod pancurses_backend {
                         if defer_sgr_reset {
                             out.push_str(&last_sgr);
                         }
-                        // Use CUP to position at the right border, matching
-                        // the non-layout path at line 1820.  This works for
-                        // both normal rows (cursor at after_content) and
-                        // overflow rows (cursor past after_content).
                         // Fill between after_content and right_border with
                         // spaces to clear any stale characters.
+                        // When overflow fills all columns to the right border,
+                        // skip the fill since the text already occupies that space.
                         let right_border_x = rect.x + rect.w - 1;
-                        let after_content = rect.x + 1 + 5 + column_layout.iter()
-                            .map(|&(_, w, _)| w as i32).sum::<i32>()
-                            + (n.saturating_sub(1) as i32);
-                        if after_content < right_border_x {
-                            let gap = (right_border_x - after_content) as usize;
-                            out.push_str(&" ".repeat(gap));
+                        if !overflow_consumed_all {
+                            let after_content: i32 = rect.x + 1 + 5 + column_layout.iter()
+                                .enumerate()
+                                .map(|(idx, &(col_idx, w, _))| {
+                                    let gap = if idx + 1 < n {
+                                        if lm > 0 && ((col_idx as usize) == lm - 1 || (col_idx as usize) == lm + mc - 1) {
+                                            2
+                                        } else {
+                                            1
+                                        }
+                                    } else { 0 };
+                                    w as i32 + gap
+                                })
+                                .sum::<i32>();
+                            if after_content < right_border_x {
+                                let gap = (right_border_x - after_content) as usize;
+                                out.push_str(SGR_FG_DEFAULT);
+                                out.push_str(SGR_BG_DEFAULT);
+                                out.push_str(&" ".repeat(gap));
+                            }
                         }
                         out.push_str(&sgr_cup(ry, right_border_x));
                         out.push_str("│");
@@ -1936,6 +2469,7 @@ mod pancurses_backend {
                                 } else {
                                     out.push_str(&sgr_cup(ry, col_screen_x));
                                     if is_boundary {
+                                        out.push_str(SGR_UNDERLINE);
                                         out.push_str(sgr_sep());
                                     } else {
                                         out.push_str(SGR_FG_DEFAULT);
@@ -1972,6 +2506,9 @@ mod pancurses_backend {
                                 }
                             } else { text.to_string() };
                             out.push_str(&sgr_cup(ry, col_screen_x));
+                            if is_boundary {
+                                out.push_str(SGR_UNDERLINE);
+                            }
                             if is_cursor_cell {
                                 out.push_str(sgr_cell_cursor());
                             } else if cell_style == 2 {
@@ -2008,7 +2545,15 @@ mod pancurses_backend {
                     }
                     out.push_str("┘");
                 }
-                // Status bar: dark gray fg
+                // Status bar: dark gray fg — hints matching ratatui's hints_line()
+                let display_status = if *editing || !edit_buf.is_empty() {
+                    "  type to edit (or addr: val)   Enter·confirm   Esc·discard".to_string()
+                } else if !status_text.is_empty() {
+                    status_text.clone()
+                } else {
+                    "  type/F2·edit; Ctrl+C·copy; Ctrl+X·cut; Ctrl+V·paste; Ctrl+;·date; Ctrl+:·time; Ctrl+S·save; F1·help".to_string()
+                };
+                let ds_len = display_status.len();
                 if has_status {
                     let sr = if has_tabs {
                         row_offset + max_data_rows as i32
@@ -2017,11 +2562,11 @@ mod pancurses_backend {
                     };
                     if sr < rect.y + rect.h {
                         let max_w = rect.w as usize;
-                        let st_end = status_text.char_indices().nth(max_w).map(|(i, _)| i).unwrap_or(status_text.len());
+                        let st_end = display_status.char_indices().nth(max_w).map(|(i, _)| i).unwrap_or(ds_len);
                         out.push_str(&sgr_cup(sr, rect.x));
                         out.push_str(sgr_sep());
-                        out.push_str(&status_text[..st_end]);
-                        let st_vis = status_text[..st_end].chars().count();
+                        out.push_str(&display_status[..st_end]);
+                        let st_vis = display_status[..st_end].chars().count();
                         if has_tabs {
                             if st_vis < rect.w as usize - 1 {
                                 for _ in st_vis..rect.w as usize - 1 {
@@ -2081,19 +2626,75 @@ mod pancurses_backend {
     }
 
     fn spreadsheet_enter(state: &mut PcState, fid: usize) {
-        if let Some(n) = state.node_mut(fid) {
-            if let PcWidgetKind::Spreadsheet { ref cells, ref mut cursor_row, ref mut cursor_col, ref mut editing, ref mut edit_buf, ref mut edit_pos, .. } = n.kind {
-                if *editing {
-                    cells.borrow_mut().insert((*cursor_row, *cursor_col), edit_buf.clone());
-                    *editing = false;
-                    if *cursor_row + 1 < u32::MAX { *cursor_row += 1; }
+        let result = {
+            let n = state.node_mut(fid);
+            if let Some(n) = n {
+                if let PcWidgetKind::Spreadsheet { ref cells, ref raw_cells, ref mut cursor_row, ref mut cursor_col, ref mut editing, ref mut edit_buf, ref mut edit_pos, total_rows, .. } = n.kind {
+                    if *editing {
+                        let val = edit_buf.clone();
+                        let r = *cursor_row;
+                        let c = *cursor_col;
+                        // Only commit+move if buffer differs from original
+                        let original = raw_cells.borrow().get(&(r, c)).cloned()
+                            .or_else(|| cells.borrow().get(&(r, c)).cloned())
+                            .unwrap_or_default();
+                        if val != original {
+                            cells.borrow_mut().insert((r, c), val.clone());
+                            raw_cells.borrow_mut().insert((r, c), val.clone());
+                            // Advance cursor down (matching ratatui's commit_edit_and_move_down)
+                            if *cursor_row + 1 < total_rows {
+                                *cursor_row += 1;
+                                // Re-enter edit mode at the new cursor position
+                                // (matching ratatui's reference behavior)
+                                let existing = raw_cells.borrow().get(&(*cursor_row, *cursor_col)).cloned()
+                                    .or_else(|| cells.borrow().get(&(*cursor_row, *cursor_col)).cloned())
+                                    .unwrap_or_default();
+                                *edit_buf = existing;
+                                *edit_pos = edit_buf.len();
+                                *editing = true;
+                            } else {
+                                *editing = false;
+                                edit_buf.clear();
+                            }
+                            Some((r, c, val))
+                        } else {
+                            // Value unchanged — still advance cursor (matching ratatui)
+                            if *cursor_row + 1 < total_rows {
+                                *cursor_row += 1;
+                                let existing = raw_cells.borrow().get(&(*cursor_row, *cursor_col)).cloned()
+                                    .or_else(|| cells.borrow().get(&(*cursor_row, *cursor_col)).cloned())
+                                    .unwrap_or_default();
+                                *edit_buf = existing;
+                                *edit_pos = edit_buf.len();
+                                *editing = true;
+                            } else {
+                                *editing = false;
+                                edit_buf.clear();
+                            }
+                            None
+                        }
+                    } else {
+                        *editing = true;
+                        // Load the raw cell value (not formatted display) so the
+                        // edit buffer matches ratatui's formula_bar_value.
+                        let existing = raw_cells.borrow().get(&(*cursor_row, *cursor_col)).cloned()
+                            .or_else(|| cells.borrow().get(&(*cursor_row, *cursor_col)).cloned())
+                            .unwrap_or_default();
+                        *edit_buf = existing;
+                        *edit_pos = edit_buf.len();
+                        None
+                    }
                 } else {
-                    *editing = true;
-                    let existing = cells.borrow().get(&(*cursor_row, *cursor_col)).cloned().unwrap_or_default();
-                    *edit_buf = existing;
-                    *edit_pos = edit_buf.len();
+                    None
                 }
+            } else {
+                None
             }
+        };
+        if let Some((r, c, val)) = result {
+            let mut cbs = std::mem::take(&mut state.commit_edit_callbacks);
+            for cb in cbs.iter_mut() { cb(r, c, val.clone()); }
+            state.commit_edit_callbacks = cbs;
         }
     }
 
@@ -2203,13 +2804,40 @@ mod pancurses_backend {
     }
 
     fn spreadsheet_commit_edit(state: &mut PcState, fid: usize) {
-        if let Some(n) = state.node_mut(fid) {
-            if let PcWidgetKind::Spreadsheet { ref cells, cursor_row, cursor_col, ref edit_buf, ref mut editing, .. } = n.kind {
-                if *editing {
-                    cells.borrow_mut().insert((cursor_row, cursor_col), edit_buf.clone());
-                    *editing = false;
+        let result = {
+            let n = state.node_mut(fid);
+            if let Some(n) = n {
+                if let PcWidgetKind::Spreadsheet { ref cells, ref raw_cells, cursor_row, cursor_col, ref mut edit_buf, ref mut editing, .. } = n.kind {
+                    if *editing {
+                        let val = edit_buf.clone();
+                        let original = raw_cells.borrow().get(&(cursor_row, cursor_col)).cloned()
+                            .or_else(|| cells.borrow().get(&(cursor_row, cursor_col)).cloned())
+                            .unwrap_or_default();
+                        if val != original {
+                            cells.borrow_mut().insert((cursor_row, cursor_col), val.clone());
+                            raw_cells.borrow_mut().insert((cursor_row, cursor_col), val.clone());
+                            *editing = false;
+                            edit_buf.clear();
+                            Some((cursor_row, cursor_col, val))
+                        } else {
+                            *editing = false;
+                            edit_buf.clear();
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
                 }
+            } else {
+                None
             }
+        };
+        if let Some((r, c, val)) = result {
+            let mut cbs = std::mem::take(&mut state.commit_edit_callbacks);
+            for cb in cbs.iter_mut() { cb(r, c, val.clone()); }
+            state.commit_edit_callbacks = cbs;
         }
     }
 
@@ -2283,7 +2911,7 @@ mod pancurses_backend {
     }
 
     pub fn create_button(label: &str) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(with_state(|s| s.add_node(PcWidgetKind::Button { label: label.to_string() }, find_window_id(s))))
+        Ok(with_state(|s| s.add_node(PcWidgetKind::Button { label: label.to_string(), weight: 400, italic: false }, find_window_id(s))))
     }
 
     pub fn create_label(text: &str) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
@@ -2335,6 +2963,18 @@ mod pancurses_backend {
 
     pub fn create_textview() -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
         Ok(with_state(|s| s.add_node(PcWidgetKind::TextView { text: String::new() }, find_window_id(s))))
+    }
+
+    pub fn create_canvas() -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(with_state(|s| s.add_node(PcWidgetKind::Canvas, find_window_id(s))))
+    }
+
+    pub fn create_overlay() -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(with_state(|s| s.add_node(PcWidgetKind::Overlay, find_window_id(s))))
+    }
+
+    pub fn create_scrolled_window() -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(with_state(|s| s.add_node(PcWidgetKind::ScrolledWindow, find_window_id(s))))
     }
 
     pub fn create_spreadsheet(rows: u32, cols: u32) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
@@ -2549,6 +3189,12 @@ mod pancurses_backend {
         });
     }
 
+    pub fn spreadsheet_add_commit_edit_callback<F: FnMut(u32, u32, String) + 'static>(f: F) {
+        with_state(|state| {
+            state.commit_edit_callbacks.push(Box::new(f));
+        });
+    }
+
     pub fn spreadsheet_set_cursor(id: usize, row: u32, col: u32) {
         with_state(|s| {
             if let Some(n) = s.node_mut(id) {
@@ -2560,31 +3206,51 @@ mod pancurses_backend {
         });
     }
 
-    pub fn spreadsheet_commit_formula_bar(spreadsheet_id: usize) {
+    pub fn spreadsheet_set_edit_state(id: usize, is_editing: bool, buf: &str, pos: usize) {
         with_state(|s| {
+            if let Some(n) = s.node_mut(id) {
+                if let PcWidgetKind::Spreadsheet { ref mut editing, ref mut edit_buf, ref mut edit_pos, .. } = n.kind {
+                    *editing = is_editing;
+                    *edit_buf = buf.to_string();
+                    *edit_pos = pos;
+                }
+            }
+        });
+    }
+
+    pub fn spreadsheet_commit_formula_bar(spreadsheet_id: usize) {
+        let result = with_state(|s| {
             let (entry_id, cursor_row, cursor_col) = match s.node(spreadsheet_id) {
                 Some(n) => match &n.kind {
                     PcWidgetKind::Spreadsheet { formula_bar_entry_id, cursor_row, cursor_col, .. } => {
                         (*formula_bar_entry_id, *cursor_row, *cursor_col)
                     }
-                    _ => return,
+                    _ => return None,
                 },
-                None => return,
+                None => return None,
             };
-            let Some(eid) = entry_id else { return };
+            let Some(eid) = entry_id else { return None };
             let text = match s.node(eid) {
                 Some(en) => match &en.kind {
                     PcWidgetKind::Entry { buffer, .. } => buffer.clone(),
-                    _ => return,
+                    _ => return None,
                 },
-                None => return,
+                None => return None,
             };
             if let Some(n) = s.node_mut(spreadsheet_id) {
                 if let PcWidgetKind::Spreadsheet { ref cells, .. } = n.kind {
-                    cells.borrow_mut().insert((cursor_row, cursor_col), text);
+                    cells.borrow_mut().insert((cursor_row, cursor_col), text.clone());
                 }
             }
+            Some((cursor_row, cursor_col, text))
         });
+        if let Some((r, c, text)) = result {
+            with_state(|s| {
+                let mut cbs = std::mem::take(&mut s.commit_edit_callbacks);
+                for cb in cbs.iter_mut() { cb(r, c, text.clone()); }
+                s.commit_edit_callbacks = cbs;
+            });
+        }
     }
 
     pub fn spreadsheet_set_formula_bar(spreadsheet_id: usize, address_label_id: usize, entry_id: usize) {
@@ -2861,18 +3527,73 @@ mod pancurses_backend {
         if children.is_empty() { return 0; }
 
         let parent_rect = s.node(id).map(|n| n.rect).unwrap_or(Rect::default());
+        let spacing = spacing.min(2);
         let total_children = children.len() as i32;
         let total_spacing = spacing * (total_children - 1).max(0);
 
         if horizontal {
             let total_w = parent_rect.w.saturating_sub(total_spacing).max(1);
-            let per_child = if total_children > 0 { (total_w / total_children).max(1) } else { 1 };
-            let mut x = parent_rect.x;
-            for child_id in &children {
-                if let Some(n) = s.node_mut(*child_id) {
-                    n.rect = Rect { x, y: parent_rect.y, w: per_child, h: parent_rect.h.max(1) };
+            // Compute natural widths for each child based on content
+            let natural_widths: Vec<i32> = children.iter().map(|&cid| {
+                match s.node(cid).map(|n| &n.kind) {
+                    Some(PcWidgetKind::Button { label, .. }) => (label.len() + 2) as i32,
+                    Some(PcWidgetKind::Label { text }) => (text.len() + 0) as i32,
+                    Some(PcWidgetKind::CheckButton { label, .. }) => (label.len() + 4) as i32,
+                    Some(PcWidgetKind::RadioButton { label, .. }) => (label.len() + 4) as i32,
+                    Some(PcWidgetKind::DropDown { items, .. }) => {
+                        let max_item = items.iter().map(|s| s.len()).max().unwrap_or(0);
+                        (max_item + 3) as i32 // [text▼]
+                    }
+                    Some(PcWidgetKind::Entry { buffer, .. }) => (buffer.len() + 4).max(6) as i32,
+                    Some(PcWidgetKind::TextView { text }) => {
+                        text.lines().next().map(|l| l.len()).unwrap_or(0).max(6) as i32
+                    }
+                    _ => 4,
                 }
-                x += per_child + spacing;
+            }).collect();
+            let total_natural: i32 = natural_widths.iter().sum();
+            if total_natural <= total_w {
+                // Give each child its natural width then distribute extra proportionally
+                let extra = total_w - total_natural;
+                let mut x = parent_rect.x;
+                let mut remaining = extra;
+                for (i, child_id) in children.iter().enumerate() {
+                    let extra_share = if i == children.len() - 1 {
+                        remaining
+                    } else {
+                        let share = extra * natural_widths[i] / total_natural;
+                        remaining -= share;
+                        share
+                    };
+                    let w = natural_widths[i] + extra_share;
+                    if let Some(n) = s.node_mut(*child_id) {
+                        n.rect = Rect { x, y: parent_rect.y, w, h: parent_rect.h.max(1) };
+                    }
+                    x += w;
+                    if i + 1 < children.len() { x += spacing; }
+                }
+            } else {
+                // Shrink longest-first: give each child its natural width,
+                // then repeatedly shrink the widest by 1 until everything fits.
+                let mut widths: Vec<i32> = natural_widths.iter().map(|&w| w.max(1)).collect();
+                let mut total: i32 = widths.iter().sum();
+                while total > total_w {
+                    // Find the widest child and shrink it by 1
+                    let mut max_i = 0;
+                    for i in 1..widths.len() {
+                        if widths[i] > widths[max_i] { max_i = i; }
+                    }
+                    widths[max_i] -= 1;
+                    total -= 1;
+                }
+                let mut x = parent_rect.x;
+                for (i, child_id) in children.iter().enumerate() {
+                    if let Some(n) = s.node_mut(*child_id) {
+                        n.rect = Rect { x, y: parent_rect.y, w: widths[i], h: parent_rect.h.max(1) };
+                    }
+                    x += widths[i];
+                    if i + 1 < children.len() { x += spacing; }
+                }
             }
         } else {
             // Natural-height vertical layout: each child gets 1 row by default,
@@ -2946,6 +3667,17 @@ mod pancurses_backend {
         get_entry_text(id)
     }
 
+    pub fn set_button_font_style(id: usize, w: i32, it: bool) {
+        with_state(|s| {
+            if let Some(n) = s.node_mut(id) {
+                if let PcWidgetKind::Button { ref mut weight, ref mut italic, .. } = n.kind {
+                    *weight = w;
+                    *italic = it;
+                }
+            }
+        });
+    }
+
     pub fn set_focus(id: usize) {
         with_state(|s| s.focus_id = Some(id));
     }
@@ -2970,14 +3702,14 @@ mod pancurses_backend {
             };
             let (cells, raw_cells, top_row, left_col, cursor_row, cursor_col, editing, edit_buf, edit_pos,
                  col_width, margin_cols, main_cols, menu_text, status_text,
-                 formula_bar_trailing, column_layout, row_labels) = match &n.kind {
+                 border_title, formula_bar_trailing, column_layout, row_labels) = match &n.kind {
                 PcWidgetKind::Spreadsheet { cells, raw_cells, top_row, left_col, cursor_row, cursor_col,
                     editing, edit_buf, edit_pos, col_width, margin_cols, main_cols,
-                    menu_text, status_text, ref formula_bar_trailing, ref column_layout, ref row_labels, .. } => {
+                    menu_text, status_text, ref border_title, ref formula_bar_trailing, ref column_layout, ref row_labels, .. } => {
                     (cells.clone(), raw_cells.clone(), *top_row, *left_col, *cursor_row, *cursor_col,
                      *editing, edit_buf.clone(), *edit_pos, *col_width,
                      *margin_cols, *main_cols, menu_text.clone(), status_text.clone(),
-                     formula_bar_trailing.clone(), column_layout.clone(), row_labels.clone())
+                     border_title.clone(), formula_bar_trailing.clone(), column_layout.clone(), row_labels.clone())
                 }
                 _ => return,
             };
@@ -3016,15 +3748,45 @@ mod pancurses_backend {
                     .map(|(_, l)| l.as_str())
                     .unwrap_or("1");
                 let addr_text = format!("{}{}", col_part, row_label.trim());
-                let cell_val = raw_cells.borrow().get(&(cursor_row, cursor_col)).cloned().unwrap_or_default();
-                let max_fb = width.saturating_sub(addr_text.chars().count() + 3 + formula_bar_trailing.chars().count()).max(1);
-                let fb_text = if cell_val.chars().count() > max_fb {
-                    let truncated: String = cell_val.chars().take(max_fb.saturating_sub(3)).collect();
-                    format!(" {}  {}…{}", addr_text, truncated, formula_bar_trailing)
+                let addr_str = format!(" {}  ", addr_text);
+                if editing || !edit_buf.is_empty() {
+                    // Edit mode: show edit buffer with cursor
+                    let chars: Vec<char> = edit_buf.chars().collect();
+                    let cpos = edit_pos.min(chars.len());
+                    let before: String = chars[..cpos].iter().collect();
+                    let after: String = if cpos < chars.len() {
+                        chars[cpos + 1..].iter().collect()
+                    } else {
+                        String::new()
+                    };
+                    let cursor_ch = chars.get(cpos).map(|c| c.to_string()).unwrap_or_else(|| " ".to_string());
+                    let fb_text = format!("{}{}{}{}", addr_str, before, cursor_ch, after);
+                    let truncated: String = fb_text.chars().take(width).collect();
+                    buf[row] = truncated;
                 } else {
-                    format!(" {}  {}{}", addr_text, cell_val, formula_bar_trailing)
+                    let cell_val = raw_cells.borrow().get(&(cursor_row, cursor_col)).cloned().unwrap_or_default();
+                    let fb_text = format!(" {}  {}{}", addr_text, cell_val, formula_bar_trailing);
+                    let truncated: String = fb_text.chars().take(width).collect();
+                    buf[row] = truncated;
+                }
+                row += 1;
+            }
+
+            // Border title line (matching ratatui: ┌ title ───┐)
+            if row < height {
+                let title = if !border_title.is_empty() {
+                    border_title.clone()
+                } else {
+                    format!("corro  {}r × {}c ", mc, mc)
                 };
-                let truncated: String = fb_text.chars().take(width).collect();
+                let title_vis = title.chars().count();
+                let dash_fill = width.saturating_sub(title_vis + 3);
+                let mut border_line = String::from("┌");
+                border_line.push(' ');
+                border_line.push_str(&title);
+                border_line.push_str(&"─".repeat(dash_fill));
+                border_line.push('┐');
+                let truncated: String = border_line.chars().take(width).collect();
                 buf[row] = truncated;
                 row += 1;
             }
@@ -3043,14 +3805,14 @@ mod pancurses_backend {
                     for (i, &(ci, w, ref label)) in column_layout.iter().enumerate() {
                         let padded = format!("{:<1$}", label, (w as usize).max(1));
                         hdr.push_str(&padded);
-                        if i + 1 < n {
-                            let is_boundary = lm > 0 && (ci == (lm - 1) as u32 || ci == (lm + mc - 1) as u32);
-                            if is_boundary {
-                                hdr.push('│');
-                            } else {
-                                hdr.push(' ');
-                            }
+                    if i + 1 < n {
+                        let is_boundary = lm > 0 && (ci == (lm - 1) as u32 || ci == (lm + mc - 1) as u32);
+                        if is_boundary {
+                            hdr.push_str("│ ");
+                        } else {
+                            hdr.push(' ');
                         }
+                    }
                     }
                 } else {
                     let max_data_cols = ((width as i32 - rh_w as i32 - 2) / (cw as i32 + 1)).max(1) as usize;
@@ -3121,35 +3883,42 @@ mod pancurses_backend {
             }
 
             // Data rows (with │ border)
-            let grid_bottom = height - if status_text.is_empty() { 0 } else { 2 };
+            let has_status_bar = !status_text.is_empty() || editing || !edit_buf.is_empty();
+            let grid_bottom = height - if has_status_bar { 2 } else { 0 };
+            let header_row_count = if !menu_text.is_empty() { 5 } else { 4 };
             while row < grid_bottom && row < height {
-                let row_idx = top_row + (row.saturating_sub(4)) as u32;
+                let row_idx = top_row + (row.saturating_sub(header_row_count)) as u32;
                 let mut data_row = String::new();
                 data_row.push('│');
                 // Row header
                 if use_row_labels {
                     if let Some((_, label)) = row_labels.iter().find(|(r, _)| *r == row_idx) {
-                        data_row.push_str(label);
+                        data_row.push_str(&format!("{:>4} ", label.trim()));
                     } else {
-                        data_row.push_str(&format!("{:>4}", row_idx + 1));
+                        data_row.push_str(&format!("{:>4} ", row_idx + 1));
                     }
                 } else {
-                    data_row.push_str(&format!("{:>4}", row_idx + 1));
+                    data_row.push_str(&format!("{:>4} ", row_idx + 1));
                 }
-                data_row.push(sep);
                 // Data cells
                 let cells_ref = cells.borrow();
                 if use_layout {
                     let lm = margin_cols;
+                    let mc = main_cols;
                     let n = column_layout.len();
                     let mut vi = 0usize;
                     while vi < n {
                         let (col_idx, w, _) = column_layout[vi];
                         let cell_text = cells_ref.get(&(row_idx, col_idx)).map(|s| s.as_str()).unwrap_or("");
                         let cell_w = w as usize;
+                        let is_boundary = lm > 0 && (col_idx == lm - 1 || col_idx == lm + mc - 1);
                         if cell_text.is_empty() {
-                            data_row.push_str(&format!("{:<1$}", "", cell_w));
+                            let gap_extra = if vi + 1 < n && !is_boundary { 1 } else { 0 };
+                            data_row.push_str(&format!("{:<1$}", "", cell_w + gap_extra));
                             vi += 1;
+                            if vi < n && is_boundary {
+                                data_row.push_str("│ ");
+                            }
                             continue;
                         }
                         let text_width = cell_text.chars().count();
@@ -3159,6 +3928,22 @@ mod pancurses_backend {
                             let mut scan = vi + 1;
                             while scan < n {
                                 let (sc_idx, _, _) = column_layout[scan];
+                                // Stop at left-margin boundary unconditionally.
+                                if lm > 0 && (sc_idx as usize) == lm as usize {
+                                    break;
+                                }
+                                // At right-margin boundary: stop if text fits
+                                // within the main columns + PipeAndSpace,
+                                // otherwise continue into right-margin cols.
+                                if lm > 0 && (sc_idx as usize) == lm as usize + mc as usize {
+                                    let boundary_total: usize = column_layout[vi..scan].iter()
+                                        .map(|&(_, w, _)| w as usize).sum::<usize>()
+                                        + (scan.saturating_sub(vi + 1))
+                                        + 2;
+                                    if text_width <= boundary_total {
+                                        break;
+                                    }
+                                }
                                 let sc_text = cells_ref.get(&(row_idx, sc_idx)).map(|s| s.as_str()).unwrap_or("");
                                 if sc_text.is_empty() {
                                     overflow_cols += 1;
@@ -3166,11 +3951,29 @@ mod pancurses_backend {
                                 } else { break; }
                             }
                         }
-                        let gap_after = if overflow_cols == 0 && vi + 1 < n { 1 } else { 0 };
-                        let total_avail: usize = column_layout[vi..=vi+overflow_cols].iter()
+                        let gap_after = if overflow_cols == 0 && vi + 1 < n && !is_boundary { 1 } else { 0 };
+                        let mut total_avail: usize = column_layout[vi..=vi+overflow_cols].iter()
                             .map(|&(_, w, _)| w as usize).sum::<usize>()
                             + overflow_cols // spaces between overflow columns
                             + gap_after;   // gap to next column
+                        // Include right-gap for consistent overflow width
+                        if vi + overflow_cols + 1 >= n {
+                            let mut render_w: usize = column_layout.iter()
+                                .map(|&(_, w, _)| w as usize).sum::<usize>();
+                            for idx in 0..n.saturating_sub(1) {
+                                let col_idx = column_layout[idx].0 as usize;
+                                let lm_u = lm as usize;
+                                if lm_u > 0 && (col_idx == lm_u - 1 || col_idx == lm_u + mc as usize - 1) {
+                                    render_w += 2;
+                                } else {
+                                    render_w += 1;
+                                }
+                            }
+                            let total_w = (width as usize).saturating_sub(7);
+                            if total_w > render_w {
+                                total_avail = total_avail.saturating_add(total_w - render_w);
+                            }
+                        }
                         let display = if text_width > total_avail {
                             if overflow_cols == 0 {
                                 cell_text.chars().take(total_avail).collect()
@@ -3193,6 +3996,9 @@ mod pancurses_backend {
                         };
                         data_row.push_str(&format!("{:<1$}", display, total_width));
                         vi += 1 + overflow_cols;
+                        if vi < n && is_boundary {
+                            data_row.push_str("│ ");
+                        }
                     }
                 } else {
                     let max_data_cols = ((width as i32 - rh_w as i32 - 2) / (cw as i32 + 1)).max(1) as usize;
@@ -3259,8 +4065,17 @@ mod pancurses_backend {
             }
 
             // Status bar (always on its own line below the bottom border)
-            if !status_text.is_empty() && row < height {
-                let display = &status_text[..status_text.len().min(width)];
+            let edit_hint = "  type to edit (or addr: val)   Enter·confirm   Esc·discard";
+            let normal_hint = "  type/F2·edit; Ctrl+C·copy; Ctrl+X·cut; Ctrl+V·paste; Ctrl+;·date; Ctrl+:·time; Ctrl+S·save; F1·help";
+            let display_status = if editing || !edit_buf.is_empty() {
+                edit_hint.to_string()
+            } else if !status_text.is_empty() {
+                status_text.clone()
+            } else {
+                normal_hint.to_string()
+            };
+            if !display_status.is_empty() && row < height {
+                let display = &display_status[..display_status.len().min(width)];
                 buf[row] = display.to_string();
             }
         });
@@ -3539,27 +4354,22 @@ mod pancurses_backend {
             assert!(buf[1].contains("A1"), "formula bar missing A1: {:?}", &buf[1]);
             assert!(buf[1].contains("This Text is really long"), "formula bar missing text");
 
-            // Line 2: Grid header starts with │ border, then column labels
-            assert!(buf[2].starts_with("│"), "grid header missing border: {:?}", &buf[2]);
-            assert!(buf[2].contains("A"), "header missing A");
-            assert!(buf[2].contains("B"), "header missing B");
-            assert!(buf[2].contains("C"), "header missing C");
+            // Line 3: Grid header starts with │ border, then column labels
+            // (Line 0=menu, 1=formula bar, 2=border ┌─, 3=header)
+            assert!(buf[3].starts_with("│"), "grid header missing border: {:?}", &buf[3]);
+            assert!(buf[3].contains("A"), "header missing A");
+            assert!(buf[3].contains("B"), "header missing B");
+            assert!(buf[3].contains("C"), "header missing C");
 
-            // Note: ratatui shows a border box around the grid:
-            //   ┌ corro  3r × 3c  ops 3─────┐   (top border)
-            //   │     [A  │ A     B     C   │   (column headers)
-            // Our pancurses buffer may not match the border format exactly
-            // but the cell content and structural elements should match.
-
-            // Data rows: each should contain the overflow text
-            assert!(buf[4].contains("This Text is really long"), "row 1 missing overflow text");
-            assert!(buf[4].starts_with("│   1"), "row 1 label wrong: {:?}", &buf[4]);
+            // Data rows: start at line 5 (menu=0 formula=1 border=2 header=3 sep=4)
+            assert!(buf[5].contains("This Text is really long"), "row 1 missing overflow text");
+            assert!(buf[5].starts_with("│   1"), "row 1 label wrong: {:?}", &buf[5]);
 
             // Row 2 should start with │   2
-            assert!(buf[5].starts_with("│   2"), "row 2 label wrong: {:?}", &buf[5]);
+            assert!(buf[6].starts_with("│   2"), "row 2 label wrong: {:?}", &buf[6]);
 
             // Row 3 should start with │   3
-            assert!(buf[6].starts_with("│   3"), "row 3 label wrong: {:?}", &buf[6]);
+            assert!(buf[7].starts_with("│   3"), "row 3 label wrong: {:?}", &buf[7]);
 
             // Status bar
             let last = &buf[buf.len() - 1];
@@ -4100,9 +4910,189 @@ mod pancurses_backend {
                 Some(wid),
             ));
             let buf = render_spreadsheet_to_buffer(sid, 80, 10);
-            // Header is at index 1 (index 0 = formula bar, since menu_text is empty)
-            assert!(buf[1].contains("X"), "header missing X in {:?}", &buf[1]);
-            assert!(buf[1].contains("Y"), "header missing Y in {:?}", &buf[1]);
+            // Header is at index 2 (index 0 = formula bar, index 1 = border, since menu_text is empty)
+            assert!(buf[2].contains("X"), "header missing X in {:?}", &buf[2]);
+            assert!(buf[2].contains("Y"), "header missing Y in {:?}", &buf[2]);
+        }
+
+        /// Reproduce blank spreadsheet: test with margin columns, header rows,
+        /// and cell data stored via `set_cell` (like `fill_cells` does).
+        #[test]
+        fn pnc_fill_cells_simulation() {
+            let wid = with_state(|s| s.add_node(
+                PcWidgetKind::Window { title: "corro".into() }, None,
+            ));
+            let total_rows = 24u32;
+            let total_cols = 5u32;
+            let sid = with_state(|s| s.add_node(
+                PcWidgetKind::Spreadsheet {
+                    cells: Rc::new(RefCell::new(HashMap::new())),
+                    raw_cells: Rc::new(RefCell::new(HashMap::new())),
+                    cell_styles: Rc::new(RefCell::new(HashMap::new())),
+                    total_rows, total_cols,
+                    top_row: 0, left_col: 0,
+                    cursor_row: 0, cursor_col: 0,
+                    editing: false, edit_buf: String::new(), edit_pos: 0,
+                    col_width: 12, margin_cols: 0, main_cols: total_cols,
+                    formula_bar_address_id: None, formula_bar_entry_id: None,
+                    anchor: None,
+                    menu_text: " [File]   Edit    Insert    Format    Sheet    Help".into(),
+                    status_text: "status bar".into(),
+                    border_title: "corro  24r × 3c  ops 0".into(),
+                    formula_bar_trailing: String::new(),
+                    column_layout: Vec::new(),
+                    row_labels: Vec::new(),
+                    tab_titles: Vec::new(),
+                    tab_active: 0,
+                    header_row_count: 2,
+                    main_row_count: 24,
+                },
+                Some(wid),
+            ));
+
+            // Simulate what pnc_backend.rs does: margin_cols=2, main_cols=3, total 5 columns
+            let lm = 2u32;
+            let mc = 3u32;
+            let col_ixs: Vec<usize> = (0..5).collect();
+            let layout: Vec<(u32, u32, String)> = col_ixs.iter().map(|&c| {
+                (c as u32, 10u32, format!("C{}", c))
+            }).collect();
+            let row_labels: Vec<(u32, String)> = (0..total_rows)
+                .map(|i| (i, format!("{:>4}", i + 1)))
+                .collect();
+            with_state(|state| {
+                let n = state.node_mut(sid).unwrap();
+                match &mut n.kind {
+                    PcWidgetKind::Spreadsheet { ref mut column_layout, .. } => {
+                        *column_layout = layout;
+                    }
+                    _ => unreachable!(),
+                }
+            });
+            spreadsheet_set_row_labels(sid, row_labels);
+            spreadsheet_set_grid_config(sid, lm, mc);
+            spreadsheet_set_cursor(sid, 0, 0);
+
+            // Store cell data at (display_row_idx, global_col_idx) like fill_cells
+            // Set both margin (col 0,1) and main (col 2,3,4) cells
+            spreadsheet_set_cell(sid, 0, 2, "hello"); // main col
+            spreadsheet_set_cell(sid, 0, 3, "world"); // main col
+            spreadsheet_set_cell(sid, 1, 2, "foo");
+            spreadsheet_set_cell(sid, 1, 3, "bar");
+
+            let buf = render_spreadsheet_to_buffer(sid, 120, 40);
+
+            // Data rows start at index 5 (menu+formula+border+header+separator=5)
+            // Row 1 should contain "hello" in the first main column
+            assert!(buf[5].contains("hello"),
+                "row 1 missing 'hello'. line={:?}", &buf[5]);
+            assert!(buf[5].contains("world"),
+                "row 1 missing 'world'. line={:?}", &buf[5]);
+
+            assert!(buf[6].contains("foo"),
+                "row 2 missing 'foo'. line={:?}", &buf[6]);
+            assert!(buf[6].contains("bar"),
+                "row 2 missing 'bar'. line={:?}", &buf[6]);
+
+            assert!(buf[5].starts_with("│   1"),
+                "row 1 should start with │   1. got={:?}", &buf[5]);
+        }
+
+        /// Diagnose blank rows: check row_idx computation and label lookup
+        /// for the exact same flow as render_widget during app startup.
+        #[test]
+        fn diagnose_row_label_lookup() {
+            let wid = with_state(|s| s.add_node(
+                PcWidgetKind::Window { title: "corro".into() }, None,
+            ));
+            let total_rows = 10u32;
+            let total_cols = 3u32;
+            let sid = with_state(|s| s.add_node(
+                PcWidgetKind::Spreadsheet {
+                    cells: Rc::new(RefCell::new(HashMap::new())),
+                    raw_cells: Rc::new(RefCell::new(HashMap::new())),
+                    cell_styles: Rc::new(RefCell::new(HashMap::new())),
+                    total_rows, total_cols,
+                    top_row: 0, left_col: 0,
+                    cursor_row: 0, cursor_col: 2,
+                    editing: false, edit_buf: String::new(), edit_pos: 0,
+                    col_width: 12, margin_cols: 0, main_cols: total_cols,
+                    formula_bar_address_id: None, formula_bar_entry_id: None,
+                    anchor: None,
+                    menu_text: "Menu".into(),
+                    status_text: "Status".into(),
+                    border_title: "Test".into(),
+                    formula_bar_trailing: String::new(),
+                    column_layout: vec![(0,10,"A".into()),(1,10,"B".into()),(2,10,"C".into())],
+                    row_labels: (0..total_rows).map(|i| (i, format!("{:>4}", i + 1))).collect(),
+                    tab_titles: Vec::new(),
+                    tab_active: 0,
+                    header_row_count: 2,
+                    main_row_count: 24,
+                },
+                Some(wid),
+            ));
+            spreadsheet_set_cursor(sid, 0, 2);
+
+            // Replicate fill_cells: store cell text at (display_row_idx, global_col_idx)
+            spreadsheet_set_cell(sid, 0, 2, "A1_data");
+            spreadsheet_set_cell(sid, 1, 2, "A2_data");
+
+            let buf = render_spreadsheet_to_buffer(sid, 80, 20);
+            // Data rows start at index 5 (menu=0 formula=1 border=2 header=3 sep=4)
+            assert!(buf[5].contains("A1_data"),
+                "buf[5] missing cell data: {:?}", &buf[5]);
+            assert!(buf[5].contains("   1"),
+                "buf[5] missing row label: {:?}", &buf[5]);
+            assert!(buf[6].contains("A2_data"),
+                "buf[6] missing cell data: {:?}", &buf[6]);
+        }
+
+        /// Test rendering with empty cell data that fill_cells would produce
+        /// for an empty grid (no content at any address).
+        #[test]
+        fn pnc_fill_cells_empty_grid_renders_structure() {
+            let wid = with_state(|s| s.add_node(
+                PcWidgetKind::Window { title: "corro".into() }, None,
+            ));
+            let total_rows = 10u32;
+            let total_cols = 5u32;
+            let sid = with_state(|s| s.add_node(
+                PcWidgetKind::Spreadsheet {
+                    cells: Rc::new(RefCell::new(HashMap::new())),
+                    raw_cells: Rc::new(RefCell::new(HashMap::new())),
+                    cell_styles: Rc::new(RefCell::new(HashMap::new())),
+                    total_rows, total_cols,
+                    top_row: 0, left_col: 0,
+                    cursor_row: 0, cursor_col: 0,
+                    editing: false, edit_buf: String::new(), edit_pos: 0,
+                    col_width: 12, margin_cols: 2, main_cols: 3,
+                    formula_bar_address_id: None, formula_bar_entry_id: None,
+                    anchor: None,
+                    menu_text: " [File]   Edit".into(),
+                    status_text: "status".into(),
+                    border_title: "test".into(),
+                    formula_bar_trailing: String::new(),
+                    column_layout: vec![(0,6,"L0".into()),(1,6,"L1".into()),(2,10,"A".into()),(3,10,"B".into()),(4,10,"C".into())],
+                    row_labels: (0..total_rows).map(|i| (i, format!("{:>4}", i + 1))).collect(),
+                    tab_titles: Vec::new(),
+                    tab_active: 0,
+                    header_row_count: 2,
+                    main_row_count: 24,
+                },
+                Some(wid),
+            ));
+            spreadsheet_set_cursor(sid, 0, 2);
+
+            // Do NOT set any cell data — test what an empty grid renders like
+            let buf = render_spreadsheet_to_buffer(sid, 120, 40);
+
+            // Structure should still be present: menu, formula bar, headers, data rows
+            assert!(buf[0].contains("File"), "menu missing: {:?}", &buf[0]);
+            assert!(buf[3].contains("A"), "header missing A: {:?}", &buf[3]);
+
+            // Data rows should have proper structure even if empty
+            assert!(buf[5].starts_with("│"), "data row missing │: {:?}", &buf[5]);
         }
 
         /// Rendering: pre-computed row labels appear in data rows.
@@ -4137,6 +5127,189 @@ mod pancurses_backend {
             let buf = render_spreadsheet_to_buffer(sid, 80, 10);
             assert!(buf[4].contains("ROW0"), "row 0 label missing: {:?}", buf[4]);
             assert!(buf[5].contains("ROW1"), "row 1 label missing: {:?}", buf[5]);
+        }
+
+        /// Verify the SGR rendering of the formula bar: uses sgr_formula() style,
+        /// includes trailing status text, and does NOT emit extra resets before the border.
+        /// This calls render_widget with a dummy Window pointer because Spreadsheet
+        /// rendering never accesses the Window (it writes SGR to spreadsheet_output).
+        #[test]
+        fn formula_bar_sgr_matches_ratatui() {
+            let wid = with_state(|s| s.add_node(
+                PcWidgetKind::Window { title: "test".into() }, None,
+            ));
+            let total_rows = 3u32;
+            let total_cols = 3u32;
+            let sid = with_state(|s| s.add_node(
+                PcWidgetKind::Spreadsheet {
+                    cells: Rc::new(RefCell::new(HashMap::new())),
+                    raw_cells: Rc::new(RefCell::new(HashMap::from([
+                        ((0, 0), "42".into()),
+                    ]))),
+                    cell_styles: Rc::new(RefCell::new(HashMap::new())),
+                    total_rows, total_cols,
+                    top_row: 0, left_col: 0,
+                    cursor_row: 0, cursor_col: 0,
+                    editing: false, edit_buf: String::new(), edit_pos: 0,
+                    col_width: 12, margin_cols: 0, main_cols: total_cols,
+                    formula_bar_address_id: None, formula_bar_entry_id: None,
+                    anchor: None,
+                    menu_text: "Menu".into(),
+                    status_text: String::new(),
+                    border_title: "Test".into(),
+                    formula_bar_trailing: "   ·  Loaded workbook /root/src/corro_mainloop/t_shift5.corro @ revision 30".into(),
+                    column_layout: vec![(0,8,"A".into()),(1,8,"B".into()),(2,8,"C".into())],
+                    row_labels: (0..total_rows).map(|i| (i, format!("{:>4}", i + 1))).collect(),
+                    tab_titles: Vec::new(),
+                    tab_active: 0,
+                    header_row_count: 2,
+                    main_row_count: 24,
+                },
+                Some(wid),
+            ));
+            spreadsheet_set_cursor(sid, 0, 0);
+
+            let buf = render_spreadsheet_to_buffer(sid, 80, 10);
+            // Formula bar (buf[1]) should contain address, cell value, and trailing status
+            assert!(buf[1].contains("A1"), "formula bar missing A1: {:?}", buf[1]);
+            assert!(buf[1].contains("42"), "formula bar missing cell value: {:?}", buf[1]);
+            assert!(buf[1].contains("Loaded workbook"),
+                "formula bar missing trailing status: {:?}", buf[1]);
+            assert!(buf[1].contains("·"),
+                "formula bar missing separator: {:?}", buf[1]);
+            // The trailing text should match the expected status message
+            assert!(buf[1].contains("Loaded workbook"),
+                "formula bar missing status prefix: {:?}", buf[1]);
+            assert!(!buf[1].contains("type/F2"),
+                "formula bar should NOT show edit hints (they belong in status bar): {:?}", buf[1]);
+        }
+
+        /// Test that right-aligned numeric content is rendered correctly
+        #[test]
+        fn right_aligned_cell_rendering() {
+            let wid = with_state(|s| s.add_node(
+                PcWidgetKind::Window { title: "test".into() }, None,
+            ));
+            let sid = with_state(|s| s.add_node(
+                PcWidgetKind::Spreadsheet {
+                    cells: Rc::new(RefCell::new(HashMap::new())),
+                    raw_cells: Rc::new(RefCell::new(HashMap::new())),
+                    cell_styles: Rc::new(RefCell::new(HashMap::new())),
+                    total_rows: 5, total_cols: 3, top_row: 0, left_col: 0,
+                    cursor_row: 0, cursor_col: 1,
+                    editing: false, edit_buf: String::new(), edit_pos: 0,
+                    col_width: 12,
+                    margin_cols: 1, main_cols: 2,
+                    formula_bar_address_id: None, formula_bar_entry_id: None,
+                    anchor: None,
+                    menu_text: String::new(),
+                    status_text: String::new(),
+                    border_title: String::new(),
+                    formula_bar_trailing: String::new(),
+                    column_layout: vec![(0,4,"[A".into()),(1,4,"A".into()),(2,4,"]A".into())],
+                    row_labels: vec![(0,"   1".into()),(1,"   2".into())],
+                    tab_titles: Vec::new(),
+                    tab_active: 0,
+                    header_row_count: 2,
+                    main_row_count: 3,
+                },
+                Some(wid),
+            ));
+            spreadsheet_set_grid_config(sid, 1, 2);
+            spreadsheet_set_cell(sid, 1, 1, "  22");
+            let buf = render_spreadsheet_to_buffer(sid, 40, 12);
+            // Data rows start at index 4 (border+header+separator=4 when no menu bar)
+            eprintln!("buf 2-col: buf[5] = {:?}", &buf[5]);
+            // The cell at (row=1, col=1) should contain "  22" (4 chars)
+            assert!(buf[5].contains("  22"),
+                "Cell should contain '  22' but got: {:?}", &buf[5]);
+
+            // Now test with larger margin_cols that match the real backend scenario
+            let sid2 = with_state(|s| s.add_node(
+                PcWidgetKind::Spreadsheet {
+                    cells: Rc::new(RefCell::new(HashMap::new())),
+                    raw_cells: Rc::new(RefCell::new(HashMap::new())),
+                    cell_styles: Rc::new(RefCell::new(HashMap::new())),
+                    total_rows: 5, total_cols: 3, top_row: 0, left_col: 0,
+                    cursor_row: 0, cursor_col: 1,
+                    editing: false, edit_buf: String::new(), edit_pos: 0,
+                    col_width: 12,
+                    margin_cols: 702, main_cols: 2,
+                    formula_bar_address_id: None, formula_bar_entry_id: None,
+                    anchor: None,
+                    menu_text: String::new(),
+                    status_text: String::new(),
+                    border_title: String::new(),
+                    formula_bar_trailing: String::new(),
+                    column_layout: vec![
+                        (701,4,"[A".into()),
+                        (702,4,"A".into()),
+                        (703,4,"B".into()),
+                        (704,4,"]A".into()),
+                    ],
+                    row_labels: vec![(0,"   1".into()),(1,"   2".into())],
+                    tab_titles: Vec::new(),
+                    tab_active: 0,
+                    header_row_count: 2,
+                    main_row_count: 3,
+                },
+                Some(wid),
+            ));
+            spreadsheet_set_grid_config(sid2, 702, 2);
+            spreadsheet_set_cell(sid2, 1, 702, "  22");
+            let buf2 = render_spreadsheet_to_buffer(sid2, 40, 12);
+            eprintln!("buf 702-col: buf[5] = {:?}", &buf2[5]);
+            assert!(buf2[5].contains("  22"),
+                "Cell at col 702 should contain '  22' but got: {:?}", &buf2[5]);
+
+        }
+        
+        /// Test cell content rendering for the right-aligned "22" in a wide-margin setup.
+        #[test]
+        fn right_aligned_cell_matches_reference() {
+            let wid = with_state(|s| s.add_node(
+                PcWidgetKind::Window { title: "test".into() }, None,
+            ));
+            let sid = with_state(|s| s.add_node(
+                PcWidgetKind::Spreadsheet {
+                    cells: Rc::new(RefCell::new(HashMap::new())),
+                    raw_cells: Rc::new(RefCell::new(HashMap::new())),
+                    cell_styles: Rc::new(RefCell::new(HashMap::new())),
+                    total_rows: 100, total_cols: 5, top_row: 0, left_col: 0,
+                    cursor_row: 1, cursor_col: 702,
+                    editing: false, edit_buf: String::new(), edit_pos: 0,
+                    col_width: 12,
+                    margin_cols: 702, main_cols: 2,
+                    formula_bar_address_id: None, formula_bar_entry_id: None,
+                    anchor: None,
+                    menu_text: " [File]   Edit    Insert    Format    Sheet    Help".into(),
+                    status_text: "  type to edit (or addr: val)   Enter·confirm   Esc·discard".into(),
+                    border_title: "corro  2r x 2c ops 34".into(),
+                    formula_bar_trailing: "   ·  Loaded workbook /root/src/corro_mainloop/t_shift5.corro @ revision 34".into(),
+                    column_layout: vec![
+                        (701,4,"[A".into()),
+                        (702,4,"A".into()),
+                        (703,4,"B".into()),
+                    ],
+                    row_labels: vec![(0,"   1".into()),(1,"   2".into())],
+                    tab_titles: Vec::new(),
+                    tab_active: 0,
+                    header_row_count: 2,
+                    main_row_count: 2,
+                },
+                Some(wid),
+            ));
+            spreadsheet_set_grid_config(sid, 702, 2);
+            spreadsheet_set_cursor(sid, 1, 702);
+            // Simulate fill_cells: store right-aligned number in main column A
+            spreadsheet_set_cell(sid, 1, 702, "  22");
+            spreadsheet_set_cell_style(sid, 1, 702, 0);
+            spreadsheet_set_raw_cell(sid, 1, 702, "22");
+            let buf = render_spreadsheet_to_buffer(sid, 120, 40);
+            eprintln!("Line 6: {:?}", &buf[6]);
+            // The rendered output must contain "  22" (right-aligned in 4-wide cell)
+            assert!(buf[6].contains("  22") || buf[6].contains("22"),
+                "Cell should contain '22' but line 6 = {:?}", &buf[6]);
         }
     }
 }

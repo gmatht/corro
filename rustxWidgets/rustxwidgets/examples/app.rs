@@ -84,6 +84,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let total_h = ch + ROWS as f64 * ch;
 
     let app = App::init()?;
+
+    #[cfg(feature = "gtk")]
+    if let Some(loader) = rustxwidgets::backends::gtk::loader() {
+        println!("GTK version: {:?}", loader.version());
+    }
+
     let win = app.create_window()?;
     win.set_title("App \u{2014} Spreadsheet with Menus, Dialogs && Widgets");
     win.set_default_size(1600, 1000);
@@ -194,6 +200,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     bold_btn.set_font_style(700, false);
     italic_btn.set_font_style(400, true);
+    hl_btn.add_class("hl-btn");
     toolbar.append(&open_btn);
     toolbar.append(&save_btn);
     toolbar.append(&quit_btn);
@@ -220,7 +227,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut widget_panel = app.create_box(Orientation::Horizontal, 8)?;
 
     let dd = app.create_dropdown(&["Small", "Medium", "Large"])?;
-    dd.set_active(Some(1));
+    dd.set_active(1);
     let dd_cb = dd.clone();
     dd.connect_changed(move || {
         println!("  [widget] DropDown: active={}", dd_cb.get_active());
@@ -294,6 +301,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .cell-fg-red { color: #cc0000; }
         .cell-fg-blue { color: #0000cc; }
         .cell-fg-green { color: #006600; }
+        .hl-btn { background: #ffff00; }
         "#;
         if let Some(provider) =
             gtk_dynamic_loader::create_css_provider(&gtk_loader, css)
@@ -1168,7 +1176,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    connect_action!(sa_quit, { || std::process::exit(0) });
+    connect_action!(sa_quit, || std::process::exit(0));
 
     let tc2 = texts.clone();
     let sc2 = sel.clone();
@@ -1327,9 +1335,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Assemble and run ────────────────────────────────────────────
     vbox.append(&scrolled);
-    vbox.set_child_vexpand(&scrolled, true);
-    vbox.set_child_hexpand(&scrolled, true);
-    win.set_child_box(&vbox);
+    scrolled.set_vexpand(true);
+    scrolled.set_hexpand(true);
+    win.set_child(&vbox);
     win.present();
 
     println!("=== App: Spreadsheet with Menus, Dialogs && Widgets ===");

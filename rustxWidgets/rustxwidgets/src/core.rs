@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+#[cfg(windows)]
 use std::collections::HashMap;
 use std::os::raw::c_void;
 use std::rc::Rc;
@@ -382,7 +383,57 @@ impl App {
         crate::backends_pancurses_adapter::create_spreadsheet(rows, cols)
     }
 
+    #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
+    pub fn create_canvas(&self) -> Result<crate::backends_pancurses_adapter::Canvas, Error> {
+        crate::backends_pancurses_adapter::create_canvas()
+    }
+
+    #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
+    pub fn create_overlay(&self) -> Result<crate::backends_pancurses_adapter::Overlay, Error> {
+        crate::backends_pancurses_adapter::create_overlay()
+    }
+
+    #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
+    pub fn create_scrolled_window(&self) -> Result<crate::backends_pancurses_adapter::ScrolledWindow, Error> {
+        crate::backends_pancurses_adapter::create_scrolled_window()
+    }
+
+    #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
+    pub fn open_file(&self, title: &str) -> Result<Option<String>, Error> {
+        crate::backends_pancurses_adapter::open_file(title)
+    }
+
+    #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
+    pub fn save_file(&self, title: &str) -> Result<Option<String>, Error> {
+        crate::backends_pancurses_adapter::save_file(title)
+    }
+
     // -- Zork paths --
+
+    #[cfg(feature = "zork")]
+    pub fn create_canvas(&self) -> Result<crate::backends_zork_adapter::Canvas, Error> {
+        crate::backends_zork_adapter::create_canvas()
+    }
+
+    #[cfg(feature = "zork")]
+    pub fn create_overlay(&self) -> Result<crate::backends_zork_adapter::Overlay, Error> {
+        crate::backends_zork_adapter::create_overlay()
+    }
+
+    #[cfg(feature = "zork")]
+    pub fn create_scrolled_window(&self) -> Result<crate::backends_zork_adapter::ScrolledWindow, Error> {
+        crate::backends_zork_adapter::create_scrolled_window()
+    }
+
+    #[cfg(feature = "zork")]
+    pub fn open_file(&self, title: &str) -> Result<Option<String>, Error> {
+        crate::backends_zork_adapter::open_file(title)
+    }
+
+    #[cfg(feature = "zork")]
+    pub fn save_file(&self, title: &str) -> Result<Option<String>, Error> {
+        crate::backends_zork_adapter::save_file(title)
+    }
 
     #[cfg(feature = "zork")]
     pub fn create_window(&self) -> Result<crate::backends_zork_adapter::Window, Error> {
@@ -540,7 +591,6 @@ impl App {
     pub fn create_scrolled_window(&self) -> Result<crate::backends_wasm_adapter::ScrolledWindow, Error> {
         crate::backends_wasm_adapter::create_scrolled_window()
     }
-
     #[cfg(all(target_arch = "wasm32", not(feature = "pancurses"), not(feature = "zork")))]
     pub fn open_file(&self, _title: &str) -> Result<Option<String>, Error> {
         Ok(None) // File dialogs not available in WASM
