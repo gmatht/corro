@@ -1701,8 +1701,8 @@ mod pancurses_backend {
                                 let is_boundary = lm > 0 && (*ci == (lm - 1) as u32 || *ci == (lm + mc - 1) as u32);
                                 out.push_str(&sgr_cup(hr, hx));
                                 if is_boundary {
-                                    out.push_str("│ ");
-                                    hx += 2;
+                                    out.push_str("│");
+                                    hx += 1;
                                 } else {
                                     out.push_str(" ");
                                     hx += 1;
