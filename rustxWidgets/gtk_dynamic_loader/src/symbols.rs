@@ -153,6 +153,7 @@ pub type GtkWidgetGetVexpand = unsafe extern "C" fn(widget: *mut c_void) -> i32;
 // GtkEditable (GTK4 replacement for gtk_entry_get_text/set_text)
 pub type GtkEditableGetText = unsafe extern "C" fn(editable: *mut c_void) -> *const i8;
 pub type GtkEditableSetText = unsafe extern "C" fn(editable: *mut c_void, text: *const i8);
+pub type GtkEditableSetPosition = unsafe extern "C" fn(editable: *mut c_void, position: i32);
 
 // GtkWidget parent handling
 pub type GtkWidgetUnparent = unsafe extern "C" fn(widget: *mut c_void);
@@ -396,6 +397,7 @@ pub struct Symbols {
     // GtkEditable (GTK4)
     pub gtk_editable_get_text: Option<GtkEditableGetText>,
     pub gtk_editable_set_text: Option<GtkEditableSetText>,
+    pub gtk_editable_set_position: Option<GtkEditableSetPosition>,
 
     // GtkWidget parent handling
     pub gtk_widget_unparent: Option<GtkWidgetUnparent>,
@@ -634,6 +636,7 @@ impl Symbols {
         // GtkEditable (GTK4, replaces gtk_entry_get_text/set_text)
         let gtk_editable_get_text = unsafe { sym::<GtkEditableGetText>(gtk, "gtk_editable_get_text") };
         let gtk_editable_set_text = unsafe { sym::<GtkEditableSetText>(gtk, "gtk_editable_set_text") };
+        let gtk_editable_set_position = unsafe { sym::<GtkEditableSetPosition>(gtk, "gtk_editable_set_position") };
 
         // GtkWidget parent handling
         let gtk_widget_unparent = unsafe { sym::<GtkWidgetUnparent>(gtk, "gtk_widget_unparent") };
@@ -692,7 +695,7 @@ impl Symbols {
             gtk_text_view_new, gtk_text_buffer_new, gtk_text_view_get_buffer, gtk_text_buffer_set_text, gtk_text_buffer_get_text, gtk_text_buffer_get_start_iter, gtk_text_buffer_get_end_iter, gtk_text_iter_copy, gtk_text_iter_free, gtk_text_view_set_wrap_mode,
             gtk_widget_set_hexpand, gtk_widget_set_vexpand,
             gtk_widget_get_hexpand, gtk_widget_get_vexpand,
-            gtk_editable_get_text, gtk_editable_set_text,
+            gtk_editable_get_text, gtk_editable_set_text, gtk_editable_set_position,
             gtk_widget_unparent, gtk_widget_get_parent,
             gtk_window_set_default_size,
             gtk_drawing_area_set_draw_func, gtk_drawing_area_set_content_width, gtk_drawing_area_set_content_height,

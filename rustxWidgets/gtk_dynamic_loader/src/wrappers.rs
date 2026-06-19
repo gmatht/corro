@@ -1337,6 +1337,11 @@ impl Entry {
         None
     }
 
+    pub fn set_position(&self, position: i32) {
+        guard_widget!(self, "Entry", "set_position");
+        if let Some(f) = self.loader.symbols.gtk_editable_set_position { unsafe { f(self.inner, position); } }
+    }
+
     pub fn set_width_chars(&self, n: i32) {
         guard_widget!(self, "Entry", "set_width_chars");
         if let Some(w) = self.loader.symbols.gtk_entry_set_width_chars { unsafe { w(self.inner, n); } }
