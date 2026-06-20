@@ -81,7 +81,7 @@ pub type GtkWidgetDestroy = unsafe extern "C" fn(widget: *mut c_void);
 pub type GtkWindowClose = unsafe extern "C" fn(window: *mut c_void);
 pub type GFree = unsafe extern "C" fn(ptr: *mut c_void);
 // gdk event helpers
-pub type GdkEventGetKeyval = unsafe extern "C" fn(event: *mut c_void) -> u32;
+pub type GdkEventGetKeyval = unsafe extern "C" fn(event: *mut c_void, keyval: *mut u32) -> i32;
 pub type GdkKeyvalFromName = unsafe extern "C" fn(name: *const i8) -> u32;
 pub type GdkDisplayGetDefault = unsafe extern "C" fn() -> *mut c_void;
 pub type GdkScreenGetDefault = unsafe extern "C" fn() -> *mut c_void;
@@ -91,6 +91,7 @@ pub type GtkLabelSetXalign = unsafe extern "C" fn(label: *mut c_void, xalign: f3
 pub type GtkEventControllerKeyNew = unsafe extern "C" fn() -> *mut c_void;
 pub type GtkEventControllerFocusNew = unsafe extern "C" fn() -> *mut c_void;
 pub type GtkWidgetAddController = unsafe extern "C" fn(widget: *mut c_void, controller: *mut c_void);
+pub type GtkEventControllerSetPropagationPhase = unsafe extern "C" fn(controller: *mut c_void, phase: u32);
 pub type GtkScrolledWindowGetVadjustment = unsafe extern "C" fn(sw: *mut c_void) -> *mut c_void;
 pub type GtkScrolledWindowGetHadjustment = unsafe extern "C" fn(sw: *mut c_void) -> *mut c_void;
 pub type GtkAdjustmentGetValue = unsafe extern "C" fn(adj: *mut c_void) -> f64;
@@ -326,6 +327,7 @@ pub struct Symbols {
     pub gtk_event_controller_key_new: Option<GtkEventControllerKeyNew>,
     pub gtk_event_controller_focus_new: Option<GtkEventControllerFocusNew>,
     pub gtk_widget_add_controller: Option<GtkWidgetAddController>,
+    pub gtk_event_controller_set_propagation_phase: Option<GtkEventControllerSetPropagationPhase>,
     pub gtk_widget_set_can_target: Option<GtkWidgetSetCanTarget>,
     pub gtk_widget_set_halign: Option<GtkWidgetSetHalign>,
     pub gtk_widget_set_valign: Option<GtkWidgetSetValign>,
@@ -541,6 +543,7 @@ impl Symbols {
         let gtk_event_controller_key_new = unsafe { sym::<GtkEventControllerKeyNew>(gtk, "gtk_event_controller_key_new") };
         let gtk_event_controller_focus_new = unsafe { sym::<GtkEventControllerFocusNew>(gtk, "gtk_event_controller_focus_new") };
         let gtk_widget_add_controller = unsafe { sym::<GtkWidgetAddController>(gtk, "gtk_widget_add_controller") };
+        let gtk_event_controller_set_propagation_phase = unsafe { sym::<GtkEventControllerSetPropagationPhase>(gtk, "gtk_event_controller_set_propagation_phase") };
         let gtk_widget_set_can_target = unsafe { sym::<GtkWidgetSetCanTarget>(gtk, "gtk_widget_set_can_target") };
         let gtk_widget_set_halign = unsafe { sym::<GtkWidgetSetHalign>(gtk, "gtk_widget_set_halign") };
         let gtk_widget_set_valign = unsafe { sym::<GtkWidgetSetValign>(gtk, "gtk_widget_set_valign") };
@@ -675,6 +678,7 @@ impl Symbols {
             gtk_event_controller_key_new,
             gtk_event_controller_focus_new,
             gtk_widget_add_controller,
+            gtk_event_controller_set_propagation_phase,
             gtk_widget_set_can_target,
             gtk_widget_set_halign,
             gtk_widget_set_valign,

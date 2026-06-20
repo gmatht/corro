@@ -196,7 +196,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }).unwrap_or(65364);
                 let _ = unsafe { connect_signal_bool(syms_ref, instance, "key-press-event", Box::new(move |ev: *mut std::os::raw::c_void| -> i32 {
                     if let Some(get_keyval) = syms_for_closure.gdk_event_get_keyval {
-                        let kv = unsafe { get_keyval(ev) };
+                        let mut kv = 0u32;
+                        unsafe { get_keyval(ev, &mut kv); }
                         match kv {
                             k if k == left_k => { if c_idx > 0 { grid_for_key[r_idx][c_idx-1].grab_focus(); return 1; } }
                             k if k == right_k => { if c_idx + 1 < grid_for_key[r_idx].len() { grid_for_key[r_idx][c_idx+1].grab_focus(); return 1; } }

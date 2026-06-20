@@ -419,19 +419,23 @@ mod gtk_adapter {
             self.draw_text_styled(x, y, text, font, size, r, g, b, a, 0, 0)
         }
         fn draw_text_styled(&mut self, x: f64, y: f64, text: &str, font: &str, size: f64, r: f64, g: f64, b: f64, a: f64, slant: i32, weight: i32) {
+            self.cc.save();
             self.cc.set_source_rgba(r, g, b, a);
             self.cc.select_font_face(font, slant, weight);
             self.cc.set_font_size(size);
             self.cc.move_to(x, y);
             self.cc.show_text(text);
+            self.cc.restore();
         }
         fn text_extents(&self, text: &str, font: &str, size: f64) -> (f64, f64, f64, f64) {
             self.text_extents_styled(text, font, size, 0, 0)
         }
         fn text_extents_styled(&self, text: &str, font: &str, size: f64, slant: i32, weight: i32) -> (f64, f64, f64, f64) {
+            self.cc.save();
             self.cc.select_font_face(font, slant, weight);
             self.cc.set_font_size(size);
             let e = self.cc.text_extents(text);
+            self.cc.restore();
             (e.x_bearing, e.y_bearing, e.width, e.height)
         }
         fn clear(&mut self, r: f64, g: f64, b: f64, a: f64) {
@@ -482,10 +486,16 @@ mod gtk_adapter {
                     cb(&mut ctx, w, h);
                 }));
             } else {
-                // GTK3 path
-                let _ = self.drawing_area.connect_draw_gtk3(Box::new(move |_widget: *mut c_void, cr: *mut c_void| -> i32 {
+                // GTK3 path — use widget allocation to provide real w/h
+                let _ = self.drawing_area.connect_draw_gtk3(Box::new(move |widget: *mut c_void, cr: *mut c_void| -> i32 {
+                    let w = if let Some(f) = loader.symbols.gtk_widget_get_allocated_width {
+                        unsafe { f(widget) }
+                    } else { 0 };
+                    let h = if let Some(f) = loader.symbols.gtk_widget_get_allocated_height {
+                        unsafe { f(widget) }
+                    } else { 0 };
                     let mut ctx = GtkDrawContext::new(cr, &loader);
-                    cb(&mut ctx, 0, 0);
+                    cb(&mut ctx, w, h);
                     0
                 }));
             }
@@ -509,7 +519,8 @@ mod gtk_adapter {
                 .expect("GTK loader not initialized after Canvas creation");
             let symbols = &loader.symbols;
             let inner = *self.drawing_area.as_ref();
-            let is_gtk4 = symbols.gtk_gesture_click_new.is_some();
+            // gtk_drawing_area_set_draw_func is GTK4-only; gtk_gesture_click_new exists in GTK3 >= 3.24
+            let is_gtk4 = symbols.gtk_drawing_area_set_draw_func.is_some();
             if is_gtk4 {
                 // GTK4: use GestureClick — store in _controllers to keep alive
                 if let Ok(gesture) = gtk_dynamic_loader::GestureClick::new(loader.clone()) {
@@ -547,7 +558,8 @@ mod gtk_adapter {
                 .expect("GTK loader not initialized after Canvas creation");
             let symbols = &loader.symbols;
             let inner = *self.drawing_area.as_ref();
-            let is_gtk4 = symbols.gtk_gesture_click_new.is_some();
+            // gtk_drawing_area_set_draw_func is GTK4-only; gtk_gesture_click_new exists in GTK3 >= 3.24
+            let is_gtk4 = symbols.gtk_drawing_area_set_draw_func.is_some();
             if is_gtk4 {
                 if let Ok(ctrl) = gtk_dynamic_loader::EventControllerKey::new(loader.clone()) {
                     let mut cb = cb;

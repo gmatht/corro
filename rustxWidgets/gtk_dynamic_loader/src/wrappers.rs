@@ -1075,6 +1075,14 @@ impl EventControllerKey {
         }
     }
 
+    /// GTK_PHASE_CAPTURE = 1
+    pub fn set_propagation_phase_capture(&self) {
+        guard_widget!(self, "EventControllerKey", "set_propagation_phase");
+        if let Some(f) = self.loader.symbols.gtk_event_controller_set_propagation_phase {
+            unsafe { f(self.inner, 1); }
+        }
+    }
+
     /// Get the keyval from a GDK key event
     ///
     /// # Safety
@@ -1089,7 +1097,9 @@ impl EventControllerKey {
     /// `event` must be a valid GDK key event pointer.
     pub unsafe fn get_keyval_static(loader: &Arc<Loader>, event: *mut c_void) -> u32 {
         if let Some(get_kv) = loader.symbols.gdk_event_get_keyval {
-            unsafe { get_kv(event) }
+            let mut keyval: u32 = 0;
+            get_kv(event, &mut keyval);
+            keyval
         } else { 0 }
     }
 }
