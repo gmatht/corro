@@ -653,6 +653,7 @@ mod gtk_adapter {
         pub fn set_vexpand(&self, expand: bool) { self.0.set_vexpand(expand); }
     }
 
+    /// Creates a new GTK Overlay widget.
     pub fn create_overlay() -> Result<Overlay, Error> {
         let loader = crate::backends::gtk::loader()
             .ok_or_else(|| Error::Backend("GTK loader not initialized".into()))?;
@@ -663,6 +664,7 @@ mod gtk_adapter {
 
     // ---- File dialogs ----
 
+    /// Opens a file dialog and returns the selected file path.
     pub fn open_file(title: &str) -> Result<Option<String>, Error> {
         let loader = crate::backends::gtk::loader()
             .ok_or_else(|| Error::Backend("GTK loader not initialized".into()))?;
@@ -674,6 +676,7 @@ mod gtk_adapter {
         Ok(None)
     }
 
+    /// Opens a file save dialog and returns the selected file path.
     pub fn save_file(title: &str) -> Result<Option<String>, Error> {
         let loader = crate::backends::gtk::loader()
             .ok_or_else(|| Error::Backend("GTK loader not initialized".into()))?;
@@ -687,6 +690,7 @@ mod gtk_adapter {
 
     // ---- Spreadsheet (cross-platform grid widget) ----
 
+    /// A spreadsheet widget that combines a canvas with an overlay for cross-platform grid rendering.
     pub struct Spreadsheet(pub Canvas, pub Overlay);
 
     impl Clone for Spreadsheet { fn clone(&self) -> Self { Spreadsheet(self.0.clone(), self.1.clone()) } }
@@ -697,34 +701,45 @@ mod gtk_adapter {
     impl Widget for Spreadsheet { fn raw_handle(&self) -> *mut c_void { *self.1.as_ref() } }
 
     impl Spreadsheet {
+        /// Sets the text content of a cell. User manages data via callbacks.
         pub fn set_cell(&self, _row: usize, _col: usize, _text: &str) { /* user manages data via callbacks */ }
+        /// Gets the text content of a cell. Returns None as user manages data via callbacks.
         pub fn get_cell(&self, _row: usize, _col: usize) -> Option<String> { None }
+        /// Queues the canvas for a redraw.
         pub fn queue_redraw(&self) { self.0.queue_redraw(); }
 
+        /// Sets a callback for drawing the spreadsheet content.
         pub fn set_draw_callback(&self, cb: Box<dyn FnMut(&mut dyn crate::core::DrawContext, i32, i32)>) {
             self.0.set_draw_callback(cb);
         }
 
+        /// Sets a callback for handling keyboard input.
         pub fn on_key(&self, cb: Box<dyn FnMut(u32, u32) -> bool>) {
             self.0.on_key(cb);
         }
 
+        /// Sets a callback for handling mouse click events.
         pub fn on_click(&self, cb: Box<dyn FnMut(f64, f64)>) {
             self.0.on_click(cb);
         }
 
+        /// Sets whether the spreadsheet should expand horizontally.
         pub fn set_hexpand(&self, expand: bool) { self.1.set_hexpand(expand); }
+        /// Sets whether the spreadsheet should expand vertically.
         pub fn set_vexpand(&self, expand: bool) { self.1.set_vexpand(expand); }
 
+        /// Returns a reference to the underlying canvas widget.
         pub fn canvas(&self) -> &Canvas {
             &self.0
         }
 
+        /// Returns a reference to the overlay widget.
         pub fn overlay(&self) -> &Overlay {
             &self.1
         }
     }
 
+    /// Creates a new spreadsheet widget with the specified number of rows and columns.
     pub fn create_spreadsheet(rows: usize, cols: usize) -> Result<Spreadsheet, Error> {
         let canvas = create_canvas()?;
         let overlay = create_overlay()?;
@@ -737,6 +752,7 @@ mod gtk_adapter {
         Ok(Spreadsheet(canvas, overlay))
     }
 
+    /// Quits the GTK main event loop.
     pub fn quit_main_loop() -> Result<(), Error> {
         crate::backends::gtk::quit_main_loop().map_err(|e| Error::Backend(format!("{}", e)))
     }
