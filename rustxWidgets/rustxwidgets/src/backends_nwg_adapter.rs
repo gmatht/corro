@@ -507,6 +507,8 @@ mod nwg_adapter {
         focus_out_cb: Rc<RefCell<Option<Box<dyn FnMut(*mut c_void) -> i32>>>>,
         _focus_in_handler: Option<nwg::RawEventHandler>,
         _focus_out_handler: Option<nwg::RawEventHandler>,
+        key_cb: Rc<RefCell<Option<Box<dyn FnMut(u32) -> bool>>>>,
+        _key_handler: Option<nwg::RawEventHandler>,
         pub(crate) pos_x: std::cell::Cell<i32>,
         pub(crate) pos_y: std::cell::Cell<i32>,
     }
@@ -521,6 +523,8 @@ mod nwg_adapter {
                 focus_out_cb: self.focus_out_cb.clone(),
                 _focus_in_handler: None,
                 _focus_out_handler: None,
+                key_cb: self.key_cb.clone(),
+                _key_handler: None,
                 pos_x: std::cell::Cell::new(self.pos_x.get()),
                 pos_y: std::cell::Cell::new(self.pos_y.get()),
             }
@@ -587,6 +591,9 @@ mod nwg_adapter {
                 }
             }
         }
+        pub fn on_key(&self, f: Box<dyn FnMut(u32) -> bool>) {
+            *self.key_cb.borrow_mut() = Some(f);
+        }
         pub fn add_class(&self, _class: &str) {}
         pub fn remove_class(&self, _class: &str) {}
         pub fn set_margin_start(&self, px: i32) {
@@ -643,6 +650,7 @@ mod nwg_adapter {
             .map_err(|e| Error::Backend(format!("{}", e)))?;
         let focus_in_cb: Rc<RefCell<Option<Box<dyn FnMut(*mut c_void) -> i32>>>> = Rc::new(RefCell::new(None));
         let focus_out_cb: Rc<RefCell<Option<Box<dyn FnMut(*mut c_void) -> i32>>>> = Rc::new(RefCell::new(None));
+        let key_cb: Rc<RefCell<Option<Box<dyn FnMut(u32) -> bool>>>> = Rc::new(RefCell::new(None));
         let hwnd = inner.handle.hwnd().unwrap_or(std::ptr::null_mut());
         if hwnd != std::ptr::null_mut() {
             unsafe {
@@ -688,7 +696,23 @@ mod nwg_adapter {
             ).ok()
         } else { None };
 
-        Ok(Entry { inner: Rc::new(inner), _handler: Rc::new(handler), changed_cb, focus_in_cb, focus_out_cb, _focus_in_handler, _focus_out_handler, pos_x: std::cell::Cell::new(0), pos_y: std::cell::Cell::new(0) })
+        let _key_handler = if hwnd != std::ptr::null_mut() {
+            let kc = key_cb.clone();
+            static ENTRY_KEY_ID: AtomicUsize = AtomicUsize::new(0x60000000);
+            let id = ENTRY_KEY_ID.fetch_add(1, Ordering::SeqCst);
+            nwg::bind_raw_event_handler(
+                &nwg::ControlHandle::Hwnd(hwnd), id,
+                move |_h, msg, w, _l| {
+                    if msg != winapi::um::winuser::WM_KEYDOWN && msg != winapi::um::winuser::WM_SYSKEYDOWN { return None; }
+                    if let Some(ref mut f) = *kc.borrow_mut() {
+                        if f(w as u32) { return Some(0); }
+                    }
+                    None
+                },
+            ).ok()
+        } else { None };
+
+        Ok(Entry { inner: Rc::new(inner), _handler: Rc::new(handler), changed_cb, focus_in_cb, focus_out_cb, _focus_in_handler, _focus_out_handler, key_cb, _key_handler, pos_x: std::cell::Cell::new(0), pos_y: std::cell::Cell::new(0) })
     }
 
     // ========== DropDown ==========
@@ -864,9 +888,11 @@ mod nwg_adapter {
             }
         }
         pub fn present(&self) {
+            self.inner.set_visible(true);
             let hwnd = self.inner.handle.hwnd().unwrap_or(std::ptr::null_mut());
             if hwnd != std::ptr::null_mut() {
                 unsafe {
+                    winapi::um::winuser::SetForegroundWindow(hwnd as _);
                     let mut rect: winapi::shared::windef::RECT = std::mem::zeroed();
                     winapi::um::winuser::GetClientRect(hwnd, &mut rect);
                     let w = rect.right - rect.left;
