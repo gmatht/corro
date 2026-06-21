@@ -265,6 +265,12 @@ mod nwg_adapter {
         }
     }
 
+    impl Widget for Label {
+        fn raw_handle(&self) -> *mut c_void {
+            self.0.handle.hwnd().unwrap_or(std::ptr::null_mut()) as *mut c_void
+        }
+    }
+
     pub fn create_label(parent: *mut c_void) -> Result<Label, Error> {
         crate::backends::nwg::create_label(parent).map(|l| Label(Rc::new(l))).map_err(|e| Error::Backend(format!("{}", e)))
     }
@@ -298,6 +304,12 @@ mod nwg_adapter {
     impl AsRef<*mut c_void> for BoxWidget {
         fn as_ref(&self) -> &*mut c_void {
             &self.hwnd
+        }
+    }
+
+    impl Widget for BoxWidget {
+        fn raw_handle(&self) -> *mut c_void {
+            self.hwnd
         }
     }
 
@@ -620,6 +632,12 @@ mod nwg_adapter {
         }
     }
 
+    impl Widget for Entry {
+        fn raw_handle(&self) -> *mut c_void {
+            self.inner.handle.hwnd().unwrap_or(std::ptr::null_mut()) as *mut c_void
+        }
+    }
+
     pub fn create_entry(parent: *mut c_void) -> Result<Entry, Error> {
         let (inner, changed_cb, handler) = crate::backends::nwg::create_entry(parent)
             .map_err(|e| Error::Backend(format!("{}", e)))?;
@@ -897,6 +915,20 @@ mod nwg_adapter {
     impl AsRef<*mut c_void> for Dialog {
         fn as_ref(&self) -> &*mut c_void {
             unsafe { &*(&self.inner.handle.hwnd().unwrap_or(std::ptr::null_mut()) as *const _ as *const *mut c_void) }
+        }
+    }
+
+    impl Widget for Dialog {
+        fn raw_handle(&self) -> *mut c_void {
+            self.inner.handle.hwnd().unwrap_or(std::ptr::null_mut()) as *mut c_void
+        }
+    }
+
+    impl Dialog {
+        pub fn set_visible(&self, v: bool) {
+            unsafe {
+                winapi::um::winuser::ShowWindow(self.inner.handle.hwnd().unwrap_or(std::ptr::null_mut()) as _, if v { winapi::um::winuser::SW_SHOW } else { winapi::um::winuser::SW_HIDE });
+            }
         }
     }
 
@@ -1692,6 +1724,12 @@ mod nwg_adapter {
         fn as_ref(&self) -> &*mut c_void {
             static NULL: usize = 0;
             unsafe { &*(&NULL as *const usize as *const *mut c_void) }
+        }
+    }
+
+    impl Widget for MenuBar {
+        fn raw_handle(&self) -> *mut c_void {
+            std::ptr::null_mut()
         }
     }
 
