@@ -53,6 +53,8 @@ pub struct App {
     parent_cell: Rc<RefCell<Option<*mut c_void>>>,
     #[cfg(windows)]
     action_registry: Rc<RefCell<HashMap<String, Box<dyn FnMut()>>>>,
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+    action_group: Rc<RefCell<Option<crate::backends_gtk_adapter::Application>>>,
 }
 
 impl App {
@@ -78,10 +80,16 @@ impl App {
             #[cfg(not(windows))]
             return Ok(App {
                 inner: Rc::new(RefCell::new(Some(b))),
+                #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+                action_group: Rc::new(RefCell::new(None)),
             });
         }
         #[cfg(feature = "pancurses")]
-        return Ok(App { inner: Rc::new(RefCell::new(Some(b))) });
+        return Ok(App {
+            inner: Rc::new(RefCell::new(Some(b))),
+            #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+            action_group: Rc::new(RefCell::new(None)),
+        });
     }
 
     // -- Linux paths --
@@ -757,6 +765,34 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
         return crate::backends_nwg_adapter::create_dialog(&self.parent_cell).map(|d| crate::common::Dialog { inner: d });
     }
 
+    /// Ensure the GTK application / action group exists (no-op on Windows).
+    /// Returns an opaque `*mut c_void` that can be passed to `new_menubar`.
+    pub fn ensure_action_group(&self) -> Result<*mut c_void, Error> {
+        #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+        {
+            if self.action_group.borrow().is_none() {
+                let app = crate::backends_gtk_adapter::create_application()?;
+                app.register()?;
+                *self.action_group.borrow_mut() = Some(app);
+            }
+            Ok(self.action_group.borrow().as_ref().unwrap().as_ptr())
+        }
+        #[cfg(not(all(feature = "gtk", target_os = "linux", not(feature = "zork"))))]
+        Ok(std::ptr::null_mut())
+    }
+
+    /// Register a SimpleAction with the action group.
+    /// On GTK this adds the action to the GApplication; on Windows it is a no-op.
+    pub fn register_action(&self, action: &crate::common::SimpleAction) -> Result<(), Error> {
+        #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+        if let Some(ref app) = *self.action_group.borrow() {
+            app.add_action(&action.inner)?;
+        }
+        #[cfg(not(all(feature = "gtk", target_os = "linux", not(feature = "zork"))))]
+        {}
+        Ok(())
+    }
+
 /// Run the backend main loop
     pub fn run(self) -> Result<(), Error> {
         let boxed = self.inner.borrow_mut().take().ok_or_else(|| Error::Backend("App::run already called".into()))?;
@@ -772,6 +808,8 @@ impl From<Box<dyn crate::backends::BackendApp>> for App {
             parent_cell: Rc::new(RefCell::new(None)),
             #[cfg(windows)]
             action_registry: Rc::new(RefCell::new(HashMap::new())),
+            #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+            action_group: Rc::new(RefCell::new(None)),
         }
     }
 }
