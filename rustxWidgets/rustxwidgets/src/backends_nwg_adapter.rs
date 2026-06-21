@@ -855,8 +855,7 @@ mod nwg_adapter {
         pub(crate) buttons: Rc<RefCell<Vec<(nwg::Button, nwg::EventHandler)>>>,
         pub(crate) response_cb: Rc<RefCell<Option<Box<dyn FnMut(i32)>>>>,
         pub(crate) _handler: Rc<nwg::EventHandler>,
-        layout_cb: Rc<RefCell<Option<Box<dyn FnMut(i32, i32)>>>>,
-        child_hwnd: Rc<RefCell<Option<*mut c_void>>>,
+        layout_cb: Rc<RefCell<Vec<Box<dyn FnMut(i32, i32)>>>>,
     }
 
     impl Clone for Dialog {
@@ -867,7 +866,6 @@ mod nwg_adapter {
                 response_cb: self.response_cb.clone(),
                 _handler: self._handler.clone(),
                 layout_cb: self.layout_cb.clone(),
-                child_hwnd: self.child_hwnd.clone(),
             }
         }
     }
@@ -897,9 +895,15 @@ mod nwg_adapter {
                     winapi::um::winuser::GetClientRect(hwnd, &mut rect);
                     let w = rect.right - rect.left;
                     let h = rect.bottom - rect.top;
-                    if let Some(ref mut cb) = *self.layout_cb.borrow_mut() {
+                    for cb in self.layout_cb.borrow_mut().iter_mut() {
                         cb(w, h);
                     }
+                    winapi::um::winuser::RedrawWindow(
+                        hwnd as _,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        winapi::um::winuser::RDW_INVALIDATE | winapi::um::winuser::RDW_UPDATENOW | winapi::um::winuser::RDW_ALLCHILDREN | winapi::um::winuser::RDW_ERASE | winapi::um::winuser::RDW_FRAME,
+                    );
                 }
             }
         }
@@ -907,11 +911,17 @@ mod nwg_adapter {
             for &ptr in &child.collect_hwnds() {
                 if !ptr.is_null() {
                     unsafe {
-                        winapi::um::winuser::SetParent(ptr as _, self.inner.handle.hwnd().unwrap_or(std::ptr::null_mut()) as _);
+                        let dlg = self.inner.handle.hwnd().unwrap_or(std::ptr::null_mut());
+                        winapi::um::winuser::SetParent(ptr as _, dlg as _);
+                        winapi::um::winuser::ShowWindow(ptr as _, winapi::um::winuser::SW_SHOW);
+                        winapi::um::winuser::SetWindowPos(
+                            ptr as _, winapi::um::winuser::HWND_TOP,
+                            0, 0, 0, 0,
+                            winapi::um::winuser::SWP_NOMOVE | winapi::um::winuser::SWP_NOSIZE,
+                        );
                     }
-                    *self.child_hwnd.borrow_mut() = Some(ptr);
                     let child_hwnd = ptr;
-                    *self.layout_cb.borrow_mut() = Some(Box::new(move |w, h| {
+                    self.layout_cb.borrow_mut().push(Box::new(move |w, h| {
                         set_window_pos(child_hwnd, 0, 0, w, h);
                     }));
                 }
@@ -966,8 +976,7 @@ mod nwg_adapter {
         let (inner, _, handler) = crate::backends::nwg::create_dialog(parent_cell, btn_cb)
             .map_err(|e| Error::Backend(format!("{}", e)))?;
 
-        let layout_cb: Rc<RefCell<Option<Box<dyn FnMut(i32, i32)>>>> = Rc::new(RefCell::new(None));
-        let child_hwnd: Rc<RefCell<Option<*mut c_void>>> = Rc::new(RefCell::new(None));
+        let layout_cb: Rc<RefCell<Vec<Box<dyn FnMut(i32, i32)>>>> = Rc::new(RefCell::new(Vec::new()));
 
         // Bind raw WM_SIZE handler for dialog
         let dlg_hwnd = inner.handle.hwnd().unwrap_or(std::ptr::null_mut());
@@ -982,8 +991,8 @@ mod nwg_adapter {
                     if msg == winapi::um::winuser::WM_SIZE {
                         let w = (l & 0xFFFF) as i32;
                         let h = ((l >> 16) & 0xFFFF) as i32;
-                        if let Some(ref mut cb) = *cb.borrow_mut() {
-                            cb(w, h);
+                        for cb_item in cb.borrow_mut().iter_mut() {
+                            cb_item(w, h);
                         }
                     }
                     None
@@ -991,7 +1000,7 @@ mod nwg_adapter {
             ).map_err(|e| Error::Backend(format!("{}", e)))?;
         }
 
-        Ok(Dialog { inner: Rc::new(inner), buttons: Rc::new(RefCell::new(Vec::new())), response_cb, _handler: Rc::new(handler), layout_cb, child_hwnd })
+        Ok(Dialog { inner: Rc::new(inner), buttons: Rc::new(RefCell::new(Vec::new())), response_cb, _handler: Rc::new(handler), layout_cb })
     }
 
     pub fn create_dialog_button(
@@ -1081,14 +1090,14 @@ mod nwg_adapter {
                 winapi::um::wingdi::SetTextColor(self.hdc, color);
                 let old_bkmode = winapi::um::wingdi::SetBkMode(self.hdc, winapi::um::wingdi::TRANSPARENT as i32);
                 let hfont = Self::make_font(font, size, if weight != 0 { winapi::um::wingdi::FW_BOLD as i32 } else { winapi::um::wingdi::FW_NORMAL as i32 }, _slant != 0);
-                if !hfont.is_null() {
+                if hfont.is_null() {
+                    let sys = winapi::um::wingdi::GetStockObject(winapi::um::wingdi::SYSTEM_FONT as i32) as winapi::shared::windef::HFONT;
+                    let old = winapi::um::wingdi::SelectObject(self.hdc, sys as _);
+                    winapi::um::wingdi::TextOutW(self.hdc, x as i32, y as i32, wide.as_ptr() as _, wide.len() as i32);
+                    winapi::um::wingdi::SelectObject(self.hdc, old);
+                } else {
                     let old_font = winapi::um::wingdi::SelectObject(self.hdc, hfont as _);
-                    let mut rect = winapi::shared::windef::RECT {
-                        left: x as i32, top: y as i32,
-                        right: self.w, bottom: self.h,
-                    };
-                    winapi::um::winuser::DrawTextW(self.hdc, wide.as_ptr() as _, wide.len() as i32,
-                        &mut rect, winapi::um::winuser::DT_LEFT | winapi::um::winuser::DT_TOP | winapi::um::winuser::DT_NOCLIP);
+                    winapi::um::wingdi::TextOutW(self.hdc, x as i32, y as i32, wide.as_ptr() as _, wide.len() as i32);
                     winapi::um::wingdi::SelectObject(self.hdc, old_font);
                     winapi::um::wingdi::DeleteObject(hfont as _);
                 }
