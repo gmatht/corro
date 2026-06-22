@@ -34,12 +34,13 @@ pub mod android;
 #[cfg(all(target_os = "android", not(feature = "zork")))]
 pub use self::android::init_backend as init;
 
-/// pancurses is a cross-platform fallback; its `init` is exported only when no
-/// higher-priority backend is compiled for the current platform.
+/// pancurses is a cross-platform fallback; its `init` is always available
+/// at `backends::pancurses::init()` when compiled, and also re-exported as
+/// `init_pancurses` for combined-backend builds.
 #[cfg(feature = "pancurses")]
 pub mod pancurses;
-#[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
-pub use self::pancurses::init;
+#[cfg(feature = "pancurses")]
+pub use self::pancurses::init as init_pancurses;
 
 #[cfg(feature = "zork")]
 pub mod zork;
