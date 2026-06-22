@@ -21,10 +21,21 @@ mod nwg_adapter {
     // -- Window --
 
     pub struct Window {
-        pub(crate) inner: nwg::Window,
-        pub(crate) _handler: nwg::EventHandler,
+        pub(crate) inner: Rc<nwg::Window>,
+        pub(crate) _handler: Rc<nwg::EventHandler>,
         root_child: Rc<RefCell<Option<*mut c_void>>>,
         layout_cb: Rc<RefCell<Option<Box<dyn FnMut(i32, i32)>>>>,
+    }
+
+    impl Clone for Window {
+        fn clone(&self) -> Self {
+            Window {
+                inner: self.inner.clone(),
+                _handler: self._handler.clone(),
+                root_child: self.root_child.clone(),
+                layout_cb: self.layout_cb.clone(),
+            }
+        }
     }
 
     impl Widget for Window {
@@ -130,7 +141,7 @@ mod nwg_adapter {
             ).map_err(|e| Error::Backend(format!("{}", e)))?;
         }
 
-        Ok(Window { inner, _handler: handler, root_child, layout_cb })
+        Ok(Window { inner: Rc::new(inner), _handler: Rc::new(handler), root_child, layout_cb })
     }
 
     // -- Button --
@@ -594,6 +605,8 @@ mod nwg_adapter {
         pub fn on_key(&self, f: Box<dyn FnMut(u32) -> bool>) {
             *self.key_cb.borrow_mut() = Some(f);
         }
+        pub fn set_hexpand(&self, _expand: bool) {}
+        pub fn set_vexpand(&self, _expand: bool) {}
         pub fn add_class(&self, _class: &str) {}
         pub fn remove_class(&self, _class: &str) {}
         pub fn set_margin_start(&self, px: i32) {
@@ -745,6 +758,8 @@ mod nwg_adapter {
         pub fn connect_changed(&self, _f: impl FnMut() + 'static) -> Result<u64, Error> {
             Ok(0)
         }
+        pub fn set_hexpand(&self, _expand: bool) {}
+        pub fn set_vexpand(&self, _expand: bool) {}
     }
 
     impl AsRef<*mut c_void> for DropDown {
@@ -1758,10 +1773,21 @@ mod nwg_adapter {
     type MenuIndex = HashMap<(*mut std::ffi::c_void, u32), String>;
 
     pub struct MenuBar {
-        pub(crate) _menus: Vec<nwg::Menu>,
-        pub(crate) _items: Vec<nwg::MenuItem>,
-        pub(crate) _raw_handler: nwg::RawEventHandler,
+        pub(crate) _menus: Rc<Vec<nwg::Menu>>,
+        pub(crate) _items: Rc<Vec<nwg::MenuItem>>,
+        pub(crate) _raw_handler: Rc<nwg::RawEventHandler>,
         pub(crate) action_registry: Rc<RefCell<HashMap<String, Box<dyn FnMut()>>>>,
+    }
+
+    impl Clone for MenuBar {
+        fn clone(&self) -> Self {
+            MenuBar {
+                _menus: self._menus.clone(),
+                _items: self._items.clone(),
+                _raw_handler: self._raw_handler.clone(),
+                action_registry: self.action_registry.clone(),
+            }
+        }
     }
 
     impl AsRef<*mut c_void> for MenuBar {
@@ -1898,7 +1924,7 @@ mod nwg_adapter {
             },
         ).map_err(|e| Error::Backend(format!("{}", e)))?;
 
-        Ok(MenuBar { _menus: menus, _items: items, _raw_handler: raw_handler, action_registry })
+        Ok(MenuBar { _menus: Rc::new(menus), _items: Rc::new(items), _raw_handler: Rc::new(raw_handler), action_registry })
     }
 
     // -- SimpleAction: stores callback by action name --
@@ -1906,6 +1932,15 @@ mod nwg_adapter {
     pub struct SimpleAction {
         pub(crate) name: String,
         pub(crate) registry: Rc<RefCell<HashMap<String, Box<dyn FnMut()>>>>,
+    }
+
+    impl Clone for SimpleAction {
+        fn clone(&self) -> Self {
+            SimpleAction {
+                name: self.name.clone(),
+                registry: self.registry.clone(),
+            }
+        }
     }
 
     impl SimpleAction {
