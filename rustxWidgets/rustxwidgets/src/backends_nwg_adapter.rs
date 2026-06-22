@@ -1962,6 +1962,10 @@ mod nwg_adapter {
             Ok(None)
         }
     }
+
+    pub fn quit_main_loop() {
+        crate::backends::nwg::quit_main_loop();
+    }
 }
 
 #[cfg(windows)]

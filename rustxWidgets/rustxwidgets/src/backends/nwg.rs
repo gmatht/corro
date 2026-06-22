@@ -4,6 +4,7 @@ mod nwg_backend {
     use std::cell::RefCell;
     use std::os::raw::c_void;
     use std::rc::Rc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     pub struct NwgApp {
         pub(crate) current_parent: Rc<RefCell<Option<*mut c_void>>>,
@@ -30,8 +31,23 @@ mod nwg_backend {
         Ok(hwnd as *mut c_void)
     }
 
+    static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+    pub fn quit_main_loop() {
+        QUIT_REQUESTED.store(true, Ordering::SeqCst);
+        unsafe {
+            winapi::um::winuser::PostQuitMessage(0);
+        }
+    }
+
+    pub fn is_quit_requested() -> bool {
+        QUIT_REQUESTED.load(Ordering::SeqCst)
+    }
+
     impl crate::backends::BackendApp for NwgApp {
         fn run(self: Box<Self>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            // Reset quit flag so a re-run works
+            QUIT_REQUESTED.store(false, Ordering::SeqCst);
             // Custom message loop: same as nwg::dispatch_thread_events() but
             // without IsDialogMessageW, so Enter/Escape keys reach the Edit
             // control's raw event handler instead of being consumed.
