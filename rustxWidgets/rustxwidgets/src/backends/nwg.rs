@@ -32,7 +32,18 @@ mod nwg_backend {
 
     impl crate::backends::BackendApp for NwgApp {
         fn run(self: Box<Self>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-            nwg::dispatch_thread_events();
+            // Custom message loop: same as nwg::dispatch_thread_events() but
+            // without IsDialogMessageW, so Enter/Escape keys reach the Edit
+            // control's raw event handler instead of being consumed.
+            unsafe {
+                use winapi::um::winuser::{GetMessageW, TranslateMessage, DispatchMessageW, MSG};
+                use std::mem;
+                let mut msg: MSG = mem::zeroed();
+                while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) != 0 {
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
             Ok(())
         }
     }

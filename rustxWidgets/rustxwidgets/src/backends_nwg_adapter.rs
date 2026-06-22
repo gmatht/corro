@@ -703,9 +703,18 @@ mod nwg_adapter {
             nwg::bind_raw_event_handler(
                 &nwg::ControlHandle::Hwnd(hwnd), id,
                 move |_h, msg, w, _l| {
-                    if msg != winapi::um::winuser::WM_KEYDOWN && msg != winapi::um::winuser::WM_SYSKEYDOWN { return None; }
-                    if let Some(ref mut f) = *kc.borrow_mut() {
-                        if f(w as u32) { return Some(0); }
+                    // Consume WM_CHAR for Enter/Escape to prevent beep
+                    if msg == winapi::um::winuser::WM_CHAR {
+                        let c = (w & 0xFF) as u8;
+                        if c == 0x0D || c == 0x1B {
+                            return Some(0);
+                        }
+                        return None;
+                    }
+                    if msg == winapi::um::winuser::WM_KEYDOWN || msg == winapi::um::winuser::WM_SYSKEYDOWN {
+                        if let Some(ref mut f) = *kc.borrow_mut() {
+                            if f(w as u32) { return Some(0); }
+                        }
                     }
                     None
                 },
