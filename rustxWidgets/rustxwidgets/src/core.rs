@@ -60,31 +60,24 @@ pub struct App {
 impl App {
     /// Initialize the default backend and return an App wrapper.
     /// Uses the priority chain from `backends::init()` (gtk > nwg > wasm > android > pancurses).
+    /// When compiled with both `gui` and `pancurses`, this uses the GUI backend path;
+    /// the pancurses backend initializes separately via `backends::pancurses::init()`.
     pub fn init() -> Result<Self, Error> {
         let b = match crate::backends::init() {
             Ok(b) => b,
             Err(e) => return Err(Error::Backend(format!("{}", e))),
         };
-        #[cfg(not(feature = "pancurses"))]
+        #[cfg(windows)]
         {
-            #[cfg(windows)]
-            {
-                // Create a hidden parent window for child controls
-                let parent_hwnd = crate::backends::nwg::create_hidden_parent()?;
-                return Ok(App {
-                    inner: Rc::new(RefCell::new(Some(b))),
-                    parent_cell: Rc::new(RefCell::new(Some(parent_hwnd))),
-                    action_registry: Rc::new(RefCell::new(HashMap::new())),
-                });
-            }
-            #[cfg(not(windows))]
+            // Create a hidden parent window for child controls
+            let parent_hwnd = crate::backends::nwg::create_hidden_parent()?;
             return Ok(App {
                 inner: Rc::new(RefCell::new(Some(b))),
-                #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
-                action_group: Rc::new(RefCell::new(None)),
+                parent_cell: Rc::new(RefCell::new(Some(parent_hwnd))),
+                action_registry: Rc::new(RefCell::new(HashMap::new())),
             });
         }
-        #[cfg(feature = "pancurses")]
+        #[cfg(not(windows))]
         return Ok(App {
             inner: Rc::new(RefCell::new(Some(b))),
             #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
@@ -203,7 +196,7 @@ impl App {
         crate::backends_nwg_adapter::create_window(&self.parent_cell)
     }
 
-    #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(windows, not(feature = "zork")))]
     pub fn create_button(&self, label: &str) -> Result<crate::backends_nwg_adapter::Button, Error> {
         let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
         crate::backends_nwg_adapter::create_button(parent, label)
@@ -217,7 +210,7 @@ impl App {
         Ok(lbl)
     }
 
-    #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(windows, not(feature = "zork")))]
     pub fn create_box(&self, orientation: crate::backends::nwg::Orientation, spacing: i32) -> Result<crate::backends_nwg_adapter::BoxWidget, Error> {
         let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
         crate::backends_nwg_adapter::create_box(orientation, spacing, parent)
@@ -239,7 +232,7 @@ impl App {
         crate::backends_nwg_adapter::create_menu()
     }
 
-    #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(windows, not(feature = "zork")))]
     /// # Safety
     /// `window_hwnd` must be a valid HWND.
     pub unsafe fn create_menubar(&self, model: &crate::backends_nwg_adapter::Menu, window_hwnd: *mut c_void) -> Result<crate::backends_nwg_adapter::MenuBar, Error> {
@@ -251,18 +244,18 @@ impl App {
         crate::backends_nwg_adapter::create_simple_action(name, self.action_registry.clone())
     }
 
-    #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(windows, not(feature = "zork")))]
     pub fn create_dialog(&self) -> Result<crate::backends_nwg_adapter::Dialog, Error> {
         crate::backends_nwg_adapter::create_dialog(&self.parent_cell)
     }
 
-    #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(windows, not(feature = "zork")))]
     pub fn create_dropdown(&self, items: &[&str]) -> Result<crate::backends_nwg_adapter::DropDown, Error> {
         let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
         crate::backends_nwg_adapter::create_dropdown(parent, items)
     }
 
-    #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(windows, not(feature = "zork")))]
     pub fn create_checkbutton(&self, label: &str) -> Result<crate::backends_nwg_adapter::CheckButton, Error> {
         let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
         let cb = crate::backends_nwg_adapter::create_checkbutton(parent)?;
@@ -270,7 +263,7 @@ impl App {
         Ok(cb)
     }
 
-    #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(windows, not(feature = "zork")))]
     pub fn create_radiobutton(&self, label: &str) -> Result<crate::backends_nwg_adapter::RadioButton, Error> {
         let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
         let rb = crate::backends_nwg_adapter::create_radiobutton(parent)?;
@@ -278,37 +271,37 @@ impl App {
         Ok(rb)
     }
 
-    #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(windows, not(feature = "zork")))]
     pub fn create_textview(&self) -> Result<crate::backends_nwg_adapter::TextView, Error> {
         let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
         crate::backends_nwg_adapter::create_textview(parent)
     }
 
-    #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(windows, not(feature = "zork")))]
     pub fn create_canvas(&self) -> Result<crate::backends_nwg_adapter::Canvas, Error> {
         let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
         crate::backends_nwg_adapter::create_canvas(parent)
     }
 
-    #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(windows, not(feature = "zork")))]
     pub fn create_overlay(&self) -> Result<crate::backends_nwg_adapter::Overlay, Error> {
         let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
         crate::backends_nwg_adapter::create_overlay(parent)
     }
 
-    #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(windows, not(feature = "zork")))]
     pub fn create_scrolled_window(&self) -> Result<crate::backends_nwg_adapter::ScrolledWindow, Error> {
         let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
         crate::backends_nwg_adapter::create_scrolled_window(parent)
     }
 
-    #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(windows, not(feature = "zork")))]
     pub fn open_file(&self, title: &str) -> Result<Option<String>, Error> {
         let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
         crate::backends_nwg_adapter::open_file(title, parent)
     }
 
-    #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(windows, not(feature = "zork")))]
     pub fn save_file(&self, title: &str) -> Result<Option<String>, Error> {
         let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
         crate::backends_nwg_adapter::save_file(title, parent)
@@ -580,31 +573,31 @@ impl App {
         crate::backends_wasm_adapter::create_radiobutton(None, label)
     }
 
-    #[cfg(all(target_arch = "wasm32", not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
     pub fn create_textview(&self) -> Result<crate::backends_wasm_adapter::TextView, Error> {
         crate::backends_wasm_adapter::create_textview()
     }
 
-    #[cfg(all(target_arch = "wasm32", not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
     pub fn create_canvas(&self) -> Result<crate::backends_wasm_adapter::Canvas, Error> {
         crate::backends_wasm_adapter::create_canvas()
     }
 
-    #[cfg(all(target_arch = "wasm32", not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
     pub fn create_overlay(&self) -> Result<crate::backends_wasm_adapter::Overlay, Error> {
         crate::backends_wasm_adapter::create_overlay()
     }
 
-    #[cfg(all(target_arch = "wasm32", not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
     pub fn create_scrolled_window(&self) -> Result<crate::backends_wasm_adapter::ScrolledWindow, Error> {
         crate::backends_wasm_adapter::create_scrolled_window()
     }
-    #[cfg(all(target_arch = "wasm32", not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
     pub fn open_file(&self, _title: &str) -> Result<Option<String>, Error> {
         Ok(None) // File dialogs not available in WASM
     }
 
-    #[cfg(all(target_arch = "wasm32", not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
     pub fn save_file(&self, _title: &str) -> Result<Option<String>, Error> {
         Ok(None) // File dialogs not available in WASM
     }

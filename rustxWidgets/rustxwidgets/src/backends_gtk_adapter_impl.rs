@@ -29,6 +29,7 @@ mod gtk_adapter {
         pub fn set_child(&self, child: &impl AsRef<*mut c_void>) {
             self.0.set_child(child);
         }
+        pub fn set_child_box(&self, bx: &BoxWidget) { self.set_child(bx); }
 
         pub fn present(&self) {
             self.0.present();

@@ -207,6 +207,10 @@ mod pancurses_backend {
             // recognized even when terminfo uses SS3 (\x1bOA etc.).
             // screen-256color lacks kri/kind/kLFT/kRIT, so also register
             // \x1b[1;2{A,B,C,D} as the corresponding plain arrow keys.
+            // define_key is ncurses/PDCurses but is absent from the PDCurses
+            // version bundled by pdcurses-sys 0.7.x. On Windows, ConPTY handles
+            // these sequences natively, so skip the workaround there.
+            #[cfg(not(windows))]
             {
                 use std::os::raw::{c_char, c_int};
                 extern "C" {
@@ -1434,7 +1438,7 @@ mod pancurses_backend {
                 }
                 if focused {
                     let cursor_display = cursor.saturating_sub(buffer.len().saturating_sub(max_w));
-                    let ch = '_' as u32 | A_REVERSE as u32;
+                    let ch = '_' as chtype | A_REVERSE as chtype;
                     root.mvaddch(rect.y, rect.x + cursor_display as i32, ch);
                 }
                 if has_colors() {

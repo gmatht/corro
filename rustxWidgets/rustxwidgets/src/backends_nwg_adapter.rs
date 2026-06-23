@@ -21,10 +21,21 @@ mod nwg_adapter {
     // -- Window --
 
     pub struct Window {
-        pub(crate) inner: nwg::Window,
-        pub(crate) _handler: nwg::EventHandler,
+        pub(crate) inner: Rc<nwg::Window>,
+        pub(crate) _handler: Rc<nwg::EventHandler>,
         root_child: Rc<RefCell<Option<*mut c_void>>>,
         layout_cb: Rc<RefCell<Option<Box<dyn FnMut(i32, i32)>>>>,
+    }
+
+    impl Clone for Window {
+        fn clone(&self) -> Self {
+            Window {
+                inner: self.inner.clone(),
+                _handler: self._handler.clone(),
+                root_child: self.root_child.clone(),
+                layout_cb: self.layout_cb.clone(),
+            }
+        }
     }
 
     impl Widget for Window {
@@ -130,7 +141,7 @@ mod nwg_adapter {
             ).map_err(|e| Error::Backend(format!("{}", e)))?;
         }
 
-        Ok(Window { inner, _handler: handler, root_child, layout_cb })
+        Ok(Window { inner: Rc::new(inner), _handler: Rc::new(handler), root_child, layout_cb })
     }
 
     // -- Button --
@@ -507,6 +518,8 @@ mod nwg_adapter {
         focus_out_cb: Rc<RefCell<Option<Box<dyn FnMut(*mut c_void) -> i32>>>>,
         _focus_in_handler: Option<nwg::RawEventHandler>,
         _focus_out_handler: Option<nwg::RawEventHandler>,
+        key_cb: Rc<RefCell<Option<Box<dyn FnMut(u32) -> bool>>>>,
+        _key_handler: Option<nwg::RawEventHandler>,
         pub(crate) pos_x: std::cell::Cell<i32>,
         pub(crate) pos_y: std::cell::Cell<i32>,
     }
@@ -521,6 +534,8 @@ mod nwg_adapter {
                 focus_out_cb: self.focus_out_cb.clone(),
                 _focus_in_handler: None,
                 _focus_out_handler: None,
+                key_cb: self.key_cb.clone(),
+                _key_handler: None,
                 pos_x: std::cell::Cell::new(self.pos_x.get()),
                 pos_y: std::cell::Cell::new(self.pos_y.get()),
             }
@@ -587,6 +602,11 @@ mod nwg_adapter {
                 }
             }
         }
+        pub fn on_key(&self, f: Box<dyn FnMut(u32) -> bool>) {
+            *self.key_cb.borrow_mut() = Some(f);
+        }
+        pub fn set_hexpand(&self, _expand: bool) {}
+        pub fn set_vexpand(&self, _expand: bool) {}
         pub fn add_class(&self, _class: &str) {}
         pub fn remove_class(&self, _class: &str) {}
         pub fn set_margin_start(&self, px: i32) {
@@ -643,6 +663,7 @@ mod nwg_adapter {
             .map_err(|e| Error::Backend(format!("{}", e)))?;
         let focus_in_cb: Rc<RefCell<Option<Box<dyn FnMut(*mut c_void) -> i32>>>> = Rc::new(RefCell::new(None));
         let focus_out_cb: Rc<RefCell<Option<Box<dyn FnMut(*mut c_void) -> i32>>>> = Rc::new(RefCell::new(None));
+        let key_cb: Rc<RefCell<Option<Box<dyn FnMut(u32) -> bool>>>> = Rc::new(RefCell::new(None));
         let hwnd = inner.handle.hwnd().unwrap_or(std::ptr::null_mut());
         if hwnd != std::ptr::null_mut() {
             unsafe {
@@ -688,7 +709,32 @@ mod nwg_adapter {
             ).ok()
         } else { None };
 
-        Ok(Entry { inner: Rc::new(inner), _handler: Rc::new(handler), changed_cb, focus_in_cb, focus_out_cb, _focus_in_handler, _focus_out_handler, pos_x: std::cell::Cell::new(0), pos_y: std::cell::Cell::new(0) })
+        let _key_handler = if hwnd != std::ptr::null_mut() {
+            let kc = key_cb.clone();
+            static ENTRY_KEY_ID: AtomicUsize = AtomicUsize::new(0x60000000);
+            let id = ENTRY_KEY_ID.fetch_add(1, Ordering::SeqCst);
+            nwg::bind_raw_event_handler(
+                &nwg::ControlHandle::Hwnd(hwnd), id,
+                move |_h, msg, w, _l| {
+                    // Consume WM_CHAR for Enter/Escape to prevent beep
+                    if msg == winapi::um::winuser::WM_CHAR {
+                        let c = (w & 0xFF) as u8;
+                        if c == 0x0D || c == 0x1B {
+                            return Some(0);
+                        }
+                        return None;
+                    }
+                    if msg == winapi::um::winuser::WM_KEYDOWN || msg == winapi::um::winuser::WM_SYSKEYDOWN {
+                        if let Some(ref mut f) = *kc.borrow_mut() {
+                            if f(w as u32) { return Some(0); }
+                        }
+                    }
+                    None
+                },
+            ).ok()
+        } else { None };
+
+        Ok(Entry { inner: Rc::new(inner), _handler: Rc::new(handler), changed_cb, focus_in_cb, focus_out_cb, _focus_in_handler, _focus_out_handler, key_cb, _key_handler, pos_x: std::cell::Cell::new(0), pos_y: std::cell::Cell::new(0) })
     }
 
     // ========== DropDown ==========
@@ -712,6 +758,8 @@ mod nwg_adapter {
         pub fn connect_changed(&self, _f: impl FnMut() + 'static) -> Result<u64, Error> {
             Ok(0)
         }
+        pub fn set_hexpand(&self, _expand: bool) {}
+        pub fn set_vexpand(&self, _expand: bool) {}
     }
 
     impl AsRef<*mut c_void> for DropDown {
@@ -831,8 +879,7 @@ mod nwg_adapter {
         pub(crate) buttons: Rc<RefCell<Vec<(nwg::Button, nwg::EventHandler)>>>,
         pub(crate) response_cb: Rc<RefCell<Option<Box<dyn FnMut(i32)>>>>,
         pub(crate) _handler: Rc<nwg::EventHandler>,
-        layout_cb: Rc<RefCell<Option<Box<dyn FnMut(i32, i32)>>>>,
-        child_hwnd: Rc<RefCell<Option<*mut c_void>>>,
+        layout_cb: Rc<RefCell<Vec<Box<dyn FnMut(i32, i32)>>>>,
     }
 
     impl Clone for Dialog {
@@ -843,7 +890,6 @@ mod nwg_adapter {
                 response_cb: self.response_cb.clone(),
                 _handler: self._handler.clone(),
                 layout_cb: self.layout_cb.clone(),
-                child_hwnd: self.child_hwnd.clone(),
             }
         }
     }
@@ -864,16 +910,24 @@ mod nwg_adapter {
             }
         }
         pub fn present(&self) {
+            self.inner.set_visible(true);
             let hwnd = self.inner.handle.hwnd().unwrap_or(std::ptr::null_mut());
             if hwnd != std::ptr::null_mut() {
                 unsafe {
+                    winapi::um::winuser::SetForegroundWindow(hwnd as _);
                     let mut rect: winapi::shared::windef::RECT = std::mem::zeroed();
                     winapi::um::winuser::GetClientRect(hwnd, &mut rect);
                     let w = rect.right - rect.left;
                     let h = rect.bottom - rect.top;
-                    if let Some(ref mut cb) = *self.layout_cb.borrow_mut() {
+                    for cb in self.layout_cb.borrow_mut().iter_mut() {
                         cb(w, h);
                     }
+                    winapi::um::winuser::RedrawWindow(
+                        hwnd as _,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        winapi::um::winuser::RDW_INVALIDATE | winapi::um::winuser::RDW_UPDATENOW | winapi::um::winuser::RDW_ALLCHILDREN | winapi::um::winuser::RDW_ERASE | winapi::um::winuser::RDW_FRAME,
+                    );
                 }
             }
         }
@@ -881,11 +935,17 @@ mod nwg_adapter {
             for &ptr in &child.collect_hwnds() {
                 if !ptr.is_null() {
                     unsafe {
-                        winapi::um::winuser::SetParent(ptr as _, self.inner.handle.hwnd().unwrap_or(std::ptr::null_mut()) as _);
+                        let dlg = self.inner.handle.hwnd().unwrap_or(std::ptr::null_mut());
+                        winapi::um::winuser::SetParent(ptr as _, dlg as _);
+                        winapi::um::winuser::ShowWindow(ptr as _, winapi::um::winuser::SW_SHOW);
+                        winapi::um::winuser::SetWindowPos(
+                            ptr as _, winapi::um::winuser::HWND_TOP,
+                            0, 0, 0, 0,
+                            winapi::um::winuser::SWP_NOMOVE | winapi::um::winuser::SWP_NOSIZE,
+                        );
                     }
-                    *self.child_hwnd.borrow_mut() = Some(ptr);
                     let child_hwnd = ptr;
-                    *self.layout_cb.borrow_mut() = Some(Box::new(move |w, h| {
+                    self.layout_cb.borrow_mut().push(Box::new(move |w, h| {
                         set_window_pos(child_hwnd, 0, 0, w, h);
                     }));
                 }
@@ -940,8 +1000,7 @@ mod nwg_adapter {
         let (inner, _, handler) = crate::backends::nwg::create_dialog(parent_cell, btn_cb)
             .map_err(|e| Error::Backend(format!("{}", e)))?;
 
-        let layout_cb: Rc<RefCell<Option<Box<dyn FnMut(i32, i32)>>>> = Rc::new(RefCell::new(None));
-        let child_hwnd: Rc<RefCell<Option<*mut c_void>>> = Rc::new(RefCell::new(None));
+        let layout_cb: Rc<RefCell<Vec<Box<dyn FnMut(i32, i32)>>>> = Rc::new(RefCell::new(Vec::new()));
 
         // Bind raw WM_SIZE handler for dialog
         let dlg_hwnd = inner.handle.hwnd().unwrap_or(std::ptr::null_mut());
@@ -956,8 +1015,8 @@ mod nwg_adapter {
                     if msg == winapi::um::winuser::WM_SIZE {
                         let w = (l & 0xFFFF) as i32;
                         let h = ((l >> 16) & 0xFFFF) as i32;
-                        if let Some(ref mut cb) = *cb.borrow_mut() {
-                            cb(w, h);
+                        for cb_item in cb.borrow_mut().iter_mut() {
+                            cb_item(w, h);
                         }
                     }
                     None
@@ -965,7 +1024,7 @@ mod nwg_adapter {
             ).map_err(|e| Error::Backend(format!("{}", e)))?;
         }
 
-        Ok(Dialog { inner: Rc::new(inner), buttons: Rc::new(RefCell::new(Vec::new())), response_cb, _handler: Rc::new(handler), layout_cb, child_hwnd })
+        Ok(Dialog { inner: Rc::new(inner), buttons: Rc::new(RefCell::new(Vec::new())), response_cb, _handler: Rc::new(handler), layout_cb })
     }
 
     pub fn create_dialog_button(
@@ -1055,14 +1114,14 @@ mod nwg_adapter {
                 winapi::um::wingdi::SetTextColor(self.hdc, color);
                 let old_bkmode = winapi::um::wingdi::SetBkMode(self.hdc, winapi::um::wingdi::TRANSPARENT as i32);
                 let hfont = Self::make_font(font, size, if weight != 0 { winapi::um::wingdi::FW_BOLD as i32 } else { winapi::um::wingdi::FW_NORMAL as i32 }, _slant != 0);
-                if !hfont.is_null() {
+                if hfont.is_null() {
+                    let sys = winapi::um::wingdi::GetStockObject(winapi::um::wingdi::SYSTEM_FONT as i32) as winapi::shared::windef::HFONT;
+                    let old = winapi::um::wingdi::SelectObject(self.hdc, sys as _);
+                    winapi::um::wingdi::TextOutW(self.hdc, x as i32, y as i32, wide.as_ptr() as _, wide.len() as i32);
+                    winapi::um::wingdi::SelectObject(self.hdc, old);
+                } else {
                     let old_font = winapi::um::wingdi::SelectObject(self.hdc, hfont as _);
-                    let mut rect = winapi::shared::windef::RECT {
-                        left: x as i32, top: y as i32,
-                        right: self.w, bottom: self.h,
-                    };
-                    winapi::um::winuser::DrawTextW(self.hdc, wide.as_ptr() as _, wide.len() as i32,
-                        &mut rect, winapi::um::winuser::DT_LEFT | winapi::um::winuser::DT_TOP | winapi::um::winuser::DT_NOCLIP);
+                    winapi::um::wingdi::TextOutW(self.hdc, x as i32, y as i32, wide.as_ptr() as _, wide.len() as i32);
                     winapi::um::wingdi::SelectObject(self.hdc, old_font);
                     winapi::um::wingdi::DeleteObject(hfont as _);
                 }
@@ -1714,10 +1773,21 @@ mod nwg_adapter {
     type MenuIndex = HashMap<(*mut std::ffi::c_void, u32), String>;
 
     pub struct MenuBar {
-        pub(crate) _menus: Vec<nwg::Menu>,
-        pub(crate) _items: Vec<nwg::MenuItem>,
-        pub(crate) _raw_handler: nwg::RawEventHandler,
+        pub(crate) _menus: Rc<Vec<nwg::Menu>>,
+        pub(crate) _items: Rc<Vec<nwg::MenuItem>>,
+        pub(crate) _raw_handler: Rc<nwg::RawEventHandler>,
         pub(crate) action_registry: Rc<RefCell<HashMap<String, Box<dyn FnMut()>>>>,
+    }
+
+    impl Clone for MenuBar {
+        fn clone(&self) -> Self {
+            MenuBar {
+                _menus: self._menus.clone(),
+                _items: self._items.clone(),
+                _raw_handler: self._raw_handler.clone(),
+                action_registry: self.action_registry.clone(),
+            }
+        }
     }
 
     impl AsRef<*mut c_void> for MenuBar {
@@ -1854,7 +1924,7 @@ mod nwg_adapter {
             },
         ).map_err(|e| Error::Backend(format!("{}", e)))?;
 
-        Ok(MenuBar { _menus: menus, _items: items, _raw_handler: raw_handler, action_registry })
+        Ok(MenuBar { _menus: Rc::new(menus), _items: Rc::new(items), _raw_handler: Rc::new(raw_handler), action_registry })
     }
 
     // -- SimpleAction: stores callback by action name --
@@ -1862,6 +1932,15 @@ mod nwg_adapter {
     pub struct SimpleAction {
         pub(crate) name: String,
         pub(crate) registry: Rc<RefCell<HashMap<String, Box<dyn FnMut()>>>>,
+    }
+
+    impl Clone for SimpleAction {
+        fn clone(&self) -> Self {
+            SimpleAction {
+                name: self.name.clone(),
+                registry: self.registry.clone(),
+            }
+        }
     }
 
     impl SimpleAction {
@@ -1917,6 +1996,10 @@ mod nwg_adapter {
         } else {
             Ok(None)
         }
+    }
+
+    pub fn quit_main_loop() {
+        crate::backends::nwg::quit_main_loop();
     }
 }
 
