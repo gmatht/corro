@@ -663,9 +663,9 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
     /// Create a new Window and return a platform-independent handle.
     pub fn new_window(&self) -> Result<crate::common::Window, Error> {
         #[cfg(all(feature = "gtk", unix))]
-        return crate::backends_gtk_adapter::create_window().map(|w| crate::common::Window { inner: w });
+        return crate::backends_gtk_adapter::create_window();
         #[cfg(windows)]
-        return crate::backends_nwg_adapter::create_window(&self.parent_cell).map(|w| crate::common::Window { inner: w });
+        return crate::backends_nwg_adapter::create_window(&self.parent_cell);
     }
 
     /// Create a new layout Box.
@@ -676,16 +676,16 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
                 crate::common::Orientation::Horizontal => gtk_dynamic_loader::Orientation::Horizontal,
                 crate::common::Orientation::Vertical => gtk_dynamic_loader::Orientation::Vertical,
             };
-            return crate::backends_gtk_adapter::create_box(gtk_orient, spacing).map(|b| crate::common::WidgetBox { inner: b });
+            return crate::backends_gtk_adapter::create_box(gtk_orient, spacing);
         }
         #[cfg(windows)]
         {
             let nwg_orient = match orientation {
                 crate::common::Orientation::Horizontal => crate::backends::nwg::Orientation::Horizontal,
-                crate::common::Orientation::Vertical => crate::backends::nwg::Orientation::Vertical,
+                crate::common::Orientation::Vertical => crate::backendsg::Orientation::Vertical,
             };
             let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
-            return crate::backends_nwg_adapter::create_box(nwg_orient, spacing, parent).map(|b| crate::common::WidgetBox { inner: b });
+            return crate::backends_nwg_adapter::create_box(nwg_orient, spacing, parent);
         }
     }
 
@@ -693,55 +693,54 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
     pub fn new_label(&self, text: &str) -> Result<crate::common::Label, Error> {
         #[cfg(all(feature = "gtk", unix))]
         {
-            let lbl = crate::backends_gtk_adapter::create_label(text)?;
-            Ok(crate::common::Label { inner: lbl })
+            return crate::backends_gtk_adapter::create_label(text);
         }
         #[cfg(windows)]
         {
             let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
             let lbl = crate::backends_nwg_adapter::create_label(parent)?;
             lbl.set_text(text);
-            Ok(crate::common::Label { inner: lbl })
+            return Ok(lbl);
         }
     }
 
     /// Create a new text Entry.
     pub fn new_entry(&self) -> Result<crate::common::Entry, Error> {
         #[cfg(all(feature = "gtk", unix))]
-        return crate::backends_gtk_adapter::create_entry().map(|e| crate::common::Entry { inner: e });
+        return crate::backends_gtk_adapter::create_entry();
         #[cfg(windows)]
         {
             let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
-            return crate::backends_nwg_adapter::create_entry(parent).map(|e| crate::common::Entry { inner: e });
+            return crate::backends_nwg_adapter::create_entry(parent);
         }
     }
 
     /// Create a new Canvas (custom drawing surface).
     pub fn new_canvas(&self) -> Result<crate::common::Canvas, Error> {
         #[cfg(all(feature = "gtk", unix))]
-        return crate::backends_gtk_adapter::create_canvas().map(|c| crate::common::Canvas { inner: c });
+        return crate::backends_gtk_adapter::create_canvas();
         #[cfg(windows)]
         {
             let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
-            return crate::backends_nwg_adapter::create_canvas(parent).map(|c| crate::common::Canvas { inner: c });
+            return crate::backends_nwg_adapter::create_canvas(parent);
         }
     }
 
     /// Create a new Menu data model.
     pub fn new_menu(&self) -> Result<crate::common::Menu, Error> {
         #[cfg(all(feature = "gtk", unix))]
-        return crate::backends_gtk_adapter::create_menu().map(|m| crate::common::Menu { inner: m });
+        return crate::backends_gtk_adapter::create_menu();
         #[cfg(windows)]
-        return crate::backends_nwg_adapter::create_menu().map(|m| crate::common::Menu { inner: m });
+        return crate::backends_nwg_adapter::create_menu();
     }
 
     /// Create a new SimpleAction that will dispatch to the given name.
     /// On Windows the action is registered in the shared action registry.
     pub fn new_simple_action(&self, name: &str) -> Result<crate::common::SimpleAction, Error> {
         #[cfg(all(feature = "gtk", unix))]
-        return crate::backends_gtk_adapter::create_simple_action(name).map(|a| crate::common::SimpleAction { inner: a });
+        return crate::backends_gtk_adapter::create_simple_action(name);
         #[cfg(windows)]
-        return crate::backends_nwg_adapter::create_simple_action(name, self.action_registry.clone()).map(|a| crate::common::SimpleAction { inner: a });
+        return crate::backends_nwg_adapter::create_simple_action(name, self.action_registry.clone());
     }
 
     /// Create a MenuBar from a Menu model.
@@ -749,20 +748,20 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
     /// (pass null if not available); on Windows it is unused.
     pub fn new_menubar(&self, model: &crate::common::Menu, action_group: *mut c_void) -> Result<crate::common::MenuBar, Error> {
         #[cfg(all(feature = "gtk", unix))]
-        return unsafe { crate::backends_gtk_adapter::create_menubar(&model.inner, action_group).map(|m| crate::common::MenuBar { inner: m }) };
+        return unsafe { crate::backends_gtk_adapter::create_menubar(model, action_group) };
         #[cfg(windows)]
         {
             let hwnd = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
-            return crate::backends_nwg_adapter::create_menubar(&model.inner, hwnd, self.action_registry.clone()).map(|m| crate::common::MenuBar { inner: m });
+            return crate::backends_nwg_adapter::create_menubar(model, hwnd, self.action_registry.clone());
         }
     }
 
     /// Create a new Dialog.
     pub fn new_dialog(&self) -> Result<crate::common::Dialog, Error> {
         #[cfg(all(feature = "gtk", unix))]
-        return crate::backends_gtk_adapter::create_dialog().map(|d| crate::common::Dialog { inner: d });
+        return crate::backends_gtk_adapter::create_dialog();
         #[cfg(windows)]
-        return crate::backends_nwg_adapter::create_dialog(&self.parent_cell).map(|d| crate::common::Dialog { inner: d });
+        return crate::backends_nwg_adapter::create_dialog(&self.parent_cell);
     }
 
     /// Ensure the GTK application / action group exists (no-op on Windows).
@@ -786,7 +785,7 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
     pub fn register_action(&self, action: &crate::common::SimpleAction) -> Result<(), Error> {
         #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
         if let Some(ref app) = *self.action_group.borrow() {
-            app.add_action(&action.inner)?;
+            app.add_action(action)?;
         }
         #[cfg(not(all(feature = "gtk", target_os = "linux", not(feature = "zork"))))]
         {}
