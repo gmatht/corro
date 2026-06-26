@@ -1,3 +1,62 @@
+// ---------------------------------------------------------------------------
+// Cross-platform key constants
+// ---------------------------------------------------------------------------
+pub mod key {
+    #[cfg(unix)]
+    mod plat {
+        pub const RETURN: u32 = 0xFF0D;
+        pub const ENTER: u32 = 0xFF8D;
+        pub const ESCAPE: u32 = 0xFF1B;
+        pub const BACKSPACE: u32 = 0xFF08;
+        pub const DELETE: u32 = 0xFFFF;
+        pub const LEFT: u32 = 0xFF51;
+        pub const UP: u32 = 0xFF52;
+        pub const RIGHT: u32 = 0xFF53;
+        pub const DOWN: u32 = 0xFF54;
+        pub const TAB: u32 = 0xFF09;
+        pub const HOME: u32 = 0xFF50;
+        pub const END: u32 = 0xFF57;
+        pub const PAGE_UP: u32 = 0xFF55;
+        pub const PAGE_DOWN: u32 = 0xFF56;
+        pub const F1: u32 = 0xFFBE;
+        pub const F2: u32 = 0xFFBF;
+        pub const ALT_L: u32 = 0xFFE9;
+        pub const ALT_R: u32 = 0xFFEA;
+    }
+    #[cfg(windows)]
+    mod plat {
+        pub const RETURN: u32 = 0x0D;
+        pub const ENTER: u32 = 0x6C;
+        pub const ESCAPE: u32 = 0x1B;
+        pub const BACKSPACE: u32 = 0x08;
+        pub const DELETE: u32 = 0x2E;
+        pub const LEFT: u32 = 0x25;
+        pub const UP: u32 = 0x26;
+        pub const RIGHT: u32 = 0x27;
+        pub const DOWN: u32 = 0x28;
+        pub const TAB: u32 = 0x09;
+        pub const HOME: u32 = 0x24;
+        pub const END: u32 = 0x23;
+        pub const PAGE_UP: u32 = 0x21;
+        pub const PAGE_DOWN: u32 = 0x22;
+        pub const F1: u32 = 0x70;
+        pub const F2: u32 = 0x71;
+        pub const ALT_L: u32 = 0x12;
+        pub const ALT_R: u32 = 0x12;
+    }
+    pub use plat::*;
+
+    /// Normalize a platform key value so it can be compared with the
+    /// constants above. On Windows this masks with 0xFF to strip the
+    /// extended-key flag. On Unix the keyval is returned as-is.
+    pub fn normalize(keyval: u32) -> u32 {
+        #[cfg(windows)]
+        { keyval & 0xFF }
+        #[cfg(not(windows))]
+        { keyval }
+    }
+}
+
 use std::cell::RefCell;
 #[cfg(windows)]
 use std::collections::HashMap;
@@ -656,7 +715,10 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
     /// Create a new Window and return a platform-independent handle.
     pub fn new_window(&self) -> Result<crate::common::Window, Error> {
         #[cfg(all(feature = "gtk", unix))]
-        return crate::backends_gtk_adapter::create_window();
+        {
+            let inner = crate::backends_gtk_adapter::create_window()?;
+            return Ok(crate::common::Window { inner });
+        }
         #[cfg(windows)]
         {
             let inner = crate::backends_nwg_adapter::create_window(&self.parent_cell)?;
@@ -672,7 +734,8 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
                 crate::common::Orientation::Horizontal => gtk_dynamic_loader::Orientation::Horizontal,
                 crate::common::Orientation::Vertical => gtk_dynamic_loader::Orientation::Vertical,
             };
-            return crate::backends_gtk_adapter::create_box(gtk_orient, spacing);
+            let inner = crate::backends_gtk_adapter::create_box(gtk_orient, spacing)?;
+            return Ok(crate::common::WidgetBox { inner });
         }
         #[cfg(windows)]
         {
@@ -690,7 +753,8 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
     pub fn new_label(&self, text: &str) -> Result<crate::common::Label, Error> {
         #[cfg(all(feature = "gtk", unix))]
         {
-            return crate::backends_gtk_adapter::create_label(text);
+            let inner = crate::backends_gtk_adapter::create_label(text)?;
+            return Ok(crate::common::Label { inner });
         }
         #[cfg(windows)]
         {
@@ -704,7 +768,10 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
     /// Create a new text Entry.
     pub fn new_entry(&self) -> Result<crate::common::Entry, Error> {
         #[cfg(all(feature = "gtk", unix))]
-        return crate::backends_gtk_adapter::create_entry();
+        {
+            let inner = crate::backends_gtk_adapter::create_entry()?;
+            return Ok(crate::common::Entry { inner });
+        }
         #[cfg(windows)]
         {
             let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
@@ -716,7 +783,10 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
     /// Create a new Canvas (custom drawing surface).
     pub fn new_canvas(&self) -> Result<crate::common::Canvas, Error> {
         #[cfg(all(feature = "gtk", unix))]
-        return crate::backends_gtk_adapter::create_canvas();
+        {
+            let inner = crate::backends_gtk_adapter::create_canvas()?;
+            return Ok(crate::common::Canvas { inner });
+        }
         #[cfg(windows)]
         {
             let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
@@ -728,7 +798,10 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
     /// Create a new Menu data model.
     pub fn new_menu(&self) -> Result<crate::common::Menu, Error> {
         #[cfg(all(feature = "gtk", unix))]
-        return crate::backends_gtk_adapter::create_menu();
+        {
+            let inner = crate::backends_gtk_adapter::create_menu()?;
+            return Ok(crate::common::Menu { inner });
+        }
         #[cfg(windows)]
         {
             let inner = crate::backends_nwg_adapter::create_menu()?;
@@ -740,7 +813,10 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
     /// On Windows the action is registered in the shared action registry.
     pub fn new_simple_action(&self, name: &str) -> Result<crate::common::SimpleAction, Error> {
         #[cfg(all(feature = "gtk", unix))]
-        return crate::backends_gtk_adapter::create_simple_action(name);
+        {
+            let inner = crate::backends_gtk_adapter::create_simple_action(name)?;
+            return Ok(crate::common::SimpleAction { inner });
+        }
         #[cfg(windows)]
         {
             let inner = crate::backends_nwg_adapter::create_simple_action(name, self.action_registry.clone())?;
@@ -753,7 +829,10 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
     /// (pass null if not available); on Windows it is unused.
     pub fn new_menubar(&self, model: &crate::common::Menu, action_group: *mut c_void) -> Result<crate::common::MenuBar, Error> {
         #[cfg(all(feature = "gtk", unix))]
-        return unsafe { crate::backends_gtk_adapter::create_menubar(model, action_group) };
+        {
+            let inner = unsafe { crate::backends_gtk_adapter::create_menubar(&model.inner, action_group) }?;
+            return Ok(crate::common::MenuBar { inner });
+        }
         #[cfg(windows)]
         {
             let hwnd = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
@@ -765,7 +844,10 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
     /// Create a new Dialog.
     pub fn new_dialog(&self) -> Result<crate::common::Dialog, Error> {
         #[cfg(all(feature = "gtk", unix))]
-        return crate::backends_gtk_adapter::create_dialog();
+        {
+            let inner = crate::backends_gtk_adapter::create_dialog()?;
+            return Ok(crate::common::Dialog { inner });
+        }
         #[cfg(windows)]
         {
             let inner = crate::backends_nwg_adapter::create_dialog(&self.parent_cell)?;
@@ -794,7 +876,7 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
     pub fn register_action(&self, action: &crate::common::SimpleAction) -> Result<(), Error> {
         #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
         if let Some(ref app) = *self.action_group.borrow() {
-            app.add_action(action)?;
+            app.add_action(&action.inner)?;
         }
         #[cfg(not(all(feature = "gtk", target_os = "linux", not(feature = "zork"))))]
         {}
@@ -805,6 +887,15 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
     pub fn run(self) -> Result<(), Error> {
         let boxed = self.inner.borrow_mut().take().ok_or_else(|| Error::Backend("App::run already called".into()))?;
         boxed.run().map_err(|e| Error::Backend(format!("{}", e)))
+    }
+
+    /// Post a quit message to the backend's event loop.
+    /// Safe to call from signal handlers and event callbacks.
+    pub fn quit(&self) {
+        #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+        let _ = crate::backends_gtk_adapter::quit_main_loop();
+        #[cfg(all(windows, not(feature = "zork")))]
+        crate::backends_nwg_adapter::quit_main_loop();
     }
 }
 

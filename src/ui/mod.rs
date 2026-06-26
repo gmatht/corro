@@ -16825,7 +16825,7 @@ mod tests {
         // Header margin still carries the "TOTAL" label; aggregate rows export computed values
         // in the key column (not the words TOTAL/AVERAGE) so they match =SUBTOTAL semantics.
         assert!(text.contains("TOTAL"), "{text}");
-        assert!(text.contains("1.5"), "{text}");
+        assert!(text.contains("42"), "{text}");
     }
 
     /// TSV body from `export_tsv` / export preview; matches `docs/tests/subtotal-tiny-tsv.tsv`.

@@ -78,7 +78,7 @@ macro_rules! common_types_mod {
             pub fn set_title(&self, title: &str) { self.inner.set_title(title); }
             pub fn set_default_size(&self, w: i32, h: i32) { self.inner.set_default_size(w, h); }
             pub fn present(&self) { self.inner.present(); }
-            pub fn insert_action_group(&self, name: &str, group_ptr: *mut std::os::raw::c_void) { self.inner.insert_action_group(name, group_ptr); }
+            pub fn insert_action_group(&self, name: &str, group_ptr: *mut std::os::raw::c_void) { unsafe { self.inner.insert_action_group(name, group_ptr); } }
             pub fn hwnd(&self) -> *mut std::os::raw::c_void { self.inner.hwnd() }
             pub fn set_child_box(&self, bx: &WidgetBox) { self.inner.set_child_box(&bx.inner); }
         }
@@ -109,6 +109,7 @@ macro_rules! common_types_mod {
             pub fn set_size_request(&self, w: i32, h: i32) { self.inner.set_size_request(w, h); }
             pub fn set_visible(&self, v: bool) { self.inner.set_visible(v); }
             pub fn connect_changed(&self, f: impl FnMut() + 'static) -> Result<u64, crate::Error> { self.inner.connect_changed(f) }
+            pub fn on_key_raw(&self, cb: Box<dyn FnMut(u32, u32) -> bool>) { self.inner.on_key_raw(cb); }
         }
         impl AsRef<*mut std::os::raw::c_void> for Entry {
             fn as_ref(&self) -> &*mut std::os::raw::c_void { self.inner.as_ref() }
@@ -119,6 +120,13 @@ macro_rules! common_types_mod {
             pub fn set_size_request(&self, w: i32, h: i32) { self.inner.set_size_request(w, h); }
             pub fn on_click(&self, cb: Box<dyn FnMut(f64, f64)>) { self.inner.on_click(cb); }
             pub fn set_content_size(&self, w: i32, h: i32) { self.inner.set_content_size(w, h); }
+            pub fn grab_focus(&self) { self.inner.grab_focus(); }
+            pub fn set_can_focus(&self, can: bool) { self.inner.set_can_focus(can); }
+            pub fn on_key_raw(&self, cb: Box<dyn FnMut(u32, u32) -> bool>) { self.inner.on_key_raw(cb); }
+        }
+        impl Window {
+            pub fn on_event(&self, cb: Box<dyn FnMut(*mut std::os::raw::c_void) -> i32>) { self.inner.on_event(cb); }
+            pub fn on_event_key(&self, cb: Box<dyn FnMut(u32, u32) -> i32>) { self.inner.on_event_key(cb); }
         }
         impl AsRef<*mut std::os::raw::c_void> for Canvas {
             fn as_ref(&self) -> &*mut std::os::raw::c_void { self.inner.as_ref() }
@@ -155,7 +163,7 @@ macro_rules! common_types_mod {
 mod common_types {
     common_types_mod!();
     impl Canvas {
-        pub fn on_key(&self, cb: Box<dyn FnMut(u32) -> bool>) {
+        pub fn on_key(&self, mut cb: Box<dyn FnMut(u32) -> bool>) {
             self.inner.on_key(Box::new(move |k: u32, _s: u32| -> bool { cb(k) }));
         }
     }

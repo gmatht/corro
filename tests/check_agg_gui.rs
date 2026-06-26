@@ -157,6 +157,8 @@ fn test_full_agg_pipeline() {
     raw.set(&CellAddr::Main { row: 3, col: 1 }, "54.5".into());
     raw.set(&CellAddr::Main { row: 4, col: 0 }, "3".into());
     raw.set(&CellAddr::Main { row: 4, col: 1 }, "109".into());
+    raw.set(&CellAddr::Main { row: 5, col: 0 }, "7".into());
+    raw.set(&CellAddr::Main { row: 5, col: 1 }, "8".into());
     raw.set(&CellAddr::Main { row: 6, col: 0 }, "1".into());
     raw.set(&CellAddr::Main { row: 6, col: 1 }, "2".into());
 

@@ -17,6 +17,8 @@ mod gtk_adapter {
 
     impl AsRef<*mut c_void> for Window { fn as_ref(&self) -> &*mut c_void { self.0.as_ref() } }
 
+    impl Clone for Window { fn clone(&self) -> Self { Window(self.0.clone()) } }
+
     impl Window {
         pub fn set_title(&self, title: &str) {
             self.0.set_title(title);
@@ -43,6 +45,48 @@ mod gtk_adapter {
 
         pub fn hwnd(&self) -> *mut c_void {
             *self.0.as_ref()
+        }
+        pub fn on_event(&self, cb: Box<dyn FnMut(*mut c_void) -> i32>) {
+            if let Some(loader) = crate::backends::gtk::loader() {
+                let win_ptr = *self.0.as_ref();
+                if !win_ptr.is_null() {
+                    let l = loader.clone();
+                    unsafe {
+                        let _ = gtk_dynamic_loader::widget_connect_signal_bool(
+                            &l, win_ptr, "event", cb,
+                        );
+                    }
+                }
+            }
+        }
+
+        pub fn on_event_key(&self, mut cb: Box<dyn FnMut(u32, u32) -> i32>) {
+            if let Some(loader) = crate::backends::gtk::loader() {
+                let win_ptr = *self.0.as_ref();
+                if !win_ptr.is_null() {
+                    let l = loader.clone();
+                    unsafe {
+                        let _ = gtk_dynamic_loader::widget_connect_signal_bool(
+                            &l.clone(), win_ptr, "event",
+                            Box::new(move |ev: *mut c_void| -> i32 {
+                                let mut keyval: u32 = 0;
+                                if let Some(get_kv) = l.symbols.gdk_event_get_keyval {
+                                    if get_kv(ev, &mut keyval) == 0 {
+                                        return 0;
+                                    }
+                                } else {
+                                    return 0;
+                                }
+                                let mut state: u32 = 0;
+                                if let Some(get_st) = l.symbols.gdk_event_get_state {
+                                    get_st(ev, &mut state);
+                                }
+                                cb(keyval, state)
+                            }),
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -93,6 +137,7 @@ mod gtk_adapter {
         pub fn set_size_request(&self, w: i32, h: i32) { self.0.set_size_request(w, h); }
         /// Set the x alignment of the label's text (0.0 left .. 1.0 right)
         pub fn set_xalign(&self, x: f32) { self.0.set_xalign(x); }
+        pub fn raw_handle(&self) -> *mut c_void { *self.0.as_ref() }
     }
 
     impl Clone for Label { fn clone(&self) -> Self { Label(self.0.clone()) } }
@@ -103,6 +148,8 @@ mod gtk_adapter {
     impl Widget for BoxWidget { fn raw_handle(&self) -> *mut c_void { *self.0.as_ref() } }
     impl AsRef<*mut c_void> for BoxWidget { fn as_ref(&self) -> &*mut c_void { self.0.as_ref() } }
 
+    impl Clone for BoxWidget { fn clone(&self) -> Self { BoxWidget(self.0.clone()) } }
+
     impl BoxWidget {
         pub fn append(&self, child: &impl AsRef<*mut c_void>) {
             self.0.append(child);
@@ -112,6 +159,8 @@ mod gtk_adapter {
         pub fn set_vexpand(&self, expand: bool) { self.0.set_vexpand(expand); }
         pub fn set_hexpand(&self, expand: bool) { self.0.set_hexpand(expand); }
         pub fn set_visible(&self, visible: bool) { self.0.set_visible(visible); }
+        pub fn set_child_hexpand(&self, _child: &impl AsRef<*mut c_void>, _expand: bool) {}
+        pub fn set_child_vexpand(&self, _child: &impl AsRef<*mut c_void>, _expand: bool) {}
     }
 
     #[repr(transparent)]
@@ -160,6 +209,26 @@ mod gtk_adapter {
         pub fn set_visible(&self, visible: bool) { self.0.set_visible(visible); }
         pub fn set_hexpand(&self, expand: bool) { self.0.set_hexpand(expand); }
         pub fn set_vexpand(&self, expand: bool) { self.0.set_vexpand(expand); }
+        pub fn on_key_raw(&self, cb: Box<dyn FnMut(u32, u32) -> bool>) {
+            if let Some(loader) = crate::backends::gtk::loader() {
+                let entry_ptr = *self.0.as_ref();
+                if !entry_ptr.is_null() {
+                    let l = loader.clone();
+                    let mut cb = cb;
+                    unsafe {
+                        let _ = gtk_dynamic_loader::widget_connect_signal_bool(
+                            &l.clone(), entry_ptr, "key-press-event",
+                            Box::new(move |ev: *mut c_void| -> i32 {
+                                let keyval = gtk_dynamic_loader::EventControllerKey::get_keyval_static(&l, ev);
+                                if keyval == 0 { return 0; }
+                                let state = gtk_dynamic_loader::EventControllerKey::get_state_static(&l, ev);
+                                if cb(keyval, state) { 1 } else { 0 }
+                            }),
+                        );
+                    }
+                }
+            }
+        }
     }
 
     impl Clone for Entry { fn clone(&self) -> Self { Entry(self.0.clone()) } }
@@ -204,6 +273,8 @@ mod gtk_adapter {
     #[repr(transparent)]
     pub struct Menu(pub gtk_dynamic_loader::Menu);
 
+    impl Clone for Menu { fn clone(&self) -> Self { Menu(self.0.clone()) } }
+
     impl Menu {
         pub fn append(&mut self, label: &str, detailed_action: &str) {
             self.0.append(label, detailed_action);
@@ -222,6 +293,7 @@ mod gtk_adapter {
     #[repr(transparent)]
     pub struct MenuBar(pub gtk_dynamic_loader::MenuBar);
 
+    impl Clone for MenuBar { fn clone(&self) -> Self { MenuBar(self.0.clone()) } }
     impl Widget for MenuBar { fn raw_handle(&self) -> *mut c_void { *self.0.as_ref() } }
     impl AsRef<*mut c_void> for MenuBar { fn as_ref(&self) -> &*mut c_void { self.0.as_ref() } }
 
@@ -234,6 +306,8 @@ mod gtk_adapter {
 
     #[repr(transparent)]
     pub struct SimpleAction(pub gtk_dynamic_loader::SimpleAction);
+
+    impl Clone for SimpleAction { fn clone(&self) -> Self { SimpleAction(self.0.clone()) } }
 
     impl SimpleAction {
         pub fn connect_activate<F: FnMut(*mut c_void) + 'static>(&self, f: F) -> Result<u64, Error> {
@@ -585,6 +659,18 @@ mod gtk_adapter {
                     );
                 }
             }
+        }
+
+        pub fn on_key_raw(&self, cb: Box<dyn FnMut(u32, u32) -> bool>) {
+            self.on_key(cb);
+        }
+
+        pub fn grab_focus(&self) {
+            self.drawing_area.grab_focus();
+        }
+
+        pub fn set_can_focus(&self, can: bool) {
+            self.drawing_area.set_can_focus(can);
         }
     }
 

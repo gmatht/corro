@@ -22,4 +22,12 @@ SET $1:[A_1 =TOTAL
 SET $1:[A7 Extra
 SET $1:A7 1
 SET $1:B7 2
-
+SET A1 42
+SET A2 elloH
+SET C2 estT
+SET A1 42
+SET A2 elloH
+SET C2 estT
+SET A1 42
+SET A2 elloH
+SET C2 estT

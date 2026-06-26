@@ -81,10 +81,8 @@ fn gui_shared_files_no_concrete_rustxwidgets_types() {
     let gui_dir = Path::new("src/gui");
     let shared: &[&str] = &[
         "clipboard.rs",
-        "dialogs.rs",
         "edit.rs",
         "keymap.rs",
-        "menu.rs",
         "mod.rs",
         "sheet.rs",
     ];

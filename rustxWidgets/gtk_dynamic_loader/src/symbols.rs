@@ -82,6 +82,7 @@ pub type GtkWindowClose = unsafe extern "C" fn(window: *mut c_void);
 pub type GFree = unsafe extern "C" fn(ptr: *mut c_void);
 // gdk event helpers
 pub type GdkEventGetKeyval = unsafe extern "C" fn(event: *mut c_void, keyval: *mut u32) -> i32;
+pub type GdkEventGetState = unsafe extern "C" fn(event: *mut c_void, state: *mut u32);
 pub type GdkKeyvalFromName = unsafe extern "C" fn(name: *const i8) -> u32;
 pub type GdkDisplayGetDefault = unsafe extern "C" fn() -> *mut c_void;
 pub type GdkScreenGetDefault = unsafe extern "C" fn() -> *mut c_void;
@@ -146,6 +147,7 @@ pub type GtkTextIterFree = unsafe extern "C" fn(iter: *mut c_void);
 pub type GtkTextViewSetWrapMode = unsafe extern "C" fn(text_view: *mut c_void, wrap_mode: i32);
 
 // GtkWidget helper for visibility/event handling
+pub type GtkWidgetSetCanFocus = unsafe extern "C" fn(widget: *mut c_void, can_focus: i32);
 pub type GtkWidgetSetHexpand = unsafe extern "C" fn(widget: *mut c_void, expand: i32);
 pub type GtkWidgetSetVexpand = unsafe extern "C" fn(widget: *mut c_void, expand: i32);
 pub type GtkWidgetGetHexpand = unsafe extern "C" fn(widget: *mut c_void) -> i32;
@@ -280,6 +282,7 @@ pub struct Symbols {
     pub gtk_style_context_add_provider_for_display: Option<GtkStyleContextAddProviderForDisplay>,
     pub gtk_style_context_add_provider_for_screen: Option<GtkStyleContextAddProviderForScreen>,
     pub gdk_event_get_keyval: Option<GdkEventGetKeyval>,
+    pub gdk_event_get_state: Option<GdkEventGetState>,
     pub gdk_keyval_from_name: Option<GdkKeyvalFromName>,
     // application/menu/action
     pub gtk_application_new: Option<GtkApplicationNew>,
@@ -323,6 +326,7 @@ pub struct Symbols {
     pub cairo_show_text: Option<unsafe extern "C" fn(cr: *mut c_void, utf8: *const i8)>,
     // widget helpers
     pub gtk_widget_queue_draw: Option<unsafe extern "C" fn(widget: *mut c_void)>,
+    pub gtk_widget_set_can_focus: Option<GtkWidgetSetCanFocus>,
     pub gtk_label_set_xalign: Option<GtkLabelSetXalign>,
     pub gtk_event_controller_key_new: Option<GtkEventControllerKeyNew>,
     pub gtk_event_controller_focus_new: Option<GtkEventControllerFocusNew>,
@@ -481,6 +485,7 @@ impl Symbols {
         let gtk_style_context_add_provider_for_display = unsafe { sym::<GtkStyleContextAddProviderForDisplay>(gtk, "gtk_style_context_add_provider_for_display") };
         let gtk_style_context_add_provider_for_screen = unsafe { sym::<GtkStyleContextAddProviderForScreen>(gtk, "gtk_style_context_add_provider_for_screen") };
         let gdk_event_get_keyval = open_sym_try!(libs, "libgdk", GdkEventGetKeyval, "gdk_event_get_keyval").or_else(|| unsafe { sym::<GdkEventGetKeyval>(gtk, "gdk_event_get_keyval") });
+        let gdk_event_get_state = open_sym_try!(libs, "libgdk", GdkEventGetState, "gdk_event_get_state").or_else(|| unsafe { sym::<GdkEventGetState>(gtk, "gdk_event_get_state") });
         let gdk_keyval_from_name = open_sym_try!(libs, "libgdk", GdkKeyvalFromName, "gdk_keyval_from_name").or_else(|| unsafe { sym::<GdkKeyvalFromName>(gtk, "gdk_keyval_from_name") });
         let gtk_grid_new = unsafe { sym::<GtkGridNew>(gtk, "gtk_grid_new") };
         let gtk_grid_attach = unsafe { sym::<GtkGridAttach>(gtk, "gtk_grid_attach") };
@@ -538,6 +543,7 @@ impl Symbols {
         let gtk_drawing_area_set_draw_func = unsafe { sym::<GtkDrawingAreaSetDrawFunc>(gtk, "gtk_drawing_area_set_draw_func") };
         let gtk_drawing_area_set_content_width = unsafe { sym::<GtkDrawingAreaSetContentWidth>(gtk, "gtk_drawing_area_set_content_width") };
         let gtk_drawing_area_set_content_height = unsafe { sym::<GtkDrawingAreaSetContentHeight>(gtk, "gtk_drawing_area_set_content_height") };
+        let gtk_widget_set_can_focus = unsafe { sym::<GtkWidgetSetCanFocus>(gtk, "gtk_widget_set_can_focus") };
         let gtk_widget_queue_draw = unsafe { sym::<unsafe extern "C" fn(*mut c_void)>(gtk, "gtk_widget_queue_draw") };
         let gtk_label_set_xalign = unsafe { sym::<GtkLabelSetXalign>(gtk, "gtk_label_set_xalign") };
         let gtk_event_controller_key_new = unsafe { sym::<GtkEventControllerKeyNew>(gtk, "gtk_event_controller_key_new") };
@@ -671,7 +677,8 @@ impl Symbols {
             cairo_create, cairo_font_face_destroy,
             cairo_move_to, cairo_set_source_rgb, cairo_set_source_rgba, cairo_rectangle, cairo_fill, cairo_stroke, cairo_set_line_width, cairo_select_font_face, cairo_set_font_size, cairo_show_text,
             gtk_widget_queue_draw,
-            gtk_file_chooser_native_new, gtk_native_dialog_run, gtk_file_chooser_get_filename, gtk_widget_destroy, gtk_window_close, g_free, gdk_display_get_default, gdk_screen_get_default, gtk_style_context_add_provider_for_display, gtk_style_context_add_provider_for_screen, gdk_event_get_keyval, gdk_keyval_from_name,
+            gtk_widget_set_can_focus,
+            gtk_file_chooser_native_new, gtk_native_dialog_run, gtk_file_chooser_get_filename, gtk_widget_destroy, gtk_window_close, g_free, gdk_display_get_default, gdk_screen_get_default, gtk_style_context_add_provider_for_display, gtk_style_context_add_provider_for_screen, gdk_event_get_keyval, gdk_event_get_state, gdk_keyval_from_name,
             gtk_application_new, g_application_run, g_application_register, g_simple_action_new, g_action_map_add_action, g_action_group_activate_action, g_action_map_lookup_action, g_action_activate,
             g_menu_new, g_menu_append, g_application_set_app_menu, g_application_set_menubar, g_menu_append_submenu, gtk_popover_menu_bar_new_from_model, gtk_menu_bar_new, gtk_menu_new, gtk_menu_item_new_with_label, gtk_menu_shell_append, gtk_menu_item_set_submenu, gtk_window_set_application, gtk_widget_insert_action_group, gtk_actionable_set_detailed_action_name, g_menu_model_get_n_items, g_menu_model_get_item_attribute_value, g_menu_model_get_item_link, g_variant_get_string, g_variant_unref,
             gtk_label_set_xalign,

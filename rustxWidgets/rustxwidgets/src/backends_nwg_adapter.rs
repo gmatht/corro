@@ -25,6 +25,7 @@ mod nwg_adapter {
         pub(crate) _handler: Rc<nwg::EventHandler>,
         root_child: Rc<RefCell<Option<*mut c_void>>>,
         layout_cb: Rc<RefCell<Option<Box<dyn FnMut(i32, i32)>>>>,
+        event_key_cb: Rc<RefCell<Option<Box<dyn FnMut(u32, u32) -> i32>>>>,
     }
 
     impl Clone for Window {
@@ -34,6 +35,7 @@ mod nwg_adapter {
                 _handler: self._handler.clone(),
                 root_child: self.root_child.clone(),
                 layout_cb: self.layout_cb.clone(),
+                event_key_cb: self.event_key_cb.clone(),
             }
         }
     }
@@ -111,6 +113,10 @@ mod nwg_adapter {
         pub fn hwnd(&self) -> *mut c_void {
             self.inner.handle.hwnd().unwrap_or(std::ptr::null_mut()) as *mut c_void
         }
+        pub fn on_event(&self, _cb: Box<dyn FnMut(*mut c_void) -> i32>) {}
+        pub fn on_event_key(&self, cb: Box<dyn FnMut(u32, u32) -> i32>) {
+            *self.event_key_cb.borrow_mut() = Some(cb);
+        }
     }
 
     pub fn create_window(parent_cell: &Rc<RefCell<Option<*mut c_void>>>) -> Result<Window, Error> {
@@ -118,10 +124,11 @@ mod nwg_adapter {
             .map_err(|e| Error::Backend(format!("{}", e)))?;
         let root_child: Rc<RefCell<Option<*mut c_void>>> = Rc::new(RefCell::new(None));
         let layout_cb: Rc<RefCell<Option<Box<dyn FnMut(i32, i32)>>>> = Rc::new(RefCell::new(None));
+        let event_key_cb: Rc<RefCell<Option<Box<dyn FnMut(u32, u32) -> i32>>>> = Rc::new(RefCell::new(None));
 
-        // Bind raw WM_SIZE handler
         let hwnd = inner.handle.hwnd().unwrap_or(std::ptr::null_mut());
         if hwnd != std::ptr::null_mut() {
+            // Bind raw WM_SIZE handler
             let cb = layout_cb.clone();
             static RAW_HANDLER_ID: AtomicUsize = AtomicUsize::new(0x10000000);
             let handler_id = RAW_HANDLER_ID.fetch_add(1, Ordering::SeqCst);
@@ -139,9 +146,49 @@ mod nwg_adapter {
                     None
                 },
             ).map_err(|e| Error::Backend(format!("{}", e)))?;
+
+            // Bind raw WM_KEYDOWN/WM_SYSKEYDOWN handler for on_event_key.
+            // The state parameter is a GDK-compatible modifier mask:
+            //   bit 3 = Alt (MOD1_MASK)
+            // Alt is detected from WM_SYSKEYDOWN.
+            // If the callback returns 0 (not consumed), the message is forwarded
+            // to the focused child window via PostMessage so the canvas or entry
+            // raw handlers can process it.  DefWindowProc for a non-dialog window
+            // does not forward WM_KEYDOWN to child controls.
+            let kcb = event_key_cb.clone();
+            static KEY_HANDLER_ID: AtomicUsize = AtomicUsize::new(0x30000000);
+            let key_id = KEY_HANDLER_ID.fetch_add(1, Ordering::SeqCst);
+            let parent_hwnd = hwnd;
+            nwg::bind_raw_event_handler(
+                &nwg::ControlHandle::Hwnd(hwnd),
+                key_id,
+                move |_h, msg, w, l| {
+                    if msg != winapi::um::winuser::WM_KEYDOWN && msg != winapi::um::winuser::WM_SYSKEYDOWN {
+                        return None;
+                    }
+                    if let Some(ref mut f) = *kcb.borrow_mut() {
+                        let mut state: u32 = 0;
+                        if msg == winapi::um::winuser::WM_SYSKEYDOWN {
+                            state |= 8; // GDK_MOD1_MASK (Alt)
+                        }
+                        if f(w as u32, state) != 0 {
+                            return Some(0); // consumed, do not forward
+                        }
+                    }
+                    // Forward to the focused child window so canvas/entry
+                    // raw handlers can process the keystroke.
+                    unsafe {
+                        let focused = winapi::um::winuser::GetFocus();
+                        if focused != std::ptr::null_mut() && focused != parent_hwnd {
+                            winapi::um::winuser::PostMessageW(focused, msg, w, l);
+                        }
+                    }
+                    None
+                },
+            ).map_err(|e| Error::Backend(format!("{}", e)))?;
         }
 
-        Ok(Window { inner: Rc::new(inner), _handler: Rc::new(handler), root_child, layout_cb })
+        Ok(Window { inner: Rc::new(inner), _handler: Rc::new(handler), root_child, layout_cb, event_key_cb })
     }
 
     // -- Button --
@@ -635,6 +682,10 @@ mod nwg_adapter {
         }
         pub fn set_halign(&self, _align: i32) {}
         pub fn set_valign(&self, _align: i32) {}
+        pub fn on_key_raw(&self, cb: Box<dyn FnMut(u32, u32) -> bool>) {
+            let mut cb = cb;
+            *self.key_cb.borrow_mut() = Some(Box::new(move |k: u32| -> bool { cb(k, 0) }));
+        }
         pub fn connect_activate(&self, _f: impl FnMut(*mut c_void) + 'static) -> Result<u64, Error> { Ok(0) }
         pub fn connect_focus_in_event(&self, f: impl FnMut(*mut c_void) -> i32 + 'static) -> Result<u64, Error> {
             *self.focus_in_cb.borrow_mut() = Some(Box::new(f));
@@ -1197,6 +1248,14 @@ mod nwg_adapter {
         pub fn on_key(&self, cb: Box<dyn FnMut(u32) -> bool>) {
             *self.key_cb.borrow_mut() = Some(cb);
         }
+        pub fn on_key_raw(&self, cb: Box<dyn FnMut(u32, u32) -> bool>) {
+            let mut cb = cb;
+            *self.key_cb.borrow_mut() = Some(Box::new(move |k: u32| -> bool { cb(k, 0) }));
+        }
+        pub fn grab_focus(&self) {
+            unsafe { winapi::um::winuser::SetFocus(self.hwnd as _); }
+        }
+        pub fn set_can_focus(&self, _can: bool) {}
     }
 
     impl Clone for Canvas {

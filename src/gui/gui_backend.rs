@@ -13,57 +13,7 @@ use super::compute::{self, CellDisplayStyle};
 use super::dialogs;
 use super::render::{self, CellSink};
 
-// ---------------------------------------------------------------------------
-// Platform key constants
-// ---------------------------------------------------------------------------
-
-#[cfg(unix)]
-mod key {
-    pub const RETURN: u32 = 0xFF0D;
-    pub const ESCAPE: u32 = 0xFF1B;
-    pub const BACKSPACE: u32 = 0xFF08;
-    pub const DELETE: u32 = 0xFFFF;
-    pub const LEFT: u32 = 0xFF51;
-    pub const UP: u32 = 0xFF52;
-    pub const RIGHT: u32 = 0xFF53;
-    pub const DOWN: u32 = 0xFF54;
-    pub const TAB: u32 = 0xFF09;
-    pub const HOME: u32 = 0xFF50;
-    pub const END: u32 = 0xFF57;
-    pub const PAGE_UP: u32 = 0xFF55;
-    pub const PAGE_DOWN: u32 = 0xFF56;
-    pub const F1: u32 = 0xFFBE;
-    pub const F2: u32 = 0xFFBF;
-    pub const ALT_L: u32 = 0xFFE9;
-    pub const ALT_R: u32 = 0xFFEA;
-}
-
-#[cfg(all(feature = "gui", windows))]
-mod key {
-    pub const RETURN: u32 = 0x0D;
-    pub const ESCAPE: u32 = 0x1B;
-    pub const BACKSPACE: u32 = 0x08;
-    pub const DELETE: u32 = 0x2E;
-    pub const LEFT: u32 = 0x25;
-    pub const UP: u32 = 0x26;
-    pub const RIGHT: u32 = 0x27;
-    pub const DOWN: u32 = 0x28;
-    pub const TAB: u32 = 0x09;
-    pub const HOME: u32 = 0x24;
-    pub const END: u32 = 0x23;
-    pub const PAGE_UP: u32 = 0x21;
-    pub const PAGE_DOWN: u32 = 0x22;
-    pub const F1: u32 = 0x70;
-    pub const F2: u32 = 0x71;
-    pub const ALT_L: u32 = 0x12;
-    pub const ALT_R: u32 = 0x12;
-}
-
-#[cfg(all(feature = "gui", target_family = "unix"))]
-use key::*;
-
-#[cfg(all(feature = "gui", windows))]
-use key::*;
+use rustxwidgets::core::key::{normalize, RETURN, ESCAPE, BACKSPACE, DELETE, LEFT, UP, RIGHT, DOWN, TAB, HOME, END, PAGE_UP, PAGE_DOWN, F1, F2, ALT_L, ALT_R};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -138,12 +88,24 @@ impl CellSink for GuiCanvasSink {
 }
 
 // ---------------------------------------------------------------------------
+// Save-before-quit helper
+// ---------------------------------------------------------------------------
+
+fn save_before_quit(state: &GuiState) {
+    // Commit any pending edit first so committed ops are written to the
+    // CORRO_LOG file via commit_workbook_op.
+    if state.editing.get() {
+        commit_edit(state);
+    }
+    state.rxapp.quit();
+}
+
+// ---------------------------------------------------------------------------
 // Shared state
 // ---------------------------------------------------------------------------
 
 struct GuiState {
     app: *mut super::App,
-    #[allow(dead_code)]
     rxapp: rustxwidgets::App,
     canvas: Canvas,
     formula_entry: Entry,
@@ -369,12 +331,7 @@ fn handle_key(keyval: u32, state_rc: &Rc<GuiState>) -> bool {
     let prev_key = state.prev_key.get();
     state.prev_key.set(keyval);
     let app = unsafe { &mut *state.app };
-    let key = {
-        #[cfg(windows)]
-        { keyval & 0xFF }
-        #[cfg(not(windows))]
-        { keyval }
-    };
+    let key = normalize(keyval);
 
     // Gate: if this is 'q' and Alt-F+Q flags are set, quit immediately
     // before any other processing.  The flags may have been set by a
@@ -389,10 +346,7 @@ fn handle_key(keyval: u32, state_rc: &Rc<GuiState>) -> bool {
         state.alt_active.set(false);
         state.seq_alt_f.set(false);
         state.last_was_f.set(false);
-        #[cfg(unix)]
-        let _ = rustxwidgets::backends_gtk_adapter::quit_main_loop();
-        #[cfg(windows)]
-        rustxwidgets::backends_nwg_adapter::quit_main_loop();
+        save_before_quit(state);
         return true;
     }
 
@@ -428,10 +382,7 @@ fn handle_key(keyval: u32, state_rc: &Rc<GuiState>) -> bool {
             state.alt_active.set(false);
             state.seq_alt_f.set(false);
             state.last_was_f.set(false);
-            #[cfg(unix)]
-            let _ = rustxwidgets::backends_gtk_adapter::quit_main_loop();
-            #[cfg(windows)]
-            rustxwidgets::backends_nwg_adapter::quit_main_loop();
+            save_before_quit(state);
             return true;
         }
     }
@@ -457,10 +408,7 @@ fn handle_key(keyval: u32, state_rc: &Rc<GuiState>) -> bool {
             state.alt_active.set(false);
             state.seq_alt_f.set(false);
             state.last_was_f.set(false);
-            #[cfg(unix)]
-            let _ = rustxwidgets::backends_gtk_adapter::quit_main_loop();
-            #[cfg(windows)]
-            rustxwidgets::backends_nwg_adapter::quit_main_loop();
+            save_before_quit(state);
             return true;
         }
     }
@@ -602,10 +550,7 @@ fn handle_edit_key(key: u32, state: &GuiState) -> bool {
             state.alt_active.set(false);
             state.seq_alt_f.set(false);
             state.last_was_f.set(false);
-            #[cfg(unix)]
-            let _ = rustxwidgets::backends_gtk_adapter::quit_main_loop();
-            #[cfg(windows)]
-            rustxwidgets::backends_nwg_adapter::quit_main_loop();
+            save_before_quit(state);
             return true;
         }
     }
@@ -614,7 +559,7 @@ fn handle_edit_key(key: u32, state: &GuiState) -> bool {
         state.last_was_f.set(false);
     }
     match key {
-        RETURN | 0x0D => {
+        RETURN => {
             commit_edit(state);
             move_cursor(state, 1, 0);
             true
@@ -624,6 +569,8 @@ fn handle_edit_key(key: u32, state: &GuiState) -> bool {
             state.edit_buf.borrow_mut().clear();
             state.mode.set(GuiMode::Normal);
             update_formula_bar(state, state.last_row.get(), state.last_col.get());
+            state.canvas.set_can_focus(true);
+            state.canvas.grab_focus();
             state.canvas.queue_redraw();
             true
         }
@@ -706,6 +653,9 @@ fn start_edit_with(state: &GuiState, ch: char) {
 fn commit_edit(state: &GuiState) {
     state.editing.set(false);
     state.mode.set(GuiMode::Normal);
+    if let Some(text) = state.formula_entry.get_text() {
+        *state.edit_buf.borrow_mut() = text;
+    }
     let val = state.edit_buf.borrow().clone();
     if !val.is_empty() {
         let app = unsafe { &mut *state.app };
@@ -743,22 +693,8 @@ fn commit_edit(state: &GuiState) {
     // sequences are handled by the canvas key controller rather than
     // the formula entry, where GTK's internal mnemonic monitor may
     // intercept the Alt modifier before our controller can process it.
-    #[cfg(unix)]
-    focus_canvas(state);
-}
-
-#[cfg(unix)]
-fn focus_canvas(state: &GuiState) {
-    if let Some(loader) = rustxwidgets::backends::gtk::loader() {
-        unsafe {
-            if let Some(set_can_focus) = loader.symbols.gtk_widget_set_can_focus {
-                set_can_focus(state.canvas.raw_handle(), 1);
-            }
-            if let Some(grab) = loader.symbols.gtk_widget_grab_focus {
-                grab(state.canvas.raw_handle());
-            }
-        }
-    }
+    state.canvas.set_can_focus(true);
+    state.canvas.grab_focus();
 }
 
 fn handle_delete(state: &GuiState) {
@@ -1007,10 +943,7 @@ fn handle_menu_action(name: &str, state: &GuiState) {
             }
         }
         "quit" => {
-            #[cfg(unix)]
-            let _ = rustxwidgets::backends_gtk_adapter::quit_main_loop();
-            #[cfg(windows)]
-            rustxwidgets::backends_nwg_adapter::quit_main_loop();
+            save_before_quit(state);
         }
         "find" => dialogs::find_dialog(|result| {
             if let Some(text) = result {
@@ -1171,17 +1104,9 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // Canvas
     let canvas = rxapp.new_canvas()?;
     canvas.set_size_request(800, 600);
-    // Ensure the canvas can receive keyboard focus (needed for focus_canvas
-    // to succeed after commit_edit — GtkDrawingArea does not accept focus
-    // by default).
-    #[cfg(unix)]
-    if let Some(loader) = rustxwidgets::backends::gtk::loader() {
-        unsafe {
-            if let Some(set_can_focus) = loader.symbols.gtk_widget_set_can_focus {
-                set_can_focus(canvas.raw_handle(), 1);
-            }
-        }
-    }
+    // Ensure the canvas can receive keyboard focus (needed after commit_edit
+    // to return focus — GtkDrawingArea does not accept focus by default).
+    canvas.set_can_focus(true);
 
     // Status label
     let status_label = rxapp.new_label("Ready")?;
@@ -1236,10 +1161,7 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
             s.seq_alt_f.set(false);
             s.menu_nav.set(MenuNavState::Inactive);
             s.last_was_f.set(false);
-            #[cfg(unix)]
-            let _ = rustxwidgets::backends_gtk_adapter::quit_main_loop();
-            #[cfg(windows)]
-            rustxwidgets::backends_nwg_adapter::quit_main_loop();
+            save_before_quit(s);
             return true;
         }
 
@@ -1268,185 +1190,75 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         on_formula_entry_changed(&shared_entry);
     })?;
 
-    // Window-level GTK event interception to catch Alt-F+Q before the
+    // Window-level event interception to catch Alt-F+Q before the
     // menu bar's mnemonic accelerator can steal the keystrokes.
-    #[cfg(unix)]
+    // On non-GTK backends `on_event_key` is a no-op.
     {
-        if let Some(loader) = rustxwidgets::backends::gtk::loader() {
-            let win_ptr = win.raw_handle();
-            if !win_ptr.is_null() {
-                let l_for_sig = loader.clone();
-                let l_for_cb = loader.clone();
-                let state_w = shared.clone();
-                unsafe {
-                    let _ = gtk_dynamic_loader::widget_connect_signal_bool(
-                        &l_for_sig,
-                        win_ptr,
-                        "event",
-                        Box::new(move |event: *mut std::ffi::c_void| -> i32 {
-                            let s: &GuiState = &*state_w;
-                            let mut keyval: u32 = 0;
-                            if let Some(get_kv) = l_for_cb.symbols.gdk_event_get_keyval {
-                                if get_kv(event, &mut keyval) == 0 {
-                                    return 0;
-                                }
-                            } else {
-                                return 0;
-                            }
-                            let mut state: u32 = 0;
-                            if let Some(get_st) = l_for_cb.symbols.gdk_event_get_state {
-                                get_st(event, &mut state);
-                            }
-                            let alt_held = (state & 0x8) != 0;
-                            if alt_held || keyval == ALT_L || keyval == ALT_R {
-                                s.alt_active.set(true);
-                            }
-                            if keyval == ALT_L || keyval == ALT_R {
-                                return 1;
-                            }
-                            let ch = char::from_u32(keyval).unwrap_or('\0').to_ascii_lowercase();
-                            if (state & 0x4) != 0 && ch == 'q' {
-                                s.seq_alt_f.set(false);
-                                let _ = rustxwidgets::backends_gtk_adapter::quit_main_loop();
-                                return 1;
-                            }
-                            if (alt_held || s.alt_active.get()) && ch == 'f' {
-                                s.menu_nav.set(MenuNavState::File);
-                                s.seq_alt_f.set(true);
-                                s.alt_active.set(false);
-                                s.alt_f_detected.set(true);
-                                return 1;
-                            }
-                            if !s.editing.get() && ch == 'f' {
-                                s.menu_nav.set(MenuNavState::File);
-                                s.seq_alt_f.set(true);
-                                s.alt_active.set(false);
-                                s.alt_f_detected.set(true);
-                                return 1;
-                            }
-                            if ch == 'q'
-                                && (s.menu_nav.get() == MenuNavState::File
-                                    || s.seq_alt_f.get())
-                            {
-                                let _ = rustxwidgets::backends_gtk_adapter::quit_main_loop();
-                                return 1;
-                            }
-                            if !alt_held {
-                                s.alt_active.set(false);
-                                s.seq_alt_f.set(false);
-                            }
-                            0
-                        }),
-                    );
-                }
+        let state_w = shared.clone();
+        win.on_event_key(Box::new(move |keyval: u32, state: u32| -> i32 {
+            let s: &GuiState = &*state_w;
+            let alt_held = (state & 0x8) != 0;
+            if alt_held || keyval == ALT_L || keyval == ALT_R {
+                s.alt_active.set(true);
             }
-        }
+            if keyval == ALT_L || keyval == ALT_R {
+                return 1;
+            }
+            let ch = char::from_u32(keyval).unwrap_or('\0').to_ascii_lowercase();
+            if (state & 0x4) != 0 && ch == 'q' {
+                s.seq_alt_f.set(false);
+                save_before_quit(s);
+                return 1;
+            }
+            if (alt_held || s.alt_active.get()) && ch == 'f' {
+                s.menu_nav.set(MenuNavState::File);
+                s.seq_alt_f.set(true);
+                s.alt_active.set(false);
+                s.alt_f_detected.set(true);
+                return 1;
+            }
+            if !s.editing.get() && ch == 'f' {
+                s.menu_nav.set(MenuNavState::File);
+                s.seq_alt_f.set(true);
+                s.alt_active.set(false);
+                s.alt_f_detected.set(true);
+                return 1;
+            }
+            if ch == 'q'
+                && (s.menu_nav.get() == MenuNavState::File
+                    || s.seq_alt_f.get())
+            {
+                save_before_quit(s);
+                return 1;
+            }
+            if !alt_held {
+                s.alt_active.set(false);
+                s.seq_alt_f.set(false);
+            }
+            0
+        }));
     }
 
     // Intercept Enter/Escape from formula entry during editing
-    #[cfg(unix)]
-    {
-        if let Some(loader) = rustxwidgets::backends::gtk::loader() {
-            let entry_ptr = formula_entry.raw_handle();
-            if !entry_ptr.is_null() {
-                let l2 = loader.clone();
-                let l2_for_cb = l2.clone();
-                let state_k = shared.clone();
-                unsafe {
-                    let _ = gtk_dynamic_loader::widget_connect_signal_bool(
-                        &l2,
-                        entry_ptr,
-                        "event",
-                        Box::new(move |ev: *mut std::ffi::c_void| -> i32 {
-                            let keyval =
-                                gtk_dynamic_loader::EventControllerKey::get_keyval_static(
-                                    &l2_for_cb, ev,
-                                );
-                            if keyval == 0 {
-                                return 0;
-                            }
-                            let state =
-                                gtk_dynamic_loader::EventControllerKey::get_state_static(
-                                    &l2_for_cb, ev,
-                                );
-                            let alt_held = (state & 0x8) != 0;
-                            if alt_held || keyval == ALT_L || keyval == ALT_R {
-                                state_k.alt_active.set(true);
-                            }
-                            if keyval == ALT_L || keyval == ALT_R {
-                                return 1;
-                            }
-                            let ch =
-                                char::from_u32(keyval).unwrap_or('\0').to_ascii_lowercase();
-                            if (alt_held || state_k.alt_active.get()) && ch == 'f' {
-                                state_k.last_was_f.set(true);
-                                state_k.menu_nav.set(MenuNavState::File);
-                                state_k.seq_alt_f.set(true);
-                                state_k.alt_active.set(false);
-                                state_k.alt_f_detected.set(true);
-                                let _ = handle_key(keyval, &state_k);
-                                return 1;
-                            }
-                            if !state_k.editing.get() && ch == 'f' {
-                                state_k.last_was_f.set(true);
-                                state_k.menu_nav.set(MenuNavState::File);
-                                state_k.seq_alt_f.set(true);
-                                state_k.alt_active.set(false);
-                                state_k.alt_f_detected.set(true);
-                                let _ = handle_key(keyval, &state_k);
-                                return 1;
-                            }
-                            if ch == 'q'
-                                && (state_k.menu_nav.get() == MenuNavState::File
-                                    || state_k.seq_alt_f.get()
-                                    || state_k.last_was_f.get())
-                            {
-                                if !state_k.seq_alt_f.get()
-                                    && state_k.menu_nav.get() == MenuNavState::Inactive
-                                    && state_k.editing.get()
-                                    && !state_k.edit_buf.borrow().is_empty()
-                                {
-                                    state_k.menu_nav.set(MenuNavState::Inactive);
-                                    state_k.alt_active.set(false);
-                                    state_k.seq_alt_f.set(false);
-                                } else {
-                                    #[cfg(unix)]
-                                    let _ = rustxwidgets::backends_gtk_adapter::quit_main_loop();
-                                    #[cfg(windows)]
-                                    rustxwidgets::backends_nwg_adapter::quit_main_loop();
-                                    return 1;
-                                }
-                            }
-                            if handle_key(keyval, &state_k) {
-                                1
-                            } else {
-                                0
-                            }
-                        }),
-                    );
-                }
-            }
-        }
-    }
-    #[cfg(windows)]
     {
         let shared_k = shared.clone();
-        let shared_k2 = shared.clone();
-        formula_entry.on_key(Box::new(move |keyval: u32| -> bool {
-            shared_k2.key_counter.set(shared_k2.key_counter.get() + 1);
-            shared_k2.last_key.set(keyval);
-            let masked = keyval & 0xFF;
-            if masked == RETURN || masked == ESCAPE {
-                handle_key(keyval, &shared_k);
-                true
-            } else {
-                false
+        let shared_k_cnt = shared.clone();
+        formula_entry.on_key_raw(Box::new(move |keyval: u32, _state: u32| -> bool {
+            shared_k_cnt.key_counter.set(shared_k_cnt.key_counter.get() + 1);
+            shared_k_cnt.last_key.set(keyval);
+            let k = normalize(keyval);
+            // Intercept navigation keys from formula entry and forward
+            // them through handle_key so the user can navigate cells
+            // even when the canvas does not have keyboard focus.
+            match k {
+                RETURN | ESCAPE | TAB | LEFT | RIGHT | UP | DOWN
+                | HOME | END | PAGE_UP | PAGE_DOWN => {
+                    handle_key(keyval, &shared_k);
+                    true
+                }
+                _ => false,
             }
         }));
-
-        // WM_CHAR for Enter/Escape is consumed in the NWG adapter's _key_handler
-        // to prevent the Edit control from beeping. The on_key callback above handles
-        // WM_KEYDOWN for Enter/Escape by calling handle_key and returning true (consumed).
     }
 
     // Assemble layout

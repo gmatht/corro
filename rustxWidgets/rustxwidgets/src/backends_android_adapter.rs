@@ -246,6 +246,7 @@ mod android_adapter {
                 Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
             });
         }
+        pub fn on_key_raw(&self, _cb: Box<dyn FnMut(u32, u32) -> bool>) {}
 
         pub fn connect_changed(&self, _f: impl FnMut() + 'static) -> Result<u64, Error> {
             Ok(0)

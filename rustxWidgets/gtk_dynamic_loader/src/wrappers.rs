@@ -69,6 +69,15 @@ pub struct BoxWidget {
 #[derive(Clone, Copy)]
 pub enum Orientation { Horizontal = 0, Vertical = 1 }
 
+impl Clone for BoxWidget {
+    fn clone(&self) -> Self {
+        if let Some(gref) = self.loader.symbols.g_object_ref {
+            unsafe { gref(self.inner); }
+        }
+        BoxWidget { inner: self.inner, loader: self.loader.clone(), orientation: self.orientation, _not_send: PhantomData }
+    }
+}
+
 impl BoxWidget {
     pub fn new(loader: Arc<Loader>, orientation: Orientation, spacing: i32) -> Result<Self, Error> {
         let symbols = &loader.symbols;
@@ -138,6 +147,15 @@ pub struct Window {
     inner: *mut c_void,
     loader: Arc<Loader>,
     _not_send: PhantomData<Rc<()>>,
+}
+
+impl Clone for Window {
+    fn clone(&self) -> Self {
+        if let Some(gref) = self.loader.symbols.g_object_ref {
+            unsafe { gref(self.inner); }
+        }
+        Window { inner: self.inner, loader: self.loader.clone(), _not_send: PhantomData }
+    }
 }
 
 impl Window {
@@ -831,6 +849,19 @@ impl DrawingArea {
         }
     }
 
+    pub fn set_can_focus(&self, can: bool) {
+        guard_widget!(self, "DrawingArea", "set_can_focus");
+        if let Some(f) = self.loader.symbols.gtk_widget_set_can_focus {
+            unsafe { f(self.inner, if can { 1 } else { 0 }); }
+        }
+    }
+    pub fn grab_focus(&self) {
+        guard_widget!(self, "DrawingArea", "grab_focus");
+        if let Some(f) = self.loader.symbols.gtk_widget_grab_focus {
+            unsafe { f(self.inner); }
+        }
+    }
+
     /// GTK3: connect to the "draw" signal. The closure receives (widget_ptr, cairo_t*) and returns gboolean.
     pub fn connect_draw_gtk3(&self, cb: Box<dyn FnMut(*mut std::ffi::c_void, *mut std::ffi::c_void) -> i32>) -> Result<u64, String> {
         guard_widget_or!(self, "DrawingArea", "connect_draw_gtk3", Err("drawing area dropped".into()));
@@ -1100,6 +1131,18 @@ impl EventControllerKey {
             let mut keyval: u32 = 0;
             get_kv(event, &mut keyval);
             keyval
+        } else { 0 }
+    }
+
+    /// Static version of get_state that doesn't need a controller instance
+    ///
+    /// # Safety
+    /// `event` must be a valid GDK key event pointer.
+    pub unsafe fn get_state_static(loader: &Arc<Loader>, event: *mut c_void) -> u32 {
+        if let Some(get_st) = loader.symbols.gdk_event_get_state {
+            let mut state: u32 = 0;
+            get_st(event, &mut state);
+            state
         } else { 0 }
     }
 }
@@ -2008,6 +2051,15 @@ pub struct MenuBar {
     inner: *mut c_void,
     loader: Arc<Loader>,
     _not_send: PhantomData<Rc<()>>,
+}
+
+impl Clone for MenuBar {
+    fn clone(&self) -> Self {
+        if let Some(gref) = self.loader.symbols.g_object_ref {
+            unsafe { gref(self.inner); }
+        }
+        MenuBar { inner: self.inner, loader: self.loader.clone(), _not_send: PhantomData }
+    }
 }
 
 impl MenuBar {

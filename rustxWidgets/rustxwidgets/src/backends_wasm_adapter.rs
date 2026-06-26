@@ -152,6 +152,8 @@ impl Window {
 
         /// # Safety – kept for API compatibility; no‑op on WASM.
         pub unsafe fn insert_action_group(&self, _name: &str, _group_ptr: *mut c_void) {}
+        pub fn on_event(&self, _cb: Box<dyn FnMut(*mut c_void) -> i32>) {}
+        pub fn on_event_key(&self, _cb: Box<dyn FnMut(u32, u32) -> i32>) {}
     }
 
     pub fn create_window() -> Result<Window, Error> {
@@ -536,6 +538,8 @@ impl Window {
         pub fn grab_focus(&self) {
             let _ = self.elem.focus();
         }
+
+        pub fn on_key_raw(&self, _cb: Box<dyn FnMut(u32, u32) -> bool>) {}
 
         pub fn connect_focus_in_event<F: FnMut(*mut c_void) -> i32 + 'static>(
             &self,
@@ -1407,6 +1411,14 @@ impl Window {
             // Make canvas focusable
             self.elem.set_tab_index(0);
         }
+        pub fn on_key_raw(&self, cb: Box<dyn FnMut(u32, u32) -> bool>) {
+            let mut cb = cb;
+            self.on_key(Box::new(move |k: u32| -> bool { cb(k, 0) }));
+        }
+        pub fn grab_focus(&self) {
+            let _ = self.elem.call("focus");
+        }
+        pub fn set_can_focus(&self, _can: bool) {}
     }
 
     pub fn create_canvas() -> Result<Canvas, Error> {

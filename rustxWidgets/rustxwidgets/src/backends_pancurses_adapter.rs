@@ -45,6 +45,8 @@ mod pancurses_adapter {
         pub fn hwnd(&self) -> *mut c_void {
             std::ptr::null_mut()
         }
+        pub fn on_event(&self, _cb: Box<dyn FnMut(*mut c_void) -> i32>) {}
+        pub fn on_event_key(&self, _cb: Box<dyn FnMut(u32, u32) -> i32>) {}
     }
 
     // -- Button --
@@ -225,6 +227,7 @@ mod pancurses_adapter {
         pub fn add_class(&self, _class_name: &str) {}
         pub fn remove_class(&self, _class_name: &str) {}
         pub fn grab_focus(&self) {}
+        pub fn on_key_raw(&self, _cb: Box<dyn FnMut(u32, u32) -> bool>) {}
 
         pub fn connect_activate<F: FnMut(*mut c_void) + 'static>(&self, f: F) -> Result<u64, Error> {
             let mut f = f;
@@ -557,6 +560,9 @@ mod pancurses_adapter {
         pub fn set_draw_callback(&self, _cb: Box<dyn FnMut(&mut dyn crate::core::DrawContext, i32, i32)>) {}
         pub fn on_click(&self, _cb: Box<dyn FnMut(f64, f64)>) {}
         pub fn on_key(&self, _cb: Box<dyn FnMut(u32) -> bool>) {}
+        pub fn on_key_raw(&self, _cb: Box<dyn FnMut(u32, u32) -> bool>) {}
+        pub fn grab_focus(&self) {}
+        pub fn set_can_focus(&self, _can: bool) {}
     }
 
     // -- Overlay --
