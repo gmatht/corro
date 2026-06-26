@@ -3,6 +3,7 @@ pub use crate::core::{App, DrawContext, Error, HandlerId, Widget};
 pub use crate::backends_gtk_adapter::{Window, Button, Label, BoxWidget, Grid, Entry, Menu, MenuBar, SimpleAction, Dialog, DropDown, CheckButton, RadioButton, TextView, Orientation, Canvas, Overlay, Spreadsheet};
 #[cfg(all(windows, not(feature = "zork")))]
 pub use crate::common::{Window, WidgetBox, Label, Entry, Canvas, Menu, MenuBar, SimpleAction, Dialog, Orientation};
+#[cfg(all(windows, not(feature = "zork")))]
 pub use crate::backends_nwg_adapter::{Button, Grid, DropDown, CheckButton, RadioButton, TextView, Appendable};
 #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
 pub use crate::backends_wasm_adapter::{Window, Button, Label, BoxWidget, Grid, Entry, Menu, SimpleAction, Dialog, DropDown, CheckButton, RadioButton, TextView, Canvas, Overlay, ScrolledWindow, Orientation};

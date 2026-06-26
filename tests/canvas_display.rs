@@ -1,4 +1,4 @@
-#[cfg(feature = "gui")]
+#[cfg(all(feature = "gui", target_os = "linux"))]
 mod canvas_tests {
     use std::cell::Cell;
     use std::ffi::c_void;

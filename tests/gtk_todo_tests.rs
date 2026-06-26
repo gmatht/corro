@@ -1,3 +1,5 @@
+#![cfg(all(target_os = "linux", feature = "gui"))]
+
 use std::fs;
 use std::path::Path;
 
