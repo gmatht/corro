@@ -74,6 +74,65 @@ pub(crate) fn fold_numbers(func: AggFunc, xs: &[f64]) -> String {
     }
 }
 
+pub(crate) fn footer_row_agg_func(grid: &Grid, footer_row_idx: usize) -> Option<AggFunc> {
+    let key_col = ColumnAddr::Left(MARGIN_COLS - 1);
+    let val = grid.get(&CellAddr::Footer {
+        row: footer_row_idx as u32,
+        col: key_col,
+    })?;
+    crate::ops::margin_key_agg_func(&val)
+}
+
+pub(crate) fn footer_special_col_aggregate(
+    grid: &Grid,
+    footer_func: AggFunc,
+    global_col: usize,
+    main_rows: usize,
+    main_cols: usize,
+) -> Option<String> {
+    let row_func = right_col_agg_func(grid, global_col);
+    let data_cols = data_main_col_count(grid);
+    let mut samples: Vec<f64> = Vec::new();
+    for r in 0..main_rows {
+        let row_val = if let Some(func) = row_func {
+            crate::agg::compute_aggregate(
+                grid,
+                &AggregateDef {
+                    func,
+                    source: MainRange {
+                        row_start: r as u32,
+                        row_end: r as u32 + 1,
+                        col_start: 0,
+                        col_end: data_cols as u32,
+                    },
+                },
+            )
+        } else if global_col < MARGIN_COLS {
+            String::new()
+        } else if global_col < MARGIN_COLS + main_cols {
+            cell_effective_display(
+                grid,
+                &CellAddr::Main {
+                    row: r as u32,
+                    col: (global_col - MARGIN_COLS) as u32,
+                },
+            )
+        } else {
+            cell_effective_display(
+                grid,
+                &CellAddr::Right {
+                    col: (global_col - MARGIN_COLS - main_cols),
+                    row: r as u32,
+                },
+            )
+        };
+        if let Some(n) = parse_num(&row_val) {
+            samples.push(n);
+        }
+    }
+    Some(fold_numbers(footer_func, &samples))
+}
+
 // Shared helper functions used by UI and ODS
 pub(crate) fn data_main_col_count(grid: &Grid) -> usize {
     let mc = grid.main_cols();

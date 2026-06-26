@@ -1,34 +1,53 @@
 //! Common type definitions shared across all backends.
 
 // Platform-specific type re-exports using cfg
+macro_rules! platform_module {
+    ($backend:path, $Orientation:ident) => {
+        pub use $backend::{Window, BoxWidget, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, DropDown, CheckButton, RadioButton, TextView, Orientation as $Orientation};
+        pub type PlatformWindow = Window;
+        pub type PlatformWidgetBox = BoxWidget;
+        pub type PlatformLabel = Label;
+        pub type PlatformEntry = Entry;
+        pub type PlatformCanvas = Canvas;
+        pub type PlatformMenu = Menu;
+        pub type PlatformSimpleAction = SimpleAction;
+        pub type PlatformMenuBar = MenuBar;
+        pub type PlatformDialog = Dialog;
+        pub type PlatformDropDown = DropDown;
+        pub type PlatformCheckButton = CheckButton;
+        pub type PlatformRadioButton = RadioButton;
+        pub type PlatformTextView = TextView;
+    };
+}
+
 #[cfg(all(feature = "gtk", target_os = "linux"))]
 mod platform {
-    pub use crate::backends_gtk_adapter::{Window, BoxWidget, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, DropDown, CheckButton, RadioButton, TextView, Orientation as GtkOrientation};
+    platform_module!(crate::backends_gtk_adapter, GtkOrientation);
 }
 
 #[cfg(windows)]
 mod platform {
-    pub use crate::backends_nwg_adapter::{Window, BoxWidget, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, DropDown, CheckButton, RadioButton, TextView, Orientation as NwgOrientation};
+    platform_module!(crate::backends_nwg_adapter, NwgOrientation);
 }
 
 #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows))))]
 mod platform {
-    pub use crate::backends_pancurses_adapter::{Window, BoxWidget, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, DropDown, CheckButton, RadioButton, TextView, Orientation as PancursesOrientation};
+    platform_module!(crate::backends_pancurses_adapter, PancursesOrientation);
 }
 
 #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
 mod platform {
-    pub use crate::backends_wasm_adapter::{Window, BoxWidget, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, DropDown, CheckButton, RadioButton, TextView, Orientation as WasmOrientation};
+    platform_module!(crate::backends_wasm_adapter, WasmOrientation);
 }
 
 #[cfg(all(target_os = "android", not(feature = "zork")))]
 mod platform {
-    pub use crate::backends_android_adapter::{Window, BoxWidget, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, DropDown, CheckButton, RadioButton, TextView, Orientation as AndroidOrientation};
+    platform_module!(crate::backends_android_adapter, AndroidOrientation);
 }
 
 #[cfg(feature = "zork")]
 mod platform {
-    pub use crate::backends_zork_adapter::{Window, BoxWidget, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, DropDown, CheckButton, RadioButton, TextView, Orientation as ZorkOrientation};
+    platform_module!(crate::backends_zork_adapter, ZorkOrientation);
 }
 
 macro_rules! common_types_mod {
@@ -182,3 +201,17 @@ pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleActi
 
 #[cfg(feature = "zork")]
 pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog};
+
+// Re-export Orientation from the active platform backend
+#[cfg(all(feature = "gtk", target_os = "linux"))]
+pub use self::platform::GtkOrientation as Orientation;
+#[cfg(windows)]
+pub use self::platform::NwgOrientation as Orientation;
+#[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows))))]
+pub use self::platform::PancursesOrientation as Orientation;
+#[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
+pub use self::platform::WasmOrientation as Orientation;
+#[cfg(all(target_os = "android", not(feature = "zork")))]
+pub use self::platform::AndroidOrientation as Orientation;
+#[cfg(feature = "zork")]
+pub use self::platform::ZorkOrientation as Orientation;

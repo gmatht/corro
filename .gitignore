@@ -2,3 +2,5 @@
 # Local integration tests (not for CI; copy template from repo if needed)
 tests/local_*.rs
 tmp*
+
+gtk-dlopen
