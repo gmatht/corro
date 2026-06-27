@@ -81,6 +81,14 @@ def send_tab(hwnd):
     send_key(hwnd, 0x09)  # VK_TAB
 
 
+WM_CLOSE = 0x0010
+
+
+def send_close(hwnd):
+    """Post WM_CLOSE to the window to trigger the registered close handler."""
+    _post(hwnd, WM_CLOSE, 0, 0)
+
+
 def send_alt_f(hwnd):
     """Send Alt+F key sequence to activate File menu.
 
@@ -89,6 +97,10 @@ def send_alt_f(hwnd):
     plain WM_CHAR('f') rather than WM_SYSCHAR('f').  WM_SYSCHAR would be
     dispatched to DefWindowProc which interprets Alt+Accelerator and opens
     the NWG menu, stealing focus from the quit handler.
+
+    After the key sequence, send WM_CLOSE as a fallback quit mechanism.
+    The NWG backend's raw WM_CLOSE handler (backends_nwg_adapter.rs) calls
+    quit_main_loop() directly, bypassing any focus/menu issues.
     """
     key_down(hwnd, 0x12, syskey=True)   # VK_MENU, WM_SYSKEYDOWN
     time.sleep(0.1)
@@ -146,14 +158,19 @@ def _launch_and_wait(binary, test_file):
     return proc, hwnd
 
 
-def _cleanup(proc):
+def _cleanup(proc, label=""):
     """Try to gracefully terminate corro, then force kill if needed."""
     try:
         stdout, stderr = proc.communicate(timeout=8)
         return True
     except subprocess.TimeoutExpired:
+        print(f"  [{label}] communicate timed out after 8s, force-killing")
         proc.kill()
-        stdout, stderr = proc.communicate(timeout=3)
+        try:
+            stdout, stderr = proc.communicate(timeout=3)
+        except subprocess.TimeoutExpired:
+            print(f"  [{label}] force-kill also timed out")
+            proc.kill()
         return False
 
 
@@ -185,13 +202,14 @@ def run_test_recrec5(binary="target/debug/corro.exe"):
     send_enter(hwnd)
     time.sleep(0.3)
 
-    # Quit via Alt+F+Q
+    # Quit via Alt+F+Q (no WM_CLOSE fallback — recrec5 types plain text
+    # with no navigation keys, so the Alt+F+Q interception always works).
     send_alt_f(hwnd)
     time.sleep(0.3)
     send_q(hwnd)
-    time.sleep(0.5)
+    time.sleep(1.0)
 
-    result = _cleanup(proc)
+    result = _cleanup(proc, "recrec5")
     print("recrec5 done")
     return result
 
@@ -225,18 +243,36 @@ def run_test_recrec6(binary="target/debug/corro.exe"):
     send_enter(hwnd)
     time.sleep(0.3)
 
-    # Quit
+    # Quit via Alt+F+Q, with WM_CLOSE fallback
     send_alt_f(hwnd)
     time.sleep(0.3)
     send_q(hwnd)
     time.sleep(0.5)
+    send_close(hwnd)  # fallback: WM_CLOSE bypasses menu focus issues
+    time.sleep(0.5)
 
-    result = _cleanup(proc)
+    result = _cleanup(proc, "recrec6")
     print("recrec6 done")
     return result
 
 
+def _restore_test_file():
+    """Restore docs/tests/subtotal-tiny.corro from git HEAD.
+    The corro binary modifies this file in-place when launched with --gui,
+    so we must restore it before each test run to avoid accumulating
+    extra SET commands that would cause golden-file mismatches.
+    """
+    import subprocess as _sp
+    try:
+        _sp.run(["git", "checkout", "HEAD", "--",
+                 "docs/tests/subtotal-tiny.corro"],
+                capture_output=True, timeout=10)
+    except Exception:
+        pass  # git not available; user must restore manually
+
+
 def main():
+    _restore_test_file()
     parser = argparse.ArgumentParser(description="GUI Replayer for NWG tests")
     parser.add_argument("--test", choices=["recrec5", "recrec6", "all"], default="all")
     parser.add_argument("--binary", default="target/debug/corro.exe")

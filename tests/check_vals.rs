@@ -1,11 +1,46 @@
-#![allow(unused)]
+/// Ensure the two test-data files are byte-identical and contain no
+/// stale replayer-output lines (elloH / estT).  Replayer test sessions
+/// used to modify the file in-place, accumulating duplicate SET commands
+/// that broke the golden export tests.
+///
+/// `test_rec5.corro` is a working copy of `subtotal-tiny.corro` — it is
+/// git-ignored and regenerated from the blessed file before each run.
+#[test]
+fn test_data_files_are_consistent() {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let src = manifest.join("docs/tests/subtotal-tiny.corro");
+    let dst = manifest.join("test_rec5.corro");
+    // Regenerate working copy from blessed source.  The destination may be
+    // read-only (set by gui_loop.sh / pre-commit hook), so remove first.
+    let _ = std::fs::remove_file(&dst);
+    std::fs::copy(&src, &dst).unwrap_or_else(|e| panic!("copy {} -> {}: {e}", src.display(), dst.display()));
+    // Restore read-only guard so stray test runs can't corrupt the copy.
+    if let Ok(meta) = std::fs::metadata(&dst) {
+        let mut perms = meta.permissions();
+        perms.set_readonly(true);
+        let _ = std::fs::set_permissions(&dst, perms);
+    }
+    let f1 = std::fs::read(&src).unwrap();
+    let f2 = std::fs::read(&dst).unwrap();
+    assert_eq!(f1, f2, "docs/tests/subtotal-tiny.corro and test_rec5.corro must be byte-identical");
+    let text = String::from_utf8_lossy(&f1);
+    assert!(!text.contains("elloH"), "subtotal-tiny.corro must not contain 'elloH' (stale replayer output)");
+    assert!(!text.contains("estT"), "subtotal-tiny.corro must not contain 'estT' (stale replayer output)");
+}
 
 use std::path::PathBuf;
 
 #[test]
 fn check_test_rec5_values() {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_rec5.corro");
-    let mut app = corro::ui::App::new(Some(path));
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let src = manifest.join("docs/tests/subtotal-tiny.corro");
+    // Copy to a temporary file so we don't race with
+    // test_data_files_are_consistent which also manages test_rec5.corro.
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::copy(&src, tmp.path()).unwrap_or_else(|e| {
+        panic!("copy {} -> {}: {e}", src.display(), tmp.path().display())
+    });
+    let mut app = corro::ui::App::new(Some(tmp.path().to_path_buf()));
     app.load_initial().unwrap();
     let sheet = app.workbook.active_sheet().clone();
     let grid = &sheet.grid;

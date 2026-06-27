@@ -99,6 +99,10 @@ mod nwg_adapter {
             let hwnd = self.inner.handle.hwnd().unwrap_or(std::ptr::null_mut());
             if hwnd != std::ptr::null_mut() {
                 unsafe {
+                    // Bring window to foreground so child controls can
+                    // receive keyboard focus (required by SetFocus).
+                    winapi::um::winuser::SetForegroundWindow(hwnd);
+                    winapi::um::winuser::BringWindowToTop(hwnd);
                     let mut rect: winapi::shared::windef::RECT = std::mem::zeroed();
                     winapi::um::winuser::GetClientRect(hwnd, &mut rect);
                     let w = rect.right - rect.left;
@@ -153,8 +157,10 @@ mod nwg_adapter {
             // Alt is detected from WM_SYSKEYDOWN.
             // If the callback returns 0 (not consumed), the message is forwarded
             // to the focused child window via PostMessage so the canvas or entry
-            // raw handlers can process it.  DefWindowProc for a non-dialog window
-            // does not forward WM_KEYDOWN to child controls.
+            // raw handlers can process it.  After forwarding, we consume the
+            // message (return Some(0)) so DefWindowProc does NOT process it.
+            // This prevents WM_SYSKEYDOWN(Alt) from activating the menu bar,
+            // which would steal focus from the window-level quit handler.
             let kcb = event_key_cb.clone();
             static KEY_HANDLER_ID: AtomicUsize = AtomicUsize::new(0x30000000);
             let key_id = KEY_HANDLER_ID.fetch_add(1, Ordering::SeqCst);
@@ -183,9 +189,28 @@ mod nwg_adapter {
                             winapi::um::winuser::PostMessageW(focused, msg, w, l);
                         }
                     }
-                    None
+                    Some(0) // consumed — prevent DefWindowProc from activating menu
                 },
             ).map_err(|e| Error::Backend(format!("{}", e)))?;
+
+            // Bind raw WM_CLOSE handler: replayer tests can post WM_CLOSE
+            // directly to the main window as a reliable quit mechanism that
+            // does not depend on the foreground-window focus state.
+            {
+                static CLOSE_ID: AtomicUsize = AtomicUsize::new(0x40000000);
+                let cid = CLOSE_ID.fetch_add(1, Ordering::SeqCst);
+                nwg::bind_raw_event_handler(
+                    &nwg::ControlHandle::Hwnd(hwnd), cid,
+                    move |_h, msg, _w, _l| {
+                        if msg == winapi::um::winuser::WM_CLOSE {
+                            crate::backends::nwg::quit_main_loop();
+                            Some(0)
+                        } else {
+                            None
+                        }
+                    },
+                ).map_err(|e| Error::Backend(format!("{}", e)))?;
+            }
         }
 
         Ok(Window { inner: Rc::new(inner), _handler: Rc::new(handler), root_child, layout_cb, event_key_cb })
