@@ -78,7 +78,8 @@ if [ "$HAS_CARGO" = true ]; then
     # Also ensure test_rec5.corro is byte-identical to subtotal-tiny.corro
     # (the committed version may be out of sync).
     git checkout -- docs/tests/subtotal-tiny.corro test_rec5.corro 2>/dev/null || true
-    cp docs/tests/subtotal-tiny.corro test_rec5.corro
+    chmod +w test_rec5.corro 2>/dev/null || true
+    cp -f docs/tests/subtotal-tiny.corro test_rec5.corro 2>/dev/null || true
 
     # ---------------------------------------------------------------------------
     # Rust integration tests (NWG on Windows, gtk on Linux)

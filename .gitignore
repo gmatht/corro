@@ -2,9 +2,7 @@
 # Local integration tests (not for CI; copy template from repo if needed)
 tests/local_*.rs
 tmp*
-# Working copy of subtotal-tiny.corro for replayer tests; regenerated from
-# docs/tests/subtotal-tiny.corro before each test run.
-test_rec5.corro
+# test_rec5.corro is now tracked in git (committed as canonical test data).
 
 gtk-dlopen
 __pycache__/
