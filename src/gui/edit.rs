@@ -27,6 +27,7 @@ pub enum EditAction {
 
 pub fn handle_edit_input(keyval: u32, shared: &SharedState, redraw: &dyn Fn()) -> EditAction {
     match keyval {
+        #[allow(unreachable_patterns)]
         KEY_RETURN | KEY_ENTER => {
             let text = shared.edit_buf.borrow().clone();
             shared.editing.set(false);

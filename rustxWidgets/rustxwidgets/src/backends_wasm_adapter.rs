@@ -106,11 +106,17 @@ mod wasm_adapter {
     // -----------------------------------------------------------------------
     // Window
     // -----------------------------------------------------------------------
-    pub struct Window {
-        elem: HtmlDivElement,
-    }
+pub struct Window {
+    elem: HtmlDivElement,
+}
 
-    impl AsElement for Window {
+impl Clone for Window {
+    fn clone(&self) -> Self {
+        Window { elem: self.elem.clone() }
+    }
+}
+
+impl AsElement for Window {
         fn as_element(&self) -> &Element {
             self.elem.as_ref()
         }
@@ -119,6 +125,12 @@ mod wasm_adapter {
     impl Widget for Window {
         fn raw_handle(&self) -> *mut c_void {
             &self.elem as *const HtmlDivElement as *mut c_void
+        }
+    }
+
+    impl AsRef<*mut c_void> for Window {
+        fn as_ref(&self) -> &*mut c_void {
+            unsafe { &*(&self.raw_handle() as *const *mut c_void) }
         }
     }
 
@@ -267,6 +279,18 @@ impl Window {
         }
     }
 
+    impl Widget for Label {
+        fn raw_handle(&self) -> *mut c_void {
+            &self.elem as *const Element as *mut c_void
+        }
+    }
+
+    impl AsRef<*mut c_void> for Label {
+        fn as_ref(&self) -> &*mut c_void {
+            unsafe { &*(&self.raw_handle() as *const *mut c_void) }
+        }
+    }
+
     impl Label {
         pub fn set_text(&self, text: &str) {
             self.elem.set_text_content(Some(text));
@@ -321,11 +345,17 @@ impl Window {
     // -----------------------------------------------------------------------
     // BoxWidget
     // -----------------------------------------------------------------------
-    pub struct BoxWidget {
-        elem: HtmlDivElement,
-    }
+pub struct BoxWidget {
+    elem: HtmlDivElement,
+}
 
-    impl AsElement for BoxWidget {
+impl Clone for BoxWidget {
+    fn clone(&self) -> Self {
+        BoxWidget { elem: self.elem.clone() }
+    }
+}
+
+impl AsElement for BoxWidget {
         fn as_element(&self) -> &Element {
             self.elem.as_ref()
         }
@@ -337,13 +367,27 @@ impl Window {
         }
     }
 
+    impl AsRef<*mut c_void> for BoxWidget {
+        fn as_ref(&self) -> &*mut c_void {
+            unsafe { &*(&self.raw_handle() as *const *mut c_void) }
+        }
+    }
+
+    fn as_element_from_ptr(ptr: *mut c_void) -> &'static Element {
+        unsafe { &*(ptr as *const Element) }
+    }
+
+    fn as_html_element(ptr: *mut c_void) -> Option<&'static HtmlElement> {
+        unsafe { (*(ptr as *const Element)).dyn_ref::<HtmlElement>() }
+    }
+
     impl BoxWidget {
-        pub fn append(&self, child: &impl AsElement) {
-            self.elem.append_child(child.as_element()).ok();
+        pub fn append(&self, child: &impl AsRef<*mut c_void>) {
+            self.elem.append_child(as_element_from_ptr(*child.as_ref())).ok();
         }
 
-        pub fn set_child_vexpand(&self, child: &impl AsElement, expand: bool) {
-            if let Some(html) = child.as_element().dyn_ref::<HtmlElement>() {
+        pub fn set_child_vexpand(&self, child: &impl AsRef<*mut c_void>, expand: bool) {
+            if let Some(html) = as_html_element(*child.as_ref()) {
                 if expand {
                     html.style().set_property("flex-grow", "1").ok();
                     html.style().set_property("align-self", "stretch").ok();
@@ -353,12 +397,15 @@ impl Window {
             }
         }
 
-        pub fn set_child_hexpand(&self, child: &impl AsElement, expand: bool) {
-            if let Some(html) = child.as_element().dyn_ref::<HtmlElement>() {
+        pub fn set_child_hexpand(&self, child: &impl AsRef<*mut c_void>, expand: bool) {
+            if let Some(html) = as_html_element(*child.as_ref()) {
                 if expand {
                     html.style().set_property("align-self", "stretch").ok();
                 }
             }
+        }
+
+        pub fn set_hexpand(&self, _expand: bool) {
         }
     }
 
@@ -428,6 +475,7 @@ impl Window {
     // -----------------------------------------------------------------------
     pub struct Entry {
         elem: HtmlInputElement,
+        key_cb: Rc<RefCell<Option<Box<dyn FnMut(u32, u32) -> bool>>>>,
         closures: Rc<RefCell<Vec<Box<dyn Any>>>>,
         next_id: Rc<RefCell<u64>>,
     }
@@ -448,9 +496,16 @@ impl Window {
         fn clone(&self) -> Self {
             Entry {
                 elem: self.elem.clone(),
+                key_cb: self.key_cb.clone(),
                 closures: self.closures.clone(),
                 next_id: self.next_id.clone(),
             }
+        }
+    }
+
+    impl AsRef<*mut c_void> for Entry {
+        fn as_ref(&self) -> &*mut c_void {
+            unsafe { &*(&self.raw_handle() as *const *mut c_void) }
         }
     }
 
@@ -474,6 +529,9 @@ impl Window {
             if h > 0 {
                 set_css(self.elem.as_ref(), "height", &format!("{}px", h));
             }
+        }
+
+        pub fn set_hexpand(&self, _expand: bool) {
         }
 
         pub fn connect_changed(&self, f: impl FnMut() + 'static) -> Result<u64, Error> {
@@ -539,7 +597,21 @@ impl Window {
             let _ = self.elem.focus();
         }
 
-        pub fn on_key_raw(&self, _cb: Box<dyn FnMut(u32, u32) -> bool>) {}
+        pub fn on_key_raw(&self, cb: Box<dyn FnMut(u32, u32) -> bool>) {
+            *self.key_cb.borrow_mut() = Some(cb);
+            let cb2 = self.key_cb.clone();
+            let closure = Closure::<dyn FnMut(KeyboardEvent)>::new(move |evt: KeyboardEvent| {
+                if let Some(ref mut f) = *cb2.borrow_mut() {
+                    if f(evt.key_code(), 0) {
+                        evt.prevent_default();
+                    }
+                }
+            });
+            self.elem
+                .add_event_listener_with_callback("keydown", closure.as_ref().unchecked_ref())
+                .ok();
+            store_closure(Box::new(closure));
+        }
 
         pub fn connect_focus_in_event<F: FnMut(*mut c_void) -> i32 + 'static>(
             &self,
@@ -633,6 +705,7 @@ impl Window {
         elem.set_type("text");
         Ok(Entry {
             elem,
+            key_cb: Rc::new(RefCell::new(None)),
             closures: Rc::new(RefCell::new(Vec::new())),
             next_id: Rc::new(RefCell::new(1)),
         })
@@ -647,11 +720,12 @@ impl Window {
         Submenu { label: String, items: Vec<MenuItem> },
     }
 
-    pub struct Menu {
-        items: Vec<MenuItem>,
-    }
+#[derive(Clone)]
+pub struct Menu {
+    items: Vec<MenuItem>,
+}
 
-    impl Menu {
+impl Menu {
         pub fn append(&mut self, label: &str, detailed_action: &str) {
             let action = detailed_action
                 .split('(')
@@ -676,11 +750,17 @@ impl Window {
         Ok(Menu { items: Vec::new() })
     }
 
-    pub struct MenuBar {
-        elem: HtmlDivElement,
-    }
+pub struct MenuBar {
+    elem: HtmlDivElement,
+}
 
-    impl AsElement for MenuBar {
+impl Clone for MenuBar {
+    fn clone(&self) -> Self {
+        MenuBar { elem: self.elem.clone() }
+    }
+}
+
+impl AsElement for MenuBar {
         fn as_element(&self) -> &Element {
             self.elem.as_ref()
         }
@@ -690,6 +770,15 @@ impl Window {
         fn raw_handle(&self) -> *mut c_void {
             &self.elem as *const HtmlDivElement as *mut c_void
         }
+    }
+
+    impl AsRef<*mut c_void> for MenuBar {
+        fn as_ref(&self) -> &*mut c_void {
+            unsafe { &*(&self.raw_handle() as *const *mut c_void) }
+        }
+    }
+
+    impl MenuBar {
     }
 
     pub fn create_menubar(model: &Menu, _action_group: *mut c_void) -> Result<MenuBar, Error> {
@@ -799,11 +888,12 @@ impl Window {
         Ok(MenuBar { elem: bar })
     }
 
-    pub struct SimpleAction {
-        name: String,
-    }
+#[derive(Clone)]
+pub struct SimpleAction {
+    name: String,
+}
 
-    impl SimpleAction {
+impl SimpleAction {
         pub fn connect_activate<F: FnMut(*mut c_void) + 'static>(
             &self,
             f: F,
@@ -850,6 +940,12 @@ impl Window {
         }
     }
 
+    impl AsRef<*mut c_void> for Dialog {
+        fn as_ref(&self) -> &*mut c_void {
+            unsafe { &*(&self.raw_handle() as *const *mut c_void) }
+        }
+    }
+
     impl Dialog {
         pub fn set_title(&self, title: &str) {
             let h2 = create_element("h2");
@@ -886,12 +982,12 @@ impl Window {
             &self.content_area as *const HtmlDivElement as *mut c_void
         }
 
-        pub fn append_content_area(&self, child: &impl AsElement) {
-            self.content_area.append_child(child.as_element()).ok();
+        pub fn append_content_area(&self, child: &impl AsRef<*mut c_void>) {
+            self.content_area.append_child(as_element_from_ptr(*child.as_ref())).ok();
         }
 
         pub fn present(&self) {
-            let _ = self.elem.show_modal();
+            let _ = self.elem.show();
         }
 
         pub fn connect_response<F: FnMut(i32) + 'static>(&self, f: F) -> Result<u64, Error> {
@@ -1336,6 +1432,12 @@ impl Window {
         }
     }
 
+    impl AsRef<*mut c_void> for Canvas {
+        fn as_ref(&self) -> &*mut c_void {
+            unsafe { &*(&self.raw_handle() as *const *mut c_void) }
+        }
+    }
+
     impl Clone for Canvas {
         fn clone(&self) -> Self {
             Canvas {
@@ -1416,7 +1518,7 @@ impl Window {
             self.on_key(Box::new(move |k: u32| -> bool { cb(k, 0) }));
         }
         pub fn grab_focus(&self) {
-            let _ = self.elem.call("focus");
+            let _ = self.elem.focus();
         }
         pub fn set_can_focus(&self, _can: bool) {}
     }

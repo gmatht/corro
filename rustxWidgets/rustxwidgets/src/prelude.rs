@@ -8,7 +8,9 @@ pub use crate::common::{Window, WidgetBox, Label, Entry, Canvas, Menu, MenuBar, 
 #[cfg(all(windows, not(feature = "zork")))]
 pub use crate::backends_nwg_adapter::{Button, Grid, DropDown, CheckButton, RadioButton, TextView, Appendable};
 #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
-pub use crate::backends_wasm_adapter::{Window, Button, Label, BoxWidget, Grid, Entry, Menu, SimpleAction, Dialog, DropDown, CheckButton, RadioButton, TextView, Canvas, Overlay, ScrolledWindow, Orientation};
+pub use crate::common::{Window, WidgetBox, Label, Entry, Canvas, Menu, MenuBar, SimpleAction, Dialog, Orientation};
+#[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
+pub use crate::backends_wasm_adapter::{Button, Grid, DropDown, CheckButton, RadioButton, TextView, Overlay, ScrolledWindow};
 #[cfg(all(target_os = "android", not(feature = "zork")))]
 pub use crate::backends_android_adapter::{Window, Button, Label, Grid, DropDown, CheckButton, RadioButton, Dialog, TextView};
 

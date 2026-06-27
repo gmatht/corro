@@ -62,6 +62,14 @@ if [ "$HAS_CARGO" = true ]; then
     fi
     echo ""
 
+    # Restore test data files from git before running tests.
+    # The NWG replayer can modify subtotal-tiny.corro (it launches
+    # corro.exe --gui on that file, which appends SET commands).
+    # Also ensure test_rec5.corro is byte-identical to subtotal-tiny.corro
+    # (the committed version may be out of sync).
+    git checkout -- docs/tests/subtotal-tiny.corro test_rec5.corro 2>/dev/null || true
+    cp docs/tests/subtotal-tiny.corro test_rec5.corro
+
     # ---------------------------------------------------------------------------
     # Rust integration tests (NWG on Windows, gtk on Linux)
     # ---------------------------------------------------------------------------
@@ -85,7 +93,7 @@ if [ "$HAS_CARGO" = true ]; then
     # ---------------------------------------------------------------------------
 
     echo "--- Running GUI-specific Rust tests ---"
-    for t in gui_enter_text_creates_file check_agg_gui check_gui_imports quit_alt_f_q; do
+    for t in check_vals gui_enter_text_creates_file check_agg_gui check_gui_imports quit_alt_f_q; do
         if cargo +nightly test --features gui --test "$t" 2>/dev/null; then
             pass "$t"
         else

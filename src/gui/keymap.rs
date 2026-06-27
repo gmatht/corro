@@ -13,6 +13,7 @@ pub fn keyval_to_action(keyval: u32, _state: &KeyState) -> Option<Action> {
         END => Some(Action::MoveEnd),
         PAGE_UP => Some(Action::MovePageUp),
         PAGE_DOWN => Some(Action::MovePageDown),
+        #[allow(unreachable_patterns)]
         RETURN | ENTER => Some(Action::StartEdit),
         ESCAPE => Some(Action::CancelEdit),
         TAB => Some(Action::MoveRight),

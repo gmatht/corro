@@ -184,7 +184,12 @@ mod common_types {
 mod common_types { common_types_mod!(); }
 
 #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
-mod common_types { common_types_mod!(); }
+mod common_types {
+    common_types_mod!();
+    impl Canvas {
+        pub fn on_key(&self, cb: Box<dyn FnMut(u32) -> bool>) { self.inner.on_key(cb); }
+    }
+}
 
 #[cfg(all(target_os = "android", not(feature = "zork")))]
 mod common_types { common_types_mod!(); }

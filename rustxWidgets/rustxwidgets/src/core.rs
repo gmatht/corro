@@ -44,6 +44,27 @@ pub mod key {
         pub const ALT_L: u32 = 0x12;
         pub const ALT_R: u32 = 0x12;
     }
+    #[cfg(target_arch = "wasm32")]
+    mod plat {
+        pub const RETURN: u32 = 0x0D;
+        pub const ENTER: u32 = 0x0D;
+        pub const ESCAPE: u32 = 0x1B;
+        pub const BACKSPACE: u32 = 0x08;
+        pub const DELETE: u32 = 0x2E;
+        pub const LEFT: u32 = 0x25;
+        pub const UP: u32 = 0x26;
+        pub const RIGHT: u32 = 0x27;
+        pub const DOWN: u32 = 0x28;
+        pub const TAB: u32 = 0x09;
+        pub const HOME: u32 = 0x24;
+        pub const END: u32 = 0x23;
+        pub const PAGE_UP: u32 = 0x21;
+        pub const PAGE_DOWN: u32 = 0x22;
+        pub const F1: u32 = 0x70;
+        pub const F2: u32 = 0x71;
+        pub const ALT_L: u32 = 0x12;
+        pub const ALT_R: u32 = 0x12;
+    }
     pub use plat::*;
 
     /// Normalize a platform key value so it can be compared with the
@@ -62,6 +83,22 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::os::raw::c_void;
 use std::rc::Rc;
+
+/// Detect terminal size. On Unix uses `ioctl(TIOCGWINSZ)`;
+/// on other platforms returns `None` (caller should fall back
+/// to environment variables or defaults).
+pub fn terminal_size() -> Option<(usize, usize)> {
+    #[cfg(unix)]
+    {
+        let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+        if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) } == 0 && ws.ws_col > 0
+        {
+            return Some((ws.ws_col as usize, ws.ws_row as usize));
+        }
+    }
+    let _ = std::env::var("COLUMNS").ok();
+    None
+}
 
 /// Opaque handler id returned when connecting signals
 pub type HandlerId = u64;
@@ -724,6 +761,11 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
             let inner = crate::backends_nwg_adapter::create_window(&self.parent_cell)?;
             Ok(crate::common::Window { inner })
         }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let inner = crate::backends_wasm_adapter::create_window()?;
+            Ok(crate::common::Window { inner })
+        }
     }
 
     /// Create a new layout Box.
@@ -747,6 +789,11 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
             let inner = crate::backends_nwg_adapter::create_box(nwg_orient, spacing, parent)?;
             Ok(crate::common::WidgetBox { inner })
         }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let inner = crate::backends_wasm_adapter::create_box(orientation, spacing)?;
+            Ok(crate::common::WidgetBox { inner })
+        }
     }
 
     /// Create a new Label with the given text.
@@ -761,6 +808,11 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
             let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
             let inner = crate::backends_nwg_adapter::create_label(parent)?;
             inner.set_text(text);
+            Ok(crate::common::Label { inner })
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let inner = crate::backends_wasm_adapter::create_label(text)?;
             Ok(crate::common::Label { inner })
         }
     }
@@ -778,6 +830,11 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
             let inner = crate::backends_nwg_adapter::create_entry(parent)?;
             Ok(crate::common::Entry { inner })
         }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let inner = crate::backends_wasm_adapter::create_entry()?;
+            Ok(crate::common::Entry { inner })
+        }
     }
 
     /// Create a new Canvas (custom drawing surface).
@@ -791,6 +848,11 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
         {
             let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
             let inner = crate::backends_nwg_adapter::create_canvas(parent)?;
+            Ok(crate::common::Canvas { inner })
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let inner = crate::backends_wasm_adapter::create_canvas()?;
             Ok(crate::common::Canvas { inner })
         }
     }
@@ -807,6 +869,11 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
             let inner = crate::backends_nwg_adapter::create_menu()?;
             Ok(crate::common::Menu { inner })
         }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let inner = crate::backends_wasm_adapter::create_menu()?;
+            Ok(crate::common::Menu { inner })
+        }
     }
 
     /// Create a new SimpleAction that will dispatch to the given name.
@@ -820,6 +887,11 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
         #[cfg(windows)]
         {
             let inner = crate::backends_nwg_adapter::create_simple_action(name, self.action_registry.clone())?;
+            Ok(crate::common::SimpleAction { inner })
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let inner = crate::backends_wasm_adapter::create_simple_action(name)?;
             Ok(crate::common::SimpleAction { inner })
         }
     }
@@ -839,6 +911,11 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
             let inner = crate::backends_nwg_adapter::create_menubar(&model.inner, hwnd, self.action_registry.clone())?;
             Ok(crate::common::MenuBar { inner })
         }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let inner = crate::backends_wasm_adapter::create_menubar(&model.inner, action_group)?;
+            Ok(crate::common::MenuBar { inner })
+        }
     }
 
     /// Create a new Dialog.
@@ -851,6 +928,11 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
         #[cfg(windows)]
         {
             let inner = crate::backends_nwg_adapter::create_dialog(&self.parent_cell)?;
+            Ok(crate::common::Dialog { inner })
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let inner = crate::backends_wasm_adapter::create_dialog()?;
             Ok(crate::common::Dialog { inner })
         }
     }
@@ -892,6 +974,8 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
     /// Post a quit message to the backend's event loop.
     /// Safe to call from signal handlers and event callbacks.
     pub fn quit(&self) {
+        #[cfg(target_arch = "wasm32")]
+        {}
         #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
         let _ = crate::backends_gtk_adapter::quit_main_loop();
         #[cfg(all(windows, not(feature = "zork")))]

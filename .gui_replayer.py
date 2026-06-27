@@ -293,10 +293,11 @@ def main():
         print("ERROR: ctypes not available (needed for Win32 API)")
         return 1
 
-    binary = args.binary
+    binary = args.binary or os.environ.get("BIN", "")
     if not os.path.exists(binary):
         print(f"ERROR: binary not found at {binary}")
-        print("Build with: cargo +nightly build --features gui")
+        print("  Try: cargo +nightly build --features gui")
+        print("  Or set the BIN environment variable to the corro.exe path")
         return 1
 
     tests = []

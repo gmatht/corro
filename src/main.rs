@@ -46,13 +46,14 @@ fn cli_option_suggestion(arg: &str) -> Option<&'static str> {
 
 fn determine_default_ui() -> UiKind {
     #[cfg(feature = "ratatui")]
-    { UiKind::Ratatui }
-    #[cfg(not(feature = "ratatui"))]
+    { return UiKind::Ratatui; }
+    #[cfg(target_arch = "wasm32")]
+    { return UiKind::Gui; }
     #[cfg(feature = "gui")]
-    { UiKind::Gui }
-    #[cfg(not(any(feature = "ratatui", feature = "gui")))]
+    { return UiKind::Gui; }
     #[cfg(feature = "pancurses")]
-    { UiKind::Pancurses }
+    { return UiKind::Pancurses; }
+    UiKind::Ratatui
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -151,6 +152,25 @@ fn parse_args() -> Result<Args, String> {
     })
 }
 
+#[cfg(target_arch = "wasm32")]
+fn main() {
+    let mut app = if let Some(path) = std::env::args().nth(1) {
+        let mut a = corro::gui::App::new_with_paths(vec![std::path::PathBuf::from(path)]);
+        if let Err(e) = a.load_initial() {
+            eprintln!("corro: load error: {e}");
+        }
+        a
+    } else {
+        let mut a = corro::gui::App::new_with_paths(vec![]);
+        let _ = a.load_initial();
+        a
+    };
+    if let Err(e) = app.run() {
+        eprintln!("corro: run error: {e}");
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn main() {
     let (res, exit_message) = try_main();
     if let Some(msg) = exit_message {
@@ -204,6 +224,7 @@ fn main() {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn try_main() -> (Result<(), Box<dyn std::error::Error>>, Option<String>) {
     // Parse args; return early with no exit message on CLI errors/help/version.
     let args = match parse_args() {

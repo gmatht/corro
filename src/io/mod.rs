@@ -5,10 +5,12 @@ use crate::ops::{
     append_line, apply_line, apply_log_line_to_workbook, apply_workbook_op, Op, SheetState,
     WorkbookOp, WorkbookSnapshot, WorkbookState, LOG_HEADER_PREFIX, LOG_VERSION,
 };
+#[cfg(not(target_arch = "wasm32"))]
 use notify::{RecursiveMode, Watcher};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::mpsc::Receiver;
 use thiserror::Error;
 
@@ -16,6 +18,7 @@ use thiserror::Error;
 pub enum IoError {
     #[error("I/O: {0}")]
     Io(#[from] std::io::Error),
+    #[cfg(not(target_arch = "wasm32"))]
     #[error("Notify: {0}")]
     Notify(#[from] notify::Error),
 }
@@ -647,14 +650,16 @@ fn parse_csv_line(line: &str) -> Vec<String> {
 }
 
 /// Watches `path` for changes; poll [`LogWatcher::poll_dirty`].
+#[cfg(not(target_arch = "wasm32"))]
 pub struct LogWatcher {
     _watcher: notify::RecommendedWatcher,
     pub path: PathBuf,
     rx: Receiver<notify::Result<notify::Event>>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl LogWatcher {
-    pub fn new(path: PathBuf) -> Result<Self, notify::Error> {
+    pub fn new(path: PathBuf) -> Result<Self, IoError> {
         let (tx, rx) = std::sync::mpsc::channel();
         let mut watcher = notify::recommended_watcher(move |ev| {
             let _ = tx.send(ev);
@@ -677,6 +682,31 @@ impl LogWatcher {
             }
         }
         dirty
+    }
+}
+
+/// WASM fallback: polls file size instead of using notify.
+#[cfg(target_arch = "wasm32")]
+pub struct LogWatcher {
+    pub path: PathBuf,
+    offset: u64,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl LogWatcher {
+    pub fn new(path: PathBuf) -> Result<Self, IoError> {
+        let offset = if path.exists() {
+            std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0)
+        } else {
+            0
+        };
+        Ok(LogWatcher { path, offset })
+    }
+
+    pub fn poll_dirty(&self) -> bool {
+        std::fs::metadata(&self.path)
+            .map(|m| m.len() > self.offset)
+            .unwrap_or(false)
     }
 }
 

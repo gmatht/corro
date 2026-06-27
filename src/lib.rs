@@ -19,5 +19,5 @@ pub use ui_core::format_cell_display;
 
 #[cfg(feature = "ratatui")]
 pub mod ui;
-#[cfg(any(feature = "gui", feature = "pancurses"))]
+#[cfg(any(feature = "gui", feature = "pancurses", target_arch = "wasm32"))]
 pub mod gui;
