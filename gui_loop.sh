@@ -26,7 +26,9 @@ skip() { SKIP=$((SKIP+1)); echo "  SKIP: $1"; }
 HAS_WSL=false
 HAS_WSL_BASH=false
 HAS_PYTHON=false
+PYTHON=""
 HAS_CARGO=false
+HAS_WSL_CARGO=false
 
 if command -v wsl.exe &>/dev/null; then
     HAS_WSL=true
@@ -37,12 +39,20 @@ fi
 
 if command -v python3 &>/dev/null; then
     HAS_PYTHON=true
+    PYTHON="python3"
 elif command -v python &>/dev/null; then
     HAS_PYTHON=true
+    PYTHON="python"
 fi
 
 if command -v cargo &>/dev/null; then
     HAS_CARGO=true
+fi
+
+if [ "$HAS_WSL" = true ] && [ "$HAS_WSL_BASH" = true ]; then
+    if wsl.exe bash -c "command -v cargo &>/dev/null" 2>/dev/null; then
+        HAS_WSL_CARGO=true
+    fi
 fi
 
 echo "=== GUI Backend Test Suite ==="
@@ -113,12 +123,12 @@ fi
 if [[ $OSTYPE == "msys" || $OSTYPE == "cygwin" || -n "${WINDIR:-}" ]]; then
     echo "--- NWG replayer tests ---"
     if [ "$HAS_PYTHON" = true ] && [ -f .gui_replayer.py ]; then
-        if python3 .gui_replayer.py --test recrec5 2>/dev/null; then
+        if $PYTHON .gui_replayer.py --test recrec5 2>/dev/null; then
             pass "NWG replayer: recrec5"
         else
             fail "NWG replayer: recrec5"
         fi
-        if python3 .gui_replayer.py --test recrec6 2>/dev/null; then
+        if $PYTHON .gui_replayer.py --test recrec6 2>/dev/null; then
             pass "NWG replayer: recrec6"
         else
             fail "NWG replayer: recrec6"
@@ -135,36 +145,32 @@ echo ""
 # GTK tests via WSL (Linux/WSL only)
 # ---------------------------------------------------------------------------
 
-if [ "$HAS_WSL" = true ] && [ "$HAS_WSL_BASH" = true ] && [ "$HAS_CARGO" = true ]; then
+if [ "$HAS_WSL" = true ] && [ "$HAS_WSL_BASH" = true ] && [ "$HAS_WSL_CARGO" = true ]; then
     echo "--- GTK3/GTK4 tests via WSL ---"
 
-    # Build GTK3
-    if wsl.exe bash -c "cd /mnt/$(pwd | sed 's|/|/|g') && cargo +nightly build --features gui" 2>/dev/null; then
-        pass "GTK3 build"
+    # Build with GTK feature (single build, GTK_DLOPEN_PREFER_GTK3 runtime toggle)
+    WSL_PWD="/mnt/$(pwd | sed 's|/|/|g')"
+    if wsl.exe bash -c "cd '$WSL_PWD' && cargo +nightly build --features gui" 2>/dev/null; then
+        pass "GTK build"
     else
-        fail "GTK3 build"
-    fi
-
-    # Build GTK4 (using Cargo.toml feature)
-    if wsl.exe bash -c "cd /mnt/$(pwd | sed 's|/|/|g') && cargo +nightly build --features gui" 2>/dev/null; then
-        pass "GTK4 build"
-    else
-        fail "GTK4 build"
+        fail "GTK build"
     fi
 
     # Run Rust tests
-    if wsl.exe bash -c "cd /mnt/$(pwd | sed 's|/|/|g') && cargo +nightly test --features gui --test test_tiny5" 2>/dev/null; then
+    if wsl.exe bash -c "cd '$WSL_PWD' && cargo +nightly test --features gui --test test_tiny5" 2>/dev/null; then
         pass "GTK recrec5"
     else
         fail "GTK recrec5"
     fi
-    if wsl.exe bash -c "cd /mnt/$(pwd | sed 's|/|/|g') && cargo +nightly test --features gui --test test_tiny6" 2>/dev/null; then
+    if wsl.exe bash -c "cd '$WSL_PWD' && cargo +nightly test --features gui --test test_tiny6" 2>/dev/null; then
         pass "GTK recrec6"
     else
         fail "GTK recrec6"
     fi
+elif [ "$HAS_WSL" = true ] && [ "$HAS_WSL_BASH" = true ]; then
+    skip "GTK tests (cargo not installed in WSL)"
 else
-    skip "GTK tests (WSL/bash/cargo not available)"
+    skip "GTK tests (WSL/bash not available)"
 fi
 
 echo ""
