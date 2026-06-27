@@ -3,6 +3,7 @@ use crate::ops::{Op, WorkbookOp};
 use crate::ui_core;
 use std::collections::HashMap;
 use rustxwidgets::backends_pancurses_adapter::*;
+use rustxwidgets::core::terminal_size;
 
 use unicode_width::UnicodeWidthStr;
 
@@ -75,15 +76,9 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         let env_rows: Option<usize> = std::env::var("CORRO_TERM_ROWS").ok().and_then(|s| s.parse().ok());
         if let (Some(c), Some(r)) = (env_cols, env_rows) {
             (c, r)
+        } else if let Some((cols, rows)) = terminal_size() {
+            (cols, rows)
         } else {
-            #[cfg(unix)]
-            {
-                let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-                if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) } == 0 && ws.ws_col > 0
-                {
-                    return (ws.ws_col as usize, ws.ws_row as usize);
-                }
-            }
             let cols: usize = std::env::var("COLUMNS")
                 .ok()
                 .and_then(|s| s.parse().ok())

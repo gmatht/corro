@@ -65,7 +65,7 @@ echo ""
 
 if [ "$HAS_CARGO" = true ]; then
     echo "--- Building GUI backend ---"
-    if cargo +nightly build --features gui 2>/dev/null; then
+    if cargo +nightly build --features gui 2>&1; then
         pass "Build (gui features)"
     else
         fail "Build (gui features)"
@@ -86,13 +86,13 @@ if [ "$HAS_CARGO" = true ]; then
     # ---------------------------------------------------------------------------
 
     echo "--- Running recording replay tests (test_tiny5 / test_tiny6) ---"
-    if cargo +nightly test --features gui --test test_tiny5 2>/dev/null; then
+    if cargo +nightly test --features gui --test test_tiny5 2>&1; then
         pass "recrec5 (test_tiny5)"
     else
         fail "recrec5 (test_tiny5)"
     fi
 
-    if cargo +nightly test --features gui --test test_tiny6 2>/dev/null; then
+    if cargo +nightly test --features gui --test test_tiny6 2>&1; then
         pass "recrec6 (test_tiny6)"
     else
         fail "recrec6 (test_tiny6)"
@@ -105,7 +105,7 @@ if [ "$HAS_CARGO" = true ]; then
 
     echo "--- Running GUI-specific Rust tests ---"
     for t in check_vals gui_enter_text_creates_file check_agg_gui check_gui_imports quit_alt_f_q; do
-        if cargo +nightly test --features gui --test "$t" 2>/dev/null; then
+        if cargo +nightly test --features gui --test "$t" 2>&1; then
             pass "$t"
         else
             fail "$t"
@@ -124,12 +124,12 @@ fi
 if [[ $OSTYPE == "msys" || $OSTYPE == "cygwin" || -n "${WINDIR:-}" ]]; then
     echo "--- NWG replayer tests ---"
     if [ "$HAS_PYTHON" = true ] && [ -f .gui_replayer.py ]; then
-        if $PYTHON .gui_replayer.py --test recrec5 2>/dev/null; then
+        if $PYTHON .gui_replayer.py --test recrec5 2>&1; then
             pass "NWG replayer: recrec5"
         else
             fail "NWG replayer: recrec5"
         fi
-        if $PYTHON .gui_replayer.py --test recrec6 2>/dev/null; then
+        if $PYTHON .gui_replayer.py --test recrec6 2>&1; then
             pass "NWG replayer: recrec6"
         else
             fail "NWG replayer: recrec6"
@@ -150,20 +150,23 @@ if [ "$HAS_WSL" = true ] && [ "$HAS_WSL_BASH" = true ] && [ "$HAS_WSL_CARGO" = t
     echo "--- GTK3/GTK4 tests via WSL ---"
 
     # Build with GTK feature (single build, GTK_DLOPEN_PREFER_GTK3 runtime toggle)
-    WSL_PWD="/mnt/$(pwd | sed 's|/|/|g')"
-    if wsl.exe bash -c "cd '$WSL_PWD' && cargo +nightly build --features gui" 2>/dev/null; then
+    # DISPLAY=:0 is set inside WSL so that external test wrappers that add
+    # 'DISPLAY=:0' after 'timeout' (wrong bash syntax) don't cause errors.
+    # Inside the WSL bash -c string, DISPLAY=:0 is a regular env var prefix.
+    WSL_PWD="/mnt/$(pwd | sed 's|^/\([a-z]\)/|\1/|')"
+    if wsl.exe bash -c "cd '$WSL_PWD' && DISPLAY=:0 cargo +nightly build --features gui" 2>&1; then
         pass "GTK build"
     else
         fail "GTK build"
     fi
 
     # Run Rust tests
-    if wsl.exe bash -c "cd '$WSL_PWD' && cargo +nightly test --features gui --test test_tiny5" 2>/dev/null; then
+    if wsl.exe bash -c "cd '$WSL_PWD' && DISPLAY=:0 cargo +nightly test --features gui --test test_tiny5" 2>&1; then
         pass "GTK recrec5"
     else
         fail "GTK recrec5"
     fi
-    if wsl.exe bash -c "cd '$WSL_PWD' && cargo +nightly test --features gui --test test_tiny6" 2>/dev/null; then
+    if wsl.exe bash -c "cd '$WSL_PWD' && DISPLAY=:0 cargo +nightly test --features gui --test test_tiny6" 2>&1; then
         pass "GTK recrec6"
     else
         fail "GTK recrec6"

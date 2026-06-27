@@ -1303,6 +1303,7 @@ dependencies = [
  "gtk_dynamic_loader",
  "jni",
  "js-sys",
+ "libc",
  "libloading 0.8.9",
  "native-windows-gui",
  "ndk",

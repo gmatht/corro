@@ -8,3 +8,4 @@ gtk-dlopen
 __pycache__/
 *.pyc
 junk.*
+debug.log

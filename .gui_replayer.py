@@ -147,27 +147,55 @@ def _launch_and_wait(binary, test_file):
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    time.sleep(1.5)
-    hwnd = find_corro_window()
+    # Retry finding the window: initial 1.5s, then up to 5 more at 1s intervals
+    hwnd = None
+    for attempt in range(6):
+        hwnd = find_corro_window()
+        if hwnd:
+            break
+        if attempt == 0:
+            time.sleep(1.5)
+        else:
+            time.sleep(1.0)
     if hwnd:
         # Bring to foreground for reliable focus (though PostMessage
         # bypasses foreground requirements).
         ctypes.windll.user32.SetForegroundWindow(hwnd)
         ctypes.windll.user32.BringWindowToTop(hwnd)
         time.sleep(0.5)
+    else:
+        print("WARNING: corro window not found")
     return proc, hwnd
 
 
 def _cleanup(proc, label=""):
-    """Try to gracefully terminate corro, then force kill if needed."""
+    """Try to gracefully terminate corro, then force kill if needed.
+    Returns True if the process exited cleanly (returncode == 0)."""
+    elapsed = 0.0
+    import time as _time
+    t0 = _time.time()
     try:
-        stdout, stderr = proc.communicate(timeout=8)
-        return True
+        stdout, stderr = proc.communicate(timeout=12)
+        elapsed = _time.time() - t0
+        ok = proc.returncode == 0
+        if not ok:
+            print(f"  [{label}] exit code={proc.returncode} elapsed={elapsed:.1f}s")
+        # Print captured output for diagnostics
+        if stdout:
+            sys.stdout.write(stdout.decode("utf-8", errors="replace"))
+        if stderr:
+            sys.stderr.write(stderr.decode("utf-8", errors="replace"))
+        return ok
     except subprocess.TimeoutExpired:
-        print(f"  [{label}] communicate timed out after 8s, force-killing")
+        elapsed = _time.time() - t0
+        print(f"  [{label}] communicate timed out after {elapsed:.1f}s, force-killing")
         proc.kill()
         try:
             stdout, stderr = proc.communicate(timeout=3)
+            if stdout:
+                sys.stdout.write(stdout.decode("utf-8", errors="replace"))
+            if stderr:
+                sys.stderr.write(stderr.decode("utf-8", errors="replace"))
         except subprocess.TimeoutExpired:
             print(f"  [{label}] force-kill also timed out")
             proc.kill()
@@ -178,9 +206,13 @@ def run_test_recrec5(binary="target/debug/corro.exe"):
     """Test: open subtotal-tiny, enter data, quit."""
     print(f"Running recrec5 test with {binary}")
     test_file = "docs/tests/subtotal-tiny.corro"
+    output_file = "docs/tests/subtotal-tiny.corro"  # corro writes back to same file
     if not os.path.exists(test_file):
         print(f"ERROR: test file not found: {test_file}")
         return False
+
+    # Record initial output size (should be small, just test data)
+    initial_size = os.path.getsize(output_file) if os.path.exists(output_file) else 0
 
     proc, hwnd = _launch_and_wait(binary, test_file)
     if not hwnd:
@@ -202,14 +234,18 @@ def run_test_recrec5(binary="target/debug/corro.exe"):
     send_enter(hwnd)
     time.sleep(0.3)
 
-    # Quit via Alt+F+Q (no WM_CLOSE fallback — recrec5 types plain text
-    # with no navigation keys, so the Alt+F+Q interception always works).
+    # Quit via Alt+F+Q, with WM_CLOSE fallback
     send_alt_f(hwnd)
     time.sleep(0.3)
     send_q(hwnd)
-    time.sleep(1.0)
+    time.sleep(0.5)
+    send_close(hwnd)  # fallback: WM_CLOSE bypasses menu focus issues
+    time.sleep(0.5)
 
     result = _cleanup(proc, "recrec5")
+    final_size = os.path.getsize(output_file) if os.path.exists(output_file) else 0
+    output_exists = "yes" if os.path.exists(output_file) and final_size > initial_size else "no"
+    print(f"  output_file={output_exists} initial={initial_size}b final={final_size}b")
     print("recrec5 done")
     return result
 

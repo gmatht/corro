@@ -1107,6 +1107,10 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // Ensure the canvas can receive keyboard focus (needed after commit_edit
     // to return focus — GtkDrawingArea does not accept focus by default).
     canvas.set_can_focus(true);
+    // Grab focus to the canvas so keyboard events arrive at the canvas's
+    // on_key handler.  Without this, NWG may leave focus on the window or
+    // menu bar, and keystrokes sent by the replayer would be lost.
+    canvas.grab_focus();
 
     // Status label
     let status_label = rxapp.new_label("Ready")?;

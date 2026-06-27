@@ -181,12 +181,32 @@ mod nwg_adapter {
                             return Some(0); // consumed, do not forward
                         }
                     }
-                    // Forward to the focused child window so canvas/entry
-                    // raw handlers can process the keystroke.
+                    // Forward keyboard messages to the correct child.
+                    // The window-level raw handler consumes all key events
+                    // to prevent DefWindowProc from activating the menu bar
+                    // on WM_SYSKEYDOWN(Alt).  We manually post the message
+                    // to the focused child (or a suitable descendant if no
+                    // child has focus).
                     unsafe {
                         let focused = winapi::um::winuser::GetFocus();
                         if focused != std::ptr::null_mut() && focused != parent_hwnd {
+                            // Forward to the focused child.
                             winapi::um::winuser::PostMessageW(focused, msg, w, l);
+                        } else {
+                            // No child has focus.  Post to all grandchildren
+                            // (Canvas and Entry are grandchildren of the main
+                            // window, inside the Box container).  Each child's
+                            // raw event handler will process or ignore the
+                            // message as appropriate.
+                            let mut child = winapi::um::winuser::GetWindow(parent_hwnd, winapi::um::winuser::GW_CHILD);
+                            while child != std::ptr::null_mut() {
+                                let mut gc = winapi::um::winuser::GetWindow(child, winapi::um::winuser::GW_CHILD);
+                                while gc != std::ptr::null_mut() {
+                                    winapi::um::winuser::PostMessageW(gc, msg, w, l);
+                                    gc = winapi::um::winuser::GetWindow(gc, winapi::um::winuser::GW_HWNDNEXT);
+                                }
+                                child = winapi::um::winuser::GetWindow(child, winapi::um::winuser::GW_HWNDNEXT);
+                            }
                         }
                     }
                     Some(0) // consumed — prevent DefWindowProc from activating menu

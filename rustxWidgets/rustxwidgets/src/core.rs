@@ -85,8 +85,7 @@ use std::os::raw::c_void;
 use std::rc::Rc;
 
 /// Detect terminal size. On Unix uses `ioctl(TIOCGWINSZ)`;
-/// on other platforms returns `None` (caller should fall back
-/// to environment variables or defaults).
+/// on Windows uses `GetConsoleScreenBufferInfo`.
 pub fn terminal_size() -> Option<(usize, usize)> {
     #[cfg(unix)]
     {
@@ -96,7 +95,26 @@ pub fn terminal_size() -> Option<(usize, usize)> {
             return Some((ws.ws_col as usize, ws.ws_row as usize));
         }
     }
-    let _ = std::env::var("COLUMNS").ok();
+    #[cfg(windows)]
+    {
+        use winapi::um::processenv::GetStdHandle;
+        use winapi::um::winbase::STD_OUTPUT_HANDLE;
+        use winapi::um::wincon::GetConsoleScreenBufferInfo;
+        use winapi::um::wincon::CONSOLE_SCREEN_BUFFER_INFO;
+        unsafe {
+            let handle = GetStdHandle(STD_OUTPUT_HANDLE);
+            if handle != winapi::um::handleapi::INVALID_HANDLE_VALUE {
+                let mut info: CONSOLE_SCREEN_BUFFER_INFO = std::mem::zeroed();
+                if GetConsoleScreenBufferInfo(handle, &mut info) != 0 {
+                    let cols = info.srWindow.Right - info.srWindow.Left + 1;
+                    let rows = info.srWindow.Bottom - info.srWindow.Top + 1;
+                    if cols > 0 && rows > 0 {
+                        return Some((cols as usize, rows as usize));
+                    }
+                }
+            }
+        }
+    }
     None
 }
 
