@@ -7,3 +7,6 @@ tmp*
 test_rec5.corro
 
 gtk-dlopen
+__pycache__/
+*.pyc
+junk.*
