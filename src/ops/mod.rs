@@ -2738,54 +2738,62 @@ pub fn append_op(path: &Path, op: &Op, main_cols: usize) -> std::io::Result<()> 
 
 /// Append a plain-text log line.
 pub fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
-    #[cfg(debug_assertions)]
+    #[cfg(target_arch = "wasm32")]
     {
-        let preview = if line.len() > 200 {
-            format!("{}...[{} bytes]", &line[..200], line.len())
-        } else {
-            line.to_string()
-        };
-        let msg = format!(
-            "DEBUG append_line: path={} line_len={} line_preview={}",
-            path.display(),
-            line.len(),
-            preview
-        );
-        crate::debug_log::log(&msg);
-        eprintln!("{}", msg);
-        // Also log the raw bytes (hex preview) so we can correlate any
-        // observed on-disk corruption with the exact payload handed to the
-        // writer. Keep this limited to debug builds to avoid runtime overhead
-        // in release.
-        let raw_bytes = line.as_bytes();
-        let hex_preview: String = raw_bytes
-            .iter()
-            .take(256)
-            .map(|b| format!("{:02X}", b))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let raw_msg = format!(
-            "DEBUG append_line raw_bytes: path={} len={} hex_preview={}",
-            path.display(),
-            raw_bytes.len(),
-            hex_preview
-        );
-        crate::debug_log::log(&raw_msg);
-        eprintln!("{}", raw_msg);
+        // On WASM there is no real filesystem. Store the line in a JS global
+        // variable so the browser test framework can read it after the app
+        // quits and verify the recording replay output.
+        rustxwidgets::backends_wasm_adapter::append_wasm_output_line(line);
+        eprintln!("CORRO_WASM_OUTPUT: {}", line);
+        return Ok(());
     }
-
-    let mut f = OpenOptions::new().create(true).append(true).open(path)?;
-    writeln!(f, "{line}")?;
-    f.sync_all()?;
-
-    #[cfg(debug_assertions)]
+    #[cfg(not(target_arch = "wasm32"))]
     {
-        let msg = format!("DEBUG append_line: path={} sync_all_done", path.display());
-        crate::debug_log::log(&msg);
-        eprintln!("{}", msg);
-    }
+        #[cfg(debug_assertions)]
+        {
+            let preview = if line.len() > 200 {
+                format!("{}...[{} bytes]", &line[..200], line.len())
+            } else {
+                line.to_string()
+            };
+            let msg = format!(
+                "DEBUG append_line: path={} line_len={} line_preview={}",
+                path.display(),
+                line.len(),
+                preview
+            );
+            crate::debug_log::log(&msg);
+            eprintln!("{}", msg);
+            let raw_bytes = line.as_bytes();
+            let hex_preview: String = raw_bytes
+                .iter()
+                .take(256)
+                .map(|b| format!("{:02X}", b))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let raw_msg = format!(
+                "DEBUG append_line raw_bytes: path={} len={} hex_preview={}",
+                path.display(),
+                raw_bytes.len(),
+                hex_preview
+            );
+            crate::debug_log::log(&raw_msg);
+            eprintln!("{}", raw_msg);
+        }
 
-    Ok(())
+        let mut f = OpenOptions::new().create(true).append(true).open(path)?;
+        writeln!(f, "{line}")?;
+        f.sync_all()?;
+
+        #[cfg(debug_assertions)]
+        {
+            let msg = format!("DEBUG append_line: path={} sync_all_done", path.display());
+            crate::debug_log::log(&msg);
+            eprintln!("{}", msg);
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]

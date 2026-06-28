@@ -179,59 +179,78 @@ mod gtk_adapter {
     }
 
     #[repr(transparent)]
-    pub struct Entry(pub GEntry);
-    impl Widget for Entry { fn raw_handle(&self) -> *mut c_void { *self.0.as_ref() } }
-    impl AsRef<*mut c_void> for Entry { fn as_ref(&self) -> &*mut c_void { self.0.as_ref() } }
+    pub struct Entry {
+        inner: GEntry,
+        _controllers: Rc<RefCell<Vec<Box<dyn std::any::Any>>>>,
+    }
+    impl Widget for Entry { fn raw_handle(&self) -> *mut c_void { *self.inner.as_ref() } }
+    impl AsRef<*mut c_void> for Entry { fn as_ref(&self) -> &*mut c_void { self.inner.as_ref() } }
 
     impl Entry {
-        pub fn set_text(&self, text: &str) { self.0.set_text(text); }
-        pub fn get_text(&self) -> Option<String> { self.0.get_text() }
-        pub fn set_width_chars(&self, n: i32) { self.0.set_width_chars(n); }
-        pub fn set_size_request(&self, w: i32, h: i32) { self.0.set_size_request(w, h); }
-        pub fn connect_changed(&self, f: impl FnMut() + 'static) -> Result<u64, Error> { self.0.connect_changed(f).map_err(|e| Error::Backend(format!("{}", e))) }
+        pub fn set_text(&self, text: &str) { self.inner.set_text(text); }
+        pub fn get_text(&self) -> Option<String> { self.inner.get_text() }
+        pub fn set_width_chars(&self, n: i32) { self.inner.set_width_chars(n); }
+        pub fn set_size_request(&self, w: i32, h: i32) { self.inner.set_size_request(w, h); }
+        pub fn connect_changed(&self, f: impl FnMut() + 'static) -> Result<u64, Error> { self.inner.connect_changed(f).map_err(|e| Error::Backend(format!("{}", e))) }
         pub fn connect_activate<F: FnMut(*mut c_void) + 'static>(&self, f: F) -> Result<u64, Error> {
-            self.0.connect_activate(f).map_err(|e| Error::Backend(format!("{}", e)))
+            self.inner.connect_activate(f).map_err(|e| Error::Backend(format!("{}", e)))
         }
-        pub fn connect_button_press(&self, f: impl FnMut() + 'static) -> Result<u64, Error> { self.0.connect_button_press(f).map_err(|e| Error::Backend(format!("{}", e))) }
-        pub fn add_class(&self, class_name: &str) { self.0.add_class(class_name); }
-        pub fn remove_class(&self, class_name: &str) { self.0.remove_class(class_name); }
-        pub fn grab_focus(&self) { self.0.grab_focus(); }
+        pub fn connect_button_press(&self, f: impl FnMut() + 'static) -> Result<u64, Error> { self.inner.connect_button_press(f).map_err(|e| Error::Backend(format!("{}", e))) }
+        pub fn add_class(&self, class_name: &str) { self.inner.add_class(class_name); }
+        pub fn remove_class(&self, class_name: &str) { self.inner.remove_class(class_name); }
+        pub fn grab_focus(&self) { self.inner.grab_focus(); }
         pub fn connect_focus_in_event<F: FnMut(*mut c_void) -> i32 + 'static>(&self, f: F) -> Result<u64, Error> {
-            self.0.connect_focus_in_event(f).map_err(|e| Error::Backend(format!("{}", e)))
+            self.inner.connect_focus_in_event(f).map_err(|e| Error::Backend(format!("{}", e)))
         }
         pub fn connect_focus_out_event<F: FnMut(*mut c_void) -> i32 + 'static>(&self, f: F) -> Result<u64, Error> {
-            self.0.connect_focus_out_event(f).map_err(|e| Error::Backend(format!("{}", e)))
+            self.inner.connect_focus_out_event(f).map_err(|e| Error::Backend(format!("{}", e)))
         }
-        pub fn set_margin_start(&self, margin: i32) { self.0.set_margin_start(margin); }
-        pub fn set_margin_top(&self, margin: i32) { self.0.set_margin_top(margin); }
-        pub fn set_halign(&self, align: i32) { self.0.set_halign(align); }
-        pub fn set_valign(&self, align: i32) { self.0.set_valign(align); }
-        pub fn set_visible(&self, visible: bool) { self.0.set_visible(visible); }
-        pub fn set_hexpand(&self, expand: bool) { self.0.set_hexpand(expand); }
-        pub fn set_vexpand(&self, expand: bool) { self.0.set_vexpand(expand); }
+        pub fn set_margin_start(&self, margin: i32) { self.inner.set_margin_start(margin); }
+        pub fn set_margin_top(&self, margin: i32) { self.inner.set_margin_top(margin); }
+        pub fn set_halign(&self, align: i32) { self.inner.set_halign(align); }
+        pub fn set_valign(&self, align: i32) { self.inner.set_valign(align); }
+        pub fn set_visible(&self, visible: bool) { self.inner.set_visible(visible); }
+        pub fn set_hexpand(&self, expand: bool) { self.inner.set_hexpand(expand); }
+        pub fn set_vexpand(&self, expand: bool) { self.inner.set_vexpand(expand); }
         pub fn on_key_raw(&self, cb: Box<dyn FnMut(u32, u32) -> bool>) {
             if let Some(loader) = crate::backends::gtk::loader() {
-                let entry_ptr = *self.0.as_ref();
+                let entry_ptr = *self.inner.as_ref();
                 if !entry_ptr.is_null() {
-                    let l = loader.clone();
-                    let mut cb = cb;
-                    unsafe {
-                        let _ = gtk_dynamic_loader::widget_connect_signal_bool(
-                            &l.clone(), entry_ptr, "key-press-event",
-                            Box::new(move |ev: *mut c_void| -> i32 {
-                                let keyval = gtk_dynamic_loader::EventControllerKey::get_keyval_static(&l, ev);
-                                if keyval == 0 { return 0; }
-                                let state = gtk_dynamic_loader::EventControllerKey::get_state_static(&l, ev);
+                    let symbols = &loader.symbols;
+                    let is_gtk4 = symbols.gtk_drawing_area_set_draw_func.is_some();
+                    if is_gtk4 {
+                        // GTK4: use EventControllerKey — "key-press-event" signal is deprecated
+                        // and may not fire on GtkEntry.  EventControllerKey works reliably.
+                        if let Ok(ctrl) = gtk_dynamic_loader::EventControllerKey::new(loader.clone()) {
+                            let mut cb = cb;
+                            let _ = ctrl.connect_key_pressed(Box::new(move |keyval: u32, state: u32| -> i32 {
                                 if cb(keyval, state) { 1 } else { 0 }
-                            }),
-                        );
+                            }));
+                            ctrl.add_to_widget(&self.inner);
+                            self._controllers.borrow_mut().push(Box::new(ctrl));
+                        }
+                    } else {
+                        // GTK3 path: connect to raw "key-press-event" signal
+                        let l = loader.clone();
+                        let mut cb = cb;
+                        unsafe {
+                            let _ = gtk_dynamic_loader::widget_connect_signal_bool(
+                                &l.clone(), entry_ptr, "key-press-event",
+                                Box::new(move |ev: *mut c_void| -> i32 {
+                                    let keyval = gtk_dynamic_loader::EventControllerKey::get_keyval_static(&l, ev);
+                                    if keyval == 0 { return 0; }
+                                    let state = gtk_dynamic_loader::EventControllerKey::get_state_static(&l, ev);
+                                    if cb(keyval, state) { 1 } else { 0 }
+                                }),
+                            );
+                        }
                     }
                 }
             }
         }
     }
 
-    impl Clone for Entry { fn clone(&self) -> Self { Entry(self.0.clone()) } }
+    impl Clone for Entry { fn clone(&self) -> Self { Entry { inner: self.inner.clone(), _controllers: self._controllers.clone() } } }
     impl Clone for DropDown { fn clone(&self) -> Self { DropDown(self.0.clone()) } }
     impl Clone for CheckButton { fn clone(&self) -> Self { CheckButton(self.0.clone()) } }
     impl Clone for RadioButton { fn clone(&self) -> Self { RadioButton(self.0.clone()) } }
@@ -265,7 +284,7 @@ mod gtk_adapter {
 
     pub fn create_entry() -> Result<Entry, Error> {
         let e = crate::backends::gtk::create_entry().map_err(|e| Error::Backend(format!("{}", e)))?;
-        Ok(Entry(e))
+        Ok(Entry { inner: e, _controllers: Rc::new(RefCell::new(Vec::new())) })
     }
 
     // ---- Menu types ----

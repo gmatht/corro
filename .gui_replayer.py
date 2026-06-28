@@ -38,8 +38,11 @@ KF_ALTDOWN = 0x2000
 def _post(hwnd, msg, wparam, lparam=0):
     """Post a message to the given window."""
     if not HAS_WIN32 or hwnd is None:
-        return
-    ctypes.windll.user32.PostMessageW(hwnd, msg, wparam, lparam)
+        return False
+    ok = ctypes.windll.user32.PostMessageW(hwnd, msg, wparam, lparam)
+    if not ok:
+        print(f"  WARN: PostMessageW({hwnd}, 0x{msg:04x}, 0x{wparam:04x}) failed (returned {ok})")
+    return ok
 
 
 def key_down(hwnd, vk_code, syskey=False):
@@ -90,29 +93,25 @@ def send_close(hwnd):
 
 
 def send_alt_f(hwnd):
-    """Send Alt+F key sequence to activate File menu.
+    """Send Alt+F key sequence to set the NWG seq_alt_f flag.
+
+    This activates the Rust-level Alt+F detector so that a subsequent
+    Q keystroke (sent via the normal key path to the focused child)
+    triggers save_before_quit.  We do NOT send Q here — the replayer
+    sends all keystrokes including Q through the normal input path so
+    that the Rust handle_key function processes them in order.
 
     Alt down uses WM_SYSKEYDOWN to set the Alt modifier.  F uses regular
-    WM_KEYDOWN (not WM_SYSKEYDOWN) so that TranslateMessage generates a
-    plain WM_CHAR('f') rather than WM_SYSCHAR('f').  WM_SYSCHAR would be
-    dispatched to DefWindowProc which interprets Alt+Accelerator and opens
-    the NWG menu, stealing focus from the quit handler.
-
-    After the key sequence, send WM_CLOSE as a fallback quit mechanism.
-    The NWG backend's raw WM_CLOSE handler (backends_nwg_adapter.rs) calls
-    quit_main_loop() directly, bypassing any focus/menu issues.
+    WM_KEYDOWN so TranslateMessage generates WM_CHAR('f') rather than
+    WM_SYSCHAR('f'), avoiding the NWG menu accelerator.
     """
     key_down(hwnd, 0x12, syskey=True)   # VK_MENU, WM_SYSKEYDOWN
     time.sleep(0.1)
-    key_down(hwnd, 0x46, syskey=False)  # VK_F, WM_KEYDOWN (Alt held but not syskey)
+    key_down(hwnd, 0x46, syskey=False)  # VK_F, WM_KEYDOWN
     time.sleep(0.05)
     key_up(hwnd, 0x46, syskey=False)    # VK_F up
     time.sleep(0.05)
     key_up(hwnd, 0x12, syskey=True)     # VK_MENU up, WM_SYSKEYUP
-
-
-def send_q(hwnd):
-    send_key(hwnd, 0x51)  # VK_Q
 
 
 def send_down(hwnd):
@@ -202,7 +201,7 @@ def _cleanup(proc, label=""):
         return False
 
 
-def run_test_recrec5(binary="target/debug/corro.exe"):
+def run_test_recrec5(binary="target/release/corro.exe"):
     """Test: open subtotal-tiny, enter data, quit."""
     print(f"Running recrec5 test with {binary}")
     test_file = "docs/tests/subtotal-tiny.corro"
@@ -234,23 +233,25 @@ def run_test_recrec5(binary="target/debug/corro.exe"):
     send_enter(hwnd)
     time.sleep(0.3)
 
-    # Quit via Alt+F+Q, with WM_CLOSE fallback
-    send_alt_f(hwnd)
+    # Quit via WM_CLOSE.  The NWG backend's raw WM_CLOSE handler
+    # calls quit_main_loop() which posts WM_QUIT, causing the message
+    # loop to exit cleanly.  This avoids the race condition with
+    # Alt+F+Q where PostMessageW(WM_KEYUP/Q) fails because the app
+    # already started quitting after processing WM_KEYDOWN/Q.
     time.sleep(0.3)
-    send_q(hwnd)
-    time.sleep(0.5)
-    send_close(hwnd)  # fallback: WM_CLOSE bypasses menu focus issues
+    send_close(hwnd)
     time.sleep(0.5)
 
     result = _cleanup(proc, "recrec5")
     final_size = os.path.getsize(output_file) if os.path.exists(output_file) else 0
     output_exists = "yes" if os.path.exists(output_file) and final_size > initial_size else "no"
     print(f"  output_file={output_exists} initial={initial_size}b final={final_size}b")
+    _restore_test_file()
     print("recrec5 done")
     return result
 
 
-def run_test_recrec6(binary="target/debug/corro.exe"):
+def run_test_recrec6(binary="target/release/corro.exe"):
     """Test: open subtotal-tiny, navigate cells, quit."""
     print(f"Running recrec6 test with {binary}")
     test_file = "docs/tests/subtotal-tiny.corro"
@@ -279,39 +280,62 @@ def run_test_recrec6(binary="target/debug/corro.exe"):
     send_enter(hwnd)
     time.sleep(0.3)
 
-    # Quit via Alt+F+Q, with WM_CLOSE fallback
-    send_alt_f(hwnd)
+    # Quit via WM_CLOSE (see recrec5 for rationale).
     time.sleep(0.3)
-    send_q(hwnd)
-    time.sleep(0.5)
-    send_close(hwnd)  # fallback: WM_CLOSE bypasses menu focus issues
+    send_close(hwnd)
     time.sleep(0.5)
 
     result = _cleanup(proc, "recrec6")
+    _restore_test_file()
     print("recrec6 done")
     return result
 
 
 def _restore_test_file():
-    """Restore docs/tests/subtotal-tiny.corro from git HEAD.
+    """Restore docs/tests/subtotal-tiny.corro to canonical 21-line state
+    and ensure it is writable.
+
     The corro binary modifies this file in-place when launched with --gui,
-    so we must restore it before each test run to avoid accumulating
-    extra SET commands that would cause golden-file mismatches.
+    appending SET commands.  We restore it before each test run to avoid
+    accumulating extra SET commands that would cause golden-file mismatches.
+
+    The canonical file is the first 22 lines.
+    We preserve them and discard any replayer artifacts that have been
+    appended by previous runs.
     """
-    import subprocess as _sp
+    canonical_lines = 22
+    path = "docs/tests/subtotal-tiny.corro"
+    if not os.path.exists(path):
+        print(f"WARN: _restore_test_file: {path} not found, cannot restore")
+        return
     try:
-        _sp.run(["git", "checkout", "HEAD", "--",
-                 "docs/tests/subtotal-tiny.corro"],
-                capture_output=True, timeout=10)
-    except Exception:
-        pass  # git not available; user must restore manually
+        # First clear the read-only attribute so we can write.
+        # git checks out files read-only on Windows.
+        if sys.platform == "win32":
+            import subprocess as _sp
+            # Use PowerShell for reliable attribute clearing (attrib.exe can be flaky)
+            _sp.run(["powershell", "-Command",
+                     f"Set-ItemProperty -LiteralPath '{path}' -Name IsReadOnly -Value $false"],
+                    capture_output=True, text=True)
+        import os as _os, stat as _stat
+        _os.chmod(path, _stat.S_IWRITE | _stat.S_IREAD)
+    except Exception as e:
+        print(f"WARN: _restore_test_file clear read-only failed: {e}")
+    try:
+        with open(path, "r") as f:
+            lines = f.readlines()
+        if len(lines) != canonical_lines:
+            with open(path, "w") as f:
+                f.writelines(lines[:canonical_lines])
+    except Exception as e:
+        print(f"WARN: _restore_test_file error restoring {path}: {e}")
 
 
 def main():
     _restore_test_file()
     parser = argparse.ArgumentParser(description="GUI Replayer for NWG tests")
     parser.add_argument("--test", choices=["recrec5", "recrec6", "all"], default="all")
-    parser.add_argument("--binary", default="target/debug/corro.exe")
+    parser.add_argument("--binary", default="target/release/corro.exe")
     parser.add_argument("--list", action="store_true", help="List available tests")
     args = parser.parse_args()
 

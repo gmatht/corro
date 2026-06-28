@@ -165,6 +165,13 @@ fn main() {
         let _ = a.load_initial();
         a
     };
+    // Leak the App so its memory stays valid after main() returns.
+    // The GuiState holds a raw pointer to this App; DOM event listeners
+    // registered by the WASM adapter continue to fire after main() exits
+    // because their closures are stored in a global static (CLOSURES).
+    // If we let the App drop, the raw pointer becomes dangling and keyboard
+    // callbacks would access freed memory (undefined behavior).
+    let app: &'static mut corro::gui::App = Box::leak(Box::new(app));
     if let Err(e) = app.run() {
         eprintln!("corro: run error: {e}");
     }

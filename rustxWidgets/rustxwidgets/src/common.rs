@@ -20,7 +20,7 @@ macro_rules! platform_module {
     };
 }
 
-#[cfg(all(feature = "gtk", target_os = "linux"))]
+#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
 mod platform {
     platform_module!(crate::backends_gtk_adapter, GtkOrientation);
 }
@@ -159,7 +159,7 @@ macro_rules! common_types_mod {
 }
 
 // Common wrapper types with `inner` field for the platform-specific types
-#[cfg(all(feature = "gtk", target_os = "linux"))]
+#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
 mod common_types {
     common_types_mod!();
     impl Canvas {
@@ -197,7 +197,7 @@ mod common_types { common_types_mod!(); }
 #[cfg(feature = "zork")]
 mod common_types { common_types_mod!(); }
 
-#[cfg(all(feature = "gtk", target_os = "linux"))]
+#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
 pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog};
 
 #[cfg(windows)]
@@ -216,7 +216,7 @@ pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleActi
 pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog};
 
 // Re-export Orientation from the active platform backend
-#[cfg(all(feature = "gtk", target_os = "linux"))]
+#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
 pub use self::platform::GtkOrientation as Orientation;
 #[cfg(windows)]
 pub use self::platform::NwgOrientation as Orientation;

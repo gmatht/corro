@@ -77,22 +77,43 @@ if [ "$HAS_CARGO" = true ]; then
     # corro.exe --gui on that file, which appends SET commands).
     # Also ensure test_rec5.corro is byte-identical to subtotal-tiny.corro
     # (the committed version may be out of sync).
+    # The committed HEAD may itself have accumulated replayer artifacts,
+    # so we truncate to the canonical 21 lines after checkout.
     git checkout -- docs/tests/subtotal-tiny.corro test_rec5.corro 2>/dev/null || true
-    chmod +w test_rec5.corro 2>/dev/null || true
-    cp -f docs/tests/subtotal-tiny.corro test_rec5.corro 2>/dev/null || true
+    for f in docs/tests/subtotal-tiny.corro test_rec5.corro; do
+        if [ -f "$f" ]; then
+            head -n 22 "$f" > /tmp/$(basename "$f").clean 2>/dev/null
+            cp -f /tmp/$(basename "$f").clean "$f" 2>/dev/null || true
+            chmod +w "$f" 2>/dev/null || true
+            rm -f /tmp/$(basename "$f").clean 2>/dev/null || true
+        fi
+    done
+    # On Windows, chmod +w may not clear the read-only attribute.
+    # Use attrib -r as a fallback (available via cmd.exe in Git Bash).
+    if [[ $OSTYPE == "msys" || $OSTYPE == "cygwin" || -n "${WINDIR:-}" ]]; then
+        for f in docs/tests/subtotal-tiny.corro test_rec5.corro; do
+            if [ -f "$f" ]; then
+                # Git Bash converts /d/GitHub/... to D:\GitHub\... for native Windows exes
+                cmd.exe /c "attrib -R $f" 2>/dev/null || true
+            fi
+        done
+    fi
 
     # ---------------------------------------------------------------------------
     # Rust integration tests (NWG on Windows, gtk on Linux)
     # ---------------------------------------------------------------------------
 
     echo "--- Running recording replay tests (test_tiny5 / test_tiny6) ---"
-    if cargo +nightly test --features gui --test test_tiny5 2>&1; then
+    # NOTE: No --features gui here — these tests only use ui::App (TUI) which
+    # doesn't need the gui feature. The gui feature links native-windows-gui
+    # which causes the test process to hang after completion on Windows.
+    if cargo +nightly test --test test_tiny5 2>&1; then
         pass "recrec5 (test_tiny5)"
     else
         fail "recrec5 (test_tiny5)"
     fi
 
-    if cargo +nightly test --features gui --test test_tiny6 2>&1; then
+    if cargo +nightly test --test test_tiny6 2>&1; then
         pass "recrec6 (test_tiny6)"
     else
         fail "recrec6 (test_tiny6)"
@@ -161,12 +182,12 @@ if [ "$HAS_WSL" = true ] && [ "$HAS_WSL_BASH" = true ] && [ "$HAS_WSL_CARGO" = t
     fi
 
     # Run Rust tests
-    if wsl.exe bash -c "cd '$WSL_PWD' && DISPLAY=:0 cargo +nightly test --features gui --test test_tiny5" 2>&1; then
+    if wsl.exe bash -c "cd '$WSL_PWD' && DISPLAY=:0 cargo +nightly test --test test_tiny5" 2>&1; then
         pass "GTK recrec5"
     else
         fail "GTK recrec5"
     fi
-    if wsl.exe bash -c "cd '$WSL_PWD' && DISPLAY=:0 cargo +nightly test --features gui --test test_tiny6" 2>&1; then
+    if wsl.exe bash -c "cd '$WSL_PWD' && DISPLAY=:0 cargo +nightly test --test test_tiny6" 2>&1; then
         pass "GTK recrec6"
     else
         fail "GTK recrec6"
@@ -176,6 +197,26 @@ elif [ "$HAS_WSL" = true ] && [ "$HAS_WSL_BASH" = true ]; then
 else
     skip "GTK tests (WSL/bash not available)"
 fi
+
+# ---------------------------------------------------------------------------
+# WASM build (cross-compile check)
+# ---------------------------------------------------------------------------
+
+echo "--- WASM build ---"
+if [ "$HAS_CARGO" = true ]; then
+    if rustup target list --toolchain nightly 2>/dev/null | grep -q "wasm32-unknown-unknown (installed)"; then
+        if cargo +nightly build --target wasm32-unknown-unknown --features wasm --no-default-features 2>&1; then
+            pass "WASM build"
+        else
+            fail "WASM build"
+        fi
+    else
+        skip "WASM build (wasm32-unknown-unknown target not installed)"
+    fi
+else
+    skip "WASM build (cargo not available)"
+fi
+echo ""
 
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed, $SKIP skipped ==="

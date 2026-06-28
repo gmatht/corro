@@ -993,7 +993,7 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
     /// Safe to call from signal handlers and event callbacks.
     pub fn quit(&self) {
         #[cfg(target_arch = "wasm32")]
-        {}
+        crate::backends_wasm_adapter::quit_main_loop();
         #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
         let _ = crate::backends_gtk_adapter::quit_main_loop();
         #[cfg(all(windows, not(feature = "zork")))]

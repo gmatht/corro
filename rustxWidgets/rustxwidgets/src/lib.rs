@@ -9,7 +9,7 @@ pub mod lifecycle_stress;
 pub mod backends;
 #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
 mod backends_gtk_adapter_impl;
-#[cfg(all(feature = "gtk", not(feature = "zork")))]
+#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
 pub mod backends_gtk_adapter;
 #[cfg(all(windows, not(feature = "zork")))]
 pub mod backends_nwg_adapter;

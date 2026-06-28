@@ -193,20 +193,21 @@ mod nwg_adapter {
                             // Forward to the focused child.
                             winapi::um::winuser::PostMessageW(focused, msg, w, l);
                         } else {
-                            // No child has focus.  Post to all grandchildren
-                            // (Canvas and Entry are grandchildren of the main
-                            // window, inside the Box container).  Each child's
-                            // raw event handler will process or ignore the
-                            // message as appropriate.
-                            let mut child = winapi::um::winuser::GetWindow(parent_hwnd, winapi::um::winuser::GW_CHILD);
-                            while child != std::ptr::null_mut() {
-                                let mut gc = winapi::um::winuser::GetWindow(child, winapi::um::winuser::GW_CHILD);
-                                while gc != std::ptr::null_mut() {
-                                    winapi::um::winuser::PostMessageW(gc, msg, w, l);
-                                    gc = winapi::um::winuser::GetWindow(gc, winapi::um::winuser::GW_HWNDNEXT);
+                            // No child has focus.  Post to all descendant
+                            // windows recursively.  This ensures the formula
+                            // entry (great-great-grandchild of the main window
+                            // in the VBox -> formula bar -> entry hierarchy)
+                            // receives keyboard messages even when no child
+                            // has keyboard focus.
+                            unsafe fn post_to_descendants(hwnd: winapi::shared::windef::HWND, msg: u32, w: winapi::shared::minwindef::WPARAM, l: winapi::shared::minwindef::LPARAM) {
+                                let mut child = winapi::um::winuser::GetWindow(hwnd, winapi::um::winuser::GW_CHILD);
+                                while child != std::ptr::null_mut() {
+                                    winapi::um::winuser::PostMessageW(child, msg, w, l);
+                                    post_to_descendants(child, msg, w, l);
+                                    child = winapi::um::winuser::GetWindow(child, winapi::um::winuser::GW_HWNDNEXT);
                                 }
-                                child = winapi::um::winuser::GetWindow(child, winapi::um::winuser::GW_HWNDNEXT);
                             }
+                            post_to_descendants(parent_hwnd, msg, w, l);
                         }
                     }
                     Some(0) // consumed — prevent DefWindowProc from activating menu
@@ -1348,6 +1349,26 @@ mod nwg_adapter {
 
         if hwnd != std::ptr::null_mut() {
             let raw_hwnd: winapi::shared::windef::HWND = hwnd as _;
+
+            // WM_KEYDOWN/WM_SYSKEYDOWN handler for keyboard input.
+            // Without this, the Canvas's key_cb is never called because
+            // no raw handler is registered to process keystroke messages.
+            {
+                let kc = key_cb.clone();
+                static KEYBOARD_ID: AtomicUsize = AtomicUsize::new(0x70000000);
+                let kid = KEYBOARD_ID.fetch_add(1, Ordering::SeqCst);
+                if let Some(h) = nwg::bind_raw_event_handler(
+                    &nwg::ControlHandle::Hwnd(raw_hwnd), kid,
+                    move |_h, msg, w, _l| {
+                        if msg == winapi::um::winuser::WM_KEYDOWN || msg == winapi::um::winuser::WM_SYSKEYDOWN {
+                            if let Some(ref mut f) = *kc.borrow_mut() {
+                                if f(w as u32) { return Some(0); }
+                            }
+                        }
+                        None
+                    },
+                ).ok() { handlers.push(h); }
+            }
 
             // Suppress WM_ERASEBKGND (prevent flash from class background brush)
             {

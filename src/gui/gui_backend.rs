@@ -569,8 +569,6 @@ fn handle_edit_key(key: u32, state: &GuiState) -> bool {
             state.edit_buf.borrow_mut().clear();
             state.mode.set(GuiMode::Normal);
             update_formula_bar(state, state.last_row.get(), state.last_col.get());
-            state.canvas.set_can_focus(true);
-            state.canvas.grab_focus();
             state.canvas.queue_redraw();
             true
         }
@@ -641,12 +639,25 @@ fn start_edit(state: &GuiState) {
 }
 
 fn start_edit_with(state: &GuiState, ch: char) {
+    let already_editing = state.editing.get();
     state.editing.set(true);
-    state.edit_buf.borrow_mut().clear();
     let s = ch.to_string();
-    state.edit_buf.borrow_mut().push_str(&s);
-    state.formula_entry.set_text(&s);
-    state.formula_entry.grab_focus();
+    if state.edit_buf.borrow().is_empty() {
+        state.edit_buf.borrow_mut().push_str(&s);
+    } else {
+        // Already has characters - append so multi-character edits work
+        // even when keystrokes are delivered to both canvas and formula
+        // entry (NWG fallback when no child has keyboard focus).
+        let mut buf = state.edit_buf.borrow_mut();
+        buf.push_str(&s);
+    }
+    if !already_editing {
+        // First character: clear the formula entry so the default keyboard
+        // handler (WM_CHAR on Windows, key-press-event on GTK) inserts
+        // this character without doubling.
+        state.formula_entry.set_text("");
+        state.formula_entry.grab_focus();
+    }
     state.canvas.queue_redraw();
 }
 
@@ -670,11 +681,14 @@ fn commit_edit(state: &GuiState) {
         let wbo = WorkbookOp::SheetOp { sheet_id, op };
         if let Some(ref p) = app.core.path.clone() {
             let mut active_sheet = sheet_id;
-            let _ = crate::io::commit_workbook_op(
+            if let Err(e) = crate::io::commit_workbook_op(
                 p, &mut app.core.offset, &mut app.core.workbook,
                 &mut active_sheet, &wbo,
-            );
-            app.core.ops_applied = app.core.ops_applied.saturating_add(1);
+            ) {
+                eprintln!("ERROR: commit_workbook_op failed: {e} (path={})", p.display());
+            } else {
+                app.core.ops_applied = app.core.ops_applied.saturating_add(1);
+            }
         }
         let main_rows = crate::addr::MainRows(app.core.workbook.active_sheet().grid.main_rows());
         let main_cols = crate::addr::MainCols(app.core.workbook.active_sheet().grid.main_cols());
@@ -688,13 +702,6 @@ fn commit_edit(state: &GuiState) {
     }
     state.edit_buf.borrow_mut().clear();
     state.canvas.queue_redraw();
-
-    // Return keyboard focus to the canvas so subsequent Alt-F+Q key
-    // sequences are handled by the canvas key controller rather than
-    // the formula entry, where GTK's internal mnemonic monitor may
-    // intercept the Alt modifier before our controller can process it.
-    state.canvas.set_can_focus(true);
-    state.canvas.grab_focus();
 }
 
 fn handle_delete(state: &GuiState) {
@@ -725,11 +732,14 @@ fn handle_delete(state: &GuiState) {
             let wbo = WorkbookOp::SheetOp { sheet_id, op };
             if let Some(ref p) = app.core.path.clone() {
                 let mut active_sheet = sheet_id;
-                let _ = crate::io::commit_workbook_op(
+                if let Err(e) = crate::io::commit_workbook_op(
                     p, &mut app.core.offset, &mut app.core.workbook,
                     &mut active_sheet, &wbo,
-                );
-                app.core.ops_applied = app.core.ops_applied.saturating_add(1);
+                ) {
+                    eprintln!("ERROR: commit_workbook_op failed: {e} (path={})", p.display());
+                } else {
+                    app.core.ops_applied = app.core.ops_applied.saturating_add(1);
+                }
             }
             app.core.status = "Cleared selection".into();
             recompute_viewport(state);
@@ -744,11 +754,14 @@ fn handle_delete(state: &GuiState) {
     let wbo = WorkbookOp::SheetOp { sheet_id, op };
     if let Some(ref p) = app.core.path.clone() {
         let mut active_sheet = sheet_id;
-        let _ = crate::io::commit_workbook_op(
+        if let Err(e) = crate::io::commit_workbook_op(
             p, &mut app.core.offset, &mut app.core.workbook,
             &mut active_sheet, &wbo,
-        );
-        app.core.ops_applied = app.core.ops_applied.saturating_add(1);
+        ) {
+            eprintln!("ERROR: commit_workbook_op failed: {e} (path={})", p.display());
+        } else {
+            app.core.ops_applied = app.core.ops_applied.saturating_add(1);
+        }
     }
     recompute_viewport(state);
     state.canvas.queue_redraw();
@@ -1107,10 +1120,6 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // Ensure the canvas can receive keyboard focus (needed after commit_edit
     // to return focus — GtkDrawingArea does not accept focus by default).
     canvas.set_can_focus(true);
-    // Grab focus to the canvas so keyboard events arrive at the canvas's
-    // on_key handler.  Without this, NWG may leave focus on the window or
-    // menu bar, and keystrokes sent by the replayer would be lost.
-    canvas.grab_focus();
 
     // Status label
     let status_label = rxapp.new_label("Ready")?;
@@ -1251,14 +1260,20 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
             shared_k_cnt.key_counter.set(shared_k_cnt.key_counter.get() + 1);
             shared_k_cnt.last_key.set(keyval);
             let k = normalize(keyval);
-            // Intercept navigation keys from formula entry and forward
-            // them through handle_key so the user can navigate cells
-            // even when the canvas does not have keyboard focus.
             match k {
                 RETURN | ESCAPE | TAB | LEFT | RIGHT | UP | DOWN
                 | HOME | END | PAGE_UP | PAGE_DOWN => {
                     handle_key(keyval, &shared_k);
                     true
+                }
+                // Printable characters: start editing if needed, but return
+                // false so the default handler inserts the character via
+                // WM_CHAR (Windows) or key-press-event default (GTK).
+                // This avoids doubling when start_edit_with clears the
+                // entry and the default handler inserts the same char.
+                _ if (32..=126).contains(&k) => {
+                    handle_key(keyval, &shared_k);
+                    false
                 }
                 _ => false,
             }

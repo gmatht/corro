@@ -29,6 +29,50 @@ mod wasm_adapter {
         document().create_element(tag).unwrap()
     }
 
+    pub fn quit_main_loop() {
+        // On WASM there is no message loop to quit.  Signal the test
+        // framework that the app has quit, and try to close the tab.
+        if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
+            // Set document title as a signal for test frameworks
+            // that may poll for it.
+            doc.set_title("CORRO_QUIT");
+        }
+        if let Some(win) = web_sys::window() {
+            let _ = win.close();
+        }
+    }
+
+    /// Store a line of output in a JS global (`window.__corro_output`).
+    /// The browser test framework can read this variable after the app quits
+    /// to verify the recording replay output.
+    pub fn append_wasm_output_line(line: &str) {
+        if let Some(win) = web_sys::window() {
+            let js_val = wasm_bindgen::JsValue::from_str(line);
+            let _ = js_sys::Reflect::set(
+                &win,
+                &wasm_bindgen::JsValue::from_str("__corro_output_dirty"),
+                &wasm_bindgen::JsValue::TRUE,
+            );
+            let current = js_sys::Reflect::get(
+                &win,
+                &wasm_bindgen::JsValue::from_str("__corro_output"),
+            )
+            .ok()
+            .and_then(|v| v.as_string())
+            .unwrap_or_default();
+            let new = if current.is_empty() {
+                line.to_string()
+            } else {
+                format!("{}\n{}", current, line)
+            };
+            let _ = js_sys::Reflect::set(
+                &win,
+                &wasm_bindgen::JsValue::from_str("__corro_output"),
+                &wasm_bindgen::JsValue::from_str(&new),
+            );
+        }
+    }
+
     fn set_css(elem: &Element, prop: &str, val: &str) {
         if let Some(html) = elem.dyn_ref::<HtmlElement>() {
             html.style().set_property(prop, val).ok();
@@ -108,11 +152,17 @@ mod wasm_adapter {
     // -----------------------------------------------------------------------
 pub struct Window {
     elem: HtmlDivElement,
+    event_key_cb: Rc<RefCell<Option<Box<dyn FnMut(u32, u32) -> i32>>>>,
+    closures: Rc<RefCell<Vec<Box<dyn Any>>>>,
 }
 
 impl Clone for Window {
     fn clone(&self) -> Self {
-        Window { elem: self.elem.clone() }
+        Window {
+            elem: self.elem.clone(),
+            event_key_cb: self.event_key_cb.clone(),
+            closures: self.closures.clone(),
+        }
     }
 }
 
@@ -165,7 +215,31 @@ impl Window {
         /// # Safety – kept for API compatibility; no‑op on WASM.
         pub unsafe fn insert_action_group(&self, _name: &str, _group_ptr: *mut c_void) {}
         pub fn on_event(&self, _cb: Box<dyn FnMut(*mut c_void) -> i32>) {}
-        pub fn on_event_key(&self, _cb: Box<dyn FnMut(u32, u32) -> i32>) {}
+        pub fn on_event_key(&self, mut cb: Box<dyn FnMut(u32, u32) -> i32>) {
+            *self.event_key_cb.borrow_mut() = Some(cb);
+            let cb2 = self.event_key_cb.clone();
+            let closure = Closure::<dyn FnMut(KeyboardEvent)>::new(move |evt: KeyboardEvent| {
+                let keyval = evt.key_code() as u32;
+                let mut state = 0u32;
+                if evt.alt_key() {
+                    state |= 0x8; // GDK_MOD1_MASK / ALT
+                }
+                if let Some(cb) = cb2.borrow_mut().as_mut() {
+                    if cb(keyval, state) != 0 {
+                        evt.prevent_default();
+                    }
+                }
+            });
+            let listener = wasm_bindgen::JsCast::unchecked_into::<js_sys::Function>(
+                closure.as_ref().clone(),
+            );
+            web_sys::window()
+                .and_then(|w| w.document())
+                .map(|doc| {
+                    doc.add_event_listener_with_callback("keydown", &listener).ok();
+                });
+            self.closures.borrow_mut().push(Box::new(closure));
+        }
     }
 
     pub fn create_window() -> Result<Window, Error> {
@@ -176,7 +250,11 @@ impl Window {
         body().append_child(div.as_ref()).map_err(|e| {
             Error::Backend(format!("create_window append: {:?}", e))
         })?;
-        Ok(Window { elem: div })
+        Ok(Window {
+            elem: div,
+            event_key_cb: Rc::new(RefCell::new(None)),
+            closures: Rc::new(RefCell::new(Vec::new())),
+        })
     }
 
     // -----------------------------------------------------------------------
