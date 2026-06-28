@@ -9,3 +9,6 @@ __pycache__/
 *.pyc
 junk.*
 debug.log
+stderr*.txt
+stdout*.txt
+commit_msg.txt
