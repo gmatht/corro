@@ -32,7 +32,10 @@ HAS_WSL_CARGO=false
 
 if command -v wsl.exe &>/dev/null; then
     HAS_WSL=true
-    if wsl.exe bash --version &>/dev/null; then
+    # Wrap wsl.exe to prevent MSYS2 path conversion (which would convert
+    # WSL paths like /mnt/d/... to D:\..., breaking the command).
+    wsl() { MSYS2_ARG_CONV_EXCL="*" wsl.exe "$@"; }
+    if wsl bash --version &>/dev/null; then
         HAS_WSL_BASH=true
     fi
 fi
@@ -45,12 +48,12 @@ elif command -v python &>/dev/null; then
     PYTHON="python"
 fi
 
-if command -v cargo &>/dev/null; then
+if command -v cargo &>/dev/null || which cargo &>/dev/null 2>&1; then
     HAS_CARGO=true
 fi
 
 if [ "$HAS_WSL" = true ] && [ "$HAS_WSL_BASH" = true ]; then
-    if wsl.exe bash -c "command -v cargo &>/dev/null" 2>/dev/null; then
+    if wsl bash -c "command -v cargo &>/dev/null" 2>/dev/null; then
         HAS_WSL_CARGO=true
     fi
 fi
@@ -80,9 +83,13 @@ if [ "$HAS_CARGO" = true ]; then
     # The committed HEAD may itself have accumulated replayer artifacts,
     # so we truncate to the canonical 21 lines after checkout.
     git checkout -- docs/tests/subtotal-tiny.corro test_rec5.corro 2>/dev/null || true
+    # The committed file has blank lines between SET commands (42 lines total).
+    # head -n 42 preserves all 21 SET/FILL commands + 21 blank lines.
+    # Using fewer lines (e.g. head -n 21) would truncate to only 11 SET
+    # commands because of the interleaved blank lines.
     for f in docs/tests/subtotal-tiny.corro test_rec5.corro; do
         if [ -f "$f" ]; then
-            head -n 22 "$f" > /tmp/$(basename "$f").clean 2>/dev/null
+            head -n 42 "$f" > /tmp/$(basename "$f").clean 2>/dev/null
             cp -f /tmp/$(basename "$f").clean "$f" 2>/dev/null || true
             chmod +w "$f" 2>/dev/null || true
             rm -f /tmp/$(basename "$f").clean 2>/dev/null || true
@@ -97,6 +104,12 @@ if [ "$HAS_CARGO" = true ]; then
                 cmd.exe /c "attrib -R $f" 2>/dev/null || true
             fi
         done
+    fi
+    # Ensure test_rec5.corro is writable and has consistent line endings.
+    # The git checkout may leave it read-only with CRLF line endings, which
+    # can cause "output mismatch" in the check_vals test.
+    if [ -f test_rec5.corro ]; then
+        chmod +w test_rec5.corro 2>/dev/null || true
     fi
 
     # ---------------------------------------------------------------------------
@@ -145,12 +158,16 @@ fi
 if [[ $OSTYPE == "msys" || $OSTYPE == "cygwin" || -n "${WINDIR:-}" ]]; then
     echo "--- NWG replayer tests ---"
     if [ "$HAS_PYTHON" = true ] && [ -f .gui_replayer.py ]; then
-        if $PYTHON .gui_replayer.py --test recrec5 2>&1; then
+        # The debug binary was already built in the Build step above.
+        # Pass BIN env var so the replayer uses the freshly-built debug binary.
+        # Use release binary (debug binary has eprintln! calls that fill the
+        # stderr pipe buffer, causing the child process to block mid-commit).
+        if BIN="target/release/corro.exe" $PYTHON .gui_replayer.py --test recrec5 2>&1; then
             pass "NWG replayer: recrec5"
         else
             fail "NWG replayer: recrec5"
         fi
-        if $PYTHON .gui_replayer.py --test recrec6 2>&1; then
+        if BIN="target/release/corro.exe" $PYTHON .gui_replayer.py --test recrec6 2>&1; then
             pass "NWG replayer: recrec6"
         else
             fail "NWG replayer: recrec6"
@@ -175,19 +192,19 @@ if [ "$HAS_WSL" = true ] && [ "$HAS_WSL_BASH" = true ] && [ "$HAS_WSL_CARGO" = t
     # 'DISPLAY=:0' after 'timeout' (wrong bash syntax) don't cause errors.
     # Inside the WSL bash -c string, DISPLAY=:0 is a regular env var prefix.
     WSL_PWD="/mnt/$(pwd | sed 's|^/\([a-z]\)/|\1/|')"
-    if wsl.exe bash -c "cd '$WSL_PWD' && DISPLAY=:0 cargo +nightly build --features gui" 2>&1; then
+    if wsl bash -c "cd '$WSL_PWD' && DISPLAY=:0 cargo +nightly build --features gui" 2>&1; then
         pass "GTK build"
     else
         fail "GTK build"
     fi
 
     # Run Rust tests
-    if wsl.exe bash -c "cd '$WSL_PWD' && DISPLAY=:0 cargo +nightly test --test test_tiny5" 2>&1; then
+    if wsl bash -c "cd '$WSL_PWD' && DISPLAY=:0 cargo +nightly test --test test_tiny5" 2>&1; then
         pass "GTK recrec5"
     else
         fail "GTK recrec5"
     fi
-    if wsl.exe bash -c "cd '$WSL_PWD' && DISPLAY=:0 cargo +nightly test --test test_tiny6" 2>&1; then
+    if wsl bash -c "cd '$WSL_PWD' && DISPLAY=:0 cargo +nightly test --test test_tiny6" 2>&1; then
         pass "GTK recrec6"
     else
         fail "GTK recrec6"
