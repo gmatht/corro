@@ -89,7 +89,7 @@ if [ "$HAS_CARGO" = true ]; then
     # commands because of the interleaved blank lines.
     for f in docs/tests/subtotal-tiny.corro test_rec5.corro; do
         if [ -f "$f" ]; then
-            head -n 42 "$f" > /tmp/$(basename "$f").clean 2>/dev/null
+            head -n 42 "$f" > /tmp/$(basename "$f").clean 2>/dev/null || true
             cp -f /tmp/$(basename "$f").clean "$f" 2>/dev/null || true
             chmod +w "$f" 2>/dev/null || true
             rm -f /tmp/$(basename "$f").clean 2>/dev/null || true
