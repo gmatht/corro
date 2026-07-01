@@ -1,0 +1,26 @@
+# Normalize to LF for all text files.
+* text=auto eol=lf
+
+# Rust source files must use LF line endings — the cross-backend
+# consistency test (tests/gtk_todo_tests.rs) does pattern matching
+# on source content and assumes Unix line endings.
+*.rs text eol=lf
+
+# Cargo and config files
+*.toml text eol=lf
+*.lock -diff
+*.md text eol=lf
+*.sh text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+
+# Binary / test-data artefacts — do not touch
+*.corro binary
+*.ods binary
+*.png binary
+*.ico binary
+*.exe binary
+*.dll binary
+*.so binary
+*.pyc binary

@@ -13,3 +13,7 @@ debug.log
 stderr*.txt
 stdout*.txt
 commit_msg.txt
+# Stray test artifacts
+/null
+/t.corro
+/--

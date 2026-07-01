@@ -83,7 +83,7 @@ macro_rules! common_types_mod {
             pub fn set_child_box(&self, bx: &WidgetBox) { self.inner.set_child_box(&bx.inner); }
         }
         impl WidgetBox {
-            pub fn append(&mut self, child: &impl AsRef<*mut std::os::raw::c_void>) { self.inner.append(child); }
+            pub fn append(&self, child: &impl AsRef<*mut std::os::raw::c_void>) { self.inner.append(child); }
             pub fn set_child_hexpand(&self, child: &impl AsRef<*mut std::os::raw::c_void>, expand: bool) { self.inner.set_child_hexpand(child, expand); }
             pub fn set_child_vexpand(&self, child: &impl AsRef<*mut std::os::raw::c_void>, expand: bool) { self.inner.set_child_vexpand(child, expand); }
             pub fn set_hexpand(&self, expand: bool) { self.inner.set_hexpand(expand); }

@@ -268,16 +268,35 @@ mod gtk_adapter {
                     let symbols = &loader.symbols;
                     let is_gtk4 = symbols.gtk_drawing_area_set_draw_func.is_some();
                     if is_gtk4 {
-                        // GTK4: use EventControllerKey — "key-press-event" signal is deprecated
-                        // and may not fire on GtkEntry.  EventControllerKey works reliably.
+                        // GTK4: GtkEntry's internal EventControllerKey (CAPTURE phase) consumes
+                        // RETURN/TAB/ESCAPE/arrows before our bubble-phase EventControllerKey can
+                        // fire.  We use two mechanisms:
+                        //
+                        // 1. EventControllerKey for printable characters (which the entry does
+                        //    NOT consume for non-IM keys).
+                        // 2. The "activate" signal for RETURN.  GtkEntry emits "activate"
+                        //    synchronously before its internal controller returns GDK_EVENT_STOP,
+                        //    so we can commit the edit.
+                        let shared_cb = std::rc::Rc::new(std::cell::RefCell::new(Some(cb)));
+                        self._controllers.borrow_mut().push(Box::new(shared_cb.clone()));
                         if let Ok(ctrl) = gtk_dynamic_loader::EventControllerKey::new(loader.clone()) {
-                            let mut cb = cb;
+                            let sc = shared_cb.clone();
                             let _ = ctrl.connect_key_pressed(Box::new(move |keyval: u32, state: u32| -> i32 {
-                                if cb(keyval, state) { 1 } else { 0 }
+                                if let Some(ref mut f) = *sc.borrow_mut() {
+                                    if f(keyval, state) { 1 } else { 0 }
+                                } else { 0 }
                             }));
                             ctrl.add_to_widget(&self.inner);
                             self._controllers.borrow_mut().push(Box::new(ctrl));
                         }
+                        // Connect to "activate" for RETURN (which the entry's internal controller
+                        // stops before our bubble-phase EventControllerKey sees it).
+                        let sa = shared_cb.clone();
+                        let _ = self.inner.connect_activate(Box::new(move |_entry: *mut std::os::raw::c_void| {
+                            if let Some(ref mut f) = *sa.borrow_mut() {
+                                f(0xFF0D, 0); // VK_RETURN
+                            }
+                        }));
                     } else {
                         // GTK3 path: connect to raw "key-press-event" signal
                         let l = loader.clone();

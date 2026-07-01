@@ -31,10 +31,124 @@ fn gui_menu_items_available() {
     assert!(all_menu_items_found, "Not all Ratatui menu items have GTK equivalents");
 }
 
-/// Strip leading whitespace from each line so pattern matching is
-/// resilient to indentation changes (e.g. rustfmt, refactoring).
+/// Strip leading (and trailing) whitespace from each line so pattern
+/// matching is resilient to indentation changes (e.g. rustfmt,
+/// refactoring) and to \r\n / \r line-ending differences.
 fn strip_leading(s: &str) -> String {
-    s.lines().map(|l| l.trim_start()).collect::<Vec<_>>().join("\n")
+    s.lines().map(|l| l.trim()).collect::<Vec<_>>().join("\n")
+}
+
+/// Extract string literal match-arm values from a Rust `match` block body.
+/// This parses the content between the opening `{` after `match name {` and
+/// the matching closing `}` at the function level.  It returns only simple
+/// identifier-like string literals (no spaces, pipes, or operator chars).
+fn extract_match_arm_strings(text: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    // Find the first '{' that starts the match body (skipping comments)
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+
+    // Skip past `match name {` to find the opening `{`
+    let mut brace_depth = 0i32;
+    let mut in_match_body = false;
+    while i < len {
+        if chars[i] == '/' && i + 1 < len {
+            if chars[i + 1] == '/' {
+                i += 2;
+                while i < len && chars[i] != '\n' { i += 1; }
+                continue;
+            }
+            if chars[i + 1] == '*' {
+                i += 2;
+                while i + 1 < len && !(chars[i] == '*' && chars[i + 1] == '/') { i += 1; }
+                if i + 1 < len { i += 2; }
+                continue;
+            }
+        }
+        if chars[i] == '{' {
+            brace_depth += 1;
+            if !in_match_body && brace_depth == 1 {
+                in_match_body = true;
+            }
+        } else if chars[i] == '}' {
+            brace_depth -= 1;
+            if in_match_body && brace_depth == 0 {
+                break; // end of function/block
+            }
+        } else if in_match_body && chars[i] == '"' {
+            // Extract string literal content
+            i += 1;
+            let mut s = String::new();
+            while i < len {
+                if chars[i] == '\\' && i + 1 < len {
+                    i += 2;
+                    continue;
+                }
+                if chars[i] == '"' {
+                    break;
+                }
+                s.push(chars[i]);
+                i += 1;
+            }
+            // Only keep identifier-like strings (action names are
+            // snake_case or simple words with no spaces/pipes)
+            if !s.is_empty()
+                && !s.contains(char::is_whitespace)
+                && !s.contains('|')
+                && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                result.push(s);
+            }
+        }
+        i += 1;
+    }
+    result.sort();
+    result.dedup();
+    result
+}
+
+#[test]
+fn gui_menu_action_names_cover_all_defined_actions() {
+    // Verify that every action name defined in menu.rs::action_kind_to_name()
+    // has a corresponding match arm in gui_backend.rs::handle_menu_action().
+    // This ensures the GUI backend dispatches all defined menu actions.
+    let menu_rs = fs::read_to_string("src/gui/menu.rs").unwrap();
+    let gui_backend_rs = fs::read_to_string("src/gui/gui_backend.rs").unwrap();
+
+    // Extract action names from action_kind_to_name() in menu.rs
+    let menu_normalized = strip_leading(&menu_rs);
+    let action_names: Vec<String> = {
+        let start_marker = "pub fn action_kind_to_name";
+        let start = menu_normalized.find(start_marker)
+            .expect("action_kind_to_name not found in menu.rs");
+        let body = &menu_normalized[start..];
+        extract_match_arm_strings(body)
+    };
+
+    // Extract action names from handle_menu_action() match arms in gui_backend.rs
+    let gui_normalized = strip_leading(&gui_backend_rs);
+    let handled_names: Vec<String> = {
+        let start_marker = "fn handle_menu_action";
+        let start = gui_normalized.find(start_marker)
+            .expect("handle_menu_action not found in gui_backend.rs");
+        let body = &gui_normalized[start..];
+        extract_match_arm_strings(body)
+    };
+
+    // Verify: every action name from menu.rs must appear in gui_backend.rs
+    let mut missing: Vec<&str> = Vec::new();
+    for name in &action_names {
+        if !handled_names.iter().any(|h| h == name) {
+            missing.push(name);
+        }
+    }
+
+    assert!(
+        missing.is_empty(),
+        "Menu actions defined in menu.rs but missing from gui_backend.rs::handle_menu_action:\n  {}",
+        missing.join("\n  ")
+    );
 }
 
 #[test]

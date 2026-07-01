@@ -137,7 +137,10 @@ pub fn register_action<F: FnMut() + 'static>(
 }
 
 /// Execute a menu action by name, wiring it to the appropriate dialog or stub.
-/// This is called when a menu item is activated.
+/// This is a shared handler intended for non-GUI backends (pancurses/ratatui).
+/// Currently unused — the GUI backend uses its own `handle_menu_action` in
+/// `gui_backend.rs`. Keep the `eprintln!` stubs until real logic is wired.
+#[allow(dead_code)]
 pub fn handle_action(name: &str, rxapp: &rustxwidgets::App) {
     match name {
         "open" => {

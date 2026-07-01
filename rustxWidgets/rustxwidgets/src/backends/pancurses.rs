@@ -4284,7 +4284,7 @@ mod pancurses_backend {
                     formula_bar_address_id: None,
                     formula_bar_entry_id: None,
                     anchor: None,
-                    menu_text: " [File]  Edit    Insert    Format    Sheet    Help".into(),
+                    menu_text: " [File]   Edit   View   Insert   Format   Sheet   Data   Help".into(),
                     status_text: "  type/F2·edit; Ctrl+C·copy; Ctrl+X·cut; Ctrl+V·paste; Ctrl+;·date; Ctrl+:·time; Ctrl+S·save; F1·help".into(),
                     border_title: String::new(),
                     formula_bar_trailing: String::new(),
@@ -4350,7 +4350,7 @@ mod pancurses_backend {
 
             // Verify key structural elements match ratatui output
             // Line 0: Menu bar
-            assert_eq!(&buf[0], " [File]  Edit    Insert    Format    Sheet    Help",
+            assert_eq!(&buf[0], " [File]   Edit   View   Insert   Format   Sheet   Data   Help",
                 "menu bar mismatch: {:?}", &buf[0]);
 
             // Line 1: Formula bar — should start with leading space then A1
@@ -4940,7 +4940,7 @@ mod pancurses_backend {
                     col_width: 12, margin_cols: 0, main_cols: total_cols,
                     formula_bar_address_id: None, formula_bar_entry_id: None,
                     anchor: None,
-                    menu_text: " [File]   Edit    Insert    Format    Sheet    Help".into(),
+                    menu_text: " [File]   Edit   View   Insert   Format   Sheet   Data   Help".into(),
                     status_text: "status bar".into(),
                     border_title: "corro  24r × 3c  ops 0".into(),
                     formula_bar_trailing: String::new(),
@@ -5286,7 +5286,7 @@ mod pancurses_backend {
                     margin_cols: 702, main_cols: 2,
                     formula_bar_address_id: None, formula_bar_entry_id: None,
                     anchor: None,
-                    menu_text: " [File]   Edit    Insert    Format    Sheet    Help".into(),
+                    menu_text: " [File]   Edit   View   Insert   Format   Sheet   Data   Help".into(),
                     status_text: "  type to edit (or addr: val)   Enter·confirm   Esc·discard".into(),
                     border_title: "corro  2r x 2c ops 34".into(),
                     formula_bar_trailing: "   ·  Loaded workbook /root/src/corro_mainloop/t_shift5.corro @ revision 34".into(),

@@ -14045,7 +14045,7 @@ mod tests {
         let help = menu_popup_area(area, MenuSection::Help, None);
 
         // x positions follow the new root order:
-        //   File(1) Edit(9) View(17) Insert(25) Format(35) Sheet(45) Data(54) Help(62)
+        //   File(1) Edit(9) View(17) Insert(25) Format(35) Sheet(45) Data(54) Help(61)
         assert_eq!(file.x, 1);
         assert_eq!(edit.x, 9);
         assert_eq!(view.x, 17);

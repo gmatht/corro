@@ -54,6 +54,7 @@ HAS_WSL_BASH=false
 HAS_PYTHON=false
 PYTHON=""
 HAS_CARGO=false
+HAS_NIGHTLY=false
 HAS_WSL_CARGO=false
 HAS_WSL_NIGHTLY=false
 WSL_GTK_AVAILABLE=false
@@ -79,6 +80,20 @@ fi
 
 if command -v cargo &>/dev/null || which cargo &>/dev/null 2>&1; then
     HAS_CARGO=true
+fi
+
+# Check for Rust nightly toolchain on the host (used by all cargo +nightly commands)
+HAS_NIGHTLY=false
+if command -v rustup &>/dev/null; then
+    if rustup toolchain list 2>/dev/null | grep -q nightly; then
+        HAS_NIGHTLY=true
+    fi
+fi
+
+# Select cargo command: prefer nightly, fall back to default
+CARGO_CMD="cargo"
+if [ "$HAS_NIGHTLY" = true ]; then
+    CARGO_CMD="cargo +nightly"
 fi
 
 # Deep WSL prerequisite checks
@@ -131,7 +146,7 @@ echo "=== GUI Backend Test Suite ==="
 echo "Host:       $(uname -s 2>/dev/null || echo unknown)"
 echo "WSL:        $HAS_WSL  WSL bash: $HAS_WSL_BASH  WSL cargo: $HAS_WSL_CARGO  WSL nightly: $HAS_WSL_NIGHTLY"
 echo "WSL GTK:    $WSL_GTK_VERSION"
-echo "Python:     $HAS_PYTHON  Cargo: $HAS_CARGO"
+echo "Python:     $HAS_PYTHON  Cargo: $HAS_CARGO  Nightly: $HAS_NIGHTLY  Cargo cmd: ${CARGO_CMD/cargo +nightly/+nightly}"
 echo ""
 
 # ---------------------------------------------------------------------------
@@ -190,12 +205,12 @@ fi
 if [ "$GTK_ONLY" = false ] && [ "$HAS_CARGO" = true ]; then
     echo "--- Building GUI backend (NWG) ---"
     # Build release first (needed for NWG replayer tests)
-    if cargo +nightly build --release --features gui 2>&1; then
+    if $CARGO_CMD build --release --features gui 2>&1; then
         pass "Build release (gui features)"
     else
         fail "Build release (gui features)"
     fi
-    if cargo +nightly build --features gui 2>&1; then
+    if $CARGO_CMD build --features gui 2>&1; then
         pass "Build debug (gui features)"
     else
         fail "Build debug (gui features)"
@@ -225,13 +240,13 @@ if [ "$GTK_ONLY" = false ] && [ "$HAS_CARGO" = true ]; then
 
     # Rust integration tests (NWG on Windows)
     echo "--- Running recording replay tests (test_tiny5 / test_tiny6) ---"
-    if cargo +nightly test --test test_tiny5 2>&1; then
+    if $CARGO_CMD test --test test_tiny5 2>&1; then
         pass "recrec5 (test_tiny5)"
     else
         fail "recrec5 (test_tiny5)"
     fi
 
-    if cargo +nightly test --test test_tiny6 2>&1; then
+    if $CARGO_CMD test --test test_tiny6 2>&1; then
         pass "recrec6 (test_tiny6)"
     else
         fail "recrec6 (test_tiny6)"
@@ -241,14 +256,14 @@ if [ "$GTK_ONLY" = false ] && [ "$HAS_CARGO" = true ]; then
     # GUI-specific Rust tests
     echo "--- Running GUI-specific Rust tests ---"
     for t in check_vals gui_enter_text_creates_file check_agg_gui check_gui_imports quit_alt_f_q; do
-        if cargo +nightly test --features gui --test "$t" 2>&1; then
+        if $CARGO_CMD test --features gui --test "$t" 2>&1; then
             pass "$t"
         else
             fail "$t"
         fi
     done
     # Cross-backend consistency tests (pattern verification, no live GUI needed)
-    if cargo +nightly test --features gui --test gtk_todo_tests 2>&1; then
+    if $CARGO_CMD test --features gui --test gtk_todo_tests 2>&1; then
         pass "gtk_todo_tests (cross-backend consistency)"
     else
         fail "gtk_todo_tests (cross-backend consistency)"
@@ -371,8 +386,8 @@ fi
 if [ "$NWG_ONLY" = false ] && [ "$GTK_ONLY" = false ]; then
     echo "--- WASM build ---"
     if [ "$HAS_CARGO" = true ]; then
-        if rustup target list --toolchain nightly 2>/dev/null | grep -q "wasm32-unknown-unknown (installed)"; then
-            if cargo +nightly build --target wasm32-unknown-unknown --features wasm --no-default-features 2>&1; then
+        if rustup target list --toolchain nightly 2>/dev/null | grep -q "wasm32-unknown-unknown (installed)" || [ "$HAS_NIGHTLY" = false ]; then
+            if $CARGO_CMD build --target wasm32-unknown-unknown --features wasm --no-default-features 2>&1; then
                 pass "WASM build"
             else
                 fail "WASM build"

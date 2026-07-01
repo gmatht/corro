@@ -126,8 +126,7 @@ pub fn replace_dialog<F: FnOnce(Option<(String, String)>) + 'static>(on_result: 
     {
         use rustxwidgets::{App, Entry};
         if let Ok(app) = App::init() {
-            #[cfg_attr(not(windows), allow(unused_mut))]
-            if let (Ok(dialog), Ok(find_entry), Ok(replace_entry), Ok(mut vbox)) =
+            if let (Ok(dialog), Ok(find_entry), Ok(replace_entry), Ok(vbox)) =
                 (app.create_dialog(), app.create_entry(), app.create_entry(), app.create_box(Orientation::Vertical, 4))
             {
                 dialog.set_title("Replace");
@@ -183,8 +182,7 @@ pub fn sort_dialog<F: FnOnce(Option<(usize, bool)>) + 'static>(_workbook: &Workb
         use rustxwidgets::{App, CheckButton, DropDown};
         if let Ok(app) = App::init() {
             let cols: &[&str] = &["Column A", "Column B", "Column C", "Column D", "Column E"];
-            #[cfg_attr(not(windows), allow(unused_mut))]
-            if let (Ok(dialog), Ok(sort_col), Ok(ascending), Ok(mut vbox)) =
+            if let (Ok(dialog), Ok(sort_col), Ok(ascending), Ok(vbox)) =
                 (app.create_dialog(), app.create_dropdown(cols), app.create_checkbutton("Ascending"),
                  app.create_box(Orientation::Vertical, 4))
             {

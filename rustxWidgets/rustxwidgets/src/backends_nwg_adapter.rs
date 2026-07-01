@@ -443,7 +443,7 @@ mod nwg_adapter {
     }
 
     impl BoxWidget {
-        pub fn append(&mut self, child: &impl Appendable) {
+        pub fn append(&self, child: &impl Appendable) {
             let hwnds = child.collect_hwnds();
             for &ptr in &hwnds {
                 if !ptr.is_null() && !self.hwnd.is_null() {
