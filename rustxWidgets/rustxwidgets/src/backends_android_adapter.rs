@@ -339,12 +339,13 @@ mod android_adapter {
     }
 
     impl DropDown {
-        pub fn set_active(&self, index: u32) {
+        pub fn set_active(&self, index: Option<u32>) {
+            if let Some(idx) = index {
             let _ = crate::backends::android::with_env_and_activity(|env, _activity| {
                 let spinner = unsafe { jni::objects::JObject::from_raw(self.0 as jni::sys::jobject) };
                 env.call_method(
                     &spinner, "setSelection", "(I)V",
-                    &[(index as i32).into()],
+                    &[(idx as i32).into()],
                 )?;
                 Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
             });

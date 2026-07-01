@@ -3,13 +3,18 @@
 //! Run with: cargo run --example bold_test
 //! Exits 0 on pass (pixels differ), 1 on fail (identical).
 
-#![cfg(windows)]
-
 use rustxwidgets::prelude::*;
 use std::cell::RefCell;
 use std::rc::Rc;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(not(windows))]
+    {
+        println!("bold_test requires Windows (NWG backend); skipped");
+        return Ok(());
+    }
+    #[cfg(windows)]
+    {
     let app = App::init()?;
 
     let window = app.create_window()?;
@@ -61,8 +66,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("FAIL: Bold text looks identical to normal text!");
         std::process::exit(1);
     }
+    }
 }
 
+#[cfg(windows)]
 fn pump(hwnd: *mut std::os::raw::c_void) {
     unsafe {
         winapi::um::winuser::UpdateWindow(hwnd as _);
@@ -79,6 +86,7 @@ fn pump(hwnd: *mut std::os::raw::c_void) {
     }
 }
 
+#[cfg(windows)]
 fn capture(hwnd: *mut std::os::raw::c_void) -> Result<(Vec<u8>, i32, i32), Box<dyn std::error::Error>> {
     unsafe {
         let mut rect: winapi::shared::windef::RECT = std::mem::zeroed();
@@ -125,10 +133,12 @@ fn capture(hwnd: *mut std::os::raw::c_void) -> Result<(Vec<u8>, i32, i32), Box<d
     }
 }
 
+#[cfg(windows)]
 fn count_diff(a: &[u8], b: &[u8]) -> usize {
     a.iter().zip(b.iter()).filter(|(pa, pb)| pa != pb).count()
 }
 
+#[cfg(windows)]
 fn save_bmp(path: &str, pixels: &[u8], w: i32, h: i32) -> Result<(), Box<dyn std::error::Error>> {
     let stride = (w * 4) as usize;
     let pixel_size = stride * h as usize;

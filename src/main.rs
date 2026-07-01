@@ -44,17 +44,20 @@ fn cli_option_suggestion(arg: &str) -> Option<&'static str> {
     }
 }
 
-fn determine_default_ui() -> UiKind {
-    #[cfg(feature = "ratatui")]
-    { return UiKind::Ratatui; }
-    #[cfg(target_arch = "wasm32")]
-    { return UiKind::Gui; }
-    #[cfg(feature = "gui")]
-    { return UiKind::Gui; }
-    #[cfg(feature = "pancurses")]
-    { return UiKind::Pancurses; }
-    UiKind::Ratatui
-}
+#[cfg(any(target_arch = "wasm32", feature = "gui"))]
+fn determine_default_ui() -> UiKind { UiKind::Gui }
+
+#[cfg(all(
+    not(any(target_arch = "wasm32", feature = "gui")),
+    feature = "pancurses"
+))]
+fn determine_default_ui() -> UiKind { UiKind::Pancurses }
+
+#[cfg(all(
+    not(any(target_arch = "wasm32", feature = "gui")),
+    not(feature = "pancurses")
+))]
+fn determine_default_ui() -> UiKind { UiKind::Ratatui }
 
 fn parse_args() -> Result<Args, String> {
     let mut revision = None;

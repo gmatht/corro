@@ -241,8 +241,8 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         format!("corro  {}r × {}c  ops {}", mr, mc, total_ops);
     spreadsheet.set_border_title(&border_title);
 
-    // Menu
-    spreadsheet.set_menu_text(" [File]   Edit    Insert    Format    Sheet    Help");
+    // Menu — built from the shared menu definitions so it never drifts
+    spreadsheet.set_menu_text(&format!(" {}", super::menu::menu_bar_text()));
 
     // Formula bar trailing: show app status text (matches ratatui's
     // mode_prompt_widget which appends "   ·  {status}" after the cell value).

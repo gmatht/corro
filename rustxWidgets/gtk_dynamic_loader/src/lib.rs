@@ -1,4 +1,5 @@
 //! gtk_dynamic_loader: runtime GTK loader and small safe wrappers (Linux-only)
+#![cfg(unix)]
 #![allow(dead_code)]
 mod error;
 mod loader;

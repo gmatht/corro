@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use gtk_dynamic_loader::{Loader, Window, BoxWidget, Label, Button, Orientation};
 
 #[test]

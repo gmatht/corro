@@ -1,3 +1,5 @@
+#![cfg(feature = "ratatui")]
+
 #[test]
 fn test_eval_main() {
     let path = std::path::PathBuf::from("docs/tests/subtotal-tiny.corro");

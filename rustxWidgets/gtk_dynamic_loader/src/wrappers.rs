@@ -592,6 +592,14 @@ pub struct Grid {
     inner: *mut c_void,
     loader: Arc<Loader>,
 }
+impl Clone for Grid {
+    fn clone(&self) -> Self {
+        if let Some(gref) = self.loader.symbols.g_object_ref {
+            unsafe { gref(self.inner); }
+        }
+        Grid { inner: self.inner, loader: self.loader.clone() }
+    }
+}
 
 impl Grid {
     pub fn new(loader: Arc<Loader>) -> Result<Self, Error> {
@@ -2193,7 +2201,7 @@ impl Dialog {
 
     pub fn set_default_size(&self, width: i32, height: i32) {
         guard_widget!(self, "Dialog", "set_default_size");
-        if let Some(set_size) = self.loader.symbols.gtk_dialog_set_default_size {
+        if let Some(set_size) = self.loader.symbols.gtk_window_set_default_size {
             unsafe { set_size(self.inner, width, height); }
         }
     }

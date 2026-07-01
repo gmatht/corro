@@ -163,9 +163,9 @@ pub trait Widget {
 #[derive(Clone)]
 pub struct App {
     inner: Rc<RefCell<Option<Box<dyn crate::backends::BackendApp>>>>,
-    #[cfg(windows)]
+    #[cfg(all(windows, not(feature = "zork")))]
     parent_cell: Rc<RefCell<Option<*mut c_void>>>,
-    #[cfg(windows)]
+    #[cfg(all(windows, not(feature = "zork")))]
     action_registry: Rc<RefCell<HashMap<String, Box<dyn FnMut()>>>>,
     #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
     action_group: Rc<RefCell<Option<crate::backends_gtk_adapter::Application>>>,
@@ -181,7 +181,7 @@ impl App {
             Ok(b) => b,
             Err(e) => return Err(Error::Backend(format!("{}", e))),
         };
-        #[cfg(windows)]
+        #[cfg(all(windows, not(feature = "zork")))]
         {
             // Create a hidden parent window for child controls
             let parent_hwnd = crate::backends::nwg::create_hidden_parent()?;
@@ -191,7 +191,7 @@ impl App {
                 action_registry: Rc::new(RefCell::new(HashMap::new())),
             });
         }
-        #[cfg(not(windows))]
+        #[cfg(not(all(windows, not(feature = "zork"))))]
         return Ok(App {
             inner: Rc::new(RefCell::new(Some(b))),
             #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
@@ -769,17 +769,17 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
 
     /// Create a new Window and return a platform-independent handle.
     pub fn new_window(&self) -> Result<crate::common::Window, Error> {
-        #[cfg(all(feature = "gtk", unix))]
+        #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
         {
             let inner = crate::backends_gtk_adapter::create_window()?;
             return Ok(crate::common::Window { inner });
         }
-        #[cfg(windows)]
+        #[cfg(all(windows, not(feature = "zork")))]
         {
             let inner = crate::backends_nwg_adapter::create_window(&self.parent_cell)?;
             Ok(crate::common::Window { inner })
         }
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
         {
             let inner = crate::backends_wasm_adapter::create_window()?;
             Ok(crate::common::Window { inner })
@@ -788,7 +788,7 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
 
     /// Create a new layout Box.
     pub fn new_box(&self, orientation: crate::common::Orientation, spacing: i32) -> Result<crate::common::WidgetBox, Error> {
-        #[cfg(all(feature = "gtk", unix))]
+        #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
         {
             let gtk_orient = match orientation {
                 crate::common::Orientation::Horizontal => gtk_dynamic_loader::Orientation::Horizontal,
@@ -797,7 +797,7 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
             let inner = crate::backends_gtk_adapter::create_box(gtk_orient, spacing)?;
             return Ok(crate::common::WidgetBox { inner });
         }
-        #[cfg(windows)]
+        #[cfg(all(windows, not(feature = "zork")))]
         {
             let nwg_orient = match orientation {
                 crate::common::Orientation::Horizontal => crate::backends::nwg::Orientation::Horizontal,
@@ -807,7 +807,7 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
             let inner = crate::backends_nwg_adapter::create_box(nwg_orient, spacing, parent)?;
             Ok(crate::common::WidgetBox { inner })
         }
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
         {
             let inner = crate::backends_wasm_adapter::create_box(orientation, spacing)?;
             Ok(crate::common::WidgetBox { inner })
@@ -816,19 +816,19 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
 
     /// Create a new Label with the given text.
     pub fn new_label(&self, text: &str) -> Result<crate::common::Label, Error> {
-        #[cfg(all(feature = "gtk", unix))]
+        #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
         {
             let inner = crate::backends_gtk_adapter::create_label(text)?;
             return Ok(crate::common::Label { inner });
         }
-        #[cfg(windows)]
+        #[cfg(all(windows, not(feature = "zork")))]
         {
             let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
             let inner = crate::backends_nwg_adapter::create_label(parent)?;
             inner.set_text(text);
             Ok(crate::common::Label { inner })
         }
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
         {
             let inner = crate::backends_wasm_adapter::create_label(text)?;
             Ok(crate::common::Label { inner })
@@ -837,18 +837,18 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
 
     /// Create a new text Entry.
     pub fn new_entry(&self) -> Result<crate::common::Entry, Error> {
-        #[cfg(all(feature = "gtk", unix))]
+        #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
         {
             let inner = crate::backends_gtk_adapter::create_entry()?;
             return Ok(crate::common::Entry { inner });
         }
-        #[cfg(windows)]
+        #[cfg(all(windows, not(feature = "zork")))]
         {
             let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
             let inner = crate::backends_nwg_adapter::create_entry(parent)?;
             Ok(crate::common::Entry { inner })
         }
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
         {
             let inner = crate::backends_wasm_adapter::create_entry()?;
             Ok(crate::common::Entry { inner })
@@ -857,18 +857,18 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
 
     /// Create a new Canvas (custom drawing surface).
     pub fn new_canvas(&self) -> Result<crate::common::Canvas, Error> {
-        #[cfg(all(feature = "gtk", unix))]
+        #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
         {
             let inner = crate::backends_gtk_adapter::create_canvas()?;
             return Ok(crate::common::Canvas { inner });
         }
-        #[cfg(windows)]
+        #[cfg(all(windows, not(feature = "zork")))]
         {
             let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
             let inner = crate::backends_nwg_adapter::create_canvas(parent)?;
             Ok(crate::common::Canvas { inner })
         }
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
         {
             let inner = crate::backends_wasm_adapter::create_canvas()?;
             Ok(crate::common::Canvas { inner })
@@ -877,17 +877,22 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
 
     /// Create a new Menu data model.
     pub fn new_menu(&self) -> Result<crate::common::Menu, Error> {
-        #[cfg(all(feature = "gtk", unix))]
+        #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
         {
             let inner = crate::backends_gtk_adapter::create_menu()?;
             return Ok(crate::common::Menu { inner });
         }
-        #[cfg(windows)]
+        #[cfg(all(windows, not(feature = "zork")))]
         {
             let inner = crate::backends_nwg_adapter::create_menu()?;
             Ok(crate::common::Menu { inner })
         }
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
+        {
+            let inner = crate::backends_pancurses_adapter::create_menu()?;
+            Ok(crate::common::Menu { inner })
+        }
+        #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
         {
             let inner = crate::backends_wasm_adapter::create_menu()?;
             Ok(crate::common::Menu { inner })
@@ -897,17 +902,22 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
     /// Create a new SimpleAction that will dispatch to the given name.
     /// On Windows the action is registered in the shared action registry.
     pub fn new_simple_action(&self, name: &str) -> Result<crate::common::SimpleAction, Error> {
-        #[cfg(all(feature = "gtk", unix))]
+        #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
         {
             let inner = crate::backends_gtk_adapter::create_simple_action(name)?;
             return Ok(crate::common::SimpleAction { inner });
         }
-        #[cfg(windows)]
+        #[cfg(all(windows, not(feature = "zork")))]
         {
             let inner = crate::backends_nwg_adapter::create_simple_action(name, self.action_registry.clone())?;
             Ok(crate::common::SimpleAction { inner })
         }
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
+        {
+            let inner = crate::backends_pancurses_adapter::create_simple_action(name)?;
+            Ok(crate::common::SimpleAction { inner })
+        }
+        #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
         {
             let inner = crate::backends_wasm_adapter::create_simple_action(name)?;
             Ok(crate::common::SimpleAction { inner })
@@ -917,38 +927,58 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
     /// Create a MenuBar from a Menu model.
     /// `action_group` – on GTK a `*mut c_void` pointer to a `GActionGroup`
     /// (pass null if not available); on Windows it is unused.
-    pub fn new_menubar(&self, model: &crate::common::Menu, action_group: *mut c_void) -> Result<crate::common::MenuBar, Error> {
-        #[cfg(all(feature = "gtk", unix))]
+    pub fn new_menubar(&self, model: &crate::common::Menu, _action_group: *mut c_void) -> Result<crate::common::MenuBar, Error> {
+        #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
         {
-            let inner = unsafe { crate::backends_gtk_adapter::create_menubar(&model.inner, action_group) }?;
+            let inner = unsafe { crate::backends_gtk_adapter::create_menubar(&model.inner, _action_group) }?;
             return Ok(crate::common::MenuBar { inner });
         }
-        #[cfg(windows)]
+        #[cfg(all(windows, not(feature = "zork")))]
         {
             let hwnd = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
             let inner = crate::backends_nwg_adapter::create_menubar(&model.inner, hwnd, self.action_registry.clone())?;
             Ok(crate::common::MenuBar { inner })
         }
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
+        {
+            let inner = crate::backends_pancurses_adapter::create_menubar(&model.inner, _action_group)?;
+            Ok(crate::common::MenuBar { inner })
+        }
+        #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
         {
             let inner = crate::backends_wasm_adapter::create_menubar(&model.inner, action_group)?;
             Ok(crate::common::MenuBar { inner })
         }
     }
 
+    /// Build a Menu tree from declarative SubmenuDef definitions.
+    /// `label_prefix` is prepended to each submenu label (e.g. "\u{3164}" for
+    /// GTK4 to prevent mnemonic accelerator assignment; pass "" for other backends).
+    pub fn build_menu_model(&self, submenus: &[crate::common::SubmenuDef], label_prefix: &str) -> Result<crate::common::Menu, Error> {
+        let mut root = self.new_menu()?;
+        for sm in submenus {
+            let mut sub = self.new_menu()?;
+            for item in sm.items {
+                sub.append(item.label, &format!("{}.{}", sm.prefix, item.action));
+            }
+            root.append_submenu(&format!("{}{}", label_prefix, sm.label), &sub);
+        }
+        Ok(root)
+    }
+
     /// Create a new Dialog.
     pub fn new_dialog(&self) -> Result<crate::common::Dialog, Error> {
-        #[cfg(all(feature = "gtk", unix))]
+        #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
         {
             let inner = crate::backends_gtk_adapter::create_dialog()?;
             return Ok(crate::common::Dialog { inner });
         }
-        #[cfg(windows)]
+        #[cfg(all(windows, not(feature = "zork")))]
         {
             let inner = crate::backends_nwg_adapter::create_dialog(&self.parent_cell)?;
             Ok(crate::common::Dialog { inner })
         }
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
         {
             let inner = crate::backends_wasm_adapter::create_dialog()?;
             Ok(crate::common::Dialog { inner })
@@ -973,10 +1003,10 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
 
     /// Register a SimpleAction with the action group.
     /// On GTK this adds the action to the GApplication; on Windows it is a no-op.
-    pub fn register_action(&self, action: &crate::common::SimpleAction) -> Result<(), Error> {
+    pub fn register_action(&self, _action: &crate::common::SimpleAction) -> Result<(), Error> {
         #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
         if let Some(ref app) = *self.action_group.borrow() {
-            app.add_action(&action.inner)?;
+            app.add_action(&_action.inner)?;
         }
         #[cfg(not(all(feature = "gtk", target_os = "linux", not(feature = "zork"))))]
         {}
@@ -992,7 +1022,7 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
     /// Post a quit message to the backend's event loop.
     /// Safe to call from signal handlers and event callbacks.
     pub fn quit(&self) {
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
         crate::backends_wasm_adapter::quit_main_loop();
         #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
         let _ = crate::backends_gtk_adapter::quit_main_loop();
@@ -1005,9 +1035,9 @@ impl From<Box<dyn crate::backends::BackendApp>> for App {
     fn from(b: Box<dyn crate::backends::BackendApp>) -> Self {
         App {
             inner: Rc::new(RefCell::new(Some(b))),
-            #[cfg(windows)]
+            #[cfg(all(windows, not(feature = "zork")))]
             parent_cell: Rc::new(RefCell::new(None)),
-            #[cfg(windows)]
+            #[cfg(all(windows, not(feature = "zork")))]
             action_registry: Rc::new(RefCell::new(HashMap::new())),
             #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
             action_group: Rc::new(RefCell::new(None)),

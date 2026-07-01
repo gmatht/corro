@@ -1,308 +1,315 @@
-use rustxwidgets::prelude::*;
-use rustxwidgets::backends_gtk_adapter as gtk;
-use std::rc::Rc;
-use std::cell::RefCell;
-
-const VISIBLE_ROWS: usize = 100;
-const VISIBLE_COLS: usize = 26;
-const CELL_W: i32 = 150;
-const CELL_H: i32 = 28;
-
-type CellFormat = (bool, bool, u8, String, String);
-
-fn col_to_label(n: usize) -> String {
-    if n < 26 {
-        format!("{}", (b'A' + (n as u8)) as char)
-    } else {
-        let mut s = String::new();
-        let mut v = n;
-        loop {
-            s.insert(0, (b'A' + (v % 26) as u8) as char);
-            v /= 26;
-            if v == 0 { break; }
-            v -= 1;
-        }
-        s
-    }
+fn main() {
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+    return gtk_main().unwrap_or_else(|e: Box<dyn std::error::Error>| { eprintln!("Error: {}", e); std::process::exit(1); });
+    println!("skipped (requires GTK on Linux)");
 }
 
-fn compute_row_y(heights: &[i32], row: usize) -> i32 {
-    let mut y = 0;
-    for i in 0..row {
-        if i < heights.len() { y += heights[i]; }
-    }
-    y
-}
+#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+fn gtk_main() -> Result<(), Box<dyn std::error::Error>> {
+    use rustxwidgets::prelude::*;
+    use rustxwidgets::backends_gtk_adapter as gtk;
+    use std::rc::Rc;
+    use std::cell::RefCell;
 
-fn parse_color(hex: &str) -> (f64, f64, f64) {
-    if hex.len() >= 7 && hex.as_bytes()[0] == b'#' {
-        let r = u8::from_str_radix(&hex[1..3], 16).unwrap_or(0) as f64 / 255.0;
-        let g = u8::from_str_radix(&hex[3..5], 16).unwrap_or(0) as f64 / 255.0;
-        let b = u8::from_str_radix(&hex[5..7], 16).unwrap_or(0) as f64 / 255.0;
-        (r, g, b)
-    } else {
-        (0.0, 0.0, 0.0)
-    }
-}
+    const VISIBLE_ROWS: usize = 100;
+    const VISIBLE_COLS: usize = 26;
+    const CELL_W: i32 = 150;
+    const CELL_H: i32 = 28;
 
-fn draw_grid(
-    cr: *mut std::ffi::c_void,
-    _w: i32,
-    _h: i32,
-    loader: &std::sync::Arc<gtk_dynamic_loader::Loader>,
-    texts: &RefCell<Vec<Vec<String>>>,
-    fmts: &RefCell<Vec<Vec<CellFormat>>>,
-    sel: &RefCell<Option<(usize, usize)>>,
-    _col_widths: &RefCell<Vec<i32>>,
-    _row_heights: &RefCell<Vec<i32>>,
-    editing: &RefCell<Option<gtk::Entry>>,
-) {
-    let cc = gtk_dynamic_loader::CairoContext::new(loader, cr);
+    type CellFormat = (bool, bool, u8, String, String);
 
-    let chw = 46_f64;
-    let cw = CELL_W as f64;
-    let ch = CELL_H as f64;
-    let total_w = chw + VISIBLE_COLS as f64 * cw;
-    let total_h = ch + VISIBLE_ROWS as f64 * ch;
-
-    cc.set_source_rgb(1.0, 1.0, 1.0);
-    cc.rectangle(0.0, 0.0, total_w, total_h);
-    cc.fill();
-
-    cc.set_source_rgb(0.91, 0.91, 0.91);
-    cc.rectangle(0.0, 0.0, chw, ch);
-    cc.fill();
-
-    cc.set_source_rgb(0.8, 0.8, 0.8);
-    cc.rectangle(chw, 0.0, VISIBLE_COLS as f64 * cw, ch);
-    cc.fill();
-    cc.rectangle(0.0, ch, chw, VISIBLE_ROWS as f64 * ch);
-    cc.fill();
-
-    cc.set_source_rgb(0.7, 0.7, 0.7);
-    cc.set_line_width(0.5);
-    for c in 0..=VISIBLE_COLS {
-        let x = chw + c as f64 * cw;
-        cc.move_to(x, 0.0);
-        cc.line_to(x, total_h);
-        cc.stroke();
-    }
-    for r in 0..=VISIBLE_ROWS {
-        let y = ch + r as f64 * ch;
-        cc.move_to(0.0, y);
-        cc.line_to(total_w, y);
-        cc.stroke();
-    }
-
-    cc.select_font_face("monospace", 0, 1);
-    cc.set_font_size(12.0);
-    cc.set_source_rgb(0.0, 0.0, 0.0);
-    for c in 0..VISIBLE_COLS {
-        let lbl = col_to_label(c);
-        let ext = cc.text_extents(&lbl);
-        let x = chw + c as f64 * cw + cw / 2.0 - ext.x_bearing - ext.width / 2.0;
-        let y = ch / 2.0 - ext.y_bearing - ext.height / 2.0;
-        cc.move_to(x, y);
-        cc.show_text(&lbl);
-    }
-
-    cc.set_font_size(12.0);
-    for r in 0..VISIBLE_ROWS {
-        let lbl = format!("{}", r + 1);
-        let ext = cc.text_extents(&lbl);
-        let x = chw / 2.0 - ext.x_bearing - ext.width / 2.0;
-        let y = ch + r as f64 * ch + ch / 2.0 - ext.y_bearing - ext.height / 2.0;
-        cc.move_to(x, y);
-        cc.show_text(&lbl);
-    }
-
-    let t = texts.borrow();
-    let f = fmts.borrow();
-    let mut overflow_end_col = vec![vec![0usize; VISIBLE_COLS]; VISIBLE_ROWS];
-
-    cc.set_font_size(13.0);
-    for r in 0..VISIBLE_ROWS {
-        for c in 0..VISIBLE_COLS {
-            let text = &t[r][c];
-            if text.is_empty() { continue; }
-            let (bold, italic, _align, _fg_hex, _bg_hex) = &f[r][c];
-            let slant = if *italic { 1 } else { 0 };
-            let weight = if *bold { 1 } else { 0 };
-            cc.select_font_face("monospace", slant, weight);
-            let ext = cc.text_extents(text);
-            let cx = chw + c as f64 * cw;
-            let pad = 4.0;
-            let tx = match *_align {
-                0 => cx + pad - ext.x_bearing,
-                1 => cx + cw / 2.0 - ext.x_bearing - ext.width / 2.0,
-                _ => cx + cw - pad - ext.x_bearing - ext.width,
-            };
-            let text_right = tx + ext.x_bearing + ext.width;
-            if text_right > cx + cw {
-                let mut lo = c;
-                for oc in (c + 1)..VISIBLE_COLS {
-                    if !t[r][oc].is_empty() { break; }
-                    lo = oc;
-                }
-                overflow_end_col[r][c] = lo;
+    fn col_to_label(n: usize) -> String {
+        if n < 26 {
+            format!("{}", (b'A' + (n as u8)) as char)
+        } else {
+            let mut s = String::new();
+            let mut v = n;
+            loop {
+                s.insert(0, (b'A' + (v % 26) as u8) as char);
+                v /= 26;
+                if v == 0 { break; }
+                v -= 1;
             }
+            s
         }
     }
 
-    cc.set_source_rgb(1.0, 1.0, 1.0);
-    cc.rectangle(0.0, 0.0, total_w, total_h);
-    cc.fill();
-
-    cc.set_source_rgb(0.91, 0.91, 0.91);
-    cc.rectangle(0.0, 0.0, chw, ch);
-    cc.fill();
-
-    cc.set_source_rgb(0.8, 0.8, 0.8);
-    cc.rectangle(chw, 0.0, VISIBLE_COLS as f64 * cw, ch);
-    cc.fill();
-    cc.rectangle(0.0, ch, chw, VISIBLE_ROWS as f64 * ch);
-    cc.fill();
-
-    cc.set_source_rgb(0.7, 0.7, 0.7);
-    cc.set_line_width(0.5);
-    for r in 0..=VISIBLE_ROWS {
-        let y = ch + r as f64 * ch;
-        cc.move_to(0.0, y);
-        cc.line_to(total_w, y);
-        cc.stroke();
+    fn compute_row_y(heights: &[i32], row: usize) -> i32 {
+        let mut y = 0;
+        for i in 0..row {
+            if i < heights.len() { y += heights[i]; }
+        }
+        y
     }
 
-    for bc in 0..=VISIBLE_COLS {
-        let x = chw + bc as f64 * cw;
-        cc.move_to(x, 0.0);
-        cc.line_to(x, ch);
-        cc.stroke();
-        for r in 0..VISIBLE_ROWS {
-            let skip = bc > 0 && overflow_end_col[r][bc - 1] >= bc;
-            if !skip {
-                let y1 = ch + r as f64 * ch;
-                let y2 = ch + (r + 1) as f64 * ch;
-                cc.move_to(x, y1);
-                cc.line_to(x, y2);
-                cc.stroke();
-            }
+    fn parse_color(hex: &str) -> (f64, f64, f64) {
+        if hex.len() >= 7 && hex.as_bytes()[0] == b'#' {
+            let r = u8::from_str_radix(&hex[1..3], 16).unwrap_or(0) as f64 / 255.0;
+            let g = u8::from_str_radix(&hex[3..5], 16).unwrap_or(0) as f64 / 255.0;
+            let b = u8::from_str_radix(&hex[5..7], 16).unwrap_or(0) as f64 / 255.0;
+            (r, g, b)
+        } else {
+            (0.0, 0.0, 0.0)
         }
     }
 
-    cc.save();
-    let edit_target: Option<(usize, usize)> = if editing.borrow().is_some() {
-        *sel.borrow()
-    } else {
-        None
-    };
+    fn draw_grid(
+        cr: *mut std::ffi::c_void,
+        _w: i32,
+        _h: i32,
+        loader: &std::sync::Arc<gtk_dynamic_loader::Loader>,
+        texts: &RefCell<Vec<Vec<String>>>,
+        fmts: &RefCell<Vec<Vec<CellFormat>>>,
+        sel: &RefCell<Option<(usize, usize)>>,
+        _col_widths: &RefCell<Vec<i32>>,
+        _row_heights: &RefCell<Vec<i32>>,
+        editing: &RefCell<Option<gtk::Entry>>,
+    ) {
+        let cc = gtk_dynamic_loader::CairoContext::new(loader, cr);
 
-    cc.set_font_size(13.0);
-    for r in 0..VISIBLE_ROWS {
-        for c in 0..VISIBLE_COLS {
-            let text = &t[r][c];
-            if text.is_empty() { continue; }
-            if Some((r, c)) == edit_target { continue; }
-            let (bold, italic, align, fg_hex, bg_hex) = &f[r][c];
+        let chw = 46_f64;
+        let cw = CELL_W as f64;
+        let ch = CELL_H as f64;
+        let total_w = chw + VISIBLE_COLS as f64 * cw;
+        let total_h = ch + VISIBLE_ROWS as f64 * ch;
 
-            let cx = chw + c as f64 * cw;
-            let cy = ch + r as f64 * ch;
-
-            if fg_hex != "#000000" {
-                let (fr, fgg, fb) = parse_color(fg_hex);
-                cc.set_source_rgb(fr, fgg, fb);
-            } else {
-                cc.set_source_rgb(0.0, 0.0, 0.0);
-            }
-
-            let slant = if *italic { 1 } else { 0 };
-            let weight = if *bold { 1 } else { 0 };
-            cc.select_font_face("monospace", slant, weight);
-
-            let ext = cc.text_extents(text);
-
-            let pad = 4.0;
-            let tx = match *align {
-                0 => cx + pad - ext.x_bearing,
-                1 => cx + cw / 2.0 - ext.x_bearing - ext.width / 2.0,
-                _ => cx + cw - pad - ext.x_bearing - ext.width,
-            };
-            let ty = cy + ch / 2.0 - ext.y_bearing - ext.height / 2.0;
-
-            let last_oc = overflow_end_col[r][c];
-            let text_right = tx + ext.x_bearing + ext.width + 2.0;
-            let clip_right = if last_oc > c {
-                let mut limit = text_right;
-                for oc in (c + 1)..VISIBLE_COLS {
-                    if !t[r][oc].is_empty() {
-                        limit = limit.min(chw + oc as f64 * cw);
-                        break;
-                    }
-                }
-                limit.min(total_w)
-            } else {
-                cx + cw
-            };
-
-            if bg_hex != "#ffffff" || last_oc > c {
-                let (br, bg, bb) = parse_color(bg_hex);
-                cc.set_source_rgb(br, bg, bb);
-                cc.rectangle(cx, cy + 1.0, clip_right - cx, ch - 2.0);
-                cc.fill();
-            }
-
-            if fg_hex != "#000000" {
-                let (fr, fgg, fb) = parse_color(fg_hex);
-                cc.set_source_rgb(fr, fgg, fb);
-            } else {
-                cc.set_source_rgb(0.0, 0.0, 0.0);
-            }
-
-            cc.save();
-            cc.rectangle(cx, cy, clip_right - cx, ch);
-            cc.clip();
-            cc.move_to(tx, ty);
-            cc.show_text(text);
-            cc.restore();
-        }
-    }
-    cc.restore();
-
-    cc.select_font_face("monospace", 0, 1);
-    cc.set_font_size(12.0);
-    cc.set_source_rgb(0.0, 0.0, 0.0);
-    for c in 0..VISIBLE_COLS {
-        let lbl = col_to_label(c);
-        let ext = cc.text_extents(&lbl);
-        let x = chw + c as f64 * cw + cw / 2.0 - ext.x_bearing - ext.width / 2.0;
-        let y = ch / 2.0 - ext.y_bearing - ext.height / 2.0;
-        cc.move_to(x, y);
-        cc.show_text(&lbl);
-    }
-
-    cc.set_font_size(12.0);
-    for r in 0..VISIBLE_ROWS {
-        let lbl = format!("{}", r + 1);
-        let ext = cc.text_extents(&lbl);
-        let x = chw / 2.0 - ext.x_bearing - ext.width / 2.0;
-        let y = ch + r as f64 * ch + ch / 2.0 - ext.y_bearing - ext.height / 2.0;
-        cc.move_to(x, y);
-        cc.show_text(&lbl);
-    }
-
-    if let Some((sr, sc)) = *sel.borrow() {
-        let sx = chw + sc as f64 * cw;
-        let sy = ch + sr as f64 * ch;
-        cc.set_source_rgba(0.83, 0.91, 1.0, 0.3);
-        cc.rectangle(sx, sy, cw, ch);
+        cc.set_source_rgb(1.0, 1.0, 1.0);
+        cc.rectangle(0.0, 0.0, total_w, total_h);
         cc.fill();
-        cc.set_source_rgb(0.1, 0.45, 0.91);
-        cc.set_line_width(2.0);
-        cc.rectangle(sx + 0.5, sy + 0.5, cw - 1.0, ch - 1.0);
-        cc.stroke();
-    }
-}
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+        cc.set_source_rgb(0.91, 0.91, 0.91);
+        cc.rectangle(0.0, 0.0, chw, ch);
+        cc.fill();
+
+        cc.set_source_rgb(0.8, 0.8, 0.8);
+        cc.rectangle(chw, 0.0, VISIBLE_COLS as f64 * cw, ch);
+        cc.fill();
+        cc.rectangle(0.0, ch, chw, VISIBLE_ROWS as f64 * ch);
+        cc.fill();
+
+        cc.set_source_rgb(0.7, 0.7, 0.7);
+        cc.set_line_width(0.5);
+        for c in 0..=VISIBLE_COLS {
+            let x = chw + c as f64 * cw;
+            cc.move_to(x, 0.0);
+            cc.line_to(x, total_h);
+            cc.stroke();
+        }
+        for r in 0..=VISIBLE_ROWS {
+            let y = ch + r as f64 * ch;
+            cc.move_to(0.0, y);
+            cc.line_to(total_w, y);
+            cc.stroke();
+        }
+
+        cc.select_font_face("monospace", 0, 1);
+        cc.set_font_size(12.0);
+        cc.set_source_rgb(0.0, 0.0, 0.0);
+        for c in 0..VISIBLE_COLS {
+            let lbl = col_to_label(c);
+            let ext = cc.text_extents(&lbl);
+            let x = chw + c as f64 * cw + cw / 2.0 - ext.x_bearing - ext.width / 2.0;
+            let y = ch / 2.0 - ext.y_bearing - ext.height / 2.0;
+            cc.move_to(x, y);
+            cc.show_text(&lbl);
+        }
+
+        cc.set_font_size(12.0);
+        for r in 0..VISIBLE_ROWS {
+            let lbl = format!("{}", r + 1);
+            let ext = cc.text_extents(&lbl);
+            let x = chw / 2.0 - ext.x_bearing - ext.width / 2.0;
+            let y = ch + r as f64 * ch + ch / 2.0 - ext.y_bearing - ext.height / 2.0;
+            cc.move_to(x, y);
+            cc.show_text(&lbl);
+        }
+
+        let t = texts.borrow();
+        let f = fmts.borrow();
+        let mut overflow_end_col = vec![vec![0usize; VISIBLE_COLS]; VISIBLE_ROWS];
+
+        cc.set_font_size(13.0);
+        for r in 0..VISIBLE_ROWS {
+            for c in 0..VISIBLE_COLS {
+                let text = &t[r][c];
+                if text.is_empty() { continue; }
+                let (bold, italic, _align, _fg_hex, _bg_hex) = &f[r][c];
+                let slant = if *italic { 1 } else { 0 };
+                let weight = if *bold { 1 } else { 0 };
+                cc.select_font_face("monospace", slant, weight);
+                let ext = cc.text_extents(text);
+                let cx = chw + c as f64 * cw;
+                let pad = 4.0;
+                let tx = match *_align {
+                    0 => cx + pad - ext.x_bearing,
+                    1 => cx + cw / 2.0 - ext.x_bearing - ext.width / 2.0,
+                    _ => cx + cw - pad - ext.x_bearing - ext.width,
+                };
+                let text_right = tx + ext.x_bearing + ext.width;
+                if text_right > cx + cw {
+                    let mut lo = c;
+                    for oc in (c + 1)..VISIBLE_COLS {
+                        if !t[r][oc].is_empty() { break; }
+                        lo = oc;
+                    }
+                    overflow_end_col[r][c] = lo;
+                }
+            }
+        }
+
+        cc.set_source_rgb(1.0, 1.0, 1.0);
+        cc.rectangle(0.0, 0.0, total_w, total_h);
+        cc.fill();
+
+        cc.set_source_rgb(0.91, 0.91, 0.91);
+        cc.rectangle(0.0, 0.0, chw, ch);
+        cc.fill();
+
+        cc.set_source_rgb(0.8, 0.8, 0.8);
+        cc.rectangle(chw, 0.0, VISIBLE_COLS as f64 * cw, ch);
+        cc.fill();
+        cc.rectangle(0.0, ch, chw, VISIBLE_ROWS as f64 * ch);
+        cc.fill();
+
+        cc.set_source_rgb(0.7, 0.7, 0.7);
+        cc.set_line_width(0.5);
+        for r in 0..=VISIBLE_ROWS {
+            let y = ch + r as f64 * ch;
+            cc.move_to(0.0, y);
+            cc.line_to(total_w, y);
+            cc.stroke();
+        }
+
+        for bc in 0..=VISIBLE_COLS {
+            let x = chw + bc as f64 * cw;
+            cc.move_to(x, 0.0);
+            cc.line_to(x, ch);
+            cc.stroke();
+            for r in 0..VISIBLE_ROWS {
+                let skip = bc > 0 && overflow_end_col[r][bc - 1] >= bc;
+                if !skip {
+                    let y1 = ch + r as f64 * ch;
+                    let y2 = ch + (r + 1) as f64 * ch;
+                    cc.move_to(x, y1);
+                    cc.line_to(x, y2);
+                    cc.stroke();
+                }
+            }
+        }
+
+        cc.save();
+        let edit_target: Option<(usize, usize)> = if editing.borrow().is_some() {
+            *sel.borrow()
+        } else {
+            None
+        };
+
+        cc.set_font_size(13.0);
+        for r in 0..VISIBLE_ROWS {
+            for c in 0..VISIBLE_COLS {
+                let text = &t[r][c];
+                if text.is_empty() { continue; }
+                if Some((r, c)) == edit_target { continue; }
+                let (bold, italic, align, fg_hex, bg_hex) = &f[r][c];
+
+                let cx = chw + c as f64 * cw;
+                let cy = ch + r as f64 * ch;
+
+                if fg_hex != "#000000" {
+                    let (fr, fgg, fb) = parse_color(fg_hex);
+                    cc.set_source_rgb(fr, fgg, fb);
+                } else {
+                    cc.set_source_rgb(0.0, 0.0, 0.0);
+                }
+
+                let slant = if *italic { 1 } else { 0 };
+                let weight = if *bold { 1 } else { 0 };
+                cc.select_font_face("monospace", slant, weight);
+
+                let ext = cc.text_extents(text);
+
+                let pad = 4.0;
+                let tx = match *align {
+                    0 => cx + pad - ext.x_bearing,
+                    1 => cx + cw / 2.0 - ext.x_bearing - ext.width / 2.0,
+                    _ => cx + cw - pad - ext.x_bearing - ext.width,
+                };
+                let ty = cy + ch / 2.0 - ext.y_bearing - ext.height / 2.0;
+
+                let last_oc = overflow_end_col[r][c];
+                let text_right = tx + ext.x_bearing + ext.width + 2.0;
+                let clip_right = if last_oc > c {
+                    let mut limit = text_right;
+                    for oc in (c + 1)..VISIBLE_COLS {
+                        if !t[r][oc].is_empty() {
+                            limit = limit.min(chw + oc as f64 * cw);
+                            break;
+                        }
+                    }
+                    limit.min(total_w)
+                } else {
+                    cx + cw
+                };
+
+                if bg_hex != "#ffffff" || last_oc > c {
+                    let (br, bg, bb) = parse_color(bg_hex);
+                    cc.set_source_rgb(br, bg, bb);
+                    cc.rectangle(cx, cy + 1.0, clip_right - cx, ch - 2.0);
+                    cc.fill();
+                }
+
+                if fg_hex != "#000000" {
+                    let (fr, fgg, fb) = parse_color(fg_hex);
+                    cc.set_source_rgb(fr, fgg, fb);
+                } else {
+                    cc.set_source_rgb(0.0, 0.0, 0.0);
+                }
+
+                cc.save();
+                cc.rectangle(cx, cy, clip_right - cx, ch);
+                cc.clip();
+                cc.move_to(tx, ty);
+                cc.show_text(text);
+                cc.restore();
+            }
+        }
+        cc.restore();
+
+        cc.select_font_face("monospace", 0, 1);
+        cc.set_font_size(12.0);
+        cc.set_source_rgb(0.0, 0.0, 0.0);
+        for c in 0..VISIBLE_COLS {
+            let lbl = col_to_label(c);
+            let ext = cc.text_extents(&lbl);
+            let x = chw + c as f64 * cw + cw / 2.0 - ext.x_bearing - ext.width / 2.0;
+            let y = ch / 2.0 - ext.y_bearing - ext.height / 2.0;
+            cc.move_to(x, y);
+            cc.show_text(&lbl);
+        }
+
+        cc.set_font_size(12.0);
+        for r in 0..VISIBLE_ROWS {
+            let lbl = format!("{}", r + 1);
+            let ext = cc.text_extents(&lbl);
+            let x = chw / 2.0 - ext.x_bearing - ext.width / 2.0;
+            let y = ch + r as f64 * ch + ch / 2.0 - ext.y_bearing - ext.height / 2.0;
+            cc.move_to(x, y);
+            cc.show_text(&lbl);
+        }
+
+        if let Some((sr, sc)) = *sel.borrow() {
+            let sx = chw + sc as f64 * cw;
+            let sy = ch + sr as f64 * ch;
+            cc.set_source_rgba(0.83, 0.91, 1.0, 0.3);
+            cc.rectangle(sx, sy, cw, ch);
+            cc.fill();
+            cc.set_source_rgb(0.1, 0.45, 0.91);
+            cc.set_line_width(2.0);
+            cc.rectangle(sx + 0.5, sy + 0.5, cw - 1.0, ch - 1.0);
+            cc.stroke();
+        }
+    }
+
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--prefer-gtk3" || a == "-3") {
         std::env::set_var("GTK_DLOPEN_PREFER_GTK3", "1");
@@ -458,8 +465,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Keep event controllers alive until after win.present(). They are
-    // declared here (function scope) so they outlive the setup blocks below.
     let mut _gestures: Vec<gtk_dynamic_loader::GestureClick> = Vec::new();
     let mut _key_ctrl: Option<gtk_dynamic_loader::EventControllerKey> = None;
 
@@ -488,8 +493,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 formula_e.set_text(&new_text);
-                // Must use overlay.remove() not remove_from_parent() because
-                // GtkOverlay keeps a separate internal children list.
                 overlay_commit.remove(&e);
                 qr();
             }
@@ -567,7 +570,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         start
     };
 
-    // Click to select and edit
     {
         let sel2 = selected_coord.clone();
         let fe2 = formula_entry.clone();
@@ -679,7 +681,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Formatting button handlers
     {
         let sel = selected_coord.clone();
         let fmts = cell_formats.clone();
@@ -786,7 +787,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // Keyboard navigation + click-to-edit
     {
         let sel_coord = selected_coord.clone();
         let edit_entry_nav = editing_entry.clone();
@@ -799,7 +799,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Ok(ctrl) = gtk_dynamic_loader::EventControllerKey::new(loader.clone()) {
                 ctrl.add_to_widget(&win);
                 let start_edit_gtk4 = start_edit_kb.clone();
-                ctrl.connect_key_pressed(Box::new(move |keyval: u32| -> i32 {
+                ctrl.connect_key_pressed(Box::new(move |keyval: u32, _state: u32| -> i32 {
                     if *text_input_active.borrow() {
                         return 0;
                     }
@@ -808,7 +808,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let _ = edit_entry_nav.borrow_mut().take();
                         } else if keyval == 0xFF0D || keyval == 0xFF8D {
                             commit_fn();
-                            // Move to cell below and start editing
                             let next = sel_coord.borrow().map(|(r, c)| (r + 1, c)).filter(|(r, _)| *r < VISIBLE_ROWS);
                             if let Some((r, c)) = next {
                                 *sel_coord.borrow_mut() = Some((r, c));
@@ -867,7 +866,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let _ = edit_entry_nav.borrow_mut().take();
                         } else if keyval == 0xFF0D || keyval == 0xFF8D {
                             commit_fn();
-                            // Move to cell below and start editing
                             let next = sel_coord.borrow().map(|(r, c)| (r + 1, c)).filter(|(r, _)| *r < VISIBLE_ROWS);
                             if let Some((r, c)) = next {
                                 *sel_coord.borrow_mut() = Some((r, c));
@@ -913,7 +911,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // File operations
     {
         let loader_open = loader.clone();
         let texts_open = texts.clone();
@@ -988,7 +985,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let _ = quit_btn.on_click(|| std::process::exit(0));
 
-    // Layout
     let vbox = gtk::create_box(gtk::Orientation::Vertical, 0)?;
     let toolbar_box = gtk::create_box(gtk::Orientation::Vertical, 0)?;
     toolbar_box.append(&toolbar);
@@ -1005,7 +1001,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let result = app.run().map_err(|e| Box::new(e) as Box<dyn std::error::Error>);
 
-    // Remove any leftover editing entry from the overlay.
     if let Some(e) = editing_entry.borrow_mut().take() {
         overlay.remove(&e);
     }

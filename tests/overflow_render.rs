@@ -1,3 +1,5 @@
+#![cfg(feature = "ratatui")]
+
 use corro::ui::App;
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;

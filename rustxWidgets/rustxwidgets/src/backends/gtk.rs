@@ -1,4 +1,4 @@
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
 mod gtk_backend {
     use std::sync::Arc;
     use std::error::Error as StdError;
@@ -152,4 +152,5 @@ mod gtk_backend {
     }
 }
 
+#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
 pub use gtk_backend::{init, create_window, create_button, create_label, create_box, create_grid, create_entry, create_menu, create_simple_action, create_menubar, create_dialog, create_dropdown, create_checkbutton, create_radiobutton, create_textview, create_drawing_area, create_overlay, create_scrolled_window, loader, quit_main_loop};

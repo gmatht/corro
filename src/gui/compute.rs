@@ -1,7 +1,7 @@
 use crate::agg::compute_aggregate;
 use crate::agg::helpers::{
-    data_main_col_count, fold_numbers, left_margin_main_col_aggregate,
-    left_margin_special_col_aggregate, parse_num, previous_raw_block,
+    data_main_col_count, left_margin_main_col_aggregate,
+    left_margin_special_col_aggregate, previous_raw_block,
 };
 use crate::formula::cell_effective_display;
 use crate::grid::{CellAddr, ColumnAddr, GridBox, MainRange, HEADER_ROWS, MARGIN_COLS};

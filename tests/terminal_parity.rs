@@ -1,5 +1,7 @@
 
 
+#![cfg(all(target_os = "linux", feature = "pancurses", feature = "ratatui"))]
+
 mod tmux {
     use std::process::Command;
 
@@ -181,17 +183,18 @@ fn edit_c3_hello_world_full_screen_match() {
         &ratatui[..ratatui.len().min(3000)]);
 }
 
-/// Navigate to column K (past J) and verify the ratatui formula bar shows K1.
+/// Navigate to column K (past J) in the right margin and verify the ratatui formula bar shows ]K1.
 #[test]
 fn navigate_to_column_k_via_ratatui() {
     use crossterm::event::KeyCode;
     let mut keys = Vec::new();
-    for _ in 0..10 {
+    // Grid has 5 main columns (A-E).  15 Right presses from A1 reaches ]K1.
+    for _ in 0..15 {
         keys.push(KeyCode::Right);
     }
     let ratatui = render_via_ratatui_with_keys("docs/tests/overflow.corro", &keys);
-    assert!(ratatui.contains("K1"),
-        "ratatui formula bar should show K1 after 10 Right presses\n{}",
+    assert!(ratatui.contains("]K1"),
+        "ratatui formula bar should show ]K1 after 15 Right presses\n{}",
         &ratatui[..ratatui.len().min(3000)]);
 }
 

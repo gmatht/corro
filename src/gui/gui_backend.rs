@@ -64,12 +64,6 @@ impl GuiCanvasSink {
         }
     }
 
-    fn clear(&self) {
-        self.cells.borrow_mut().clear();
-        self.styles.borrow_mut().clear();
-        self.raw_values.borrow_mut().clear();
-        self.cursor_pos.set(None);
-    }
 }
 
 impl CellSink for GuiCanvasSink {
@@ -125,7 +119,6 @@ struct GuiState {
     last_was_f: Cell<bool>,
     prev_key: Cell<u32>,
     menu_nav: Cell<MenuNavState>,
-    alt_f_detected: Cell<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -884,27 +877,10 @@ fn build_menu(rxapp: &rustxwidgets::App, win: &Window, state: &Rc<GuiState>) -> 
 
     let action_group = rxapp.ensure_action_group()?;
 
-    let file_menu = menu::build_submenu(rxapp, menu::FILE_MENU, "app")?;
-    let edit_menu = menu::build_submenu(rxapp, menu::EDIT_MENU, "app")?;
-    let view_menu = menu::build_submenu(rxapp, menu::VIEW_MENU, "app")?;
-    let insert_menu = menu::build_submenu(rxapp, menu::INSERT_MENU, "app")?;
-    let format_menu = menu::build_submenu(rxapp, menu::FORMAT_MENU, "app")?;
-    let sheet_menu = menu::build_submenu(rxapp, menu::SHEET_MENU, "app")?;
-    let data_menu = menu::build_submenu(rxapp, menu::DATA_MENU, "app")?;
-    let help_menu = menu::build_submenu(rxapp, menu::HELP_MENU, "app")?;
-
-    let mut menubar_model = rxapp.new_menu()?;
+    // Build the full menu tree from shared definitions (rustxwidgets).
     // Prefix labels with U+3164 (Hangul Filler) to prevent GTK4's
-    // GtkPopoverMenuBar from auto-assigning mnemonic accelerators
-    // (Alt+F, Alt+E, etc.).
-    menubar_model.append_submenu("\u{3164}File", &file_menu);
-    menubar_model.append_submenu("\u{3164}Edit", &edit_menu);
-    menubar_model.append_submenu("\u{3164}View", &view_menu);
-    menubar_model.append_submenu("\u{3164}Insert", &insert_menu);
-    menubar_model.append_submenu("\u{3164}Format", &format_menu);
-    menubar_model.append_submenu("\u{3164}Sheet", &sheet_menu);
-    menubar_model.append_submenu("\u{3164}Data", &data_menu);
-    menubar_model.append_submenu("\u{3164}Help", &help_menu);
+    // GtkPopoverMenuBar from auto-assigning mnemonic accelerators.
+    let menubar_model = rxapp.build_menu_model(&menu::all_submenus(), "\u{3164}")?;
 
     // Register action callbacks with state access
     let s = state.clone();
@@ -1144,7 +1120,6 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     corro_app.core.cursor.col = cursor_col;
     corro_app.core.anchor = Some(SheetCursor { row: hr, col: lm });
 
-    let _data_width = 200usize;
     let data_rows = 30usize;
     let data_cols = 12usize;
 
@@ -1190,7 +1165,6 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         last_was_f: Cell::new(false),
         prev_key: Cell::new(0),
         menu_nav: Cell::new(MenuNavState::Inactive),
-        alt_f_detected: Cell::new(false),
     });
 
     // Build menu
@@ -1272,14 +1246,12 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                 s.menu_nav.set(MenuNavState::File);
                 s.seq_alt_f.set(true);
                 s.alt_active.set(false);
-                s.alt_f_detected.set(true);
                 return 1;
             }
             if !s.editing.get() && ch == 'f' {
                 s.menu_nav.set(MenuNavState::File);
                 s.seq_alt_f.set(true);
                 s.alt_active.set(false);
-                s.alt_f_detected.set(true);
                 return 1;
             }
             if ch == 'q'

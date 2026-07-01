@@ -8,31 +8,48 @@ use corro::gui::Backend;
 use std::fs;
 
 /// Test that when running corro --gui with a non-existent file,
-/// the file is created and text entered into cells is saved.
+/// the file is created on first commit and text entered into cells is saved.
 #[test]
-fn test_gui_creates_file_and_saves_text() {
-    // Create a temporary directory for our test
+fn test_gui_committed_edit_creates_file() {
     let temp_dir = tempfile::tempdir().unwrap();
     let test_file = temp_dir.path().join("t.corro");
 
-    // Ensure the file doesn't exist initially
     assert!(!test_file.exists());
 
-    // Create a GUI app with the non-existent file
     let mut app = GuiApp::new_with_paths(vec![test_file.clone()]);
-    app.set_backend(Backend::Gtk);
+    app.set_backend(Backend::Gui);
 
-    // Simulate the app loading (this should create the file if it doesn't exist)
+    // load_initial sets up the in-memory workbook but does NOT create the file.
+    // The .corro file is created lazily on the first commit_workbook_op call.
     let result = app.load_initial();
     assert!(result.is_ok(), "Failed to load initial state: {:?}", result);
 
-    // At this point, the file should be created
-    assert!(test_file.exists(), "File was not created: {:?}", test_file);
+    // File must NOT exist yet — load_initial only reads, never writes.
+    assert!(!test_file.exists(),
+        "load_initial should NOT create the file; creation happens on first commit");
 
-    // Get the file size (should be small since it's a new workbook)
-    let file_size = fs::metadata(&test_file).unwrap().len();
-    assert!(file_size > 0, "File should not be empty: {:?}", test_file);
+    // Simulate what happens when the user edits a cell: the GUI calls
+    // commit_workbook_op (via commit_edit in gui_backend.rs).  We exercise
+    // the exact same path here through the core workbook API.
+    let addr = corro::grid::CellAddr::Main { row: 0, col: 0 };
+    app.core.workbook.active_sheet_mut().grid.set(&addr, "hello".into());
+    let sheet_id = app.core.workbook.sheet_id(app.core.workbook.active_sheet);
+    let op = corro::ops::Op::SetCell { addr, value: "hello".into() };
+    let wbo = corro::ops::WorkbookOp::SheetOp { sheet_id, op };
+    let mut active_sheet = sheet_id;
+    corro::io::commit_workbook_op(
+        &test_file,
+        &mut app.core.offset,
+        &mut app.core.workbook,
+        &mut active_sheet,
+        &wbo,
+    )
+    .expect("commit_workbook_op should succeed");
 
-    // Clean up
+    // Now the file must exist with the committed content
+    assert!(test_file.exists(), "File should be created by commit_workbook_op");
+    let content = fs::read_to_string(&test_file).unwrap();
+    assert!(content.contains("hello"), "file content should contain 'hello'");
+
     temp_dir.close().unwrap();
 }

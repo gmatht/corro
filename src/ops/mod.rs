@@ -3185,7 +3185,7 @@ addr,
         state
             .grid
             .set(&CellAddr::Main { row: 0, col: 2 }, "Tail".into());
-        let global_source_col = (MARGIN_COLS + 1) as u32;
+        let _global_source_col = (MARGIN_COLS + 1) as u32;
         state.grid.set(
             &CellAddr::Header {
                 row: 0,

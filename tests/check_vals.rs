@@ -30,6 +30,7 @@ fn test_data_files_are_consistent() {
 
 use std::path::PathBuf;
 
+#[cfg(feature = "ratatui")]
 #[test]
 fn check_test_rec5_values() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));

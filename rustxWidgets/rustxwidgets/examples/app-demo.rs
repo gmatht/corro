@@ -84,12 +84,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = App::init()?;
 
-    #[cfg(feature = "gtk")]
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
     if let Some(loader) = rustxwidgets::backends::gtk::loader() {
         println!("GTK version: {:?}", loader.version());
     }
 
-    let win = app.create_window()?;
+    let win = app.new_window()?;
     win.set_title("App Demo \u{2014} Spreadsheet with Menus and Dialogs");
     win.set_default_size(1600, 1000);
 
@@ -147,33 +147,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ── Top-level layout ────────────────────────────────────────────
-    let mut vbox = app.create_box(Orientation::Vertical, 0)?;
+    let mut vbox = app.new_box(Orientation::Vertical, 0)?;
 
     // ── Menu bar: File, Edit, Help ──────────────────────────────────
-    let mut file_menu = app.create_menu()?;
+    let mut file_menu = app.new_menu()?;
     file_menu.append("New", "app.new");
     file_menu.append("Open...", "app.open");
     file_menu.append("Save As...", "app.save");
     file_menu.append("Quit", "app.quit");
 
-    let mut edit_menu = app.create_menu()?;
+    let mut edit_menu = app.new_menu()?;
     edit_menu.append("Find && Replace...", "app.find");
     edit_menu.append("Clear Cell", "app.clear");
 
-    let mut help_menu = app.create_menu()?;
+    let mut help_menu = app.new_menu()?;
     help_menu.append("About App Demo", "app.about");
 
-    let mut menubar_model = app.create_menu()?;
+    let mut menubar_model = app.new_menu()?;
     menubar_model.append_submenu("File", &file_menu);
     menubar_model.append_submenu("Edit", &edit_menu);
     menubar_model.append_submenu("Help", &help_menu);
 
     let menubar =
-        unsafe { app.create_menubar(&menubar_model, win.hwnd())? };
+        app.new_menubar(&menubar_model, win.hwnd())?;
     vbox.append(&menubar);
 
     // ── Toolbar ─────────────────────────────────────────────────────
-    let mut toolbar = app.create_box(Orientation::Horizontal, 2)?;
+    let mut toolbar = app.new_box(Orientation::Horizontal, 2)?;
     let open_btn = app.create_button("Open")?;
     let save_btn = app.create_button("Save")?;
     let quit_btn = app.create_button("Quit")?;
@@ -209,10 +209,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     vbox.append(&toolbar);
 
     // ── Formula bar ─────────────────────────────────────────────────
-    let mut formula_bar = app.create_box(Orientation::Horizontal, 4)?;
-    let fx_label = app.create_label("  fx  ")?;
+    let mut formula_bar = app.new_box(Orientation::Horizontal, 4)?;
+    let fx_label = app.new_label("  fx  ")?;
     formula_bar.append(&fx_label);
-    let formula_entry = app.create_entry()?;
+    let formula_entry = app.new_entry()?;
     formula_entry.set_width_chars(40);
     formula_entry.set_size_request(400, 26);
     formula_bar.append(&formula_entry);
@@ -220,7 +220,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Spreadsheet canvas ──────────────────────────────────────────
     let overlay = app.create_overlay()?;
-    let canvas = app.create_canvas()?;
+    let canvas = app.new_canvas()?;
     canvas.set_size_request(total_w as i32, total_h as i32);
     canvas.set_content_size(total_w as i32, total_h as i32);
     overlay.set_child(&canvas);
@@ -231,7 +231,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         overlay.set_hexpand(true);
     }
 
-    #[cfg(feature = "gtk")]
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
     let scrolled = {
         let gtk_loader = rustxwidgets::backends::gtk::loader()
             .expect("GTK loader not initialized");
@@ -257,26 +257,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         {
             gtk_dynamic_loader::add_css_provider_global(
                 &gtk_loader,
-                *win.as_ref(),
+                win.hwnd(),
                 provider,
                 600,
             );
         }
         s
     };
-    #[cfg(feature = "gtk")]
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
     scrolled.set_hexpand(true);
-    #[cfg(feature = "gtk")]
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
     scrolled.set_vexpand(true);
 
-    #[cfg(not(feature = "gtk"))]
+    #[cfg(not(all(feature = "gtk", target_os = "linux", not(feature = "zork"))))]
     let scrolled = {
         let s = app.create_scrolled_window()?;
         s.set_policy(0, 0);
         s.set_child(&overlay);
         s
     };
-    #[cfg(not(feature = "gtk"))]
+    #[cfg(not(all(feature = "gtk", target_os = "linux", not(feature = "zork"))))]
     {
         scrolled.set_hexpand(true);
         scrolled.set_vexpand(true);
@@ -355,7 +355,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if ee.borrow().is_some() {
                     return;
                 }
-                if let Ok(entry) = ae.create_entry() {
+                if let Ok(entry) = ae.new_entry() {
                     *ta.borrow_mut() = true;
                     entry.set_text(&te.borrow()[r][c]);
                     let fmt = fe.borrow()[r][c].clone();
@@ -1039,13 +1039,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = quit_btn.on_click(|| std::process::exit(0));
 
     // ── SimpleAction: wire menu items to callbacks ──────────────────
-    let sa_new = app.create_simple_action("app.new")?;
-    let sa_open = app.create_simple_action("app.open")?;
-    let sa_save = app.create_simple_action("app.save")?;
-    let sa_quit = app.create_simple_action("app.quit")?;
-    let sa_find = app.create_simple_action("app.find")?;
-    let sa_clear = app.create_simple_action("app.clear")?;
-    let sa_about = app.create_simple_action("app.about")?;
+    let sa_new = app.new_simple_action("app.new")?;
+    let sa_open = app.new_simple_action("app.open")?;
+    let sa_save = app.new_simple_action("app.save")?;
+    let sa_quit = app.new_simple_action("app.quit")?;
+    let sa_find = app.new_simple_action("app.find")?;
+    let sa_clear = app.new_simple_action("app.clear")?;
+    let sa_about = app.new_simple_action("app.about")?;
 
     // Helper to connect a simple action regardless of backend.
     // GTK/NWG/WASM use connect_activate(FnMut(*mut c_void));
@@ -1175,19 +1175,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cff = canvas.clone();
     connect_action!(sa_find, {
         move || {
-            if let Ok(dialog) = af.create_dialog() {
+            if let Ok(dialog) = af.new_dialog() {
                 dialog.set_title("Find && Replace");
                 dialog.set_default_size(350, 200);
 
                 if let Ok(mut dvbox) =
-                    af.create_box(Orientation::Vertical, 4)
+                    af.new_box(Orientation::Vertical, 4)
                 {
-                    if let Ok(find_entry) = af.create_entry() {
+                    if let Ok(find_entry) = af.new_entry() {
                         find_entry.set_width_chars(30);
                         dvbox.append(&find_entry);
 
                         if let Ok(replace_entry) =
-                            af.create_entry()
+                            af.new_entry()
                         {
                             replace_entry
                                 .set_width_chars(30);
@@ -1258,24 +1258,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let aa = app.clone();
     connect_action!(sa_about, {
         move || {
-            if let Ok(dialog) = aa.create_dialog() {
+            if let Ok(dialog) = aa.new_dialog() {
                 dialog.set_title("About App Demo");
                 dialog.set_default_size(320, 180);
 
                 if let Ok(mut dvbox) =
-                    aa.create_box(Orientation::Vertical, 8)
+                    aa.new_box(Orientation::Vertical, 8)
                 {
-                    if let Ok(title_lbl) = aa.create_label(
+                    if let Ok(title_lbl) = aa.new_label(
                         "App Demo v0.1",
                     ) {
                         dvbox.append(&title_lbl);
                     }
-                    if let Ok(desc_lbl) = aa.create_label(
+                    if let Ok(desc_lbl) = aa.new_label(
                         "Portable demo combining\ndialog, topmenu, and x-sheet",
                     ) {
                         dvbox.append(&desc_lbl);
                     }
-                    if let Ok(tech_lbl) = aa.create_label(
+                    if let Ok(tech_lbl) = aa.new_label(
                         "Built with rustxwidgets\nCross-platform GUI toolkit",
                     ) {
                         dvbox.append(&tech_lbl);

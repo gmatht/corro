@@ -6,7 +6,6 @@ edition = "2021"
 [dependencies]
 libc = "0.2"
 thiserror = "1.0"
-libloading = "0.8"
 
 [target.'cfg(unix)'.dependencies]
 libloading = "0.8"

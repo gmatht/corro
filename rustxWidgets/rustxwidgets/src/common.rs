@@ -25,12 +25,12 @@ mod platform {
     platform_module!(crate::backends_gtk_adapter, GtkOrientation);
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, not(feature = "zork")))]
 mod platform {
     platform_module!(crate::backends_nwg_adapter, NwgOrientation);
 }
 
-#[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows))))]
+#[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
 mod platform {
     platform_module!(crate::backends_pancurses_adapter, PancursesOrientation);
 }
@@ -106,10 +106,21 @@ macro_rules! common_types_mod {
             pub fn get_text(&self) -> Option<String> { self.inner.get_text() }
             pub fn grab_focus(&self) { self.inner.grab_focus(); }
             pub fn set_hexpand(&self, expand: bool) { self.inner.set_hexpand(expand); }
+            pub fn set_vexpand(&self, expand: bool) { self.inner.set_vexpand(expand); }
             pub fn set_size_request(&self, w: i32, h: i32) { self.inner.set_size_request(w, h); }
             pub fn set_visible(&self, v: bool) { self.inner.set_visible(v); }
             pub fn connect_changed(&self, f: impl FnMut() + 'static) -> Result<u64, crate::Error> { self.inner.connect_changed(f) }
             pub fn on_key_raw(&self, cb: Box<dyn FnMut(u32, u32) -> bool>) { self.inner.on_key_raw(cb); }
+            pub fn add_class(&self, class_name: &str) { self.inner.add_class(class_name); }
+            pub fn remove_class(&self, class_name: &str) { self.inner.remove_class(class_name); }
+            pub fn set_halign(&self, align: i32) { self.inner.set_halign(align); }
+            pub fn set_valign(&self, align: i32) { self.inner.set_valign(align); }
+            pub fn set_width_chars(&self, n: i32) { self.inner.set_width_chars(n); }
+            pub fn connect_activate<F: FnMut(*mut std::os::raw::c_void) + 'static>(&self, f: F) -> Result<u64, crate::Error> { self.inner.connect_activate(f) }
+            pub fn connect_focus_in_event<F: FnMut(*mut std::os::raw::c_void) -> i32 + 'static>(&self, f: F) -> Result<u64, crate::Error> { self.inner.connect_focus_in_event(f) }
+            pub fn connect_focus_out_event<F: FnMut(*mut std::os::raw::c_void) -> i32 + 'static>(&self, f: F) -> Result<u64, crate::Error> { self.inner.connect_focus_out_event(f) }
+            pub fn set_margin_start(&self, px: i32) { self.inner.set_margin_start(px); }
+            pub fn set_margin_top(&self, px: i32) { self.inner.set_margin_top(px); }
         }
         impl AsRef<*mut std::os::raw::c_void> for Entry {
             fn as_ref(&self) -> &*mut std::os::raw::c_void { self.inner.as_ref() }
@@ -127,6 +138,7 @@ macro_rules! common_types_mod {
         impl Window {
             pub fn on_event(&self, cb: Box<dyn FnMut(*mut std::os::raw::c_void) -> i32>) { self.inner.on_event(cb); }
             pub fn on_event_key(&self, cb: Box<dyn FnMut(u32, u32) -> i32>) { self.inner.on_event_key(cb); }
+            pub fn on_close(&self, cb: Box<dyn FnMut()>) { self.inner.on_close(cb); }
         }
         impl AsRef<*mut std::os::raw::c_void> for Canvas {
             fn as_ref(&self) -> &*mut std::os::raw::c_void { self.inner.as_ref() }
@@ -169,7 +181,7 @@ mod common_types {
     }
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, not(feature = "zork")))]
 mod common_types {
     common_types_mod!();
     impl Canvas {
@@ -180,7 +192,7 @@ mod common_types {
     }
 }
 
-#[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows))))]
+#[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
 mod common_types { common_types_mod!(); }
 
 #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
@@ -200,10 +212,10 @@ mod common_types { common_types_mod!(); }
 #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
 pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog};
 
-#[cfg(windows)]
+#[cfg(all(windows, not(feature = "zork")))]
 pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog};
 
-#[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows))))]
+#[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
 pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog};
 
 #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
@@ -218,9 +230,9 @@ pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleActi
 // Re-export Orientation from the active platform backend
 #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
 pub use self::platform::GtkOrientation as Orientation;
-#[cfg(windows)]
+#[cfg(all(windows, not(feature = "zork")))]
 pub use self::platform::NwgOrientation as Orientation;
-#[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows))))]
+#[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
 pub use self::platform::PancursesOrientation as Orientation;
 #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
 pub use self::platform::WasmOrientation as Orientation;
@@ -228,3 +240,20 @@ pub use self::platform::WasmOrientation as Orientation;
 pub use self::platform::AndroidOrientation as Orientation;
 #[cfg(feature = "zork")]
 pub use self::platform::ZorkOrientation as Orientation;
+
+// -- Shared menu definition types (no platform deps) --
+
+/// A single menu item: label + action name.
+#[derive(Clone, Copy)]
+pub struct MenuItemDef {
+    pub label: &'static str,
+    pub action: &'static str,
+}
+
+/// A submenu: label + prefix for action names + items.
+#[derive(Clone, Copy)]
+pub struct SubmenuDef {
+    pub label: &'static str,
+    pub prefix: &'static str,
+    pub items: &'static [MenuItemDef],
+}

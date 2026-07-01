@@ -1,5 +1,5 @@
 // High-level ergonomic wrappers over gtk_compat for the rustxwidgets API
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
 mod gtk_adapter {
     use std::os::raw::c_void;
     use std::cell::RefCell;
@@ -60,30 +60,63 @@ mod gtk_adapter {
             }
         }
 
+        pub fn on_close(&self, cb: Box<dyn FnMut()>) {
+            if let Some(loader) = crate::backends::gtk::loader() {
+                let win_ptr = *self.0.as_ref();
+                if !win_ptr.is_null() {
+                    let l = loader.clone();
+                    let is_gtk4 = l.symbols.gtk_drawing_area_set_draw_func.is_some();
+                    let signal = if is_gtk4 { "close-request" } else { "delete-event" };
+                    let mut cb = cb;
+                    unsafe {
+                        let _ = gtk_dynamic_loader::widget_connect_signal_bool(
+                            &l, win_ptr, signal,
+                            Box::new(move |_ev: *mut c_void| -> i32 {
+                                cb();
+                                0
+                            }),
+                        );
+                    }
+                }
+            }
+        }
         pub fn on_event_key(&self, mut cb: Box<dyn FnMut(u32, u32) -> i32>) {
             if let Some(loader) = crate::backends::gtk::loader() {
                 let win_ptr = *self.0.as_ref();
                 if !win_ptr.is_null() {
                     let l = loader.clone();
-                    unsafe {
-                        let _ = gtk_dynamic_loader::widget_connect_signal_bool(
-                            &l.clone(), win_ptr, "event",
-                            Box::new(move |ev: *mut c_void| -> i32 {
-                                let mut keyval: u32 = 0;
-                                if let Some(get_kv) = l.symbols.gdk_event_get_keyval {
-                                    if get_kv(ev, &mut keyval) == 0 {
+                    let is_gtk4 = l.symbols.gtk_drawing_area_set_draw_func.is_some();
+                    if is_gtk4 {
+                        if let Ok(ctrl) = gtk_dynamic_loader::EventControllerKey::new(l.clone()) {
+                            let _ = ctrl.connect_key_pressed(Box::new(move |keyval: u32, state: u32| -> i32 {
+                                cb(keyval, state)
+                            }));
+                            ctrl.add_to_widget(&self.0);
+                            // Widget takes ownership of the controller via gtk_widget_add_controller.
+                            // Dropping the Rust wrapper balances the constructor's ref (GTK4) or
+                            // the ref_sink ref (GTK3); the widget's own ref keeps it alive.
+                        }
+                    } else {
+                        unsafe {
+                            let _ = gtk_dynamic_loader::widget_connect_signal_bool(
+                                &l.clone(), win_ptr, "event",
+                                Box::new(move |ev: *mut c_void| -> i32 {
+                                    let mut keyval: u32 = 0;
+                                    if let Some(get_kv) = l.symbols.gdk_event_get_keyval {
+                                        if get_kv(ev, &mut keyval) == 0 {
+                                            return 0;
+                                        }
+                                    } else {
                                         return 0;
                                     }
-                                } else {
-                                    return 0;
-                                }
-                                let mut state: u32 = 0;
-                                if let Some(get_st) = l.symbols.gdk_event_get_state {
-                                    get_st(ev, &mut state);
-                                }
-                                cb(keyval, state)
-                            }),
-                        );
+                                    let mut state: u32 = 0;
+                                    if let Some(get_st) = l.symbols.gdk_event_get_state {
+                                        get_st(ev, &mut state);
+                                    }
+                                    cb(keyval, state)
+                                }),
+                            );
+                        }
                     }
                 }
             }
@@ -93,6 +126,7 @@ mod gtk_adapter {
     #[repr(transparent)]
     pub struct Button(pub GButton);
 
+    impl Widget for Button { fn raw_handle(&self) -> *mut c_void { *self.0.as_ref() } }
     impl AsRef<*mut c_void> for Button { fn as_ref(&self) -> &*mut c_void { self.0.as_ref() } }
 
     impl Button {
@@ -118,6 +152,7 @@ mod gtk_adapter {
     #[repr(transparent)]
     pub struct Label(pub GLabel);
 
+    impl Widget for Label { fn raw_handle(&self) -> *mut c_void { *self.0.as_ref() } }
     impl AsRef<*mut c_void> for Label { fn as_ref(&self) -> &*mut c_void { self.0.as_ref() } }
 
     impl Label {
@@ -159,14 +194,29 @@ mod gtk_adapter {
         pub fn set_vexpand(&self, expand: bool) { self.0.set_vexpand(expand); }
         pub fn set_hexpand(&self, expand: bool) { self.0.set_hexpand(expand); }
         pub fn set_visible(&self, visible: bool) { self.0.set_visible(visible); }
-        pub fn set_child_hexpand(&self, _child: &impl AsRef<*mut c_void>, _expand: bool) {}
-        pub fn set_child_vexpand(&self, _child: &impl AsRef<*mut c_void>, _expand: bool) {}
+        pub fn set_child_hexpand(&self, child: &impl AsRef<*mut c_void>, expand: bool) {
+            if let Some(loader) = crate::backends::gtk::loader() {
+                let child_ptr = *child.as_ref();
+                if !child_ptr.is_null() {
+                    unsafe { gtk_dynamic_loader::widget_set_hexpand(&loader, child_ptr, expand); }
+                }
+            }
+        }
+        pub fn set_child_vexpand(&self, child: &impl AsRef<*mut c_void>, expand: bool) {
+            if let Some(loader) = crate::backends::gtk::loader() {
+                let child_ptr = *child.as_ref();
+                if !child_ptr.is_null() {
+                    unsafe { gtk_dynamic_loader::widget_set_vexpand(&loader, child_ptr, expand); }
+                }
+            }
+        }
     }
 
     #[repr(transparent)]
     pub struct Grid(pub GGrid);
     impl Widget for Grid { fn raw_handle(&self) -> *mut c_void { *self.0.as_ref() } }
     impl AsRef<*mut c_void> for Grid { fn as_ref(&self) -> &*mut c_void { self.0.as_ref() } }
+    impl Clone for Grid { fn clone(&self) -> Self { Grid(self.0.clone()) } }
 
     impl Grid {
         pub fn attach(&self, child: &impl AsRef<*mut c_void>, left: i32, top: i32, width: i32, height: i32) {
@@ -178,7 +228,6 @@ mod gtk_adapter {
         pub fn set_size_request(&self, w: i32, h: i32) { self.0.set_size_request(w, h); }
     }
 
-    #[repr(transparent)]
     pub struct Entry {
         inner: GEntry,
         _controllers: Rc<RefCell<Vec<Box<dyn std::any::Any>>>>,
@@ -398,7 +447,9 @@ mod gtk_adapter {
     impl AsRef<*mut c_void> for DropDown { fn as_ref(&self) -> &*mut c_void { self.0.as_ref() } }
 
     impl DropDown {
-        pub fn set_active(&self, index: u32) { self.0.set_active(index); }
+        pub fn set_active(&self, index: Option<u32>) {
+            if let Some(idx) = index { self.0.set_active(idx); }
+        }
         pub fn get_active(&self) -> i32 { self.0.get_active() }
         pub fn connect_changed<F: FnMut() + 'static>(&self, f: F) -> Result<u64, Error> {
             self.0.connect_changed(f).map_err(|e| Error::Backend(format!("{}", e)))
@@ -672,7 +723,8 @@ mod gtk_adapter {
                         &l3, inner, "key-press-event",
                         Box::new(move |ev: *mut c_void| -> i32 {
                             let keyval = gtk_dynamic_loader::EventControllerKey::get_keyval_static(&l2, ev);
-                            let state = 0u32;
+                            if keyval == 0 { return 0; }
+                            let state = gtk_dynamic_loader::EventControllerKey::get_state_static(&l2, ev);
                             if cb(keyval, state) { 1 } else { 0 }
                         }),
                     );
@@ -705,6 +757,8 @@ mod gtk_adapter {
 
     #[repr(transparent)]
     pub struct ScrolledWindow(pub GScrolledWindow);
+
+    impl Clone for ScrolledWindow { fn clone(&self) -> Self { ScrolledWindow(self.0.clone()) } }
 
     impl ScrolledWindow {
         pub fn set_child(&self, child: &impl AsRef<*mut c_void>) {
@@ -865,8 +919,8 @@ mod gtk_adapter {
 
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
 pub use gtk_adapter::*;
 
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
 pub use gtk_dynamic_loader::Orientation;

@@ -16,7 +16,7 @@ use std::path::Path;
 
 use corro::export::{delimited_export_matrix, DelimitedExportOptions, ExportContent};
 use corro::formula::{cell_effective_display, refresh_spills, set_eval_context};
-use corro::grid::{CellAddr, ColumnAddr, HEADER_ROWS, MARGIN_COLS};
+use corro::grid::{CellAddr, ColumnAddr, HEADER_ROWS};
 use corro::ods::{export_ods_bytes_workbook_with_options, import_ods_workbook};
 use zip::ZipArchive;
 use corro::ops::WorkbookState;
@@ -231,7 +231,7 @@ fn debug_subtotal_b11_inspect() {
     let _g2 = set_eval_context(&wa);
     eprintln!("Main (10,1) eff after: {:?}", cell_effective_display(ga, &b11));
     for (a, t) in ga.iter_nonempty() {
-        if let CellAddr::Header { row, col } = a {
+        if let CellAddr::Header { row, col: _ } = a {
             if row == (HEADER_ROWS - 1) as u32 && (t.contains("TAX") || t.contains("0.1")) {
                 eprintln!("header ~1 row with tax-ish: {a:?} => {:?}", t);
             }

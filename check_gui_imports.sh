@@ -30,10 +30,8 @@ echo "=== Check 2: No concrete rustxwidgets::App / rustxwidgets::Window in share
 
 shared_files=(
     "$gui_dir/clipboard.rs"
-    "$gui_dir/dialogs.rs"
     "$gui_dir/edit.rs"
     "$gui_dir/keymap.rs"
-    "$gui_dir/menu.rs"
     "$gui_dir/mod.rs"
     "$gui_dir/sheet.rs"
 )

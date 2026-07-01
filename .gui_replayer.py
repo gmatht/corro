@@ -12,6 +12,7 @@ Usage:
 """
 
 import argparse
+import glob
 import os
 import re
 import shutil
@@ -140,11 +141,18 @@ def find_corro_window():
 
 
 def _launch_and_wait(binary, test_file):
-    """Launch corro, wait for window, and return (proc, hwnd)."""
+    """Launch corro, wait for window, and return (proc, hwnd).
+
+    Stderr is NOT piped: the debug binary can produce enough eprintln! output
+    to fill the 4KB Windows pipe buffer, which deadlocks the process before
+    communicate() is called.  By letting stderr flow to the real stderr we
+    avoid the deadlock entirely.  The caller can still observe stderr output
+    (it appears inline on the console).
+    """
     proc = subprocess.Popen(
         [binary, "--gui", test_file],
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stderr=None,
     )
     # Retry finding the window: initial 1.5s, then up to 5 more at 1s intervals
     hwnd = None
@@ -167,43 +175,100 @@ def _launch_and_wait(binary, test_file):
     return proc, hwnd
 
 
-def _cleanup(proc, label=""):
+def _cleanup(proc, label="", hwnd=None):
     """Try to gracefully terminate corro, then force kill if needed.
-    Returns True if the process exited cleanly (returncode == 0)."""
+    Returns True if the process exited cleanly (returncode == 0).
+
+    If hwnd is provided, tries Alt+F+Q keystrokes before force-killing.
+
+    Note: stderr is NOT piped (see _launch_and_wait), so any stderr
+    output from the child appears directly on the parent's stderr.
+    """
     elapsed = 0.0
     import time as _time
     t0 = _time.time()
+
+    # Check if hwnd is still valid before any PostMessageW calls
+    hwnd_valid = False
+    if hwnd is not None and HAS_WIN32:
+        hwnd_valid = ctypes.windll.user32.IsWindow(hwnd) != 0
+        if not hwnd_valid:
+            print(f"  [{label}] hwnd={hwnd} is no longer a valid window")
+
+    # First try: communicate with 8s timeout
     try:
-        stdout, stderr = proc.communicate(timeout=12)
+        stdout, _stderr = proc.communicate(timeout=8)
         elapsed = _time.time() - t0
         ok = proc.returncode == 0
         if not ok:
             print(f"  [{label}] exit code={proc.returncode} elapsed={elapsed:.1f}s")
-        # Print captured output for diagnostics
         if stdout:
             sys.stdout.write(stdout.decode("utf-8", errors="replace"))
-        if stderr:
-            sys.stderr.write(stderr.decode("utf-8", errors="replace"))
         return ok
     except subprocess.TimeoutExpired:
         elapsed = _time.time() - t0
-        print(f"  [{label}] communicate timed out after {elapsed:.1f}s, force-killing")
-        proc.kill()
+        print(f"  [{label}] timed out after {elapsed:.1f}s, trying Alt+F+Q fallback")
+
+    # Second try: if we have a valid HWND, send Alt+F+Q as fallback quit mechanism
+    if hwnd_valid:
+        print(f"  [{label}] sending Alt+F+Q fallback")
+        send_alt_f(hwnd)
+        _time.sleep(0.3)
+        send_key(hwnd, 0x51)  # VK_Q
+        _time.sleep(0.5)
         try:
-            stdout, stderr = proc.communicate(timeout=3)
+            stdout, _stderr = proc.communicate(timeout=6)
+            elapsed = _time.time() - t0
+            ok = proc.returncode == 0
+            if not ok:
+                print(f"  [{label}] Alt+F+Q: exit code={proc.returncode} elapsed={elapsed:.1f}s")
             if stdout:
                 sys.stdout.write(stdout.decode("utf-8", errors="replace"))
-            if stderr:
-                sys.stderr.write(stderr.decode("utf-8", errors="replace"))
+            if ok:
+                return True
         except subprocess.TimeoutExpired:
-            print(f"  [{label}] force-kill also timed out")
-            proc.kill()
-        return False
+            elapsed = _time.time() - t0
+            print(f"  [{label}] Alt+F+Q also timed out")
+    elif hwnd is not None:
+        print(f"  [{label}] skipping Alt+F+Q fallback (window no longer valid)")
+
+    # Third try: WM_CLOSE again (in case previous attempt was dropped)
+    if hwnd_valid:
+        print(f"  [{label}] re-sending WM_CLOSE")
+        send_close(hwnd)
+        _time.sleep(0.5)
+        try:
+            stdout, _stderr = proc.communicate(timeout=4)
+            elapsed = _time.time() - t0
+            ok = proc.returncode == 0
+            if stdout:
+                sys.stdout.write(stdout.decode("utf-8", errors="replace"))
+            if ok:
+                return True
+        except subprocess.TimeoutExpired:
+            elapsed = _time.time() - t0
+            print(f"  [{label}] WM_CLOSE retry also timed out")
+    elif hwnd is not None:
+        print(f"  [{label}] skipping WM_CLOSE retry (window no longer valid)")
+
+    # Finally force-kill
+    elapsed = _time.time() - t0
+    print(f"  [{label}] force-killing after {elapsed:.1f}s total")
+    proc.kill()
+    try:
+        stdout, _stderr = proc.communicate(timeout=3)
+        if stdout:
+            sys.stdout.write(stdout.decode("utf-8", errors="replace"))
+    except subprocess.TimeoutExpired:
+        print(f"  [{label}] force-kill also timed out")
+        proc.kill()
+    return False
 
 
 def run_test_recrec5(binary="target/release/corro.exe"):
     """Test: open subtotal-tiny, enter data, quit."""
     print(f"Running recrec5 test with {binary}")
+    _restore_test_file()
     test_file = "docs/tests/subtotal-tiny.corro"
     output_file = "docs/tests/subtotal-tiny.corro"  # corro writes back to same file
     if not os.path.exists(test_file):
@@ -242,7 +307,7 @@ def run_test_recrec5(binary="target/release/corro.exe"):
     send_close(hwnd)
     time.sleep(0.5)
 
-    result = _cleanup(proc, "recrec5")
+    result = _cleanup(proc, "recrec5", hwnd)
     final_size = os.path.getsize(output_file) if os.path.exists(output_file) else 0
     output_exists = "yes" if os.path.exists(output_file) and final_size > initial_size else "no"
     print(f"  output_file={output_exists} initial={initial_size}b final={final_size}b")
@@ -254,6 +319,7 @@ def run_test_recrec5(binary="target/release/corro.exe"):
 def run_test_recrec6(binary="target/release/corro.exe"):
     """Test: open subtotal-tiny, navigate cells, quit."""
     print(f"Running recrec6 test with {binary}")
+    _restore_test_file()
     test_file = "docs/tests/subtotal-tiny.corro"
     if not os.path.exists(test_file):
         print(f"ERROR: test file not found: {test_file}")
@@ -285,57 +351,132 @@ def run_test_recrec6(binary="target/release/corro.exe"):
     send_close(hwnd)
     time.sleep(0.5)
 
-    result = _cleanup(proc, "recrec6")
+    result = _cleanup(proc, "recrec6", hwnd)
     _restore_test_file()
     print("recrec6 done")
     return result
 
 
+# The committed test data file has blank lines between SET commands
+# (42 lines total: 21 SET/FILL + 21 blank).  These produce the same
+# workbook state as the compact 21-line form because the parser skips
+# blank lines.  We include blank lines here so that the restored file
+# is byte-identical to the committed git version.
+_CANONICAL_LINES = [
+    "SET $1:A1 1",
+    "",
+    "SET $1:A2 2",
+    "",
+    "SET $1:B1 4",
+    "",
+    "SET $1:B2 5",
+    "",
+    "SET $1:C~1 =TOTAL",
+    "",
+    "SET $1:[A3 =TOTAL",
+    "",
+    "SET $1:B2 105",
+    "",
+    "SET $1:[A4 MAX",
+    "",
+    "SET $1:[A5 =TOTAL",
+    "",
+    "SET $1:[A4 AVERAGE",
+    "",
+    "SET $1:[A~1 01234567890123456789",
+    "",
+    "SET $1:[A~1 ",
+    "",
+    "SET $1:C1 d",
+    "",
+    "SET $1:C~1 asdf",
+    "",
+    "SET $1:C~1 =TOTAL",
+    "",
+    "$1:FILL C1=",
+    "",
+    "SET $1:C~1 =TOTAL",
+    "",
+    "SET $1:[A_1 =TOTAL",
+    "",
+    "SET $1:[A7 Extra",
+    "",
+    "SET $1:A7 1",
+    "",
+    "SET $1:B7 2",
+    "",
+]
+
+
+def _make_writable(p):
+    """Ensure file p is writable using multiple fallback methods."""
+    import subprocess as _sp, os as _os, stat as _stat
+    try:
+        if sys.platform == "win32":
+            # First try attrib -r (most reliable on Windows)
+            _sp.run(["attrib", "-R", p], capture_output=True, text=True, timeout=5)
+            # Also try PowerShell to clear ReadOnly
+            _sp.run(
+                ["powershell", "-Command",
+                 f"Set-ItemProperty -LiteralPath '{p}' -Name IsReadOnly -Value $false"],
+                capture_output=True, text=True, timeout=5)
+        _os.chmod(p, _stat.S_IWRITE | _stat.S_IREAD)
+    except Exception as e:
+        print(f"WARN: _make_writable({p}) failed: {e}")
+
+
 def _restore_test_file():
-    """Restore docs/tests/subtotal-tiny.corro to canonical 21-line state
+    """Restore docs/tests/subtotal-tiny.corro to canonical content
     and ensure it is writable.
 
     The corro binary modifies this file in-place when launched with --gui,
     appending SET commands.  We restore it before each test run to avoid
     accumulating extra SET commands that would cause golden-file mismatches.
 
-    The canonical file is the first 22 lines.
-    We preserve them and discard any replayer artifacts that have been
-    appended by previous runs.
+    This function rewrites the file from the hardcoded _CANONICAL_LINES list
+    so the content is always correct regardless of prior corruption.
     """
-    canonical_lines = 22
     path = "docs/tests/subtotal-tiny.corro"
-    if not os.path.exists(path):
-        print(f"WARN: _restore_test_file: {path} not found, cannot restore")
+
+    # Ensure file is writable BEFORE writing
+    _make_writable(path)
+
+    # Write canonical content
+    try:
+        with open(path, "w", newline="") as f:
+            for line in _CANONICAL_LINES:
+                f.write(line + "\r\n")
+        print(f"  restored {path} to {len(_CANONICAL_LINES)} canonical lines")
+    except Exception as e:
+        print(f"WARN: _restore_test_file error writing {path}: {e}")
         return
+
+    # Also restore the companion file test_rec5.corro (must be byte-identical
+    # to subtotal-tiny.corro per check_vals::test_data_files_are_consistent).
+    companion = "test_rec5.corro"
+    _make_writable(companion)
     try:
-        # First clear the read-only attribute so we can write.
-        # git checks out files read-only on Windows.
-        if sys.platform == "win32":
-            import subprocess as _sp
-            # Use PowerShell for reliable attribute clearing (attrib.exe can be flaky)
-            _sp.run(["powershell", "-Command",
-                     f"Set-ItemProperty -LiteralPath '{path}' -Name IsReadOnly -Value $false"],
-                    capture_output=True, text=True)
-        import os as _os, stat as _stat
-        _os.chmod(path, _stat.S_IWRITE | _stat.S_IREAD)
+        with open(companion, "w", newline="") as f:
+            for line in _CANONICAL_LINES:
+                f.write(line + "\r\n")
+        print(f"  restored {companion} to {len(_CANONICAL_LINES)} canonical lines")
     except Exception as e:
-        print(f"WARN: _restore_test_file clear read-only failed: {e}")
-    try:
-        with open(path, "r") as f:
-            lines = f.readlines()
-        if len(lines) != canonical_lines:
-            with open(path, "w") as f:
-                f.writelines(lines[:canonical_lines])
-    except Exception as e:
-        print(f"WARN: _restore_test_file error restoring {path}: {e}")
+        print(f"WARN: _restore_test_file error writing {companion}: {e}")
+    # Verify the files are writable now
+    for p in (path, companion):
+        if os.path.exists(p):
+            try:
+                with open(p, "ab") as f:
+                    pass
+            except PermissionError as e:
+                print(f"WARN: {p} still not writable after restore: {e}")
 
 
 def main():
     _restore_test_file()
     parser = argparse.ArgumentParser(description="GUI Replayer for NWG tests")
     parser.add_argument("--test", choices=["recrec5", "recrec6", "all"], default="all")
-    parser.add_argument("--binary", default="target/release/corro.exe")
+    parser.add_argument("--binary", default="")
     parser.add_argument("--list", action="store_true", help="List available tests")
     args = parser.parse_args()
 
@@ -346,7 +487,7 @@ def main():
         return 0
 
     if sys.platform != "win32":
-        print("ERROR: .gui_replayer.py is Windows-only (uses Win32 SendInput)")
+        print("ERROR: .gui_replayer.py is Windows-only (uses Win32 PostMessage)")
         return 1
 
     if not HAS_WIN32:
@@ -354,11 +495,39 @@ def main():
         return 1
 
     binary = args.binary or os.environ.get("BIN", "")
+    if binary:
+        # Explicit binary path provided; use it as-is.
+        pass
+    elif os.path.exists("target/release/corro.exe"):
+        binary = "target/release/corro.exe"
+    elif os.path.exists("target/debug/corro.exe"):
+        binary = "target/debug/corro.exe"
+    else:
+        print("ERROR: corro.exe not found (neither target/debug/ nor target/release/)")
+        print("  Building with: cargo +nightly build --features gui")
+        rc = subprocess.call(["cargo", "+nightly", "build", "--features", "gui"])
+        if rc != 0:
+            print("ERROR: build failed")
+            return 1
+        binary = "target/debug/corro.exe"
     if not os.path.exists(binary):
-        print(f"ERROR: binary not found at {binary}")
-        print("  Try: cargo +nightly build --features gui")
-        print("  Or set the BIN environment variable to the corro.exe path")
+        print(f"ERROR: binary still not found at {binary}")
         return 1
+    # Warn if binary may be stale
+    bin_mtime = os.path.getmtime(binary)
+    src_patterns = ["src/**/*.rs", "rustxWidgets/**/*.rs", "Cargo.toml", "rustxWidgets/rustxwidgets/Cargo.toml"]
+    newest_src = 0
+    for pat in src_patterns:
+        for f in glob.glob(pat, recursive=True):
+            try:
+                mtime = os.path.getmtime(f)
+                if mtime > newest_src:
+                    newest_src = mtime
+            except OSError:
+                pass
+    if newest_src > bin_mtime:
+        print(f"  WARNING: binary is older than source files; consider rebuilding with:")
+        print(f"    cargo +nightly build{' --release' if 'release' in binary else ''} --features gui")
 
     tests = []
     if args.test == "all":

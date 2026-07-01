@@ -1,5 +1,5 @@
 use crate::gui::dialogs;
-use rustxwidgets::common::{Menu, SimpleAction};
+use rustxwidgets::common::{SimpleAction, MenuItemDef, SubmenuDef};
 
 pub struct MenuAction {
     pub label: &'static str,
@@ -122,16 +122,6 @@ pub fn action_kind_to_name(kind: MenuActionKind) -> &'static str {
         MenuActionKind::FormatAlignDefault => "format_align_default",
         MenuActionKind::FormatReset => "format_reset",
     }
-}
-
-/// Build a submenu model from action descriptors.
-pub fn build_submenu(rxapp: &rustxwidgets::App, items: &[MenuAction], prefix: &str) -> Result<Menu, Box<dyn std::error::Error>> {
-    let mut menu = rxapp.new_menu()?;
-    for item in items {
-        let name = action_kind_to_name(item.action);
-        menu.append(item.label, &format!("{}.{}", prefix, name));
-    }
-    Ok(menu)
 }
 
 /// Create a SimpleAction, connect its callback, and register it.
@@ -286,3 +276,43 @@ pub const HELP_MENU: &[MenuAction] = &[
     MenuAction { label: "Keybindings", shortcut: "F1", action: MenuActionKind::HelpKeybinds },
     MenuAction { label: "About",       shortcut: "",   action: MenuActionKind::About },
 ];
+
+// -- Shared SubmenuDef definitions (single source of truth for all backends) --
+
+fn actions_to_defs(items: &[MenuAction]) -> Vec<MenuItemDef> {
+    items.iter().map(|a| MenuItemDef {
+        label: a.label,
+        action: action_kind_to_name(a.action),
+    }).collect()
+}
+
+/// All submenus as SubmenuDef slices — used by rustxwidgets::App::build_menu_model().
+pub fn all_submenus() -> Vec<SubmenuDef> {
+    vec![
+        SubmenuDef { label: "File",   prefix: "app", items: actions_to_defs(FILE_MENU).leak() },
+        SubmenuDef { label: "Edit",   prefix: "app", items: actions_to_defs(EDIT_MENU).leak() },
+        SubmenuDef { label: "View",   prefix: "app", items: actions_to_defs(VIEW_MENU).leak() },
+        SubmenuDef { label: "Insert", prefix: "app", items: actions_to_defs(INSERT_MENU).leak() },
+        SubmenuDef { label: "Format", prefix: "app", items: actions_to_defs(FORMAT_MENU).leak() },
+        SubmenuDef { label: "Sheet",  prefix: "app", items: actions_to_defs(SHEET_MENU).leak() },
+        SubmenuDef { label: "Data",   prefix: "app", items: actions_to_defs(DATA_MENU).leak() },
+        SubmenuDef { label: "Help",   prefix: "app", items: actions_to_defs(HELP_MENU).leak() },
+    ]
+}
+
+/// Menu bar display text for backends that render a static text bar (pancurses).
+pub fn menu_bar_text() -> String {
+    let defs = all_submenus();
+    let mut s = String::new();
+    for (i, sm) in defs.iter().enumerate() {
+        if i > 0 { s.push_str("   "); }
+        if i == 0 {
+            s.push('[');
+            s.push_str(sm.label);
+            s.push(']');
+        } else {
+            s.push_str(sm.label);
+        }
+    }
+    s
+}

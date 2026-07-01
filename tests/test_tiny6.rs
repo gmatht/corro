@@ -1,10 +1,11 @@
+#![cfg(feature = "ratatui")]
+
 #[test]
 fn test_narrow2() {
     let path = std::path::PathBuf::from("docs/tests/subtotal-tiny.corro");
-    let mut app = corro::ui::App::new(Some(path.clone()));
+    let _app = corro::ui::App::new(Some(path.clone()));
     println!("before load");
     // Manually do what load_initial does
-    let data = std::fs::read_to_string(&path).unwrap();
     let mut workbook = corro::ops::WorkbookState::new();
     let mut active_sheet = workbook.sheet_id(workbook.active_sheet);
     let (_, _replay) = corro::io::load_workbook_revisions_partial(

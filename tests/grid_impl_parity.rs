@@ -1,4 +1,4 @@
-use corro::grid::{CellAddr, ColumnAddr, Grid, GridBox, GridImpl};
+use corro::grid::{CellAddr, ColumnAddr, Grid, GridBox};
 
 #[test]
 fn grid_impl_parity_get_set_and_size() {

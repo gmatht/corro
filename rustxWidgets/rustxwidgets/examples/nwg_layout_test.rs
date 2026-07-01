@@ -1,20 +1,28 @@
-use rustxwidgets::prelude::*;
-use std::os::raw::c_void;
-
-fn check_widget_nonzero(child: &impl AsRef<*mut c_void>, name: &str) {
-    unsafe {
-        let hwnd = *child.as_ref();
-        let mut rect: winapi::shared::windef::RECT = std::mem::zeroed();
-        winapi::um::winuser::GetWindowRect(hwnd as _, &mut rect);
-        let w = rect.right - rect.left;
-        let h = rect.bottom - rect.top;
-        assert!(w > 0 && h > 0,
-            "{} has zero area: {}x{} at ({},{})", name, w, h, rect.left, rect.top);
-        println!("  {}: rect=({},{},{},{}) size={}x{}", name, rect.left, rect.top, rect.right, rect.bottom, w, h);
-    }
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(windows)]
+    return nwg_main();
+    println!("skipped (requires Windows)");
+    Ok(())
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[cfg(windows)]
+fn nwg_main() -> Result<(), Box<dyn std::error::Error>> {
+    use rustxwidgets::prelude::*;
+    use std::os::raw::c_void;
+
+    fn check_widget_nonzero(child: &impl AsRef<*mut c_void>, name: &str) {
+        unsafe {
+            let hwnd = *child.as_ref();
+            let mut rect: winapi::shared::windef::RECT = std::mem::zeroed();
+            winapi::um::winuser::GetWindowRect(hwnd as _, &mut rect);
+            let w = rect.right - rect.left;
+            let h = rect.bottom - rect.top;
+            assert!(w > 0 && h > 0,
+                "{} has zero area: {}x{} at ({},{})", name, w, h, rect.left, rect.top);
+            println!("  {}: rect=({},{},{},{}) size={}x{}", name, rect.left, rect.top, rect.right, rect.bottom, w, h);
+        }
+    }
+
     let app = App::init()?;
     let win = app.create_window()?;
     win.set_title("Layout Position Test");

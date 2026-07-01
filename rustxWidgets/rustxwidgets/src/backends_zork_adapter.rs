@@ -42,6 +42,7 @@ impl Window {
     }
     pub fn on_event(&self, _cb: Box<dyn FnMut(*mut c_void) -> i32>) {}
     pub fn on_event_key(&self, _cb: Box<dyn FnMut(u32, u32) -> i32>) {}
+    pub fn on_close(&self, _cb: Box<dyn FnMut()>) {}
 }
 
 // -- Button --

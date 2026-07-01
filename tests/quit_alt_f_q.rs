@@ -1,11 +1,11 @@
 //! Test that Alt+F → Q (Quit from File menu) causes the app to quit on Windows.
 //! Before the fix, `handle_menu_action("quit")` was a no-op on Windows.
 //! The fix adds `quit_main_loop()` to the NWG backend which posts `WM_QUIT`.
+#![cfg(all(windows, feature = "gui"))]
 
 use rustxwidgets::backends::BackendApp;
 
 #[test]
-#[cfg(windows)]
 fn quit_main_loop_sets_flag_and_posts_wm_quit() {
     // Verify default state: quit is NOT requested.
     assert!(

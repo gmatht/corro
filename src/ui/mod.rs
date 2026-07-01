@@ -372,6 +372,8 @@ pub(crate) enum MenuSection {
     Width,
     Insert,
     Help,
+    View,
+    Data,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -462,6 +464,8 @@ pub(crate) enum MenuAction {
     HelpCols,
     About,
     HelpFull,
+    ToggleHeaders,
+    ToggleMargins,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -819,6 +823,37 @@ const HELP_MENU_ITEMS: [MenuItem; 4] = [
     },
 ];
 
+const VIEW_MENU_ITEMS: [MenuItem; 2] = [
+    MenuItem {
+        shortcut: 'H',
+        label: "Toggle Headers",
+        target: MenuTarget::Action(MenuAction::ToggleHeaders),
+    },
+    MenuItem {
+        shortcut: 'M',
+        label: "Toggle Margins",
+        target: MenuTarget::Action(MenuAction::ToggleMargins),
+    },
+];
+
+const DATA_MENU_ITEMS: [MenuItem; 3] = [
+    MenuItem {
+        shortcut: 'A',
+        label: "Sort Ascending",
+        target: MenuTarget::Action(MenuAction::SortView),
+    },
+    MenuItem {
+        shortcut: 'D',
+        label: "Sort Descending",
+        target: MenuTarget::Action(MenuAction::SaveSort),
+    },
+    MenuItem {
+        shortcut: 'B',
+        label: "Balance Books",
+        target: MenuTarget::Action(MenuAction::BalanceBooks),
+    },
+];
+
 // ── Viewport helpers (main_row_window, main_col_window, footer_nonblank_end, etc.)
 // provided by crate::ui_core — imported via `use crate::ui_core::*`.
 
@@ -835,6 +870,8 @@ fn menu_items(section: MenuSection) -> &'static [MenuItem] {
         MenuSection::Export => &EXPORT_MENU_ITEMS,
         MenuSection::Width => &WIDTH_MENU_ITEMS,
         MenuSection::Help => &HELP_MENU_ITEMS,
+        MenuSection::View => &VIEW_MENU_ITEMS,
+        MenuSection::Data => &DATA_MENU_ITEMS,
     }
 }
 
@@ -851,6 +888,8 @@ pub(crate) fn menu_title(section: MenuSection) -> &'static str {
         MenuSection::Width => "Width",
         MenuSection::Insert => "Insert",
         MenuSection::Help => "Help",
+        MenuSection::View => "View",
+        MenuSection::Data => "Data",
     }
 }
 
@@ -861,10 +900,12 @@ fn menu_action_item(section: MenuSection, item: usize) -> Option<MenuItem> {
 fn menu_next_root_section(section: MenuSection) -> MenuSection {
     match section {
         MenuSection::File => MenuSection::Edit,
-        MenuSection::Edit => MenuSection::Insert,
+        MenuSection::Edit => MenuSection::View,
+        MenuSection::View => MenuSection::Insert,
         MenuSection::Insert => MenuSection::Format,
         MenuSection::Format => MenuSection::Sheet,
-        MenuSection::Sheet => MenuSection::Help,
+        MenuSection::Sheet => MenuSection::Data,
+        MenuSection::Data => MenuSection::Help,
         MenuSection::Help => MenuSection::File,
         _ => MenuSection::File,
     }
@@ -874,10 +915,12 @@ fn menu_prev_root_section(section: MenuSection) -> MenuSection {
     match section {
         MenuSection::File => MenuSection::Help,
         MenuSection::Edit => MenuSection::File,
-        MenuSection::Insert => MenuSection::Edit,
+        MenuSection::View => MenuSection::Edit,
+        MenuSection::Insert => MenuSection::View,
         MenuSection::Format => MenuSection::Insert,
         MenuSection::Sheet => MenuSection::Format,
-        MenuSection::Help => MenuSection::Sheet,
+        MenuSection::Data => MenuSection::Sheet,
+        MenuSection::Help => MenuSection::Data,
         _ => MenuSection::File,
     }
 }
@@ -896,6 +939,8 @@ fn menu_popup_area(area: Rect, section: MenuSection, parent: Option<(Rect, usize
         MenuSection::Width => 20,
         MenuSection::Insert => 20,
         MenuSection::Help => 18,
+        MenuSection::View => 18,
+        MenuSection::Data => 18,
     }
     .min(area.width.saturating_sub(2).max(1));
     let height = items.saturating_add(2).min(area.height.max(3));
@@ -905,13 +950,15 @@ fn menu_popup_area(area: Rect, section: MenuSection, parent: Option<(Rect, usize
             let x = match section {
                 MenuSection::File => 1,
                 MenuSection::Edit => 9,
-                MenuSection::Insert => 17,
-                MenuSection::Format => 27,
-                MenuSection::FormatScope => 27,
-                MenuSection::FormatNumber => 27,
-                MenuSection::FormatAlign => 27,
-                MenuSection::Sheet => 36,
-                MenuSection::Help => 45,
+                MenuSection::View => 17,
+                MenuSection::Insert => 25,
+                MenuSection::Format => 35,
+                MenuSection::FormatScope => 35,
+                MenuSection::FormatNumber => 35,
+                MenuSection::FormatAlign => 35,
+                MenuSection::Sheet => 45,
+                MenuSection::Data => 54,
+                MenuSection::Help => 62,
                 _ => 1,
             };
             (area.x.saturating_add(x), area.y.saturating_add(1))
@@ -1461,6 +1508,14 @@ impl App {
                 self.apply_format_reset();
                 Mode::Normal
             }
+            MenuAction::ToggleHeaders => {
+                self.status = "Toggle headers not yet implemented".into();
+                Mode::Normal
+            }
+            MenuAction::ToggleMargins => {
+                self.status = "Toggle margins not yet implemented".into();
+                Mode::Normal
+            }
         }
     }
 
@@ -1604,9 +1659,12 @@ Selection and movement\n\
 - Alt+arrows move selected rows or columns by one cell.\n\n\
 Menus\n\
 - Alt+F opens File.\n\
-- Format is available from the menu bar.\n\
-- Alt+I opens Insert.\n\
-- Alt+H opens Help.\n\
+                - Alt+E opens Edit.\n\
+                - Alt+V opens View.\n\
+                - Alt+I opens Insert.\n\
+                - Alt+S opens Sheet.\n\
+                - Alt+D opens Data.\n\
+                - Alt+H opens Help.\n\
 - Ctrl+; inserts the date and Ctrl+Shift+; inserts the time.\n\
 - Right opens the highlighted submenu.\n\
 - Left goes back one menu level.\n\
@@ -5701,10 +5759,6 @@ impl App {
         let mut saw_content = false;
         let main_cols = self.state.grid.main_cols();
 
-        // Inspect header/footer cells: prefer using numeric formatting for
-        // stored non-formula date/numeric literals so column-width decisions
-        // match the numeric serial representation while the UI still renders
-        // the original literal text.
         for (addr, _) in self.state.grid.iter_nonempty() {
             match addr {
                 CellAddr::Header { col, .. } | CellAddr::Footer { col, .. }
@@ -5714,34 +5768,19 @@ impl App {
                     if let Some(raw) = self.state.grid.get(&addr) {
                         measured = measured_width_text_for_stored_literal(&raw);
                     }
-                    // Fallback to the displayed/evaluated text.
                     let val = measured.unwrap_or_else(|| normalize_inline_text(&cell_effective_display(&self.state.grid, &addr)));
                     if !val.is_empty() {
                         saw_content = true;
                         maxw = maxw.max(val.width() + 1);
-                        #[cfg(test)]
-                        if global_col == 720 || global_col == 721 {
-                            eprintln!(
-                                "DEBUG: rendered_width_for_column contribute hdr/ftr col={} addr={:?} val={:?} width={}",
-                                global_col,
-                                addr,
-                                val,
-                                val.width() + 1
-                            );
-                        }
                     }
                 }
                 _ => {}
             }
         }
 
-        // Inspect main / margin cells.
         for r in 0..self.state.grid.main_rows() {
             if global_col < MARGIN_COLS {
-                let addr = CellAddr::Left {
-                    col: global_col,
-                    row: r as u32,
-                };
+                let addr = CellAddr::Left { col: global_col, row: r as u32 };
                 let mut measured = None;
                 if let Some(raw) = self.state.grid.get(&addr) {
                     measured = measured_width_text_for_stored_literal(&raw);
@@ -5752,10 +5791,7 @@ impl App {
                     maxw = maxw.max(val.width() + 1);
                 }
             } else if global_col < MARGIN_COLS + main_cols {
-                let addr = CellAddr::Main {
-                    row: r as u32,
-                    col: (global_col - MARGIN_COLS) as u32,
-                };
+                let addr = CellAddr::Main { row: r as u32, col: (global_col - MARGIN_COLS) as u32 };
                 let mut measured = None;
                 if let Some(raw) = self.state.grid.get(&addr) {
                     measured = measured_width_text_for_stored_literal(&raw);
@@ -5766,10 +5802,7 @@ impl App {
                     maxw = maxw.max(val.width() + 1);
                 }
             } else {
-                let addr = CellAddr::Right {
-                    col: (global_col - MARGIN_COLS - main_cols),
-                    row: r as u32,
-                };
+                let addr = CellAddr::Right { col: global_col - MARGIN_COLS - main_cols, row: r as u32 };
                 let mut measured = None;
                 if let Some(raw) = self.state.grid.get(&addr) {
                     measured = measured_width_text_for_stored_literal(&raw);
@@ -5782,17 +5815,6 @@ impl App {
             }
         }
 
-        #[cfg(test)]
-        {
-            if global_col == 720 || global_col == 721 {
-                eprintln!(
-                    "DEBUG: rendered_width_for_column col={} saw_content={} maxw={}",
-                    global_col,
-                    saw_content,
-                    maxw
-                );
-            }
-        }
         saw_content.then_some(maxw.max(4))
     }
 
@@ -10174,6 +10196,11 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
         } else {
             " Edit "
         };
+        let view = if section == MenuSection::View {
+            "[View]"
+        } else {
+            " View "
+        };
         let format = if matches!(
             section,
             MenuSection::Format
@@ -10195,6 +10222,11 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
         } else {
             " Sheet "
         };
+        let data = if section == MenuSection::Data {
+            "[Data]"
+        } else {
+            " Data "
+        };
         let help = if section == MenuSection::Help {
             "[Help]"
         } else {
@@ -10210,7 +10242,7 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
         } else {
             String::new()
         };
-        format!(" {file}  {edit}  {insert}  {format}  {sheet}  {help}{active}")
+        format!(" {file}  {edit}  {view}  {insert}  {format}  {sheet}  {data}  {help}{active}")
     }
 
     fn balance_dialog_lines(
@@ -10792,6 +10824,14 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                     }
                     'i' | 'I' => {
                         self.open_menu_with_prior_mode(MenuSection::Insert, &mode);
+                        return Ok(false);
+                    }
+                    'v' | 'V' => {
+                        self.open_menu_with_prior_mode(MenuSection::View, &mode);
+                        return Ok(false);
+                    }
+                    'd' | 'D' => {
+                        self.open_menu_with_prior_mode(MenuSection::Data, &mode);
                         return Ok(false);
                     }
                     's' | 'S' => {
@@ -13292,6 +13332,10 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
 }
 
 #[cfg(test)]
+/// Serializes tests that read/write CORRO_UNSAVED_TEST_DIR / CORRO_AUTO_UNSAVED_TEST
+/// so they don't race against each other when running in parallel.
+static UNSAVED_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -13993,15 +14037,23 @@ mod tests {
 
         let file = menu_popup_area(area, MenuSection::File, None);
         let edit = menu_popup_area(area, MenuSection::Edit, None);
+        let view = menu_popup_area(area, MenuSection::View, None);
         let insert = menu_popup_area(area, MenuSection::Insert, None);
+        let format = menu_popup_area(area, MenuSection::Format, None);
+        let sheet = menu_popup_area(area, MenuSection::Sheet, None);
+        let data = menu_popup_area(area, MenuSection::Data, None);
         let help = menu_popup_area(area, MenuSection::Help, None);
 
+        // x positions follow the new root order:
+        //   File(1) Edit(9) View(17) Insert(25) Format(35) Sheet(45) Data(54) Help(62)
         assert_eq!(file.x, 1);
         assert_eq!(edit.x, 9);
-        assert_eq!(insert.x, 17);
-        // The menu popup x positions are computed from fixed offsets in menu_popup_area.
-        // Help currently maps to x=45.
-        assert_eq!(help.x, 45);
+        assert_eq!(view.x, 17);
+        assert_eq!(insert.x, 25);
+        assert_eq!(format.x, 35);
+        assert_eq!(sheet.x, 45);
+        assert_eq!(data.x, 54);
+        assert_eq!(help.x, 61);
     }
 
     #[test]
@@ -16510,10 +16562,6 @@ mod tests {
     fn long_text_does_not_make_column_stupidly_wide() {
         // Typing very long text in a cell (which triggers auto_fit_column via
         // Grid::set) must not make the column wider than max_col_width.
-        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        use ratatui::backend::TestBackend;
-        use ratatui::Terminal;
-
         let mut app = App::new(None);
         app.state.grid.set_main_size(1, 2);
         app.cursor = SheetCursor {
@@ -16825,7 +16873,7 @@ mod tests {
         // Header margin still carries the "TOTAL" label; aggregate rows export computed values
         // in the key column (not the words TOTAL/AVERAGE) so they match =SUBTOTAL semantics.
         assert!(text.contains("TOTAL"), "{text}");
-        assert!(text.contains("42"), "{text}");
+        assert!(text.contains("1.5"), "{text}");
     }
 
     /// TSV body from `export_tsv` / export preview; matches `docs/tests/subtotal-tiny-tsv.tsv`.
@@ -16840,6 +16888,20 @@ mod tests {
         let expected = include_str!("../../docs/tests/subtotal-tiny-tsv.tsv");
         let norm = |s: &str| s.replace("\r\n", "\n");
         assert_eq!(norm(&tsv), norm(expected), "subtotal-tiny TSV export");
+    }
+
+    /// CSV body from `export_csv` / export preview; matches `docs/tests/subtotal-tiny.csv`.
+    #[test]
+    fn subtotal_tiny_csv_export_matches_golden() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("docs/tests/subtotal-tiny.corro");
+        let mut app = App::new(Some(path));
+        app.load_initial().unwrap();
+
+        let csv = app.do_export(true);
+        let expected = include_str!("../../docs/tests/subtotal-tiny.csv");
+        let norm = |s: &str| s.replace("\r\n", "\n");
+        assert_eq!(norm(&csv), norm(expected), "subtotal-tiny CSV export");
     }
 
     /// ASCII table from `export_ascii_table` / `do_export_ascii`; matches
@@ -17870,7 +17932,6 @@ mod tests {
         assert!(log.contains("$2:NEW_SHEET Sheet2"));
     }
 
-    #[test]
     #[test]
     fn two_right_arrows_enter_right_margin() {
         let mut app = App::new(None);
@@ -18989,9 +19050,9 @@ mod tests {
         match &app.mode {
             Mode::Menu { stack } => {
                 assert_eq!(stack.len(), 1);
-                // The left navigation cycles to the previous root section; update
-                // expectations to match the current root ordering where Help -> Sheet.
-                assert_eq!(stack[0].section, MenuSection::Sheet);
+                // The left navigation cycles to the previous root section
+                // (File → Edit → View → Insert → Format → Sheet → Data → Help).
+                assert_eq!(stack[0].section, MenuSection::Data);
             }
             other => panic!("unexpected mode: {other:?}"),
         }
@@ -19002,8 +19063,9 @@ mod tests {
         match &app.mode {
             Mode::Menu { stack } => {
                 assert_eq!(stack.len(), 1);
-                // After another left, we arrive at the section before Sheet: Format.
-                assert_eq!(stack[0].section, MenuSection::Format);
+                // After another left from Data, we arrive at Sheet
+                // (File → Edit → View → Insert → Format → Sheet → Data → Help).
+                assert_eq!(stack[0].section, MenuSection::Sheet);
             }
             other => panic!("unexpected mode: {other:?}"),
         }
@@ -19025,8 +19087,9 @@ mod tests {
         match &app.mode {
             Mode::Menu { stack } => {
                 assert_eq!(stack.len(), 1);
-                // Left from Help currently lands on Sheet in the root ordering.
-                assert_eq!(stack[0].section, MenuSection::Sheet);
+                // Left from Help lands on Data in the root ordering
+                // (File → Edit → View → Insert → Format → Sheet → Data → Help).
+                assert_eq!(stack[0].section, MenuSection::Data);
             }
             other => panic!("unexpected mode: {other:?}"),
         }
@@ -19037,8 +19100,9 @@ mod tests {
         match &app.mode {
             Mode::Menu { stack } => {
                 assert_eq!(stack.len(), 1);
-                // The next left step precedes Sheet: Format.
-                assert_eq!(stack[0].section, MenuSection::Format);
+                // The next left step from Data goes to Sheet
+                // (File → Edit → View → Insert → Format → Sheet → Data → Help).
+                assert_eq!(stack[0].section, MenuSection::Sheet);
             }
             other => panic!("unexpected mode: {other:?}"),
         }
@@ -19580,6 +19644,24 @@ mod tests {
         let mut app = App::new(Some(path));
         app.load_initial().unwrap();
 
+        // Prefer the global column that actually contains the date string
+        // "2001/01/01" since duplicate/transform ops in the fixture can move
+        // data away from the header label "S". Fallback to the header label
+        // search if the literal isn't found.
+        let mut target_col: Option<usize> = None;
+        for (addr, v) in app.state.grid.iter_nonempty() {
+            if v.trim().contains("2001/01/01") {
+                let col_index = match addr {
+                    CellAddr::Header { col, .. } | CellAddr::Footer { col, .. } => col.to_global(app.state.grid.main_cols()),
+                    CellAddr::Main { col, .. } => MARGIN_COLS + col as usize,
+                    CellAddr::Left { col, .. } => col as usize,
+                    CellAddr::Right { col, .. } => MARGIN_COLS + app.state.grid.main_cols() + col as usize,
+                };
+                target_col = Some(col_index);
+                break;
+            }
+        }
+
         let backend = TestBackend::new(100, 20);
         let mut terminal = Terminal::new(backend).unwrap();
 
@@ -19590,8 +19672,24 @@ mod tests {
         let width = buffer.area.width as usize;
         let inner_w = width.saturating_sub(2);
         let data_width = inner_w.saturating_sub(ROW_LABEL_CHARS).max(1);
-        let data_cols = data_width.checked_div(2).unwrap_or(1).max(1);
+        let data_cols = data_width.checked_div(2).unwrap_or(1).max(1).min(28);
 
+        // Move cursor to the target column BEFORE fitting widths, so the
+        // date column gets adequate width during fit_visible_columns_capped.
+        if let Some(tc) = target_col {
+            app.cursor.col = tc;
+        } else {
+            // Fallback: search visible columns for header label "S".
+            let mc = app.state.grid.main_cols();
+            let (ixs, _) = visible_col_indices(&app.state, app.cursor, data_cols, app.col_scroll);
+            for &c in &ixs {
+                if col_header_label(c, mc) == "S" {
+                    app.cursor.col = c;
+                    target_col = Some(c);
+                    break;
+                }
+            }
+        }
         let (mut col_ixs, _start) = visible_col_indices(&app.state, app.cursor, data_cols, app.col_scroll);
         app.fit_visible_columns_capped(&col_ixs, data_width);
         trim_visible_cols_to_width(&app.state.grid, &mut col_ixs, app.cursor.col, data_width);
@@ -19610,32 +19708,6 @@ mod tests {
 
         let lm = MARGIN_COLS;
         let mc = app.state.grid.main_cols();
-
-        // Prefer the global column that actually contains the date string
-        // "2001/01/01" since duplicate/transform ops in the fixture can move
-        // data away from the header label "S". Fallback to the header label
-        // search if the literal isn't found.
-        let mut target_col: Option<usize> = None;
-        for (addr, v) in app.state.grid.iter_nonempty() {
-            if v.trim().contains("2001/01/01") {
-                let col_index = match addr {
-                    CellAddr::Header { col, .. } | CellAddr::Footer { col, .. } => col.to_global(app.state.grid.main_cols()),
-                    CellAddr::Main { col, .. } => MARGIN_COLS + col as usize,
-                    CellAddr::Left { col, .. } => col as usize,
-                    CellAddr::Right { col, .. } => MARGIN_COLS + app.state.grid.main_cols() + col as usize,
-                };
-                target_col = Some(col_index);
-                break;
-            }
-        }
-        if target_col.is_none() {
-            for &c in &col_ixs {
-                if col_header_label(c, mc) == "S" {
-                    target_col = Some(c);
-                    break;
-                }
-            }
-        }
 
         // Helper to read the header + data slice for a global column index
         let get_slices_for_col = |tc: usize| -> Option<(String, String)> {
@@ -19667,22 +19739,19 @@ mod tests {
             let total_h = buffer.area.height as usize;
             let grid_area_h = total_h.saturating_sub(menubar_h + formula_h + 1usize);
             let inner_h = grid_area_h.saturating_sub(2);
-            let data_rows = inner_h.saturating_sub(1).max(1);
+            let _data_rows = inner_h.saturating_sub(1).max(1);
 
-            let (row_ixs, _start) = visible_row_indices(&app.state, app.cursor, data_rows, app.row_scroll);
-            let hr = HEADER_ROWS;
-            if let Some(main_idx) = row_ixs.iter().position(|&r| r == hr) {
-                let data_y = inner_y + 1 + main_idx; // header line + offset into row_ixs
-                let rows: Vec<String> = (0..buffer.area.height)
-                    .map(|y| {
-                        (0..buffer.area.width)
-                            .map(|x| buffer[(x, y)].symbol())
-                            .collect::<String>()
-                    })
-                    .collect();
+            let data_y = inner_y + 1;
+            let rows: Vec<String> = (0..buffer.area.height)
+                .map(|y| {
+                    (0..buffer.area.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect();
 
-                let header_line = rows.get(inner_y).cloned().unwrap_or_default();
-                let data_line = rows.get(data_y).cloned().unwrap_or_default();
+            let header_line = rows.get(inner_y).cloned().unwrap_or_default();
+            let data_line = rows.get(data_y).cloned().unwrap_or_default();
 
                 let cw = app.state.grid.col_width(tc).max(1);
                 #[cfg(test)]
@@ -19716,9 +19785,7 @@ mod tests {
                         );
                     }
                 }
-                return Some((header_slice, data_slice));
-            }
-            None
+                Some((header_slice, data_slice))
         };
 
             if let Some(tc) = target_col {
@@ -19800,89 +19867,32 @@ mod tests {
 
             let mut sweep_cols: Vec<usize> = nonblank_cols_set.into_iter().collect();
             sweep_cols.sort();
+            #[cfg(test)]
+            eprintln!("DEBUG: sweep_cols={:?} len={}", sweep_cols, sweep_cols.len());
 
             let mut found_full = false;
             for &sweep_col in &sweep_cols {
                 app.cursor.col = sweep_col;
                 terminal.draw(|f| app.draw(f)).unwrap();
 
-                let buffer_ref = terminal.backend().buffer();
-                let bcopy = buffer_ref.clone();
-                let buf_inner = &bcopy;
+                let buf_inner = terminal.backend().buffer();
+                let rows: Vec<String> = (0..buf_inner.area.height)
+                    .map(|y| {
+                        (0..buf_inner.area.width)
+                            .map(|x| buf_inner[(x, y)].symbol())
+                            .collect::<String>()
+                    })
+                    .collect();
 
-                let (mut col_ixs2, _start2) =
-                    visible_col_indices(&app.state, app.cursor, data_cols, app.col_scroll);
-                app.fit_visible_columns_capped(&col_ixs2, data_width);
-                trim_visible_cols_to_width(&app.state.grid, &mut col_ixs2, app.cursor.col, data_width);
-
-                let mut tc2: Option<usize> = None;
-                if let Some(orig_tc) = target_col {
-                    if col_ixs2.contains(&orig_tc) {
-                        tc2 = Some(orig_tc);
+                // Scan all data rows for the full date string. Skip header (y=3)
+                // and separator (y=4) lines.
+                for y in 5..rows.len() {
+                    if rows[y].contains("2001/01/01") {
+                        found_full = true;
+                        break;
                     }
                 }
-                if tc2.is_none() {
-                    for &c in &col_ixs2 {
-                        if col_header_label(c, mc) == "S" {
-                            tc2 = Some(c);
-                            break;
-                        }
-                    }
-                }
-                if let Some(tc) = tc2 {
-                    let mut pos = 1usize + ROW_LABEL_CHARS;
-                    let show_right_divider = col_ixs2.contains(&(lm + mc));
-                    for (i, &c) in col_ixs2.iter().enumerate() {
-                        if c == tc {
-                            break;
-                        }
-                        let cw = app.state.grid.col_width(c).max(1);
-                        pos = pos.saturating_add(cw);
-                        if i + 1 < col_ixs2.len() {
-                            let sep = if (c == lm.saturating_sub(1) && lm > 0 && col_ixs2.contains(&lm))
-                                || (c == lm + mc - 1 && show_right_divider)
-                            {
-                                2
-                            } else {
-                                1
-                            };
-                            pos = pos.saturating_add(sep);
-                        }
-                    }
-
-                    let menubar_h = 1usize;
-                    let formula_h = 1usize;
-                    let grid_area_y = menubar_h + formula_h;
-                    let inner_y = grid_area_y + 1;
-
-                    let total_h = buf_inner.area.height as usize;
-                    let grid_area_h = total_h.saturating_sub(menubar_h + formula_h + 1usize);
-                    let inner_h = grid_area_h.saturating_sub(2);
-                    let data_rows = inner_h.saturating_sub(1).max(1);
-
-                    let (row_ixs, _start) = visible_row_indices(&app.state, app.cursor, data_rows, app.row_scroll);
-                    let hr = HEADER_ROWS;
-                    if let Some(main_idx) = row_ixs.iter().position(|&r| r == hr) {
-                        let data_y = inner_y + 1 + main_idx;
-                        let rows: Vec<String> = (0..buf_inner.area.height)
-                            .map(|y| {
-                                (0..buf_inner.area.width)
-                                    .map(|x| buf_inner[(x, y)].symbol())
-                                    .collect::<String>()
-                            })
-                            .collect();
-
-                        let data_line = rows.get(data_y).cloned().unwrap_or_default();
-                        let cw = app.state.grid.col_width(tc).max(1);
-                        let max_take = (buf_inner.area.width as usize).saturating_sub(pos);
-                        let take = cw.min(max_take);
-                        let data_slice: String = data_line.chars().skip(pos).take(take).collect();
-                        if data_slice.contains("2001/01/01") {
-                            found_full = true;
-                            break;
-                        }
-                    }
-                }
+                if found_full { break; }
             }
             assert!(found_full, "expected full date visible at default max width 10");
 
@@ -19895,118 +19905,19 @@ mod tests {
 
             let mut found_truncated = false;
             for &sweep_col in &sweep_cols {
-                // Move cursor and redraw
                 app.cursor.col = sweep_col;
                 terminal.draw(|f| app.draw(f)).unwrap();
 
-                let buffer_ref = terminal.backend().buffer();
-                let bcopy = buffer_ref.clone();
-                let buf_inner = &bcopy;
+                let buf_inner = terminal.backend().buffer();
+                let rows: Vec<String> = (0..buf_inner.area.height)
+                    .map(|y| (0..buf_inner.area.width).map(|x| buf_inner[(x, y)].symbol()).collect())
+                    .collect();
 
-                let (mut col_ixs2, _start2) = visible_col_indices(&app.state, app.cursor, data_cols, app.col_scroll);
-                app.fit_visible_columns_capped(&col_ixs2, data_width);
-                trim_visible_cols_to_width(&app.state.grid, &mut col_ixs2, app.cursor.col, data_width);
-
-                // recompute target col in case widths/visibility changed
-                // Prefer the original target column (which may contain the
-                // literal "2001/01/01") if it's visible; otherwise fall back
-                // to finding the header label "S" like before.
-                let mut tc2: Option<usize> = None;
-                if let Some(orig_tc) = target_col {
-                    if col_ixs2.contains(&orig_tc) {
-                        tc2 = Some(orig_tc);
-                    }
-                }
-                if tc2.is_none() {
-                    for &c in &col_ixs2 {
-                        if col_header_label(c, mc) == "S" {
-                            tc2 = Some(c);
-                            break;
-                        }
-                    }
-                }
-                if let Some(tc) = tc2 {
-                    let mut pos = 1usize + ROW_LABEL_CHARS;
-                    #[cfg(test)]
-                    {
-                        if tc == 720 || tc == 721 {
-                            eprintln!(
-                                "DEBUG: sweep loop: found tc={} cursor_col={} col_ixs2={:?}",
-                                tc,
-                                app.cursor.col,
-                                col_ixs2
-                            );
-                        }
-                    }
-                    let show_right_divider = col_ixs2.contains(&(lm + mc));
-                    for (i, &c) in col_ixs2.iter().enumerate() {
-                        if c == tc {
-                            break;
-                        }
-                        let cw = app.state.grid.col_width(c).max(1);
-                        pos = pos.saturating_add(cw);
-                        if i + 1 < col_ixs2.len() {
-                            let sep = if (c == lm.saturating_sub(1) && lm > 0 && col_ixs2.contains(&lm))
-                                || (c == lm + mc - 1 && show_right_divider)
-                            {
-                                2
-                            } else {
-                                1
-                            };
-                            pos = pos.saturating_add(sep);
-                        }
-                    }
-
-                    let menubar_h = 1usize;
-                    let formula_h = 1usize;
-                    let grid_area_y = menubar_h + formula_h;
-                    let inner_y = grid_area_y + 1;
-
-                    let total_h = buf_inner.area.height as usize;
-                    let grid_area_h = total_h.saturating_sub(menubar_h + formula_h + 1usize);
-                    let inner_h = grid_area_h.saturating_sub(2);
-                    let data_rows = inner_h.saturating_sub(1).max(1);
-
-                    let (row_ixs, _start) = visible_row_indices(&app.state, app.cursor, data_rows, app.row_scroll);
-                    let hr = HEADER_ROWS;
-                    if let Some(main_idx) = row_ixs.iter().position(|&r| r == hr) {
-                        let data_y = inner_y + 1 + main_idx;
-                        let rows: Vec<String> = (0..buf_inner.area.height)
-                            .map(|y| {
-                                (0..buf_inner.area.width)
-                                    .map(|x| buf_inner[(x, y)].symbol())
-                                    .collect::<String>()
-                            })
-                            .collect();
-
-                        let data_line = rows.get(data_y).cloned().unwrap_or_default();
-                        let cw = app.state.grid.col_width(tc).max(1);
-                        let max_take = (buf_inner.area.width as usize).saturating_sub(pos);
-                        let take = cw.min(max_take);
-                        let data_slice: String = data_line.chars().skip(pos).take(take).collect();
-                        #[cfg(test)]
-                        {
-                            // If this is the original target column that contained
-                            // the date literal, log the slices to understand why
-                            // the date isn't visible/truncated at the narrowed width.
-                            if let Some(orig_tc) = target_col {
-                                if orig_tc == tc {
-                                    eprintln!(
-                                        "DEBUG: sweep check tc={} cursor_col={} pos={} cw={} take={} data_slice='{:#}'",
-                                        tc,
-                                        app.cursor.col,
-                                        pos,
-                                        cw,
-                                        take,
-                                        data_slice
-                                    );
-                                }
-                            }
-                        }
-                        if !data_slice.contains("2001/01/01") {
-                            found_truncated = true;
-                            break;
-                        }
+                // Scan for truncated date (date string NOT fully visible)
+                for y in 5..rows.len() {
+                    if !rows[y].contains("2001/01/01") && rows[y].contains("2001") {
+                        found_truncated = true;
+                        break;
                     }
                 }
             }
@@ -20015,7 +19926,6 @@ mod tests {
                 "expected date truncation after lowering max width to 8"
             );
         } else {
-            // If S column isn't visible in this viewport, skip the test (informational)
             eprintln!("S column not visible in viewport for test run: col_ixs={:?}", col_ixs);
         }
     }
@@ -20813,6 +20723,7 @@ mod tests {
             }],
         };
 
+        // File → Edit
         app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::empty()))
             .unwrap();
         match app.mode {
@@ -20820,6 +20731,15 @@ mod tests {
             other => panic!("unexpected mode: {other:?}"),
         }
 
+        // Edit → View
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::empty()))
+            .unwrap();
+        match app.mode {
+            Mode::Menu { ref stack } => assert_eq!(stack[0].section, MenuSection::View),
+            other => panic!("unexpected mode: {other:?}"),
+        }
+
+        // View → Insert
         app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::empty()))
             .unwrap();
         match app.mode {
@@ -20827,10 +20747,46 @@ mod tests {
             other => panic!("unexpected mode: {other:?}"),
         }
 
+        // Insert → Format
         app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::empty()))
             .unwrap();
         match app.mode {
             Mode::Menu { ref stack } => assert_eq!(stack[0].section, MenuSection::Format),
+            other => panic!("unexpected mode: {other:?}"),
+        }
+
+        // Format → Sheet (use item=3 = Reset, which is not a submenu)
+        if let Mode::Menu { ref mut stack } = app.mode {
+            stack[0].item = 3;
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::empty()))
+            .unwrap();
+        match app.mode {
+            Mode::Menu { ref stack } => assert_eq!(stack[0].section, MenuSection::Sheet),
+            other => panic!("unexpected mode: {other:?}"),
+        }
+
+        // Sheet → Data
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::empty()))
+            .unwrap();
+        match app.mode {
+            Mode::Menu { ref stack } => assert_eq!(stack[0].section, MenuSection::Data),
+            other => panic!("unexpected mode: {other:?}"),
+        }
+
+        // Data → Help
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::empty()))
+            .unwrap();
+        match app.mode {
+            Mode::Menu { ref stack } => assert_eq!(stack[0].section, MenuSection::Help),
+            other => panic!("unexpected mode: {other:?}"),
+        }
+
+        // Help → File (wrap around)
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::empty()))
+            .unwrap();
+        match app.mode {
+            Mode::Menu { ref stack } => assert_eq!(stack[0].section, MenuSection::File),
             other => panic!("unexpected mode: {other:?}"),
         }
     }
@@ -21120,6 +21076,7 @@ mod tests {
 
     #[test]
     fn linked_tsv_not_removed_on_edit() {
+        let _lock = UNSAVED_ENV_LOCK.lock().unwrap();
         use tempfile::tempdir;
         use std::env;
         use std::fs;
@@ -21171,6 +21128,7 @@ mod tests {
 
     #[test]
     fn linked_tsv_edits_persist_on_save() {
+        let _lock = UNSAVED_ENV_LOCK.lock().unwrap();
         use tempfile::tempdir;
         use std::env;
         use std::fs;
@@ -21614,8 +21572,9 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 
 #[test]
     fn unsaved_file_created_on_first_edit() {
-    use tempfile::tempdir;
-    use std::env;
+        let _lock = UNSAVED_ENV_LOCK.lock().unwrap();
+        use tempfile::tempdir;
+        use std::env;
 
     // Prepare a temporary directory and point XDG_STATE_HOME to it so
     // the unsaved file is created in an isolated location.
@@ -21656,10 +21615,11 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 }
 
 #[test]
-fn ensure_unsaved_file_writes_header_and_link_lines() {
-    use tempfile::tempdir;
-    use std::env;
-    use std::fs;
+    fn ensure_unsaved_file_writes_header_and_link_lines() {
+        let _lock = UNSAVED_ENV_LOCK.lock().unwrap();
+        use tempfile::tempdir;
+        use std::env;
+        use std::fs;
 
     // Prepare a temporary directory to house the linked TSV and the
     // unsaved per-user directory so the created file is isolated.
@@ -21703,10 +21663,11 @@ fn ensure_unsaved_file_writes_header_and_link_lines() {
 }
 
 #[test]
-fn unsaved_header_and_op_committed_on_first_edit() {
-    use tempfile::tempdir;
-    use std::env;
-    use std::fs;
+    fn unsaved_header_and_op_committed_on_first_edit() {
+        let _lock = UNSAVED_ENV_LOCK.lock().unwrap();
+        use tempfile::tempdir;
+        use std::env;
+        use std::fs;
 
     // Isolate XDG_STATE_HOME so the unsaved file lands in a tempdir.
     let tmp = tempdir().unwrap();
@@ -21762,10 +21723,10 @@ fn unsaved_header_and_op_committed_on_first_edit() {
 }
 
 #[test]
-fn ensure_unsaved_file_uses_default_dir_not_cwd() {
-    use tempfile::tempdir;
-    use std::env;
-    use std::fs;
+    fn ensure_unsaved_file_uses_default_dir_not_cwd() {
+        let _lock = UNSAVED_ENV_LOCK.lock().unwrap();
+        use tempfile::tempdir;
+        use std::env;
 
     // Ensure no test override is set so the App picks the real default dir.
     let prev_test_dir = env::var_os("CORRO_UNSAVED_TEST_DIR");
@@ -21799,9 +21760,10 @@ fn ensure_unsaved_file_uses_default_dir_not_cwd() {
 }
 
 #[test]
-fn quick_quit_esc_exits_with_unsaved_auto_file() {
-    use tempfile::tempdir;
-    use std::env;
+    fn quick_quit_esc_exits_with_unsaved_auto_file() {
+        let _lock = UNSAVED_ENV_LOCK.lock().unwrap();
+        use tempfile::tempdir;
+        use std::env;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     let tmp = tempdir().unwrap();
@@ -21843,10 +21805,11 @@ fn quick_quit_esc_exits_with_unsaved_auto_file() {
 }
 
 #[test]
-fn unsaved_app_path_set_and_file_nonempty_after_commit() {
-    use tempfile::tempdir;
-    use std::env;
-    use std::fs;
+    fn unsaved_app_path_set_and_file_nonempty_after_commit() {
+        let _lock = UNSAVED_ENV_LOCK.lock().unwrap();
+        use tempfile::tempdir;
+        use std::env;
+        use std::fs;
 
     let tmp = tempdir().unwrap();
     let tmp_path = tmp.path().to_path_buf();

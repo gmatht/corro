@@ -52,12 +52,34 @@ mod nwg_backend {
             // without IsDialogMessageW, so Enter/Escape keys reach the Edit
             // control's raw event handler instead of being consumed.
             unsafe {
-                use winapi::um::winuser::{GetMessageW, TranslateMessage, DispatchMessageW, MSG};
+                use winapi::um::winuser::{GetMessageW, TranslateMessage, DispatchMessageW, MSG, PM_REMOVE, PeekMessageW};
                 use std::mem;
                 let mut msg: MSG = mem::zeroed();
-                while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) != 0 {
+                loop {
+                    let ret = GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0);
+                    if ret == 0 {
+                        break; // WM_QUIT received
+                    }
+                    if ret == -1 {
+                        // Error — exit loop
+                        break;
+                    }
                     TranslateMessage(&msg);
                     DispatchMessageW(&msg);
+                    // Fallback: check quit flag in case PostQuitMessage was
+                    // not called (e.g., raw event handler consumed WM_CLOSE
+                    // without calling DefWindowProc, or quit was requested
+                    // from a non-message context).
+                    if QUIT_REQUESTED.load(Ordering::SeqCst) {
+                        // Drain remaining messages without blocking so that
+                        // any pending cleanup (WM_DESTROY, etc.) runs before
+                        // we exit.
+                        while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+                            TranslateMessage(&msg);
+                            DispatchMessageW(&msg);
+                        }
+                        break;
+                    }
                 }
             }
             Ok(())

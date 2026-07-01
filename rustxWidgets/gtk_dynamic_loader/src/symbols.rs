@@ -1,5 +1,5 @@
 use crate::error::Error;
-use libloading::os::unix::Library;
+use crate::loader::RawLib as Library;
 use std::ffi::c_void;
 
 // Minimal subset of function pointer types we need
@@ -108,8 +108,6 @@ pub type GtkDialogNew = unsafe extern "C" fn() -> *mut c_void;
 pub type GtkDialogAddButton = unsafe extern "C" fn(dialog: *mut c_void, button_text: *const i8, response_id: i32) -> *mut c_void;
 pub type GtkDialogGetContentArea = unsafe extern "C" fn(dialog: *mut c_void) -> *mut c_void;
 pub type GtkDialogRun = unsafe extern "C" fn(dialog: *mut c_void) -> i32;
-pub type GtkDialogSetDefaultSize = unsafe extern "C" fn(dialog: *mut c_void, width: i32, height: i32);
-
 // Dropdown - GTK3 ComboBoxText
 pub type GtkComboBoxTextNew = unsafe extern "C" fn() -> *mut c_void;
 pub type GtkComboBoxTextAppendText = unsafe extern "C" fn(combo: *mut c_void, text: *const i8);
@@ -356,7 +354,6 @@ pub struct Symbols {
     pub gtk_dialog_add_button: Option<GtkDialogAddButton>,
     pub gtk_dialog_get_content_area: Option<GtkDialogGetContentArea>,
     pub gtk_dialog_run: Option<GtkDialogRun>,
-    pub gtk_dialog_set_default_size: Option<GtkDialogSetDefaultSize>,
 
     // Dropdown - GTK3 ComboBoxText
     pub gtk_combo_box_text_new: Option<GtkComboBoxTextNew>,
@@ -598,7 +595,6 @@ impl Symbols {
         let gtk_dialog_add_button = unsafe { sym::<GtkDialogAddButton>(gtk, "gtk_dialog_add_button") };
         let gtk_dialog_get_content_area = unsafe { sym::<GtkDialogGetContentArea>(gtk, "gtk_dialog_get_content_area") };
         let gtk_dialog_run = unsafe { sym::<GtkDialogRun>(gtk, "gtk_dialog_run") };
-        let gtk_dialog_set_default_size = unsafe { sym::<GtkDialogSetDefaultSize>(gtk, "gtk_dialog_set_default_size") };
 
         // Dropdown - GTK3 ComboBoxText
         let gtk_combo_box_text_new = unsafe { sym::<GtkComboBoxTextNew>(gtk, "gtk_combo_box_text_new") };
@@ -698,7 +694,7 @@ impl Symbols {
             gtk_scrolled_window_get_vadjustment,
             gtk_scrolled_window_get_hadjustment,
             gtk_adjustment_get_value,
-            gtk_dialog_new, gtk_dialog_add_button, gtk_dialog_get_content_area, gtk_dialog_run, gtk_dialog_set_default_size,
+            gtk_dialog_new, gtk_dialog_add_button, gtk_dialog_get_content_area, gtk_dialog_run,
             gtk_combo_box_text_new, gtk_combo_box_text_append_text, gtk_combo_box_text_get_active_text, gtk_combo_box_set_active, gtk_combo_box_get_active,
             gtk_drop_down_new, gtk_drop_down_set_selected, gtk_drop_down_get_selected, gtk_string_list_new,
             gtk_check_button_new_with_label, gtk_check_button_get_active, gtk_check_button_set_active, gtk_check_button_set_group, gtk_toggle_button_get_active, gtk_toggle_button_set_active,

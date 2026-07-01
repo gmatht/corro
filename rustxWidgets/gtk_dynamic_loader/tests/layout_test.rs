@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use gtk_dynamic_loader::*;
 use std::ffi::c_void;
 use std::sync::Arc;

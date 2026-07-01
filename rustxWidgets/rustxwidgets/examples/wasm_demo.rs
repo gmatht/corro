@@ -1,8 +1,15 @@
-use rustxwidgets::prelude::*;
-use std::rc::Rc;
-use std::cell::RefCell;
-
 fn main() {
+    #[cfg(target_arch = "wasm32")]
+    return wasm_main();
+    println!("skipped (requires wasm32 target)");
+}
+
+#[cfg(target_arch = "wasm32")]
+fn wasm_main() {
+    use rustxwidgets::prelude::*;
+    use std::rc::Rc;
+    use std::cell::RefCell;
+
     let app = App::init().expect("init");
     let win = app.create_window().expect("window");
     win.set_title("rustxwidgets WASM demo");

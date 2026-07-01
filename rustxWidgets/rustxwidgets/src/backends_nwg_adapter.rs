@@ -26,6 +26,7 @@ mod nwg_adapter {
         root_child: Rc<RefCell<Option<*mut c_void>>>,
         layout_cb: Rc<RefCell<Option<Box<dyn FnMut(i32, i32)>>>>,
         event_key_cb: Rc<RefCell<Option<Box<dyn FnMut(u32, u32) -> i32>>>>,
+        close_cb: Rc<RefCell<Option<Box<dyn FnMut()>>>>,
     }
 
     impl Clone for Window {
@@ -36,6 +37,7 @@ mod nwg_adapter {
                 root_child: self.root_child.clone(),
                 layout_cb: self.layout_cb.clone(),
                 event_key_cb: self.event_key_cb.clone(),
+                close_cb: self.close_cb.clone(),
             }
         }
     }
@@ -121,6 +123,9 @@ mod nwg_adapter {
         pub fn on_event_key(&self, cb: Box<dyn FnMut(u32, u32) -> i32>) {
             *self.event_key_cb.borrow_mut() = Some(cb);
         }
+        pub fn on_close(&self, cb: Box<dyn FnMut()>) {
+            *self.close_cb.borrow_mut() = Some(cb);
+        }
     }
 
     pub fn create_window(parent_cell: &Rc<RefCell<Option<*mut c_void>>>) -> Result<Window, Error> {
@@ -129,6 +134,7 @@ mod nwg_adapter {
         let root_child: Rc<RefCell<Option<*mut c_void>>> = Rc::new(RefCell::new(None));
         let layout_cb: Rc<RefCell<Option<Box<dyn FnMut(i32, i32)>>>> = Rc::new(RefCell::new(None));
         let event_key_cb: Rc<RefCell<Option<Box<dyn FnMut(u32, u32) -> i32>>>> = Rc::new(RefCell::new(None));
+        let close_cb: Rc<RefCell<Option<Box<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
 
         let hwnd = inner.handle.hwnd().unwrap_or(std::ptr::null_mut());
         if hwnd != std::ptr::null_mut() {
@@ -217,13 +223,19 @@ mod nwg_adapter {
             // Bind raw WM_CLOSE handler: replayer tests can post WM_CLOSE
             // directly to the main window as a reliable quit mechanism that
             // does not depend on the foreground-window focus state.
+            // Calls the registered close callback (save_before_quit) before
+            // quitting so that pending edits are committed to the output file.
             {
+                let cb = close_cb.clone();
                 static CLOSE_ID: AtomicUsize = AtomicUsize::new(0x40000000);
                 let cid = CLOSE_ID.fetch_add(1, Ordering::SeqCst);
                 nwg::bind_raw_event_handler(
                     &nwg::ControlHandle::Hwnd(hwnd), cid,
                     move |_h, msg, _w, _l| {
                         if msg == winapi::um::winuser::WM_CLOSE {
+                            if let Some(ref mut f) = *cb.borrow_mut() {
+                                f();
+                            }
                             crate::backends::nwg::quit_main_loop();
                             Some(0)
                         } else {
@@ -234,7 +246,7 @@ mod nwg_adapter {
             }
         }
 
-        Ok(Window { inner: Rc::new(inner), _handler: Rc::new(handler), root_child, layout_cb, event_key_cb })
+        Ok(Window { inner: Rc::new(inner), _handler: Rc::new(handler), root_child, layout_cb, event_key_cb, close_cb })
     }
 
     // -- Button --
@@ -297,6 +309,8 @@ mod nwg_adapter {
                 }
             }
         }
+        pub fn add_class(&self, _class: &str) {}
+        pub fn remove_class(&self, _class: &str) {}
     }
 
     impl AsRef<*mut c_void> for Button {

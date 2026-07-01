@@ -215,6 +215,7 @@ impl Window {
         /// # Safety – kept for API compatibility; no‑op on WASM.
         pub unsafe fn insert_action_group(&self, _name: &str, _group_ptr: *mut c_void) {}
         pub fn on_event(&self, _cb: Box<dyn FnMut(*mut c_void) -> i32>) {}
+        pub fn on_close(&self, _cb: Box<dyn FnMut()>) {}
         pub fn on_event_key(&self, mut cb: Box<dyn FnMut(u32, u32) -> i32>) {
             *self.event_key_cb.borrow_mut() = Some(cb);
             let cb2 = self.event_key_cb.clone();
