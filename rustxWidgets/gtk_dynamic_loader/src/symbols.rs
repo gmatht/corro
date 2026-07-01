@@ -102,6 +102,11 @@ pub type GtkWidgetSetHalign = unsafe extern "C" fn(widget: *mut c_void, align: i
 pub type GtkWidgetSetValign = unsafe extern "C" fn(widget: *mut c_void, align: i32);
 pub type GtkWidgetGetAllocatedWidth = unsafe extern "C" fn(widget: *mut c_void) -> i32;
 pub type GtkWidgetGetAllocatedHeight = unsafe extern "C" fn(widget: *mut c_void) -> i32;
+pub type GtkWidgetGetMapped = unsafe extern "C" fn(widget: *mut c_void) -> i32;
+pub type GtkWidgetGetDisplay = unsafe extern "C" fn(widget: *mut c_void) -> *mut c_void;
+
+// Display sync — flushes pending display requests and waits for server round-trip
+pub type GdkDisplaySync = unsafe extern "C" fn(display: *mut c_void);
 
 // Dialog
 pub type GtkDialogNew = unsafe extern "C" fn() -> *mut c_void;
@@ -191,6 +196,12 @@ pub type GtkScrolledWindowSetChild = unsafe extern "C" fn(scrolled: *mut c_void,
 pub type GtkDrawingAreaSetDrawFunc = unsafe extern "C" fn(area: *mut c_void, draw_func: Option<unsafe extern "C" fn(*mut c_void, *mut c_void, i32, i32, *mut c_void)>, user_data: *mut c_void, destroy: Option<unsafe extern "C" fn(*mut c_void, *mut c_void)>);
 pub type GtkDrawingAreaSetContentWidth = unsafe extern "C" fn(area: *mut c_void, width: i32);
 pub type GtkDrawingAreaSetContentHeight = unsafe extern "C" fn(area: *mut c_void, height: i32);
+
+// Frame clock (GTK4's display-synchronized animation clock)
+pub type GtkWidgetGetFrameClock = unsafe extern "C" fn(widget: *mut c_void) -> *mut c_void;
+pub type GdkFrameClockRequestPhase = unsafe extern "C" fn(clock: *mut c_void, phase: u32);
+pub type GdkFrameClockBeginUpdating = unsafe extern "C" fn(clock: *mut c_void);
+pub type GdkFrameClockEndUpdating = unsafe extern "C" fn(clock: *mut c_void);
 
 // Cairo additions
 pub type CairoTextExtents = unsafe extern "C" fn(cr: *mut c_void, utf8: *const i8, extents: *mut c_void);
@@ -335,6 +346,13 @@ pub struct Symbols {
     pub gtk_widget_set_valign: Option<GtkWidgetSetValign>,
     pub gtk_widget_get_allocated_width: Option<GtkWidgetGetAllocatedWidth>,
     pub gtk_widget_get_allocated_height: Option<GtkWidgetGetAllocatedHeight>,
+    pub gtk_widget_get_mapped: Option<GtkWidgetGetMapped>,
+    pub gtk_widget_get_display: Option<GtkWidgetGetDisplay>,
+    pub gdk_display_sync: Option<GdkDisplaySync>,
+    pub gtk_widget_get_frame_clock: Option<GtkWidgetGetFrameClock>,
+    pub gdk_frame_clock_request_phase: Option<GdkFrameClockRequestPhase>,
+    pub gdk_frame_clock_begin_updating: Option<GdkFrameClockBeginUpdating>,
+    pub gdk_frame_clock_end_updating: Option<GdkFrameClockEndUpdating>,
     pub gtk_gesture_click_new: Option<GtkGestureClickNew>,
     pub gtk_scrolled_window_new: Option<GtkScrolledWindowNew>,
     pub gtk_scrolled_window_set_policy: Option<GtkScrolledWindowSetPolicy>,
@@ -552,6 +570,13 @@ impl Symbols {
         let gtk_widget_set_valign = unsafe { sym::<GtkWidgetSetValign>(gtk, "gtk_widget_set_valign") };
         let gtk_widget_get_allocated_width = unsafe { sym::<GtkWidgetGetAllocatedWidth>(gtk, "gtk_widget_get_allocated_width") };
         let gtk_widget_get_allocated_height = unsafe { sym::<GtkWidgetGetAllocatedHeight>(gtk, "gtk_widget_get_allocated_height") };
+        let gtk_widget_get_mapped = unsafe { sym::<GtkWidgetGetMapped>(gtk, "gtk_widget_get_mapped") };
+        let gtk_widget_get_display = unsafe { sym::<GtkWidgetGetDisplay>(gtk, "gtk_widget_get_display") };
+        let gdk_display_sync = unsafe { sym::<GdkDisplaySync>(gtk, "gdk_display_sync") };
+        let gtk_widget_get_frame_clock = unsafe { sym::<GtkWidgetGetFrameClock>(gtk, "gtk_widget_get_frame_clock") };
+        let gdk_frame_clock_request_phase = unsafe { sym::<GdkFrameClockRequestPhase>(gtk, "gdk_frame_clock_request_phase") };
+        let gdk_frame_clock_begin_updating = unsafe { sym::<GdkFrameClockBeginUpdating>(gtk, "gdk_frame_clock_begin_updating") };
+        let gdk_frame_clock_end_updating = unsafe { sym::<GdkFrameClockEndUpdating>(gtk, "gdk_frame_clock_end_updating") };
         let gtk_gesture_click_new = unsafe { sym::<GtkGestureClickNew>(gtk, "gtk_gesture_click_new") };
         let gtk_scrolled_window_new = unsafe { sym::<GtkScrolledWindowNew>(gtk, "gtk_scrolled_window_new") };
         let gtk_scrolled_window_set_policy = unsafe { sym::<GtkScrolledWindowSetPolicy>(gtk, "gtk_scrolled_window_set_policy") };
@@ -687,6 +712,13 @@ impl Symbols {
             gtk_widget_set_valign,
             gtk_widget_get_allocated_width,
             gtk_widget_get_allocated_height,
+            gtk_widget_get_mapped,
+            gtk_widget_get_display,
+            gdk_display_sync,
+            gtk_widget_get_frame_clock,
+            gdk_frame_clock_request_phase,
+            gdk_frame_clock_begin_updating,
+            gdk_frame_clock_end_updating,
             gtk_gesture_click_new,
             gtk_scrolled_window_new,
             gtk_scrolled_window_set_policy,

@@ -139,6 +139,7 @@ macro_rules! common_types_mod {
             pub fn on_event(&self, cb: Box<dyn FnMut(*mut std::os::raw::c_void) -> i32>) { self.inner.on_event(cb); }
             pub fn on_event_key(&self, cb: Box<dyn FnMut(u32, u32) -> i32>) { self.inner.on_event_key(cb); }
             pub fn on_close(&self, cb: Box<dyn FnMut()>) { self.inner.on_close(cb); }
+            pub fn queue_redraw(&self) { self.inner.queue_redraw(); }
         }
         impl AsRef<*mut std::os::raw::c_void> for Canvas {
             fn as_ref(&self) -> &*mut std::os::raw::c_void { self.inner.as_ref() }

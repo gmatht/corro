@@ -37,6 +37,22 @@ mod gtk_adapter {
             self.0.present();
         }
 
+        /// Queue a redraw of the entire window.  On GTK4 the DrawingArea
+        /// may have its own draw function, but forcing a window-level
+        /// queue_draw cascades to all children (including the canvas),
+        /// ensuring the draw callback fires even when the canvas-level
+        /// queue_draw alone doesn't trigger the frame clock.
+        pub fn queue_redraw(&self) {
+            if let Some(loader) = crate::backends::gtk::loader() {
+                let win_ptr = *self.0.as_ref();
+                if !win_ptr.is_null() {
+                    if let Some(qd) = loader.symbols.gtk_widget_queue_draw {
+                        unsafe { qd(win_ptr); }
+                    }
+                }
+            }
+        }
+
         /// # Safety
         /// `group_ptr` must be a valid GActionGroup pointer or null.
         pub unsafe fn insert_action_group(&self, name: &str, group_ptr: *mut std::os::raw::c_void) {
@@ -88,13 +104,24 @@ mod gtk_adapter {
                     let is_gtk4 = l.symbols.gtk_drawing_area_set_draw_func.is_some();
                     if is_gtk4 {
                         if let Ok(ctrl) = gtk_dynamic_loader::EventControllerKey::new(l.clone()) {
+                            // Use default BUBBLE propagation phase so the focused
+                            // child widget (formula entry, canvas) processes keys
+                            // first.  This controller acts as a genuine fallback
+                            // for keys the focused widget doesn't consume.
+                            //
+                            // CAPTURE phase causes a critical data-loss bug:
+                            // start_edit_with() calls set_text("") on the entry
+                            // which triggers connect_changed -> on_formula_entry_changed
+                            // overwrites edit_buf with "".  On NWG the character
+                            // is then inserted by the default handler (returns false),
+                            // restoring edit_buf via connect_changed.  But with
+                            // CAPTURE the window returns GDK_EVENT_STOP (1), the
+                            // character never reaches the entry, and the first
+                            // keystroke's content is permanently lost.
                             let _ = ctrl.connect_key_pressed(Box::new(move |keyval: u32, state: u32| -> i32 {
                                 cb(keyval, state)
                             }));
                             ctrl.add_to_widget(&self.0);
-                            // Widget takes ownership of the controller via gtk_widget_add_controller.
-                            // Dropping the Rust wrapper balances the constructor's ref (GTK4) or
-                            // the ref_sink ref (GTK3); the widget's own ref keeps it alive.
                         }
                     } else {
                         unsafe {
@@ -649,6 +676,11 @@ mod gtk_adapter {
                     let mut ctx = GtkDrawContext::new(cr, &loader);
                     cb(&mut ctx, w, h);
                 }));
+                // Request an immediate initial redraw.  On GTK4 the frame clock
+                // may not tick immediately (especially with the Cairo renderer
+                // or on virtual displays such as WSL), so we explicitly queue a
+                // redraw after setting the draw func to kickstart the first frame.
+                self.drawing_area.queue_draw();
             } else {
                 // GTK3 path — use widget allocation to provide real w/h
                 let _ = self.drawing_area.connect_draw_gtk3(Box::new(move |widget: *mut c_void, cr: *mut c_void| -> i32 {
@@ -934,6 +966,31 @@ mod gtk_adapter {
     /// Quits the GTK main event loop.
     pub fn quit_main_loop() -> Result<(), Error> {
         crate::backends::gtk::quit_main_loop().map_err(|e| Error::Backend(format!("{}", e)))
+    }
+
+    /// Pump the GTK main context for `count` iterations.
+    /// All iterations use blocking waits so poll() returns as soon as
+    /// the X11 server or frame clock timer fires.  This ensures frame
+    /// clock ticks are actually waited for rather than skipped.
+    ///
+    /// On a 60fps display each blocking iteration may take up to ~16ms
+    /// (the frame clock interval).  500 blocking iterations = ~8s max.
+    /// Callers should use a reasonable count (e.g. 500) to cover slow
+    /// virtual displays (WSLg, Xvfb) without excessive delay.
+    pub fn pump_main_context(count: usize) {
+        if let Some(loader) = crate::backends::gtk::loader() {
+            if let Some(glib_lib) = loader.libs.get("libglib") {
+                type Iteration = unsafe extern "C" fn(*mut std::ffi::c_void, i32) -> i32;
+                if let Ok(iter_fn) = unsafe { glib_lib.get::<Iteration>(b"g_main_context_iteration") } {
+                    let iter = *iter_fn;
+                    unsafe {
+                        for _ in 0..count {
+                            iter(std::ptr::null_mut(), 1);
+                        }
+                    }
+                }
+            }
+        }
     }
 
 }

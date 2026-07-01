@@ -119,6 +119,7 @@ mod nwg_adapter {
         pub fn hwnd(&self) -> *mut c_void {
             self.inner.handle.hwnd().unwrap_or(std::ptr::null_mut()) as *mut c_void
         }
+        pub fn queue_redraw(&self) {}
         pub fn on_event(&self, _cb: Box<dyn FnMut(*mut c_void) -> i32>) {}
         pub fn on_event_key(&self, cb: Box<dyn FnMut(u32, u32) -> i32>) {
             *self.event_key_cb.borrow_mut() = Some(cb);

@@ -52,6 +52,16 @@ impl Loader {
         let libcairo = open_first(&cairo_cands);
         if let Some(c) = libcairo { libs.insert("libcairo".into(), Arc::new(c)); }
 
+        // Force X11 backend to avoid Wayland's asynchronous window configure round-trip.
+        // On Wayland (including WSLg), gtk_window_present() returns before the compositor
+        // acknowledges the configure request, so gtk_widget_get_mapped and
+        // gtk_widget_get_allocated_width return 0 even after event pumping.  The X11
+        // backend maps windows synchronously, eliminating this race condition entirely.
+        // Users who prefer Wayland can override this by setting GDK_BACKEND=wayland.
+        if std::env::var_os("GDK_BACKEND").is_none() {
+            std::env::set_var("GDK_BACKEND", "x11");
+        }
+
         // Prefer software/cairo rendering to avoid GL/X11 SHM issues on headless or restricted hosts.
         // Set before loading libgtk so the renderer selection observes these env vars early.
         if std::env::var_os("GSK_RENDERER").is_none() {

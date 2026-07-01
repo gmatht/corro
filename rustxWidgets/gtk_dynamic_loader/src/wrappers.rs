@@ -198,14 +198,221 @@ impl Window {
         }
         if let Some(present) = loader.symbols.gtk_window_present {
             unsafe { present(self.inner); }
-            // GTK4: gtk_window_present defers layout to the next loop iteration.
-            // Force one iteration so widgets appear immediately, not a frame later.
-            if loader.symbols.gtk_widget_show_all.is_none() {
-                if let Some(glib_lib) = loader.libs.get("libglib") {
-                    type Iteration = unsafe extern "C" fn(*mut std::ffi::c_void, i32) -> i32;
-                    if let Ok(iter_fn) = unsafe { glib_lib.get::<Iteration>(b"g_main_context_iteration") } {
-                        let iter = *iter_fn;
-                        unsafe { iter(std::ptr::null_mut(), 0); }
+            // Pump the main context to complete the window mapping round-trip
+            // and allow the frame clock to fire its first tick.
+            //
+            // On GTK4/Wayland (including WSLg) the configure/acknowledge
+            // round-trip is asynchronous — the window and its children are
+            // not mapped/allocated until the main loop processes the configure
+            // event.  Without pumping events here, grab_focus() (called by
+            // start_edit in gui_backend.rs) silently fails because the target
+            // widget isn't mapped yet, and no widget in the window ever
+            // receives keyboard focus.
+            //
+            // Furthermore, on both GTK3 and GTK4 the initial draw (expose
+            // event or frame clock tick) is deferred until the main loop
+            // processes it.  Without sufficient event pumping here, the canvas
+            // draw callback may not have fired by the time present() returns,
+            // causing replayers to report "WINDOW_DRAWN=false (blank window)".
+            if let Some(glib_lib) = loader.libs.get("libglib") {
+                type Iteration = unsafe extern "C" fn(*mut std::ffi::c_void, i32) -> i32;
+                if let Ok(iter_fn) = unsafe { glib_lib.get::<Iteration>(b"g_main_context_iteration") } {
+                    let iter = *iter_fn;
+                    let get_aw = loader.symbols.gtk_widget_get_allocated_width;
+                    let get_mapped = loader.symbols.gtk_widget_get_mapped;
+                    unsafe {
+                        // Phase 1: pump blocking iterations until the window
+                        // is both allocated and mapped.  On Wayland (including
+                        // WSLg) the configure/acknowledge round-trip is
+                        // asynchronous — the compositor sends width/height in
+                        // a configure event that must be processed by the main
+                        // context.  Without sufficient pumping here the window
+                        // never becomes receptive to grab_focus().
+                        //
+                        // 500 iterations is generous: each blocking iteration
+                        // waits for and dispatches one source.  WSLg virtual
+                        // compositors can be slow to respond, so we err on
+                        // the side of over-pumping rather than under-pumping.
+                        for _ in 0..500 {
+                            let allocated = get_aw.map_or(1, |f| f(self.inner));
+                            let mapped = get_mapped.map_or(1, |f| f(self.inner));
+                            if allocated > 0 && mapped != 0 { break; }
+                            iter(std::ptr::null_mut(), 1);
+                        }
+                        // Phase 2: pump a mix of blocking then non-blocking
+                        // iterations.  The blocking lead-in (10 iterations)
+                        // waits for the frame clock to fire its first tick or
+                        // the expose event to arrive — timer sources and X11
+                        // events are only dispatched by blocking iterations.
+                        // After the tick fires the remaining iterations drain
+                        // any idle sources (non-blocking) without stalling on
+                        // the next frame clock timer (16ms each = 8s for 500).
+                        for _ in 0..10 {
+                            iter(std::ptr::null_mut(), 1);
+                        }
+                        for _ in 0..490 {
+                            iter(std::ptr::null_mut(), 0);
+                        }
+                        // Force a redraw on the window to ensure the canvas
+                        // draw callback runs at least once.  On X11 this
+                        // schedules an idle handler that calls snapshot() on
+                        // the widget tree, which invokes our draw function.
+                        if let Some(qd) = loader.symbols.gtk_widget_queue_draw {
+                            unsafe { qd(self.inner); }
+                        }
+                        // Pump a mix of blocking then non-blocking iterations.
+                        // The blocking lead-in (10 iterations) waits for the
+                        // queued redraw to be processed: allocation idle runs,
+                        // schedules a frame clock tick, and the blocking
+                        // iteration waits for the tick timer.  Non-blocking
+                        // iterations drain remaining idle sources without
+                        // stalling on subsequent frame clock ticks.
+                        for _ in 0..10 {
+                            iter(std::ptr::null_mut(), 1);
+                        }
+                        for _ in 0..490 {
+                            iter(std::ptr::null_mut(), 0);
+                        }
+                        // Sync display server to flush pending map/configure
+                        if let (Some(get_disp), Some(disp_sync)) = (
+                            loader.symbols.gtk_widget_get_display,
+                            loader.symbols.gdk_display_sync,
+                        ) {
+                            let display = unsafe { get_disp(self.inner) };
+                            if !display.is_null() {
+                                unsafe { disp_sync(display); }
+                            }
+                        }
+                        // Phase 4: Force a frame clock cycle via
+                        // gdk_frame_clock_request_phase (GTK4).  On virtual
+                        // displays (WSLg, Xvfb) the frame clock timer may
+                        // not tick automatically, so the draw function
+                        // registered by set_draw_func never fires.  By
+                        // explicitly requesting a PAINT phase we force the
+                        // frame clock to process the pending redraw.
+                        if let (Some(get_fc), Some(request_phase)) = (
+                            loader.symbols.gtk_widget_get_frame_clock,
+                            loader.symbols.gdk_frame_clock_request_phase,
+                        ) {
+                            let clock = unsafe { get_fc(self.inner) };
+                            if !clock.is_null() {
+                                // GDK_FRAME_CLOCK_PHASE_PAINT = 16 triggers
+                                // the snapshot/paint cycle which calls the
+                                // DrawingArea draw function.
+                                unsafe { request_phase(clock, 16); }
+                                // Also call gdk_frame_clock_begin_updating
+                                // to tell the frame clock to keep ticking
+                                // on virtual displays where the compositor
+                                // doesn't provide VBLANK interrupts.  Without
+                                // this, the frame clock timer may never fire,
+                                // so request_phase alone is insufficient.
+                                if let Some(begin_upd) = loader.symbols.gdk_frame_clock_begin_updating {
+                                    unsafe { begin_upd(clock); }
+                                }
+                                // Queue a draw on the window now that the
+                                // frame clock is set to keep ticking.  This
+                                // ensures the redraw is submitted while the
+                                // frame clock is active, so the next tick
+                                // processes it.
+                                if let Some(qd) = loader.symbols.gtk_widget_queue_draw {
+                                    unsafe { qd(self.inner); }
+                                }
+                                // Pump blocking iterations to let the frame
+                                // clock process the requested phase.
+                                // 500 blocking iterations (up to ~8s at
+                                // 16ms per tick) to wait for the first
+                                // frame clock tick on virtual displays
+                                // (WSLg, Xvfb) where the initial tick may
+                                // be significantly delayed.  All-blocking
+                                // ensures that even on very slow virtual
+                                // compositors or when the frame clock uses
+                                // a long timer interval (e.g. 1000ms), we
+                                // wait long enough for at least one tick.
+                                for _ in 0..500 {
+                                    iter(std::ptr::null_mut(), 1);
+                                }
+                            }
+                        }
+                        // Synchronize with the display server to ensure all
+                        // pending X11/Wayland round-trips (map, configure,
+                        // allocate) have completed before returning.  This
+                        // flushes the client-side request buffer and waits
+                        // for the server to process everything, so that
+                        // gtk_widget_get_mapped / get_allocated_width below
+                        // (checked by gui_backend.rs after present returns)
+                        // reflect the actual server state, not stale values.
+                        if let (Some(get_disp), Some(disp_sync)) = (
+                            loader.symbols.gtk_widget_get_display,
+                            loader.symbols.gdk_display_sync,
+                        ) {
+                            let display = unsafe { get_disp(self.inner) };
+                            if !display.is_null() {
+                                unsafe { disp_sync(display); }
+                            }
+                        }
+
+                        // Phase 5: Fallback draw trigger via g_timeout_add.
+                        // This is COMPLETELY independent of the GTK4 frame clock
+                        // and works even on virtual displays (WSLg, Xvfb) where
+                        // the frame clock may not tick reliably.
+                        //
+                        // The approach: register a 1ms one-shot GLib timeout
+                        // that calls gtk_widget_queue_draw on the window.  The
+                        // queue_draw call itself schedules a frame clock tick
+                        // via gdk_surface_request_draw -> gdk_frame_clock_schedule_tick.
+                        // Even if gdk_frame_clock_begin_updating was not called
+                        // or had no effect, queue_draw triggers a SINGLE frame
+                        // clock tick, which is sufficient for the initial draw.
+                        //
+                        // We also call queue_draw on the window directly BEFORE
+                        // the timeout, as well as INSIDE the timeout callback,
+                        // providing two independent opportunities for the frame
+                        // clock to schedule a tick.
+                        if let Some(qd) = loader.symbols.gtk_widget_queue_draw {
+                            // Direct queue_draw (this also schedules a tick via
+                            // gdk_surface_request_draw on X11)
+                            unsafe { qd(self.inner); }
+                            // Schedule a timeout that fires after 1ms and calls
+                            // queue_draw again, as a backup.  The timeout
+                            // source works regardless of the frame clock state.
+                            type TimeoutAdd = unsafe extern "C" fn(
+                                u32,
+                                Option<unsafe extern "C" fn(*mut c_void) -> i32>,
+                                *mut c_void,
+                            ) -> u32;
+                            if let Ok(timeout_add) = unsafe {
+                                glib_lib.get::<TimeoutAdd>(b"g_timeout_add")
+                            } {
+                                let timeout_add = *timeout_add;
+                                struct TimeoutCtx {
+                                    win: *mut c_void,
+                                    qd: unsafe extern "C" fn(*mut c_void),
+                                }
+                                extern "C" fn timeout_cb(data: *mut c_void) -> i32 {
+                                    unsafe {
+                                        let ctx = &*(data as *const TimeoutCtx);
+                                        (ctx.qd)(ctx.win);
+                                    }
+                                    0 // FALSE = one-shot, autoremove
+                                }
+                                let ctx = Box::into_raw(Box::new(TimeoutCtx {
+                                    win: self.inner,
+                                    qd,
+                                }));
+                                timeout_add(
+                                    1, // 1ms timeout
+                                    Some(timeout_cb),
+                                    ctx as *mut c_void,
+                                );
+                            }
+                            // Pump to process the timeout and the subsequent
+                            // frame clock tick.  500 blocking iterations should
+                            // be more than sufficient for a 1ms timeout + 16ms
+                            // frame clock interval.
+                            for _ in 0..500 {
+                                iter(std::ptr::null_mut(), 1);
+                            }
+                        }
                     }
                 }
             }
@@ -1428,8 +1635,14 @@ impl Entry {
 
     pub fn connect_activate<F: FnMut(*mut c_void) + 'static>(&self, f: F) -> Result<u64, Error> {
         guard_widget_or!(self, "Entry", "connect_activate", Err(Error::Other("entry dropped".into())));
-        let boxed: Box<Box<dyn FnMut(*mut c_void)>> = Box::new(Box::new(f));
-        let res = unsafe { crate::signals::connect_signal_param(&self.loader.symbols, self.inner, "activate", boxed) };
+        // GtkEntry::activate has 0 signal parameters (GLib calls with instance + user_data only).
+        // connect_signal_param uses a 3-arg trampoline (instance, param, user_data), but GLib
+        // passes only 2 C args.  On x86-64 the 3rd register (RDX) is undefined — typically 0,
+        // causing the trampoline's null-check on user_data to silently bail out.  Use
+        // connect_signal (2-arg trampoline) instead, wrapping the FnMut(*mut c_void) as FnMut().
+        let mut f = f;
+        let wrapper: Box<dyn FnMut()> = Box::new(move || { f(std::ptr::null_mut()); });
+        let res = unsafe { crate::signals::connect_signal(&self.loader.symbols, self.inner, "activate", wrapper, 2) };
         match res {
             Ok(id) => Ok(id),
             Err(e) => Err(Error::Other(e)),

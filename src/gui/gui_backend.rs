@@ -648,7 +648,17 @@ fn start_edit_with(state: &GuiState, ch: char) {
         // First character: clear the formula entry so the default keyboard
         // handler (WM_CHAR on Windows, key-press-event on GTK) inserts
         // this character without doubling.
+        //
+        // Save edit_buf before set_text("") because the changed signal
+        // (connect_changed -> on_formula_entry_changed) will overwrite
+        // it with the entry's empty text.  Restore after so the first
+        // character isn't lost.  On NWG the character is later inserted
+        // by the default handler (on_key_raw returns false), triggering
+        // connect_changed again with the correct content.  On GTK with
+        // BUBBLE-phase window handler the same path applies.
+        let saved = state.edit_buf.borrow().clone();
         state.formula_entry.set_text("");
+        *state.edit_buf.borrow_mut() = saved;
         state.formula_entry.grab_focus();
     }
     state.canvas.queue_redraw();
@@ -657,11 +667,6 @@ fn start_edit_with(state: &GuiState, ch: char) {
 fn commit_edit(state: &GuiState) {
     state.editing.set(false);
     state.mode.set(GuiMode::Normal);
-    if let Some(text) = state.formula_entry.get_text() {
-        if !text.is_empty() {
-            *state.edit_buf.borrow_mut() = text;
-        }
-    }
     let val = state.edit_buf.borrow().clone();
     if !val.is_empty() {
         let app = unsafe { &mut *state.app };
@@ -1107,7 +1112,7 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     win.set_title(&format!("corro {}", env!("CARGO_PKG_VERSION")));
     win.set_default_size(1200, 800);
 
-    let mut vbox = rxapp.new_box(Orientation::Vertical, 0)?;
+    let vbox = rxapp.new_box(Orientation::Vertical, 0)?;
 
     // Fit column widths to rendered content
     corro_app.fit_main_columns_to_max_width();
@@ -1124,7 +1129,7 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     let data_cols = 12usize;
 
     // Formula bar
-    let mut formula_bar = rxapp.new_box(Orientation::Horizontal, 2)?;
+    let formula_bar = rxapp.new_box(Orientation::Horizontal, 2)?;
     let addr_label = rxapp.new_label("A1")?;
     let f_label = rxapp.new_label("  fx  ")?;
     let formula_entry = rxapp.new_entry()?;
@@ -1137,6 +1142,13 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // Canvas
     let canvas = rxapp.new_canvas()?;
     canvas.set_size_request(800, 600);
+    // On GTK4, the draw callback receives content_width × content_height.
+    // If content size is left at 0 (default), GtkDrawingArea skips the draw
+    // callback entirely on GTK 4.6+ (width ≤ 0 || height ≤ 0 guard).  Set a
+    // non-zero initial content size so the first frame clock tick invokes the
+    // draw callback.  The draw callback itself updates content_size to the
+    // actual allocated dimensions on every frame so window resizes are tracked.
+    canvas.set_content_size(800, 600);
     // Ensure the canvas can receive keyboard focus (needed after commit_edit
     // to return focus — GtkDrawingArea does not accept focus by default).
     canvas.set_can_focus(true);
@@ -1171,13 +1183,8 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     let menubar = build_menu(&rxapp, &win, &shared)?;
     vbox.append(&menubar);
 
-    // Draw callback
-    let shared_draw = shared.clone();
-    canvas.set_draw_callback(Box::new(move |dc: &mut dyn DrawContext, w: i32, h: i32| {
-        render_grid(dc, &shared_draw, w, h);
-    }));
-
-    // Keyboard
+    // Keyboard (draw callback registered after present() below so the
+    // DrawingArea is realized before gtk_drawing_area_set_draw_func is called)
     let shared_key = shared.clone();
     let alt_f_armed = Rc::new(Cell::new(false));
     canvas.on_key(Box::new(move |keyval: u32| -> bool {
@@ -1222,8 +1229,10 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         on_formula_entry_changed(&shared_entry);
     })?;
 
-    // Window-level event interception to catch Alt-F+Q before the
-    // menu bar's mnemonic accelerator can steal the keystrokes.
+    // Window-level event interception.  Handles Alt-F+Q quit sequence
+    // before the menu bar's mnemonic accelerator can steal keystrokes.
+    // Also provides a fallback for editing keys (RETURN, ESCAPE, arrows,
+    // printable characters) when no child widget has keyboard focus.
     // On non-GTK backends `on_event_key` is a no-op.
     {
         let state_w = shared.clone();
@@ -1265,7 +1274,11 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                 s.alt_active.set(false);
                 s.seq_alt_f.set(false);
             }
-            0
+            // Fallback: if this key reached the window level (no child widget
+            // with focus handled it), process editing keys here.  This is
+            // critical when grab_focus() on the formula entry silently fails
+            // because the widget isn't mapped yet (e.g. slow WSL compositor).
+            if handle_key(keyval, &state_w) { 1 } else { 0 }
         }));
     }
 
@@ -1313,11 +1326,74 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     vbox.set_child_vexpand(&canvas, true);
     vbox.append(&status_label);
 
-    win.set_child_box(&vbox);
-    win.present();
+    // Register the draw callback BEFORE present() so the extensive event
+    // pumping inside present() — which waits for the frame clock to fire
+    // its first tick (up to 500+500 blocking iterations) — actually calls
+    // our draw function.  When set_draw_callback was placed AFTER present(),
+    // the initial 1050+ iterations did nothing because no draw function
+    // was registered yet.  On virtual displays (WSLg, Xvfb) the next
+    // frame clock tick may be delayed enough for a replayer to find the
+    // window visible but blank ("WINDOW_DRAWN=false (blank window)").
+    //
+    // gtk_drawing_area_set_draw_func stores the callback in widget instance
+    // data and works correctly whether the DrawingArea is realized or not;
+    // the callback is invoked on the first frame clock tick after realization.
+    let shared_draw = shared.clone();
+    let canvas_draw = canvas.clone();
+    eprintln!("PHASE: before_set_draw_callback");
+    let _ = std::fs::write("/tmp/gui_setup_phase1.txt", "before_set_draw_callback\n");
+    canvas.set_draw_callback(Box::new(move |dc: &mut dyn DrawContext, w: i32, h: i32| {
+        eprintln!("DRAW_CALLBACK called: w={} h={}", w, h);
+        let _ = std::fs::write("/tmp/dim.txt", format!("{} {}\n", w, h));
+        // Update content size to actual dimensions so GtkDrawingArea's draw
+        // guard (width ≤ 0 || height ≤ 0) passes on every subsequent frame
+        // and window resizes are reflected correctly.
+        canvas_draw.set_content_size(w, h);
+        render_grid(dc, &shared_draw, w, h);
+    }));
+    eprintln!("PHASE: after_set_draw_callback");
+    let _ = std::fs::write("/tmp/gui_setup_phase2.txt", "after_set_draw_callback\n");
 
-    // Start editing at A1 immediately so typing goes into the cell
+    win.set_child_box(&vbox);
+    eprintln!("PHASE: about_to_present");
+    win.present();
+    eprintln!("PHASE: after_present");
+    let _ = std::fs::write("/tmp/gui_setup_phase3.txt", "after_present\n");
+
+    // Queue an explicit redraw on the toplevel window: on GTK4 with the
+    // Cairo GSK renderer, a canvas-only queue_draw may not cascade to
+    // the toplevel's frame clock.  Marking the window dirty ensures the
+    // frame clock is armed before the start_edit() canvas queue_redraw.
+    win.queue_redraw();
+
+    // Also queue a redraw on the canvas explicitly.  On GTK4 the
+    // window-level queue_draw cascades, but marking the canvas
+    // directly ensures the DrawingArea's draw func is scheduled
+    // independently, providing redundancy if the cascade is slow.
+    canvas.queue_redraw();
+
+    // Start editing at A1: grab_focus on the formula entry.
+    // The draw callback was already registered before present(),
+    // so the initial frame clock tick inside present() draws the grid.
     start_edit(&shared);
+
+    // Pump events after start_edit() to ensure the frame clock processes
+    // the pending redraw (from queue_redraw/queue_draw) and the focus
+    // change (from grab_focus) BEFORE the main loop starts.  This
+    // prevents WINDOW_DRAWN=false on slow virtual displays where the
+    // frame clock timer hasn't fired yet.
+    rxapp.pump_events(500);
+
+    // Second safety net: queue another redraw + pump cycle to cover the
+    // case where the frame clock tick processed by pump_events above was
+    // consumed by the Phase 4 tick (inside present()) and the next tick
+    // hasn't fired yet by the time pump_events returns.  By queueing a
+    // fresh redraw and pumping again, we give the frame clock a second
+    // opportunity to process the canvas draw callback before the main
+    // loop starts.
+    win.queue_redraw();
+    canvas.queue_redraw();
+    rxapp.pump_events(500);
 
     rxapp.run()?;
     Ok(())

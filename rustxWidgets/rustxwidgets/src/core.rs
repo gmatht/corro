@@ -1029,6 +1029,20 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
         #[cfg(all(windows, not(feature = "zork")))]
         crate::backends_nwg_adapter::quit_main_loop();
     }
+
+    /// Pump the backend's event loop for `count` blocking iterations.
+    /// On GTK/Linux this processes pending main context events (frame
+    /// clock ticks, redraws, configure events).  On other backends this
+    /// is a no-op.
+    ///
+    /// Call after `queue_redraw()` to ensure the draw callback fires
+    /// before entering the main loop, especially on virtual displays
+    /// (Xvfb, WSL) where the GTK4 frame clock may not tick automatically.
+    pub fn pump_events(&self, count: usize) {
+        #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+        crate::backends_gtk_adapter::pump_main_context(count);
+        let _ = count;
+    }
 }
 
 impl From<Box<dyn crate::backends::BackendApp>> for App {
