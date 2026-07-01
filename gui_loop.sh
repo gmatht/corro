@@ -247,6 +247,12 @@ if [ "$GTK_ONLY" = false ] && [ "$HAS_CARGO" = true ]; then
             fail "$t"
         fi
     done
+    # Cross-backend consistency tests (pattern verification, no live GUI needed)
+    if cargo +nightly test --features gui --test gtk_todo_tests 2>&1; then
+        pass "gtk_todo_tests (cross-backend consistency)"
+    else
+        fail "gtk_todo_tests (cross-backend consistency)"
+    fi
     echo ""
 elif [ "$GTK_ONLY" = false ]; then
     skip "Rust build and tests (cargo not available)"
@@ -329,14 +335,14 @@ if [ "$NWG_ONLY" = false ] && [ "$HAS_WSL" = true ] && [ "$HAS_WSL_BASH" = true 
         else
             fail "GTK recrec6"
         fi
-        # Cross-backend consistency tests (Linux-only, require gui+ratatui)
-        CROSS_BACKEND_OUT=$(wsl bash -c "cd '$WSL_PWD' && DISPLAY=:0 $WSL_CARGO +nightly test --features gui,ratatui --test gtk_todo_tests" 2>&1) && {
+        # Cross-backend consistency tests (Linux-specific test gui_spreadsheet_scrollbars runs only on Linux)
+        CROSS_BACKEND_OUT=$(wsl bash -c "cd '$WSL_PWD' && DISPLAY=:0 $WSL_CARGO +nightly test --features gui --test gtk_todo_tests" 2>&1) && {
             pass "GTK cross-backend consistency (gtk_todo_tests)"
         } || {
             fail "GTK cross-backend consistency (gtk_todo_tests)"
             echo "  Test output (last 20 lines):"
             echo "$CROSS_BACKEND_OUT" | tail -20
-            echo "  TIP: Run manually: wsl bash -c \"cd '$WSL_PWD' && $WSL_CARGO +nightly test --features gui,ratatui --test gtk_todo_tests\""
+            echo "  TIP: Run manually: wsl bash -c \"cd '$WSL_PWD' && $WSL_CARGO +nightly test --features gui --test gtk_todo_tests\""
         }
         # terminal_parity requires pancurses+ratatui+tmux; run if available
         if wsl bash -c "command -v tmux &>/dev/null" 2>/dev/null; then

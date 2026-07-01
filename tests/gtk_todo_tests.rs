@@ -1,4 +1,4 @@
-#![cfg(all(target_os = "linux", feature = "gui", feature = "ratatui"))]
+#![cfg(feature = "gui")]
 
 use std::fs;
 use std::path::Path;
@@ -31,30 +31,39 @@ fn gui_menu_items_available() {
     assert!(all_menu_items_found, "Not all Ratatui menu items have GTK equivalents");
 }
 
+/// Strip leading whitespace from each line so pattern matching is
+/// resilient to indentation changes (e.g. rustfmt, refactoring).
+fn strip_leading(s: &str) -> String {
+    s.lines().map(|l| l.trim_start()).collect::<Vec<_>>().join("\n")
+}
+
 #[test]
 fn gui_menu_items_not_wired_to_real_functions() {
     // Verify that menu items ARE currently NOT wired to real functions, they use eprintln instead
     let menu_path = Path::new("src/gui/menu.rs");
     let content = fs::read_to_string(menu_path).unwrap();
+    let normalized = strip_leading(&content);
 
     // Check that menu handlers DO use eprintln instead of calling real functions.
-    // Patterns match the current handle_action match-arm structure in menu.rs.
-    let open_pattern = "        \"open\" => {\n            if let Some(path) = dialogs::file_open_dialog() {\n                eprintln!(\"Open file: {:?}\", path);\n            }\n        }";
-    let save_pattern = "        \"save\" => {\n            if let Some(path) = dialogs::file_save_dialog() {\n                eprintln!(\"Save file: {:?}\", path);\n            }\n        }";
-    let about_pattern = "        \"about\" => dialogs::show_about_dialog(),";
-    let help_pattern = "        \"help_keybinds\" => dialogs::show_keybinds_help(),";
-    let find_pattern = "        \"find\" => dialogs::find_dialog(|result| {\n            if let Some(text) = result {\n                eprintln!(\"Find: {}\", text);\n            }\n        }),";
-    let replace_pattern = "        \"replace\" => dialogs::replace_dialog(|result| {\n            if let Some((find, replace)) = result {\n                eprintln!(\"Replace: '{}' with '{}'\", find, replace);\n            }\n        }),";
+    // Patterns match the current handle_action match-arm structure in menu.rs,
+    // with leading whitespace stripped so formatting changes don't break the match.
+    let open_pattern = strip_leading("\"open\" => {\n    if let Some(path) = dialogs::file_open_dialog() {\n        eprintln!(\"Open file: {:?}\", path);\n    }\n}");
+    let save_pattern = strip_leading("\"save\" => {\n    if let Some(path) = dialogs::file_save_dialog() {\n        eprintln!(\"Save file: {:?}\", path);\n    }\n}");
+    let about_pattern = strip_leading("\"about\" => dialogs::show_about_dialog(),");
+    let help_pattern = strip_leading("\"help_keybinds\" => dialogs::show_keybinds_help(),");
+    let find_pattern = strip_leading("\"find\" => dialogs::find_dialog(|result| {\n    if let Some(text) = result {\n        eprintln!(\"Find: {}\", text);\n    }\n}),");
+    let replace_pattern = strip_leading("\"replace\" => dialogs::replace_dialog(|result| {\n    if let Some((find, replace)) = result {\n        eprintln!(\"Replace: '{}' with '{}'\", find, replace);\n    }\n}),");
 
-    assert!(content.contains(open_pattern), "Menu item 'Open' should still be using eprintln instead of calling real function");
-    assert!(content.contains(save_pattern), "Menu item 'Save' should still be using eprintln instead of calling real function");
-    assert!(content.contains(about_pattern), "Menu item 'About' should NOT use eprintln (already calls real function)");
-    assert!(content.contains(help_pattern), "Menu item 'Keybindings' should NOT use eprintln (already calls real function)");
-    assert!(content.contains(find_pattern), "Menu item 'Find' should still be using eprintln instead of calling real function");
-    assert!(content.contains(replace_pattern), "Menu item 'Replace' should still be using eprintln instead of calling real function");
+    assert!(normalized.contains(&open_pattern), "Menu item 'Open' should still be using eprintln instead of calling real function");
+    assert!(normalized.contains(&save_pattern), "Menu item 'Save' should still be using eprintln instead of calling real function");
+    assert!(normalized.contains(&about_pattern), "Menu item 'About' should NOT use eprintln (already calls real function)");
+    assert!(normalized.contains(&help_pattern), "Menu item 'Keybindings' should NOT use eprintln (already calls real function)");
+    assert!(normalized.contains(&find_pattern), "Menu item 'Find' should still be using eprintln instead of calling real function");
+    assert!(normalized.contains(&replace_pattern), "Menu item 'Replace' should still be using eprintln instead of calling real function");
 }
 
 #[test]
+#[cfg(feature = "ratatui")]
 fn gui_sheet_tab_bar_displayed() {
     let mut app = corro::ui::App::new(None);
     app.load_initial().unwrap();
@@ -92,6 +101,7 @@ fn gui_add_column_plus_column() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn gui_spreadsheet_scrollbars() {
     // Verify that the gtk::create_scrolled_window symbol exists.
     // This compiles only when the GTK backend is active; the runtime
