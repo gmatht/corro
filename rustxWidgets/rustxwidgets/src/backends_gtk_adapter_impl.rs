@@ -644,8 +644,11 @@ mod gtk_adapter {
     /// Canvas wraps a DrawingArea into the cross-platform Canvas API.
     /// Stores event controllers in a reference-counted slot so they outlive
     /// the constructor scope (GTK4 controllers are freed if dropped).
+    /// Also stores a copy of the draw callback for the `force_draw` fallback
+    /// that renders directly to the window surface (bypassing the frame clock).
     pub struct Canvas {
         pub drawing_area: gtk_dynamic_loader::DrawingArea,
+        draw_cb: Rc<RefCell<Option<Box<dyn FnMut(&mut dyn crate::core::DrawContext, i32, i32)>>>>,
         _controllers: Rc<RefCell<Vec<Box<dyn std::any::Any>>>>,
     }
 
@@ -653,6 +656,7 @@ mod gtk_adapter {
         fn clone(&self) -> Self {
             Canvas {
                 drawing_area: self.drawing_area.clone(),
+                draw_cb: self.draw_cb.clone(),
                 _controllers: self._controllers.clone(),
             }
         }
@@ -666,15 +670,21 @@ mod gtk_adapter {
 
     impl Canvas {
         pub fn set_draw_callback(&self, cb: Box<dyn FnMut(&mut dyn crate::core::DrawContext, i32, i32)>) {
+            // Store the callback for force_draw fallback
+            *self.draw_cb.borrow_mut() = Some(cb);
+
             let loader = crate::backends::gtk::loader()
                 .expect("GTK loader not initialized after Canvas creation");
-            let mut cb = cb;
             let symbols = &loader.symbols;
             if symbols.gtk_drawing_area_set_draw_func.is_some() {
-                // GTK4 path
+                // GTK4 path — use draw_cb so force_draw can also invoke it
+                let cb_stored = self.draw_cb.clone();
+                let loader_clone = loader.clone();
                 let _ = self.drawing_area.set_draw_func(Box::new(move |cr: *mut c_void, w: i32, h: i32| {
-                    let mut ctx = GtkDrawContext::new(cr, &loader);
-                    cb(&mut ctx, w, h);
+                    let mut ctx = GtkDrawContext::new(cr, &loader_clone);
+                    if let Some(ref mut cb) = *cb_stored.borrow_mut() {
+                        cb(&mut ctx, w, h);
+                    }
                 }));
                 // Request an immediate initial redraw.  On GTK4 the frame clock
                 // may not tick immediately (especially with the Cairo renderer
@@ -683,17 +693,130 @@ mod gtk_adapter {
                 self.drawing_area.queue_draw();
             } else {
                 // GTK3 path — use widget allocation to provide real w/h
+                let cb_stored = self.draw_cb.clone();
+                let loader_clone = loader.clone();
                 let _ = self.drawing_area.connect_draw_gtk3(Box::new(move |widget: *mut c_void, cr: *mut c_void| -> i32 {
-                    let w = if let Some(f) = loader.symbols.gtk_widget_get_allocated_width {
+                    let w = if let Some(f) = loader_clone.symbols.gtk_widget_get_allocated_width {
                         unsafe { f(widget) }
                     } else { 0 };
-                    let h = if let Some(f) = loader.symbols.gtk_widget_get_allocated_height {
+                    let h = if let Some(f) = loader_clone.symbols.gtk_widget_get_allocated_height {
                         unsafe { f(widget) }
                     } else { 0 };
-                    let mut ctx = GtkDrawContext::new(cr, &loader);
-                    cb(&mut ctx, w, h);
+                    let mut ctx = GtkDrawContext::new(cr, &loader_clone);
+                    if let Some(ref mut cb) = *cb_stored.borrow_mut() {
+                        cb(&mut ctx, w, h);
+                    }
                     0
                 }));
+            }
+        }
+
+        /// Force an immediate draw of the canvas content directly to the window
+        /// surface, bypassing the GTK4 frame clock.  This is a fallback for
+        /// virtual displays (WSL, Xvfb) where the frame clock may never tick.
+        /// `window_ptr` must be a valid GtkWindow pointer.
+        ///
+        /// `fallback_w`/`fallback_h` are used when the surface reports zero
+        /// dimensions (the X11/Wayland surface hasn't been configured yet
+        /// even though GTK widget allocation already reflects the requested
+        /// default size from `set_default_size`).
+        ///
+        /// Two rendering paths are tried:
+        /// 1. `gdk_surface_create_cairo_context` (GTK 4.14+) — preferred, creates
+        ///    a GdkCairoContext that draws directly to the surface buffer.
+        /// 2. `gdk_surface_begin_draw_frame` + `gdk_draw_context_get_cairo_context`
+        ///    + `gdk_surface_end_draw_frame` (GTK 4.0-4.14) — deprecated but
+        ///    present on older GTK4 (e.g. Ubuntu 24.04 with GTK 4.12).
+        ///
+        /// After rendering, `gdk_display_sync` is called to flush the display.
+        pub fn force_draw(&self, window_ptr: *mut c_void, fallback_w: i32, fallback_h: i32) {
+            let loader = match crate::backends::gtk::loader() {
+                Some(l) => l,
+                None => return,
+            };
+            let symbols = &loader.symbols;
+            let get_surface = match symbols.gtk_native_get_surface {
+                Some(f) => f,
+                None => return,
+            };
+            let get_w = match symbols.gdk_surface_get_width {
+                Some(f) => f,
+                None => return,
+            };
+            let get_h = match symbols.gdk_surface_get_height {
+                Some(f) => f,
+                None => return,
+            };
+
+            let surface = unsafe { get_surface(window_ptr) };
+            if surface.is_null() { return; }
+            let mut w = unsafe { get_w(surface) };
+            let mut h = unsafe { get_h(surface) };
+            if w <= 0 || h <= 0 {
+                // Surface not yet configured by display server.  Use caller-provided
+                // fallback dimensions so the draw callback still runs and the canvas
+                // claims focus despite the absent server-side configuration.
+                w = fallback_w;
+                h = fallback_h;
+                if w <= 0 || h <= 0 { return; }
+            }
+
+            // Approach A (GTK 4.14+): gdk_surface_create_cairo_context
+            if let Some(create_cairo) = symbols.gdk_surface_create_cairo_context {
+                let cairo_destroy = match symbols.cairo_destroy {
+                    Some(f) => f,
+                    None => return,
+                };
+                let cr = unsafe { create_cairo(surface) };
+                if cr.is_null() { return; }
+                let mut ctx = GtkDrawContext::new(cr, &loader);
+                if let Some(ref mut cb) = *self.draw_cb.borrow_mut() {
+                    cb(&mut ctx, w, h);
+                }
+                unsafe { cairo_destroy(cr); }
+            } else {
+                // Approach B (GTK 4.0-4.14): begin_draw_frame + end_draw_frame
+                let begin_frame = match symbols.gdk_surface_begin_draw_frame {
+                    Some(f) => f,
+                    None => return,
+                };
+                let get_cr = match symbols.gdk_draw_context_get_cairo_context {
+                    Some(f) => f,
+                    None => return,
+                };
+                let end_frame = match symbols.gdk_surface_end_draw_frame {
+                    Some(f) => f,
+                    None => return,
+                };
+                let cairo_destroy = match symbols.cairo_destroy {
+                    Some(f) => f,
+                    None => return,
+                };
+                let context = unsafe { begin_frame(surface, std::ptr::null_mut()) };
+                if context.is_null() { return; }
+                let cr = unsafe { get_cr(context) };
+                if cr.is_null() {
+                    unsafe { end_frame(surface, context); }
+                    return;
+                }
+                let mut ctx = GtkDrawContext::new(cr, &loader);
+                if let Some(ref mut cb) = *self.draw_cb.borrow_mut() {
+                    cb(&mut ctx, w, h);
+                }
+                unsafe { cairo_destroy(cr); }
+                unsafe { end_frame(surface, context); }
+            }
+
+            // Sync the display to ensure the rendered content reaches the
+            // display server (X11: XFlush; Wayland: wl_display_flush).
+            if let (Some(get_disp), Some(disp_sync)) = (
+                symbols.gtk_widget_get_display,
+                symbols.gdk_display_sync,
+            ) {
+                let display = unsafe { get_disp(window_ptr) };
+                if !display.is_null() {
+                    unsafe { disp_sync(display); }
+                }
             }
         }
 
@@ -800,6 +923,7 @@ mod gtk_adapter {
         let da = crate::backends::gtk::create_drawing_area().map_err(|e| Error::Backend(format!("{}", e)))?;
         Ok(Canvas {
             drawing_area: da,
+            draw_cb: Rc::new(RefCell::new(None)),
             _controllers: Rc::new(RefCell::new(Vec::new())),
         })
     }

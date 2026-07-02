@@ -213,6 +213,17 @@ pub type CairoClip = unsafe extern "C" fn(cr: *mut c_void);
 pub type CairoLineTo = unsafe extern "C" fn(cr: *mut c_void, x: f64, y: f64);
 pub type CairoPaint = unsafe extern "C" fn(cr: *mut c_void);
 
+// GdkSurface — for direct rendering bypassing frame clock
+pub type GtkNativeGetSurface = unsafe extern "C" fn(native: *mut c_void) -> *mut c_void;
+pub type GdkSurfaceCreateCairoContext = unsafe extern "C" fn(surface: *mut c_void) -> *mut c_void;
+pub type GdkSurfaceGetWidth = unsafe extern "C" fn(surface: *mut c_void) -> i32;
+
+// GdkSurface begin/end draw frame (GTK 4.0-4.14, deprecated in 4.14+)
+pub type GdkSurfaceBeginDrawFrame = unsafe extern "C" fn(surface: *mut c_void, region: *mut c_void) -> *mut c_void;
+pub type GdkSurfaceEndDrawFrame = unsafe extern "C" fn(surface: *mut c_void, context: *mut c_void);
+pub type GdkDrawContextGetCairoContext = unsafe extern "C" fn(context: *mut c_void) -> *mut c_void;
+pub type GdkSurfaceGetHeight = unsafe extern "C" fn(surface: *mut c_void) -> i32;
+
 #[repr(C)]
 pub struct CairoTextExtentsT {
     pub x_bearing: f64,
@@ -432,6 +443,18 @@ pub struct Symbols {
     pub gtk_drawing_area_set_content_width: Option<GtkDrawingAreaSetContentWidth>,
     pub gtk_drawing_area_set_content_height: Option<GtkDrawingAreaSetContentHeight>,
 
+    // GtkNative (GtkWindow implements this) — for direct surface access
+    pub gtk_native_get_surface: Option<GtkNativeGetSurface>,
+
+    // GdkSurface operations — for direct Cairo rendering bypassing frame clock
+    pub gdk_surface_create_cairo_context: Option<GdkSurfaceCreateCairoContext>,
+    pub gdk_surface_get_width: Option<GdkSurfaceGetWidth>,
+    pub gdk_surface_get_height: Option<GdkSurfaceGetHeight>,
+    // GdkSurface begin/end draw frame (GTK 4.0-4.14, fallback when gdk_surface_create_cairo_context unavailable)
+    pub gdk_surface_begin_draw_frame: Option<GdkSurfaceBeginDrawFrame>,
+    pub gdk_surface_end_draw_frame: Option<GdkSurfaceEndDrawFrame>,
+    pub gdk_draw_context_get_cairo_context: Option<GdkDrawContextGetCairoContext>,
+
     // Cairo canvas drawing
     pub cairo_text_extents: Option<CairoTextExtents>,
     pub cairo_save: Option<CairoSave>,
@@ -439,6 +462,8 @@ pub struct Symbols {
     pub cairo_clip: Option<CairoClip>,
     pub cairo_line_to: Option<CairoLineTo>,
     pub cairo_paint: Option<CairoPaint>,
+    // Cairo context lifecycle
+    pub cairo_destroy: Option<unsafe extern "C" fn(cr: *mut c_void)>,
 }
 
 impl Symbols {
@@ -555,9 +580,18 @@ impl Symbols {
         let cairo_clip = open_sym_try!(libs, "libcairo", CairoClip, "cairo_clip").or_else(|| None);
         let cairo_line_to = open_sym_try!(libs, "libcairo", CairoLineTo, "cairo_line_to").or_else(|| None);
         let cairo_paint = open_sym_try!(libs, "libcairo", CairoPaint, "cairo_paint").or_else(|| None);
+        let cairo_destroy = open_sym_try!(libs, "libcairo", unsafe extern "C" fn(*mut c_void), "cairo_destroy").or_else(|| None);
         let gtk_drawing_area_set_draw_func = unsafe { sym::<GtkDrawingAreaSetDrawFunc>(gtk, "gtk_drawing_area_set_draw_func") };
         let gtk_drawing_area_set_content_width = unsafe { sym::<GtkDrawingAreaSetContentWidth>(gtk, "gtk_drawing_area_set_content_width") };
         let gtk_drawing_area_set_content_height = unsafe { sym::<GtkDrawingAreaSetContentHeight>(gtk, "gtk_drawing_area_set_content_height") };
+        let gtk_native_get_surface = unsafe { sym::<GtkNativeGetSurface>(gtk, "gtk_native_get_surface") };
+        let gdk_surface_create_cairo_context = unsafe { sym::<GdkSurfaceCreateCairoContext>(gtk, "gdk_surface_create_cairo_context") };
+        let gdk_surface_get_width = unsafe { sym::<GdkSurfaceGetWidth>(gtk, "gdk_surface_get_width") };
+        let gdk_surface_get_height = unsafe { sym::<GdkSurfaceGetHeight>(gtk, "gdk_surface_get_height") };
+        // Fallback direct-drawing symbols (GTK 4.0-4.14, deprecated in favor of gdk_surface_create_cairo_context)
+        let gdk_surface_begin_draw_frame = unsafe { sym::<GdkSurfaceBeginDrawFrame>(gtk, "gdk_surface_begin_draw_frame") };
+        let gdk_surface_end_draw_frame = unsafe { sym::<GdkSurfaceEndDrawFrame>(gtk, "gdk_surface_end_draw_frame") };
+        let gdk_draw_context_get_cairo_context = unsafe { sym::<GdkDrawContextGetCairoContext>(gtk, "gdk_draw_context_get_cairo_context") };
         let gtk_widget_set_can_focus = unsafe { sym::<GtkWidgetSetCanFocus>(gtk, "gtk_widget_set_can_focus") };
         let gtk_widget_queue_draw = unsafe { sym::<unsafe extern "C" fn(*mut c_void)>(gtk, "gtk_widget_queue_draw") };
         let gtk_label_set_xalign = unsafe { sym::<GtkLabelSetXalign>(gtk, "gtk_label_set_xalign") };
@@ -738,7 +772,9 @@ impl Symbols {
             gtk_widget_unparent, gtk_widget_get_parent,
             gtk_window_set_default_size,
             gtk_drawing_area_set_draw_func, gtk_drawing_area_set_content_width, gtk_drawing_area_set_content_height,
-            cairo_text_extents, cairo_save, cairo_restore, cairo_clip, cairo_line_to, cairo_paint,
+            gtk_native_get_surface, gdk_surface_create_cairo_context, gdk_surface_get_width, gdk_surface_get_height,
+            gdk_surface_begin_draw_frame, gdk_surface_end_draw_frame, gdk_draw_context_get_cairo_context,
+            cairo_text_extents, cairo_save, cairo_restore, cairo_clip, cairo_line_to, cairo_paint, cairo_destroy,
         })
     }
 }

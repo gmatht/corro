@@ -565,6 +565,7 @@ mod pancurses_adapter {
         pub fn on_key_raw(&self, _cb: Box<dyn FnMut(u32, u32) -> bool>) {}
         pub fn grab_focus(&self) {}
         pub fn set_can_focus(&self, _can: bool) {}
+        pub fn force_draw(&self, _window_ptr: *mut c_void, _fallback_w: i32, _fallback_h: i32) {}
     }
 
     // -- Overlay --

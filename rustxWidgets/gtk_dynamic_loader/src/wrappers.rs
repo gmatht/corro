@@ -273,16 +273,6 @@ impl Window {
                         for _ in 0..490 {
                             iter(std::ptr::null_mut(), 0);
                         }
-                        // Sync display server to flush pending map/configure
-                        if let (Some(get_disp), Some(disp_sync)) = (
-                            loader.symbols.gtk_widget_get_display,
-                            loader.symbols.gdk_display_sync,
-                        ) {
-                            let display = unsafe { get_disp(self.inner) };
-                            if !display.is_null() {
-                                unsafe { disp_sync(display); }
-                            }
-                        }
                         // Phase 4: Force a frame clock cycle via
                         // gdk_frame_clock_request_phase (GTK4).  On virtual
                         // displays (WSLg, Xvfb) the frame clock timer may
@@ -300,117 +290,14 @@ impl Window {
                                 // the snapshot/paint cycle which calls the
                                 // DrawingArea draw function.
                                 unsafe { request_phase(clock, 16); }
-                                // Also call gdk_frame_clock_begin_updating
-                                // to tell the frame clock to keep ticking
-                                // on virtual displays where the compositor
-                                // doesn't provide VBLANK interrupts.  Without
-                                // this, the frame clock timer may never fire,
-                                // so request_phase alone is insufficient.
-                                if let Some(begin_upd) = loader.symbols.gdk_frame_clock_begin_updating {
-                                    unsafe { begin_upd(clock); }
-                                }
-                                // Queue a draw on the window now that the
-                                // frame clock is set to keep ticking.  This
-                                // ensures the redraw is submitted while the
-                                // frame clock is active, so the next tick
-                                // processes it.
-                                if let Some(qd) = loader.symbols.gtk_widget_queue_draw {
-                                    unsafe { qd(self.inner); }
-                                }
                                 // Pump blocking iterations to let the frame
                                 // clock process the requested phase.
-                                // 500 blocking iterations (up to ~8s at
-                                // 16ms per tick) to wait for the first
-                                // frame clock tick on virtual displays
-                                // (WSLg, Xvfb) where the initial tick may
-                                // be significantly delayed.  All-blocking
-                                // ensures that even on very slow virtual
-                                // compositors or when the frame clock uses
-                                // a long timer interval (e.g. 1000ms), we
-                                // wait long enough for at least one tick.
-                                for _ in 0..500 {
+                                for _ in 0..10 {
                                     iter(std::ptr::null_mut(), 1);
                                 }
-                            }
-                        }
-                        // Synchronize with the display server to ensure all
-                        // pending X11/Wayland round-trips (map, configure,
-                        // allocate) have completed before returning.  This
-                        // flushes the client-side request buffer and waits
-                        // for the server to process everything, so that
-                        // gtk_widget_get_mapped / get_allocated_width below
-                        // (checked by gui_backend.rs after present returns)
-                        // reflect the actual server state, not stale values.
-                        if let (Some(get_disp), Some(disp_sync)) = (
-                            loader.symbols.gtk_widget_get_display,
-                            loader.symbols.gdk_display_sync,
-                        ) {
-                            let display = unsafe { get_disp(self.inner) };
-                            if !display.is_null() {
-                                unsafe { disp_sync(display); }
-                            }
-                        }
-
-                        // Phase 5: Fallback draw trigger via g_timeout_add.
-                        // This is COMPLETELY independent of the GTK4 frame clock
-                        // and works even on virtual displays (WSLg, Xvfb) where
-                        // the frame clock may not tick reliably.
-                        //
-                        // The approach: register a 1ms one-shot GLib timeout
-                        // that calls gtk_widget_queue_draw on the window.  The
-                        // queue_draw call itself schedules a frame clock tick
-                        // via gdk_surface_request_draw -> gdk_frame_clock_schedule_tick.
-                        // Even if gdk_frame_clock_begin_updating was not called
-                        // or had no effect, queue_draw triggers a SINGLE frame
-                        // clock tick, which is sufficient for the initial draw.
-                        //
-                        // We also call queue_draw on the window directly BEFORE
-                        // the timeout, as well as INSIDE the timeout callback,
-                        // providing two independent opportunities for the frame
-                        // clock to schedule a tick.
-                        if let Some(qd) = loader.symbols.gtk_widget_queue_draw {
-                            // Direct queue_draw (this also schedules a tick via
-                            // gdk_surface_request_draw on X11)
-                            unsafe { qd(self.inner); }
-                            // Schedule a timeout that fires after 1ms and calls
-                            // queue_draw again, as a backup.  The timeout
-                            // source works regardless of the frame clock state.
-                            type TimeoutAdd = unsafe extern "C" fn(
-                                u32,
-                                Option<unsafe extern "C" fn(*mut c_void) -> i32>,
-                                *mut c_void,
-                            ) -> u32;
-                            if let Ok(timeout_add) = unsafe {
-                                glib_lib.get::<TimeoutAdd>(b"g_timeout_add")
-                            } {
-                                let timeout_add = *timeout_add;
-                                struct TimeoutCtx {
-                                    win: *mut c_void,
-                                    qd: unsafe extern "C" fn(*mut c_void),
+                                for _ in 0..490 {
+                                    iter(std::ptr::null_mut(), 0);
                                 }
-                                extern "C" fn timeout_cb(data: *mut c_void) -> i32 {
-                                    unsafe {
-                                        let ctx = &*(data as *const TimeoutCtx);
-                                        (ctx.qd)(ctx.win);
-                                    }
-                                    0 // FALSE = one-shot, autoremove
-                                }
-                                let ctx = Box::into_raw(Box::new(TimeoutCtx {
-                                    win: self.inner,
-                                    qd,
-                                }));
-                                timeout_add(
-                                    1, // 1ms timeout
-                                    Some(timeout_cb),
-                                    ctx as *mut c_void,
-                                );
-                            }
-                            // Pump to process the timeout and the subsequent
-                            // frame clock tick.  500 blocking iterations should
-                            // be more than sufficient for a 1ms timeout + 16ms
-                            // frame clock interval.
-                            for _ in 0..500 {
-                                iter(std::ptr::null_mut(), 1);
                             }
                         }
                     }

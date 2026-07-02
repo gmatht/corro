@@ -134,6 +134,11 @@ macro_rules! common_types_mod {
             pub fn grab_focus(&self) { self.inner.grab_focus(); }
             pub fn set_can_focus(&self, can: bool) { self.inner.set_can_focus(can); }
             pub fn on_key_raw(&self, cb: Box<dyn FnMut(u32, u32) -> bool>) { self.inner.on_key_raw(cb); }
+            /// Force an immediate draw by rendering directly to the window
+            /// surface.  `fallback_w`/`fallback_h` are used when the platform
+            /// surface reports zero dimensions (the display server hasn't
+            /// configured the surface yet).  On non-GTK backends this is a no-op.
+            pub fn force_draw(&self, window_ptr: *mut std::os::raw::c_void, fallback_w: i32, fallback_h: i32) { self.inner.force_draw(window_ptr, fallback_w, fallback_h); }
         }
         impl Window {
             pub fn on_event(&self, cb: Box<dyn FnMut(*mut std::os::raw::c_void) -> i32>) { self.inner.on_event(cb); }

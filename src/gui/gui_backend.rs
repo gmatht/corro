@@ -648,17 +648,7 @@ fn start_edit_with(state: &GuiState, ch: char) {
         // First character: clear the formula entry so the default keyboard
         // handler (WM_CHAR on Windows, key-press-event on GTK) inserts
         // this character without doubling.
-        //
-        // Save edit_buf before set_text("") because the changed signal
-        // (connect_changed -> on_formula_entry_changed) will overwrite
-        // it with the entry's empty text.  Restore after so the first
-        // character isn't lost.  On NWG the character is later inserted
-        // by the default handler (on_key_raw returns false), triggering
-        // connect_changed again with the correct content.  On GTK with
-        // BUBBLE-phase window handler the same path applies.
-        let saved = state.edit_buf.borrow().clone();
         state.formula_entry.set_text("");
-        *state.edit_buf.borrow_mut() = saved;
         state.formula_entry.grab_focus();
     }
     state.canvas.queue_redraw();
@@ -667,6 +657,11 @@ fn start_edit_with(state: &GuiState, ch: char) {
 fn commit_edit(state: &GuiState) {
     state.editing.set(false);
     state.mode.set(GuiMode::Normal);
+    if let Some(text) = state.formula_entry.get_text() {
+        if !text.is_empty() {
+            *state.edit_buf.borrow_mut() = text;
+        }
+    }
     let val = state.edit_buf.borrow().clone();
     if !val.is_empty() {
         let app = unsafe { &mut *state.app };
@@ -1112,7 +1107,7 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     win.set_title(&format!("corro {}", env!("CARGO_PKG_VERSION")));
     win.set_default_size(1200, 800);
 
-    let vbox = rxapp.new_box(Orientation::Vertical, 0)?;
+    let mut vbox = rxapp.new_box(Orientation::Vertical, 0)?;
 
     // Fit column widths to rendered content
     corro_app.fit_main_columns_to_max_width();
@@ -1129,7 +1124,7 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     let data_cols = 12usize;
 
     // Formula bar
-    let formula_bar = rxapp.new_box(Orientation::Horizontal, 2)?;
+    let mut formula_bar = rxapp.new_box(Orientation::Horizontal, 2)?;
     let addr_label = rxapp.new_label("A1")?;
     let f_label = rxapp.new_label("  fx  ")?;
     let formula_entry = rxapp.new_entry()?;
@@ -1142,13 +1137,6 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // Canvas
     let canvas = rxapp.new_canvas()?;
     canvas.set_size_request(800, 600);
-    // On GTK4, the draw callback receives content_width × content_height.
-    // If content size is left at 0 (default), GtkDrawingArea skips the draw
-    // callback entirely on GTK 4.6+ (width ≤ 0 || height ≤ 0 guard).  Set a
-    // non-zero initial content size so the first frame clock tick invokes the
-    // draw callback.  The draw callback itself updates content_size to the
-    // actual allocated dimensions on every frame so window resizes are tracked.
-    canvas.set_content_size(800, 600);
     // Ensure the canvas can receive keyboard focus (needed after commit_edit
     // to return focus — GtkDrawingArea does not accept focus by default).
     canvas.set_can_focus(true);
@@ -1183,19 +1171,13 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     let menubar = build_menu(&rxapp, &win, &shared)?;
     vbox.append(&menubar);
 
-    // Keyboard (draw callback registered after present() below so the
-    // DrawingArea is realized before gtk_drawing_area_set_draw_func is called)
+    // Keyboard: canvas.on_key, win.on_event_key, etc.
     let shared_key = shared.clone();
     let alt_f_armed = Rc::new(Cell::new(false));
     canvas.on_key(Box::new(move |keyval: u32| -> bool {
         let ch = char::from_u32(keyval).unwrap_or('\0').to_ascii_lowercase();
-
         let s: &GuiState = &*shared_key;
-        if ch == 'q'
-            && (alt_f_armed.get()
-                || s.seq_alt_f.get()
-                || s.menu_nav.get() == MenuNavState::File)
-        {
+        if ch == 'q' && (alt_f_armed.get() || s.seq_alt_f.get() || s.menu_nav.get() == MenuNavState::File) {
             alt_f_armed.set(false);
             s.seq_alt_f.set(false);
             s.menu_nav.set(MenuNavState::Inactive);
@@ -1203,96 +1185,32 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
             save_before_quit(s);
             return true;
         }
-
-        if ch == 'f' {
-            alt_f_armed.set(true);
-            return handle_key(keyval, &shared_key);
-        }
-
-        if keyval == ALT_L || keyval == ALT_R {
-            return handle_key(keyval, &shared_key);
-        }
-
+        if ch == 'f' { alt_f_armed.set(true); return handle_key(keyval, &shared_key); }
+        if keyval == ALT_L || keyval == ALT_R { return handle_key(keyval, &shared_key); }
         alt_f_armed.set(false);
         handle_key(keyval, &shared_key)
     }));
 
     // Click
     let shared_click = shared.clone();
-    canvas.on_click(Box::new(move |x: f64, y: f64| {
-        handle_click(x, y, &shared_click);
-    }));
+    canvas.on_click(Box::new(move |x: f64, y: f64| { handle_click(x, y, &shared_click); }));
 
     // Formula entry change
     let shared_entry = shared.clone();
-    formula_entry.connect_changed(move || {
-        on_formula_entry_changed(&shared_entry);
-    })?;
+    formula_entry.connect_changed(move || { on_formula_entry_changed(&shared_entry); })?;
 
-    // Window-level event interception.  Handles Alt-F+Q quit sequence
-    // before the menu bar's mnemonic accelerator can steal keystrokes.
-    // Also provides a fallback for editing keys (RETURN, ESCAPE, arrows,
-    // printable characters) when no child widget has keyboard focus.
-    // On non-GTK backends `on_event_key` is a no-op.
-    {
-        let state_w = shared.clone();
-        win.on_event_key(Box::new(move |keyval: u32, state: u32| -> i32 {
-            let s: &GuiState = &*state_w;
-            let alt_held = (state & 0x8) != 0;
-            if alt_held || keyval == ALT_L || keyval == ALT_R {
-                s.alt_active.set(true);
-            }
-            if keyval == ALT_L || keyval == ALT_R {
-                return 1;
-            }
-            let ch = char::from_u32(keyval).unwrap_or('\0').to_ascii_lowercase();
-            if (state & 0x4) != 0 && ch == 'q' {
-                s.seq_alt_f.set(false);
-                save_before_quit(s);
-                return 1;
-            }
-            if (alt_held || s.alt_active.get()) && ch == 'f' {
-                s.menu_nav.set(MenuNavState::File);
-                s.seq_alt_f.set(true);
-                s.alt_active.set(false);
-                return 1;
-            }
-            if !s.editing.get() && ch == 'f' {
-                s.menu_nav.set(MenuNavState::File);
-                s.seq_alt_f.set(true);
-                s.alt_active.set(false);
-                return 1;
-            }
-            if ch == 'q'
-                && (s.menu_nav.get() == MenuNavState::File
-                    || s.seq_alt_f.get())
-            {
-                save_before_quit(s);
-                return 1;
-            }
-            if !alt_held {
-                s.alt_active.set(false);
-                s.seq_alt_f.set(false);
-            }
-            // Fallback: if this key reached the window level (no child widget
-            // with focus handled it), process editing keys here.  This is
-            // critical when grab_focus() on the formula entry silently fails
-            // because the widget isn't mapped yet (e.g. slow WSL compositor).
-            if handle_key(keyval, &state_w) { 1 } else { 0 }
-        }));
-    }
+    // NOTE: win.on_event_key REMOVED — creates an EventControllerKey without
+    // storing it, causing a segfault during gtk_window_present.  Canvas-level
+    // on_key handles most keys; if window-level fallback is needed later, the
+    // controller must be stored in a _controllers field on the Window struct.
 
-    // Register save-before-quit on window close (WM_CLOSE on NWG).
-    // This ensures the replayer tests that use WM_CLOSE (instead of
-    // Alt+F+Q) still commit pending edits to the output file.
+    // Register save-before-quit on close
     {
         let state_c = shared.clone();
-        win.on_close(Box::new(move || {
-            save_before_quit(&*state_c);
-        }));
+        win.on_close(Box::new(move || { save_before_quit(&*state_c); }));
     }
 
-    // Intercept Enter/Escape from formula entry during editing
+    // Intercept Enter/Escape from formula entry
     {
         let shared_k = shared.clone();
         let shared_k_cnt = shared.clone();
@@ -1301,16 +1219,10 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
             shared_k_cnt.last_key.set(keyval);
             let k = normalize(keyval);
             match k {
-                RETURN | ESCAPE | TAB | LEFT | RIGHT | UP | DOWN
-                | HOME | END | PAGE_UP | PAGE_DOWN => {
+                RETURN | ESCAPE | TAB | LEFT | RIGHT | UP | DOWN | HOME | END | PAGE_UP | PAGE_DOWN => {
                     handle_key(keyval, &shared_k);
                     true
                 }
-                // Printable characters: start editing if needed, but return
-                // false so the default handler inserts the character via
-                // WM_CHAR (Windows) or key-press-event default (GTK).
-                // This avoids doubling when start_edit_with clears the
-                // entry and the default handler inserts the same char.
                 _ if (32..=126).contains(&k) => {
                     handle_key(keyval, &shared_k);
                     false
@@ -1320,7 +1232,7 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         }));
     }
 
-    // Assemble layout
+// Assemble layout
     vbox.append(&formula_bar);
     vbox.append(&canvas);
     vbox.set_child_vexpand(&canvas, true);
@@ -1339,16 +1251,11 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // data and works correctly whether the DrawingArea is realized or not;
     // the callback is invoked on the first frame clock tick after realization.
     let shared_draw = shared.clone();
-    let canvas_draw = canvas.clone();
     eprintln!("PHASE: before_set_draw_callback");
     let _ = std::fs::write("/tmp/gui_setup_phase1.txt", "before_set_draw_callback\n");
     canvas.set_draw_callback(Box::new(move |dc: &mut dyn DrawContext, w: i32, h: i32| {
         eprintln!("DRAW_CALLBACK called: w={} h={}", w, h);
         let _ = std::fs::write("/tmp/dim.txt", format!("{} {}\n", w, h));
-        // Update content size to actual dimensions so GtkDrawingArea's draw
-        // guard (width ≤ 0 || height ≤ 0) passes on every subsequent frame
-        // and window resizes are reflected correctly.
-        canvas_draw.set_content_size(w, h);
         render_grid(dc, &shared_draw, w, h);
     }));
     eprintln!("PHASE: after_set_draw_callback");
@@ -1366,12 +1273,6 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // frame clock is armed before the start_edit() canvas queue_redraw.
     win.queue_redraw();
 
-    // Also queue a redraw on the canvas explicitly.  On GTK4 the
-    // window-level queue_draw cascades, but marking the canvas
-    // directly ensures the DrawingArea's draw func is scheduled
-    // independently, providing redundancy if the cascade is slow.
-    canvas.queue_redraw();
-
     // Start editing at A1: grab_focus on the formula entry.
     // The draw callback was already registered before present(),
     // so the initial frame clock tick inside present() draws the grid.
@@ -1382,17 +1283,6 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // change (from grab_focus) BEFORE the main loop starts.  This
     // prevents WINDOW_DRAWN=false on slow virtual displays where the
     // frame clock timer hasn't fired yet.
-    rxapp.pump_events(500);
-
-    // Second safety net: queue another redraw + pump cycle to cover the
-    // case where the frame clock tick processed by pump_events above was
-    // consumed by the Phase 4 tick (inside present()) and the next tick
-    // hasn't fired yet by the time pump_events returns.  By queueing a
-    // fresh redraw and pumping again, we give the frame clock a second
-    // opportunity to process the canvas draw callback before the main
-    // loop starts.
-    win.queue_redraw();
-    canvas.queue_redraw();
     rxapp.pump_events(500);
 
     rxapp.run()?;

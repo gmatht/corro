@@ -1317,6 +1317,7 @@ mod nwg_adapter {
             unsafe { winapi::um::winuser::SetFocus(self.hwnd as _); }
         }
         pub fn set_can_focus(&self, _can: bool) {}
+        pub fn force_draw(&self, _window_ptr: *mut c_void, _fallback_w: i32, _fallback_h: i32) {}
     }
 
     impl Clone for Canvas {

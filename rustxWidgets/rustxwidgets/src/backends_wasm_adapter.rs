@@ -1601,6 +1601,7 @@ impl SimpleAction {
             let _ = self.elem.focus();
         }
         pub fn set_can_focus(&self, _can: bool) {}
+        pub fn force_draw(&self, _window_ptr: *mut c_void, _fallback_w: i32, _fallback_h: i32) {}
     }
 
     pub fn create_canvas() -> Result<Canvas, Error> {
