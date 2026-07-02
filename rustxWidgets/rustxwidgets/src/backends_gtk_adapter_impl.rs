@@ -7,9 +7,12 @@ mod gtk_adapter {
     use crate::core::{Error, Widget};
     use gtk_dynamic_loader::{Window as GWindow, Button as GButton, Label as GLabel, BoxWidget as GBox, Grid as GGrid, Entry as GEntry, Dialog as GDialog, DropDown as GDropDown, CheckButton as GCheckButton, RadioButton as GRadioButton, TextView as GTextView, ScrolledWindow as GScrolledWindow};
 
-    /// A thin transparent wrapper around gtk_compat::Window
-    #[repr(transparent)]
-    pub struct Window(pub GWindow);
+    /// Window wrapper around gtk_compat::Window.
+    /// Stores event controllers in _controllers so that on_event_key
+    /// (which adds a GtkEventControllerKey to the window) keeps the
+    /// Rust-side wrapper alive.  Without this the controller is dropped
+    /// while still owned by the window, causing a segfault later.
+    pub struct Window(pub GWindow, pub Rc<RefCell<Vec<Box<dyn std::any::Any>>>>);
 
     impl Widget for Window {
         fn raw_handle(&self) -> *mut c_void { *self.0.as_ref() }
@@ -17,7 +20,7 @@ mod gtk_adapter {
 
     impl AsRef<*mut c_void> for Window { fn as_ref(&self) -> &*mut c_void { self.0.as_ref() } }
 
-    impl Clone for Window { fn clone(&self) -> Self { Window(self.0.clone()) } }
+    impl Clone for Window { fn clone(&self) -> Self { Window(self.0.clone(), self.1.clone()) } }
 
     impl Window {
         pub fn set_title(&self, title: &str) {
@@ -104,24 +107,16 @@ mod gtk_adapter {
                     let is_gtk4 = l.symbols.gtk_drawing_area_set_draw_func.is_some();
                     if is_gtk4 {
                         if let Ok(ctrl) = gtk_dynamic_loader::EventControllerKey::new(l.clone()) {
-                            // Use default BUBBLE propagation phase so the focused
-                            // child widget (formula entry, canvas) processes keys
-                            // first.  This controller acts as a genuine fallback
-                            // for keys the focused widget doesn't consume.
-                            //
-                            // CAPTURE phase causes a critical data-loss bug:
-                            // start_edit_with() calls set_text("") on the entry
-                            // which triggers connect_changed -> on_formula_entry_changed
-                            // overwrites edit_buf with "".  On NWG the character
-                            // is then inserted by the default handler (returns false),
-                            // restoring edit_buf via connect_changed.  But with
-                            // CAPTURE the window returns GDK_EVENT_STOP (1), the
-                            // character never reaches the entry, and the first
-                            // keystroke's content is permanently lost.
                             let _ = ctrl.connect_key_pressed(Box::new(move |keyval: u32, state: u32| -> i32 {
                                 cb(keyval, state)
                             }));
                             ctrl.add_to_widget(&self.0);
+                            // Store the controller so it stays alive as long as the Window does.
+                            // Without this, the Rust wrapper's Drop calls g_object_unref,
+                            // which — even though the widget also owns a ref — interacts
+                            // badly with GTK's widget-tree walk during gtk_window_present,
+                            // causing a segfault in g_type_check_instance_is_a.
+                            self.1.borrow_mut().push(Box::new(ctrl));
                         }
                     } else {
                         unsafe {
@@ -354,7 +349,7 @@ mod gtk_adapter {
     // Factories delegate to backend so they share the App-owned loader
     pub fn create_window() -> Result<Window, Error> {
         let gw = crate::backends::gtk::create_window().map_err(|e| Error::Backend(format!("{}", e)))?;
-        Ok(Window(gw))
+        Ok(Window(gw, Rc::new(RefCell::new(Vec::new()))))
     }
 
     pub fn create_button(label: &str) -> Result<Button, Error> {

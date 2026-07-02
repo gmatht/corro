@@ -1199,10 +1199,25 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     let shared_entry = shared.clone();
     formula_entry.connect_changed(move || { on_formula_entry_changed(&shared_entry); })?;
 
-    // NOTE: win.on_event_key REMOVED — creates an EventControllerKey without
-    // storing it, causing a segfault during gtk_window_present.  Canvas-level
-    // on_key handles most keys; if window-level fallback is needed later, the
-    // controller must be stored in a _controllers field on the Window struct.
+    // Window-level event interception: fallback for keys that escape the
+    // focused widget.  The EventControllerKey is now stored in Window's
+    // _controllers field so it stays alive.
+    {
+        let state_w = shared.clone();
+        win.on_event_key(Box::new(move |keyval: u32, state: u32| -> i32 {
+            let s: &GuiState = &*state_w;
+            let alt_held = (state & 0x8) != 0;
+            if alt_held || keyval == ALT_L || keyval == ALT_R { s.alt_active.set(true); }
+            if keyval == ALT_L || keyval == ALT_R { return 1; }
+            let ch = char::from_u32(keyval).unwrap_or('\0').to_ascii_lowercase();
+            if (state & 0x4) != 0 && ch == 'q' { s.seq_alt_f.set(false); save_before_quit(s); return 1; }
+            if (alt_held || s.alt_active.get()) && ch == 'f' { s.menu_nav.set(MenuNavState::File); s.seq_alt_f.set(true); s.alt_active.set(false); return 1; }
+            if !s.editing.get() && ch == 'f' { s.menu_nav.set(MenuNavState::File); s.seq_alt_f.set(true); s.alt_active.set(false); return 1; }
+            if ch == 'q' && (s.menu_nav.get() == MenuNavState::File || s.seq_alt_f.get()) { save_before_quit(s); return 1; }
+            if !alt_held { s.alt_active.set(false); s.seq_alt_f.set(false); }
+            if handle_key(keyval, &state_w) { 1 } else { 0 }
+        }));
+    }
 
     // Register save-before-quit on close
     {
