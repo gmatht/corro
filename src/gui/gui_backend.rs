@@ -1134,60 +1134,11 @@ fn on_formula_entry_changed(state: &GuiState) {
 }
 
 // ---------------------------------------------------------------------------
-// SIGABRT handler — prints backtrace on GTK assertion failures
-// ---------------------------------------------------------------------------
-
-extern "C" fn sigabrt_handler(_sig: i32) {
-    unsafe {
-        libc::write(libc::STDERR_FILENO, b"\nSIGABRT\n".as_ptr() as *const libc::c_void, 9);
-        write_backtrace();
-        libc::signal(libc::SIGABRT, libc::SIG_DFL);
-        libc::raise(libc::SIGABRT);
-    }
-}
-
-extern "C" fn sigsegv_handler(_sig: i32) {
-    unsafe {
-        libc::write(libc::STDERR_FILENO, b"\nSIGSEGV\n".as_ptr() as *const libc::c_void, 9);
-        write_backtrace();
-        libc::signal(libc::SIGSEGV, libc::SIG_DFL);
-        libc::raise(libc::SIGSEGV);
-    }
-}
-
-unsafe fn write_backtrace() {
-    const SIZE: usize = 128;
-    let mut buf: [*mut libc::c_void; SIZE] = std::mem::zeroed();
-    libc::write(libc::STDERR_FILENO, b"===== backtrace =====\n".as_ptr() as *const libc::c_void, 22);
-    let n = libc::backtrace(buf.as_mut_ptr(), SIZE as i32);
-    for i in 0..n.min(SIZE as i32) {
-        let addr = buf[i as usize] as usize;
-        if addr == 0 { break; }
-        let mut hex = [0u8; 19];
-        hex[0] = b' '; hex[1] = b' '; hex[18] = b'\n';
-        let mut v = addr;
-        let mut pos = 17;
-        loop {
-            hex[pos] = b"0123456789abcdef"[v & 0xf];
-            v >>= 4;
-            if v == 0 || pos == 1 { break; }
-            pos -= 1;
-        }
-        libc::write(libc::STDERR_FILENO, hex.as_ptr() as *const libc::c_void, 19);
-    }
-    libc::write(libc::STDERR_FILENO, b"===== end backtrace =====\n".as_ptr() as *const libc::c_void, 27);
-}
-
-// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
 pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Error>> {
-    // Install SIGABRT and SIGSEGV handlers that print a backtrace
-    unsafe {
-        libc::signal(libc::SIGABRT, sigabrt_handler as *const () as usize);
-        libc::signal(libc::SIGSEGV, sigsegv_handler as *const () as usize);
-    }
+    rustxwidgets::core::install_debug_crash_handlers();
     let rxapp = rustxwidgets::App::init()
         .map_err(|e| format!("GUI init failed: {e}"))?;
 
@@ -1299,9 +1250,8 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
             let s: &GuiState = &*state_w;
             s.key_counter.set(s.key_counter.get() + 1);
 
-            let _ = std::fs::write(KEYLOG_PATH,
-                format!("WINDOW_KEY: keyval={keyval} state={state} key_counter={}\n",
-                    s.key_counter.get()));
+            append_keylog(&format!("WINDOW_KEY: keyval={keyval} state={state} key_counter={}\n",
+                s.key_counter.get()));
 
             // Propagate ALT key itself so GTK shows mnemonic hints
             if keyval == ALT_L || keyval == ALT_R {
@@ -1334,12 +1284,24 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                 return 0;
             }
 
+            // Check whether the entry already processed this printable
+            // character.  On GTK4 BUBBLE phase, the entry's on_key_raw
+            // fires first (line ~1405), calls handle_key, and sets
+            // entry_processed_key=true.  Without this guard the window
+            // handler would call handle_key again, doubling the character
+            // in edit_buf ("4422" instead of "42").  This is the fix
+            // described in Attempt 195 of the idea log.
+            let nk = normalize(keyval);
+            if (32..=126).contains(&nk) && s.entry_processed_key.get() {
+                s.entry_processed_key.set(false);
+                return 0;
+            }
+
             // Safety net for RETURN: if editing is false but the formula entry
             // has text or edit_buf has content (e.g., from CAPTURE-phase key
             // processing on GTK where the entry widget never received the key),
             // set editing=true before delegating to handle_key so the edit is
             // committed instead of moving the cursor.
-            let nk = normalize(keyval);
             if nk == RETURN && !s.editing.get() {
                 let text = s.formula_entry.get_text().unwrap_or_default();
                 if !text.is_empty() || !s.edit_buf.borrow().is_empty() {
@@ -1492,6 +1454,9 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
 
     // Pre-create the main loop so quit_main_loop finds a valid pointer
     // even if the user clicks Quit during the warm-up phase below.
+    // The GtkApp::run() creates a fresh loop, so this pre-created loop
+    // is only used if quit happens before run() starts.
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
     if let Some(loader) = rustxwidgets::backends::gtk::loader() {
         if let Some(loop_new) = loader.symbols.g_main_loop_new {
             let early_loop = unsafe { loop_new(std::ptr::null_mut(), 0) };

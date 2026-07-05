@@ -31,22 +31,21 @@ mod gtk_backend {
         fn run(self: Box<Self>) -> Result<(), Box<dyn StdError + Send + Sync>> {
             let symbols = &self.loader.symbols;
             let loop_run = symbols.g_main_loop_run.ok_or("missing g_main_loop_run")?;
-            // Use pre-created loop if available (from gui_backend warm-up).
-            let loop_ptr = {
-                let mut guard = self.loader.main_loop.lock().unwrap();
-                if *guard != 0 {
-                    *guard as *mut std::ffi::c_void
-                } else {
-                    let loop_new = symbols.g_main_loop_new.ok_or("missing g_main_loop_new")?;
-                    let ptr = unsafe { loop_new(std::ptr::null_mut(), 0) };
-                    *guard = ptr as usize;
-                    ptr
-                }
-            };
+            // Always create a fresh main loop here.  The pre-created loop
+            // (from gui_backend warm-up) may have had quit_main_loop called
+            // on it before run() — reusing a quit loop causes g_main_loop_run
+            // to return immediately without processing any events, producing
+            // WINDOW_DRAWN=true but no output because keystrokes are never
+            // dispatched.  Creating a fresh loop avoids this entirely.
+            let loop_new = symbols.g_main_loop_new.ok_or("missing g_main_loop_new")?;
+            let loop_ptr = unsafe { loop_new(std::ptr::null_mut(), 0) };
             if loop_ptr.is_null() {
                 return Err("g_main_loop_new returned null".into());
             }
+            // Update both MAIN_LOOP and loader.main_loop so quit_main_loop
+            // finds this fresh loop regardless of when it's called.
             MAIN_LOOP.store(loop_ptr as usize, Ordering::SeqCst);
+            *self.loader.main_loop.lock().unwrap() = loop_ptr as usize;
             unsafe { loop_run(loop_ptr); }
             Ok(())
         }

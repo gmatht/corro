@@ -1944,6 +1944,12 @@ mod nwg_adapter {
         }
     }
 
+    impl MenuBar {
+        pub fn activate_submenu_by_mnemonic(&self, _keyval: u32) -> bool { false }
+        pub fn activate_submenu_item_by_mnemonic(&self, _keyval: u32) -> bool { false }
+        pub unsafe fn insert_action_group(&self, _name: &str, _group_ptr: *mut c_void) {}
+    }
+
     /// Recursively build NWG menu items, recording the (hmenu, index)→action mapping.
     /// Collectors `menus` and `items` keep the NWG objects alive (else Drop destroys them).
     fn build_and_index(

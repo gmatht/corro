@@ -84,6 +84,66 @@ use std::collections::HashMap;
 use std::os::raw::c_void;
 use std::rc::Rc;
 
+/// Install SIGABRT and SIGSEGV handlers that print a backtrace
+/// to stderr, then re-raise with the default handler.
+/// On non-Unix platforms this is a no-op.
+pub fn install_debug_crash_handlers() {
+    #[cfg(unix)]
+    unsafe {
+        extern "C" fn sigabrt_handler(_sig: i32) {
+            unsafe {
+                write_stderr(b"\nSIGABRT\n");
+                write_backtrace_to_stderr();
+                libc::signal(libc::SIGABRT, libc::SIG_DFL);
+                libc::raise(libc::SIGABRT);
+            }
+        }
+        extern "C" fn sigsegv_handler(_sig: i32) {
+            unsafe {
+                write_stderr(b"\nSIGSEGV\n");
+                write_backtrace_to_stderr();
+                libc::signal(libc::SIGSEGV, libc::SIG_DFL);
+                libc::raise(libc::SIGSEGV);
+            }
+        }
+        libc::signal(libc::SIGABRT, sigabrt_handler as *const () as usize);
+        libc::signal(libc::SIGSEGV, sigsegv_handler as *const () as usize);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = ();
+    }
+}
+
+#[cfg(unix)]
+unsafe fn write_stderr(msg: &[u8]) {
+    libc::write(libc::STDERR_FILENO, msg.as_ptr() as *const libc::c_void, msg.len());
+}
+
+#[cfg(unix)]
+unsafe fn write_backtrace_to_stderr() {
+    const SIZE: usize = 128;
+    let mut buf: [*mut libc::c_void; SIZE] = std::mem::zeroed();
+    write_stderr(b"===== backtrace =====\n");
+    let n = libc::backtrace(buf.as_mut_ptr(), SIZE as i32);
+    for i in 0..n.min(SIZE as i32) {
+        let addr = buf[i as usize] as usize;
+        if addr == 0 { break; }
+        let mut hex = [0u8; 19];
+        hex[0] = b' '; hex[1] = b' '; hex[18] = b'\n';
+        let mut v = addr;
+        let mut pos = 17;
+        loop {
+            hex[pos] = b"0123456789abcdef"[v & 0xf];
+            v >>= 4;
+            if v == 0 || pos == 1 { break; }
+            pos -= 1;
+        }
+        write_stderr(&hex);
+    }
+    write_stderr(b"===== end backtrace =====\n");
+}
+
 /// Detect terminal size. On Unix uses `ioctl(TIOCGWINSZ)`;
 /// on Windows uses `GetConsoleScreenBufferInfo`.
 pub fn terminal_size() -> Option<(usize, usize)> {
