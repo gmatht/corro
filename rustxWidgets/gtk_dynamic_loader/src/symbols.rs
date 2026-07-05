@@ -59,6 +59,7 @@ pub type GtkPopoverMenuBarNewFromModel = unsafe extern "C" fn(model: *mut c_void
 pub type GtkMenuBarNew = unsafe extern "C" fn() -> *mut c_void;
 pub type GtkMenuNew = unsafe extern "C" fn() -> *mut c_void;
 pub type GtkMenuItemNewWithLabel = unsafe extern "C" fn(label: *const i8) -> *mut c_void;
+pub type GtkMenuItemNewWithMnemonic = unsafe extern "C" fn(label: *const i8) -> *mut c_void;
 pub type GtkMenuShellAppend = unsafe extern "C" fn(shell: *mut c_void, child: *mut c_void);
 pub type GtkMenuItemSetSubmenu = unsafe extern "C" fn(item: *mut c_void, submenu: *mut c_void);
 pub type GtkWindowSetApplication = unsafe extern "C" fn(window: *mut c_void, application: *mut c_void);
@@ -104,6 +105,28 @@ pub type GtkWidgetGetAllocatedWidth = unsafe extern "C" fn(widget: *mut c_void) 
 pub type GtkWidgetGetAllocatedHeight = unsafe extern "C" fn(widget: *mut c_void) -> i32;
 pub type GtkWidgetGetMapped = unsafe extern "C" fn(widget: *mut c_void) -> i32;
 pub type GtkWidgetGetDisplay = unsafe extern "C" fn(widget: *mut c_void) -> *mut c_void;
+
+// GtkPopoverMenuBarItem — get the popover from a bar item
+pub type GtkPopoverMenuBarItemGetPopover = unsafe extern "C" fn(item: *mut c_void) -> *mut c_void;
+// GtkPopover — get/set child widget
+pub type GtkPopoverGetChild = unsafe extern "C" fn(popover: *mut c_void) -> *mut c_void;
+pub type GtkPopoverNew = unsafe extern "C" fn() -> *mut c_void;
+pub type GtkPopoverSetChild = unsafe extern "C" fn(popover: *mut c_void, child: *mut c_void);
+
+// GtkMenuButton — for manual menu bar construction
+pub type GtkMenuButtonNew = unsafe extern "C" fn() -> *mut c_void;
+pub type GtkMenuButtonSetPopover = unsafe extern "C" fn(button: *mut c_void, popover: *mut c_void);
+pub type GtkMenuButtonSetLabel = unsafe extern "C" fn(button: *mut c_void, label: *const i8);
+pub type GtkMenuButtonGetPopover = unsafe extern "C" fn(button: *mut c_void) -> *mut c_void;
+pub type GtkMenuButtonSetHasFrame = unsafe extern "C" fn(button: *mut c_void, has_frame: i32);
+pub type GtkMenuButtonSetPrimary = unsafe extern "C" fn(button: *mut c_void, primary: i32);
+pub type GtkButtonSetHasFrame = unsafe extern "C" fn(button: *mut c_void, has_frame: i32);
+pub type GtkWidgetAddCssClass = unsafe extern "C" fn(widget: *mut c_void, css_class: *const i8);
+
+
+
+// GtkPopoverMenu — new from model (submenu-level)
+pub type GtkPopoverMenuNewFromModel = unsafe extern "C" fn(model: *mut c_void) -> *mut c_void;
 
 // Display sync — flushes pending display requests and waits for server round-trip
 pub type GdkDisplaySync = unsafe extern "C" fn(display: *mut c_void);
@@ -164,6 +187,23 @@ pub type GtkEditableSetPosition = unsafe extern "C" fn(editable: *mut c_void, po
 // GtkWidget parent handling
 pub type GtkWidgetUnparent = unsafe extern "C" fn(widget: *mut c_void);
 pub type GtkWidgetGetParent = unsafe extern "C" fn(widget: *mut c_void) -> *mut c_void;
+
+// GtkWidget tree traversal
+pub type GtkWidgetGetFirstChild = unsafe extern "C" fn(widget: *mut c_void) -> *mut c_void;
+pub type GtkWidgetGetNextSibling = unsafe extern "C" fn(widget: *mut c_void) -> *mut c_void;
+
+// GtkWidget activate (triggers the default action, e.g. opening a submenu popover)
+pub type GtkWidgetActivate = unsafe extern "C" fn(widget: *mut c_void);
+
+// GtkWidget get_visible — checks the widget's visible flag
+pub type GtkWidgetGetVisible = unsafe extern "C" fn(widget: *mut c_void) -> i32;
+
+// GtkWidget activate_action — activates a named action on a widget
+pub type GtkWidgetActivateAction = unsafe extern "C" fn(widget: *mut c_void, detailed_name: *const i8, parameter: *mut c_void);
+
+// GtkMenuButton (GTK4 submenu opener)
+pub type GtkMenuButtonGetLabel = unsafe extern "C" fn(button: *mut c_void) -> *const i8;
+pub type GtkMenuButtonSetActive = unsafe extern "C" fn(button: *mut c_void, active: i32);
 
 // GtkWindow default size
 pub type GtkWindowSetDefaultSize = unsafe extern "C" fn(window: *mut c_void, width: i32, height: i32);
@@ -291,6 +331,9 @@ pub struct Symbols {
     pub gtk_widget_set_margin_start: Option<GtkWidgetSetMarginStart>,
     pub gtk_widget_set_margin_top: Option<GtkWidgetSetMarginTop>,
     pub gtk_widget_add_events: Option<GtkWidgetAddEvents>,
+    pub gtk_widget_activate: Option<GtkWidgetActivate>,
+    pub gtk_widget_get_visible: Option<GtkWidgetGetVisible>,
+    pub gtk_widget_activate_action: Option<GtkWidgetActivateAction>,
     pub gtk_file_chooser_native_new: Option<GtkFileChooserNativeNew>,
     pub gtk_native_dialog_run: Option<GtkNativeDialogRun>,
     pub gtk_file_chooser_get_filename: Option<GtkFileChooserGetFilename>,
@@ -322,6 +365,7 @@ pub struct Symbols {
     pub gtk_menu_bar_new: Option<GtkMenuBarNew>,
     pub gtk_menu_new: Option<GtkMenuNew>,
     pub gtk_menu_item_new_with_label: Option<GtkMenuItemNewWithLabel>,
+    pub gtk_menu_item_new_with_mnemonic: Option<GtkMenuItemNewWithMnemonic>,
     pub gtk_menu_shell_append: Option<GtkMenuShellAppend>,
     pub gtk_menu_item_set_submenu: Option<GtkMenuItemSetSubmenu>,
     pub gtk_init: Option<GtkInit>,
@@ -435,6 +479,34 @@ pub struct Symbols {
     pub gtk_widget_unparent: Option<GtkWidgetUnparent>,
     pub gtk_widget_get_parent: Option<GtkWidgetGetParent>,
 
+    // GtkWidget tree traversal
+    pub gtk_widget_get_first_child: Option<GtkWidgetGetFirstChild>,
+    pub gtk_widget_get_next_sibling: Option<GtkWidgetGetNextSibling>,
+
+    // GtkPopoverMenuBarItem
+    pub gtk_popover_menu_bar_item_get_popover: Option<GtkPopoverMenuBarItemGetPopover>,
+    // GtkPopover
+    pub gtk_popover_get_child: Option<GtkPopoverGetChild>,
+    pub gtk_popover_new: Option<GtkPopoverNew>,
+    pub gtk_popover_set_child: Option<GtkPopoverSetChild>,
+
+    // GtkMenuButton — manual menu bar construction
+    pub gtk_menu_button_new: Option<GtkMenuButtonNew>,
+    pub gtk_menu_button_set_popover: Option<GtkMenuButtonSetPopover>,
+    pub gtk_menu_button_set_label: Option<GtkMenuButtonSetLabel>,
+        pub gtk_menu_button_set_has_frame: Option<GtkMenuButtonSetHasFrame>,
+    pub gtk_menu_button_set_primary: Option<GtkMenuButtonSetPrimary>,
+    pub gtk_button_set_has_frame: Option<GtkButtonSetHasFrame>,
+    pub gtk_widget_add_css_class: Option<GtkWidgetAddCssClass>,
+    pub gtk_menu_button_get_popover: Option<GtkMenuButtonGetPopover>,
+
+    // GtkPopoverMenu — new from model
+    pub gtk_popover_menu_new_from_model: Option<GtkPopoverMenuNewFromModel>,
+
+    // GtkMenuButton
+    pub gtk_menu_button_get_label: Option<GtkMenuButtonGetLabel>,
+    pub gtk_menu_button_set_active: Option<GtkMenuButtonSetActive>,
+
     // GtkWindow default size
     pub gtk_window_set_default_size: Option<GtkWindowSetDefaultSize>,
 
@@ -467,6 +539,10 @@ pub struct Symbols {
 }
 
 impl Symbols {
+    pub fn empty() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
+
     pub fn load(libs: &std::collections::HashMap<String, std::sync::Arc<Library>>) -> Result<Self, Error> {
         // helper to lookup in libgtk first then glib/gobject as appropriate
         let gtk = libs.get("libgtk").expect("libgtk missing");
@@ -553,6 +629,9 @@ impl Symbols {
         let gtk_widget_set_margin_start = unsafe { sym::<GtkWidgetSetMarginStart>(gtk, "gtk_widget_set_margin_start") };
         let gtk_widget_set_margin_top = unsafe { sym::<GtkWidgetSetMarginTop>(gtk, "gtk_widget_set_margin_top") };
         let gtk_widget_add_events = unsafe { sym::<GtkWidgetAddEvents>(gtk, "gtk_widget_add_events") };
+        let gtk_widget_activate = unsafe { sym::<GtkWidgetActivate>(gtk, "gtk_widget_activate") };
+        let gtk_widget_get_visible = unsafe { sym::<GtkWidgetGetVisible>(gtk, "gtk_widget_get_visible") };
+        let gtk_widget_activate_action = unsafe { sym::<GtkWidgetActivateAction>(gtk, "gtk_widget_activate_action") };
         let gtk_init = unsafe { sym::<GtkInit>(gtk, "gtk_init") };
         let g_signal_emit_by_name = unsafe { sym::<GSignalEmitByName>(gobject, "g_signal_emit_by_name") };
         let g_idle_add = unsafe { sym::<unsafe extern "C" fn(func: Option<unsafe extern "C" fn(*mut c_void) -> i32>, data: *mut c_void) -> u32>(glib, "g_idle_add") };
@@ -599,7 +678,6 @@ impl Symbols {
         let gtk_event_controller_focus_new = unsafe { sym::<GtkEventControllerFocusNew>(gtk, "gtk_event_controller_focus_new") };
         let gtk_widget_add_controller = unsafe { sym::<GtkWidgetAddController>(gtk, "gtk_widget_add_controller") };
         let gtk_event_controller_set_propagation_phase = unsafe { sym::<GtkEventControllerSetPropagationPhase>(gtk, "gtk_event_controller_set_propagation_phase") };
-        let gtk_widget_set_can_target = unsafe { sym::<GtkWidgetSetCanTarget>(gtk, "gtk_widget_set_can_target") };
         let gtk_widget_set_halign = unsafe { sym::<GtkWidgetSetHalign>(gtk, "gtk_widget_set_halign") };
         let gtk_widget_set_valign = unsafe { sym::<GtkWidgetSetValign>(gtk, "gtk_widget_set_valign") };
         let gtk_widget_get_allocated_width = unsafe { sym::<GtkWidgetGetAllocatedWidth>(gtk, "gtk_widget_get_allocated_width") };
@@ -638,6 +716,7 @@ impl Symbols {
         let gtk_menu_bar_new = unsafe { sym::<GtkMenuBarNew>(gtk, "gtk_menu_bar_new") };
         let gtk_menu_new = unsafe { sym::<GtkMenuNew>(gtk, "gtk_menu_new") };
         let gtk_menu_item_new_with_label = unsafe { sym::<GtkMenuItemNewWithLabel>(gtk, "gtk_menu_item_new_with_label") };
+        let gtk_menu_item_new_with_mnemonic = unsafe { sym::<GtkMenuItemNewWithMnemonic>(gtk, "gtk_menu_item_new_with_mnemonic") };
         let gtk_menu_shell_append = unsafe { sym::<GtkMenuShellAppend>(gtk, "gtk_menu_shell_append") };
         let gtk_menu_item_set_submenu = unsafe { sym::<GtkMenuItemSetSubmenu>(gtk, "gtk_menu_item_set_submenu") };
         let gtk_window_set_application = unsafe { sym::<GtkWindowSetApplication>(gtk, "gtk_window_set_application") };
@@ -706,6 +785,35 @@ impl Symbols {
         let gtk_widget_unparent = unsafe { sym::<GtkWidgetUnparent>(gtk, "gtk_widget_unparent") };
         let gtk_widget_get_parent = unsafe { sym::<GtkWidgetGetParent>(gtk, "gtk_widget_get_parent") };
 
+        // GtkWidget tree traversal
+        let gtk_widget_get_first_child = unsafe { sym::<GtkWidgetGetFirstChild>(gtk, "gtk_widget_get_first_child") };
+        let gtk_widget_get_next_sibling = unsafe { sym::<GtkWidgetGetNextSibling>(gtk, "gtk_widget_get_next_sibling") };
+
+        // GtkPopoverMenuBarItem
+        let gtk_popover_menu_bar_item_get_popover = unsafe { sym::<GtkPopoverMenuBarItemGetPopover>(gtk, "gtk_popover_menu_bar_item_get_popover") };
+        // GtkPopover
+        let gtk_popover_get_child = unsafe { sym::<GtkPopoverGetChild>(gtk, "gtk_popover_get_child") };
+        let gtk_popover_new = unsafe { sym::<GtkPopoverNew>(gtk, "gtk_popover_new") };
+        let gtk_popover_set_child = unsafe { sym::<GtkPopoverSetChild>(gtk, "gtk_popover_set_child") };
+
+        // GtkMenuButton — manual menu bar construction
+        let gtk_menu_button_new = unsafe { sym::<GtkMenuButtonNew>(gtk, "gtk_menu_button_new") };
+        let gtk_menu_button_set_popover = unsafe { sym::<GtkMenuButtonSetPopover>(gtk, "gtk_menu_button_set_popover") };
+        let gtk_menu_button_set_label = unsafe { sym::<GtkMenuButtonSetLabel>(gtk, "gtk_menu_button_set_label") };
+                let gtk_menu_button_set_has_frame = unsafe { sym::<GtkMenuButtonSetHasFrame>(gtk, "gtk_menu_button_set_has_frame") };
+        let gtk_menu_button_set_primary = unsafe { sym::<GtkMenuButtonSetPrimary>(gtk, "gtk_menu_button_set_primary") };
+        let gtk_button_set_has_frame = unsafe { sym::<GtkButtonSetHasFrame>(gtk, "gtk_button_set_has_frame") };
+        let gtk_widget_add_css_class = unsafe { sym::<GtkWidgetAddCssClass>(gtk, "gtk_widget_add_css_class") };
+        let gtk_menu_button_get_popover = unsafe { sym::<GtkMenuButtonGetPopover>(gtk, "gtk_menu_button_get_popover") };
+        let gtk_widget_set_can_target = unsafe { sym::<GtkWidgetSetCanTarget>(gtk, "gtk_widget_set_can_target") };
+
+        // GtkPopoverMenu — new from model
+        let gtk_popover_menu_new_from_model = unsafe { sym::<GtkPopoverMenuNewFromModel>(gtk, "gtk_popover_menu_new_from_model") };
+
+        // GtkMenuButton
+        let gtk_menu_button_get_label = unsafe { sym::<GtkMenuButtonGetLabel>(gtk, "gtk_menu_button_get_label") };
+        let gtk_menu_button_set_active = unsafe { sym::<GtkMenuButtonSetActive>(gtk, "gtk_menu_button_set_active") };
+
         // GtkWindow default size
         let gtk_window_set_default_size = unsafe { sym::<GtkWindowSetDefaultSize>(gtk, "gtk_window_set_default_size") };
 
@@ -722,6 +830,7 @@ impl Symbols {
             gtk_css_provider_new, gtk_css_provider_load_from_data, gtk_style_context_add_provider,
             gtk_overlay_new, gtk_overlay_add_overlay, gtk_overlay_set_overlay_pass_through, gtk_overlay_set_child,
             gtk_widget_set_margin_start, gtk_widget_set_margin_top, gtk_widget_add_events,
+            gtk_widget_activate, gtk_widget_get_visible, gtk_widget_activate_action,
             gtk_init,
             g_signal_emit_by_name,
             gtk_label_get_text,
@@ -735,13 +844,12 @@ impl Symbols {
             gtk_widget_set_can_focus,
             gtk_file_chooser_native_new, gtk_native_dialog_run, gtk_file_chooser_get_filename, gtk_widget_destroy, gtk_window_close, g_free, gdk_display_get_default, gdk_screen_get_default, gtk_style_context_add_provider_for_display, gtk_style_context_add_provider_for_screen, gdk_event_get_keyval, gdk_event_get_state, gdk_keyval_from_name,
             gtk_application_new, g_application_run, g_application_register, g_simple_action_new, g_action_map_add_action, g_action_group_activate_action, g_action_map_lookup_action, g_action_activate,
-            g_menu_new, g_menu_append, g_application_set_app_menu, g_application_set_menubar, g_menu_append_submenu, gtk_popover_menu_bar_new_from_model, gtk_menu_bar_new, gtk_menu_new, gtk_menu_item_new_with_label, gtk_menu_shell_append, gtk_menu_item_set_submenu, gtk_window_set_application, gtk_widget_insert_action_group, gtk_actionable_set_detailed_action_name, g_menu_model_get_n_items, g_menu_model_get_item_attribute_value, g_menu_model_get_item_link, g_variant_get_string, g_variant_unref,
+            g_menu_new, g_menu_append, g_application_set_app_menu, g_application_set_menubar, g_menu_append_submenu, gtk_popover_menu_bar_new_from_model, gtk_menu_bar_new, gtk_menu_new, gtk_menu_item_new_with_label, gtk_menu_item_new_with_mnemonic, gtk_menu_shell_append, gtk_menu_item_set_submenu, gtk_window_set_application, gtk_widget_insert_action_group, gtk_actionable_set_detailed_action_name, g_menu_model_get_n_items, g_menu_model_get_item_attribute_value, g_menu_model_get_item_link, g_variant_get_string, g_variant_unref,
             gtk_label_set_xalign,
             gtk_event_controller_key_new,
             gtk_event_controller_focus_new,
             gtk_widget_add_controller,
             gtk_event_controller_set_propagation_phase,
-            gtk_widget_set_can_target,
             gtk_widget_set_halign,
             gtk_widget_set_valign,
             gtk_widget_get_allocated_width,
@@ -770,6 +878,14 @@ impl Symbols {
             gtk_widget_get_hexpand, gtk_widget_get_vexpand,
             gtk_editable_get_text, gtk_editable_set_text, gtk_editable_set_position,
             gtk_widget_unparent, gtk_widget_get_parent,
+            gtk_widget_get_first_child, gtk_widget_get_next_sibling,
+            gtk_popover_menu_bar_item_get_popover, gtk_popover_get_child, gtk_popover_new, gtk_popover_set_child,
+            gtk_menu_button_get_label, gtk_menu_button_set_active,
+            gtk_menu_button_new, gtk_menu_button_set_popover, gtk_menu_button_set_label,
+            gtk_menu_button_set_has_frame, gtk_menu_button_set_primary,
+            gtk_button_set_has_frame, gtk_widget_add_css_class,
+            gtk_menu_button_get_popover, gtk_widget_set_can_target,
+            gtk_popover_menu_new_from_model,
             gtk_window_set_default_size,
             gtk_drawing_area_set_draw_func, gtk_drawing_area_set_content_width, gtk_drawing_area_set_content_height,
             gtk_native_get_surface, gdk_surface_create_cairo_context, gdk_surface_get_width, gdk_surface_get_height,

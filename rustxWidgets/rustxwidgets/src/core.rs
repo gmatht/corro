@@ -167,7 +167,7 @@ pub struct App {
     parent_cell: Rc<RefCell<Option<*mut c_void>>>,
     #[cfg(all(windows, not(feature = "zork")))]
     action_registry: Rc<RefCell<HashMap<String, Box<dyn FnMut()>>>>,
-    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+    #[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
     action_group: Rc<RefCell<Option<crate::backends_gtk_adapter::Application>>>,
 }
 
@@ -177,6 +177,7 @@ impl App {
     /// When compiled with both `gui` and `pancurses`, this uses the GUI backend path;
     /// the pancurses backend initializes separately via `backends::pancurses::init()`.
     pub fn init() -> Result<Self, Error> {
+        let _ = std::fs::write("/tmp/corro_init.txt", "App::init() called\n");
         let b = match crate::backends::init() {
             Ok(b) => b,
             Err(e) => return Err(Error::Backend(format!("{}", e))),
@@ -194,111 +195,111 @@ impl App {
         #[cfg(not(all(windows, not(feature = "zork"))))]
         return Ok(App {
             inner: Rc::new(RefCell::new(Some(b))),
-            #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+            #[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
             action_group: Rc::new(RefCell::new(None)),
         });
     }
 
     // -- Linux paths --
 
-    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+    #[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
     pub fn create_window(&self) -> Result<crate::backends_gtk_adapter::Window, Error> {
         crate::backends_gtk_adapter::create_window().map_err(|e| e)
     }
 
-    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+    #[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
     pub fn create_button(&self, label: &str) -> Result<crate::backends_gtk_adapter::Button, Error> {
         crate::backends_gtk_adapter::create_button(label).map_err(|e| e)
     }
 
-    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+    #[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
     pub fn create_label(&self, text: &str) -> Result<crate::backends_gtk_adapter::Label, Error> {
         crate::backends_gtk_adapter::create_label(text).map_err(|e| e)
     }
 
-    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
-    pub fn create_box(&self, orientation: gtk_dynamic_loader::Orientation, spacing: i32) -> Result<crate::backends_gtk_adapter::BoxWidget, Error> {
+    #[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
+    pub fn create_box(&self, orientation: crate::backends_gtk_adapter::Orientation, spacing: i32) -> Result<crate::backends_gtk_adapter::BoxWidget, Error> {
         crate::backends_gtk_adapter::create_box(orientation, spacing).map_err(|e| e)
     }
 
-    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+    #[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
     pub fn create_grid(&self) -> Result<crate::backends_gtk_adapter::Grid, Error> {
         crate::backends_gtk_adapter::create_grid().map_err(|e| e)
     }
 
-    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+    #[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
     pub fn create_entry(&self) -> Result<crate::backends_gtk_adapter::Entry, Error> {
         crate::backends_gtk_adapter::create_entry().map_err(|e| e)
     }
 
-    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+    #[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
     pub fn create_menu(&self) -> Result<crate::backends_gtk_adapter::Menu, Error> {
         crate::backends_gtk_adapter::create_menu().map_err(|e| e)
     }
 
-    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+    #[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
     /// # Safety
     /// `action_group` must be a valid GActionGroup pointer or null.
     pub unsafe fn create_menubar(&self, model: &crate::backends_gtk_adapter::Menu, action_group: *mut c_void) -> Result<crate::backends_gtk_adapter::MenuBar, Error> {
         crate::backends_gtk_adapter::create_menubar(model, action_group).map_err(|e| e)
     }
 
-    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+    #[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
     pub fn create_simple_action(&self, name: &str) -> Result<crate::backends_gtk_adapter::SimpleAction, Error> {
         crate::backends_gtk_adapter::create_simple_action(name).map_err(|e| e)
     }
 
-    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+    #[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
     pub fn create_dialog(&self) -> Result<crate::backends_gtk_adapter::Dialog, Error> {
         crate::backends_gtk_adapter::create_dialog().map_err(|e| e)
     }
 
-    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+    #[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
     pub fn create_dropdown(&self, items: &[&str]) -> Result<crate::backends_gtk_adapter::DropDown, Error> {
         crate::backends_gtk_adapter::create_dropdown(items).map_err(|e| e)
     }
 
-    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+    #[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
     pub fn create_checkbutton(&self, label: &str) -> Result<crate::backends_gtk_adapter::CheckButton, Error> {
         crate::backends_gtk_adapter::create_checkbutton(label).map_err(|e| e)
     }
 
-    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+    #[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
     pub fn create_radiobutton(&self, label: &str) -> Result<crate::backends_gtk_adapter::RadioButton, Error> {
         crate::backends_gtk_adapter::create_radiobutton(None, label).map_err(|e| e)
     }
 
-    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+    #[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
     pub fn create_textview(&self) -> Result<crate::backends_gtk_adapter::TextView, Error> {
         crate::backends_gtk_adapter::create_textview().map_err(|e| e)
     }
 
-    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+    #[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
     pub fn create_canvas(&self) -> Result<crate::backends_gtk_adapter::Canvas, Error> {
         crate::backends_gtk_adapter::create_canvas()
     }
 
-    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+    #[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
     pub fn create_scrolled_window(&self) -> Result<crate::backends_gtk_adapter::ScrolledWindow, Error> {
         crate::backends_gtk_adapter::create_scrolled_window()
     }
 
-    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+    #[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
     pub fn create_overlay(&self) -> Result<crate::backends_gtk_adapter::Overlay, Error> {
         crate::backends_gtk_adapter::create_overlay()
     }
 
-    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+    #[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
     pub fn open_file(&self, title: &str) -> Result<Option<String>, Error> {
         crate::backends_gtk_adapter::open_file(title)
     }
 
-    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+    #[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
     pub fn save_file(&self, title: &str) -> Result<Option<String>, Error> {
         crate::backends_gtk_adapter::save_file(title)
     }
 
-    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+    #[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
     pub fn create_spreadsheet(&self, rows: usize, cols: usize) -> Result<crate::backends_gtk_adapter::Spreadsheet, Error> {
         crate::backends_gtk_adapter::create_spreadsheet(rows, cols)
     }
@@ -769,7 +770,7 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
 
     /// Create a new Window and return a platform-independent handle.
     pub fn new_window(&self) -> Result<crate::common::Window, Error> {
-        #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+        #[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
         {
             let inner = crate::backends_gtk_adapter::create_window()?;
             return Ok(crate::common::Window { inner });
@@ -788,11 +789,11 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
 
     /// Create a new layout Box.
     pub fn new_box(&self, orientation: crate::common::Orientation, spacing: i32) -> Result<crate::common::WidgetBox, Error> {
-        #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+        #[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
         {
             let gtk_orient = match orientation {
-                crate::common::Orientation::Horizontal => gtk_dynamic_loader::Orientation::Horizontal,
-                crate::common::Orientation::Vertical => gtk_dynamic_loader::Orientation::Vertical,
+                crate::common::Orientation::Horizontal => crate::backends_gtk_adapter::Orientation::Horizontal,
+                crate::common::Orientation::Vertical => crate::backends_gtk_adapter::Orientation::Vertical,
             };
             let inner = crate::backends_gtk_adapter::create_box(gtk_orient, spacing)?;
             return Ok(crate::common::WidgetBox { inner });
@@ -816,7 +817,7 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
 
     /// Create a new Label with the given text.
     pub fn new_label(&self, text: &str) -> Result<crate::common::Label, Error> {
-        #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+        #[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
         {
             let inner = crate::backends_gtk_adapter::create_label(text)?;
             return Ok(crate::common::Label { inner });
@@ -837,7 +838,7 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
 
     /// Create a new text Entry.
     pub fn new_entry(&self) -> Result<crate::common::Entry, Error> {
-        #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+        #[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
         {
             let inner = crate::backends_gtk_adapter::create_entry()?;
             return Ok(crate::common::Entry { inner });
@@ -857,7 +858,7 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
 
     /// Create a new Canvas (custom drawing surface).
     pub fn new_canvas(&self) -> Result<crate::common::Canvas, Error> {
-        #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+        #[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
         {
             let inner = crate::backends_gtk_adapter::create_canvas()?;
             return Ok(crate::common::Canvas { inner });
@@ -877,7 +878,7 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
 
     /// Create a new Menu data model.
     pub fn new_menu(&self) -> Result<crate::common::Menu, Error> {
-        #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+        #[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
         {
             let inner = crate::backends_gtk_adapter::create_menu()?;
             return Ok(crate::common::Menu { inner });
@@ -902,7 +903,7 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
     /// Create a new SimpleAction that will dispatch to the given name.
     /// On Windows the action is registered in the shared action registry.
     pub fn new_simple_action(&self, name: &str) -> Result<crate::common::SimpleAction, Error> {
-        #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+        #[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
         {
             let inner = crate::backends_gtk_adapter::create_simple_action(name)?;
             return Ok(crate::common::SimpleAction { inner });
@@ -928,7 +929,7 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
     /// `action_group` – on GTK a `*mut c_void` pointer to a `GActionGroup`
     /// (pass null if not available); on Windows it is unused.
     pub fn new_menubar(&self, model: &crate::common::Menu, _action_group: *mut c_void) -> Result<crate::common::MenuBar, Error> {
-        #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+        #[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
         {
             let inner = unsafe { crate::backends_gtk_adapter::create_menubar(&model.inner, _action_group) }?;
             return Ok(crate::common::MenuBar { inner });
@@ -961,14 +962,14 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
             for item in sm.items {
                 sub.append(item.label, &format!("{}.{}", sm.prefix, item.action));
             }
-            root.append_submenu(&format!("{}{}", label_prefix, sm.label), &sub);
+            root.append_submenu(sm.label, &sub);
         }
         Ok(root)
     }
 
     /// Create a new Dialog.
     pub fn new_dialog(&self) -> Result<crate::common::Dialog, Error> {
-        #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+        #[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
         {
             let inner = crate::backends_gtk_adapter::create_dialog()?;
             return Ok(crate::common::Dialog { inner });
@@ -988,7 +989,7 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
     /// Ensure the GTK application / action group exists (no-op on Windows).
     /// Returns an opaque `*mut c_void` that can be passed to `new_menubar`.
     pub fn ensure_action_group(&self) -> Result<*mut c_void, Error> {
-        #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+        #[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
         {
             if self.action_group.borrow().is_none() {
                 let app = crate::backends_gtk_adapter::create_application()?;
@@ -997,25 +998,27 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
             }
             Ok(self.action_group.borrow().as_ref().unwrap().as_ptr())
         }
-        #[cfg(not(all(feature = "gtk", target_os = "linux", not(feature = "zork"))))]
+        #[cfg(not(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs")))))]
         Ok(std::ptr::null_mut())
     }
 
     /// Register a SimpleAction with the action group.
     /// On GTK this adds the action to the GApplication; on Windows it is a no-op.
     pub fn register_action(&self, _action: &crate::common::SimpleAction) -> Result<(), Error> {
-        #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+        #[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
         if let Some(ref app) = *self.action_group.borrow() {
             app.add_action(&_action.inner)?;
         }
-        #[cfg(not(all(feature = "gtk", target_os = "linux", not(feature = "zork"))))]
+        #[cfg(not(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs")))))]
         {}
         Ok(())
     }
 
 /// Run the backend main loop
     pub fn run(self) -> Result<(), Error> {
+        let _ = std::fs::write("/tmp/corro_app_run.txt", "App::run() called\n");
         let boxed = self.inner.borrow_mut().take().ok_or_else(|| Error::Backend("App::run already called".into()))?;
+        let _ = std::fs::write("/tmp/corro_backend_ptr.txt", &format!("backend={:#p}\n", &*boxed as *const _ as *const u8));
         boxed.run().map_err(|e| Error::Backend(format!("{}", e)))
     }
 
@@ -1024,10 +1027,20 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
     pub fn quit(&self) {
         #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
         crate::backends_wasm_adapter::quit_main_loop();
-        #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+        #[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
         let _ = crate::backends_gtk_adapter::quit_main_loop();
         #[cfg(all(windows, not(feature = "zork")))]
         crate::backends_nwg_adapter::quit_main_loop();
+    }
+
+    /// Like quit() but returns the backend error, if any.
+    #[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
+    pub fn try_quit(&self) -> Result<(), String> {
+        crate::backends_gtk_adapter::quit_main_loop().map_err(|e| format!("{e}"))
+    }
+    #[cfg(not(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs")))))]
+    pub fn try_quit(&self) -> Result<(), String> {
+        Ok(())
     }
 
     /// Pump the backend's event loop for `count` blocking iterations.
@@ -1039,7 +1052,7 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
     /// before entering the main loop, especially on virtual displays
     /// (Xvfb, WSL) where the GTK4 frame clock may not tick automatically.
     pub fn pump_events(&self, count: usize) {
-        #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+        #[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
         crate::backends_gtk_adapter::pump_main_context(count);
         let _ = count;
     }
@@ -1053,7 +1066,7 @@ impl From<Box<dyn crate::backends::BackendApp>> for App {
             parent_cell: Rc::new(RefCell::new(None)),
             #[cfg(all(windows, not(feature = "zork")))]
             action_registry: Rc::new(RefCell::new(HashMap::new())),
-            #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+            #[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
             action_group: Rc::new(RefCell::new(None)),
         }
     }

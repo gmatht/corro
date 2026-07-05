@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # GUI backend test runner.
-# Tests GTK3/GTK4 (via WSL) and NWG (Windows native) backends.
+# Tests GTK3/GTK4 (on Linux, via WSL on Windows) and NWG (Windows native) backends.
 #
 # Usage:
 #   ./gui_loop.sh                  # Run all available backend tests

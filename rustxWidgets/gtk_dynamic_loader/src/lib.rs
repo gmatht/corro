@@ -6,6 +6,8 @@ mod loader;
 mod symbols;
 mod wrappers;
 mod signals;
+#[cfg(feature = "gtk4rs")]
+pub mod backend_gtk4rs;
 
 pub use error::Error;
 pub use loader::{Loader, Version};

@@ -7,9 +7,15 @@ pub mod common;
 pub mod overflow;
 pub mod lifecycle_stress;
 pub mod backends;
-#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+#[cfg(all(feature = "gtk4-rs", target_os = "linux", not(feature = "zork")))]
+pub mod backends_gtk_adapter {
+    // The gtk4 adapter uses dlopen-loaded sys crates via gtk4-rs.
+    // Source is in backends_gtk4_adapter.rs
+    include!("backends_gtk4_adapter.rs");
+}
+#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs")))]
 mod backends_gtk_adapter_impl;
-#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs")))]
 pub mod backends_gtk_adapter;
 #[cfg(all(windows, not(feature = "zork")))]
 pub mod backends_nwg_adapter;

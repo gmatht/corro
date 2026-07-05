@@ -1,7 +1,11 @@
 pub use crate::core::{App, DrawContext, Error, HandlerId, Widget};
-#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+#[cfg(all(feature = "gtk4-rs", target_os = "linux", not(feature = "zork")))]
 pub use crate::common::{Window, WidgetBox, Label, Entry, Canvas, Menu, MenuBar, SimpleAction, Dialog, Orientation};
-#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+#[cfg(all(feature = "gtk4-rs", target_os = "linux", not(feature = "zork")))]
+pub use crate::backends_gtk_adapter::{Button, Grid, DropDown, CheckButton, RadioButton, TextView, Overlay, Spreadsheet, ScrolledWindow};
+#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs")))]
+pub use crate::common::{Window, WidgetBox, Label, Entry, Canvas, Menu, MenuBar, SimpleAction, Dialog, Orientation};
+#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs")))]
 pub use crate::backends_gtk_adapter::{Button, Grid, DropDown, CheckButton, RadioButton, TextView, Overlay, Spreadsheet, ScrolledWindow};
 #[cfg(all(windows, not(feature = "zork")))]
 pub use crate::common::{Window, WidgetBox, Label, Entry, Canvas, Menu, MenuBar, SimpleAction, Dialog, Orientation};

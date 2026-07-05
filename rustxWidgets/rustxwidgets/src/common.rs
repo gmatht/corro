@@ -20,7 +20,12 @@ macro_rules! platform_module {
     };
 }
 
-#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+#[cfg(all(feature = "gtk4-rs", target_os = "linux", not(feature = "zork")))]
+mod platform {
+    platform_module!(crate::backends_gtk_adapter, GtkOrientation);
+}
+
+#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs")))]
 mod platform {
     platform_module!(crate::backends_gtk_adapter, GtkOrientation);
 }
@@ -157,6 +162,15 @@ macro_rules! common_types_mod {
             pub fn connect_activate<F: FnMut(*mut std::os::raw::c_void) + 'static>(&self, f: F) -> Result<u64, crate::Error> { self.inner.connect_activate(f) }
         }
         impl MenuBar {
+            pub fn activate_submenu_by_mnemonic(&self, keyval: u32) -> bool {
+                self.inner.activate_submenu_by_mnemonic(keyval)
+            }
+            pub fn activate_submenu_item_by_mnemonic(&self, keyval: u32) -> bool {
+                self.inner.activate_submenu_item_by_mnemonic(keyval)
+            }
+            pub unsafe fn insert_action_group(&self, name: &str, group_ptr: *mut std::os::raw::c_void) {
+                self.inner.insert_action_group(name, group_ptr);
+            }
         }
         impl AsRef<*mut std::os::raw::c_void> for MenuBar {
             fn as_ref(&self) -> &*mut std::os::raw::c_void { self.inner.as_ref() }
@@ -177,7 +191,17 @@ macro_rules! common_types_mod {
 }
 
 // Common wrapper types with `inner` field for the platform-specific types
-#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+#[cfg(all(feature = "gtk4-rs", target_os = "linux", not(feature = "zork")))]
+mod common_types {
+    common_types_mod!();
+    impl Canvas {
+        pub fn on_key(&self, mut cb: Box<dyn FnMut(u32) -> bool>) {
+            self.inner.on_key(Box::new(move |k: u32, _s: u32| -> bool { cb(k) }));
+        }
+    }
+}
+
+#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs")))]
 mod common_types {
     common_types_mod!();
     impl Canvas {
@@ -215,7 +239,10 @@ mod common_types { common_types_mod!(); }
 #[cfg(feature = "zork")]
 mod common_types { common_types_mod!(); }
 
-#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+#[cfg(all(feature = "gtk4-rs", target_os = "linux", not(feature = "zork")))]
+pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog};
+
+#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs")))]
 pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog};
 
 #[cfg(all(windows, not(feature = "zork")))]
@@ -234,7 +261,9 @@ pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleActi
 pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog};
 
 // Re-export Orientation from the active platform backend
-#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+#[cfg(all(feature = "gtk4-rs", target_os = "linux", not(feature = "zork")))]
+pub use self::platform::GtkOrientation as Orientation;
+#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs")))]
 pub use self::platform::GtkOrientation as Orientation;
 #[cfg(all(windows, not(feature = "zork")))]
 pub use self::platform::NwgOrientation as Orientation;

@@ -15,6 +15,7 @@ default = ["ratatui"]
 nightly = []
 ratatui = ["dep:ratatui", "dep:crossterm", "dep:unicode-truncate", "dep:unicode-segmentation"]
 gui = ["dep:rustxwidgets", "rustxwidgets/gtk"]
+gtk4 = ["gui", "rustxwidgets/gtk4-rs"]
 wasm = ["dep:rustxwidgets"]
 pancurses = ["rustxwidgets/pancurses"]
 gtk = ["gui"]
@@ -49,6 +50,15 @@ zip = { version = "0.6", default-features = false, features = ["deflate"] }
 
 [target.'cfg(unix)'.dev-dependencies]
 gtk_dynamic_loader = { path = "rustxWidgets/gtk_dynamic_loader" }
+
+[patch."https://github.com/gtk-rs/gtk-rs-core"]
+glib-sys = { path = "/root/tmp/gtk4-rs/generated/glib-sys-dlopen" }
+gobject-sys = { path = "/root/tmp/gtk4-rs/generated/gobject-sys-dlopen" }
+gio-sys = { path = "/root/tmp/gtk4-rs/generated/gio-sys-dlopen" }
+cairo-sys-rs = { path = "/root/tmp/gtk4-rs/generated/cairo-sys-rs-dlopen" }
+pango-sys = { path = "/root/tmp/gtk4-rs/generated/pango-sys-dlopen" }
+gdk-pixbuf-sys = { path = "/root/tmp/gtk4-rs/generated/gdk-pixbuf-sys-dlopen" }
+graphene-sys = { path = "/root/tmp/gtk4-rs/generated/graphene-sys-dlopen" }
 
 [[bin]]
 name = "render_ref"

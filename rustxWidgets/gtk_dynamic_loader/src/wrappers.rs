@@ -3,6 +3,7 @@ use crate::error::Error;
 use std::ffi::CString;
 use std::marker::PhantomData;
 use std::os::raw::c_void;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -239,19 +240,15 @@ impl Window {
                             if allocated > 0 && mapped != 0 { break; }
                             iter(std::ptr::null_mut(), 1);
                         }
-                        // Phase 2: pump a mix of blocking then non-blocking
-                        // iterations.  The blocking lead-in (10 iterations)
-                        // waits for the frame clock to fire its first tick or
-                        // the expose event to arrive — timer sources and X11
-                        // events are only dispatched by blocking iterations.
-                        // After the tick fires the remaining iterations drain
-                        // any idle sources (non-blocking) without stalling on
-                        // the next frame clock timer (16ms each = 8s for 500).
-                        for _ in 0..10 {
+                        // Phase 2: all blocking iterations.  On virtual displays
+                        // (WSLg, Xvfb) the frame clock timer sources are only
+                        // dispatched during blocking waits.  Non-blocking
+                        // iterations return immediately and skip timer sources,
+                        // so the draw callback never fires.  500 blocking
+                        // iterations = ~8s max wait at 16ms/tick, covering
+                        // even the slowest virtual compositors.
+                        for _ in 0..500 {
                             iter(std::ptr::null_mut(), 1);
-                        }
-                        for _ in 0..490 {
-                            iter(std::ptr::null_mut(), 0);
                         }
                         // Force a redraw on the window to ensure the canvas
                         // draw callback runs at least once.  On X11 this
@@ -260,18 +257,11 @@ impl Window {
                         if let Some(qd) = loader.symbols.gtk_widget_queue_draw {
                             unsafe { qd(self.inner); }
                         }
-                        // Pump a mix of blocking then non-blocking iterations.
-                        // The blocking lead-in (10 iterations) waits for the
-                        // queued redraw to be processed: allocation idle runs,
-                        // schedules a frame clock tick, and the blocking
-                        // iteration waits for the tick timer.  Non-blocking
-                        // iterations drain remaining idle sources without
-                        // stalling on subsequent frame clock ticks.
-                        for _ in 0..10 {
+                        // Phase 3: all blocking iterations for the queued
+                        // redraw to be processed (allocation idle, frame
+                        // clock tick dispatch).
+                        for _ in 0..500 {
                             iter(std::ptr::null_mut(), 1);
-                        }
-                        for _ in 0..490 {
-                            iter(std::ptr::null_mut(), 0);
                         }
                         // Phase 4: Force a frame clock cycle via
                         // gdk_frame_clock_request_phase (GTK4).  On virtual
@@ -290,14 +280,26 @@ impl Window {
                                 // the snapshot/paint cycle which calls the
                                 // DrawingArea draw function.
                                 unsafe { request_phase(clock, 16); }
-                                // Pump blocking iterations to let the frame
-                                // clock process the requested phase.
-                                for _ in 0..10 {
+                                // All blocking iterations to let the frame
+                                // clock process the requested phase.  On
+                                // virtual displays only blocking iterations
+                                // dispatch timer sources.
+                                for _ in 0..500 {
                                     iter(std::ptr::null_mut(), 1);
                                 }
-                                for _ in 0..490 {
-                                    iter(std::ptr::null_mut(), 0);
-                                }
+                            }
+                        }
+                        // Sync with the display server (X11: XFlush; Wayland:
+                        // wl_display_flush).  This ensures pending MapWindow,
+                        // ConfigureWindow, and drawing commands reach the
+                        // compositor before present() returns.
+                        if let (Some(get_disp), Some(disp_sync)) = (
+                            loader.symbols.gtk_widget_get_display,
+                            loader.symbols.gdk_display_sync,
+                        ) {
+                            let display = unsafe { get_disp(self.inner) };
+                            if !display.is_null() {
+                                unsafe { disp_sync(display); }
                             }
                         }
                     }
@@ -2158,6 +2160,9 @@ impl Clone for SimpleAction {
 pub struct MenuBar {
     inner: *mut c_void,
     loader: Arc<Loader>,
+    mnemonic_index: HashMap<char, usize>,
+    model_items: Vec<MenuItem>,
+    action_group: *mut c_void,
     _not_send: PhantomData<Rc<()>>,
 }
 
@@ -2166,7 +2171,14 @@ impl Clone for MenuBar {
         if let Some(gref) = self.loader.symbols.g_object_ref {
             unsafe { gref(self.inner); }
         }
-        MenuBar { inner: self.inner, loader: self.loader.clone(), _not_send: PhantomData }
+        MenuBar {
+            inner: self.inner,
+            loader: self.loader.clone(),
+            mnemonic_index: self.mnemonic_index.clone(),
+            model_items: self.model_items.clone(),
+            action_group: self.action_group,
+            _not_send: PhantomData,
+        }
     }
 }
 
@@ -2175,14 +2187,27 @@ impl MenuBar {
     /// `action_group` must be a valid GActionGroup pointer or null.
     pub unsafe fn new(loader: Arc<Loader>, model: &Menu, action_group: *mut c_void) -> Result<Self, Error> {
         let symbols = &loader.symbols;
-        // GTK4: GtkPopoverMenuBar — uses the GMenuModel directly
+        // GTK4: GtkPopoverMenuBar — uses the GMenuModel directly.
+        // Do NOT replace with build_simple_menubar (the manual fallback).
         if let Some(ctor) = symbols.gtk_popover_menu_bar_new_from_model {
             let inner = unsafe { ctor(model.ptr()) };
             if inner.is_null() {
                 return Err(Error::Other("gtk_popover_menu_bar_new_from_model returned null".into()));
             }
             take_ownership(&symbols, &loader.version, inner);
-            return Ok(MenuBar { inner, loader, _not_send: PhantomData });
+            let mut mnemonic_index = HashMap::new();
+            for (i, item) in model.items.iter().enumerate() {
+                // label is "_File" → skip '_' → mnemonic is first remaining char 'F'
+                if let Some(m) = item.label.chars()
+                    .skip_while(|&c| c != '_')
+                    .skip(1)  // skip the '_' itself
+                    .next()   // take the mnemonic character
+                    .map(|c| c.to_ascii_uppercase())
+                {
+                    mnemonic_index.entry(m).or_insert(i);
+                }
+            }
+            return Ok(MenuBar { inner, loader, mnemonic_index, model_items: model.items.clone(), action_group, _not_send: PhantomData });
         }
         // GTK3: build GtkMenuBar from the Rust-side items
         if let (Some(menu_bar_new), Some(_), Some(_)) = (
@@ -2196,7 +2221,7 @@ impl MenuBar {
             }
             Self::build_gtk3(&loader, inner, &model.items, &symbols, action_group);
             take_ownership(&symbols, &loader.version, inner);
-            return Ok(MenuBar { inner, loader, _not_send: PhantomData });
+            return Ok(MenuBar { inner, loader, mnemonic_index: HashMap::new(), model_items: model.items.clone(), action_group, _not_send: PhantomData });
         }
         Err(Error::MissingSymbol("gtk_popover_menu_bar_new_from_model".into()))
     }
@@ -2213,8 +2238,13 @@ impl MenuBar {
                 Ok(c) => c,
                 Err(_) => continue,
             };
-            if let Some(new_item) = symbols.gtk_menu_item_new_with_label {
-                let gtk_item = unsafe { new_item(c_label.as_ptr()) };
+            // Use gtk_menu_item_new_with_mnemonic so underscores are
+            // interpreted as mnemonics (e.g. _File shows as File with
+            // underlined F).  Fall back to the label variant.
+            let new_item = symbols.gtk_menu_item_new_with_mnemonic
+                .map(|f| unsafe { f(c_label.as_ptr()) })
+                .or_else(|| symbols.gtk_menu_item_new_with_label.map(|f| unsafe { f(c_label.as_ptr()) }));
+            if let Some(gtk_item) = new_item {
                 if let Some(ref submenu) = item.submenu {
                     // Submenu item: create GtkMenu and recurse
                     if let Some(menu_new) = symbols.gtk_menu_new {
@@ -2226,35 +2256,106 @@ impl MenuBar {
                     }
                 } else if !item.detailed_action.is_empty() && !action_group.is_null() {
                     let _ = set_detailed_action_name(symbols, gtk_item, &item.detailed_action);
-                    if let (Some(lookup), Some(activate_fn)) = (
-                        symbols.g_action_map_lookup_action,
-                        symbols.g_action_activate,
-                    ) {
-                        let action_name = item.detailed_action.rsplit('.').next()
-                            .unwrap_or(&item.detailed_action).to_string();
-                        // Connect to "button-release-event" (GtkWidget signal, always fires on click)
-                        let cb_action = action_name.clone();
-                        let cb_group = action_group;
-                        let cb_lookup = lookup;
-                        let cb_activate = activate_fn;
-                        let cb = Box::new(move |_event: *mut c_void| -> i32 {
-                            let c = CString::new(cb_action.as_str()).unwrap();
-                            let gaction = unsafe { cb_lookup(cb_group, c.as_ptr()) };
-                            if !gaction.is_null() {
-                                unsafe { cb_activate(gaction, std::ptr::null_mut()); }
-                            }
-                            0 // FALSE = let event propagate to GtkMenuItem default handler
-                        });
-                        let _ = unsafe { crate::signals::connect_signal_bool(
-                            symbols, gtk_item, "button-release-event", cb,
-                        )};
-                    }
                 }
                 if let Some(append) = symbols.gtk_menu_shell_append {
                     unsafe { append(shell, gtk_item); }
                 }
             }
         }
+    }
+
+    /// Activate the submenu whose mnemonic label matches `keyval`.
+    /// Returns true if a matching button was found and activated.
+    pub fn activate_submenu_by_mnemonic(&self, keyval: u32) -> bool {
+        let symbols = &self.loader.symbols;
+        let get_first = match symbols.gtk_widget_get_first_child {
+            Some(f) => f,
+            None => return false,
+        };
+        let get_next = match symbols.gtk_widget_get_next_sibling {
+            Some(f) => f,
+            None => return false,
+        };
+        let activate = match symbols.gtk_widget_activate {
+            Some(f) => f,
+            None => return false,
+        };
+
+        let key_upper = char::from_u32(keyval)
+            .map(|c| c.to_ascii_uppercase())
+            .unwrap_or('\0');
+        let &idx = match self.mnemonic_index.get(&key_upper) {
+            Some(i) => i,
+            None => return false,
+        };
+
+        // The GtkPopoverMenuBar has a single child: a GtkBox that contains the
+        // menu item buttons.  Get the box, then iterate its children.
+        let box_widget = unsafe { get_first(self.inner) };
+        if box_widget.is_null() { return false; }
+        let mut child = unsafe { get_first(box_widget) };
+        let mut i = 0usize;
+        while !child.is_null() && i < idx {
+            child = unsafe { get_next(child) };
+            i += 1;
+        }
+        if child.is_null() {
+            return false;
+        }
+
+        unsafe { activate(child); }
+        true
+    }
+
+    /// Activate a submenu item whose mnemonic matches `keyval` when a popover
+    /// is already open.  Returns true if a matching item was found and activated.
+    pub fn activate_submenu_item_by_mnemonic(&self, keyval: u32) -> bool {
+        let symbols = &self.loader.symbols;
+        let activate_action = match symbols.g_action_group_activate_action {
+            Some(f) => f,
+            None => return false,
+        };
+
+        if self.action_group.is_null() {
+            return false;
+        }
+
+        let key_upper = char::from_u32(keyval)
+            .map(|c| c.to_ascii_uppercase())
+            .unwrap_or('\0');
+
+        // Iterate all top-level bar items; for each one that has a submenu,
+        // check if any item's mnemonic matches.
+        for bar_item in &self.model_items {
+            let submenu = match &bar_item.submenu {
+                Some(m) => &m.items,
+                None => continue,
+            };
+            for sub_item in submenu {
+                if let Some(m) = sub_item.label.chars()
+                    .skip_while(|&c| c != '_')
+                    .nth(1)
+                    .map(|c| c.to_ascii_uppercase())
+                {
+                    if m == key_upper && !sub_item.detailed_action.is_empty() {
+                        // Extract the action name (without prefix) from the
+                        // detailed action name (e.g. "app.quit" -> "quit").
+                        let action_name = sub_item.detailed_action
+                            .rsplit('.')
+                            .next()
+                            .unwrap_or(&sub_item.detailed_action);
+                        let c_action = match std::ffi::CString::new(action_name) {
+                            Ok(c) => c,
+                            Err(_) => continue,
+                        };
+                        unsafe { activate_action(self.action_group, c_action.as_ptr(), std::ptr::null_mut()); }
+                        return true;
+                    }
+                }
+            }
+        }
+
+        false
     }
 }
 
@@ -2268,6 +2369,163 @@ fn set_detailed_action_name(symbols: &crate::symbols::Symbols, item: *mut c_void
 
 impl AsRef<*mut c_void> for MenuBar { fn as_ref(&self) -> &*mut c_void { &self.inner } }
 
+impl MenuBar {
+    /// Insert an action group on the underlying menubar widget so that
+    /// popover children can find actions by walking the parent chain.
+    pub fn insert_action_group(&self, name: &str, group_ptr: *mut c_void) {
+        guard_widget!(self, "MenuBar", "insert_action_group");
+        if let Some(insert) = self.loader.symbols.gtk_widget_insert_action_group {
+            let c = CString::new(name).unwrap();
+            unsafe { insert(self.inner, c.as_ptr(), group_ptr); }
+        }
+    }
+
+    /// Directly insert the action group on each bar item's popover.
+    /// Traverses the widget tree: bar → bar_item → (menu_button → popover child or button's internal popover).
+    pub fn insert_action_group_on_popovers(&self, name: &str, group_ptr: *mut c_void) -> usize {
+        let symbols = &self.loader.symbols;
+        let get_first = match symbols.gtk_widget_get_first_child {
+            Some(f) => f,
+            None => return 0,
+        };
+        let get_next = match symbols.gtk_widget_get_next_sibling {
+            Some(f) => f,
+            None => return 0,
+        };
+        let get_popover = match symbols.gtk_menu_button_get_popover {
+            Some(f) => f,
+            None => return 0,
+        };
+        let insert = match symbols.gtk_widget_insert_action_group {
+            Some(f) => f,
+            None => return 0,
+        };
+        let c_name = match std::ffi::CString::new(name) {
+            Ok(n) => n,
+            Err(_) => return 0,
+        };
+        let mut count = 0;
+        unsafe {
+            let mut child = get_first(self.inner);
+            while !child.is_null() {
+                let menu_btn = get_first(child);
+                if menu_btn.is_null() {
+                    child = get_next(child);
+                    continue;
+                }
+                // Try getting the popover via gtk_menu_button_get_popover
+                let mut popover = get_popover(menu_btn);
+                // If that fails, try the first child of the menu button (popover is parented there)
+                if popover.is_null() {
+                    popover = get_first(menu_btn);
+                }
+                if !popover.is_null() {
+                    insert(popover, c_name.as_ptr(), group_ptr);
+                    count += 1;
+                }
+                child = get_next(child);
+            }
+        }
+        count
+    }
+
+    /// Diagnostic: check which action names exist in the given GActionMap.
+    pub fn debug_check_actions(&self, group_ptr: *mut c_void, out_path: &str) {
+        use std::io::Write;
+        let symbols = &self.loader.symbols;
+        let lookup = match symbols.g_action_map_lookup_action {
+            Some(f) => f,
+            None => return,
+        };
+        let mut s = String::new();
+        for &name in &["open", "save", "corro_quit", "about", "sort_asc", "help_keybinds", "quit"] {
+            let c = match std::ffi::CString::new(name) {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+            let found = unsafe { lookup(group_ptr, c.as_ptr()) };
+            s.push_str(&format!("action_lookup: {name}={}\n", !found.is_null()));
+        }
+        let _ = std::fs::write(out_path, &s);
+    }
+
+    /// Diagnostic: check if submenu links exist for all root GMenu items.
+    pub fn debug_check_submenu_links(model_ptr: *mut c_void, loader: &crate::loader::Loader, out_path: &str) {
+        use std::io::Write;
+        let symbols = &loader.symbols;
+        let get_n_items = match symbols.g_menu_model_get_n_items {
+            Some(f) => f,
+            None => return,
+        };
+        let get_link = match symbols.g_menu_model_get_item_link {
+            Some(f) => f,
+            None => return,
+        };
+        let n = unsafe { get_n_items(model_ptr) };
+        let mut s = format!("g_menu_model_get_n_items: {n}\n");
+        for i in 0..n {
+            let link = unsafe { get_link(model_ptr, i as i32, b"submenu\0".as_ptr() as *const i8) };
+            s.push_str(&format!("  item[{i}]: submenu_link={}\n", !link.is_null()));
+        }
+        let _ = std::fs::write(out_path, &s);
+    }
+
+    /// Diagnostic: count children of the menubar and their sub-children.
+    pub fn debug_widget_tree(&self, out_path: &str) {
+        let symbols = &self.loader.symbols;
+        let get_first = match symbols.gtk_widget_get_first_child {
+            Some(f) => f,
+            None => return,
+        };
+        let get_next = match symbols.gtk_widget_get_next_sibling {
+            Some(f) => f,
+            None => return,
+        };
+        let get_popover = match symbols.gtk_menu_button_get_popover {
+            Some(f) => f,
+            None => return,
+        };
+        let mut s = String::new();
+        unsafe {
+            let mut i = 0u32;
+            let mut child = get_first(self.inner);
+            while !child.is_null() {
+                let menu_btn = get_first(child);
+                let popover_via_getter = if !menu_btn.is_null() {
+                    get_popover(menu_btn)
+                } else {
+                    std::ptr::null_mut()
+                };
+                let popover_via_get_first = if !menu_btn.is_null() {
+                    get_first(menu_btn)
+                } else {
+                    std::ptr::null_mut()
+                };
+                let btn_first_child = if !menu_btn.is_null() {
+                    get_first(menu_btn)
+                } else {
+                    std::ptr::null_mut()
+                };
+                let btn_second_child = if !btn_first_child.is_null() {
+                    get_next(btn_first_child)
+                } else {
+                    std::ptr::null_mut()
+                };
+                s.push_str(&format!(
+                    "  child[{}]: bar={:#x} btn={:#x} popover_getter={:#x} popover_first_child={:#x} btn_fc={:#x} btn_sc={:#x}\n",
+                    i, child as usize, menu_btn as usize,
+                    popover_via_getter as usize, popover_via_get_first as usize,
+                    btn_first_child as usize, btn_second_child as usize
+                ));
+                child = get_next(child);
+                i += 1;
+            }
+            s.insert_str(0, &format!("n_children: {}\n", i));
+        }
+        let _ = std::fs::write(out_path, &s);
+    }
+}
+
 impl Drop for MenuBar {
     fn drop(&mut self) {
         unsafe { crate::wrappers::unref_widget(&self.loader, self.inner); }
@@ -2279,6 +2537,7 @@ pub struct Dialog {
     inner: *mut c_void,
     loader: Arc<Loader>,
     _not_send: PhantomData<Rc<()>>,
+    dropped: std::cell::Cell<bool>,
 }
 
 impl Dialog {
@@ -2288,7 +2547,7 @@ impl Dialog {
         let inner = unsafe { ctor() };
         if inner.is_null() { return Err(Error::Other("gtk_dialog_new returned null".into())); }
         unsafe { take_ownership(&symbols, &loader.version, inner); }
-        Ok(Dialog { inner, loader, _not_send: PhantomData })
+        Ok(Dialog { inner, loader, _not_send: PhantomData, dropped: std::cell::Cell::new(false) })
     }
 
     pub fn set_title(&self, title: &str) {
@@ -2418,7 +2677,7 @@ impl Clone for Dialog {
         if let Some(gref) = self.loader.symbols.g_object_ref {
             unsafe { gref(self.inner); }
         }
-        Dialog { inner: self.inner, loader: self.loader.clone(), _not_send: PhantomData }
+        Dialog { inner: self.inner, loader: self.loader.clone(), _not_send: PhantomData, dropped: std::cell::Cell::new(self.dropped.get()) }
     }
 }
 
@@ -2426,8 +2685,18 @@ impl AsRef<*mut c_void> for Dialog { fn as_ref(&self) -> &*mut c_void { &self.in
 
 impl Drop for Dialog {
     fn drop(&mut self) {
-        unsafe { crate::wrappers::unref_widget(&self.loader, self.inner); }
+        if !self.dropped.get() {
+            unsafe { crate::wrappers::unref_widget(&self.loader, self.inner); }
+        }
         self.inner = std::ptr::null_mut();
+    }
+}
+
+impl Dialog {
+    /// Mark this dialog as having been destroyed by GTK already.
+    /// After this, Drop will skip the g_object_unref, preventing a double-free.
+    pub fn mark_destroyed(&self) {
+        self.dropped.set(true);
     }
 }
 

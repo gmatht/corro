@@ -1,12 +1,12 @@
-#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+#[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
 mod gtk_backend {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::error::Error as StdError;
-    use once_cell::sync::OnceCell;
     use gtk_dynamic_loader::Loader;
 
-    static LOADER: OnceCell<Arc<Loader>> = OnceCell::new();
-    static MAIN_LOOP: OnceCell<usize> = OnceCell::new();
+    static LOADER: std::sync::OnceLock<Arc<Loader>> = std::sync::OnceLock::new();
+    static MAIN_LOOP: AtomicUsize = AtomicUsize::new(0);
 
     pub struct GtkApp {
         loader: Arc<Loader>,
@@ -30,18 +30,37 @@ mod gtk_backend {
     impl crate::backends::BackendApp for GtkApp {
         fn run(self: Box<Self>) -> Result<(), Box<dyn StdError + Send + Sync>> {
             let symbols = &self.loader.symbols;
-            let loop_new = symbols.g_main_loop_new.ok_or("missing g_main_loop_new")?;
             let loop_run = symbols.g_main_loop_run.ok_or("missing g_main_loop_run")?;
-            unsafe {
-                let loop_ptr = loop_new(std::ptr::null_mut(), 0);
-                let _ = MAIN_LOOP.set(loop_ptr as usize);
-                loop_run(loop_ptr);
+            // Use pre-created loop if available (from gui_backend warm-up).
+            let loop_ptr = {
+                let mut guard = self.loader.main_loop.lock().unwrap();
+                if *guard != 0 {
+                    *guard as *mut std::ffi::c_void
+                } else {
+                    let loop_new = symbols.g_main_loop_new.ok_or("missing g_main_loop_new")?;
+                    let ptr = unsafe { loop_new(std::ptr::null_mut(), 0) };
+                    *guard = ptr as usize;
+                    ptr
+                }
+            };
+            if loop_ptr.is_null() {
+                return Err("g_main_loop_new returned null".into());
             }
+            MAIN_LOOP.store(loop_ptr as usize, Ordering::SeqCst);
+            unsafe { loop_run(loop_ptr); }
             Ok(())
         }
     }
 
     pub fn init() -> Result<Box<dyn crate::backends::BackendApp>, Box<dyn StdError + Send + Sync>> {
+        let backend = std::env::var("BACKEND").unwrap_or_default();
+        #[cfg(feature = "gtk4-rs")]
+        if backend == "gtk4" {
+            match gtk_dynamic_loader::Loader::new_gtk4rs() {
+                Ok(loader) => return GtkApp::new_with_loader(loader).map_err(|e| Box::new(e) as Box<dyn StdError + Send + Sync>),
+                Err(e) => { eprintln!("gtk4-rs backend failed: {e}, falling back to dlopen"); }
+            }
+        }
         match GtkApp::new_default() {
             Ok(b) => Ok(b),
             Err(e) => Err(Box::new(e)),
@@ -143,7 +162,17 @@ mod gtk_backend {
 
     pub fn quit_main_loop() -> Result<(), gtk_dynamic_loader::Error> {
         let loader = LOADER.get().ok_or(gtk_dynamic_loader::Error::Other("loader not initialized".into()))?;
-        let loop_ptr = MAIN_LOOP.get().copied().ok_or(gtk_dynamic_loader::Error::Other("main loop not running".into()))?;
+        let loop_ptr = MAIN_LOOP.load(Ordering::SeqCst);
+        let loop_ptr = if loop_ptr != 0 {
+            loop_ptr
+        } else {
+            *loader.main_loop.lock().unwrap()
+        };
+        let _ = std::fs::write("/tmp/corro_quit_loop.txt", &format!("loop_ptr={:#x} loader_val={:#x}\n",
+            loop_ptr, *loader.main_loop.lock().unwrap()));
+        if loop_ptr == 0 {
+            return Err(gtk_dynamic_loader::Error::Other("main loop not running".into()));
+        }
         let loop_quit = loader.symbols.g_main_loop_quit.ok_or(gtk_dynamic_loader::Error::MissingSymbol("g_main_loop_quit".into()))?;
         unsafe {
             loop_quit(loop_ptr as *mut std::ffi::c_void);
@@ -152,5 +181,5 @@ mod gtk_backend {
     }
 }
 
-#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+#[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
 pub use gtk_backend::{init, create_window, create_button, create_label, create_box, create_grid, create_entry, create_menu, create_simple_action, create_menubar, create_dialog, create_dropdown, create_checkbutton, create_radiobutton, create_textview, create_drawing_area, create_overlay, create_scrolled_window, loader, quit_main_loop};

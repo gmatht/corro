@@ -1,5 +1,5 @@
 // High-level ergonomic wrappers over gtk_compat for the rustxwidgets API
-#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+#[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
 mod gtk_adapter {
     use std::os::raw::c_void;
     use std::cell::RefCell;
@@ -105,21 +105,64 @@ mod gtk_adapter {
                 if !win_ptr.is_null() {
                     let l = loader.clone();
                     let is_gtk4 = l.symbols.gtk_drawing_area_set_draw_func.is_some();
+                    // Shared callback wrapper used by both GTK4 and GTK3 paths.
+                    let shared_cb: Rc<RefCell<Option<Box<dyn FnMut(u32, u32) -> i32>>>> = Rc::new(RefCell::new(Some(cb)));
                     if is_gtk4 {
+                        // CAPTURE-phase controller: handles ALL keys (not just navigation keys).
+                        // On GTK4/WSLg, when the formula entry doesn't have keyboard focus,
+                        // keyboard events are silently dropped because there's no focused
+                        // widget to receive them.  By processing ALL keys in the window
+                        // CAPTURE phase, we ensure every keystroke reaches our key handler
+                        // regardless of focus state.
+                        //
+                        // We always call the application callback and return its result
+                        // (GDK_EVENT_STOP for handled keys, GDK_EVENT_PROPAGATE otherwise).
+                        // For printable characters, the application's callback now returns
+                        // STOP (1) because start_edit_with/set_text updates the entry widget
+                        // directly — there's no need for the event to reach the entry widget.
                         if let Ok(ctrl) = gtk_dynamic_loader::EventControllerKey::new(l.clone()) {
+                            ctrl.set_propagation_phase_capture();
+                            let sc = shared_cb.clone();
                             let _ = ctrl.connect_key_pressed(Box::new(move |keyval: u32, state: u32| -> i32 {
-                                cb(keyval, state)
+                                if let Some(ref mut f) = *sc.borrow_mut() {
+                                    f(keyval, state)
+                                } else {
+                                    0
+                                }
                             }));
                             ctrl.add_to_widget(&self.0);
-                            // Store the controller so it stays alive as long as the Window does.
-                            // Without this, the Rust wrapper's Drop calls g_object_unref,
-                            // which — even though the widget also owns a ref — interacts
-                            // badly with GTK's widget-tree walk during gtk_window_present,
-                            // causing a segfault in g_type_check_instance_is_a.
+                            self.1.borrow_mut().push(Box::new(ctrl));
+                        }
+                        // BUBBLE-phase controller: no-op.  The CAPTURE-phase controller above
+                        // handles all keys and returns STOP for handled ones, so this
+                        // controller never fires for those keys.  It is retained as a
+                        // safety net for unhandled keys (where CAPTURE returns PROPAGATE),
+                        // ensuring the application callback still fires as a fallback.
+                        if let Ok(ctrl) = gtk_dynamic_loader::EventControllerKey::new(l.clone()) {
+                            let sc = shared_cb.clone();
+                            let _ = ctrl.connect_key_pressed(Box::new(move |keyval: u32, state: u32| -> i32 {
+                                // For NAV_KEYS, the CAPTURE controller already called the
+                                // callback — skip to avoid double-processing.
+                                const NAV_KEYS: &[u32] = &[
+                                    0xFF0D, 0xFF8D, 0xFF1B, 0xFF09,
+                                    0xFF51, 0xFF53, 0xFF52, 0xFF54,
+                                    0xFF50, 0xFF57, 0xFF55, 0xFF56,
+                                ];
+                                if NAV_KEYS.contains(&keyval) {
+                                    return 0;
+                                }
+                                if let Some(ref mut f) = *sc.borrow_mut() {
+                                    f(keyval, state)
+                                } else {
+                                    0
+                                }
+                            }));
+                            ctrl.add_to_widget(&self.0);
                             self.1.borrow_mut().push(Box::new(ctrl));
                         }
                     } else {
                         unsafe {
+                            let sc = shared_cb.clone();
                             let _ = gtk_dynamic_loader::widget_connect_signal_bool(
                                 &l.clone(), win_ptr, "event",
                                 Box::new(move |ev: *mut c_void| -> i32 {
@@ -135,7 +178,11 @@ mod gtk_adapter {
                                     if let Some(get_st) = l.symbols.gdk_event_get_state {
                                         get_st(ev, &mut state);
                                     }
-                                    cb(keyval, state)
+                                    if let Some(ref mut f) = *sc.borrow_mut() {
+                                        f(keyval, state)
+                                    } else {
+                                        0
+                                    }
                                 }),
                             );
                         }
@@ -291,17 +338,18 @@ mod gtk_adapter {
                     let is_gtk4 = symbols.gtk_drawing_area_set_draw_func.is_some();
                     if is_gtk4 {
                         // GTK4: GtkEntry's internal EventControllerKey (CAPTURE phase) consumes
-                        // RETURN/TAB/ESCAPE/arrows before our bubble-phase EventControllerKey can
-                        // fire.  We use two mechanisms:
+                        // RETURN/TAB/ESCAPE/arrows before a BUBBLE-phase EventControllerKey can
+                        // fire.  We use CAPTURE phase here so our controller fires BEFORE the
+                        // internal handler, intercepting RETURN directly instead of relying on
+                        // the "activate" signal (which doesn't fire reliably on WSLg/WSL).
                         //
-                        // 1. EventControllerKey for printable characters (which the entry does
-                        //    NOT consume for non-IM keys).
-                        // 2. The "activate" signal for RETURN.  GtkEntry emits "activate"
-                        //    synchronously before its internal controller returns GDK_EVENT_STOP,
-                        //    so we can commit the edit.
+                        // For printable characters our callback returns GDK_EVENT_PROPAGATE (false),
+                        // letting the internal handler insert the character normally.
+                        // The "changed" signal then fires on_formula_entry_changed as before.
                         let shared_cb = std::rc::Rc::new(std::cell::RefCell::new(Some(cb)));
                         self._controllers.borrow_mut().push(Box::new(shared_cb.clone()));
                         if let Ok(ctrl) = gtk_dynamic_loader::EventControllerKey::new(loader.clone()) {
+                            ctrl.set_propagation_phase_capture();
                             let sc = shared_cb.clone();
                             let _ = ctrl.connect_key_pressed(Box::new(move |keyval: u32, state: u32| -> i32 {
                                 if let Some(ref mut f) = *sc.borrow_mut() {
@@ -311,14 +359,11 @@ mod gtk_adapter {
                             ctrl.add_to_widget(&self.inner);
                             self._controllers.borrow_mut().push(Box::new(ctrl));
                         }
-                        // Connect to "activate" for RETURN (which the entry's internal controller
-                        // stops before our bubble-phase EventControllerKey sees it).
-                        let sa = shared_cb.clone();
-                        let _ = self.inner.connect_activate(Box::new(move |_entry: *mut std::os::raw::c_void| {
-                            if let Some(ref mut f) = *sa.borrow_mut() {
-                                f(0xFF0D, 0); // VK_RETURN
-                            }
-                        }));
+                        // NOTE: The application-level connect_activate callback in gui_backend.rs
+                        // is retained as a secondary fallback.  With CAPTURE phase we handle RETURN
+                        // directly and stop propagation, so "activate" is never emitted — but if
+                        // the CAPTURE controller somehow doesn't fire (e.g., older GTK), the
+                        // connect_activate path still works.
                     } else {
                         // GTK3 path: connect to raw "key-press-event" signal
                         let l = loader.clone();
@@ -405,6 +450,17 @@ mod gtk_adapter {
     impl Clone for MenuBar { fn clone(&self) -> Self { MenuBar(self.0.clone()) } }
     impl Widget for MenuBar { fn raw_handle(&self) -> *mut c_void { *self.0.as_ref() } }
     impl AsRef<*mut c_void> for MenuBar { fn as_ref(&self) -> &*mut c_void { self.0.as_ref() } }
+    impl MenuBar {
+        pub fn activate_submenu_by_mnemonic(&self, keyval: u32) -> bool {
+            self.0.activate_submenu_by_mnemonic(keyval)
+        }
+        pub fn activate_submenu_item_by_mnemonic(&self, keyval: u32) -> bool {
+            self.0.activate_submenu_item_by_mnemonic(keyval)
+        }
+        pub unsafe fn insert_action_group(&self, name: &str, group_ptr: *mut std::os::raw::c_void) {
+            self.0.insert_action_group(name, group_ptr);
+        }
+    }
 
     /// # Safety
     /// `action_group` must be a valid GActionGroup pointer or null.
@@ -473,6 +529,8 @@ mod gtk_adapter {
             self.0.connect_response(f).map_err(|e| Error::Backend(format!("{}", e)))
         }
         pub fn close(&self) { self.0.close(); }
+        pub fn mark_destroyed(&self) { self.0.mark_destroyed(); }
+
     }
 
     pub fn create_dialog() -> Result<Dialog, Error> {
@@ -609,7 +667,13 @@ mod gtk_adapter {
             self.cc.set_source_rgba(r, g, b, a);
             self.cc.select_font_face(font, slant, weight);
             self.cc.set_font_size(size);
-            self.cc.move_to(x, y);
+            // Cairo's move_to(x, y) treats y as the text BASELINE.
+            // The callers pass y as the TEXT TOP (matching GDI semantics).
+            // Convert: baseline = top - y_bearing (y_bearing is negative,
+            // so this ADDS the ascent to top).
+            let e = self.cc.text_extents(text);
+            let baseline = y - e.y_bearing;
+            self.cc.move_to(x, baseline);
             self.cc.show_text(text);
             self.cc.restore();
         }
@@ -1103,6 +1167,12 @@ mod gtk_adapter {
                 if let Ok(iter_fn) = unsafe { glib_lib.get::<Iteration>(b"g_main_context_iteration") } {
                     let iter = *iter_fn;
                     unsafe {
+                        // All blocking iterations: on virtual displays (WSLg, Xvfb)
+                        // the frame clock timer only fires during blocking waits.
+                        // Non-blocking iterations return immediately and skip timer
+                        // sources, so the draw callback never fires.  500 blocking
+                        // iterations = ~8s max wait at 16ms/tick, which covers even
+                        // the slowest virtual compositors.
                         for _ in 0..count {
                             iter(std::ptr::null_mut(), 1);
                         }
@@ -1114,8 +1184,8 @@ mod gtk_adapter {
 
 }
 
-#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+#[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
 pub use gtk_adapter::*;
 
-#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+#[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
 pub use gtk_dynamic_loader::Orientation;
