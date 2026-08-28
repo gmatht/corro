@@ -18,6 +18,30 @@ mod gtk_adapter {
     impl AsRef<*mut c_void> for Window { fn as_ref(&self) -> &*mut c_void { self.0.as_ref() } }
 
     impl Window {
+        /// Connect a close handler: GTK4 uses `close-request`, GTK3 `delete-event`.
+        pub fn on_close(&self, cb: Box<dyn FnMut()>) {
+            if let Some(loader) = crate::backends::gtk::loader() {
+                let win_ptr = *self.0.as_ref();
+                if !win_ptr.is_null() {
+                    let l = loader.clone();
+                    let is_gtk4 = l.symbols.gtk_drawing_area_set_draw_func.is_some();
+                    let signal = if is_gtk4 { "close-request" } else { "delete-event" };
+                    let mut cb = cb;
+                    unsafe {
+                        let _ = gtk_dynamic_loader::widget_connect_signal_bool(
+                            &l, win_ptr, signal,
+                            Box::new(move |_ev: *mut c_void| -> i32 {
+                                cb();
+                                0
+                            }),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    impl Window {
         pub fn set_title(&self, title: &str) {
             self.0.set_title(title);
         }
