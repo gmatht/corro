@@ -181,6 +181,21 @@ fn bx<E: std::fmt::Display>(e: E) -> Box<dyn StdError + Send + Sync> {
     Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
 }
 
+/// Render an arbitrary spreadsheet model to a ratatui `Buffer` using a
+/// `TestBackend`. Pure/test-only helper used by parity tests; it exercises the
+/// exact same `paint` path the real terminal app uses.
+pub fn render_model_to_test_backend(model: &SpreadsheetModel, w: u16, h: u16) -> ratatui::buffer::Buffer {
+    let backend = TestBackend::new(w, h);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|f| {
+            let mut dc = RatatuiDrawContext::new(f);
+            crate::spreadsheet::paint(model, &mut dc, w as i32, h as i32);
+        })
+        .unwrap();
+    terminal.backend().buffer().clone()
+}
+
 /// A small, representative spreadsheet model used by the demo loop and tests.
 pub fn demo_model() -> SpreadsheetModel {
     let mut m = SpreadsheetModel::new(6, 4);
@@ -198,7 +213,18 @@ pub fn demo_model() -> SpreadsheetModel {
 }
 
 /// The ratatui terminal backend application.
-pub struct RatatuiApp;
+pub struct RatatuiApp {
+    model: Option<SpreadsheetModel>,
+}
+
+impl RatatuiApp {
+    /// Initialize the ratatui backend with a specific model (instead of the demo).
+    pub fn init_with_model(
+        model: SpreadsheetModel,
+    ) -> Result<Box<dyn BackendApp>, Box<dyn StdError + Send + Sync>> {
+        Ok(Box::new(RatatuiApp { model: Some(model) }))
+    }
+}
 
 impl BackendApp for RatatuiApp {
     fn run(self: Box<Self>) -> Result<(), Box<dyn StdError + Send + Sync>> {
@@ -210,7 +236,7 @@ impl BackendApp for RatatuiApp {
         terminal::enable_raw_mode().map_err(bx)?;
         stdout().execute(EnterAlternateScreen).map_err(bx)?;
         let mut terminal = Terminal::new(CrosstermBackend::new(stdout())).map_err(bx)?;
-        let mut model = demo_model();
+        let mut model = self.model.unwrap_or_else(demo_model);
 
         let result = (|| -> Result<(), Box<dyn StdError + Send + Sync>> {
             loop {
@@ -243,22 +269,12 @@ impl BackendApp for RatatuiApp {
     }
 }
 
-/// Build a ratatui `Terminal` over a `TestBackend` and run `paint` once,
-/// returning the rendered buffer for inspection (used by parity tests).
+/// Render the demo model to a ratatui `Buffer` (pure/test helper).
 pub fn render_demo_to_test_backend(w: u16, h: u16) -> ratatui::buffer::Buffer {
-    let backend = TestBackend::new(w, h);
-    let mut terminal = Terminal::new(backend).unwrap();
-    let model = demo_model();
-    terminal
-        .draw(|f| {
-            let mut dc = RatatuiDrawContext::new(f);
-            crate::spreadsheet::paint(&model, &mut dc, w as i32, h as i32);
-        })
-        .unwrap();
-    terminal.backend().buffer().clone()
+    render_model_to_test_backend(&demo_model(), w, h)
 }
 
 #[cfg(all(feature = "ratatui", not(any(feature = "gtk", feature = "gtk4-rs", target_os = "windows", target_arch = "wasm32", target_os = "android", feature = "pancurses", feature = "zork"))))]
 pub fn init() -> Result<Box<dyn BackendApp>, Box<dyn StdError + Send + Sync>> {
-    Ok(Box::new(RatatuiApp))
+    Ok(Box::new(RatatuiApp { model: None }))
 }
