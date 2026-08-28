@@ -120,35 +120,44 @@ mod gtk_adapter {
                         // For printable characters, the application's callback now returns
                         // STOP (1) because start_edit_with/set_text updates the entry widget
                         // directly — there's no need for the event to reach the entry widget.
+                        //
+                        // Mutual-exclusion flag: the CAPTURE controller sets this before
+                        // returning STOP; the BUBBLE controller checks it to avoid
+                        // processing the same event twice.  On some GTK4/WSLg versions
+                        // the BUBBLE controller fires even when CAPTURE returns STOP,
+                        // so a simple GDK_EVENT_STOP return is not sufficient — we need
+                        // this explicit handshake.
+                        let capture_handled: std::cell::Cell<bool> = std::cell::Cell::new(false);
+                        let capture_handled = std::rc::Rc::new(capture_handled);
                         if let Ok(ctrl) = gtk_dynamic_loader::EventControllerKey::new(l.clone()) {
                             ctrl.set_propagation_phase_capture();
                             let sc = shared_cb.clone();
+                            let ch = capture_handled.clone();
                             let _ = ctrl.connect_key_pressed(Box::new(move |keyval: u32, state: u32| -> i32 {
-                                if let Some(ref mut f) = *sc.borrow_mut() {
+                                ch.set(false);
+                                let result = if let Some(ref mut f) = *sc.borrow_mut() {
                                     f(keyval, state)
                                 } else {
                                     0
+                                };
+                                if result != 0 {
+                                    ch.set(true);
                                 }
+                                result
                             }));
                             ctrl.add_to_widget(&self.0);
                             self.1.borrow_mut().push(Box::new(ctrl));
                         }
-                        // BUBBLE-phase controller: no-op.  The CAPTURE-phase controller above
-                        // handles all keys and returns STOP for handled ones, so this
-                        // controller never fires for those keys.  It is retained as a
-                        // safety net for unhandled keys (where CAPTURE returns PROPAGATE),
-                        // ensuring the application callback still fires as a fallback.
+                        // BUBBLE-phase controller: safety net.  The CAPTURE-phase controller
+                        // above handles all keys and sets capture_handled=true.  If BUBBLE
+                        // fires despite CAPTURE having returned STOP (a known issue on some
+                        // GTK4/WSLg versions), we check the flag and skip.
                         if let Ok(ctrl) = gtk_dynamic_loader::EventControllerKey::new(l.clone()) {
                             let sc = shared_cb.clone();
+                            let ch = capture_handled.clone();
                             let _ = ctrl.connect_key_pressed(Box::new(move |keyval: u32, state: u32| -> i32 {
-                                // For NAV_KEYS, the CAPTURE controller already called the
-                                // callback — skip to avoid double-processing.
-                                const NAV_KEYS: &[u32] = &[
-                                    0xFF0D, 0xFF8D, 0xFF1B, 0xFF09,
-                                    0xFF51, 0xFF53, 0xFF52, 0xFF54,
-                                    0xFF50, 0xFF57, 0xFF55, 0xFF56,
-                                ];
-                                if NAV_KEYS.contains(&keyval) {
+                                if ch.get() {
+                                    ch.set(false);
                                     return 0;
                                 }
                                 if let Some(ref mut f) = *sc.borrow_mut() {
@@ -459,6 +468,18 @@ mod gtk_adapter {
         }
         pub unsafe fn insert_action_group(&self, name: &str, group_ptr: *mut std::os::raw::c_void) {
             self.0.insert_action_group(name, group_ptr);
+        }
+        pub fn handle_mnemonic_key(&self, keyval: u32) -> bool {
+            self.0.handle_mnemonic_key(keyval)
+        }
+        pub fn handle_menu_key(&self, keyval: u32, modifiers: u32) -> bool {
+            self.0.handle_menu_key(keyval, modifiers)
+        }
+        pub fn menu_active(&self) -> bool {
+            self.0.menu_active()
+        }
+        pub fn menu_close(&self) {
+            self.0.menu_close();
         }
     }
 

@@ -293,6 +293,10 @@ impl MenuBar {
         self.0.insert_action_group(name, Some(&group));
     }
     pub fn raw_handle(&self) -> *mut std::ffi::c_void { self.0.as_ptr() as *mut _ }
+    pub fn handle_mnemonic_key(&self, _keyval: u32) -> bool { false }
+    pub fn handle_menu_key(&self, _keyval: u32, _mod: u32) -> bool { false }
+    pub fn menu_active(&self) -> bool { false }
+    pub fn menu_close(&self) {}
 }
 
 #[derive(Clone)]

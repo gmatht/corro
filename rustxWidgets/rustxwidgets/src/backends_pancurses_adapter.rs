@@ -305,6 +305,13 @@ mod pancurses_adapter {
         }
     }
 
+    impl MenuBar {
+        pub fn handle_mnemonic_key(&self, _keyval: u32) -> bool { false }
+        pub fn handle_menu_key(&self, _keyval: u32, _mod: u32) -> bool { false }
+        pub fn menu_active(&self) -> bool { false }
+        pub fn menu_close(&self) {}
+    }
+
     // -- SimpleAction --
 
     pub struct SimpleAction {

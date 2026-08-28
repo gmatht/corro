@@ -171,6 +171,31 @@ macro_rules! common_types_mod {
             pub unsafe fn insert_action_group(&self, name: &str, group_ptr: *mut std::os::raw::c_void) {
                 self.inner.insert_action_group(name, group_ptr);
             }
+            /// Handle a mnemonic keypress when a submenu popover may be open.
+            /// Returns true if the key was consumed (matched a menu item).
+            /// Returns false if no match — caller should fall through to normal key handling.
+            /// On NWG/WASM/Pancurses/Zork this is a no-op (returns false).
+            pub fn handle_mnemonic_key(&self, keyval: u32) -> bool {
+                self.inner.handle_mnemonic_key(keyval)
+            }
+            /// Handle any menu-related key event (Alt+letter to open submenu,
+            /// Escape to close, printable to select, Up/Down to navigate).
+            /// `modifiers` is a bitmask of GDK modifier state (1=Shift, 4=Control, 8=Alt/Meta).
+            /// Returns true if the key was consumed by menu handling.
+            /// Callers should also check `menu_active()` to prevent normal key handling.
+            pub fn handle_menu_key(&self, keyval: u32, modifiers: u32) -> bool {
+                self.inner.handle_menu_key(keyval, modifiers)
+            }
+            /// Returns true if a keyboard menu is currently open (Alt+letter was pressed,
+            /// menu is active for navigation).  Callers can use this to skip normal
+            /// key handling when the menu is open.
+            pub fn menu_active(&self) -> bool {
+                self.inner.menu_active()
+            }
+            /// Close any open keyboard menu and dismiss visible popovers.
+            pub fn menu_close(&self) {
+                self.inner.menu_close();
+            }
         }
         impl AsRef<*mut std::os::raw::c_void> for MenuBar {
             fn as_ref(&self) -> &*mut std::os::raw::c_void { self.inner.as_ref() }
@@ -278,11 +303,12 @@ pub use self::platform::ZorkOrientation as Orientation;
 
 // -- Shared menu definition types (no platform deps) --
 
-/// A single menu item: label + action name.
+/// A single menu item: label + action name + optional nested submenu.
 #[derive(Clone, Copy)]
 pub struct MenuItemDef {
     pub label: &'static str,
     pub action: &'static str,
+    pub submenu: Option<&'static [MenuItemDef]>,
 }
 
 /// A submenu: label + prefix for action names + items.

@@ -4,6 +4,7 @@ use std::ffi::CString;
 use std::marker::PhantomData;
 use std::os::raw::c_void;
 use std::collections::HashMap;
+use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -2163,6 +2164,8 @@ pub struct MenuBar {
     mnemonic_index: HashMap<char, usize>,
     model_items: Vec<MenuItem>,
     action_group: *mut c_void,
+    keyboard_menu_active: Rc<Cell<bool>>,
+    active_submenu_idx: Rc<Cell<Option<usize>>>,
     _not_send: PhantomData<Rc<()>>,
 }
 
@@ -2177,6 +2180,8 @@ impl Clone for MenuBar {
             mnemonic_index: self.mnemonic_index.clone(),
             model_items: self.model_items.clone(),
             action_group: self.action_group,
+            keyboard_menu_active: self.keyboard_menu_active.clone(),
+            active_submenu_idx: self.active_submenu_idx.clone(),
             _not_send: PhantomData,
         }
     }
@@ -2198,16 +2203,18 @@ impl MenuBar {
             let mut mnemonic_index = HashMap::new();
             for (i, item) in model.items.iter().enumerate() {
                 // label is "_File" → skip '_' → mnemonic is first remaining char 'F'
-                if let Some(m) = item.label.chars()
+                // If no '_' is found, fall back to the first character of the label.
+                let m = item.label.chars()
                     .skip_while(|&c| c != '_')
                     .skip(1)  // skip the '_' itself
                     .next()   // take the mnemonic character
-                    .map(|c| c.to_ascii_uppercase())
-                {
+                    .or_else(|| item.label.chars().next())
+                    .map(|c| c.to_ascii_uppercase());
+                if let Some(m) = m {
                     mnemonic_index.entry(m).or_insert(i);
                 }
             }
-            return Ok(MenuBar { inner, loader, mnemonic_index, model_items: model.items.clone(), action_group, _not_send: PhantomData });
+            return Ok(MenuBar { inner, loader, mnemonic_index, model_items: model.items.clone(), action_group, keyboard_menu_active: Rc::new(Cell::new(false)), active_submenu_idx: Rc::new(Cell::new(None)), _not_send: PhantomData });
         }
         // GTK3: build GtkMenuBar from the Rust-side items
         if let (Some(menu_bar_new), Some(_), Some(_)) = (
@@ -2221,7 +2228,7 @@ impl MenuBar {
             }
             Self::build_gtk3(&loader, inner, &model.items, &symbols, action_group);
             take_ownership(&symbols, &loader.version, inner);
-            return Ok(MenuBar { inner, loader, mnemonic_index: HashMap::new(), model_items: model.items.clone(), action_group, _not_send: PhantomData });
+            return Ok(MenuBar { inner, loader, mnemonic_index: HashMap::new(), model_items: model.items.clone(), action_group, keyboard_menu_active: Rc::new(Cell::new(false)), active_submenu_idx: Rc::new(Cell::new(None)), _not_send: PhantomData });
         }
         Err(Error::MissingSymbol("gtk_popover_menu_bar_new_from_model".into()))
     }
@@ -2309,6 +2316,7 @@ impl MenuBar {
 
     /// Activate a submenu item whose mnemonic matches `keyval` when a popover
     /// is already open.  Returns true if a matching item was found and activated.
+    /// Recursively searches nested submenus to find items at any depth.
     pub fn activate_submenu_item_by_mnemonic(&self, keyval: u32) -> bool {
         let symbols = &self.loader.symbols;
         let activate_action = match symbols.g_action_group_activate_action {
@@ -2319,27 +2327,23 @@ impl MenuBar {
         if self.action_group.is_null() {
             return false;
         }
+        let action_group = self.action_group;
 
         let key_upper = char::from_u32(keyval)
             .map(|c| c.to_ascii_uppercase())
             .unwrap_or('\0');
 
-        // Iterate all top-level bar items; for each one that has a submenu,
-        // check if any item's mnemonic matches.
-        for bar_item in &self.model_items {
-            let submenu = match &bar_item.submenu {
-                Some(m) => &m.items,
-                None => continue,
-            };
-            for sub_item in submenu {
+        fn search_items(items: &[MenuItem], key_upper: char,
+            activate_action: unsafe extern "C" fn(*mut c_void, *const i8, *mut c_void),
+            action_group: *mut c_void) -> bool
+        {
+            for sub_item in items {
                 if let Some(m) = sub_item.label.chars()
                     .skip_while(|&c| c != '_')
                     .nth(1)
                     .map(|c| c.to_ascii_uppercase())
                 {
                     if m == key_upper && !sub_item.detailed_action.is_empty() {
-                        // Extract the action name (without prefix) from the
-                        // detailed action name (e.g. "app.quit" -> "quit").
                         let action_name = sub_item.detailed_action
                             .rsplit('.')
                             .next()
@@ -2348,9 +2352,23 @@ impl MenuBar {
                             Ok(c) => c,
                             Err(_) => continue,
                         };
-                        unsafe { activate_action(self.action_group, c_action.as_ptr(), std::ptr::null_mut()); }
+                        unsafe { activate_action(action_group, c_action.as_ptr(), std::ptr::null_mut()); }
                         return true;
                     }
+                }
+                if let Some(ref children) = sub_item.submenu {
+                    if search_items(&children.items, key_upper, activate_action, action_group) {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+
+        for bar_item in &self.model_items {
+            if let Some(ref submenu) = bar_item.submenu {
+                if search_items(&submenu.items, key_upper, activate_action, action_group) {
+                    return true;
                 }
             }
         }
@@ -2427,6 +2445,206 @@ impl MenuBar {
             }
         }
         count
+    }
+
+    /// Handle a mnemonic keypress when a submenu popover may be visible.
+    /// Searches all leaf menu items for a matching mnemonic.
+    /// If found, activates the action and closes all visible popovers.
+    /// Returns true if the key was consumed.
+    pub fn handle_mnemonic_key(&self, keyval: u32) -> bool {
+        let symbols = &self.loader.symbols;
+        let activate_action = match symbols.g_action_group_activate_action {
+            Some(f) => f,
+            None => return false,
+        };
+        if self.action_group.is_null() { return false; }
+        let action_group = self.action_group;
+        let key_upper = char::from_u32(keyval)
+            .map(|c| c.to_ascii_uppercase())
+            .unwrap_or('\0');
+
+        fn search_items(items: &[MenuItem], key_upper: char,
+            activate_action: unsafe extern "C" fn(*mut c_void, *const i8, *mut c_void),
+            action_group: *mut c_void) -> Option<String>
+        {
+            for sub_item in items {
+                if let Some(m) = sub_item.label.chars()
+                    .skip_while(|&c| c != '_')
+                    .nth(1)
+                    .map(|c| c.to_ascii_uppercase())
+                {
+                    if m == key_upper && !sub_item.detailed_action.is_empty() {
+                        let action_name = sub_item.detailed_action
+                            .rsplit('.')
+                            .next()
+                            .unwrap_or(&sub_item.detailed_action)
+                            .to_string();
+                        return Some(action_name);
+                    }
+                }
+                if let Some(ref children) = sub_item.submenu {
+                    if let Some(found) = search_items(&children.items, key_upper, activate_action, action_group) {
+                        return Some(found);
+                    }
+                }
+            }
+            None
+        }
+
+        // Search only the active submenu (opened by Alt+letter), not all submenus.
+        // Without this scoping, a letter key would match the FIRST submenu globally
+        // that contains an item with that mnemonic, which may be different from the
+        // submenu the user is currently navigating (e.g., 'l' matches Format→Ce_ll
+        // instead of Tools→Export Al_l, since Format appears before Tools in the bar).
+        let mut found_action: Option<String> = None;
+        if let Some(idx) = self.active_submenu_idx.get() {
+            if let Some(ref submenu) = self.model_items[idx].submenu {
+                found_action = search_items(&submenu.items, key_upper, activate_action, action_group);
+            }
+        } else {
+            // Legacy fallback: search all submenus (used when no Alt+letter was pressed)
+            for bar_item in &self.model_items {
+                if let Some(ref submenu) = bar_item.submenu {
+                    if let Some(action) = search_items(&submenu.items, key_upper, activate_action, action_group) {
+                        found_action = Some(action);
+                        break;
+                    }
+                }
+            }
+        }
+
+        if let Some(action_name) = found_action {
+            if let Ok(c_action) = std::ffi::CString::new(action_name.as_str()) {
+                unsafe { activate_action(action_group, c_action.as_ptr(), std::ptr::null_mut()); }
+            }
+            // Clear the keyboard menu flag: after the action is activated,
+            // the menu interaction is complete.  If this flag stays true,
+            // subsequent printable keys (e.g., an autorepeat of the same
+            // character) will be re-routed through the menu system, causing
+            // double-activation.
+            self.keyboard_menu_active.set(false);
+            self.active_submenu_idx.set(None);
+            // Close all visible bar popovers
+            if let (Some(get_first), Some(get_next), Some(get_popover), Some(set_visible)) = (
+                symbols.gtk_widget_get_first_child,
+                symbols.gtk_widget_get_next_sibling,
+                symbols.gtk_menu_button_get_popover,
+                symbols.gtk_widget_set_visible,
+            ) {
+                unsafe {
+                    let mut child = get_first(self.inner);
+                    while !child.is_null() {
+                        let menu_btn = get_first(child);
+                        if !menu_btn.is_null() {
+                            let popover = get_popover(menu_btn);
+                            if !popover.is_null() {
+                                set_visible(popover, 0);
+                            }
+                        }
+                        child = get_next(child);
+                    }
+                }
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Handle any menu-related key: Alt+letter opens a submenu,
+    /// Escape closes, printable selects an item.
+    pub fn handle_menu_key(&self, keyval: u32, modifiers: u32) -> bool {
+        const ALT_MASK: u32 = 8;
+        let alt_held = (modifiers & ALT_MASK) != 0;
+        // Alt+letter: open submenu
+        if alt_held && (32..=126).contains(&keyval) {
+            if self.activate_submenu_by_mnemonic(keyval) {
+                self.keyboard_menu_active.set(true);
+                let key_upper = char::from_u32(keyval)
+                    .map(|c| c.to_ascii_uppercase()).unwrap_or('\0');
+                self.active_submenu_idx.set(self.mnemonic_index.get(&key_upper).copied());
+                return true;
+            }
+            // GTK popover path failed — try Rust-side by treating as mnemonic
+            let key_upper = char::from_u32(keyval)
+                .map(|c| c.to_ascii_uppercase()).unwrap_or('\0');
+            for (i, item) in self.model_items.iter().enumerate() {
+                // Look for _<char> mnemonic; if no '_' found, use first char as mnemonic.
+                let m = item.label.chars()
+                    .skip_while(|&c| c != '_').nth(1)
+                    .or_else(|| item.label.chars().next())
+                    .map(|c| c.to_ascii_uppercase());
+                if let Some(m) = m {
+                    if m == key_upper {
+                        self.keyboard_menu_active.set(true);
+                        self.active_submenu_idx.set(Some(i));
+                        return true;
+                    }
+                }
+            }
+            self.active_submenu_idx.set(None);
+            return false;
+        }
+        // Escape: close keyboard menu
+        if keyval == 0xFF1B && self.keyboard_menu_active.get() {
+            self.keyboard_menu_active.set(false);
+            self.active_submenu_idx.set(None);
+            // Close visible popovers too
+            if let (Some(get_first), Some(get_next), Some(get_popover), Some(set_visible)) = (
+                self.loader.symbols.gtk_widget_get_first_child,
+                self.loader.symbols.gtk_widget_get_next_sibling,
+                self.loader.symbols.gtk_menu_button_get_popover,
+                self.loader.symbols.gtk_widget_set_visible,
+            ) {
+                unsafe {
+                    let mut child = get_first(self.inner);
+                    while !child.is_null() {
+                        let menu_btn = get_first(child);
+                        if !menu_btn.is_null() {
+                            let popover = get_popover(menu_btn);
+                            if !popover.is_null() {
+                                set_visible(popover, 0);
+                            }
+                        }
+                        child = get_next(child);
+                    }
+                }
+            }
+            return true;
+        }
+        // Printable when menu active: try mnemonic
+        if self.keyboard_menu_active.get() && !alt_held && (32..=126).contains(&keyval) {
+            return self.handle_mnemonic_key(keyval);
+        }
+        false
+    }
+
+    pub fn menu_active(&self) -> bool {
+        self.keyboard_menu_active.get()
+    }
+
+    pub fn menu_close(&self) {
+        self.keyboard_menu_active.set(false);
+        self.active_submenu_idx.set(None);
+        if let (Some(get_first), Some(get_next), Some(get_popover), Some(set_visible)) = (
+            self.loader.symbols.gtk_widget_get_first_child,
+            self.loader.symbols.gtk_widget_get_next_sibling,
+            self.loader.symbols.gtk_menu_button_get_popover,
+            self.loader.symbols.gtk_widget_set_visible,
+        ) {
+            unsafe {
+                let mut child = get_first(self.inner);
+                while !child.is_null() {
+                    let menu_btn = get_first(child);
+                    if !menu_btn.is_null() {
+                        let popover = get_popover(menu_btn);
+                        if !popover.is_null() {
+                            set_visible(popover, 0);
+                        }
+                    }
+                    child = get_next(child);
+                }
+            }
+        }
     }
 
     /// Diagnostic: check which action names exist in the given GActionMap.

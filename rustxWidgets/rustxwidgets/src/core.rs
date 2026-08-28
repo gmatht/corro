@@ -1016,12 +1016,21 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
     /// `label_prefix` is prepended to each submenu label (e.g. "\u{3164}" for
     /// GTK4 to prevent mnemonic accelerator assignment; pass "" for other backends).
     pub fn build_menu_model(&self, submenus: &[crate::common::SubmenuDef], label_prefix: &str) -> Result<crate::common::Menu, Error> {
+        fn build_items(app: &App, items: &[crate::common::MenuItemDef], prefix: &str) -> Result<crate::common::Menu, Error> {
+            let mut menu = app.new_menu()?;
+            for item in items {
+                if let Some(children) = item.submenu {
+                    let sub = build_items(app, children, prefix)?;
+                    menu.append_submenu(item.label, &sub);
+                } else {
+                    menu.append(item.label, &format!("{}.{}", prefix, item.action));
+                }
+            }
+            Ok(menu)
+        }
         let mut root = self.new_menu()?;
         for sm in submenus {
-            let mut sub = self.new_menu()?;
-            for item in sm.items {
-                sub.append(item.label, &format!("{}.{}", sm.prefix, item.action));
-            }
+            let sub = build_items(self, sm.items, sm.prefix)?;
             root.append_submenu(sm.label, &sub);
         }
         Ok(root)
