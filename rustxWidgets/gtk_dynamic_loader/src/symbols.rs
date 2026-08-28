@@ -34,6 +34,8 @@ pub type GtkInit = unsafe extern "C" fn(argc: *mut libc::c_int, argv: *mut *mut 
 pub type GtkLabelSetMarkup = unsafe extern "C" fn(label: *mut c_void, markup: *const i8);
 pub type GtkWidgetSetVisible = unsafe extern "C" fn(widget: *mut c_void, visible: i32);
 pub type GtkWidgetGrabFocus = unsafe extern "C" fn(widget: *mut c_void);
+pub type GtkWidgetSetCanFocus = unsafe extern "C" fn(widget: *mut c_void, can_focus: i32);
+pub type GdkEventGetState = unsafe extern "C" fn(event: *mut c_void) -> u32;
 pub type GtkWidgetGetStyleContext = unsafe extern "C" fn(widget: *mut c_void) -> *mut c_void;
 pub type GtkStyleContextAddClass = unsafe extern "C" fn(context: *mut c_void, class_name: *const i8);
 pub type GtkStyleContextRemoveClass = unsafe extern "C" fn(context: *mut c_void, class_name: *const i8);
@@ -46,6 +48,7 @@ pub type GApplicationRun = unsafe extern "C" fn(application: *mut c_void, argc: 
 pub type GApplicationRegister = unsafe extern "C" fn(application: *mut c_void, cancellable: *mut c_void, error: *mut *mut c_void) -> i32;
 pub type GSimpleActionNew = unsafe extern "C" fn(name: *const i8, parameter_type: *mut c_void) -> *mut c_void;
 pub type GActionMapAddAction = unsafe extern "C" fn(map: *mut c_void, action: *mut c_void);
+pub type GSimpleActionGroupNew = unsafe extern "C" fn() -> *mut c_void;
 pub type GActionGroupActivateAction = unsafe extern "C" fn(group: *mut c_void, action_name: *const i8, parameter: *mut c_void);
 pub type GActionMapLookupAction = unsafe extern "C" fn(map: *mut c_void, action_name: *const i8) -> *mut c_void;
 pub type GActionActivate = unsafe extern "C" fn(action: *mut c_void, parameter: *mut c_void);
@@ -78,10 +81,9 @@ pub type GtkFileChooserNativeNew = unsafe extern "C" fn(title: *const i8, parent
 pub type GtkNativeDialogRun = unsafe extern "C" fn(native: *mut c_void) -> i32;
 pub type GtkFileChooserGetFilename = unsafe extern "C" fn(chooser: *mut c_void) -> *const i8;
 pub type GtkWidgetDestroy = unsafe extern "C" fn(widget: *mut c_void);
-pub type GtkWindowClose = unsafe extern "C" fn(window: *mut c_void);
 pub type GFree = unsafe extern "C" fn(ptr: *mut c_void);
 // gdk event helpers
-pub type GdkEventGetKeyval = unsafe extern "C" fn(event: *mut c_void, keyval: *mut u32) -> i32;
+pub type GdkEventGetKeyval = unsafe extern "C" fn(event: *mut c_void) -> u32;
 pub type GdkKeyvalFromName = unsafe extern "C" fn(name: *const i8) -> u32;
 pub type GdkDisplayGetDefault = unsafe extern "C" fn() -> *mut c_void;
 pub type GdkScreenGetDefault = unsafe extern "C" fn() -> *mut c_void;
@@ -91,7 +93,6 @@ pub type GtkLabelSetXalign = unsafe extern "C" fn(label: *mut c_void, xalign: f3
 pub type GtkEventControllerKeyNew = unsafe extern "C" fn() -> *mut c_void;
 pub type GtkEventControllerFocusNew = unsafe extern "C" fn() -> *mut c_void;
 pub type GtkWidgetAddController = unsafe extern "C" fn(widget: *mut c_void, controller: *mut c_void);
-pub type GtkEventControllerSetPropagationPhase = unsafe extern "C" fn(controller: *mut c_void, phase: u32);
 pub type GtkScrolledWindowGetVadjustment = unsafe extern "C" fn(sw: *mut c_void) -> *mut c_void;
 pub type GtkScrolledWindowGetHadjustment = unsafe extern "C" fn(sw: *mut c_void) -> *mut c_void;
 pub type GtkAdjustmentGetValue = unsafe extern "C" fn(adj: *mut c_void) -> f64;
@@ -154,7 +155,6 @@ pub type GtkWidgetGetVexpand = unsafe extern "C" fn(widget: *mut c_void) -> i32;
 // GtkEditable (GTK4 replacement for gtk_entry_get_text/set_text)
 pub type GtkEditableGetText = unsafe extern "C" fn(editable: *mut c_void) -> *const i8;
 pub type GtkEditableSetText = unsafe extern "C" fn(editable: *mut c_void, text: *const i8);
-pub type GtkEditableSetPosition = unsafe extern "C" fn(editable: *mut c_void, position: i32);
 
 // GtkWidget parent handling
 pub type GtkWidgetUnparent = unsafe extern "C" fn(widget: *mut c_void);
@@ -256,6 +256,8 @@ pub struct Symbols {
     pub gtk_label_set_markup: Option<GtkLabelSetMarkup>,
     pub gtk_widget_set_visible: Option<GtkWidgetSetVisible>,
     pub gtk_widget_grab_focus: Option<GtkWidgetGrabFocus>,
+    pub gtk_widget_set_can_focus: Option<GtkWidgetSetCanFocus>,
+    pub gdk_event_get_state: Option<GdkEventGetState>,
     pub gtk_widget_get_style_context: Option<GtkWidgetGetStyleContext>,
     pub gtk_style_context_add_class: Option<GtkStyleContextAddClass>,
     pub gtk_style_context_remove_class: Option<GtkStyleContextRemoveClass>,
@@ -273,7 +275,6 @@ pub struct Symbols {
     pub gtk_native_dialog_run: Option<GtkNativeDialogRun>,
     pub gtk_file_chooser_get_filename: Option<GtkFileChooserGetFilename>,
     pub gtk_widget_destroy: Option<GtkWidgetDestroy>,
-    pub gtk_window_close: Option<GtkWindowClose>,
     pub g_free: Option<GFree>,
     pub gdk_display_get_default: Option<GdkDisplayGetDefault>,
     pub gdk_screen_get_default: Option<GdkScreenGetDefault>,
@@ -286,6 +287,7 @@ pub struct Symbols {
     pub g_application_run: Option<GApplicationRun>,
     pub g_application_register: Option<GApplicationRegister>,
     pub g_simple_action_new: Option<GSimpleActionNew>,
+    pub g_simple_action_group_new: Option<GSimpleActionGroupNew>,
     pub g_action_map_add_action: Option<GActionMapAddAction>,
     pub g_action_group_activate_action: Option<GActionGroupActivateAction>,
     pub g_action_map_lookup_action: Option<GActionMapLookupAction>,
@@ -327,7 +329,6 @@ pub struct Symbols {
     pub gtk_event_controller_key_new: Option<GtkEventControllerKeyNew>,
     pub gtk_event_controller_focus_new: Option<GtkEventControllerFocusNew>,
     pub gtk_widget_add_controller: Option<GtkWidgetAddController>,
-    pub gtk_event_controller_set_propagation_phase: Option<GtkEventControllerSetPropagationPhase>,
     pub gtk_widget_set_can_target: Option<GtkWidgetSetCanTarget>,
     pub gtk_widget_set_halign: Option<GtkWidgetSetHalign>,
     pub gtk_widget_set_valign: Option<GtkWidgetSetValign>,
@@ -399,7 +400,6 @@ pub struct Symbols {
     // GtkEditable (GTK4)
     pub gtk_editable_get_text: Option<GtkEditableGetText>,
     pub gtk_editable_set_text: Option<GtkEditableSetText>,
-    pub gtk_editable_set_position: Option<GtkEditableSetPosition>,
 
     // GtkWidget parent handling
     pub gtk_widget_unparent: Option<GtkWidgetUnparent>,
@@ -474,7 +474,6 @@ impl Symbols {
         let gtk_native_dialog_run = open_sym_try!(libs, "libgio", GtkNativeDialogRun, "gtk_native_dialog_run").or_else(|| unsafe { sym::<GtkNativeDialogRun>(gtk, "gtk_native_dialog_run") });
         let gtk_file_chooser_get_filename = open_sym_try!(libs, "libgio", GtkFileChooserGetFilename, "gtk_file_chooser_get_filename").or_else(|| unsafe { sym::<GtkFileChooserGetFilename>(gtk, "gtk_file_chooser_get_filename") });
         let gtk_widget_destroy = unsafe { sym::<GtkWidgetDestroy>(gtk, "gtk_widget_destroy") };
-        let gtk_window_close = unsafe { sym::<GtkWindowClose>(gtk, "gtk_window_close") };
         let g_free = unsafe { sym::<GFree>(glib, "g_free") };
         let gdk_display_get_default = open_sym_try!(libs, "libgdk", GdkDisplayGetDefault, "gdk_display_get_default").or_else(|| unsafe { sym::<GdkDisplayGetDefault>(gtk, "gdk_display_get_default") });
         let gdk_screen_get_default = open_sym_try!(libs, "libgdk", GdkScreenGetDefault, "gdk_screen_get_default").or_else(|| unsafe { sym::<GdkScreenGetDefault>(gtk, "gdk_screen_get_default") });
@@ -495,6 +494,8 @@ impl Symbols {
         let gtk_label_set_markup = unsafe { sym::<GtkLabelSetMarkup>(gtk, "gtk_label_set_markup") };
         let gtk_widget_set_visible = unsafe { sym::<GtkWidgetSetVisible>(gtk, "gtk_widget_set_visible") };
         let gtk_widget_grab_focus = unsafe { sym::<GtkWidgetGrabFocus>(gtk, "gtk_widget_grab_focus") };
+        let gtk_widget_set_can_focus = unsafe { sym::<GtkWidgetSetCanFocus>(gtk, "gtk_widget_set_can_focus") };
+        let gdk_event_get_state = open_sym_try!(libs, "libgdk", GdkEventGetState, "gdk_event_get_state").or_else(|| unsafe { sym::<GdkEventGetState>(gtk, "gdk_event_get_state") });
         let gtk_widget_get_style_context = unsafe { sym::<GtkWidgetGetStyleContext>(gtk, "gtk_widget_get_style_context") };
         let gtk_style_context_add_class = unsafe { sym::<GtkStyleContextAddClass>(gtk, "gtk_style_context_add_class") };
         let gtk_style_context_remove_class = unsafe { sym::<GtkStyleContextRemoveClass>(gtk, "gtk_style_context_remove_class") };
@@ -543,7 +544,6 @@ impl Symbols {
         let gtk_event_controller_key_new = unsafe { sym::<GtkEventControllerKeyNew>(gtk, "gtk_event_controller_key_new") };
         let gtk_event_controller_focus_new = unsafe { sym::<GtkEventControllerFocusNew>(gtk, "gtk_event_controller_focus_new") };
         let gtk_widget_add_controller = unsafe { sym::<GtkWidgetAddController>(gtk, "gtk_widget_add_controller") };
-        let gtk_event_controller_set_propagation_phase = unsafe { sym::<GtkEventControllerSetPropagationPhase>(gtk, "gtk_event_controller_set_propagation_phase") };
         let gtk_widget_set_can_target = unsafe { sym::<GtkWidgetSetCanTarget>(gtk, "gtk_widget_set_can_target") };
         let gtk_widget_set_halign = unsafe { sym::<GtkWidgetSetHalign>(gtk, "gtk_widget_set_halign") };
         let gtk_widget_set_valign = unsafe { sym::<GtkWidgetSetValign>(gtk, "gtk_widget_set_valign") };
@@ -566,6 +566,7 @@ impl Symbols {
         let g_action_map_add_action = open_sym_try!(libs, "libgio", GActionMapAddAction, "g_action_map_add_action").or_else(|| unsafe { sym::<GActionMapAddAction>(glib, "g_action_map_add_action") });
         let g_action_group_activate_action = open_sym_try!(libs, "libgio", GActionGroupActivateAction, "g_action_group_activate_action").or_else(|| unsafe { sym::<GActionGroupActivateAction>(glib, "g_action_group_activate_action") });
         let g_action_map_lookup_action = open_sym_try!(libs, "libgio", GActionMapLookupAction, "g_action_map_lookup_action").or_else(|| unsafe { sym::<GActionMapLookupAction>(glib, "g_action_map_lookup_action") });
+        let g_simple_action_group_new = open_sym_try!(libs, "libgio", GSimpleActionGroupNew, "g_simple_action_group_new").or_else(|| unsafe { sym::<GSimpleActionGroupNew>(glib, "g_simple_action_group_new") });
         let g_action_activate = open_sym_try!(libs, "libgio", GActionActivate, "g_action_activate").or_else(|| unsafe { sym::<GActionActivate>(glib, "g_action_activate") });
         let g_menu_new = open_sym_try!(libs, "libgio", GMenuNew, "g_menu_new").or_else(|| unsafe { sym::<GMenuNew>(glib, "g_menu_new") });
         let g_menu_append = open_sym_try!(libs, "libgio", GMenuAppend, "g_menu_append").or_else(|| unsafe { sym::<GMenuAppend>(glib, "g_menu_append") });
@@ -639,7 +640,6 @@ impl Symbols {
         // GtkEditable (GTK4, replaces gtk_entry_get_text/set_text)
         let gtk_editable_get_text = unsafe { sym::<GtkEditableGetText>(gtk, "gtk_editable_get_text") };
         let gtk_editable_set_text = unsafe { sym::<GtkEditableSetText>(gtk, "gtk_editable_set_text") };
-        let gtk_editable_set_position = unsafe { sym::<GtkEditableSetPosition>(gtk, "gtk_editable_set_position") };
 
         // GtkWidget parent handling
         let gtk_widget_unparent = unsafe { sym::<GtkWidgetUnparent>(gtk, "gtk_widget_unparent") };
@@ -656,7 +656,7 @@ impl Symbols {
             gtk_widget_show_all, gtk_window_present,
             gtk_grid_new, gtk_grid_attach, gtk_entry_new, gtk_entry_set_text, gtk_entry_get_text,
             gtk_entry_set_width_chars, gtk_widget_set_size_request, gtk_entry_set_has_frame,
-            gtk_label_set_markup, gtk_widget_set_visible, gtk_widget_grab_focus,
+            gtk_label_set_markup, gtk_widget_set_visible, gtk_widget_grab_focus, gtk_widget_set_can_focus,
             gtk_widget_get_style_context, gtk_style_context_add_class, gtk_style_context_remove_class,
             gtk_css_provider_new, gtk_css_provider_load_from_data, gtk_style_context_add_provider,
             gtk_overlay_new, gtk_overlay_add_overlay, gtk_overlay_set_overlay_pass_through, gtk_overlay_set_child,
@@ -671,14 +671,13 @@ impl Symbols {
             cairo_create, cairo_font_face_destroy,
             cairo_move_to, cairo_set_source_rgb, cairo_set_source_rgba, cairo_rectangle, cairo_fill, cairo_stroke, cairo_set_line_width, cairo_select_font_face, cairo_set_font_size, cairo_show_text,
             gtk_widget_queue_draw,
-            gtk_file_chooser_native_new, gtk_native_dialog_run, gtk_file_chooser_get_filename, gtk_widget_destroy, gtk_window_close, g_free, gdk_display_get_default, gdk_screen_get_default, gtk_style_context_add_provider_for_display, gtk_style_context_add_provider_for_screen, gdk_event_get_keyval, gdk_keyval_from_name,
-            gtk_application_new, g_application_run, g_application_register, g_simple_action_new, g_action_map_add_action, g_action_group_activate_action, g_action_map_lookup_action, g_action_activate,
+            gtk_file_chooser_native_new, gtk_native_dialog_run, gtk_file_chooser_get_filename, gtk_widget_destroy, g_free, gdk_display_get_default, gdk_screen_get_default, gtk_style_context_add_provider_for_display, gtk_style_context_add_provider_for_screen, gdk_event_get_keyval, gdk_keyval_from_name, gdk_event_get_state,
+            gtk_application_new, g_application_run, g_application_register, g_simple_action_new, g_action_map_add_action, g_action_group_activate_action, g_action_map_lookup_action, g_action_activate, g_simple_action_group_new,
             g_menu_new, g_menu_append, g_application_set_app_menu, g_application_set_menubar, g_menu_append_submenu, gtk_popover_menu_bar_new_from_model, gtk_menu_bar_new, gtk_menu_new, gtk_menu_item_new_with_label, gtk_menu_shell_append, gtk_menu_item_set_submenu, gtk_window_set_application, gtk_widget_insert_action_group, gtk_actionable_set_detailed_action_name, g_menu_model_get_n_items, g_menu_model_get_item_attribute_value, g_menu_model_get_item_link, g_variant_get_string, g_variant_unref,
             gtk_label_set_xalign,
             gtk_event_controller_key_new,
             gtk_event_controller_focus_new,
             gtk_widget_add_controller,
-            gtk_event_controller_set_propagation_phase,
             gtk_widget_set_can_target,
             gtk_widget_set_halign,
             gtk_widget_set_valign,
@@ -699,7 +698,7 @@ impl Symbols {
             gtk_text_view_new, gtk_text_buffer_new, gtk_text_view_get_buffer, gtk_text_buffer_set_text, gtk_text_buffer_get_text, gtk_text_buffer_get_start_iter, gtk_text_buffer_get_end_iter, gtk_text_iter_copy, gtk_text_iter_free, gtk_text_view_set_wrap_mode,
             gtk_widget_set_hexpand, gtk_widget_set_vexpand,
             gtk_widget_get_hexpand, gtk_widget_get_vexpand,
-            gtk_editable_get_text, gtk_editable_set_text, gtk_editable_set_position,
+            gtk_editable_get_text, gtk_editable_set_text,
             gtk_widget_unparent, gtk_widget_get_parent,
             gtk_window_set_default_size,
             gtk_drawing_area_set_draw_func, gtk_drawing_area_set_content_width, gtk_drawing_area_set_content_height,

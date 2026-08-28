@@ -8,8 +8,8 @@ mod wasm_adapter {
     use wasm_bindgen::closure::Closure;
     use wasm_bindgen::JsCast;
     use web_sys::{
-        Document, Element, Event, FocusEvent, HtmlButtonElement, HtmlCanvasElement,
-        HtmlDialogElement, HtmlDivElement, HtmlElement, HtmlInputElement, HtmlOptionElement,
+        Document, Element, Event, FocusEvent, HtmlButtonElement, HtmlDialogElement,
+        HtmlDivElement, HtmlElement, HtmlInputElement, HtmlOptionElement,
         HtmlSelectElement, HtmlTextAreaElement, KeyboardEvent, MouseEvent,
     };
     use crate::core::{Error, Widget};
@@ -72,21 +72,6 @@ mod wasm_adapter {
     }
 
     // -----------------------------------------------------------------------
-    // Global closure storage – prevents Closures from being dropped while
-    // DOM event listeners still reference them after main() returns.
-    // -----------------------------------------------------------------------
-    struct AnySend(Box<dyn Any>);
-    unsafe impl Send for AnySend {}
-
-    fn store_closure(c: Box<dyn Any>) {
-        use once_cell::sync::Lazy;
-        use std::sync::Mutex;
-        static CLOSURES: Lazy<Mutex<Vec<AnySend>>> =
-            Lazy::new(|| Mutex::new(Vec::new()));
-        CLOSURES.lock().unwrap().push(AnySend(c));
-    }
-
-    // -----------------------------------------------------------------------
     // Orientation
     // -----------------------------------------------------------------------
     pub enum Orientation {
@@ -122,26 +107,21 @@ mod wasm_adapter {
         }
     }
 
-impl Window {
-    pub fn set_title(&self, title: &str) {
-        self.elem.set_text_content(Some(title));
-    }
+    impl Window {
+        pub fn set_title(&self, title: &str) {
+            document().set_title(title);
+        }
 
-    pub fn set_child(&self, child: &impl AsElement) {
-        self.elem.append_child(child.as_element()).ok();
-    }
+        pub fn set_child(&self, child: &impl AsElement) {
+            while let Some(c) = self.elem.first_child() {
+                self.elem.remove_child(&c).ok();
+            }
+            self.elem.append_child(child.as_element()).ok();
+        }
 
-    pub fn set_child_box(&self, child: &impl AsElement) {
-        self.elem.append_child(child.as_element()).ok();
-    }
+        pub fn present(&self) {}
 
-    pub fn present(&self) {}
-
-    pub fn hwnd(&self) -> *mut c_void {
-        &self.elem as *const HtmlDivElement as *mut c_void
-    }
-
-    pub fn set_default_size(&self, w: i32, h: i32) {
+        pub fn set_default_size(&self, w: i32, h: i32) {
             if w > 0 {
                 set_css(self.elem.as_ref(), "width", &format!("{}px", w));
             }
@@ -208,27 +188,13 @@ impl Window {
                 .map_err(|e| Error::Backend(format!("on_click: {:?}", e)))?;
             let id = *self.next_id.borrow();
             *self.next_id.borrow_mut() += 1;
-            store_closure(Box::new(closure));
+            self.closures.borrow_mut().push(Box::new(closure));
             Ok(id)
         }
 
         pub fn emit_clicked(&self) -> Result<u64, Error> {
             self.elem.click();
             Ok(0)
-        }
-
-        pub fn set_size_request(&self, w: i32, h: i32) {
-            if w > 0 {
-                set_css(self.elem.as_ref(), "width", &format!("{}px", w));
-            }
-            if h > 0 {
-                set_css(self.elem.as_ref(), "height", &format!("{}px", h));
-            }
-        }
-
-        pub fn set_font_style(&self, weight: i32, italic: bool) {
-            set_css(self.elem.as_ref(), "font-weight", &weight.to_string());
-            set_css(self.elem.as_ref(), "font-style", if italic { "italic" } else { "normal" });
         }
     }
 
@@ -338,25 +304,6 @@ impl Window {
     impl BoxWidget {
         pub fn append(&self, child: &impl AsElement) {
             self.elem.append_child(child.as_element()).ok();
-        }
-
-        pub fn set_child_vexpand(&self, child: &impl AsElement, expand: bool) {
-            if let Some(html) = child.as_element().dyn_ref::<HtmlElement>() {
-                if expand {
-                    html.style().set_property("flex-grow", "1").ok();
-                    html.style().set_property("align-self", "stretch").ok();
-                } else {
-                    html.style().set_property("flex-grow", "0").ok();
-                }
-            }
-        }
-
-        pub fn set_child_hexpand(&self, child: &impl AsElement, expand: bool) {
-            if let Some(html) = child.as_element().dyn_ref::<HtmlElement>() {
-                if expand {
-                    html.style().set_property("align-self", "stretch").ok();
-                }
-            }
         }
     }
 
@@ -485,7 +432,7 @@ impl Window {
                 .map_err(|e| Error::Backend(format!("connect_changed: {:?}", e)))?;
             let id = *self.next_id.borrow();
             *self.next_id.borrow_mut() += 1;
-            store_closure(Box::new(closure));
+            self.closures.borrow_mut().push(Box::new(closure));
             Ok(id)
         }
 
@@ -506,7 +453,7 @@ impl Window {
                 .map_err(|e| Error::Backend(format!("connect_activate: {:?}", e)))?;
             let id = *self.next_id.borrow();
             *self.next_id.borrow_mut() += 1;
-            store_closure(Box::new(closure));
+            self.closures.borrow_mut().push(Box::new(closure));
             Ok(id)
         }
 
@@ -521,7 +468,7 @@ impl Window {
                 .map_err(|e| Error::Backend(format!("connect_button_press: {:?}", e)))?;
             let id = *self.next_id.borrow();
             *self.next_id.borrow_mut() += 1;
-            store_closure(Box::new(closure));
+            self.closures.borrow_mut().push(Box::new(closure));
             Ok(id)
         }
 
@@ -551,56 +498,8 @@ impl Window {
                 .map_err(|e| Error::Backend(format!("connect_focus_in_event: {:?}", e)))?;
             let id = *self.next_id.borrow();
             *self.next_id.borrow_mut() += 1;
-            store_closure(Box::new(closure));
+            self.closures.borrow_mut().push(Box::new(closure));
             Ok(id)
-        }
-
-        pub fn set_margin_start(&self, margin: i32) {
-            set_css(self.elem.as_ref(), "left", &format!("{}px", margin));
-        }
-
-        pub fn set_margin_top(&self, margin: i32) {
-            set_css(self.elem.as_ref(), "top", &format!("{}px", margin));
-        }
-
-        pub fn set_halign(&self, align: i32) {
-            let tx = match align {
-                1 => "translateX(-50%)",
-                2 => "translateX(-100%)",
-                _ => "",
-            };
-            let ty = self.elem.style().get_property_value("transform").unwrap_or_default();
-            let new = if ty.contains("translateY") {
-                format!("{} {}", tx, ty)
-            } else {
-                tx.to_string()
-            };
-            set_css(self.elem.as_ref(), "transform", &new);
-        }
-
-        pub fn set_valign(&self, align: i32) {
-            let ty = match align {
-                1 => "translateY(-50%)",
-                2 => "translateY(-100%)",
-                _ => "",
-            };
-            let tx = self.elem.style().get_property_value("transform").unwrap_or_default();
-            let new = if tx.contains("translateX") {
-                format!("{} {}", tx, ty)
-            } else {
-                ty.to_string()
-            };
-            set_css(self.elem.as_ref(), "transform", &new);
-        }
-
-        pub fn set_visible(&self, visible: bool) {
-            if let Some(html) = self.elem.dyn_ref::<HtmlElement>() {
-                if visible {
-                    html.style().set_property("display", "").ok();
-                } else {
-                    html.style().set_property("display", "none").ok();
-                }
-            }
         }
 
         pub fn connect_focus_out_event<F: FnMut(*mut c_void) -> i32 + 'static>(
@@ -617,7 +516,7 @@ impl Window {
                 .map_err(|e| Error::Backend(format!("connect_focus_out_event: {:?}", e)))?;
             let id = *self.next_id.borrow();
             *self.next_id.borrow_mut() += 1;
-            store_closure(Box::new(closure));
+            self.closures.borrow_mut().push(Box::new(closure));
             Ok(id)
         }
     }
@@ -824,16 +723,6 @@ impl Window {
         response_cb: Rc<RefCell<Option<Box<dyn FnMut(i32)>>>>,
     }
 
-    impl Clone for Dialog {
-        fn clone(&self) -> Self {
-            Dialog {
-                elem: self.elem.clone(),
-                content_area: self.content_area.clone(),
-                response_cb: self.response_cb.clone(),
-            }
-        }
-    }
-
     impl AsElement for Dialog {
         fn as_element(&self) -> &Element {
             self.elem.as_ref()
@@ -894,7 +783,6 @@ impl Window {
             *self.response_cb.borrow_mut() = Some(Box::new(f));
             Ok(0)
         }
-        pub fn close(&self) { self.elem.close(); }
     }
 
     pub fn create_dialog() -> Result<Dialog, Error> {
@@ -945,14 +833,12 @@ impl Window {
     }
 
     impl DropDown {
-        pub fn set_active(&self, index: Option<u32>) {
-            if let Some(i) = index {
-                self.elem.set_selected_index(i as i32);
-            }
+        pub fn set_active(&self, index: u32) {
+            self.elem.set_selected_index(index as i32);
         }
 
-        pub fn get_active(&self) -> u32 {
-            self.elem.selected_index() as u32
+        pub fn get_active(&self) -> i32 {
+            self.elem.selected_index()
         }
 
         pub fn connect_changed(&self, f: impl FnMut() + 'static) -> Result<u64, Error> {
@@ -966,7 +852,7 @@ impl Window {
                 .map_err(|e| Error::Backend(format!("connect_changed: {:?}", e)))?;
             let id = *self.next_id.borrow();
             *self.next_id.borrow_mut() += 1;
-            store_closure(Box::new(closure));
+            self.closures.borrow_mut().push(Box::new(closure));
             Ok(id)
         }
     }
@@ -1040,7 +926,7 @@ impl Window {
                 .map_err(|e| Error::Backend(format!("connect_toggled: {:?}", e)))?;
             let id = *self.next_id.borrow();
             *self.next_id.borrow_mut() += 1;
-            store_closure(Box::new(closure));
+            self.closures.borrow_mut().push(Box::new(closure));
             Ok(id)
         }
     }
@@ -1116,7 +1002,7 @@ impl Window {
                 .map_err(|e| Error::Backend(format!("connect_toggled: {:?}", e)))?;
             let id = *self.next_id.borrow();
             *self.next_id.borrow_mut() += 1;
-            store_closure(Box::new(closure));
+            self.closures.borrow_mut().push(Box::new(closure));
             Ok(id)
         }
     }
@@ -1199,10 +1085,10 @@ impl Window {
 
         pub fn set_size_request(&self, w: i32, h: i32) {
             if w > 0 {
-                set_css(self.elem.as_ref(), "width", &format!("{}px", w));
+                self.elem.set_cols(w as u32);
             }
             if h > 0 {
-                set_css(self.elem.as_ref(), "height", &format!("{}px", h));
+                self.elem.set_rows(h as u32);
             }
         }
 
@@ -1233,361 +1119,6 @@ impl Window {
             closures: Rc::new(RefCell::new(Vec::new())),
             next_id: Rc::new(RefCell::new(1)),
         })
-    }
-
-    // -----------------------------------------------------------------------
-    // DrawContext (Canvas 2D)
-    // -----------------------------------------------------------------------
-    pub struct WasmDrawContext {
-        ctx: web_sys::CanvasRenderingContext2d,
-    }
-
-    impl WasmDrawContext {
-        fn set_font(&self, font: &str, size: f64, slant: i32, weight: i32) {
-            let weight_str = if weight != 0 { "bold" } else { "" };
-            let slant_str = if slant != 0 { "italic " } else { "" };
-            let size_str = format!("{}px", size);
-            let f = format!("{}{} {} {}", slant_str, weight_str, size_str, font);
-            let _ = self.ctx.set_font(&f);
-        }
-
-        fn rgba(r: f64, g: f64, b: f64, a: f64) -> String {
-            format!("rgba({},{},{},{})", (r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8, a)
-        }
-    }
-
-    impl crate::core::DrawContext for WasmDrawContext {
-        fn fill_rect(&mut self, x: f64, y: f64, w: f64, h: f64, r: f64, g: f64, b: f64, a: f64) {
-            let _ = self.ctx.set_fill_style_str(&Self::rgba(r, g, b, a));
-            self.ctx.fill_rect(x, y, w, h);
-        }
-
-        fn stroke_rect(&mut self, x: f64, y: f64, w: f64, h: f64, r: f64, g: f64, b: f64, a: f64, lw: f64) {
-            let _ = self.ctx.set_stroke_style_str(&Self::rgba(r, g, b, a));
-            self.ctx.set_line_width(lw);
-            self.ctx.stroke_rect(x, y, w, h);
-        }
-
-        fn draw_text_styled(&mut self, x: f64, y: f64, text: &str, font: &str, size: f64,
-                            r: f64, g: f64, b: f64, a: f64, slant: i32, weight: i32) {
-            self.set_font(font, size, slant, weight);
-            let _ = self.ctx.set_fill_style_str(&Self::rgba(r, g, b, a));
-            let _ = self.ctx.fill_text(text, x, y);
-        }
-
-        fn text_extents_styled(&self, text: &str, font: &str, size: f64, slant: i32, weight: i32) -> (f64, f64, f64, f64) {
-            let weight_str = if weight != 0 { "bold" } else { "" };
-            let slant_str = if slant != 0 { "italic " } else { "" };
-            let size_str = format!("{}px", size);
-            let f = format!("{}{} {} {}", slant_str, weight_str, size_str, font);
-            self.ctx.save();
-            let _ = self.ctx.set_font(&f);
-            let metrics = self.ctx.measure_text(text).expect("measure_text failed");
-            self.ctx.restore();
-            let w = metrics.width();
-            let xb = -metrics.actual_bounding_box_left();
-            let yb = -metrics.actual_bounding_box_ascent();
-            let h = metrics.actual_bounding_box_ascent() + metrics.actual_bounding_box_descent();
-            (xb, yb, w, h)
-        }
-
-        fn clear(&mut self, r: f64, g: f64, b: f64, a: f64) {
-            let _ = self.ctx.set_fill_style_str(&Self::rgba(r, g, b, a));
-            let canvas = self.ctx.canvas().unwrap();
-            let w = canvas.width() as f64;
-            let h = canvas.height() as f64;
-            self.ctx.fill_rect(0.0, 0.0, w, h);
-        }
-
-        fn save(&mut self) { self.ctx.save(); }
-        fn restore(&mut self) { self.ctx.restore(); }
-
-        fn clip(&mut self, x: f64, y: f64, w: f64, h: f64) {
-            self.ctx.begin_path();
-            self.ctx.rect(x, y, w, h);
-            self.ctx.clip();
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Canvas
-    // -----------------------------------------------------------------------
-    pub struct Canvas {
-        elem: HtmlCanvasElement,
-        draw_cb: Rc<RefCell<Option<Box<dyn FnMut(&mut dyn crate::core::DrawContext, i32, i32)>>>>,
-        click_cb: Rc<RefCell<Option<Box<dyn FnMut(f64, f64)>>>>,
-        key_cb: Rc<RefCell<Option<Box<dyn FnMut(u32) -> bool>>>>,
-        closures: Rc<RefCell<Vec<Box<dyn Any>>>>,
-    }
-
-    impl AsElement for Canvas {
-        fn as_element(&self) -> &Element {
-            self.elem.as_ref()
-        }
-    }
-
-    impl Widget for Canvas {
-        fn raw_handle(&self) -> *mut c_void {
-            &self.elem as *const HtmlCanvasElement as *mut c_void
-        }
-    }
-
-    impl Clone for Canvas {
-        fn clone(&self) -> Self {
-            Canvas {
-                elem: self.elem.clone(),
-                draw_cb: self.draw_cb.clone(),
-                click_cb: self.click_cb.clone(),
-                key_cb: self.key_cb.clone(),
-                closures: self.closures.clone(),
-            }
-        }
-    }
-
-    impl Canvas {
-        pub fn set_draw_callback(&self, cb: Box<dyn FnMut(&mut dyn crate::core::DrawContext, i32, i32)>) {
-            *self.draw_cb.borrow_mut() = Some(cb);
-            self.queue_redraw();
-        }
-
-        pub fn queue_redraw(&self) {
-            if let Some(ref mut draw_fn) = *self.draw_cb.borrow_mut() {
-                let ctx = self.elem.get_context("2d")
-                    .ok().flatten()
-                    .and_then(|o| o.dyn_into::<web_sys::CanvasRenderingContext2d>().ok());
-                if let Some(ctx) = ctx {
-                    let w = self.elem.width() as i32;
-                    let h = self.elem.height() as i32;
-                    let mut dc = WasmDrawContext { ctx };
-                    draw_fn(&mut dc, w, h);
-                }
-            }
-        }
-
-        pub fn set_size_request(&self, w: i32, h: i32) {
-            if w > 0 { self.elem.set_width(w as u32); }
-            if h > 0 { self.elem.set_height(h as u32); }
-            set_css(self.elem.as_ref(), "width", &format!("{}px", w));
-            set_css(self.elem.as_ref(), "height", &format!("{}px", h));
-        }
-
-        pub fn set_content_size(&self, w: i32, h: i32) {
-            self.elem.set_width(w as u32);
-            self.elem.set_height(h as u32);
-        }
-
-        pub fn on_click(&self, cb: Box<dyn FnMut(f64, f64)>) {
-            *self.click_cb.borrow_mut() = Some(cb);
-            let cb2 = self.click_cb.clone();
-            let closure = Closure::<dyn FnMut(MouseEvent)>::new(move |evt: MouseEvent| {
-                if let Some(ref mut f) = *cb2.borrow_mut() {
-                    f(evt.offset_x() as f64, evt.offset_y() as f64);
-                }
-            });
-            self.elem
-                .add_event_listener_with_callback("mousedown", closure.as_ref().unchecked_ref())
-                .ok();
-            store_closure(Box::new(closure));
-        }
-
-        pub fn on_key(&self, cb: Box<dyn FnMut(u32) -> bool>) {
-            *self.key_cb.borrow_mut() = Some(cb);
-            let cb2 = self.key_cb.clone();
-            let closure = Closure::<dyn FnMut(KeyboardEvent)>::new(move |evt: KeyboardEvent| {
-                if let Some(ref mut f) = *cb2.borrow_mut() {
-                    if f(evt.key_code()) {
-                        evt.prevent_default();
-                    }
-                }
-            });
-            self.elem
-                .add_event_listener_with_callback("keydown", closure.as_ref().unchecked_ref())
-                .ok();
-            store_closure(Box::new(closure));
-            // Make canvas focusable
-            self.elem.set_tab_index(0);
-        }
-    }
-
-    pub fn create_canvas() -> Result<Canvas, Error> {
-        let elem: HtmlCanvasElement = create_element("canvas").dyn_into().map_err(|e| {
-            Error::Backend(format!("create_canvas: {:?}", e))
-        })?;
-        let ctx = elem.get_context("2d")
-            .ok().flatten()
-            .and_then(|o| o.dyn_into::<web_sys::CanvasRenderingContext2d>().ok())
-            .ok_or_else(|| Error::Backend("getContext('2d') failed".into()))?;
-        // Use default font that will be overridden per draw call
-        let _ = ctx.set_font("12px monospace");
-        Ok(Canvas {
-            elem,
-            draw_cb: Rc::new(RefCell::new(None)),
-            click_cb: Rc::new(RefCell::new(None)),
-            key_cb: Rc::new(RefCell::new(None)),
-            closures: Rc::new(RefCell::new(Vec::new())),
-        })
-    }
-
-    // -----------------------------------------------------------------------
-    // Overlay (stacking container using position:relative + absolute overlays)
-    // -----------------------------------------------------------------------
-    pub struct Overlay {
-        elem: HtmlDivElement,
-        children: Rc<RefCell<Vec<Element>>>,
-    }
-
-    impl AsElement for Overlay {
-        fn as_element(&self) -> &Element {
-            self.elem.as_ref()
-        }
-    }
-
-    impl Widget for Overlay {
-        fn raw_handle(&self) -> *mut c_void {
-            &self.elem as *const HtmlDivElement as *mut c_void
-        }
-    }
-
-    impl Clone for Overlay {
-        fn clone(&self) -> Self {
-            Overlay {
-                elem: self.elem.clone(),
-                children: self.children.clone(),
-            }
-        }
-    }
-
-    impl Overlay {
-        pub fn set_child(&self, child: &impl AsElement) {
-            while let Some(c) = self.elem.first_child() {
-                self.elem.remove_child(&c).ok();
-            }
-            self.children.borrow_mut().clear();
-            self.children.borrow_mut().push(child.as_element().clone());
-            self.elem.append_child(child.as_element()).ok();
-        }
-
-        pub fn add_overlay(&self, child: &impl AsElement) {
-            self.children.borrow_mut().push(child.as_element().clone());
-            set_css(child.as_element(), "position", "absolute");
-            set_css(child.as_element(), "z-index", "10");
-            self.elem.append_child(child.as_element()).ok();
-        }
-
-        pub fn set_overlay_pass_through(&self, child: &impl AsElement, pass: bool) {
-            if pass {
-                set_css(child.as_element(), "pointer-events", "none");
-            } else {
-                set_css(child.as_element(), "pointer-events", "auto");
-            }
-        }
-
-        pub fn remove(&self, child: &impl AsElement) {
-            self.elem.remove_child(child.as_element()).ok();
-            self.children.borrow_mut().retain(|c| c != child.as_element());
-        }
-
-        pub fn show_all(&self) {
-            for c in self.children.borrow().iter() {
-                if let Some(html) = c.dyn_ref::<HtmlElement>() {
-                    html.style().set_property("display", "").ok();
-                }
-            }
-        }
-
-        pub fn set_size_request(&self, w: i32, h: i32) {
-            if w > 0 { set_css(self.elem.as_ref(), "width", &format!("{}px", w)); }
-            if h > 0 { set_css(self.elem.as_ref(), "height", &format!("{}px", h)); }
-        }
-
-        pub fn set_vexpand(&self, expand: bool) {
-            if expand {
-                set_css(self.elem.as_ref(), "flex-grow", "1");
-            } else {
-                set_css(self.elem.as_ref(), "flex-grow", "0");
-            }
-        }
-
-        pub fn set_hexpand(&self, expand: bool) {
-            if expand {
-                set_css(self.elem.as_ref(), "align-self", "stretch");
-            }
-        }
-    }
-
-    pub fn create_overlay() -> Result<Overlay, Error> {
-        let div: HtmlDivElement = create_element("div").dyn_into().map_err(|e| {
-            Error::Backend(format!("create_overlay: {:?}", e))
-        })?;
-        set_css(div.as_ref(), "position", "relative");
-        div.style().set_property("overflow", "hidden").ok();
-        Ok(Overlay {
-            elem: div,
-            children: Rc::new(RefCell::new(Vec::new())),
-        })
-    }
-
-    // -----------------------------------------------------------------------
-    // ScrolledWindow
-    // -----------------------------------------------------------------------
-    pub struct ScrolledWindow {
-        elem: HtmlDivElement,
-    }
-
-    impl AsElement for ScrolledWindow {
-        fn as_element(&self) -> &Element {
-            self.elem.as_ref()
-        }
-    }
-
-    impl Widget for ScrolledWindow {
-        fn raw_handle(&self) -> *mut c_void {
-            &self.elem as *const HtmlDivElement as *mut c_void
-        }
-    }
-
-    impl Clone for ScrolledWindow {
-        fn clone(&self) -> Self {
-            ScrolledWindow { elem: self.elem.clone() }
-        }
-    }
-
-    impl ScrolledWindow {
-        pub fn set_policy(&self, hscroll: i32, vscroll: i32) {
-            let h = match hscroll { 0 => "hidden", 1 => "scroll", _ => "auto" };
-            let v = match vscroll { 0 => "hidden", 1 => "scroll", _ => "auto" };
-            self.elem.style().set_property("overflow-x", h).ok();
-            self.elem.style().set_property("overflow-y", v).ok();
-        }
-
-        pub fn set_child(&self, child: &impl AsElement) {
-            while let Some(c) = self.elem.first_child() {
-                self.elem.remove_child(&c).ok();
-            }
-            self.elem.append_child(child.as_element()).ok();
-        }
-
-        pub fn set_vexpand(&self, expand: bool) {
-            if expand {
-                set_css(self.elem.as_ref(), "flex-grow", "1");
-                set_css(self.elem.as_ref(), "align-self", "stretch");
-            }
-        }
-
-        pub fn set_hexpand(&self, expand: bool) {
-            if expand {
-                set_css(self.elem.as_ref(), "align-self", "stretch");
-            }
-        }
-    }
-
-    pub fn create_scrolled_window() -> Result<ScrolledWindow, Error> {
-        let div: HtmlDivElement = create_element("div").dyn_into().map_err(|e| {
-            Error::Backend(format!("create_scrolled_window: {:?}", e))
-        })?;
-        div.style().set_property("overflow", "auto").ok();
-        div.style().set_property("position", "relative").ok();
-        Ok(ScrolledWindow { elem: div })
     }
 }
 

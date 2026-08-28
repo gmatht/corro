@@ -7,7 +7,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let win = app.create_window()?;
     win.set_title("Zork Demo");
 
-    let mut hbox = app.create_box(Orientation::Horizontal, 2)?;
+    let hbox = app.create_box(Orientation::Horizontal, 2)?;
     let label = app.create_label("Count: 0")?;
     let label2 = label.clone();
     let cancel = app.create_button("Cancel")?;
@@ -35,7 +35,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let entry = app.create_entry()?;
     entry.set_text("Hello, Zork!");
 
-    let mut vbox = app.create_box(Orientation::Vertical, 1)?;
+    let vbox = app.create_box(Orientation::Vertical, 1)?;
     vbox.append(&hbox);
     vbox.append(&entry);
 

@@ -93,8 +93,6 @@ mod android_adapter {
             });
             Ok(0)
         }
-
-        pub fn set_font_style(&self, _weight: i32, _italic: bool) {}
     }
 
     impl Clone for Button {
@@ -473,10 +471,6 @@ mod android_adapter {
     #[repr(transparent)]
     pub struct Dialog(pub *mut c_void);
 
-    impl Clone for Dialog {
-        fn clone(&self) -> Self { Dialog(self.0) }
-    }
-
     impl Widget for Dialog {
         fn raw_handle(&self) -> *mut c_void { self.0 }
     }
@@ -534,13 +528,6 @@ mod android_adapter {
 
         pub fn connect_response(&self, _f: impl FnMut(i32) + 'static) -> Result<u64, Error> {
             Ok(0) // TODO: DialogInterface.OnClickListener via JNI trampoline
-        }
-        pub fn close(&self) {
-            let _ = crate::backends::android::with_env_and_activity(|env, _activity| {
-                let dialog = unsafe { jni::objects::JObject::from_raw(self.0 as jni::sys::jobject) };
-                env.call_method(dialog, "dismiss", "()V", &[])?;
-                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
-            });
         }
     }
 

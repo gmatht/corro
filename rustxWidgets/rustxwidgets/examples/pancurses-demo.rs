@@ -7,7 +7,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let win = app.create_window()?;
     win.set_title("Pancurses Demo");
 
-    let mut hbox = app.create_box(Orientation::Horizontal, 2)?;
+    let hbox = app.create_box(Orientation::Horizontal, 2)?;
     let label = app.create_label("Count: 0")?;
     let label2 = label.clone();
     let button = app.create_button("Click me")?;
@@ -37,13 +37,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // add a checkbutton
     let cb = app.create_checkbutton("Check me")?;
-    let _cb2 = cb.clone();
+    let cb2 = cb.clone();
     cb.connect_toggled(move || {
         println!("Checkbox toggled");
     })?;
 
     // stack vertically: hbox on top, entry below, checkbox below
-    let mut vbox = app.create_box(Orientation::Vertical, 1)?;
+    let vbox = app.create_box(Orientation::Vertical, 1)?;
     vbox.append(&hbox);
     vbox.append(&entry);
     vbox.append(&cb);

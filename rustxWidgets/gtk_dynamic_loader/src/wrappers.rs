@@ -301,42 +301,6 @@ impl Button {
             unsafe { set(self.inner, if expand { 1 } else { 0 }); }
         }
     }
-
-    pub fn set_font_style(&self, weight: i32, italic: bool) {
-        guard_widget!(self, "Button", "set_font_style");
-        let weight_str = if weight >= 600 { "bold" } else { "normal" };
-        let style_str = if italic { "italic" } else { "normal" };
-        let css = format!("button {{ font-weight: {}; font-style: {}; }}", weight_str, style_str);
-        if let Some(provider) = crate::wrappers::create_css_provider(&self.loader, &css) {
-            crate::wrappers::add_provider_to_widget(&self.loader, self.inner, provider, 800);
-        }
-    }
-
-    pub fn add_class(&self, class_name: &str) {
-        guard_widget!(self, "Button", "add_class");
-        if let Some(get_ctx) = self.loader.symbols.gtk_widget_get_style_context {
-            if let Some(add_class) = self.loader.symbols.gtk_style_context_add_class {
-                let c = CString::new(class_name).unwrap();
-                unsafe {
-                    let ctx = get_ctx(self.inner);
-                    if !ctx.is_null() { add_class(ctx, c.as_ptr()); }
-                }
-            }
-        }
-    }
-
-    pub fn remove_class(&self, class_name: &str) {
-        guard_widget!(self, "Button", "remove_class");
-        if let Some(get_ctx) = self.loader.symbols.gtk_widget_get_style_context {
-            if let Some(remove_class) = self.loader.symbols.gtk_style_context_remove_class {
-                let c = CString::new(class_name).unwrap();
-                unsafe {
-                    let ctx = get_ctx(self.inner);
-                    if !ctx.is_null() { remove_class(ctx, c.as_ptr()); }
-                }
-            }
-        }
-    }
 }
 
 impl AsRef<*mut c_void> for Button { fn as_ref(&self) -> &*mut c_void { &self.inner } }
@@ -1034,9 +998,9 @@ impl EventControllerKey {
         Ok(EventControllerKey { inner, loader, _not_send: PhantomData })
     }
 
-    pub fn connect_key_pressed<F: FnMut(u32, u32) -> i32 + 'static>(&self, f: F) -> Result<u64, Error> {
+    pub fn connect_key_pressed<F: FnMut(u32) -> i32 + 'static>(&self, f: F) -> Result<u64, Error> {
         guard_widget_or!(self, "EventControllerKey", "connect_key_pressed", Err(Error::Other("key controller dropped".into())));
-        let boxed: Box<Box<dyn FnMut(u32, u32) -> i32>> = Box::new(Box::new(f));
+        let boxed: Box<Box<dyn FnMut(u32) -> i32>> = Box::new(Box::new(f));
         let raw = Box::into_raw(boxed) as *mut c_void;
         unsafe { self.connect_key_pressed_raw(raw) }
     }
@@ -1075,14 +1039,6 @@ impl EventControllerKey {
         }
     }
 
-    /// GTK_PHASE_CAPTURE = 1
-    pub fn set_propagation_phase_capture(&self) {
-        guard_widget!(self, "EventControllerKey", "set_propagation_phase");
-        if let Some(f) = self.loader.symbols.gtk_event_controller_set_propagation_phase {
-            unsafe { f(self.inner, 1); }
-        }
-    }
-
     /// Get the keyval from a GDK key event
     ///
     /// # Safety
@@ -1097,9 +1053,17 @@ impl EventControllerKey {
     /// `event` must be a valid GDK key event pointer.
     pub unsafe fn get_keyval_static(loader: &Arc<Loader>, event: *mut c_void) -> u32 {
         if let Some(get_kv) = loader.symbols.gdk_event_get_keyval {
-            let mut keyval: u32 = 0;
-            get_kv(event, &mut keyval);
-            keyval
+            unsafe { get_kv(event) }
+        } else { 0 }
+    }
+
+    /// Get the modifier state from a GDK key event
+    ///
+    /// # Safety
+    /// `event` must be a valid GDK key event pointer.
+    pub unsafe fn get_state_static(loader: &Arc<Loader>, event: *mut c_void) -> u32 {
+        if let Some(get_st) = loader.symbols.gdk_event_get_state {
+            unsafe { get_st(event) }
         } else { 0 }
     }
 }
@@ -1345,11 +1309,6 @@ impl Entry {
             }
         }
         None
-    }
-
-    pub fn set_position(&self, position: i32) {
-        guard_widget!(self, "Entry", "set_position");
-        if let Some(f) = self.loader.symbols.gtk_editable_set_position { unsafe { f(self.inner, position); } }
     }
 
     pub fn set_width_chars(&self, n: i32) {
@@ -1957,6 +1916,10 @@ pub struct SimpleAction {
 }
 
 impl SimpleAction {
+    /// Raw GAction pointer (for adding to a GActionMap / action group).
+    pub fn inner_ptr(&self) -> *mut c_void {
+        self.inner
+    }
     pub fn new(loader: Arc<Loader>, name: &str) -> Result<Self, Error> {
         let symbols = &loader.symbols;
         let ctor = symbols.g_simple_action_new.ok_or(Error::MissingSymbol("g_simple_action_new".into()))?;
@@ -2115,6 +2078,7 @@ impl Drop for MenuBar {
 }
 
 // ---- Dialog ----
+#[derive(Clone)]
 pub struct Dialog {
     inner: *mut c_void,
     loader: Arc<Loader>,
@@ -2233,12 +2197,10 @@ impl Dialog {
         }
     }
 
+    /// Dismiss/destroy the dialog widget.
     pub fn close(&self) {
-        guard_widget!(self, "Dialog", "close");
-        if let Some(window_close) = self.loader.symbols.gtk_window_close {
-            unsafe { window_close(self.inner); }
-        } else if let Some(widget_destroy) = self.loader.symbols.gtk_widget_destroy {
-            unsafe { widget_destroy(self.inner); }
+        if let Some(destroy) = self.loader.symbols.gtk_widget_destroy {
+            unsafe { destroy(self.inner); }
         }
     }
 
@@ -2250,15 +2212,6 @@ impl Dialog {
             // instance and name. For simplicity, just emit the signal without the param.
             unsafe { emit(self.inner, name.as_ptr()); }
         }
-    }
-}
-
-impl Clone for Dialog {
-    fn clone(&self) -> Self {
-        if let Some(gref) = self.loader.symbols.g_object_ref {
-            unsafe { gref(self.inner); }
-        }
-        Dialog { inner: self.inner, loader: self.loader.clone(), _not_send: PhantomData }
     }
 }
 

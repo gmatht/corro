@@ -1,12 +1,8 @@
 use crate::error::Error;
 use crate::symbols::Symbols;
+use libloading::os::unix::Library;
 use std::collections::HashMap;
 use std::sync::Arc;
-
-#[cfg(unix)]
-use libloading::os::unix::Library;
-#[cfg(windows)]
-use libloading::os::windows::Library;
 
 pub type RawLib = Library;
 
@@ -141,12 +137,9 @@ fn open_first(cands: &[&str]) -> Option<RawLib> {
     for &name in cands {
         // try to open with RTLD_NOW | RTLD_GLOBAL
         unsafe {
-            #[cfg(unix)]
+            // If available, add RTLD_NODELETE to avoid unloading libraries while GTK may still use them
             let flags = libc::RTLD_NOW | libc::RTLD_GLOBAL
                 | { #[allow(non_upper_case_globals)] { libc::RTLD_NODELETE } };
-            #[cfg(windows)]
-            let flags = libloading::os::windows::DEFAULT;
-
             match Library::open(Some(name), flags) {
                 Ok(lib) => return Some(lib),
                 Err(_) => continue,

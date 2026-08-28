@@ -7,13 +7,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     dialog.set_title("Widget Test Dialog");
     dialog.set_default_size(450, 500);
 
-    let mut vbox = app.create_box(
+    let vbox = app.create_box(
         rustxwidgets::prelude::Orientation::Vertical, 1,
     )?;
 
     // --- DropDown ---
     let dd = app.create_dropdown(&["Choice 1", "Choice 2", "Choice 3"])?;
-    dd.set_active(Some(1));
+    dd.set_active(1);
     assert_eq!(dd.get_active(), 1);
     println!("DropDown: OK (active={})", dd.get_active());
     let dd_cb = dd.clone();

@@ -37,9 +37,6 @@ impl Window {
     pub fn present(&self) {}
     pub fn insert_action_group(&self, _name: &str, _group_ptr: *mut c_void) {}
     pub fn set_default_size(&self, _width: i32, _height: i32) {}
-    pub fn hwnd(&self) -> *mut c_void {
-        std::ptr::null_mut()
-    }
 }
 
 // -- Button --
@@ -73,9 +70,6 @@ impl Button {
     pub fn emit_clicked(&self) -> Result<u64, Error> {
         Ok(0)
     }
-
-    pub fn set_font_style(&self, _weight: i32, _italic: bool) {}
-    pub fn set_size_request(&self, _w: i32, _h: i32) {}
 }
 
 // -- Label --
@@ -146,9 +140,6 @@ impl BoxWidget {
     pub fn layout(&self, _x: i32, _y: i32, _w: i32, _h: i32) {
         crate::backends::zork::layout_box(self.id);
     }
-
-    pub fn set_child_vexpand(&self, _child: &impl AsRef<*mut c_void>, _expand: bool) {}
-    pub fn set_child_hexpand(&self, _child: &impl AsRef<*mut c_void>, _expand: bool) {}
 }
 
 // -- Grid --
@@ -212,35 +203,6 @@ impl Entry {
 
     pub fn connect_changed(&self, f: impl FnMut() + 'static) -> Result<u64, Error> {
         crate::backends::zork::add_callback(self.id, Box::new(f));
-        Ok(0)
-    }
-
-    pub fn set_halign(&self, _align: i32) {}
-    pub fn set_valign(&self, _align: i32) {}
-    pub fn set_visible(&self, _visible: bool) {}
-    pub fn set_size_request(&self, _w: i32, _h: i32) {}
-    pub fn set_width_chars(&self, _w: i32) {}
-    pub fn set_margin_start(&self, _margin: i32) {}
-    pub fn set_margin_top(&self, _margin: i32) {}
-    pub fn add_class(&self, _class_name: &str) {}
-    pub fn remove_class(&self, _class_name: &str) {}
-    pub fn grab_focus(&self) {}
-
-    pub fn connect_activate<F: FnMut(*mut c_void) + 'static>(&self, f: F) -> Result<u64, Error> {
-        let mut f = f;
-        crate::backends::zork::add_callback(self.id, Box::new(move || f(std::ptr::null_mut())));
-        Ok(0)
-    }
-
-    pub fn connect_focus_in_event<F: FnMut(*mut c_void) -> i32 + 'static>(&self, f: F) -> Result<u64, Error> {
-        let mut f = f;
-        crate::backends::zork::add_callback(self.id, Box::new(move || { f(std::ptr::null_mut()); }));
-        Ok(0)
-    }
-
-    pub fn connect_focus_out_event<F: FnMut(*mut c_void) -> i32 + 'static>(&self, f: F) -> Result<u64, Error> {
-        let mut f = f;
-        crate::backends::zork::add_callback(self.id, Box::new(move || { f(std::ptr::null_mut()); }));
         Ok(0)
     }
 }
@@ -311,10 +273,6 @@ pub struct Dialog {
     pub(crate) id: usize,
 }
 
-impl Clone for Dialog {
-    fn clone(&self) -> Self { Dialog { id: self.id } }
-}
-
 impl Widget for Dialog {
     fn raw_handle(&self) -> *mut c_void {
         &self.id as *const usize as *mut c_void
@@ -338,10 +296,9 @@ impl Dialog {
         crate::backends::zork::set_child(self.id, child_id);
     }
     pub fn add_button(&self, _label: &str, _response_id: i32) {}
-        pub fn connect_response(&self, _f: impl FnMut(i32) + 'static) -> Result<u64, Error> { Ok(0) }
-        pub fn present(&self) {}
-        pub fn close(&self) {}
-    }
+    pub fn connect_response(&self, _f: impl FnMut(i32) + 'static) -> Result<u64, Error> { Ok(0) }
+    pub fn present(&self) {}
+}
 
 // -- DropDown --
 
@@ -586,121 +543,4 @@ pub fn create_textview() -> Result<TextView, Error> {
     crate::backends::zork::create_textview()
         .map(|id| TextView { id })
         .map_err(|e| Error::Backend(format!("{}", e)))
-}
-
-// -- Stub types for app.rs compatibility --
-
-pub struct Canvas {
-    pub(crate) id: usize,
-}
-
-impl Widget for Canvas {
-    fn raw_handle(&self) -> *mut c_void {
-        &self.id as *const usize as *mut c_void
-    }
-}
-
-impl AsRef<*mut c_void> for Canvas {
-    fn as_ref(&self) -> &*mut c_void {
-        unsafe { &*(&self.id as *const usize as *const *mut c_void) }
-    }
-}
-
-impl Clone for Canvas {
-    fn clone(&self) -> Self { Canvas { id: self.id } }
-}
-
-impl Canvas {
-    pub fn set_size_request(&self, _w: i32, _h: i32) {}
-    pub fn set_content_size(&self, _w: i32, _h: i32) {}
-    pub fn queue_redraw(&self) {}
-    pub fn set_draw_callback(&self, _cb: Box<dyn FnMut(&mut dyn crate::core::DrawContext, i32, i32)>) {}
-    pub fn on_click(&self, _cb: Box<dyn FnMut(f64, f64)>) {}
-    pub fn on_key(&self, _cb: Box<dyn FnMut(u32) -> bool>) {}
-}
-
-pub struct Overlay {
-    pub(crate) id: usize,
-}
-
-impl Widget for Overlay {
-    fn raw_handle(&self) -> *mut c_void {
-        &self.id as *const usize as *mut c_void
-    }
-}
-
-impl AsRef<*mut c_void> for Overlay {
-    fn as_ref(&self) -> &*mut c_void {
-        unsafe { &*(&self.id as *const usize as *const *mut c_void) }
-    }
-}
-
-impl Clone for Overlay {
-    fn clone(&self) -> Self { Overlay { id: self.id } }
-}
-
-impl Overlay {
-    pub fn set_child(&self, child: &impl AsRef<*mut c_void>) {
-        let child_ptr = *child.as_ref();
-        let child_id = child_ptr as usize;
-        crate::backends::zork::set_child(self.id, child_id);
-    }
-    pub fn add_overlay(&self, child: &impl AsRef<*mut c_void>) {
-        let child_ptr = *child.as_ref();
-        let child_id = child_ptr as usize;
-        crate::backends::zork::set_child(self.id, child_id);
-    }
-    pub fn set_overlay_pass_through(&self, _child: &impl AsRef<*mut c_void>, _pass: bool) {}
-    pub fn remove(&self, _child: &impl AsRef<*mut c_void>) {}
-    pub fn show_all(&self) {}
-    pub fn set_size_request(&self, _w: i32, _h: i32) {}
-}
-
-pub struct ScrolledWindow {
-    pub(crate) id: usize,
-}
-
-impl Widget for ScrolledWindow {
-    fn raw_handle(&self) -> *mut c_void {
-        &self.id as *const usize as *mut c_void
-    }
-}
-
-impl AsRef<*mut c_void> for ScrolledWindow {
-    fn as_ref(&self) -> &*mut c_void {
-        unsafe { &*(&self.id as *const usize as *const *mut c_void) }
-    }
-}
-
-impl Clone for ScrolledWindow {
-    fn clone(&self) -> Self { ScrolledWindow { id: self.id } }
-}
-
-impl ScrolledWindow {
-    pub fn set_child(&self, child: &impl AsRef<*mut c_void>) {
-        let child_ptr = *child.as_ref();
-        let child_id = child_ptr as usize;
-        crate::backends::zork::set_child(self.id, child_id);
-    }
-    pub fn set_policy(&self, _hscroll: u32, _vscroll: u32) {}
-}
-
-pub fn create_canvas() -> Result<Canvas, Error> {
-    Ok(Canvas { id: crate::backends::zork::create_canvas() })
-}
-
-pub fn create_overlay() -> Result<Overlay, Error> {
-    Ok(Overlay { id: crate::backends::zork::create_overlay() })
-}
-
-pub fn create_scrolled_window() -> Result<ScrolledWindow, Error> {
-    Ok(ScrolledWindow { id: crate::backends::zork::create_scrolled_window() })
-}
-
-pub fn open_file(_title: &str) -> Result<Option<String>, Error> {
-    Ok(None)
-}
-
-pub fn save_file(_title: &str) -> Result<Option<String>, Error> {
-    Ok(None)
 }
