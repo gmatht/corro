@@ -203,3 +203,70 @@ fn input_event_from_pancurses() {
     assert_eq!(InputEvent::from_pancurses(pancurses::Input::KeyUp), InputEvent::ArrowUp);
     assert_eq!(InputEvent::from_pancurses(pancurses::Input::KeyF1), InputEvent::F(1));
 }
+
+/// Grab the rendered terminal screen from the ratatui canvas backend.
+#[cfg(all(feature = "ratatui", feature = "headless"))]
+fn grab_ratatui(model: &SpreadsheetModel, w: u16, h: u16) -> Vec<String> {
+    let buf = rustxwidgets::backends::ratatui::render_model_to_test_backend(model, w, h);
+    (0..buf.area.height)
+        .map(|y| {
+            (0..buf.area.width)
+                .map(|x| buf.cell((x as u16, y as u16)).map(|c| c.symbol()).unwrap_or("").to_string())
+                .collect()
+        })
+        .collect()
+}
+
+/// Grab the rendered terminal screen from the pancurses cell-grid backend.
+#[cfg(feature = "pancurses")]
+fn grab_pancurses(model: &SpreadsheetModel, w: u16, h: u16) -> Vec<String> {
+    rustxwidgets::backends::pancurses_draw::render_model_to_grid(model, w, h).row_strings()
+}
+
+/// Extract the multiset of whitespace-delimited tokens from a grabbed screen.
+fn screen_tokens(rows: &[String]) -> Vec<String> {
+    let mut t: Vec<String> = rows.iter().flat_map(|r| r.split_whitespace().map(|s| s.to_string())).collect();
+    t.sort();
+    t
+}
+
+/// Terminal-grab equivalence: the ratatui canvas backend and the pancurses
+/// cell-grid backend both consume the *same* shared `paint`, so grabbing each
+/// backend's rendered screen must yield a byte-identical terminal picture
+/// (and therefore an identical token multiset). This is the direct analogue of
+/// the ratatui/pancurses driver tests, but at the level of the whole screen.
+#[cfg(all(feature = "ratatui", feature = "headless", feature = "pancurses"))]
+#[test]
+fn ratatui_and_pancurses_terminal_grab_equivalent() {
+    let models: Vec<SpreadsheetModel> = vec![
+        model_with("GRAB-TEST", &[((1, 1), "Hello"), ((2, 2), "World"), ((3, 3), "=SUM(A1:A3)")]),
+        {
+            let mut m = SpreadsheetModel::new(6, 4);
+            m.set_border_title("EQUIV-2");
+            m.set_tab_data(&["Alpha".to_string(), "Beta".to_string()], 0);
+            m.set_status_text("READY 42/100");
+            m.set_formula_bar("B2", "=A1+A2");
+            m.set_cell(1, 1, "Hello");
+            m.set_cell(2, 2, "World");
+            m
+        },
+    ];
+    for (i, m) in models.iter().enumerate() {
+        let rat = grab_ratatui(m, 80, 24);
+        let pan = grab_pancurses(m, 80, 24);
+
+        assert_eq!(rat.len(), pan.len(), "model {i}: grabbed screen heights must match");
+        for (y, (r, p)) in rat.iter().zip(pan.iter()).enumerate() {
+            assert_eq!(
+                r, p,
+                "model {i}: grabbed terminal row {y} differs between ratatui and pancurses"
+            );
+        }
+        // Order-independent content equivalence (complementary to row eq).
+        assert_eq!(
+            screen_tokens(&rat),
+            screen_tokens(&pan),
+            "model {i}: terminal-grab token sets must match"
+        );
+    }
+}
