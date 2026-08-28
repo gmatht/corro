@@ -528,6 +528,15 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
 }
 
 /// Run the backend main loop
+    /// Pump the platform event loop `count` iterations without starting the
+    /// main loop (GTK: g_main_context_iteration).  Used after window setup
+    /// so the first frame is drawn before run() blocks.
+    pub fn pump_events(&self, count: usize) {
+        #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+        crate::backends_gtk_adapter::pump_main_context(count);
+        let _ = count;
+    }
+
     pub fn run(self) -> Result<(), Error> {
         let boxed = Arc::try_unwrap(self.inner).map_err(|_| Error::Backend("failed to take backend app ownership".into()))?;
         boxed.run().map_err(|e| Error::Backend(format!("{}", e)))
