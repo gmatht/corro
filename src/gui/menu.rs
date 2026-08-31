@@ -64,6 +64,7 @@ pub enum MenuActionKind {
     FormatAlignRight,
     FormatAlignDefault,
     FormatReset,
+    ExportAll,
 }
 
 pub fn action_kind_to_name(kind: MenuActionKind) -> &'static str {
@@ -121,6 +122,7 @@ pub fn action_kind_to_name(kind: MenuActionKind) -> &'static str {
         MenuActionKind::FormatAlignRight => "format_align_right",
         MenuActionKind::FormatAlignDefault => "format_align_default",
         MenuActionKind::FormatReset => "format_reset",
+        MenuActionKind::ExportAll => "export_all",
     }
 }
 
@@ -207,11 +209,15 @@ pub const FILE_MENU: &[MenuAction] = &[
     MenuAction { label: "_Open",        shortcut: "Ctrl+O",       action: MenuActionKind::Open },
     MenuAction { label: "_Save",        shortcut: "Ctrl+S",       action: MenuActionKind::Save },
     MenuAction { label: "Save _As",     shortcut: "Ctrl+Shift+S", action: MenuActionKind::SaveAs },
+    MenuAction { label: "_Quit",        shortcut: "Ctrl+Q",       action: MenuActionKind::Quit },
+];
+
+pub const TOOLS_MENU: &[MenuAction] = &[
     MenuAction { label: "Export T_SV",  shortcut: "",             action: MenuActionKind::ExportTsv },
-    MenuAction { label: "Export C_SV",  shortcut: "",             action: MenuActionKind::ExportCsv },
+    MenuAction { label: "Export _Csv",  shortcut: "",             action: MenuActionKind::ExportCsv },
     MenuAction { label: "Export O_DS",  shortcut: "",             action: MenuActionKind::ExportOds },
     MenuAction { label: "Export ASC_II",shortcut: "",             action: MenuActionKind::ExportAscii },
-    MenuAction { label: "_Quit",        shortcut: "Ctrl+Q",       action: MenuActionKind::Quit },
+    MenuAction { label: "Export Al_l",  shortcut: "",             action: MenuActionKind::ExportAll },
 ];
 
 pub const EDIT_MENU: &[MenuAction] = &[
@@ -284,6 +290,7 @@ fn actions_to_defs(items: &[MenuAction]) -> Vec<MenuItemDef> {
     items.iter().map(|a| MenuItemDef {
         label: a.label,
         action: action_kind_to_name(a.action),
+        submenu: None,
     }).collect()
 }
 
@@ -291,14 +298,15 @@ fn actions_to_defs(items: &[MenuAction]) -> Vec<MenuItemDef> {
 pub fn all_submenus() -> Vec<SubmenuDef> {
     // Deliberately leak Vec backing buffers so the returned slices live forever.
     vec![
-        SubmenuDef { label: "_File",   prefix: "app", items: actions_to_defs(FILE_MENU).leak() },
-        SubmenuDef { label: "_Edit",   prefix: "app", items: actions_to_defs(EDIT_MENU).leak() },
-        SubmenuDef { label: "_View",   prefix: "app", items: actions_to_defs(VIEW_MENU).leak() },
-        SubmenuDef { label: "_Insert", prefix: "app", items: actions_to_defs(INSERT_MENU).leak() },
-        SubmenuDef { label: "F_or_mat", prefix: "app", items: actions_to_defs(FORMAT_MENU).leak() },
-        SubmenuDef { label: "_Sheet",  prefix: "app", items: actions_to_defs(SHEET_MENU).leak() },
-        SubmenuDef { label: "_Data",   prefix: "app", items: actions_to_defs(DATA_MENU).leak() },
-        SubmenuDef { label: "_Help",   prefix: "app", items: actions_to_defs(HELP_MENU).leak() },
+        SubmenuDef { label: "File",   prefix: "app", items: actions_to_defs(FILE_MENU).leak() },
+        SubmenuDef { label: "Edit",   prefix: "app", items: actions_to_defs(EDIT_MENU).leak() },
+        SubmenuDef { label: "View",   prefix: "app", items: actions_to_defs(VIEW_MENU).leak() },
+        SubmenuDef { label: "Insert", prefix: "app", items: actions_to_defs(INSERT_MENU).leak() },
+        SubmenuDef { label: "Format", prefix: "app", items: actions_to_defs(FORMAT_MENU).leak() },
+        SubmenuDef { label: "Sheet",  prefix: "app", items: actions_to_defs(SHEET_MENU).leak() },
+        SubmenuDef { label: "Data",   prefix: "app", items: actions_to_defs(DATA_MENU).leak() },
+        SubmenuDef { label: "Tools",  prefix: "app", items: actions_to_defs(TOOLS_MENU).leak() },
+        SubmenuDef { label: "Help",   prefix: "app", items: actions_to_defs(HELP_MENU).leak() },
     ]
 }
 

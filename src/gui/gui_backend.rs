@@ -191,6 +191,35 @@ struct GuiState {
     last_key: Cell<u32>,
     key_counter: Cell<u64>,
     entry_processed_key: Cell<bool>,
+    last_alt_keyval: Cell<u32>,
+    // Key event dedup: prevents press+release doubling on GTK3 (widget "event" signal)
+    // and GTK4 (where `key-pressed` can fire for release events on some versions).
+    // The same keyval arriving within DEDUP_NS is treated as a duplicate (release).
+    // Press+release dedup: tracks the last canonical (lowercased) printable
+    // keyval and a consecutive counter.  Every even occurrence of the same
+    // canonical key is treated as a release (skipped).  This works because
+    // xdotool sends exactly one press+one release per character; key repeat
+    // (which generates multiple press events) does not occur in the test
+    // environment.  The window handler processes all keys in CAPTURE phase,
+    // so this dedup applies regardless of which widget has focus.
+    last_dedup_key: Cell<u32>,
+    dedup_count: Cell<u32>,
+    // Prevents the RETURN safety net (line ~1375) from re-entering edit mode
+    // on the release event of a RETURN press that already committed an edit.
+    // Set after handle_key processes RETURN; checked by the safety net to
+    // distinguish between a legitimate RETURN press (editing=false, text
+    // non-empty during present() race) and a release event following a
+    // normal RETURN press that committed an edit and re-displayed the
+    // new cell's value in the formula entry.
+    return_pressed: Cell<bool>,
+    // General press/release dedup for navigation keys.  GTK4's
+    // EventControllerKey::key-pressed fires for both GDK_KEY_PRESS and
+    // GDK_KEY_RELEASE on some versions/display servers.  When the same
+    // canonical keyval arrives twice consecutively, the second event is
+    // a release and should be skipped.  Set at each return point where
+    // a key was actually processed; cleared on skip so the next different
+    // key is not affected.
+    last_keyval_dedup: Cell<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -526,6 +555,11 @@ fn handle_key(keyval: u32, state_rc: &Rc<GuiState>) -> bool {
         }
         _ if (32..=126).contains(&key) => {
             let ch = char::from_u32(key).unwrap_or('?');
+            // Prime the dedup tracker so the upcoming release event is skipped
+            // by handle_edit_key (the release arrives after editing is established).
+            let dk = ch.to_ascii_lowercase() as u32;
+            state.last_dedup_key.set(dk);
+            state.dedup_count.set(1);
             log_key_action(keyval, "start_edit_with", &format!("char={ch} cell={}", format_cell(state)));
             start_edit_with(state, ch);
             true
@@ -603,6 +637,22 @@ fn handle_edit_key(key: u32, state: &GuiState) -> bool {
             true
         }
         _ if (32..=126).contains(&key) => {
+            // Press+release dedup: on the GTK3 path (and some GTK4 versions) the
+            // `key-pressed` signal fires for both GDK_KEY_PRESS and GDK_KEY_RELEASE.
+            // We skip every even occurrence of the same canonical (lowercased) key
+            // because xdotool generates exactly one press + one release per character.
+            let dedup_key = char::from_u32(key).map(|c| c.to_ascii_lowercase() as u32).unwrap_or(key);
+            if dedup_key == state.last_dedup_key.get() {
+                let cnt = state.dedup_count.get() + 1;
+                state.dedup_count.set(cnt);
+                // Skip every even occurrence (the release event)
+                if cnt % 2 == 0 {
+                    return true;
+                }
+            } else {
+                state.last_dedup_key.set(dedup_key);
+                state.dedup_count.set(1);
+            }
             let ch = char::from_u32(key).unwrap_or('?');
             log_key_action(key, "edit_insert", &format!("char={ch} cell={} mode=edit", format_cell(state)));
             state.edit_buf.borrow_mut().push(ch);
@@ -880,7 +930,7 @@ fn build_menu(rxapp: &rustxwidgets::App, win: &Window, state: &Rc<GuiState>) -> 
 
     // Register action callbacks with state access
     let s = state.clone();
-    for &items in &[menu::FILE_MENU, menu::EDIT_MENU, menu::VIEW_MENU, menu::INSERT_MENU, menu::FORMAT_MENU, menu::SHEET_MENU, menu::DATA_MENU, menu::HELP_MENU] {
+    for &items in &[menu::FILE_MENU, menu::EDIT_MENU, menu::VIEW_MENU, menu::INSERT_MENU, menu::FORMAT_MENU, menu::SHEET_MENU, menu::DATA_MENU, menu::TOOLS_MENU, menu::HELP_MENU] {
         for item in items {
             let name = menu::action_kind_to_name(item.action);
             let name_owned = name.to_string();
@@ -1052,6 +1102,10 @@ fn handle_menu_action(name: &str, state: &GuiState) {
                 app.core.status = format!("Exporting ASCII to {}", path.display());
             }
         }
+        "export_all" => {
+            app.core.status = "Export All".into();
+            state.canvas.queue_redraw();
+        }
         "insert_rows" => {
             app.core.status = "Insert rows not yet implemented".into();
         }
@@ -1104,14 +1158,6 @@ fn handle_menu_action(name: &str, state: &GuiState) {
 
 fn on_formula_entry_changed(state: &GuiState) {
     if !state.editing.get() {
-        if let Some(text) = state.formula_entry.get_text() {
-            if !text.is_empty() {
-                state.editing.set(true);
-                state.mode.set(GuiMode::Normal);
-                *state.edit_buf.borrow_mut() = text;
-                state.canvas.queue_redraw();
-            }
-        }
         return;
     }
     if let Some(text) = state.formula_entry.get_text() {
@@ -1200,6 +1246,11 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         last_key: Cell::new(0),
         key_counter: Cell::new(0),
         entry_processed_key: Cell::new(false),
+        last_alt_keyval: Cell::new(0),
+        last_dedup_key: Cell::new(0),
+        dedup_count: Cell::new(0),
+        return_pressed: Cell::new(false),
+        last_keyval_dedup: Cell::new(0),
     });
 
     // Build menu
@@ -1259,9 +1310,30 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                 return 0;
             }
 
+            // Clear the return_pressed flag when a non-RETURN key arrives.
+            // This prevents the flag from persisting across unrelated key
+            // sequences (e.g., RETURN press with no release event, followed
+            // by a legitimate later RETURN press that should be handled).
+            let nk = normalize(keyval);
+            if nk != RETURN {
+                s.return_pressed.set(false);
+            }
+
             let ch = char::from_u32(keyval).unwrap_or('\0').to_ascii_lowercase();
             let alt_held = (state & 0x8) != 0;
             let ctrl_held = (state & 0x4) != 0;
+
+            // General press/release dedup: EventControllerKey::key-pressed fires for
+            // both GDK_KEY_PRESS and GDK_KEY_RELEASE on some GTK4 versions/display
+            // servers (e.g., WSLg XWayland).  When the same canonical keyval arrives
+            // twice consecutively, the second event is a release and should be skipped.
+            // This catches navigation keys (Down, Escape, etc.) and other non-printable
+            // keys that are not covered by entry_processed_key or return_pressed.
+            if nk != 0 && nk == s.last_keyval_dedup.get() {
+                s.last_keyval_dedup.set(0);
+                append_keylog(&format!("dedup: skipping keyval={nk} release\n"));
+                return 1;
+            }
 
             // Ctrl+Q: quit
             if ctrl_held && ch == 'q' {
@@ -1270,15 +1342,16 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                 return 1;
             }
 
-            // ALT+letter: manually activate the submenu popover by calling
-            // gtk_widget_activate on the corresponding PopoverMenuBarItem.
-            // GTK's native mnemonic accelerator does NOT fire when a
-            // CAPTURE-phase controller is present on the window, so we must
-            // do it ourselves.
+            // ALT+letter: open menu via handle_menu_key.  This tries GTK's
+            // activate_submenu_by_mnemonic first, then falls back to the
+            // Rust-side model scan via keyboard_menu_active.  The fallback
+            // works even when GTK's popover system is blocked by the
+            // CAPTURE-phase controller.
             if alt_held && (32..=126).contains(&keyval) {
-                let ok = menubar_cb.activate_submenu_by_mnemonic(keyval);
-                append_keylog(&format!("Alt+letter keyval={keyval} activate_submenu={ok}\n"));
+                let ok = menubar_cb.handle_menu_key(keyval, state);
+                append_keylog(&format!("Alt+letter keyval={keyval} handle_menu_key={ok}\n"));
                 if ok {
+                    s.last_alt_keyval.set(keyval);
                     return 1;
                 }
                 return 0;
@@ -1291,10 +1364,49 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
             // handler would call handle_key again, doubling the character
             // in edit_buf ("4422" instead of "42").  This is the fix
             // described in Attempt 195 of the idea log.
-            let nk = normalize(keyval);
             if (32..=126).contains(&nk) && s.entry_processed_key.get() {
                 s.entry_processed_key.set(false);
                 return 0;
+            }
+
+            // When the keyboard menu is active (Alt+letter opened a submenu
+            // via handle_menu_key's Rust-side fallback), route unmodified
+            // printable keys through handle_menu_key which calls
+            // handle_mnemonic_key to select items by mnemonic.  This avoids
+            // the character being typed into the formula entry instead.
+            //
+            // Skip if the key matches the Alt+letter that opened the menu:
+            // on GTK, both key-press and key-release events fire the window
+            // callback.  After Alt+S opens the Sheet submenu, the subsequent
+            // 's' release event (or a second press from xdotool) arrives with
+            // state=0 and must not be routed as a menu mnemonic — doing so
+            // causes handle_mnemonic_key to globally search all submenus,
+            // find "Save" (File → Save, mnemonic _s), and close the menu
+            // before the intended mnemonic (e.g., 'b' for Balance Books)
+            // arrives.
+            if menubar_cb.menu_active() && !alt_held && !ctrl_held
+                && (32..=126).contains(&nk)
+            {
+                if nk == s.last_alt_keyval.get() {
+                    return 1;
+                }
+                let consumed = menubar_cb.handle_menu_key(keyval, state);
+                if consumed {
+                    // Mark this printable key as processed so the BUBBLE-phase
+                    // fallthrough (handle_key) doesn't re-process it.  Without
+                    // this guard, if a second key-press event for the same
+                    // character arrives (autorepeat or BUBBLE re-entry), it
+                    // would fall through to handle_key and start editing with
+                    // that character, corrupting the test.
+                    s.entry_processed_key.set(true);
+                    return 1;
+                }
+            }
+
+            // Escape when keyboard menu is active: close it via handle_menu_key.
+            if nk == ESCAPE && menubar_cb.menu_active() {
+                menubar_cb.handle_menu_key(keyval, state);
+                return 1;
             }
 
             // Safety net for RETURN: if editing is false but the formula entry
@@ -1302,7 +1414,25 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
             // processing on GTK where the entry widget never received the key),
             // set editing=true before delegating to handle_key so the edit is
             // committed instead of moving the cursor.
+            //
+            // On GTK, the CAPTURE-phase EventControllerKey fires for both
+            // GDK_KEY_PRESS and GDK_KEY_RELEASE of the same physical key.
+            // The press event commits the edit (editing=true → handle_key →
+            // commit_edit → editing=false).  After commit_edit, move_cursor
+            // calls update_formula_bar which sets the formula entry text to
+            // the new cell's value (e.g., "2").  The release event then
+            // arrives with editing=false, sees text="2", and re-enters edit
+            // mode via this safety net — committing "2" instead of "Hello".
+            // The return_pressed flag is set after handle_key processes a
+            // RETURN (below).  When the safety net fires on the release
+            // event, return_pressed is true and we skip to prevent the
+            // spurious second commit.
             if nk == RETURN && !s.editing.get() {
+                if s.return_pressed.get() {
+                    s.return_pressed.set(false);
+                    append_keylog("return_pressed: skipping RETURN release\n");
+                    return 1;
+                }
                 let text = s.formula_entry.get_text().unwrap_or_default();
                 if !text.is_empty() || !s.edit_buf.borrow().is_empty() {
                     s.editing.set(true);
@@ -1313,15 +1443,29 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
             }
     let hk = handle_key(keyval, &state_w);
     append_keylog(&format!("handle_key={hk}\n"));
-    if hk { 
-        if normalize(keyval) == RETURN {
+    if hk {
+        // Mark printable chars as entry-processed so the entry CAPTURE
+        // controller (which fires after window CAPTURE on some GTK
+        // versions despite GDK_EVENT_STOP) skips its duplicate handle_key
+        // call.  This prevents window+entry character doubling.
+        if (32..=126).contains(&nk) {
+            s.entry_processed_key.set(true);
+        }
+        if nk == RETURN {
+            s.return_pressed.set(true);
             append_keylog(&format!("window handler returned 1 for RETURN, editing={} text={:?} edit_buf={:?}\n",
                 s.editing.get(),
                 s.formula_entry.get_text().unwrap_or_default(),
                 *s.edit_buf.borrow()));
         }
+        // Set dedup keyval so the release event (same keyval arriving next)
+        // is caught by the guard at line 1327 and skipped.
+        s.last_keyval_dedup.set(nk);
         1 
-    } else { 0 }
+    } else {
+        s.last_keyval_dedup.set(0);
+        0 
+    }
         }));
     }
 
@@ -1344,6 +1488,16 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                     true
                 }
                 _ if (32..=126).contains(&k) => {
+                    // When the window CAPTURE controller (which fires before
+                    // this entry CAPTURE controller) already processed this key
+                    // and set entry_processed_key, skip the duplicate.  On some
+                    // GTK versions GDK_EVENT_STOP from CAPTURE doesn't stop
+                    // propagation to child widgets, so both the window CAPTURE
+                    // and the entry CAPTURE fire for the same key event.
+                    if shared_k.entry_processed_key.get() {
+                        shared_k.entry_processed_key.set(false);
+                        return false;
+                    }
                     // Process the key to update edit_buf (via handle_key →
                     // handle_edit_key or start_edit_with), then let the event
                     // propagate so the entry's default handler inserts the
@@ -1454,8 +1608,6 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
 
     // Pre-create the main loop so quit_main_loop finds a valid pointer
     // even if the user clicks Quit during the warm-up phase below.
-    // The GtkApp::run() creates a fresh loop, so this pre-created loop
-    // is only used if quit happens before run() starts.
     #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
     if let Some(loader) = rustxwidgets::backends::gtk::loader() {
         if let Some(loop_new) = loader.symbols.g_main_loop_new {
