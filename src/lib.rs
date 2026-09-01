@@ -1,5 +1,4 @@
 
-#![feature(optimize_attribute)]
 
 pub mod capture;
 pub mod core;
