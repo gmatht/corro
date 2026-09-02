@@ -1352,7 +1352,7 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                 let l_for_cb = loader.clone();
                 let state_w = shared.clone();
                 unsafe {
-                    let _ = gtk_dynamic_loader::widget_connect_signal_bool(
+                    let _ = rustxwidgets::gtk_dynamic_loader::widget_connect_signal_bool(
                         &l_for_sig,
                         win_ptr,
                         "event",
@@ -1433,20 +1433,20 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                 let l2_for_cb = l2.clone();
                 let state_k = shared.clone();
                 unsafe {
-                    let _ = gtk_dynamic_loader::widget_connect_signal_bool(
+                    let _ = rustxwidgets::gtk_dynamic_loader::widget_connect_signal_bool(
                         &l2,
                         entry_ptr,
                         "event",
                         Box::new(move |ev: *mut std::ffi::c_void| -> i32 {
                             let keyval =
-                                gtk_dynamic_loader::EventControllerKey::get_keyval_static(
+                                rustxwidgets::gtk_dynamic_loader::EventControllerKey::get_keyval_static(
                                     &l2_for_cb, ev,
                                 );
                             if keyval == 0 {
                                 return 0;
                             }
                             let state =
-                                gtk_dynamic_loader::EventControllerKey::get_state_static(
+                                rustxwidgets::gtk_dynamic_loader::EventControllerKey::get_state_static(
                                     &l2_for_cb, ev,
                                 );
                             let alt_held = (state & 0x8) != 0;

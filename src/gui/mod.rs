@@ -1,4 +1,5 @@
 use crate::core::state::CoreApp;
+mod app_alias;
 use crate::grid::{CellAddr, SheetCursor, HEADER_ROWS, MARGIN_COLS};
 use crate::io::load_workbook_revisions_partial;
 use crate::io::PartialReplay;

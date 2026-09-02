@@ -1,11 +1,12 @@
 use crate::ops::WorkbookState;
+use crate::gui::app_alias::App;
 use std::path::PathBuf;
 #[cfg(feature = "gui")]
 use rustxwidgets::prelude::Orientation;
 
 pub fn file_open_dialog() -> Option<PathBuf> {
     #[cfg(feature = "gui")]
-    return rustxwidgets::App::init().ok().and_then(|app| {
+    return App::init().ok().and_then(|app| {
         app.open_file("Open Spreadsheet").ok().flatten().map(PathBuf::from)
     });
     #[allow(unreachable_code)]
@@ -14,7 +15,7 @@ pub fn file_open_dialog() -> Option<PathBuf> {
 
 pub fn file_save_dialog() -> Option<PathBuf> {
     #[cfg(feature = "gui")]
-    return rustxwidgets::App::init().ok().and_then(|app| {
+    return App::init().ok().and_then(|app| {
         app.save_file("Save Spreadsheet").ok().flatten().map(PathBuf::from)
     });
     #[allow(unreachable_code)]
@@ -24,7 +25,7 @@ pub fn file_save_dialog() -> Option<PathBuf> {
 pub fn show_about_dialog() {
     #[cfg(feature = "gui")]
     {
-        if let Ok(app) = rustxwidgets::App::init() {
+        if let Ok(app) = App::init() {
             if let Ok(dialog) = app.create_dialog() {
                 if let Ok(label) = app.create_label(&format!(
                     "corro {}\n\nAppend-only collaborative spreadsheet",
@@ -48,7 +49,7 @@ pub fn show_about_dialog() {
 pub fn show_keybinds_help() {
     #[cfg(feature = "gui")]
     {
-        if let Ok(app) = rustxwidgets::App::init() {
+        if let Ok(app) = App::init() {
             if let Ok(dialog) = app.create_dialog() {
                 if let Ok(tv) = app.create_textview() {
                     dialog.set_title("Keybindings");

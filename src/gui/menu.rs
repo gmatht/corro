@@ -1,4 +1,5 @@
 use crate::gui::dialogs;
+use crate::gui::app_alias::App;
 use rustxwidgets::{Menu, SimpleAction};
 
 pub struct MenuAction {
@@ -125,7 +126,7 @@ pub fn action_kind_to_name(kind: MenuActionKind) -> &'static str {
 }
 
 /// Build a submenu model from action descriptors.
-pub fn build_submenu(rxapp: &rustxwidgets::App, items: &[MenuAction], prefix: &str) -> Result<Menu, Box<dyn std::error::Error>> {
+pub fn build_submenu(rxapp: &App, items: &[MenuAction], prefix: &str) -> Result<Menu, Box<dyn std::error::Error>> {
     let mut menu = rxapp.create_menu()?;
     for item in items {
         let name = action_kind_to_name(item.action);
@@ -136,7 +137,7 @@ pub fn build_submenu(rxapp: &rustxwidgets::App, items: &[MenuAction], prefix: &s
 
 /// Create a SimpleAction, connect its callback, and register it.
 pub fn register_action<F: FnMut() + 'static>(
-    rxapp: &rustxwidgets::App,
+    rxapp: &App,
     name: &str,
     mut f: F,
 ) -> Result<SimpleAction, Box<dyn std::error::Error>> {
