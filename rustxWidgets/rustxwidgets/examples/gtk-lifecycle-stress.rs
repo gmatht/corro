@@ -1,3 +1,4 @@
+#![cfg(feature = "gtk")]
 use rustxwidgets::backends_gtk_adapter as gtk;
 use rustxwidgets::lifecycle_stress::Op;
 use rustxwidgets::prelude::*;

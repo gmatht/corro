@@ -1,3 +1,4 @@
+#![cfg(feature = "gtk")]
 use rustxwidgets::prelude::*;
 use std::rc::Rc;
 use std::cell::RefCell;

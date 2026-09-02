@@ -64,3 +64,23 @@ headless = []
 [dev-dependencies]
 proptest = "1.6"
 serde_json = "1.0"
+
+[[example]]
+name = "g-demo"
+required-features = ["gtk"]
+
+[[example]]
+name = "g-spreadsheet-canvas"
+required-features = ["gtk"]
+
+[[example]]
+name = "g-spreadsheet"
+required-features = ["gtk"]
+
+[[example]]
+name = "gtk-lifecycle-stress"
+required-features = ["gtk"]
+
+[[example]]
+name = "x-sheet"
+required-features = ["gtk"]
