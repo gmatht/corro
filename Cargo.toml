@@ -28,7 +28,7 @@ unicode-width = "0.2.0"
 unicode-truncate = { version = "1", optional = true }
 crossterm = { version = "0.28", optional = true }
 unicode-segmentation = { version = "1", optional = true }
-rustxwidgets = { path = "rustxWidgets/rustxwidgets", optional = true }
+rustxwidgets = { path = "rustxWidgets/rustxwidgets", optional = true, default-features = false }
 serde = { version = "1", features = ["derive"] }
 notify = "7"
 thiserror = "2"
