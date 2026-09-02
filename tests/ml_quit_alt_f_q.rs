@@ -1,3 +1,4 @@
+#![cfg(feature = "gui")]
 //! Test that Alt+F → Q (Quit from File menu) causes the app to quit on Windows.
 //! Before the fix, `handle_menu_action("quit")` was a no-op on Windows.
 //! The fix adds `quit_main_loop()` to the NWG backend which posts `WM_QUIT`.

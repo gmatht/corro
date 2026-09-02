@@ -389,7 +389,7 @@ fn handle_key(keyval: u32, state_rc: &Rc<GuiState>) -> bool {
         state.alt_active.set(false);
         state.seq_alt_f.set(false);
         state.last_was_f.set(false);
-        #[cfg(unix)]
+        #[cfg(all(unix, feature = "gui"))]
         let _ = rustxwidgets::backends_gtk_adapter::quit_main_loop();
         #[cfg(windows)]
         rustxwidgets::backends_nwg_adapter::quit_main_loop();
@@ -428,7 +428,7 @@ fn handle_key(keyval: u32, state_rc: &Rc<GuiState>) -> bool {
             state.alt_active.set(false);
             state.seq_alt_f.set(false);
             state.last_was_f.set(false);
-            #[cfg(unix)]
+            #[cfg(all(unix, feature = "gui"))]
             let _ = rustxwidgets::backends_gtk_adapter::quit_main_loop();
             #[cfg(windows)]
             rustxwidgets::backends_nwg_adapter::quit_main_loop();
@@ -457,7 +457,7 @@ fn handle_key(keyval: u32, state_rc: &Rc<GuiState>) -> bool {
             state.alt_active.set(false);
             state.seq_alt_f.set(false);
             state.last_was_f.set(false);
-            #[cfg(unix)]
+            #[cfg(all(unix, feature = "gui"))]
             let _ = rustxwidgets::backends_gtk_adapter::quit_main_loop();
             #[cfg(windows)]
             rustxwidgets::backends_nwg_adapter::quit_main_loop();
@@ -602,7 +602,7 @@ fn handle_edit_key(key: u32, state: &GuiState) -> bool {
             state.alt_active.set(false);
             state.seq_alt_f.set(false);
             state.last_was_f.set(false);
-            #[cfg(unix)]
+            #[cfg(all(unix, feature = "gui"))]
             let _ = rustxwidgets::backends_gtk_adapter::quit_main_loop();
             #[cfg(windows)]
             rustxwidgets::backends_nwg_adapter::quit_main_loop();
@@ -709,7 +709,7 @@ fn save_before_quit(state: &GuiState) {
     if state.editing.get() {
         commit_edit(state);
     }
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "gui"))]
     let _ = rustxwidgets::backends_gtk_adapter::quit_main_loop();
     #[cfg(windows)]
     rustxwidgets::backends_nwg_adapter::quit_main_loop();
@@ -764,7 +764,7 @@ fn commit_edit(state: &GuiState) {
     focus_canvas(state);
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "gui"))]
 fn focus_canvas(state: &GuiState) {
     if let Some(loader) = rustxwidgets::backends::gtk::loader() {
         unsafe {
@@ -1028,7 +1028,7 @@ fn handle_menu_action(name: &str, state: &GuiState) {
             }
         }
         "quit" => {
-            #[cfg(unix)]
+            #[cfg(all(unix, feature = "gui"))]
             let _ = rustxwidgets::backends_gtk_adapter::quit_main_loop();
             #[cfg(windows)]
             rustxwidgets::backends_nwg_adapter::quit_main_loop();
@@ -1236,7 +1236,7 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // Ensure the canvas can receive keyboard focus (needed for focus_canvas
     // to succeed after commit_edit — GtkDrawingArea does not accept focus
     // by default).
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "gui"))]
     if let Some(loader) = rustxwidgets::backends::gtk::loader() {
         unsafe {
             if let Some(set_can_focus) = loader.symbols.gtk_widget_set_can_focus {
@@ -1298,7 +1298,7 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
             s.seq_alt_f.set(false);
             s.menu_nav.set(MenuNavState::Inactive);
             s.last_was_f.set(false);
-            #[cfg(unix)]
+            #[cfg(all(unix, feature = "gui"))]
             let _ = rustxwidgets::backends_gtk_adapter::quit_main_loop();
             #[cfg(windows)]
             rustxwidgets::backends_nwg_adapter::quit_main_loop();
@@ -1343,7 +1343,7 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
 
     // Window-level GTK event interception to catch Alt-F+Q before the
     // menu bar's mnemonic accelerator can steal the keystrokes.
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "gui"))]
     {
         if let Some(loader) = rustxwidgets::backends::gtk::loader() {
             let win_ptr = win.raw_handle();
@@ -1377,6 +1377,7 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                             let ch = char::from_u32(keyval).unwrap_or('\0').to_ascii_lowercase();
                             if (state & 0x4) != 0 && ch == 'q' {
                                 s.seq_alt_f.set(false);
+                                #[cfg(all(unix, feature = "gui"))]
                                 let _ = rustxwidgets::backends_gtk_adapter::quit_main_loop();
                                 return 1;
                             }
@@ -1398,6 +1399,7 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                                 && (s.menu_nav.get() == MenuNavState::File
                                     || s.seq_alt_f.get())
                             {
+                                #[cfg(all(unix, feature = "gui"))]
                                 let _ = rustxwidgets::backends_gtk_adapter::quit_main_loop();
                                 return 1;
                             }
@@ -1424,7 +1426,7 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     }
 
     // Intercept Enter/Escape from formula entry during editing
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "gui"))]
     {
         if let Some(loader) = rustxwidgets::backends::gtk::loader() {
             let entry_ptr = formula_entry.raw_handle();
@@ -1490,7 +1492,7 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                                     state_k.alt_active.set(false);
                                     state_k.seq_alt_f.set(false);
                                 } else {
-                                    #[cfg(unix)]
+                                    #[cfg(all(unix, feature = "gui"))]
                                     let _ = rustxwidgets::backends_gtk_adapter::quit_main_loop();
                                     #[cfg(windows)]
                                     rustxwidgets::backends_nwg_adapter::quit_main_loop();

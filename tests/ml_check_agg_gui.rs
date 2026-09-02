@@ -1,3 +1,4 @@
+#![cfg(feature = "gui")]
 #![cfg(any(feature = "gui", feature = "pancurses", target_arch = "wasm32"))]
 
 use corro::grid::{

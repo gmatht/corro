@@ -1,3 +1,4 @@
+#![cfg(feature = "gui")]
 //! Phase 6 verification: corro's grid data converges onto a rustxWidgets
 //! `SpreadsheetModel` through the same `render::fill_cells` pipeline the
 //! pancurses backend uses. Rendered via the headless recorder, the model must

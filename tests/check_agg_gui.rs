@@ -1,3 +1,4 @@
+#![cfg(feature = "gui")]
 use corro::grid::{
     CellAddr, ColumnAddr, Grid, GridBox, SheetCursor, HEADER_ROWS, MARGIN_COLS, FOOTER_ROWS,
 };

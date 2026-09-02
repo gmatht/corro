@@ -1,3 +1,4 @@
+#![cfg(feature = "gui")]
 use std::fs;
 use std::path::Path;
 
