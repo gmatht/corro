@@ -261,7 +261,7 @@ pub fn compute_cell_info(
         }
     } else if let (Some(mri), Some(agg_func)) = (main_row, rca) {
         let data_cols = data_main_col_count(g);
-        compute_aggregate(
+        let agg = compute_aggregate(
             g,
             &AggregateDef {
                 func: agg_func,
@@ -272,7 +272,13 @@ pub fn compute_cell_info(
                     col_end: data_cols as u32,
                 },
             },
-        )
+        );
+        if agg.is_empty() {
+            let own = cell_effective_display(g, addr);
+            if own.is_empty() { "0".to_string() } else { own }
+        } else {
+            agg
+        }
     } else {
         cell_effective_display(g, addr)
     };
