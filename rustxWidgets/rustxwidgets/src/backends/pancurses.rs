@@ -211,7 +211,7 @@ mod pancurses_backend {
 
     impl crate::backends::BackendApp for PcApp {
         fn run(self: Box<Self>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-            let root = initscr();
+            let mut root = initscr();
             raw();
             noecho();
             root.keypad(true);
@@ -277,7 +277,10 @@ mod pancurses_backend {
                 state.running = true;
             });
 
-            while with_state(|s| s.running) {
+            // Redraw only when a key/event arrives (avoids flicker). The initial
+            // frame is drawn once here; subsequent frames only on input.
+            let redraw_frame = |root: &mut Window| {
+
                 // Clear direct-write spreadsheet output for this frame
                 with_state(|s| s.spreadsheet_output.clear());
                 // layout pass
@@ -420,6 +423,15 @@ mod pancurses_backend {
                     }
                 });
 
+                
+            };
+            redraw_frame(&mut root);
+
+            while with_state(|s| s.running) {
+                // Block for input first; only redraw when a key/event arrives
+                // (avoids flicker from redrawing every 100ms timeout).
+                let input = root.getch();
+
                 // Host frame hook: lets a host app mirror external state into the
                 // widget tree on the main thread (e.g. flush a transcript into a
                 // TextView). Runs every loop iteration; cleared on quit.
@@ -428,7 +440,7 @@ mod pancurses_backend {
                         cb();
                     }
                 });
-                match root.getch() {
+                match input {
                     Some(Input::KeyResize) => {
                         let (my, mx) = root.get_max_yx();
                         root.clear();
@@ -1383,7 +1395,8 @@ mod pancurses_backend {
                     }
                     _ => {}
                 }
-            }
+                            if input.is_some() { redraw_frame(&mut root); }
+}
 
             endwin();
             Ok(())
