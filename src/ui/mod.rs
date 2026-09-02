@@ -10159,12 +10159,12 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
     }
 
     fn menu_bar_line(&self) -> String {
-        let (section, item) = match &self.mode {
+        let section = match &self.mode {
             Mode::Menu { stack } => stack
                 .last()
-                .map(|level| (level.section, level.item))
-                .unwrap_or((MenuSection::File, usize::MAX)),
-            _ => (MenuSection::File, usize::MAX),
+                .map(|level| level.section)
+                .unwrap_or(MenuSection::File),
+            _ => MenuSection::File,
         };
         let file = if matches!(
             section,
@@ -10205,17 +10205,7 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
         } else {
             " Help "
         };
-        let active = if item != usize::MAX {
-            format!(
-                "  {}",
-                menu_action_item(section, item)
-                    .map(|i| i.label)
-                    .unwrap_or("")
-            )
-        } else {
-            String::new()
-        };
-        format!(" {file}  {edit}  {insert}  {format}  {sheet}  {help}{active}")
+        format!(" {file}  {edit}  {insert}  {format}  {sheet}  {help}")
     }
 
     fn balance_dialog_lines(
