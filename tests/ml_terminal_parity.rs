@@ -52,7 +52,24 @@ fn run_in_tmux(args: &str, keys: &[&str], wait_ms: u64) -> String {
     pane
 }
 
-/// Send the same key events to the ratatui App (via the public bench_handle_key API).
+/// Alt+F must open the File menu in the pancurses UI (regression test:
+/// the pancurses path previously never created a MenuBar widget, so
+/// menu_bar_id was None and Alt+key navigation did nothing).
+#[test]
+fn alt_f_opens_file_menu_in_pancurses() {
+    let pane = run_in_tmux("--pancurses docs/tests/overflow.corro", &["Escape", "f"], 1200);
+    let joined = pane.replace('\u{fffd}', "").replace('\x1b', "");
+    for &s in &["Open", "Save", "Save As", "Quit"] {
+        assert!(
+            joined.contains(s),
+            "pancurses missing '{}' in File menu after Alt+F\n---\n{}\n---",
+            s, &pane[..pane.len().min(1200)]
+        );
+    }
+}
+
+
+// Send the same key events to the ratatui App (via the public bench_handle_key API).
 fn ratatui_send(app: &mut corro::ui::App, code: crossterm::event::KeyCode, mods: crossterm::event::KeyModifiers) {
     let ev = crossterm::event::KeyEvent::new(code, mods);
     app.bench_handle_key(ev).ok();
@@ -89,7 +106,6 @@ fn render_via_ratatui(rel_path: &str) -> String {
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[test]
-#[ignore = "pre-existing corro GUI failure; see GOALS.md"]
 fn overflow_renders_cell_text() {
     let pane = run_in_tmux("--pancurses docs/tests/overflow.corro", &[], 600);
     assert!(pane.contains("should overflow"), "pancurses missing cell text:\n{}",
@@ -104,7 +120,6 @@ fn q_quits() {
 }
 
 #[test]
-#[ignore = "pre-existing corro GUI failure; see GOALS.md"]
 fn render_has_menu_and_cell_text() {
     let pane = run_in_tmux("--pancurses docs/tests/overflow.corro", &[], 500);
     let ratatui = render_via_ratatui("docs/tests/overflow.corro");
@@ -115,8 +130,6 @@ fn render_has_menu_and_cell_text() {
 }
 
 #[test]
-#[ignore = "pre-existing corro GUI terminal-parity failure; see GOALS.md"]
-#[ignore = "pre-existing corro GUI failure; see GOALS.md"]
 fn arrow_down_shows_a3() {
     let pane = run_in_tmux("--pancurses docs/tests/overflow.corro", &["Down"], 1200);
     assert!(pane.contains("A3"),
@@ -124,8 +137,6 @@ fn arrow_down_shows_a3() {
 }
 
 #[test]
-#[ignore = "pre-existing corro GUI terminal-parity failure; see GOALS.md"]
-#[ignore = "pre-existing corro GUI failure; see GOALS.md"]
 fn right_arrow_shows_b2() {
     let pane = run_in_tmux("--pancurses docs/tests/overflow.corro", &["Right"], 1200);
     assert!(pane.contains("B2"),
@@ -133,7 +144,6 @@ fn right_arrow_shows_b2() {
 }
 
 #[test]
-#[ignore = "pre-existing corro GUI failure; see GOALS.md"]
 fn left_arrow_does_not_jump_viewport() {
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let session = format!("corro-{}", id);
@@ -169,8 +179,6 @@ fn left_arrow_does_not_jump_viewport() {
 /// Move to C3, enter "Hello World!", and verify both backends show the
 /// correct cell address and content (structural match, not exact char).
 #[test]
-#[ignore = "pre-existing corro GUI terminal-parity failure; see GOALS.md"]
-#[ignore = "pre-existing corro GUI failure; see GOALS.md"]
 fn edit_c3_hello_world_full_screen_match() {
     use crossterm::event::KeyCode;
     let keys = &["Right", "Right", "Down", "Down", "Enter", "H", "e", "l", "l", "o", " ",
@@ -194,7 +202,6 @@ fn edit_c3_hello_world_full_screen_match() {
 
 /// Navigate to column K (past J) in the right margin and verify the ratatui formula bar shows ]K1.
 #[test]
-#[ignore = "pre-existing corro GUI failure; see GOALS.md"]
 fn navigate_to_column_k_via_ratatui() {
     use crossterm::event::KeyCode;
     let mut keys = Vec::new();
@@ -221,7 +228,6 @@ fn arrow_left_from_a1_enters_margin() {
 
 /// Arrow up from A1 should enter the header row.
 #[test]
-#[ignore = "pre-existing corro GUI failure; see GOALS.md"]
 fn arrow_up_from_a1_enters_header() {
     let pane = run_in_tmux("--pancurses docs/tests/overflow.corro", &["Up"], 1000);
     // After Up from A1, cursor should show header label (like ~1)
@@ -233,8 +239,6 @@ fn arrow_up_from_a1_enters_header() {
 /// Navigate to a cell via repeated arrow keys, enter "Hello World!", and verify
 /// the pancurses formula bar shows the correct address.
 #[test]
-#[ignore = "pre-existing corro GUI terminal-parity failure; see GOALS.md"]
-#[ignore = "pre-existing corro GUI failure; see GOALS.md"]
 fn go_to_cell_and_enter_hello_world() {
     let pane = run_in_tmux("--pancurses docs/tests/overflow.corro", &[
         "Right","Right","Down","Down","Enter","H","e","l","l","o"," ",
@@ -250,8 +254,6 @@ fn go_to_cell_and_enter_hello_world() {
 /// Go to cell A1000 via Ctrl+G, then enter "Hello World!".
 /// Verifies the pancurses formula bar shows the Go-to address.
 #[test]
-#[ignore = "pre-existing corro GUI terminal-parity failure; see GOALS.md"]
-#[ignore = "pre-existing corro GUI failure; see GOALS.md"]
 fn go_to_cell_via_ctrlg() {
     let pane = run_in_tmux("--pancurses docs/tests/overflow.corro", &[
         "C-g", "Enter", "Hello", " ", "World", "!", "Enter",

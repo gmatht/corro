@@ -255,8 +255,33 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         format!("corro  {}r × {}c  ops {}", mr, mc, total_ops);
     spreadsheet.set_border_title(&border_title);
 
-    // Menu
+    // Menu bar text (rendered) + the MenuBar *widget* so Alt+key navigation
+    // (Alt+F opens File, etc.) works — matching the GTK path which creates a
+    // MenuBar via build_menu(). Without the widget, menu_bar_id is None and
+    // Alt+key does nothing in the pancurses backend.
     spreadsheet.set_menu_text(" [File]   Edit    Insert    Format    Sheet    Help");
+    let submenu_items: Vec<(String, Vec<(String, String)>)> = [
+        ("File", crate::gui::menu::FILE_MENU),
+        ("Edit", crate::gui::menu::EDIT_MENU),
+        ("View", crate::gui::menu::VIEW_MENU),
+        ("Insert", crate::gui::menu::INSERT_MENU),
+        ("Format", crate::gui::menu::FORMAT_MENU),
+        ("Sheet", crate::gui::menu::SHEET_MENU),
+        ("Data", crate::gui::menu::DATA_MENU),
+        ("Help", crate::gui::menu::HELP_MENU),
+    ]
+    .iter()
+    .map(|(label, items): &(&str, &[crate::gui::menu::MenuAction])| {
+        (
+            label.to_string(),
+            items
+                .iter()
+                .map(|a| (a.label.to_string(), crate::gui::menu::action_kind_to_name(a.action).to_string()))
+                .collect(),
+        )
+    })
+    .collect();
+    let mb_res = unsafe { rustxwidgets::backends::pancurses::create_menubar(submenu_items, std::ptr::null_mut()) };
 
     // Formula bar trailing: show app status text (matches ratatui's
     // mode_prompt_widget which appends "   ·  {status}" after the cell value).

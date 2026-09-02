@@ -383,6 +383,43 @@ mod pancurses_backend {
                         emit_sgr(&s.spreadsheet_output);
                     }
                 });
+                // Emit the open menu popup via SGR (same direct-output path as the
+                // spreadsheet cells) so it appears on top of the SGR output.
+                with_state(|state| {
+                    if state.menu_open {
+                        if let Some(mid) = state.menu_bar_id {
+                            if let Some(n) = state.node(mid) {
+                                if let PcWidgetKind::MenuBar { labels, submenu_items } = &n.kind {
+                                    let (sub_idx, item_idx) = (state.active_submenu, state.active_item);
+                                    if sub_idx < submenu_items.len() {
+                                        let (_, items) = &submenu_items[sub_idx];
+                                        let dy = n.rect.y + 1;
+                                        let mut mx = n.rect.x + 1;
+                                        for i in 0..sub_idx {
+                                            mx += labels[i].len() as i32 + 2;
+                                        }
+                                        let max_w = items.iter().map(|(l,_)| l.len()).max().unwrap_or(0).max(4) as i32;
+                                        let mut out = String::new();
+                                        for row in 0..items.len() as i32 {
+                                            out.push_str(&sgr_cup(dy + row, mx));
+                                            out.push_str(SGR_RESET);
+                                            out.push_str(&" ".repeat((max_w + 2) as usize));
+                                        }
+                                        for (i, (lbl, _)) in items.iter().enumerate() {
+                                            out.push_str(&sgr_cup(dy + i as i32, mx));
+                                            out.push_str(if i == item_idx { sgr_row_cursor() } else { sgr_menu() });
+                                            out.push(' ');
+                                            out.push_str(lbl);
+                                            out.push_str(SGR_RESET);
+                                        }
+                                        emit_sgr(&out);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+
                 // Host frame hook: lets a host app mirror external state into the
                 // widget tree on the main thread (e.g. flush a transcript into a
                 // TextView). Runs every loop iteration; cleared on quit.
