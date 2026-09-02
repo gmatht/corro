@@ -882,21 +882,26 @@ fn menu_prev_root_section(section: MenuSection) -> MenuSection {
     }
 }
 
+/// Longest rendered menu-item label for a section (width in columns), so a
+/// submenu popup is sized dynamically from the text it must display in full.
+/// Includes the shortcuts prefix, the "·" separator, and " ▶" for submenu items.
+fn menu_max_item_width(section: MenuSection) -> usize {
+    menu_items(section)
+        .iter()
+        .map(|mi| match mi.target {
+            MenuTarget::Submenu(sub) => format!("{}·{} ▶", mi.shortcut, menu_title(sub)).len(),
+            MenuTarget::Action(_) => format!("{}·{}", mi.shortcut, mi.label).len(),
+        })
+        .max()
+        .unwrap_or(10)
+}
+
 fn menu_popup_area(area: Rect, section: MenuSection, parent: Option<(Rect, usize)>) -> Rect {
     let items = menu_items(section).len() as u16;
-    let width = match section {
-        MenuSection::Edit => 18,
-        MenuSection::File => 22,
-        MenuSection::Format => 18,
-        MenuSection::FormatScope => 18,
-        MenuSection::FormatNumber => 18,
-        MenuSection::FormatAlign => 18,
-        MenuSection::Sheet => 20,
-        MenuSection::Export => 18,
-        MenuSection::Width => 20,
-        MenuSection::Insert => 20,
-        MenuSection::Help => 18,
-    }
+    // Dynamically derive the popup width from the longest item label so nothing
+    // is truncated (e.g. "Decimal (generic)"). +2 borders, +2 highlight gutter.
+    let width = (menu_max_item_width(section) as u16).saturating_add(4)
+    .max(4)
     .min(area.width.saturating_sub(2).max(1));
     let height = items.saturating_add(2).min(area.height.max(3));
     let (x, y) = parent
@@ -14743,6 +14748,21 @@ mod tests {
         assert!(child.x > parent.x);
         assert!(child.y > parent.y);
         assert_eq!(child.y, parent.y + 2);
+    }
+
+    #[test]
+    fn submenu_popup_width_fits_longest_item() {
+        let area = Rect::new(0, 0, 120, 24);
+        // The popup width must be derived from the longest item label so nothing
+        // is truncated. "D·Decimal (generic)" is the widest Format→Number item.
+        let popup = menu_popup_area(area, MenuSection::FormatNumber, None);
+        let longest = menu_max_item_width(MenuSection::FormatNumber);
+        // Content area = width - 2 borders - 2 highlight-symbol gutter.
+        let content_width = popup.width as usize - 4;
+        assert!(
+            content_width >= longest,
+            "Format Number popup too narrow: content {content_width} < longest {longest}"
+        );
     }
 
     #[test]
