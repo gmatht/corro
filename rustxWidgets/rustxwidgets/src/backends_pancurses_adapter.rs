@@ -630,6 +630,39 @@ mod pancurses_adapter {
             .map_err(|e| Error::Backend(format!("{}", e)))
     }
 
+    // -- DataGrid (a bare grid, mirrors wxGrid; Spreadsheet is built on top) --
+
+    pub struct DataGrid {
+        pub(crate) id: usize,
+    }
+
+    impl Widget for DataGrid {
+        fn raw_handle(&self) -> *mut c_void {
+            &self.id as *const usize as *mut c_void
+        }
+    }
+
+    impl AsRef<*mut c_void> for DataGrid {
+        fn as_ref(&self) -> &*mut c_void {
+            unsafe { &*(&self.id as *const usize as *const *mut c_void) }
+        }
+    }
+
+    pub fn create_data_grid(rows: u32, cols: u32) -> Result<DataGrid, Error> {
+        crate::backends::pancurses::create_data_grid(rows, cols)
+            .map(|id| DataGrid { id })
+            .map_err(|e| Error::Backend(format!("{}", e)))
+    }
+
+    pub fn grid_set_cell(grid: &DataGrid, r: u32, c: u32, text: &str) {
+        crate::backends::pancurses::grid_set_cell(grid.id, r, c, text);
+    }
+
+    pub fn grid_get_cell(grid: &DataGrid, r: u32, c: u32) -> Option<String> {
+        crate::backends::pancurses::grid_get_cell(grid.id, r, c)
+    }
+
+
     // -- Sizers (wxSizer-like layout) --
 
     pub struct Sizer {
@@ -956,6 +989,20 @@ mod tests {
         assert_eq!(get_client_data(&btn).as_deref(), Some("my-data-42"));
         set_client_data(&btn, "updated");
         assert_eq!(get_client_data(&btn).as_deref(), Some("updated"));
+    }
+
+    #[test]
+    fn data_grid_holds_cells_independently() {
+        let win = create_window().unwrap();
+        let grid = create_data_grid(10, 3).unwrap();
+        win.set_child(&grid);
+        grid_set_cell(&grid, 1, 2, "hello");
+        assert_eq!(grid_get_cell(&grid, 1, 2).as_deref(), Some("hello"));
+        assert_eq!(grid_get_cell(&grid, 0, 0), None);
+        // The DataGrid is a bare grid: it does NOT have spreadsheet chrome, so
+        // the spreadsheet setters must not apply to it.
+        grid_set_cell(&grid, 5, 5, "out");
+        assert_eq!(grid_get_cell(&grid, 5, 5).as_deref(), Some("out"));
     }
 
     #[test]

@@ -75,35 +75,18 @@ mod pancurses_backend {
         Overlay,
         ScrolledWindow,
         Spreadsheet {
-            cells: Rc<RefCell<HashMap<(u32, u32), String>>>,
-            raw_cells: Rc<RefCell<HashMap<(u32, u32), String>>>,
-            cell_styles: Rc<RefCell<HashMap<(u32, u32), u8>>>,
-            total_rows: u32,
-            total_cols: u32,
-            top_row: u32,
-            left_col: u32,
-            cursor_row: u32,
-            cursor_col: u32,
-            editing: bool,
-            edit_buf: String,
-            edit_pos: usize,
-            col_width: u32,
-            margin_cols: u32,
-            main_cols: u32,
+            grid: crate::core::Grid,
             formula_bar_address_id: Option<usize>,
             formula_bar_entry_id: Option<usize>,
-            anchor: Option<(u32, u32)>,
-            header_row_count: u32,
-            main_row_count: u32,
             menu_text: String,
             status_text: String,
             border_title: String,
             formula_bar_trailing: String,
-            column_layout: Vec<(u32, u32, String)>,
-            row_labels: Vec<(u32, String)>,
             tab_titles: Vec<String>,
             tab_active: usize,
         },
+        /// A bare data grid (mirrors wxGrid) without the spreadsheet chrome.
+        DataGrid(crate::core::Grid),
     }
 
     pub struct PcWidgetNode {
@@ -895,7 +878,7 @@ mod pancurses_backend {
                                 if let Some(fid) = state.focus_id {
                                     if is_spreadsheet_focused(state, fid) {
                                         if let Some(n) = state.node(fid) {
-                                            if let PcWidgetKind::Spreadsheet { cursor_row, cursor_col, .. } = &n.kind {
+                                            if let PcWidgetKind::Spreadsheet { grid, .. } = &n.kind { let cursor_row = &grid.cursor_row; let cursor_col = &grid.cursor_col;
                                                 return Some((*cursor_row, *cursor_col));
                                             }
                                         }
@@ -958,14 +941,14 @@ mod pancurses_backend {
                                     if is_spreadsheet_focused(state, fid) {
                                         spreadsheet_commit_edit(state, fid);
                                         if let Some(n) = state.node_mut(fid) {
-                                            if let PcWidgetKind::Spreadsheet { ref mut cursor_col, total_cols, .. } = n.kind {
+                                            if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let cursor_col = &mut grid.cursor_col; let total_cols = grid.total_cols;
                                                 if *cursor_col + 1 < total_cols { *cursor_col += 1; }
                                             }
                                         }
                                         spreadsheet_scroll_to_cursor(state, fid);
                                     } else {
                                         let focusable: Vec<usize> = state.nodes.iter()
-                                            .filter(|n| matches!(n.kind, PcWidgetKind::Button { .. } | PcWidgetKind::Entry { .. } | PcWidgetKind::CheckButton { .. } | PcWidgetKind::Spreadsheet { .. }))
+                                            .filter(|n| matches!(n.kind, PcWidgetKind::Button { .. } | PcWidgetKind::Entry { .. } | PcWidgetKind::CheckButton { .. } | PcWidgetKind::Spreadsheet { .. } | PcWidgetKind::DataGrid(_)))
                                             .map(|n| n.id)
                                             .collect();
                                         if let Some(pos) = state.focus_id.and_then(|f| focusable.iter().position(|&x| x == f)) {
@@ -1011,13 +994,13 @@ mod pancurses_backend {
                                                             if is_spreadsheet_focused(state, fid) {
                                                                 let was_editing = {
                                                                     let n = state.node(fid).unwrap();
-                                                                    matches!(&n.kind, PcWidgetKind::Spreadsheet { editing: true, .. })
+                                                                    spreadsheet_is_editing(&n.kind)
                                                                 };
                                                                 spreadsheet_prepare_move(state, fid, false);
                                                                 spreadsheet_commit_edit(state, fid);
                                                                 let needs_sentinel = {
                                                                     if let Some(n) = state.node_mut(fid) {
-                                                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_row, ref mut cursor_col, total_rows, .. } = n.kind {
+                                                                        if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let cursor_row = &mut grid.cursor_row; let cursor_col = &mut grid.cursor_col; let total_rows = grid.total_rows;
                                                                             match dir_char {
                                                                                 'A' => { if *cursor_row > 0 { *cursor_row -= 1; None } else { Some(u32::MAX) } }
                                                                                 'B' => { if *cursor_row + 1 < total_rows { *cursor_row += 1; None } else { Some(u32::MAX - 1) } }
@@ -1038,7 +1021,7 @@ mod pancurses_backend {
                                                                     }
                                                                     let col = {
                                                                         let n = state.node(fid).unwrap();
-                                                                        if let PcWidgetKind::Spreadsheet { cursor_col, .. } = &n.kind {
+                                                                        if let PcWidgetKind::Spreadsheet { grid, .. } = &n.kind { let cursor_col = &grid.cursor_col;
                                                                             *cursor_col
                                                                         } else { 0 }
                                                                     };
@@ -1049,7 +1032,7 @@ mod pancurses_backend {
                                                                 }
                                                                 let (row, col) = {
                                                                     let n = state.node(fid).unwrap();
-                                                                    if let PcWidgetKind::Spreadsheet { cursor_row, cursor_col, .. } = &n.kind {
+                                                                    if let PcWidgetKind::Spreadsheet { grid, .. } = &n.kind { let cursor_row = &grid.cursor_row; let cursor_col = &grid.cursor_col;
                                                                         (*cursor_row, *cursor_col)
                                                                     } else { (0, 0) }
                                                                 };
@@ -1115,7 +1098,7 @@ mod pancurses_backend {
                                         if let Some(fid) = state.focus_id {
                                             if is_spreadsheet_focused(state, fid) {
                                                 if let Some(n) = state.node_mut(fid) {
-                                                    if let PcWidgetKind::Spreadsheet { ref mut editing, ref mut edit_buf, .. } = n.kind {
+                                                    if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let editing = &mut grid.editing; let edit_buf = &mut grid.edit_buf;
                                                         if *editing {
                                                             *editing = false; // cancel edit
                                                             edit_buf.clear();
@@ -1163,7 +1146,7 @@ mod pancurses_backend {
                                     if is_spreadsheet_focused(state, fid) {
                                         // Insert space into spreadsheet edit buffer when in edit mode
                                         if let Some(n) = state.node_mut(fid) {
-                                            if let PcWidgetKind::Spreadsheet { ref mut editing, ref mut edit_buf, ref mut edit_pos, .. } = n.kind {
+                                            if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let editing = &mut grid.editing; let edit_buf = &mut grid.edit_buf; let edit_pos = &mut grid.edit_pos;
                                                 if *editing {
                                                     edit_buf.insert(*edit_pos, ' ');
                                                     *edit_pos += 1;
@@ -1214,7 +1197,7 @@ mod pancurses_backend {
                                     if let Some(fid) = state.focus_id {
                                         if is_spreadsheet_focused(state, fid) {
                                             if let Some(n) = state.node_mut(fid) {
-                                                if let PcWidgetKind::Spreadsheet { ref mut editing, ref mut cursor_col, ref mut cursor_row, total_cols, total_rows, ref mut edit_buf, ref mut edit_pos, .. } = n.kind {
+                                                if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let editing = &mut grid.editing; let cursor_col = &mut grid.cursor_col; let cursor_row = &mut grid.cursor_row; let total_cols = grid.total_cols; let total_rows = grid.total_rows; let edit_buf = &mut grid.edit_buf; let edit_pos = &mut grid.edit_pos;
                                                 if !*editing {
                                                             // Not in edit mode — check for special keys
                                                             if c == 'c' || c == 'C' {
@@ -1262,7 +1245,7 @@ mod pancurses_backend {
                             if let Some(fid) = state.focus_id {
                                 if is_spreadsheet_focused(state, fid) {
                                     if let Some(n) = state.node_mut(fid) {
-                                        if let PcWidgetKind::Spreadsheet { ref mut editing, ref mut edit_buf, ref mut edit_pos, .. } = n.kind {
+                                        if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let editing = &mut grid.editing; let edit_buf = &mut grid.edit_buf; let edit_pos = &mut grid.edit_pos;
                                             if *editing && *edit_pos > 0 {
                                                 *edit_pos -= 1;
                                                 edit_buf.remove(*edit_pos);
@@ -1285,7 +1268,7 @@ mod pancurses_backend {
                             if let Some(fid) = state.focus_id {
                                 if is_spreadsheet_focused(state, fid) {
                                     if let Some(n) = state.node_mut(fid) {
-                                        if let PcWidgetKind::Spreadsheet { ref mut editing, ref mut edit_buf, ref mut edit_pos, .. } = n.kind {
+                                        if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let editing = &mut grid.editing; let edit_buf = &mut grid.edit_buf; let edit_pos = &mut grid.edit_pos;
                                             if *editing && *edit_pos < edit_buf.len() {
                                                 edit_buf.remove(*edit_pos);
                                             }
@@ -1316,7 +1299,7 @@ mod pancurses_backend {
                                 if is_spreadsheet_focused(state, fid) {
                                     let was_editing = {
                                         let n = state.node(fid).unwrap();
-                                        matches!(&n.kind, PcWidgetKind::Spreadsheet { editing: true, .. })
+                                        spreadsheet_is_editing(&n.kind)
                                     };
                                     if was_editing {
                                         // Edit mode: Left moves the edit caret within the
@@ -1325,13 +1308,13 @@ mod pancurses_backend {
                                         // cell cursor left.
                                         let at_start = {
                                             let n = state.node(fid).unwrap();
-                                            if let PcWidgetKind::Spreadsheet { edit_pos, .. } = &n.kind {
+                                            if let PcWidgetKind::Spreadsheet { grid, .. } = &n.kind { let edit_pos = &grid.edit_pos;
                                                 *edit_pos == 0
                                             } else { true }
                                         };
                                         if !at_start {
                                             if let Some(n) = state.node_mut(fid) {
-                                                if let PcWidgetKind::Spreadsheet { ref mut edit_pos, .. } = n.kind {
+                                                if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let edit_pos = &mut grid.edit_pos;
                                                     *edit_pos -= 1;
                                                 }
                                             }
@@ -1339,7 +1322,7 @@ mod pancurses_backend {
                                         } else {
                                             // Discard the in-progress edit and move the cell left.
                                             if let Some(n) = state.node_mut(fid) {
-                                                if let PcWidgetKind::Spreadsheet { ref mut editing, ref mut edit_buf, ref mut edit_pos, ref mut cursor_col, .. } = n.kind {
+                                                if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let editing = &mut grid.editing; let edit_buf = &mut grid.edit_buf; let edit_pos = &mut grid.edit_pos; let cursor_col = &mut grid.cursor_col;
                                                     *editing = false;
                                                     edit_buf.clear();
                                                     *edit_pos = 0;
@@ -1348,7 +1331,7 @@ mod pancurses_backend {
                                             }
                                             let (row, col) = {
                                                 let n = state.node(fid).unwrap();
-                                                if let PcWidgetKind::Spreadsheet { cursor_row, cursor_col, .. } = &n.kind {
+                                                if let PcWidgetKind::Spreadsheet { grid, .. } = &n.kind { let cursor_row = &grid.cursor_row; let cursor_col = &grid.cursor_col;
                                                     (*cursor_row, *cursor_col)
                                                 } else { (0, 0) }
                                             };
@@ -1357,13 +1340,13 @@ mod pancurses_backend {
                                     } else {
                                         // Not editing: move the cell cursor left.
                                         if let Some(n) = state.node_mut(fid) {
-                                            if let PcWidgetKind::Spreadsheet { ref mut cursor_col, .. } = n.kind {
+                                            if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let cursor_col = &mut grid.cursor_col;
                                                 if *cursor_col > 0 { *cursor_col -= 1; }
                                             }
                                         }
                                         let (row, col) = {
                                             let n = state.node(fid).unwrap();
-                                            if let PcWidgetKind::Spreadsheet { cursor_row, cursor_col, .. } = &n.kind {
+                                            if let PcWidgetKind::Spreadsheet { grid, .. } = &n.kind { let cursor_row = &grid.cursor_row; let cursor_col = &grid.cursor_col;
                                                 (*cursor_row, *cursor_col)
                                             } else { (0, 0) }
                                         };
@@ -1409,7 +1392,7 @@ mod pancurses_backend {
                                 if is_spreadsheet_focused(state, fid) {
                                     let was_editing = {
                                         let n = state.node(fid).unwrap();
-                                        matches!(&n.kind, PcWidgetKind::Spreadsheet { editing: true, .. })
+                                        spreadsheet_is_editing(&n.kind)
                                     };
                                     if was_editing {
                                         // Edit mode: Right moves the edit caret within the
@@ -1418,13 +1401,13 @@ mod pancurses_backend {
                                         // right, and exit edit mode.
                                         let at_end = {
                                             let n = state.node(fid).unwrap();
-                                            if let PcWidgetKind::Spreadsheet { edit_pos, edit_buf, .. } = &n.kind {
+                                            if let PcWidgetKind::Spreadsheet { grid, .. } = &n.kind { let edit_pos = &grid.edit_pos; let edit_buf = &grid.edit_buf;
                                                 *edit_pos >= edit_buf.chars().count()
                                             } else { true }
                                         };
                                         if !at_end {
                                             if let Some(n) = state.node_mut(fid) {
-                                                if let PcWidgetKind::Spreadsheet { ref mut edit_pos, .. } = n.kind {
+                                                if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let edit_pos = &mut grid.edit_pos;
                                                     *edit_pos += 1;
                                                 }
                                             }
@@ -1433,13 +1416,13 @@ mod pancurses_backend {
                                             // Commit the edit, move the cell right, exit edit mode.
                                             spreadsheet_commit_edit(state, fid);
                                             if let Some(n) = state.node_mut(fid) {
-                                                if let PcWidgetKind::Spreadsheet { ref mut cursor_col, .. } = n.kind {
+                                                if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let cursor_col = &mut grid.cursor_col;
                                                     *cursor_col += 1;
                                                 }
                                             }
                                             let (row, col) = {
                                                 let n = state.node(fid).unwrap();
-                                                if let PcWidgetKind::Spreadsheet { cursor_row, cursor_col, .. } = &n.kind {
+                                                if let PcWidgetKind::Spreadsheet { grid, .. } = &n.kind { let cursor_row = &grid.cursor_row; let cursor_col = &grid.cursor_col;
                                                     (*cursor_row, *cursor_col)
                                                 } else { (0, 0) }
                                             };
@@ -1448,13 +1431,13 @@ mod pancurses_backend {
                                     } else {
                                         // Not editing: move the cell cursor right.
                                         if let Some(n) = state.node_mut(fid) {
-                                            if let PcWidgetKind::Spreadsheet { ref mut cursor_col, .. } = n.kind {
+                                            if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let cursor_col = &mut grid.cursor_col;
                                                 *cursor_col += 1;
                                             }
                                         }
                                         let (row, col) = {
                                             let n = state.node(fid).unwrap();
-                                            if let PcWidgetKind::Spreadsheet { cursor_row, cursor_col, .. } = &n.kind {
+                                            if let PcWidgetKind::Spreadsheet { grid, .. } = &n.kind { let cursor_row = &grid.cursor_row; let cursor_col = &grid.cursor_col;
                                                 (*cursor_row, *cursor_col)
                                             } else { (0, 0) }
                                         };
@@ -1489,13 +1472,13 @@ mod pancurses_backend {
                                 if is_spreadsheet_focused(state, fid) {
                                     let was_editing = {
                                         let n = state.node(fid).unwrap();
-                                        matches!(&n.kind, PcWidgetKind::Spreadsheet { editing: true, .. })
+                                        spreadsheet_is_editing(&n.kind)
                                     };
                                     spreadsheet_prepare_move(state, fid, false);
                                     spreadsheet_commit_edit(state, fid);
                                     let needs_sentinel = {
                                         if let Some(n) = state.node_mut(fid) {
-                                            if let PcWidgetKind::Spreadsheet { ref mut cursor_row, .. } = n.kind {
+                                            if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let cursor_row = &mut grid.cursor_row;
                                                 if *cursor_row > 0 {
                                                     *cursor_row -= 1;
                                                     false
@@ -1515,7 +1498,7 @@ mod pancurses_backend {
                                         }
                                         let sentinel_col = {
                                             let n = state.node(fid).unwrap();
-                                            if let PcWidgetKind::Spreadsheet { cursor_col, .. } = &n.kind {
+                                            if let PcWidgetKind::Spreadsheet { grid, .. } = &n.kind { let cursor_col = &grid.cursor_col;
                                                 *cursor_col
                                             } else { 0 }
                                         };
@@ -1526,7 +1509,7 @@ mod pancurses_backend {
                                     }
                                     let (row, col) = {
                                         let n = state.node(fid).unwrap();
-                                        if let PcWidgetKind::Spreadsheet { cursor_row, cursor_col, .. } = &n.kind {
+                                        if let PcWidgetKind::Spreadsheet { grid, .. } = &n.kind { let cursor_row = &grid.cursor_row; let cursor_col = &grid.cursor_col;
                                             (*cursor_row, *cursor_col)
                                         } else { (0, 0) }
                                     };
@@ -1556,18 +1539,18 @@ mod pancurses_backend {
                                 if is_spreadsheet_focused(state, fid) {
                                     let was_editing = {
                                         let n = state.node(fid).unwrap();
-                                        matches!(&n.kind, PcWidgetKind::Spreadsheet { editing: true, .. })
+                                        spreadsheet_is_editing(&n.kind)
                                     };
                                     spreadsheet_commit_edit(state, fid);
                                     let max_row = {
                                         let n = state.node(fid).unwrap();
-                                        if let PcWidgetKind::Spreadsheet { total_rows, .. } = &n.kind {
-                                            *total_rows
+                                        if let PcWidgetKind::Spreadsheet { grid, .. } = &n.kind { let total_rows = grid.total_rows;
+                                            total_rows
                                         } else { 0 }
                                     };
                                     let needs_sentinel = {
                                         if let Some(n) = state.node_mut(fid) {
-                                            if let PcWidgetKind::Spreadsheet { ref mut cursor_row, .. } = n.kind {
+                                            if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let cursor_row = &mut grid.cursor_row;
                                                 if *cursor_row + 1 < max_row {
                                                     *cursor_row += 1;
                                                     false
@@ -1587,7 +1570,7 @@ mod pancurses_backend {
                                         }
                                         let sentinel_col = {
                                             let n = state.node(fid).unwrap();
-                                            if let PcWidgetKind::Spreadsheet { cursor_col, .. } = &n.kind {
+                                            if let PcWidgetKind::Spreadsheet { grid, .. } = &n.kind { let cursor_col = &grid.cursor_col;
                                                 *cursor_col
                                             } else { 0 }
                                         };
@@ -1598,7 +1581,7 @@ mod pancurses_backend {
                                     }
                                     let (row, col) = {
                                         let n = state.node(fid).unwrap();
-                                        if let PcWidgetKind::Spreadsheet { cursor_row, cursor_col, .. } = &n.kind {
+                                        if let PcWidgetKind::Spreadsheet { grid, .. } = &n.kind { let cursor_row = &grid.cursor_row; let cursor_col = &grid.cursor_col;
                                             (*cursor_row, *cursor_col)
                                         } else { (0, 0) }
                                     };
@@ -1622,7 +1605,7 @@ mod pancurses_backend {
                                     spreadsheet_prepare_move(state, fid, true);
                                     spreadsheet_commit_edit(state, fid);
                                     if let Some(n) = state.node_mut(fid) {
-                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_col, .. } = n.kind {
+                                        if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let cursor_col = &mut grid.cursor_col;
                                             if *cursor_col > 0 { *cursor_col -= 1; }
                                         }
                                     }
@@ -1638,7 +1621,7 @@ mod pancurses_backend {
                                     spreadsheet_prepare_move(state, fid, true);
                                     spreadsheet_commit_edit(state, fid);
                                     if let Some(n) = state.node_mut(fid) {
-                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_col, total_cols, .. } = n.kind {
+                                        if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let cursor_col = &mut grid.cursor_col; let total_cols = grid.total_cols;
                                             if *cursor_col + 1 < total_cols { *cursor_col += 1; }
                                         }
                                     }
@@ -1653,7 +1636,7 @@ mod pancurses_backend {
                                 if is_spreadsheet_focused(state, fid) {
                                     spreadsheet_commit_edit(state, fid);
                                     if let Some(n) = state.node_mut(fid) {
-                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_row, total_rows, .. } = n.kind {
+                                        if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let cursor_row = &mut grid.cursor_row; let total_rows = grid.total_rows;
                                             let page = 20.min(total_rows / 2);
                                             *cursor_row = cursor_row.saturating_sub(page);
                                         }
@@ -1669,7 +1652,7 @@ mod pancurses_backend {
                                 if is_spreadsheet_focused(state, fid) {
                                     spreadsheet_commit_edit(state, fid);
                                     if let Some(n) = state.node_mut(fid) {
-                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_row, total_rows, .. } = n.kind {
+                                        if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let cursor_row = &mut grid.cursor_row; let total_rows = grid.total_rows;
                                             let page = 20.min(total_rows / 2);
                                             *cursor_row = (*cursor_row + page).min(total_rows - 1);
                                         }
@@ -1685,7 +1668,7 @@ mod pancurses_backend {
                                 if is_spreadsheet_focused(state, fid) {
                                     spreadsheet_commit_edit(state, fid);
                                     if let Some(n) = state.node_mut(fid) {
-                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_col, .. } = n.kind {
+                                        if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let cursor_col = &mut grid.cursor_col;
                                             *cursor_col = 0;
                                         }
                                     }
@@ -1700,7 +1683,7 @@ mod pancurses_backend {
                                 if is_spreadsheet_focused(state, fid) {
                                     spreadsheet_commit_edit(state, fid);
                                     if let Some(n) = state.node_mut(fid) {
-                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_col, total_cols, .. } = n.kind {
+                                        if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let cursor_col = &mut grid.cursor_col; let total_cols = grid.total_cols;
                                             *cursor_col = total_cols - 1;
                                         }
                                     }
@@ -1731,7 +1714,7 @@ mod pancurses_backend {
                                     spreadsheet_prepare_move(state, fid, false);
                                     spreadsheet_commit_edit(state, fid);
                                     if let Some(n) = state.node_mut(fid) {
-                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_row, .. } = n.kind {
+                                        if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let cursor_row = &mut grid.cursor_row;
                                             if *cursor_row > 0 { *cursor_row -= 1; }
                                         }
                                     }
@@ -1747,7 +1730,7 @@ mod pancurses_backend {
                                 if is_spreadsheet_focused(state, fid) {
                                     spreadsheet_commit_edit(state, fid);
                                     if let Some(n) = state.node_mut(fid) {
-                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_row, total_rows, .. } = n.kind {
+                                        if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let cursor_row = &mut grid.cursor_row; let total_rows = grid.total_rows;
                                             if *cursor_row + 1 < total_rows { *cursor_row += 1; }
                                         }
                                     }
@@ -1969,6 +1952,22 @@ mod pancurses_backend {
                     root.attroff(COLOR_PAIR(4));
                 }
             }
+            PcWidgetKind::DataGrid(grid) => {
+                // Bare data grid (mirrors wxGrid): render the visible cells.
+                if has_colors() { root.attron(COLOR_PAIR(4)); }
+                for row in 0..rect.h.max(0) {
+                    for col in 0..rect.w.max(0) {
+                        let (r, c) = (row as u32, col as u32);
+                        let val = grid.display_value(r, c);
+                        if !val.is_empty() {
+                            let max = (rect.w - col).max(0) as usize;
+                            let slice = &val[..val.len().min(max)];
+                            root.mvaddstr(rect.y + row, rect.x + col, slice);
+                        }
+                    }
+                }
+                if has_colors() { root.attroff(COLOR_PAIR(4)); }
+            }
             PcWidgetKind::MenuBar { labels, .. } => {
                 if has_colors() {
                     root.attron(COLOR_PAIR(4));
@@ -2022,7 +2021,24 @@ mod pancurses_backend {
                 }
             }
             PcWidgetKind::Canvas | PcWidgetKind::Overlay | PcWidgetKind::ScrolledWindow => {}
-            PcWidgetKind::Spreadsheet { ref cells, ref raw_cells, ref cell_styles, ref top_row, ref left_col, ref cursor_row, ref cursor_col, ref editing, ref edit_buf, ref edit_pos, ref col_width, ref margin_cols, ref main_cols, ref menu_text, ref status_text, ref border_title, ref formula_bar_trailing, ref column_layout, ref row_labels, ref tab_titles, ref tab_active, header_row_count, main_row_count, .. } => {
+            PcWidgetKind::Spreadsheet { grid, ref menu_text, ref status_text, ref border_title, ref formula_bar_trailing, ref tab_titles, ref tab_active, .. } => {
+                let cells = &grid.cells;
+                let raw_cells = &grid.raw_cells;
+                let cell_styles = &grid.cell_styles;
+                let top_row = &grid.top_row;
+                let left_col = &grid.left_col;
+                let cursor_row = &grid.cursor_row;
+                let cursor_col = &grid.cursor_col;
+                let editing = &grid.editing;
+                let edit_buf = &grid.edit_buf;
+                let edit_pos = &grid.edit_pos;
+                let col_width = &grid.col_width;
+                let margin_cols = &grid.margin_cols;
+                let main_cols = &grid.main_cols;
+                let column_layout = &grid.column_layout;
+                let row_labels = &grid.row_labels;
+                let header_row_count = &grid.header_row_count;
+                let main_row_count = &grid.main_row_count;
                 // ── Direct SGR rendering ──
                 let lm = *margin_cols as usize;
                 let mc = *main_cols as usize;
@@ -3088,7 +3104,11 @@ mod pancurses_backend {
     }
 
     fn is_spreadsheet_focused(state: &PcState, fid: usize) -> bool {
-        state.node(fid).map_or(false, |n| matches!(n.kind, PcWidgetKind::Spreadsheet { .. }))
+        state.node(fid).map_or(false, |n| matches!(n.kind, PcWidgetKind::Spreadsheet { .. } | PcWidgetKind::DataGrid(_)))
+    }
+
+    fn spreadsheet_is_editing(kind: &PcWidgetKind) -> bool {
+        if let PcWidgetKind::Spreadsheet { grid, .. } = kind { grid.editing } else { false }
     }
 
     // ── Menu helpers (submenu support) ────────────────────────────────────────
@@ -3198,7 +3218,7 @@ mod pancurses_backend {
         let result = {
             let n = state.node_mut(fid);
             if let Some(n) = n {
-                if let PcWidgetKind::Spreadsheet { ref cells, ref raw_cells, ref mut cursor_row, ref mut cursor_col, ref mut editing, ref mut edit_buf, ref mut edit_pos, total_rows, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let cells = &grid.cells; let raw_cells = &grid.raw_cells; let cursor_row = &mut grid.cursor_row; let cursor_col = &mut grid.cursor_col; let editing = &mut grid.editing; let edit_buf = &mut grid.edit_buf; let edit_pos = &mut grid.edit_pos; let total_rows = grid.total_rows;
                     if *editing {
                         let val = edit_buf.clone();
                         let r = *cursor_row;
@@ -3271,7 +3291,7 @@ mod pancurses_backend {
 
     fn spreadsheet_scroll_to_cursor(state: &mut PcState, fid: usize) {
         if let Some(n) = state.node_mut(fid) {
-            if let PcWidgetKind::Spreadsheet { ref mut left_col, ref cursor_col, ref mut column_layout, ref cells, ref margin_cols, ref main_cols, .. } = n.kind {
+            if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let left_col = &mut grid.left_col; let cursor_col = &grid.cursor_col; let column_layout = &mut grid.column_layout; let cells = &grid.cells; let margin_cols = &grid.margin_cols; let main_cols = &grid.main_cols;
                 // When a column layout was explicitly set (e.g. by corro's
                 // pnc_backend.rs), do not overwrite it — the application code
                 // has already computed the correct columns and widths. Rebuild
@@ -3380,7 +3400,7 @@ mod pancurses_backend {
         let result = {
             let n = state.node_mut(fid);
             if let Some(n) = n {
-                if let PcWidgetKind::Spreadsheet { ref cells, ref raw_cells, cursor_row, cursor_col, ref mut edit_buf, ref mut editing, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let cells = &grid.cells; let raw_cells = &grid.raw_cells; let cursor_row = grid.cursor_row; let cursor_col = grid.cursor_col; let edit_buf = &mut grid.edit_buf; let editing = &mut grid.editing;
                     if *editing {
                         let val = edit_buf.clone();
                         let original = raw_cells.borrow().get(&(cursor_row, cursor_col)).cloned()
@@ -3606,13 +3626,52 @@ mod pancurses_backend {
     }
 
     pub fn create_spreadsheet(rows: u32, cols: u32) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-        let cells = Rc::new(RefCell::new(HashMap::new()));
-        let raw_cells = Rc::new(RefCell::new(HashMap::new()));
-        let cell_styles = Rc::new(RefCell::new(HashMap::new()));
+        let grid = new_grid(rows, cols);
         let id = with_state(|s| s.add_node(PcWidgetKind::Spreadsheet {
-            cells,
-            raw_cells,
-            cell_styles,
+            grid,
+            formula_bar_address_id: None,
+            formula_bar_entry_id: None,
+            menu_text: String::new(),
+            status_text: String::new(),
+            border_title: String::new(),
+            formula_bar_trailing: String::new(),
+            tab_titles: Vec::new(),
+            tab_active: 0,
+        }, find_window_id(s)));
+        Ok(id)
+    }
+
+    pub fn create_data_grid(rows: u32, cols: u32) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(with_state(|s| s.add_node(PcWidgetKind::DataGrid(new_grid(rows, cols)), find_window_id(s))))
+    }
+
+    pub fn grid_set_cell(id: usize, r: u32, c: u32, text: &str) {
+        with_state(|s| {
+            if let Some(n) = s.node_mut(id) {
+                if let PcWidgetKind::DataGrid(grid) = &mut n.kind {
+                    grid.cells.borrow_mut().insert((r, c), text.to_string());
+                }
+            }
+        });
+    }
+
+    pub fn grid_get_cell(id: usize, r: u32, c: u32) -> Option<String> {
+        with_state(|s| {
+            s.node(id).and_then(|n| {
+                if let PcWidgetKind::DataGrid(grid) = &n.kind {
+                    grid.cells.borrow().get(&(r, c)).cloned()
+                } else {
+                    None
+                }
+            })
+        })
+    }
+
+    fn new_grid(rows: u32, cols: u32) -> crate::core::Grid {
+        crate::core::Grid {
+            cells: Rc::new(RefCell::new(HashMap::new())),
+            raw_cells: Rc::new(RefCell::new(HashMap::new())),
+            cell_styles: Rc::new(RefCell::new(HashMap::new())),
             total_rows: rows,
             total_cols: cols,
             top_row: 0,
@@ -3625,27 +3684,18 @@ mod pancurses_backend {
             col_width: 12,
             margin_cols: 0,
             main_cols: cols,
-            formula_bar_address_id: None,
-            formula_bar_entry_id: None,
             anchor: None,
             header_row_count: 0,
             main_row_count: 0,
-            menu_text: String::new(),
-            status_text: String::new(),
-            border_title: String::new(),
-            formula_bar_trailing: String::new(),
             column_layout: Vec::new(),
             row_labels: Vec::new(),
-            tab_titles: Vec::new(),
-            tab_active: 0,
-        }, find_window_id(s)));
-        Ok(id)
+        }
     }
 
     pub fn spreadsheet_set_cell(id: usize, r: u32, c: u32, text: &str) {
         with_state(|s| {
             if let Some(n) = s.node_mut(id) {
-                if let PcWidgetKind::Spreadsheet { ref cells, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let cells = &grid.cells;
                     cells.borrow_mut().insert((r, c), text.to_string());
                 }
             }
@@ -3655,7 +3705,7 @@ mod pancurses_backend {
     pub fn spreadsheet_set_cell_style(id: usize, r: u32, c: u32, style: u8) {
         with_state(|s| {
             if let Some(n) = s.node_mut(id) {
-                if let PcWidgetKind::Spreadsheet { ref cell_styles, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let cell_styles = &grid.cell_styles;
                     cell_styles.borrow_mut().insert((r, c), style);
                 }
             }
@@ -3665,7 +3715,7 @@ mod pancurses_backend {
     pub fn spreadsheet_set_raw_cell(id: usize, r: u32, c: u32, text: &str) {
         with_state(|s| {
             if let Some(n) = s.node_mut(id) {
-                if let PcWidgetKind::Spreadsheet { ref raw_cells, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let raw_cells = &grid.raw_cells;
                     raw_cells.borrow_mut().insert((r, c), text.to_string());
                 }
             }
@@ -3675,7 +3725,7 @@ mod pancurses_backend {
     pub fn spreadsheet_get_cell(id: usize, r: u32, c: u32) -> Option<String> {
         with_state(|s| {
             s.node(id).and_then(|n| {
-                if let PcWidgetKind::Spreadsheet { ref cells, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { grid, .. } = &n.kind { let cells = &grid.cells;
                     cells.borrow().get(&(r, c)).cloned()
                 } else {
                     None
@@ -3686,7 +3736,7 @@ mod pancurses_backend {
 
     fn spreadsheet_prepare_move(state: &mut PcState, fid: usize, shift: bool) {
         if let Some(n) = state.node_mut(fid) {
-            if let PcWidgetKind::Spreadsheet { ref mut anchor, cursor_row, cursor_col, .. } = n.kind {
+            if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let anchor = &mut grid.anchor; let cursor_row = grid.cursor_row; let cursor_col = grid.cursor_col;
                 if shift {
                     if anchor.is_none() {
                         *anchor = Some((cursor_row, cursor_col));
@@ -3701,7 +3751,7 @@ mod pancurses_backend {
     pub fn spreadsheet_clear_anchor(fid: usize) {
         with_state(|s| {
             if let Some(n) = s.node_mut(fid) {
-                if let PcWidgetKind::Spreadsheet { ref mut anchor, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let anchor = &mut grid.anchor;
                     *anchor = None;
                 }
             }
@@ -3711,7 +3761,7 @@ mod pancurses_backend {
     pub fn spreadsheet_set_column_layout(spreadsheet_id: usize, layout: Vec<(u32, u32, String)>) {
         with_state(|s| {
             if let Some(n) = s.node_mut(spreadsheet_id) {
-                if let PcWidgetKind::Spreadsheet { ref mut column_layout, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let column_layout = &mut grid.column_layout;
                     *column_layout = layout;
                 }
             }
@@ -3721,8 +3771,8 @@ mod pancurses_backend {
     pub fn spreadsheet_set_row_labels(spreadsheet_id: usize, labels: Vec<(u32, String)>) {
         with_state(|s| {
             if let Some(n) = s.node_mut(spreadsheet_id) {
-                if let PcWidgetKind::Spreadsheet { ref mut row_labels, .. } = n.kind {
-                    *row_labels = labels;
+                if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind {
+                    grid.row_labels = labels;
                 }
             }
         });
@@ -3731,7 +3781,7 @@ mod pancurses_backend {
     pub fn spreadsheet_set_menu_text(spreadsheet_id: usize, text: &str) {
         with_state(|s| {
             if let Some(n) = s.node_mut(spreadsheet_id) {
-                if let PcWidgetKind::Spreadsheet { ref mut menu_text, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut grid, ref mut menu_text, .. } = n.kind {
                     *menu_text = text.to_string();
                 }
             }
@@ -3741,7 +3791,7 @@ mod pancurses_backend {
     pub fn spreadsheet_set_border_title(spreadsheet_id: usize, text: &str) {
         with_state(|s| {
             if let Some(n) = s.node_mut(spreadsheet_id) {
-                if let PcWidgetKind::Spreadsheet { ref mut border_title, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut grid, ref mut border_title, .. } = n.kind {
                     *border_title = text.to_string();
                 }
             }
@@ -3751,7 +3801,7 @@ mod pancurses_backend {
     pub fn spreadsheet_set_status_text(spreadsheet_id: usize, text: &str) {
         with_state(|s| {
             if let Some(n) = s.node_mut(spreadsheet_id) {
-                if let PcWidgetKind::Spreadsheet { ref mut status_text, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut grid, ref mut status_text, .. } = n.kind {
                     *status_text = text.to_string();
                 }
             }
@@ -3761,7 +3811,7 @@ mod pancurses_backend {
     pub fn spreadsheet_set_formula_bar_trailing(spreadsheet_id: usize, text: &str) {
         with_state(|s| {
             if let Some(n) = s.node_mut(spreadsheet_id) {
-                if let PcWidgetKind::Spreadsheet { ref mut formula_bar_trailing, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut grid, ref mut formula_bar_trailing, .. } = n.kind {
                     *formula_bar_trailing = text.to_string();
                 }
             }
@@ -3771,7 +3821,7 @@ mod pancurses_backend {
     pub fn spreadsheet_set_tab_data(spreadsheet_id: usize, titles: &[String], active: usize) {
         with_state(|s| {
             if let Some(n) = s.node_mut(spreadsheet_id) {
-                if let PcWidgetKind::Spreadsheet { ref mut tab_titles, ref mut tab_active, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut grid, ref mut tab_titles, ref mut tab_active, .. } = n.kind {
                     *tab_titles = titles.to_vec();
                     *tab_active = active;
                 }
@@ -3782,7 +3832,7 @@ mod pancurses_backend {
     pub fn spreadsheet_set_grid_config(spreadsheet_id: usize, margin_c: u32, main_c: u32) {
         with_state(|s| {
             if let Some(n) = s.node_mut(spreadsheet_id) {
-                if let PcWidgetKind::Spreadsheet { ref mut margin_cols, ref mut main_cols, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut grid, ref mut menu_text, .. } = n.kind { let margin_cols = &mut grid.margin_cols; let main_cols = &mut grid.main_cols;
                     *margin_cols = margin_c;
                     *main_cols = main_c;
                 }
@@ -3793,7 +3843,7 @@ mod pancurses_backend {
     pub fn spreadsheet_set_row_counts(spreadsheet_id: usize, header_rows: u32, main_rows: u32) {
         with_state(|s| {
             if let Some(n) = s.node_mut(spreadsheet_id) {
-                if let PcWidgetKind::Spreadsheet { ref mut header_row_count, ref mut main_row_count, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut grid, ref mut border_title, .. } = n.kind { let header_row_count = &mut grid.header_row_count; let main_row_count = &mut grid.main_row_count;
                     *header_row_count = header_rows;
                     *main_row_count = main_rows;
                 }
@@ -3804,8 +3854,8 @@ mod pancurses_backend {
     pub fn spreadsheet_cursor_position(id: usize) -> Option<(u32, u32)> {
         with_state(|s| {
             s.node(id).and_then(|n| {
-                if let PcWidgetKind::Spreadsheet { cursor_row, cursor_col, .. } = n.kind {
-                    Some((cursor_row, cursor_col))
+                if let PcWidgetKind::Spreadsheet { grid, .. } = &n.kind {
+                    Some((grid.cursor_row, grid.cursor_col))
                 } else { None }
             })
         })
@@ -3832,7 +3882,7 @@ mod pancurses_backend {
     pub fn spreadsheet_set_cursor(id: usize, row: u32, col: u32) {
         with_state(|s| {
             if let Some(n) = s.node_mut(id) {
-                if let PcWidgetKind::Spreadsheet { ref mut cursor_row, ref mut cursor_col, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut grid, ref mut status_text, .. } = n.kind { let cursor_row = &mut grid.cursor_row; let cursor_col = &mut grid.cursor_col;
                     *cursor_row = row;
                     *cursor_col = col;
                 }
@@ -3843,7 +3893,7 @@ mod pancurses_backend {
     pub fn spreadsheet_set_edit_state(id: usize, is_editing: bool, buf: &str, pos: usize) {
         with_state(|s| {
             if let Some(n) = s.node_mut(id) {
-                if let PcWidgetKind::Spreadsheet { ref mut editing, ref mut edit_buf, ref mut edit_pos, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut grid, ref mut formula_bar_trailing, .. } = n.kind { let editing = &mut grid.editing; let edit_buf = &mut grid.edit_buf; let edit_pos = &mut grid.edit_pos;
                     *editing = is_editing;
                     *edit_buf = buf.to_string();
                     *edit_pos = pos;
@@ -3856,8 +3906,8 @@ mod pancurses_backend {
         let result = with_state(|s| {
             let (entry_id, cursor_row, cursor_col) = match s.node(spreadsheet_id) {
                 Some(n) => match &n.kind {
-                    PcWidgetKind::Spreadsheet { formula_bar_entry_id, cursor_row, cursor_col, .. } => {
-                        (*formula_bar_entry_id, *cursor_row, *cursor_col)
+                    PcWidgetKind::Spreadsheet { grid, formula_bar_entry_id, .. } => {
+                        (*formula_bar_entry_id, grid.cursor_row, grid.cursor_col)
                     }
                     _ => return None,
                 },
@@ -3872,7 +3922,7 @@ mod pancurses_backend {
                 None => return None,
             };
             if let Some(n) = s.node_mut(spreadsheet_id) {
-                if let PcWidgetKind::Spreadsheet { ref cells, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut grid, ref mut tab_titles, ref mut tab_active, .. } = n.kind { let cells = &grid.cells;
                     cells.borrow_mut().insert((cursor_row, cursor_col), text.clone());
                 }
             }
@@ -3890,7 +3940,7 @@ mod pancurses_backend {
     pub fn spreadsheet_set_formula_bar(spreadsheet_id: usize, address_label_id: usize, entry_id: usize) {
         with_state(|s| {
             if let Some(n) = s.node_mut(spreadsheet_id) {
-                if let PcWidgetKind::Spreadsheet { ref mut formula_bar_address_id, ref mut formula_bar_entry_id, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut grid, ref mut formula_bar_address_id, ref mut formula_bar_entry_id, .. } = n.kind {
                     *formula_bar_address_id = Some(address_label_id);
                     *formula_bar_entry_id = Some(entry_id);
                 }
@@ -3916,8 +3966,8 @@ mod pancurses_backend {
             None => return false,
         };
         let (cells, row_labels, cursor_row, cursor_col, margin_cols, main_cols, addr_id, entry_id) = match &n.kind {
-            PcWidgetKind::Spreadsheet { cells, row_labels, cursor_row, cursor_col, margin_cols, main_cols, formula_bar_address_id, formula_bar_entry_id, .. } => {
-                (cells.clone(), row_labels.clone(), *cursor_row, *cursor_col, *margin_cols, *main_cols, *formula_bar_address_id, *formula_bar_entry_id)
+            PcWidgetKind::Spreadsheet { grid, formula_bar_address_id, formula_bar_entry_id, .. } => {
+                (grid.cells.clone(), grid.row_labels.clone(), grid.cursor_row, grid.cursor_col, grid.margin_cols, grid.main_cols, *formula_bar_address_id, *formula_bar_entry_id)
             }
             _ => return false,
         };
@@ -4502,13 +4552,11 @@ mod pancurses_backend {
             let (cells, raw_cells, top_row, left_col, cursor_row, cursor_col, editing, edit_buf, edit_pos,
                  col_width, margin_cols, main_cols, menu_text, status_text,
                  border_title, formula_bar_trailing, column_layout, row_labels) = match &n.kind {
-                PcWidgetKind::Spreadsheet { cells, raw_cells, top_row, left_col, cursor_row, cursor_col,
-                    editing, edit_buf, edit_pos, col_width, margin_cols, main_cols,
-                    menu_text, status_text, ref border_title, ref formula_bar_trailing, ref column_layout, ref row_labels, .. } => {
-                    (cells.clone(), raw_cells.clone(), *top_row, *left_col, *cursor_row, *cursor_col,
-                     *editing, edit_buf.clone(), *edit_pos, *col_width,
-                     *margin_cols, *main_cols, menu_text.clone(), status_text.clone(),
-                     border_title.clone(), formula_bar_trailing.clone(), column_layout.clone(), row_labels.clone())
+                PcWidgetKind::Spreadsheet { grid, ref menu_text, ref status_text, ref border_title, ref formula_bar_trailing, .. } => {
+                    (grid.cells.clone(), grid.raw_cells.clone(), grid.top_row, grid.left_col, grid.cursor_row, grid.cursor_col,
+                     grid.editing, grid.edit_buf.clone(), grid.edit_pos, grid.col_width,
+                     grid.margin_cols, grid.main_cols, menu_text.clone(), status_text.clone(),
+                     border_title.clone(), formula_bar_trailing.clone(), grid.column_layout.clone(), grid.row_labels.clone())
                 }
                 _ => return,
             };
@@ -4890,40 +4938,17 @@ mod pancurses_backend {
             let wid = with_state(|s| s.add_node(
                 PcWidgetKind::Window { title: "test".into() }, None,
             ));
-            let sid = with_state(|s| s.add_node(
-                PcWidgetKind::Spreadsheet {
-                    cells: Rc::new(RefCell::new(HashMap::new())),
-                    raw_cells: Rc::new(RefCell::new(HashMap::new())),
-                    cell_styles: Rc::new(RefCell::new(HashMap::new())),
-                    total_rows: 100,
-                    total_cols: 26,
-                    top_row: 0,
-                    left_col: 0,
-                    cursor_row: 0,
-                    cursor_col: 0,
-                    editing: false,
-                    edit_buf: String::new(),
-                    edit_pos: 0,
-                    col_width: 12,
-                    margin_cols: 0,
-                    main_cols: 26,
-                    formula_bar_address_id: None,
-                    formula_bar_entry_id: None,
-                    anchor: None,
-                    menu_text: String::new(),
-                    status_text: String::new(),
-                    border_title: String::new(),
-                    formula_bar_trailing: String::new(),
-                    column_layout: Vec::new(),
-                    row_labels: Vec::new(),
-                    tab_titles: Vec::new(),
-                    tab_active: 0,
-                    header_row_count: 2,
-                    main_row_count: 24,
-                },
-                Some(wid),
-            ));
-            with_state(|s| s.focus_id = Some(sid));
+            let sid = create_spreadsheet(100, 26).unwrap();
+            with_state(|s| {
+                if let Some(n) = s.node_mut(sid) {
+                    n.parent = Some(wid);
+                    if let PcWidgetKind::Spreadsheet { grid, border_title, menu_text, status_text, formula_bar_trailing, .. } = &mut n.kind {
+                        grid.header_row_count = 2;
+                        grid.main_row_count = 24;
+                    }
+                }
+                s.focus_id = Some(sid);
+            });
             sid
         }
 
@@ -4934,7 +4959,7 @@ mod pancurses_backend {
             // Simulate KeyDown by directly manipulating state:
             with_state(|state| {
                 let n = state.node_mut(sid).unwrap();
-                if let PcWidgetKind::Spreadsheet { ref mut cursor_row, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let cursor_row = &mut grid.cursor_row;
                     *cursor_row += 1;
                 }
             });
@@ -4943,7 +4968,7 @@ mod pancurses_backend {
 
             with_state(|state| {
                 let n = state.node_mut(sid).unwrap();
-                if let PcWidgetKind::Spreadsheet { ref mut cursor_col, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let cursor_col = &mut grid.cursor_col;
                     *cursor_col += 1;
                 }
             });
@@ -4953,7 +4978,7 @@ mod pancurses_backend {
             // Home should go to col 0
             with_state(|state| {
                 let n = state.node_mut(sid).unwrap();
-                if let PcWidgetKind::Spreadsheet { ref mut cursor_col, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let cursor_col = &mut grid.cursor_col;
                     *cursor_col = 0;
                 }
             });
@@ -4970,7 +4995,7 @@ mod pancurses_backend {
             // Check editing state
             with_state(|state| {
                 let n = state.node(sid).unwrap();
-                if let PcWidgetKind::Spreadsheet { editing, .. } = &n.kind {
+                if let PcWidgetKind::Spreadsheet { grid, .. } = &n.kind { let editing = &grid.editing;
                     assert!(*editing, "should be in edit mode after enter");
                 }
             });
@@ -4978,7 +5003,7 @@ mod pancurses_backend {
             // Set edit buffer text (simulate typing)
             with_state(|state| {
                 let n = state.node_mut(sid).unwrap();
-                if let PcWidgetKind::Spreadsheet { ref mut edit_buf, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let edit_buf = &mut grid.edit_buf;
                     *edit_buf = "hello".to_string();
                 }
             });
@@ -5004,7 +5029,7 @@ mod pancurses_backend {
             // Set edit buffer text
             with_state(|state| {
                 let n = state.node_mut(sid).unwrap();
-                if let PcWidgetKind::Spreadsheet { ref mut edit_buf, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let edit_buf = &mut grid.edit_buf;
                     *edit_buf = "test".to_string();
                 }
             });
@@ -5024,7 +5049,7 @@ mod pancurses_backend {
             let sid = make_spreadsheet_id();
             with_state(|state| {
                 let n = state.node_mut(sid).unwrap();
-                if let PcWidgetKind::Spreadsheet { ref mut cursor_row, ref mut cursor_col, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let cursor_row = &mut grid.cursor_row; let cursor_col = &mut grid.cursor_col;
                     *cursor_row = 0;
                     *cursor_col = 0;
                 }
@@ -5035,7 +5060,7 @@ mod pancurses_backend {
             // Simulate KeyUp: should not go negative
             with_state(|state| {
                 let n = state.node_mut(sid).unwrap();
-                if let PcWidgetKind::Spreadsheet { ref mut cursor_row, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let cursor_row = &mut grid.cursor_row;
                     if *cursor_row > 0 { *cursor_row -= 1; }
                 }
             });
@@ -5045,7 +5070,7 @@ mod pancurses_backend {
             // Simulate KeyLeft: should not go negative
             with_state(|state| {
                 let n = state.node_mut(sid).unwrap();
-                if let PcWidgetKind::Spreadsheet { ref mut cursor_col, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let cursor_col = &mut grid.cursor_col;
                     if *cursor_col > 0 { *cursor_col -= 1; }
                 }
             });
@@ -5059,44 +5084,23 @@ mod pancurses_backend {
             let wid = with_state(|s| s.add_node(
                 PcWidgetKind::Window { title: "corro".into() }, None,
             ));
-            let sid = with_state(|s| s.add_node(
-                PcWidgetKind::Spreadsheet {
-                    cells: Rc::new(RefCell::new(HashMap::new())),
-                    raw_cells: Rc::new(RefCell::new(HashMap::new())),
-                    cell_styles: Rc::new(RefCell::new(HashMap::new())),
-                    total_rows: 100,
-                    total_cols: 3,
-                    top_row: 0,
-                    left_col: 0,
-                    cursor_row: 0,
-                    cursor_col: 0,
-                    editing: false,
-                    edit_buf: String::new(),
-                    edit_pos: 0,
-                    col_width: 12,
-                    margin_cols: 0,
-                    main_cols: 3,
-                    formula_bar_address_id: None,
-                    formula_bar_entry_id: None,
-                    anchor: None,
-                    menu_text: " [File]  Edit    Insert    Format    Sheet    Help".into(),
-                    status_text: "  type/F2·edit; Ctrl+C·copy; Ctrl+X·cut; Ctrl+V·paste; Ctrl+;·date; Ctrl+:·time; Ctrl+S·save; F1·help".into(),
-                    border_title: String::new(),
-                    formula_bar_trailing: String::new(),
-                    column_layout: Vec::new(),
-                    row_labels: Vec::new(),
-                    tab_titles: Vec::new(),
-                    tab_active: 0,
-                    header_row_count: 2,
-                    main_row_count: 24,
-                },
-                Some(wid),
-            ));
+            let sid = create_spreadsheet(100, 3).unwrap();
+with_state(|s| {
+    if let Some(n) = s.node_mut(sid) {
+        n.parent = Some(wid);
+        if let PcWidgetKind::Spreadsheet { grid, border_title, menu_text, status_text, formula_bar_trailing, .. } = &mut n.kind {
+            grid.header_row_count = 2;
+            grid.main_row_count = 24;
+            *menu_text = " [File]  Edit    Insert    Format    Sheet    Help".to_string();
+            *status_text = "  type/F2·edit; Ctrl+C·copy; Ctrl+X·cut; Ctrl+V·paste; Ctrl+;·date; Ctrl+:·time; Ctrl+S·save; F1·help".to_string();
+        }
+    }
+});
             // Set cell data matching overflow.corro
             with_state(|state| {
                 let n = state.node_mut(sid).unwrap();
                 match &mut n.kind {
-                    PcWidgetKind::Spreadsheet { ref cells, ref raw_cells, .. } => {
+                    PcWidgetKind::Spreadsheet { grid, .. } => { let cells = &grid.cells; let raw_cells = &grid.raw_cells;
                         cells.borrow_mut().insert((0, 0), "This Text is really long and should overflow.".into());
                         cells.borrow_mut().insert((1, 1), "This Text is really long and should overflow.".into());
                         cells.borrow_mut().insert((2, 2), "This Text is really long and should overflow.".into());
@@ -5112,12 +5116,12 @@ mod pancurses_backend {
             let cells = with_state(|state| {
                 let n = state.node(sid).unwrap();
                 match &n.kind {
-                    PcWidgetKind::Spreadsheet { ref cells, .. } => cells.clone(),
+                    PcWidgetKind::Spreadsheet { grid, .. } => grid.cells.borrow().clone(),
                     _ => unreachable!(),
                 }
             });
             let layout: Vec<(u32, u32, String)> = (0..3).map(|col| {
-                let max_w = cells.borrow().iter()
+                let max_w = cells.iter()
                     .filter(|&((_, c), _)| *c == col)
                     .map(|((r, _), text)| text.chars().count().max(format!("{}", r + 1).len()))
                     .max()
@@ -5189,7 +5193,7 @@ mod pancurses_backend {
             // Move to last column
             with_state(|state| {
                 let n = state.node_mut(sid).unwrap();
-                if let PcWidgetKind::Spreadsheet { ref mut cursor_col, total_cols, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let cursor_col = &mut grid.cursor_col; let total_cols = grid.total_cols;
                     *cursor_col = total_cols - 1;
                 }
             });
@@ -5199,7 +5203,7 @@ mod pancurses_backend {
             // KeyRight should be clamped
             with_state(|state| {
                 let n = state.node_mut(sid).unwrap();
-                if let PcWidgetKind::Spreadsheet { ref mut cursor_col, total_cols, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let cursor_col = &mut grid.cursor_col; let total_cols = grid.total_cols;
                     if *cursor_col + 1 < total_cols { *cursor_col += 1; }
                 }
             });
@@ -5209,14 +5213,14 @@ mod pancurses_backend {
             // Move to last row
             with_state(|state| {
                 let n = state.node_mut(sid).unwrap();
-                if let PcWidgetKind::Spreadsheet { ref mut cursor_row, total_rows, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let cursor_row = &mut grid.cursor_row; let total_rows = grid.total_rows;
                     *cursor_row = total_rows - 1;
                 }
             });
             // KeyDown should be clamped
             with_state(|state| {
                 let n = state.node_mut(sid).unwrap();
-                if let PcWidgetKind::Spreadsheet { ref mut cursor_row, total_rows, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let cursor_row = &mut grid.cursor_row; let total_rows = grid.total_rows;
                     if *cursor_row + 1 < total_rows { *cursor_row += 1; }
                 }
             });
@@ -5232,14 +5236,14 @@ mod pancurses_backend {
             let sid = make_spreadsheet_id();
             with_state(|state| {
                 let n = state.node_mut(sid).unwrap();
-                if let PcWidgetKind::Spreadsheet { ref mut cursor_row, ref mut cursor_col, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let cursor_row = &mut grid.cursor_row; let cursor_col = &mut grid.cursor_col;
                     *cursor_row = 5; *cursor_col = 3;
                 }
             });
             // Down
             with_state(|state| {
                 let n = state.node_mut(sid).unwrap();
-                if let PcWidgetKind::Spreadsheet { ref mut cursor_row, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let cursor_row = &mut grid.cursor_row;
                     if *cursor_row + 1 < 100 { *cursor_row += 1; }
                 }
             });
@@ -5247,7 +5251,7 @@ mod pancurses_backend {
             // Right
             with_state(|state| {
                 let n = state.node_mut(sid).unwrap();
-                if let PcWidgetKind::Spreadsheet { ref mut cursor_col, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let cursor_col = &mut grid.cursor_col;
                     if *cursor_col + 1 < 26 { *cursor_col += 1; }
                 }
             });
@@ -5255,7 +5259,7 @@ mod pancurses_backend {
             // Up
             with_state(|state| {
                 let n = state.node_mut(sid).unwrap();
-                if let PcWidgetKind::Spreadsheet { ref mut cursor_row, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let cursor_row = &mut grid.cursor_row;
                     if *cursor_row > 0 { *cursor_row -= 1; }
                 }
             });
@@ -5263,7 +5267,7 @@ mod pancurses_backend {
             // Left
             with_state(|state| {
                 let n = state.node_mut(sid).unwrap();
-                if let PcWidgetKind::Spreadsheet { ref mut cursor_col, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let cursor_col = &mut grid.cursor_col;
                     if *cursor_col > 0 { *cursor_col -= 1; }
                 }
             });
@@ -5277,7 +5281,7 @@ mod pancurses_backend {
             with_state(|state| spreadsheet_enter(state, sid));
             with_state(|state| {
                 let n = state.node(sid).unwrap();
-                if let PcWidgetKind::Spreadsheet { editing, .. } = &n.kind {
+                if let PcWidgetKind::Spreadsheet { grid, .. } = &n.kind { let editing = &grid.editing;
                     assert!(*editing, "should be editing after enter");
                 }
             });
@@ -5291,7 +5295,7 @@ mod pancurses_backend {
             // Type text
             with_state(|state| {
                 let n = state.node_mut(sid).unwrap();
-                if let PcWidgetKind::Spreadsheet { ref mut edit_buf, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let edit_buf = &mut grid.edit_buf;
                     *edit_buf = "hello".to_string();
                 }
             });
@@ -5308,7 +5312,7 @@ mod pancurses_backend {
             // Set initial cell value
             with_state(|state| {
                 let n = state.node_mut(sid).unwrap();
-                if let PcWidgetKind::Spreadsheet { ref cells, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let cells = &grid.cells;
                     cells.borrow_mut().insert((0, 0), "original".into());
                 }
             });
@@ -5317,14 +5321,14 @@ mod pancurses_backend {
             // Change buffer
             with_state(|state| {
                 let n = state.node_mut(sid).unwrap();
-                if let PcWidgetKind::Spreadsheet { ref mut edit_buf, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let edit_buf = &mut grid.edit_buf;
                     *edit_buf = "modified".to_string();
                 }
             });
             // Cancel via Esc (set editing=false without committing)
             with_state(|state| {
                 let n = state.node_mut(sid).unwrap();
-                if let PcWidgetKind::Spreadsheet { ref mut editing, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let editing = &mut grid.editing;
                     *editing = false;
                 }
             });
@@ -5338,7 +5342,7 @@ mod pancurses_backend {
             with_state(|state| spreadsheet_enter(state, sid));
             with_state(|state| {
                 let n = state.node_mut(sid).unwrap();
-                if let PcWidgetKind::Spreadsheet { ref mut edit_buf, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let edit_buf = &mut grid.edit_buf;
                     *edit_buf = "data".to_string();
                 }
             });
@@ -5346,7 +5350,7 @@ mod pancurses_backend {
             with_state(|state| spreadsheet_commit_edit(state, sid));
             with_state(|state| {
                 let n = state.node_mut(sid).unwrap();
-                if let PcWidgetKind::Spreadsheet { ref mut cursor_col, total_cols, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let cursor_col = &mut grid.cursor_col; let total_cols = grid.total_cols;
                     if *cursor_col + 1 < total_cols { *cursor_col += 1; }
                 }
             });
@@ -5361,7 +5365,7 @@ mod pancurses_backend {
             // Try to go up from 0
             with_state(|state| {
                 let n = state.node_mut(sid).unwrap();
-                if let PcWidgetKind::Spreadsheet { ref mut cursor_row, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let cursor_row = &mut grid.cursor_row;
                     if *cursor_row > 0 { *cursor_row -= 1; }
                 }
             });
@@ -5369,7 +5373,7 @@ mod pancurses_backend {
             // Try to go left from 0
             with_state(|state| {
                 let n = state.node_mut(sid).unwrap();
-                if let PcWidgetKind::Spreadsheet { ref mut cursor_col, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let cursor_col = &mut grid.cursor_col;
                     if *cursor_col > 0 { *cursor_col -= 1; }
                 }
             });
@@ -5383,7 +5387,7 @@ mod pancurses_backend {
             // Move to (5,5)
             with_state(|state| {
                 let n = state.node_mut(sid).unwrap();
-                if let PcWidgetKind::Spreadsheet { ref mut cursor_row, ref mut cursor_col, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let cursor_row = &mut grid.cursor_row; let cursor_col = &mut grid.cursor_col;
                     *cursor_row = 5; *cursor_col = 5;
                 }
             });
@@ -5391,14 +5395,14 @@ mod pancurses_backend {
             with_state(|state| spreadsheet_prepare_move(state, sid, true));
             with_state(|state| {
                 let n = state.node_mut(sid).unwrap();
-                if let PcWidgetKind::Spreadsheet { ref mut cursor_row, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let cursor_row = &mut grid.cursor_row;
                     *cursor_row += 1;
                 }
             });
             // Anchor should be set to (5, 5)
             let anchor = with_state(|state| {
                 let n = state.node(sid).unwrap();
-                if let PcWidgetKind::Spreadsheet { anchor, .. } = &n.kind {
+                if let PcWidgetKind::Spreadsheet { grid, .. } = &n.kind { let anchor = &grid.anchor;
                     *anchor
                 } else { None }
             });
@@ -5408,7 +5412,7 @@ mod pancurses_backend {
             with_state(|state| spreadsheet_prepare_move(state, sid, false));
             let anchor = with_state(|state| {
                 let n = state.node(sid).unwrap();
-                if let PcWidgetKind::Spreadsheet { anchor, .. } = &n.kind {
+                if let PcWidgetKind::Spreadsheet { grid, .. } = &n.kind { let anchor = &grid.anchor;
                     *anchor
                 } else { None }
             });
@@ -5432,14 +5436,14 @@ mod pancurses_backend {
             // Move to (3,5) first
             with_state(|state| {
                 let n = state.node_mut(sid).unwrap();
-                if let PcWidgetKind::Spreadsheet { ref mut cursor_row, ref mut cursor_col, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let cursor_row = &mut grid.cursor_row; let cursor_col = &mut grid.cursor_col;
                     *cursor_row = 3; *cursor_col = 5;
                 }
             });
             // Simulate KeyDown handler:
             with_state(|state| {
                 let n = state.node_mut(sid).unwrap();
-                if let PcWidgetKind::Spreadsheet { ref mut cursor_row, total_rows, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let cursor_row = &mut grid.cursor_row; let total_rows = grid.total_rows;
                     if *cursor_row + 1 < total_rows { *cursor_row += 1; }
                 }
             });
@@ -5447,7 +5451,7 @@ mod pancurses_backend {
             // Simulate KeyRight handler:
             with_state(|state| {
                 let n = state.node_mut(sid).unwrap();
-                if let PcWidgetKind::Spreadsheet { ref mut cursor_col, total_cols, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let cursor_col = &mut grid.cursor_col; let total_cols = grid.total_cols;
                     if *cursor_col + 1 < total_cols { *cursor_col += 1; }
                 }
             });
@@ -5455,7 +5459,7 @@ mod pancurses_backend {
             // Simulate KeyUp handler:
             with_state(|state| {
                 let n = state.node_mut(sid).unwrap();
-                if let PcWidgetKind::Spreadsheet { ref mut cursor_row, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let cursor_row = &mut grid.cursor_row;
                     if *cursor_row > 0 { *cursor_row -= 1; }
                 }
             });
@@ -5463,7 +5467,7 @@ mod pancurses_backend {
             // Simulate KeyLeft handler:
             with_state(|state| {
                 let n = state.node_mut(sid).unwrap();
-                if let PcWidgetKind::Spreadsheet { ref mut cursor_col, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let cursor_col = &mut grid.cursor_col;
                     if *cursor_col > 0 { *cursor_col -= 1; }
                 }
             });
@@ -5477,7 +5481,7 @@ mod pancurses_backend {
             with_state(|state| spreadsheet_enter(state, sid));
             with_state(|state| {
                 let n = state.node_mut(sid).unwrap();
-                if let PcWidgetKind::Spreadsheet { ref mut edit_buf, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let edit_buf = &mut grid.edit_buf;
                     *edit_buf = "tab_test".to_string();
                 }
             });
@@ -5485,7 +5489,7 @@ mod pancurses_backend {
             with_state(|state| spreadsheet_commit_edit(state, sid));
             with_state(|state| {
                 let n = state.node_mut(sid).unwrap();
-                if let PcWidgetKind::Spreadsheet { ref mut cursor_col, total_cols, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let cursor_col = &mut grid.cursor_col; let total_cols = grid.total_cols;
                     if *cursor_col + 1 < total_cols { *cursor_col += 1; }
                 }
             });
@@ -5502,7 +5506,7 @@ mod pancurses_backend {
             // Type "hello" into edit buffer (simulates Character('h'), etc.)
             with_state(|state| {
                 let n = state.node_mut(sid).unwrap();
-                if let PcWidgetKind::Spreadsheet { ref mut edit_buf, ref mut edit_pos, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let edit_buf = &mut grid.edit_buf; let edit_pos = &mut grid.edit_pos;
                     *edit_buf = "hello".to_string();
                     *edit_pos = 5;
                 }
@@ -5524,7 +5528,7 @@ mod pancurses_backend {
                 if let Some(fid) = state.focus_id {
                     if is_spreadsheet_focused(state, fid) {
                         if let Some(n) = state.node_mut(fid) {
-                            if let PcWidgetKind::Spreadsheet { ref mut editing, ref mut edit_buf, ref mut edit_pos, .. } = n.kind {
+                            if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let editing = &mut grid.editing; let edit_buf = &mut grid.edit_buf; let edit_pos = &mut grid.edit_pos;
                                 if !*editing {
                                     *editing = true;
                                     *edit_buf = "a".to_string();
@@ -5543,7 +5547,7 @@ mod pancurses_backend {
                 if let Some(fid) = state.focus_id {
                     if is_spreadsheet_focused(state, fid) {
                         if let Some(n) = state.node_mut(fid) {
-                            if let PcWidgetKind::Spreadsheet { ref mut editing, ref mut edit_buf, ref mut edit_pos, .. } = n.kind {
+                            if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let editing = &mut grid.editing; let edit_buf = &mut grid.edit_buf; let edit_pos = &mut grid.edit_pos;
                                 if !*editing {
                                     *editing = true;
                                     *edit_buf = "b".to_string();
@@ -5570,7 +5574,7 @@ mod pancurses_backend {
             // Type "abc"
             with_state(|state| {
                 let n = state.node_mut(sid).unwrap();
-                if let PcWidgetKind::Spreadsheet { ref mut editing, ref mut edit_buf, ref mut edit_pos, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let editing = &mut grid.editing; let edit_buf = &mut grid.edit_buf; let edit_pos = &mut grid.edit_pos;
                     *editing = true;
                     *edit_buf = "abc".to_string();
                     *edit_pos = 3;
@@ -5581,7 +5585,7 @@ mod pancurses_backend {
                 if let Some(fid) = state.focus_id {
                     if is_spreadsheet_focused(state, fid) {
                         if let Some(n) = state.node_mut(fid) {
-                            if let PcWidgetKind::Spreadsheet { ref mut editing, ref mut edit_buf, ref mut edit_pos, .. } = n.kind {
+                            if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let editing = &mut grid.editing; let edit_buf = &mut grid.edit_buf; let edit_pos = &mut grid.edit_pos;
                                 if *editing && *edit_pos > 0 {
                                     *edit_pos -= 1;
                                     edit_buf.remove(*edit_pos);
@@ -5603,7 +5607,7 @@ mod pancurses_backend {
             // Mark not editing
             with_state(|state| {
                 let n = state.node_mut(sid).unwrap();
-                if let PcWidgetKind::Spreadsheet { ref mut editing, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let editing = &mut grid.editing;
                     *editing = false;
                 }
             });
@@ -5647,30 +5651,18 @@ mod pancurses_backend {
             let wid = with_state(|s| s.add_node(
                 PcWidgetKind::Window { title: "test".into() }, None,
             ));
-            let sid = with_state(|s| s.add_node(
-                PcWidgetKind::Spreadsheet {
-                    cells: Rc::new(RefCell::new(HashMap::new())),
-                    raw_cells: Rc::new(RefCell::new(HashMap::new())),
-                    cell_styles: Rc::new(RefCell::new(HashMap::new())),
-                    total_rows: 10, total_cols: 3, top_row: 0, left_col: 0,
-                    cursor_row: 0, cursor_col: 0, editing: false,
-                    edit_buf: String::new(), edit_pos: 0, col_width: 12,
-                    margin_cols: 0, main_cols: 3,
-                    formula_bar_address_id: None, formula_bar_entry_id: None,
-                    anchor: None,
-                    menu_text: "menu".into(),
-                    status_text: "status".into(),
-                    border_title: String::new(),
-                    formula_bar_trailing: String::new(),
-                    column_layout: vec![(0,10,"A".into()),(1,10,"B".into()),(2,10,"C".into())],
-                    row_labels: vec![(0,"   1".into()),(1,"   2".into())],
-                    tab_titles: Vec::new(),
-                    tab_active: 0,
-                    header_row_count: 2,
-                    main_row_count: 20,
-                },
-                Some(wid),
-            ));
+            let sid = create_spreadsheet(10, 3).unwrap();
+with_state(|s| {
+    if let Some(n) = s.node_mut(sid) {
+        n.parent = Some(wid);
+        if let PcWidgetKind::Spreadsheet { grid, border_title, menu_text, status_text, formula_bar_trailing, .. } = &mut n.kind {
+            grid.header_row_count = 2;
+            grid.main_row_count = 20;
+            *menu_text = "menu".to_string();
+            *status_text = "status".to_string();
+        }
+    }
+});
             let buf = render_spreadsheet_to_buffer(sid, 80, 10);
             assert_eq!(buf.len(), 10);
             assert!(buf[0].contains("menu"));
@@ -5685,29 +5677,16 @@ mod pancurses_backend {
             let wid = with_state(|s| s.add_node(
                 PcWidgetKind::Window { title: "test".into() }, None,
             ));
-            let sid = with_state(|s| s.add_node(
-                PcWidgetKind::Spreadsheet {
-                    cells: Rc::new(RefCell::new(HashMap::new())),
-                    raw_cells: Rc::new(RefCell::new(HashMap::new())),
-                    cell_styles: Rc::new(RefCell::new(HashMap::new())),
-                    total_rows: 10, total_cols: 2, top_row: 0, left_col: 0,
-                    cursor_row: 0, cursor_col: 0, editing: false,
-                    edit_buf: String::new(), edit_pos: 0, col_width: 12,
-                    margin_cols: 0, main_cols: 2,
-                    formula_bar_address_id: None, formula_bar_entry_id: None,
-                    anchor: None,
-                    menu_text: String::new(), status_text: String::new(),
-                    border_title: String::new(),
-                    formula_bar_trailing: String::new(),
-                    column_layout: vec![(0,5,"X".into()),(1,5,"Y".into())],
-                    row_labels: vec![],
-                    tab_titles: Vec::new(),
-                    tab_active: 0,
-                    header_row_count: 2,
-                    main_row_count: 20,
-                },
-                Some(wid),
-            ));
+            let sid = create_spreadsheet(10, 2).unwrap();
+with_state(|s| {
+    if let Some(n) = s.node_mut(sid) {
+        n.parent = Some(wid);
+        if let PcWidgetKind::Spreadsheet { grid, border_title, menu_text, status_text, formula_bar_trailing, .. } = &mut n.kind {
+            grid.header_row_count = 2;
+            grid.main_row_count = 20;
+            grid.column_layout = vec![(0, 5, "X".into()), (1, 5, "Y".into())];        }
+    }
+});
             let buf = render_spreadsheet_to_buffer(sid, 80, 10);
             // Header is at index 2 (index 0 = formula bar, index 1 = border, since menu_text is empty)
             assert!(buf[2].contains("X"), "header missing X in {:?}", &buf[2]);
@@ -5723,31 +5702,19 @@ mod pancurses_backend {
             ));
             let total_rows = 24u32;
             let total_cols = 5u32;
-            let sid = with_state(|s| s.add_node(
-                PcWidgetKind::Spreadsheet {
-                    cells: Rc::new(RefCell::new(HashMap::new())),
-                    raw_cells: Rc::new(RefCell::new(HashMap::new())),
-                    cell_styles: Rc::new(RefCell::new(HashMap::new())),
-                    total_rows, total_cols,
-                    top_row: 0, left_col: 0,
-                    cursor_row: 0, cursor_col: 0,
-                    editing: false, edit_buf: String::new(), edit_pos: 0,
-                    col_width: 12, margin_cols: 0, main_cols: total_cols,
-                    formula_bar_address_id: None, formula_bar_entry_id: None,
-                    anchor: None,
-                    menu_text: " [File]   Edit    Insert    Format    Sheet    Help".into(),
-                    status_text: "status bar".into(),
-                    border_title: "corro  24r × 3c  ops 0".into(),
-                    formula_bar_trailing: String::new(),
-                    column_layout: Vec::new(),
-                    row_labels: Vec::new(),
-                    tab_titles: Vec::new(),
-                    tab_active: 0,
-                    header_row_count: 2,
-                    main_row_count: 24,
-                },
-                Some(wid),
-            ));
+            let sid = create_spreadsheet(100, 3).unwrap();
+with_state(|s| {
+    if let Some(n) = s.node_mut(sid) {
+        n.parent = Some(wid);
+        if let PcWidgetKind::Spreadsheet { grid, border_title, menu_text, status_text, formula_bar_trailing, .. } = &mut n.kind {
+            *border_title = "corro  24r × 3c  ops 0".to_string();
+            grid.header_row_count = 2;
+            grid.main_row_count = 24;
+            *menu_text = " [File]   Edit    Insert    Format    Sheet    Help".to_string();
+            *status_text = "status bar".to_string();
+        }
+    }
+});
 
             // Simulate what pnc_backend.rs does: margin_cols=2, main_cols=3, total 5 columns
             let lm = 2u32;
@@ -5762,7 +5729,7 @@ mod pancurses_backend {
             with_state(|state| {
                 let n = state.node_mut(sid).unwrap();
                 match &mut n.kind {
-                    PcWidgetKind::Spreadsheet { ref mut column_layout, .. } => {
+                    PcWidgetKind::Spreadsheet { grid, .. } => { let column_layout = &mut grid.column_layout;
                         *column_layout = layout;
                     }
                     _ => unreachable!(),
@@ -5806,31 +5773,19 @@ mod pancurses_backend {
             ));
             let total_rows = 10u32;
             let total_cols = 3u32;
-            let sid = with_state(|s| s.add_node(
-                PcWidgetKind::Spreadsheet {
-                    cells: Rc::new(RefCell::new(HashMap::new())),
-                    raw_cells: Rc::new(RefCell::new(HashMap::new())),
-                    cell_styles: Rc::new(RefCell::new(HashMap::new())),
-                    total_rows, total_cols,
-                    top_row: 0, left_col: 0,
-                    cursor_row: 0, cursor_col: 2,
-                    editing: false, edit_buf: String::new(), edit_pos: 0,
-                    col_width: 12, margin_cols: 0, main_cols: total_cols,
-                    formula_bar_address_id: None, formula_bar_entry_id: None,
-                    anchor: None,
-                    menu_text: "Menu".into(),
-                    status_text: "Status".into(),
-                    border_title: "Test".into(),
-                    formula_bar_trailing: String::new(),
-                    column_layout: vec![(0,10,"A".into()),(1,10,"B".into()),(2,10,"C".into())],
-                    row_labels: (0..total_rows).map(|i| (i, format!("{:>4}", i + 1))).collect(),
-                    tab_titles: Vec::new(),
-                    tab_active: 0,
-                    header_row_count: 2,
-                    main_row_count: 24,
-                },
-                Some(wid),
-            ));
+            let sid = create_spreadsheet(100, 3).unwrap();
+with_state(|s| {
+    if let Some(n) = s.node_mut(sid) {
+        n.parent = Some(wid);
+        if let PcWidgetKind::Spreadsheet { grid, border_title, menu_text, status_text, formula_bar_trailing, .. } = &mut n.kind {
+            *border_title = "Test".to_string();
+            grid.header_row_count = 2;
+            grid.main_row_count = 24;
+            *menu_text = "Menu".to_string();
+            *status_text = "Status".to_string();
+        }
+    }
+});
             spreadsheet_set_cursor(sid, 0, 2);
 
             // Replicate fill_cells: store cell text at (display_row_idx, global_col_idx)
@@ -5856,31 +5811,19 @@ mod pancurses_backend {
             ));
             let total_rows = 10u32;
             let total_cols = 5u32;
-            let sid = with_state(|s| s.add_node(
-                PcWidgetKind::Spreadsheet {
-                    cells: Rc::new(RefCell::new(HashMap::new())),
-                    raw_cells: Rc::new(RefCell::new(HashMap::new())),
-                    cell_styles: Rc::new(RefCell::new(HashMap::new())),
-                    total_rows, total_cols,
-                    top_row: 0, left_col: 0,
-                    cursor_row: 0, cursor_col: 0,
-                    editing: false, edit_buf: String::new(), edit_pos: 0,
-                    col_width: 12, margin_cols: 2, main_cols: 3,
-                    formula_bar_address_id: None, formula_bar_entry_id: None,
-                    anchor: None,
-                    menu_text: " [File]   Edit".into(),
-                    status_text: "status".into(),
-                    border_title: "test".into(),
-                    formula_bar_trailing: String::new(),
-                    column_layout: vec![(0,6,"L0".into()),(1,6,"L1".into()),(2,10,"A".into()),(3,10,"B".into()),(4,10,"C".into())],
-                    row_labels: (0..total_rows).map(|i| (i, format!("{:>4}", i + 1))).collect(),
-                    tab_titles: Vec::new(),
-                    tab_active: 0,
-                    header_row_count: 2,
-                    main_row_count: 24,
-                },
-                Some(wid),
-            ));
+            let sid = create_spreadsheet(100, 3).unwrap();
+with_state(|s| {
+    if let Some(n) = s.node_mut(sid) {
+        n.parent = Some(wid);
+        if let PcWidgetKind::Spreadsheet { grid, border_title, menu_text, status_text, formula_bar_trailing, .. } = &mut n.kind {
+            *border_title = "test".to_string();
+            grid.header_row_count = 2;
+            grid.main_row_count = 24;
+            *menu_text = " [File]   Edit".to_string();
+            *status_text = "status".to_string();
+        }
+    }
+});
             spreadsheet_set_cursor(sid, 0, 2);
 
             // Do NOT set any cell data — test what an empty grid renders like
@@ -5900,29 +5843,16 @@ mod pancurses_backend {
             let wid = with_state(|s| s.add_node(
                 PcWidgetKind::Window { title: "test".into() }, None,
             ));
-            let sid = with_state(|s| s.add_node(
-                PcWidgetKind::Spreadsheet {
-                    cells: Rc::new(RefCell::new(HashMap::new())),
-                    raw_cells: Rc::new(RefCell::new(HashMap::new())),
-                    cell_styles: Rc::new(RefCell::new(HashMap::new())),
-                    total_rows: 10, total_cols: 1, top_row: 0, left_col: 0,
-                    cursor_row: 0, cursor_col: 0, editing: false,
-                    edit_buf: String::new(), edit_pos: 0, col_width: 12,
-                    margin_cols: 0, main_cols: 1,
-                    formula_bar_address_id: None, formula_bar_entry_id: None,
-                    anchor: None,
-                    menu_text: String::new(), status_text: String::new(),
-                    border_title: String::new(),
-                    formula_bar_trailing: String::new(),
-                    column_layout: vec![(0,8,"A".into())],
-                    row_labels: vec![(0,"ROW0".into()),(1,"ROW1".into())],
-                    tab_titles: Vec::new(),
-                    tab_active: 0,
-                    header_row_count: 2,
-                    main_row_count: 20,
-                },
-                Some(wid),
-            ));
+            let sid = create_spreadsheet(10, 1).unwrap();
+with_state(|s| {
+    if let Some(n) = s.node_mut(sid) {
+        n.parent = Some(wid);
+        if let PcWidgetKind::Spreadsheet { grid, border_title, menu_text, status_text, formula_bar_trailing, .. } = &mut n.kind {
+            grid.header_row_count = 2;
+            grid.main_row_count = 20;
+            grid.row_labels = vec![(0, "ROW0".into()), (1, "ROW1".into())];        }
+    }
+});
             let buf = render_spreadsheet_to_buffer(sid, 80, 10);
             assert!(buf[4].contains("ROW0"), "row 0 label missing: {:?}", buf[4]);
             assert!(buf[5].contains("ROW1"), "row 1 label missing: {:?}", buf[5]);
@@ -5939,33 +5869,21 @@ mod pancurses_backend {
             ));
             let total_rows = 3u32;
             let total_cols = 3u32;
-            let sid = with_state(|s| s.add_node(
-                PcWidgetKind::Spreadsheet {
-                    cells: Rc::new(RefCell::new(HashMap::new())),
-                    raw_cells: Rc::new(RefCell::new(HashMap::from([
-                        ((0, 0), "42".into()),
-                    ]))),
-                    cell_styles: Rc::new(RefCell::new(HashMap::new())),
-                    total_rows, total_cols,
-                    top_row: 0, left_col: 0,
-                    cursor_row: 0, cursor_col: 0,
-                    editing: false, edit_buf: String::new(), edit_pos: 0,
-                    col_width: 12, margin_cols: 0, main_cols: total_cols,
-                    formula_bar_address_id: None, formula_bar_entry_id: None,
-                    anchor: None,
-                    menu_text: "Menu".into(),
-                    status_text: String::new(),
-                    border_title: "Test".into(),
-                    formula_bar_trailing: "   ·  Loaded workbook /root/src/corro_mainloop/t_shift5.corro @ revision 30".into(),
-                    column_layout: vec![(0,8,"A".into()),(1,8,"B".into()),(2,8,"C".into())],
-                    row_labels: (0..total_rows).map(|i| (i, format!("{:>4}", i + 1))).collect(),
-                    tab_titles: Vec::new(),
-                    tab_active: 0,
-                    header_row_count: 2,
-                    main_row_count: 24,
-                },
-                Some(wid),
-            ));
+            let sid = create_spreadsheet(100, 3).unwrap();
+with_state(|s| {
+    if let Some(n) = s.node_mut(sid) {
+        n.parent = Some(wid);
+        if let PcWidgetKind::Spreadsheet { grid, border_title, menu_text, status_text, formula_bar_trailing, .. } = &mut n.kind {
+            *border_title = "Test".to_string();
+            *formula_bar_trailing = "   ·  Loaded workbook /root/src/corro_mainloop/t_shift5.corro @ revision 30".to_string();
+            grid.header_row_count = 2;
+            grid.main_row_count = 24;
+            grid.column_layout = vec![(0, 6, "L0".into()), (1, 6, "L1".into()), (2, 10, "A".into()), (3, 10, "B".into()), (4, 10, "C".into())];            *menu_text = "Menu".to_string();
+        }
+    }
+});
+spreadsheet_set_raw_cell(sid, 0, 0, "42");
+
             spreadsheet_set_cursor(sid, 0, 0);
 
             let buf = render_spreadsheet_to_buffer(sid, 80, 10);
@@ -5989,31 +5907,17 @@ mod pancurses_backend {
             let wid = with_state(|s| s.add_node(
                 PcWidgetKind::Window { title: "test".into() }, None,
             ));
-            let sid = with_state(|s| s.add_node(
-                PcWidgetKind::Spreadsheet {
-                    cells: Rc::new(RefCell::new(HashMap::new())),
-                    raw_cells: Rc::new(RefCell::new(HashMap::new())),
-                    cell_styles: Rc::new(RefCell::new(HashMap::new())),
-                    total_rows: 5, total_cols: 3, top_row: 0, left_col: 0,
-                    cursor_row: 0, cursor_col: 1,
-                    editing: false, edit_buf: String::new(), edit_pos: 0,
-                    col_width: 12,
-                    margin_cols: 1, main_cols: 2,
-                    formula_bar_address_id: None, formula_bar_entry_id: None,
-                    anchor: None,
-                    menu_text: String::new(),
-                    status_text: String::new(),
-                    border_title: String::new(),
-                    formula_bar_trailing: String::new(),
-                    column_layout: vec![(0,4,"[A".into()),(1,4,"A".into()),(2,4,"]A".into())],
-                    row_labels: vec![(0,"   1".into()),(1,"   2".into())],
-                    tab_titles: Vec::new(),
-                    tab_active: 0,
-                    header_row_count: 2,
-                    main_row_count: 3,
-                },
-                Some(wid),
-            ));
+            let sid = create_spreadsheet(5, 3).unwrap();
+with_state(|s| {
+    if let Some(n) = s.node_mut(sid) {
+        n.parent = Some(wid);
+        if let PcWidgetKind::Spreadsheet { grid, border_title, menu_text, status_text, formula_bar_trailing, .. } = &mut n.kind {
+            grid.header_row_count = 2;
+            grid.main_row_count = 3;
+            grid.column_layout = vec![(0, 4, "[A".into()), (1, 4, "A".into()), (2, 4, "]A".into())];
+        }
+    }
+});
             spreadsheet_set_grid_config(sid, 1, 2);
             spreadsheet_set_cell(sid, 1, 1, "  22");
             let buf = render_spreadsheet_to_buffer(sid, 40, 12);
@@ -6024,36 +5928,18 @@ mod pancurses_backend {
                 "Cell should contain '  22' but got: {:?}", &buf[5]);
 
             // Now test with larger margin_cols that match the real backend scenario
-            let sid2 = with_state(|s| s.add_node(
-                PcWidgetKind::Spreadsheet {
-                    cells: Rc::new(RefCell::new(HashMap::new())),
-                    raw_cells: Rc::new(RefCell::new(HashMap::new())),
-                    cell_styles: Rc::new(RefCell::new(HashMap::new())),
-                    total_rows: 5, total_cols: 3, top_row: 0, left_col: 0,
-                    cursor_row: 0, cursor_col: 1,
-                    editing: false, edit_buf: String::new(), edit_pos: 0,
-                    col_width: 12,
-                    margin_cols: 702, main_cols: 2,
-                    formula_bar_address_id: None, formula_bar_entry_id: None,
-                    anchor: None,
-                    menu_text: String::new(),
-                    status_text: String::new(),
-                    border_title: String::new(),
-                    formula_bar_trailing: String::new(),
-                    column_layout: vec![
-                        (701,4,"[A".into()),
-                        (702,4,"A".into()),
-                        (703,4,"B".into()),
-                        (704,4,"]A".into()),
-                    ],
-                    row_labels: vec![(0,"   1".into()),(1,"   2".into())],
-                    tab_titles: Vec::new(),
-                    tab_active: 0,
-                    header_row_count: 2,
-                    main_row_count: 3,
-                },
-                Some(wid),
-            ));
+            let sid2 = create_spreadsheet(5, 3).unwrap();
+with_state(|s| {
+    if let Some(n) = s.node_mut(sid2) {
+        n.parent = Some(wid);
+        if let PcWidgetKind::Spreadsheet { grid, border_title, menu_text, status_text, formula_bar_trailing, .. } = &mut n.kind {
+            grid.header_row_count = 2;
+            grid.main_row_count = 3;
+            grid.column_layout = vec![(701, 4, "[A".into()), (702, 4, "A".into()), (703, 4, "B".into())];
+            grid.row_labels = vec![(0, "   1".into()), (1, "   2".into())];
+        }
+    }
+});
             spreadsheet_set_grid_config(sid2, 702, 2);
             spreadsheet_set_cell(sid2, 1, 702, "  22");
             let buf2 = render_spreadsheet_to_buffer(sid2, 40, 12);
@@ -6069,35 +5955,22 @@ mod pancurses_backend {
             let wid = with_state(|s| s.add_node(
                 PcWidgetKind::Window { title: "test".into() }, None,
             ));
-            let sid = with_state(|s| s.add_node(
-                PcWidgetKind::Spreadsheet {
-                    cells: Rc::new(RefCell::new(HashMap::new())),
-                    raw_cells: Rc::new(RefCell::new(HashMap::new())),
-                    cell_styles: Rc::new(RefCell::new(HashMap::new())),
-                    total_rows: 100, total_cols: 5, top_row: 0, left_col: 0,
-                    cursor_row: 1, cursor_col: 702,
-                    editing: false, edit_buf: String::new(), edit_pos: 0,
-                    col_width: 12,
-                    margin_cols: 702, main_cols: 2,
-                    formula_bar_address_id: None, formula_bar_entry_id: None,
-                    anchor: None,
-                    menu_text: " [File]   Edit    Insert    Format    Sheet    Help".into(),
-                    status_text: "  type to edit (or addr: val)   Enter·confirm   Esc·discard".into(),
-                    border_title: "corro  2r x 2c ops 34".into(),
-                    formula_bar_trailing: "   ·  Loaded workbook /root/src/corro_mainloop/t_shift5.corro @ revision 34".into(),
-                    column_layout: vec![
-                        (701,4,"[A".into()),
-                        (702,4,"A".into()),
-                        (703,4,"B".into()),
-                    ],
-                    row_labels: vec![(0,"   1".into()),(1,"   2".into())],
-                    tab_titles: Vec::new(),
-                    tab_active: 0,
-                    header_row_count: 2,
-                    main_row_count: 2,
-                },
-                Some(wid),
-            ));
+            let sid = create_spreadsheet(100, 5).unwrap();
+with_state(|s| {
+    if let Some(n) = s.node_mut(sid) {
+        n.parent = Some(wid);
+        if let PcWidgetKind::Spreadsheet { grid, border_title, menu_text, status_text, formula_bar_trailing, .. } = &mut n.kind {
+            *border_title = "corro  2r x 2c ops 34".to_string();
+            *formula_bar_trailing = "   ·  Loaded workbook /root/src/corro_mainloop/t_shift5.corro @ revision 34".to_string();
+            grid.header_row_count = 2;
+            grid.main_row_count = 2;
+            grid.column_layout = vec![(701, 4, "[A".into()), (702, 4, "A".into()), (703, 4, "B".into())];
+            grid.row_labels = vec![(0, "   1".into()), (1, "   2".into())];
+            *menu_text = " [File]   Edit    Insert    Format    Sheet    Help".to_string();
+            *status_text = "  type to edit (or addr: val)   Enter·confirm   Esc·discard".to_string();
+        }
+    }
+});
             spreadsheet_set_grid_config(sid, 702, 2);
             spreadsheet_set_cursor(sid, 1, 702);
             // Simulate fill_cells: store right-aligned number in main column A

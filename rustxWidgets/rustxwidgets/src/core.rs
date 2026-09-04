@@ -63,6 +63,60 @@ pub enum MessageBoxResult {
     No,
 }
 
+/// A data grid (mirrors wxGrid): cells, cursor, viewport, editing state,
+/// column layout, and row labels.  Backends render it with their own widgets;
+/// the `Spreadsheet` widget builds its chrome (formula bar, status, tabs) on
+/// top of a `Grid`.
+#[derive(Clone, Debug)]
+pub struct Grid {
+    pub cells: Rc<RefCell<HashMap<(u32, u32), String>>>,
+    pub raw_cells: Rc<RefCell<HashMap<(u32, u32), String>>>,
+    pub cell_styles: Rc<RefCell<HashMap<(u32, u32), u8>>>,
+    pub total_rows: u32,
+    pub total_cols: u32,
+    pub top_row: u32,
+    pub left_col: u32,
+    pub cursor_row: u32,
+    pub cursor_col: u32,
+    pub editing: bool,
+    pub edit_buf: String,
+    pub edit_pos: usize,
+    pub col_width: u32,
+    pub margin_cols: u32,
+    pub main_cols: u32,
+    pub anchor: Option<(u32, u32)>,
+    pub header_row_count: u32,
+    pub main_row_count: u32,
+    pub column_layout: Vec<(u32, u32, String)>,
+    pub row_labels: Vec<(u32, String)>,
+}
+
+impl Grid {
+    /// The value displayed in a cell (committed value, falling back to the
+    /// in-progress edit buffer when editing that cell).
+    pub fn display_value(&self, row: u32, col: u32) -> String {
+        if self.editing && row == self.cursor_row && col == self.cursor_col {
+            self.edit_buf.clone()
+        } else {
+            self.cells.borrow().get(&(row, col)).cloned().unwrap_or_default()
+        }
+    }
+
+    /// Commit the in-progress edit into the cell (no-op when not editing).
+    pub fn commit_edit(&mut self) {
+        if self.editing {
+            let val = self.edit_buf.clone();
+            let r = self.cursor_row;
+            let c = self.cursor_col;
+            self.cells.borrow_mut().insert((r, c), val.clone());
+            self.raw_cells.borrow_mut().insert((r, c), val);
+            self.editing = false;
+            self.edit_buf.clear();
+            self.edit_pos = 0;
+        }
+    }
+}
+
 /// A UI event dispatched through the widget tree.  Callbacks that return
 /// `CallbackResult::Skip` let the event propagate to the parent widget
 /// (mirrors wxEvent).
