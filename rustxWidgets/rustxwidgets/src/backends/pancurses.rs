@@ -3175,8 +3175,11 @@ mod pancurses_backend {
             let win_w = n.rect.w as i32;
             let dy = n.rect.y + 1;
             let mut mx = n.rect.x + 1;
+            // Each bar label is rendered padded to len+2 with a two-space
+            // separator, so the popup x is 1 + Σ(len+4) — derived from the bar
+            // layout (matching ratatui's menu_bar_x) instead of adhoc columns.
             for i in 0..state.active_submenu {
-                mx += labels[i].len() as i32 + 2;
+                mx += labels[i].len() as i32 + 4;
             }
             let (mut py, mut px) = (dy, mx);
             let mut cur = &submenu_items[state.active_submenu].1;

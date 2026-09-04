@@ -896,6 +896,34 @@ fn menu_max_item_width(section: MenuSection) -> usize {
         .unwrap_or(10)
 }
 
+/// x-position of a root menu's label in the menu bar, calculated from the bar
+/// layout (" {file}  {edit}  {insert}  {format}  {sheet}  {help}", where each
+/// label is padded to len+2 and the fields are separated by two spaces).  A
+/// popup sits directly beneath its label — positions are derived, not
+/// hardcoded (previously File/Edit/Insert/Format aligned but Sheet and Help
+/// were one column off).  Submenu sections resolve to their parent root.
+fn menu_bar_x(section: MenuSection) -> u16 {
+    let root = match section {
+        MenuSection::FormatScope | MenuSection::FormatNumber | MenuSection::FormatAlign => MenuSection::Format,
+        _ => section,
+    };
+    let mut x = 1u16; // leading space before the first label
+    for (label, sec) in [
+        ("File", MenuSection::File),
+        ("Edit", MenuSection::Edit),
+        ("Insert", MenuSection::Insert),
+        ("Format", MenuSection::Format),
+        ("Sheet", MenuSection::Sheet),
+        ("Help", MenuSection::Help),
+    ] {
+        if sec == root {
+            return x;
+        }
+        x += label.len() as u16 + 4; // padded label (len+2) + two-space separator
+    }
+    x
+}
+
 fn menu_popup_area(area: Rect, section: MenuSection, parent: Option<(Rect, usize)>) -> Rect {
     let items = menu_items(section).len() as u16;
     // Dynamically derive the popup width from the longest item label so nothing
@@ -907,19 +935,7 @@ fn menu_popup_area(area: Rect, section: MenuSection, parent: Option<(Rect, usize
     let (x, y) = parent
         .map(|(p, item)| (p.x.saturating_add(p.width), p.y.saturating_add(item as u16)))
         .unwrap_or_else(|| {
-            let x = match section {
-                MenuSection::File => 1,
-                MenuSection::Edit => 9,
-                MenuSection::Insert => 17,
-                MenuSection::Format => 27,
-                MenuSection::FormatScope => 27,
-                MenuSection::FormatNumber => 27,
-                MenuSection::FormatAlign => 27,
-                MenuSection::Sheet => 36,
-                MenuSection::Help => 45,
-                _ => 1,
-            };
-            (area.x.saturating_add(x), area.y.saturating_add(1))
+            (area.x.saturating_add(menu_bar_x(section)), area.y.saturating_add(1))
         });
     let x = x.min(
         area.x
@@ -14759,17 +14775,35 @@ mod tests {
     fn root_menu_popups_align_under_top_bar_items() {
         let area = Rect::new(0, 0, 80, 20);
 
-        let file = menu_popup_area(area, MenuSection::File, None);
-        let edit = menu_popup_area(area, MenuSection::Edit, None);
-        let insert = menu_popup_area(area, MenuSection::Insert, None);
-        let help = menu_popup_area(area, MenuSection::Help, None);
-
-        assert_eq!(file.x, 1);
-        assert_eq!(edit.x, 9);
-        assert_eq!(insert.x, 17);
-        // The menu popup x positions are computed from fixed offsets in menu_popup_area.
-        // Help currently maps to x=45.
-        assert_eq!(help.x, 45);
+        // Popup x must equal the menu bar label's start, derived from the bar
+        // layout (" {file}  {edit}  {insert}  {format}  {sheet}  {help}" — each
+        // label padded to len+2, two-space separators) — not adhoc hardcoded
+        // columns.  Previously File/Edit/Insert/Format matched but Sheet and
+        // Help were one column left of their labels.
+        for (section, label, width) in [
+            (MenuSection::File, "File", 6),
+            (MenuSection::Edit, "Edit", 6),
+            (MenuSection::Insert, "Insert", 8),
+            (MenuSection::Format, "Format", 8),
+            (MenuSection::Sheet, "Sheet", 7),
+            (MenuSection::Help, "Help", 6),
+        ] {
+            let popup = menu_popup_area(area, section, None);
+            assert_eq!(
+                popup.x, menu_bar_x(section),
+                "popup x for {label} must be derived from the bar layout"
+            );
+            // Cross-check menu_bar_x against the bar width math.
+            let mut expect = 1u16;
+            for (l, w) in [("File",6), ("Edit",6), ("Insert",8), ("Format",8), ("Sheet",7), ("Help",6)] {
+                if l == label { break; }
+                expect += w + 2;
+            }
+            let _ = width;
+            assert_eq!(menu_bar_x(section), expect, "menu_bar_x({label})");
+        }
+        assert_eq!(menu_bar_x(MenuSection::Help), 46);
+        assert_eq!(menu_bar_x(MenuSection::Sheet), 37);
     }
 
     #[test]
