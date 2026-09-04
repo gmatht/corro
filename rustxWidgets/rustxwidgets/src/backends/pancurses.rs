@@ -60,6 +60,7 @@ mod pancurses_backend {
         Button { label: String, weight: i32, italic: bool },
         Label { text: String },
         BoxWidget { horizontal: bool, spacing: i32 },
+        Sizer(crate::Sizer),
         Grid { cols: usize, rows: usize },
         Entry { buffer: String, cursor: usize },
         CheckButton { label: String, checked: bool },
@@ -481,6 +482,7 @@ mod pancurses_backend {
                         match kind {
                             Some(PcWidgetKind::BoxWidget { .. }) => { layout_box_inner(*id, state); }
                             Some(PcWidgetKind::Grid { .. }) => { layout_grid_inner(*id, state); }
+                            Some(PcWidgetKind::Sizer(_)) => { layout_sizer_inner(*id, state); }
                             _ => {}
                         }
                     }
@@ -1895,7 +1897,7 @@ mod pancurses_backend {
                     root.attroff(COLOR_PAIR(3));
                 }
             }
-            PcWidgetKind::BoxWidget { .. } | PcWidgetKind::Grid { .. } => {}
+            PcWidgetKind::BoxWidget { .. } | PcWidgetKind::Grid { .. } | PcWidgetKind::Sizer(_) => {}
             PcWidgetKind::Dialog { title } => {
                 if has_colors() {
                     root.attron(COLOR_PAIR(7));
@@ -3460,6 +3462,42 @@ mod pancurses_backend {
         Ok(with_state(|s| s.add_node(PcWidgetKind::Grid { cols: 0, rows: 0 }, find_window_id(s))))
     }
 
+    /// Get a widget's rect (used by tests).
+    pub fn get_widget_rect(id: usize) -> Option<(i32, i32, i32, i32)> {
+        with_state(|s| s.node(id).map(|n| (n.rect.x, n.rect.y, n.rect.w, n.rect.h)))
+    }
+
+    /// Set a widget's rect directly (used by tests and manual layout).
+    pub fn set_widget_rect(id: usize, x: i32, y: i32, w: i32, h: i32) {
+        with_state(|s| {
+            if let Some(n) = s.node_mut(id) {
+                n.rect = Rect { x, y, w, h };
+            }
+        });
+    }
+
+    pub fn create_sizer(sizer: crate::Sizer) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(with_state(|s| s.add_node(PcWidgetKind::Sizer(sizer), find_window_id(s))))
+    }
+
+    /// Add a child widget to a sizer with weight, border, and flags.
+    pub fn sizer_add(id: usize, widget_id: usize, weight: i32, border: i32, flags: crate::SizerFlags) {
+        with_state(|s| {
+            if let Some(n) = s.node_mut(id) {
+                if let PcWidgetKind::Sizer(sz) = &mut n.kind {
+                    match sz {
+                        crate::Sizer::Box { children, .. }
+                        | crate::Sizer::Grid { children, .. }
+                        | crate::Sizer::FlexGrid { children, .. } => {
+                            children.push(crate::SizerChild { widget: widget_id, weight, border, flags });
+                        }
+                    }
+                }
+                n.children.push(widget_id);
+            }
+        });
+    }
+
     pub fn create_entry() -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
         Ok(with_state(|s| s.add_node(PcWidgetKind::Entry { buffer: String::new(), cursor: 0 }, find_window_id(s))))
     }
@@ -4218,6 +4256,119 @@ mod pancurses_backend {
 
     pub fn layout_box(id: usize) {
         with_state(|s| { layout_box_inner(id, s); });
+    }
+
+    /// Natural content width for a widget (used by sizer box layout).
+    fn sizer_natural_width(s: &PcState, cid: usize) -> i32 {
+        match s.node(cid).map(|n| &n.kind) {
+            Some(PcWidgetKind::Button { label, .. }) => (label.len() + 2) as i32,
+            Some(PcWidgetKind::Label { text }) => (text.len() + 0) as i32,
+            Some(PcWidgetKind::CheckButton { label, .. }) => (label.len() + 4) as i32,
+            Some(PcWidgetKind::RadioButton { label, .. }) => (label.len() + 4) as i32,
+            Some(PcWidgetKind::DropDown { items, .. }) => {
+                let max_item = items.iter().map(|s| s.len()).max().unwrap_or(0);
+                (max_item + 3) as i32
+            }
+            Some(PcWidgetKind::Entry { buffer, .. }) => (buffer.len() + 4).max(6) as i32,
+            Some(PcWidgetKind::TextView { text }) => {
+                text.lines().next().map(|l| l.len()).unwrap_or(0).max(6) as i32
+            }
+            _ => 4,
+        }
+    }
+
+    /// Layout a `Sizer` widget (mirrors wxSizer): box (row/column with
+    /// weights), grid, or flex-grid.  Children are `SizerChild` entries with
+    /// weight, border, and flags.
+    fn layout_sizer_inner(id: usize, s: &mut PcState) -> usize {
+        let sizer = {
+            let node = s.node(id);
+            if node.is_none() { return 0; }
+            let n = node.unwrap();
+            match &n.kind {
+                PcWidgetKind::Sizer(sz) => sz.clone(),
+                _ => return 0,
+            }
+        };
+        let parent_rect = s.node(id).map(|n| n.rect).unwrap_or(Rect::default());
+        match sizer {
+            crate::Sizer::Box { horizontal, spacing, children } => {
+                if children.is_empty() { return 0; }
+                let spacing = spacing.min(2);
+                let n = children.len() as i32;
+                let total_spacing = spacing * (n - 1).max(0);
+                let total_weight: i32 = children.iter().map(|c| c.weight.max(0)).sum();
+                if horizontal {
+                    let total_border: i32 = children.iter().map(|c| c.border * 2).sum();
+                    let avail = parent_rect.w.saturating_sub(total_spacing).saturating_sub(total_border).max(1);
+                    let mut x = parent_rect.x;
+                    for (i, c) in children.iter().enumerate() {
+                        let w = if c.weight > 0 && total_weight > 0 {
+                            avail * c.weight / total_weight
+                        } else {
+                            sizer_natural_width(s, c.widget)
+                        };
+                        if let Some(n) = s.node_mut(c.widget) {
+                            n.rect = Rect {
+                                x: x + c.border,
+                                y: parent_rect.y + c.border,
+                                w: w.max(1),
+                                h: parent_rect.h.saturating_sub(c.border * 2).max(1),
+                            };
+                        }
+                        x += w + c.border * 2;
+                        if i + 1 < children.len() { x += spacing; }
+                    }
+                } else {
+                    let total_border: i32 = children.iter().map(|c| c.border * 2).sum();
+                    let avail = parent_rect.h.saturating_sub(total_spacing).saturating_sub(total_border).max(1);
+                    let mut y = parent_rect.y;
+                    for (i, c) in children.iter().enumerate() {
+                        let h = if c.weight > 0 && total_weight > 0 {
+                            avail * c.weight / total_weight
+                        } else {
+                            1
+                        };
+                        if let Some(n) = s.node_mut(c.widget) {
+                            n.rect = Rect {
+                                x: parent_rect.x + c.border,
+                                y: y + c.border,
+                                w: parent_rect.w.saturating_sub(c.border * 2).max(1),
+                                h: h.max(1),
+                            };
+                        }
+                        y += h + c.border * 2;
+                        if i + 1 < children.len() { y += spacing; }
+                    }
+                }
+                children.len()
+            }
+            crate::Sizer::Grid { cols, rows, children }
+            | crate::Sizer::FlexGrid { cols, rows, children } => {
+                if children.is_empty() { return 0; }
+                let cols = cols.max(1);
+                let rows = rows.max(1);
+                let cw = parent_rect.w / cols as i32;
+                let ch = parent_rect.h / rows as i32;
+                for (i, c) in children.iter().enumerate() {
+                    let r = (i as i32 / cols as i32).min(rows as i32 - 1);
+                    let col = i as i32 % cols as i32;
+                    if let Some(n) = s.node_mut(c.widget) {
+                        n.rect = Rect {
+                            x: parent_rect.x + col * cw + c.border,
+                            y: parent_rect.y + r * ch + c.border,
+                            w: cw.saturating_sub(c.border * 2).max(1),
+                            h: ch.saturating_sub(c.border * 2).max(1),
+                        };
+                    }
+                }
+                children.len()
+            }
+        }
+    }
+
+    pub fn layout_sizer(id: usize) {
+        with_state(|s| { layout_sizer_inner(id, s); });
     }
 
     fn layout_grid_inner(id: usize, s: &mut PcState) -> usize {

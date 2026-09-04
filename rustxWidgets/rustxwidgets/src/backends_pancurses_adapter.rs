@@ -607,6 +607,74 @@ mod pancurses_adapter {
             .map_err(|e| Error::Backend(format!("{}", e)))
     }
 
+    // -- Sizers (wxSizer-like layout) --
+
+    pub struct Sizer {
+        pub(crate) id: usize,
+    }
+
+    impl AsRef<*mut c_void> for Sizer {
+        fn as_ref(&self) -> &*mut c_void {
+            unsafe { &*(&self.id as *const usize as *const *mut c_void) }
+        }
+    }
+
+    pub fn create_box_sizer(horizontal: bool, spacing: i32) -> Result<Sizer, Error> {
+        crate::backends::pancurses::create_sizer(crate::Sizer::Box {
+            horizontal,
+            spacing,
+            children: vec![],
+        })
+        .map(|id| Sizer { id })
+        .map_err(|e| Error::Backend(format!("{}", e)))
+    }
+
+    pub fn create_grid_sizer(cols: usize, rows: usize) -> Result<Sizer, Error> {
+        crate::backends::pancurses::create_sizer(crate::Sizer::Grid {
+            cols,
+            rows,
+            children: vec![],
+        })
+        .map(|id| Sizer { id })
+        .map_err(|e| Error::Backend(format!("{}", e)))
+    }
+
+    pub fn create_flex_grid_sizer(cols: usize, rows: usize) -> Result<Sizer, Error> {
+        crate::backends::pancurses::create_sizer(crate::Sizer::FlexGrid {
+            cols,
+            rows,
+            children: vec![],
+        })
+        .map(|id| Sizer { id })
+        .map_err(|e| Error::Backend(format!("{}", e)))
+    }
+
+    /// Add a child widget to a sizer with weight, border, and flags.
+    pub fn sizer_add(
+        sizer: &Sizer,
+        widget: &impl AsRef<*mut c_void>,
+        weight: i32,
+        border: i32,
+        flags: crate::SizerFlags,
+    ) {
+        let widget_id = *widget.as_ref() as usize;
+        crate::backends::pancurses::sizer_add(sizer.id, widget_id, weight, border, flags);
+    }
+
+    pub fn layout_sizer(sizer: &Sizer) {
+        crate::backends::pancurses::layout_sizer(sizer.id);
+    }
+
+    pub fn set_widget_rect(widget: &impl AsRef<*mut c_void>, x: i32, y: i32, w: i32, h: i32) {
+        let id = *widget.as_ref() as usize;
+        crate::backends::pancurses::set_widget_rect(id, x, y, w, h);
+    }
+
+    pub fn get_widget_rect(widget: &impl AsRef<*mut c_void>) -> Option<(i32, i32, i32, i32)> {
+        let id = *widget.as_ref() as usize;
+        crate::backends::pancurses::get_widget_rect(id)
+    }
+
     pub fn create_entry() -> Result<Entry, Error> {
         crate::backends::pancurses::create_entry()
             .map(|id| Entry { id })
@@ -791,6 +859,48 @@ mod tests {
         let result = crate::backends::pancurses::fire_event(btn.id, &crate::Event::Activate);
         assert_eq!(result, crate::CallbackResult::Handled);
         assert!(!parent_fired.get(), "parent should NOT fire when child handled the event");
+    }
+
+    #[test]
+    fn box_sizer_lays_out_children_by_weight() {
+        let win = create_window().unwrap();
+        let sizer = create_box_sizer(true, 0).unwrap();
+        let b1 = create_button("A").unwrap();
+        let b2 = create_button("B").unwrap();
+        win.set_child(&sizer);
+        sizer_add(&sizer, &b1, 1, 0, crate::SizerFlags::default());
+        sizer_add(&sizer, &b2, 2, 0, crate::SizerFlags::default());
+        set_widget_rect(&sizer, 0, 0, 30, 1);
+        layout_sizer(&sizer);
+
+        let (_, _, w1, _) = get_widget_rect(&b1).unwrap();
+        let (_, _, w2, _) = get_widget_rect(&b2).unwrap();
+        // Weights 1:2 over 30 columns -> 10 and 20.
+        assert_eq!(w1, 10, "weight-1 child should get 1/3 of the width");
+        assert_eq!(w2, 20, "weight-2 child should get 2/3 of the width");
+    }
+
+    #[test]
+    fn grid_sizer_arranges_children_in_cells() {
+        let win = create_window().unwrap();
+        let sizer = create_grid_sizer(2, 2).unwrap();
+        let b1 = create_button("A").unwrap();
+        let b2 = create_button("B").unwrap();
+        let b3 = create_button("C").unwrap();
+        let b4 = create_button("D").unwrap();
+        win.set_child(&sizer);
+        for b in [&b1, &b2, &b3, &b4] {
+            sizer_add(&sizer, b, 0, 0, crate::SizerFlags::default());
+        }
+        set_widget_rect(&sizer, 0, 0, 20, 2);
+        layout_sizer(&sizer);
+
+        let (x1, y1, w1, h1) = get_widget_rect(&b1).unwrap();
+        let (x2, y2, _, _) = get_widget_rect(&b2).unwrap();
+        let (x3, y3, _, _) = get_widget_rect(&b3).unwrap();
+        assert_eq!((x1, y1, w1, h1), (0, 0, 10, 1), "cell (0,0)");
+        assert_eq!((x2, y2), (10, 0), "cell (1,0)");
+        assert_eq!((x3, y3), (0, 1), "cell (0,1)");
     }
 
     #[test]

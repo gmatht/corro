@@ -7,6 +7,44 @@ use std::sync::Arc;
 /// Opaque handler id returned when connecting signals
 pub type HandlerId = u64;
 
+/// Layout alignment for a sizer child (mirrors wxSizerFlags alignment).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Align {
+    #[default]
+    Default,
+    Left,
+    Center,
+    Right,
+    Top,
+    Bottom,
+}
+
+/// Layout flags for a sizer child (mirrors wxSizerFlags).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SizerFlags {
+    pub expand: bool,
+    pub align: Align,
+}
+
+/// A sizer child: a widget id with weight, border, and flags.
+#[derive(Clone, Debug)]
+pub struct SizerChild {
+    pub widget: usize,
+    pub weight: i32,
+    pub border: i32,
+    pub flags: SizerFlags,
+}
+
+/// A layout sizer (mirrors wxSizer): arranges its children.  `Box` lays out
+/// children in a row/column with weights; `Grid`/`FlexGrid` arrange them in a
+/// fixed or flexible grid.
+#[derive(Clone, Debug)]
+pub enum Sizer {
+    Box { horizontal: bool, spacing: i32, children: Vec<SizerChild> },
+    Grid { cols: usize, rows: usize, children: Vec<SizerChild> },
+    FlexGrid { cols: usize, rows: usize, children: Vec<SizerChild> },
+}
+
 /// A UI event dispatched through the widget tree.  Callbacks that return
 /// `CallbackResult::Skip` let the event propagate to the parent widget
 /// (mirrors wxEvent).
@@ -335,6 +373,21 @@ impl App {
     #[cfg(feature = "pancurses")]
     pub fn create_grid(&self) -> Result<crate::backends_pancurses_adapter::Grid, Error> {
         crate::backends_pancurses_adapter::create_grid()
+    }
+
+    #[cfg(feature = "pancurses")]
+    pub fn create_box_sizer(&self, horizontal: bool, spacing: i32) -> Result<crate::backends_pancurses_adapter::Sizer, Error> {
+        crate::backends_pancurses_adapter::create_box_sizer(horizontal, spacing)
+    }
+
+    #[cfg(feature = "pancurses")]
+    pub fn create_grid_sizer(&self, cols: usize, rows: usize) -> Result<crate::backends_pancurses_adapter::Sizer, Error> {
+        crate::backends_pancurses_adapter::create_grid_sizer(cols, rows)
+    }
+
+    #[cfg(feature = "pancurses")]
+    pub fn create_flex_grid_sizer(&self, cols: usize, rows: usize) -> Result<crate::backends_pancurses_adapter::Sizer, Error> {
+        crate::backends_pancurses_adapter::create_flex_grid_sizer(cols, rows)
     }
 
     #[cfg(feature = "pancurses")]

@@ -3,7 +3,7 @@
 
 pub mod prelude;
 pub mod core;
-pub use core::{Action, CallbackResult, Event, MenuItem};
+pub use core::{Action, Align, CallbackResult, Event, MenuItem, Sizer, SizerChild, SizerFlags};
 pub mod spreadsheet;
 pub mod overflow;
 

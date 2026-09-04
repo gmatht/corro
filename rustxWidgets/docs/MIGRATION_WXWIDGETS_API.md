@@ -157,6 +157,15 @@ names would provide it equally, so pick the idiomatic one.
 - Keep the existing layout backends working (pancurses computes rects).
 - **Tests:** layout parity across backends for a fixed window size.
 
+  **Done**: `Sizer`/`SizerChild`/`SizerFlags`/`Align` in the core;
+  `PcWidgetKind::Sizer` + `layout_sizer_inner` (box weights, grid cells) in
+  the pancurses backend; adapter `create_box_sizer`/`create_grid_sizer`/
+  `create_flex_grid_sizer`/`sizer_add`; App-level methods; unit tests
+  (`box_sizer_lays_out_children_by_weight`, `grid_sizer_arranges_children_in_cells`).
+  **Pending**: migrate the GTK-path consumers (`gui_backend.rs`, `dialogs.rs`)
+  from `BoxWidget`/`Grid` to `Sizer` — untestable without the `gui` feature,
+  so deferred; `BoxWidget`/`Grid` remain for backward compatibility.
+
 ### Phase 4 — Standard dialogs
 - Core APIs: file open/save, message box, color picker, font picker
   (mirrors `wxFileDialog`, `wxMessageBox`, `wxColourDialog`, `wxFontDialog`).
