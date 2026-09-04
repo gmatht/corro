@@ -157,6 +157,17 @@ fn overflow_renders_cell_text() {
         safe_slice(&pane, 2000));
 }
 
+/// Up on the first menu item wraps to the last (matching the ratatui menu).
+/// Enter then fires the wrapped item's action — the File menu's last item is
+/// Replay — whose status message proves the selection wrapped around.
+#[test]
+fn menu_up_wraps_to_last_item() {
+    let pane = run_in_tmux("--pancurses docs/tests/overflow.corro", &["Escape", "f", "Up", "Enter"], 2200);
+    assert!(pane.contains("Replay:"),
+        "Up on the first item should wrap to the last (Replay) and Enter fire it\n{}",
+        safe_slice(&pane, 1500));
+}
+
 /// Ctrl+C must copy the cursor cell, not exit the app (regression: the
 /// pancurses backend used to set running=false on Ctrl+C, quitting the TUI).
 /// The copied value is written to the system clipboard via OSC 52, so the raw

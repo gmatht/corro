@@ -1506,8 +1506,9 @@ mod pancurses_backend {
                             if state.menu_open {
                                 let len = menu_current_items(state).map(|items| items.len()).unwrap_or(0);
                                 let old_item = state.active_item;
-                                if len > 0 && state.active_item > 0 {
-                                    state.active_item -= 1;
+                                if len > 0 {
+                                    // Wrap around: Up on the first item -> last.
+                                    state.active_item = (state.active_item + len - 1) % len;
                                 }
                                 MENU_HIGHLIGHT.with(|m| *m.borrow_mut() = Some((old_item, state.active_item)));
                                 None
@@ -1575,8 +1576,9 @@ mod pancurses_backend {
                             if state.menu_open {
                                 let len = menu_current_items(state).map(|items| items.len()).unwrap_or(0);
                                 let old_item = state.active_item;
-                                if len > 0 && state.active_item + 1 < len {
-                                    state.active_item += 1;
+                                if len > 0 {
+                                    // Wrap around: Down on the last item -> first.
+                                    state.active_item = (state.active_item + 1) % len;
                                 }
                                 MENU_HIGHLIGHT.with(|m| *m.borrow_mut() = Some((old_item, state.active_item)));
                                 None

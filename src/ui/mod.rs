@@ -10694,24 +10694,26 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                     }
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
+                    // Wrap around: Up on the first item moves to the last.
                     let len = stack
                         .last()
                         .map(|level| menu_items(level.section).len())
                         .unwrap_or(0);
                     if len > 0 {
                         if let Some(level) = stack.last_mut() {
-                            level.item = level.item.saturating_sub(1);
+                            level.item = (level.item + len - 1) % len;
                         }
                     }
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
+                    // Wrap around: Down on the last item moves to the first.
                     let len = stack
                         .last()
                         .map(|level| menu_items(level.section).len())
                         .unwrap_or(0);
                     if len > 0 {
                         if let Some(level) = stack.last_mut() {
-                            level.item = (level.item + 1).min(len - 1);
+                            level.item = (level.item + 1) % len;
                         }
                     }
                 }
@@ -22164,6 +22166,28 @@ mod tests {
                 assert_eq!(stack.len(), 2);
                 assert_eq!(stack[1].section, MenuSection::Width);
             }
+            other => panic!("unexpected mode: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn menu_up_down_wraps_around() {
+        let mut app = App::new(None);
+        app.mode = Mode::Menu {
+            stack: vec![MenuLevel { section: MenuSection::File, item: 0 }],
+        };
+        // Up on the first item wraps to the last File item (index 7 = Replay).
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::empty())).unwrap();
+        match &app.mode {
+            Mode::Menu { stack } => assert_eq!(stack[0].item, FILE_MENU_ITEMS.len() - 1,
+                "Up on the first item should wrap to the last"),
+            other => panic!("unexpected mode: {other:?}"),
+        }
+        // Down on the last item wraps back to the first.
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty())).unwrap();
+        match &app.mode {
+            Mode::Menu { stack } => assert_eq!(stack[0].item, 0,
+                "Down on the last item should wrap to the first"),
             other => panic!("unexpected mode: {other:?}"),
         }
     }
