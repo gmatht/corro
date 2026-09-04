@@ -454,6 +454,8 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     let pending_scope: std::rc::Rc<std::cell::RefCell<u8>> = std::rc::Rc::new(std::cell::RefCell::new(0));
     // Simple session clipboard for Copy/Cut/Paste.
     let clipboard: std::rc::Rc<std::cell::RefCell<String>> = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+    // Clone for the Ctrl+C handler (the menu callback below moves `clipboard`).
+    let ctrlc_clip = clipboard.clone();
     rustxwidgets::backends::pancurses::set_menu_action_callback(Box::new(move |name: String| {
         let app = unsafe { &mut *app_ptr };
         let hr = HEADER_ROWS;
@@ -688,6 +690,28 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         if !status.is_empty() {
             app.core.status = status.clone();
             menu_ss.set_formula_bar_trailing(&format!("   ·  {}", status));
+        }
+    }));
+
+    // Ctrl+C copies the cursor cell (standard terminal copy; it does NOT quit).
+    // The value goes to the in-app clipboard (for Paste) and, via OSC 52, to the
+    // terminal's system clipboard so it can be pasted elsewhere.
+    let ctrlc_ss = spreadsheet.clone();
+    rustxwidgets::backends::pancurses::add_key_callback('\x03', Box::new(move || {
+        let app = unsafe { &mut *app_ptr };
+        let hr = HEADER_ROWS;
+        let lm = MARGIN_COLS;
+        let main_row = app.core.cursor.row.saturating_sub(hr) as u32;
+        let main_col = app.core.cursor.col.saturating_sub(lm) as u32;
+        let addr = CellAddr::Main { row: main_row, col: main_col };
+        let val = app.core.workbook.active_sheet().grid.get(&addr).unwrap_or_default();
+        if !val.is_empty() {
+            *ctrlc_clip.borrow_mut() = val.clone();
+            rustxwidgets::backends::pancurses::set_clipboard_text(&val);
+            app.core.status = format!("Copied {} ({})", main_addr_label(main_row, main_col), val);
+            ctrlc_ss.set_formula_bar_trailing(&format!("   ·  Copied {}", main_addr_label(main_row, main_col)));
+        } else {
+            app.core.status = format!("Nothing to copy at {}", main_addr_label(main_row, main_col));
         }
     }));
 

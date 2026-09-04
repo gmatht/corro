@@ -1145,8 +1145,23 @@ mod pancurses_backend {
                                 }
                             }
                         } else if c == '\x03' {
-                            // Ctrl+C — quit
-                            with_state(|state| state.running = false);
+                            // Ctrl+C — copy (standard action).  Dispatch any key
+                            // callback registered for Ctrl+C (e.g. corro wires the
+                            // cell copy here); do NOT quit, and never insert the
+                            // control char into the edit buffer.
+                            let cbs: Vec<Box<dyn FnMut()>> = with_state(|state| {
+                                let mut out = Vec::new();
+                                let mut i = 0;
+                                while i < state.key_callbacks.len() {
+                                    if state.key_callbacks[i].0 == '\x03' {
+                                        out.push(state.key_callbacks.swap_remove(i).1);
+                                    } else {
+                                        i += 1;
+                                    }
+                                }
+                                out
+                            });
+                            fire_callbacks(cbs);
                         } else if c == '\x07' {
                             // Ctrl+G — Go to a target cell (the target is registered
                             // by corro's pnc_backend, e.g. A1000) and re-render the
@@ -4219,6 +4234,35 @@ mod pancurses_backend {
             }
         }
         result
+    }
+
+    /// Minimal RFC 4648 base64 encoder (no padding) for OSC 52 clipboard text.
+    fn base64_encode(data: &[u8]) -> String {
+        const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in data.chunks(3) {
+            let b0 = chunk[0] as u32;
+            let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+            let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+            let n = (b0 << 16) | (b1 << 8) | b2;
+            out.push(T[(n >> 18) as usize & 63] as char);
+            out.push(T[(n >> 12) as usize & 63] as char);
+            if chunk.len() > 1 { out.push(T[(n >> 6) as usize & 63] as char); }
+            if chunk.len() > 2 { out.push(T[n as usize & 63] as char); }
+        }
+        out
+    }
+
+    /// Copy text to the terminal's system clipboard via OSC 52
+    /// (\x1b]52;c;<base64>;...).  Terminals that support it let the user paste
+    /// the value in another app; unsupported terminals ignore the sequence.
+    pub fn set_clipboard_text(text: &str) {
+        let b64 = base64_encode(text.as_bytes());
+        let mut out = String::new();
+        out.push_str("\x1b]52;c;");
+        out.push_str(&b64);
+        out.push('\x07');
+        emit_sgr(&out);
     }
 
     /// Attach arbitrary string client data to a widget (mirrors wxWindow::SetClientData).

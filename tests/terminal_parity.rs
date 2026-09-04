@@ -23,6 +23,16 @@ mod tmux {
         String::from_utf8_lossy(&output.stdout).to_string()
     }
 
+    /// Same as capture_pane but keeps ANSI/OSC escape sequences (-e), so tests
+    /// can assert on raw output such as the OSC 52 clipboard sequence.
+    pub fn capture_pane_esc(session: &str) -> String {
+        let output = Command::new("tmux")
+            .args(["capture-pane", "-t", session, "-p", "-S", "-200", "-e"])
+            .output()
+            .expect("tmux capture-pane failed");
+        String::from_utf8_lossy(&output.stdout).to_string()
+    }
+
     pub fn kill_session(session: &str) {
         Command::new("tmux").args(["kill-session", "-t", session]).output().ok();
     }
@@ -126,6 +136,35 @@ fn overflow_renders_cell_text() {
     let pane = run_in_tmux("--pancurses docs/tests/overflow.corro", &[], 600);
     assert!(pane.contains("should overflow"), "pancurses missing cell text:\n{}",
         safe_slice(&pane, 2000));
+}
+
+/// Ctrl+C must copy the cursor cell, not exit the app (regression: the
+/// pancurses backend used to set running=false on Ctrl+C, quitting the TUI).
+/// The copied value is written to the system clipboard via OSC 52, so the raw
+/// (-e) pane capture must contain the base64 of the cell text.
+#[test]
+fn ctrl_c_copies_instead_of_quitting() {
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let session = format!("corro-ctrlc-{}", id);
+    let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
+    let fixture = menu_fixture();
+    tmux::new_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
+    std::thread::sleep(Duration::from_millis(1200));
+    tmux::send_keys(&session, "C-c");
+    std::thread::sleep(Duration::from_millis(400));
+    let pane = tmux::capture_pane(&session);
+    // The app must still be alive: the menu bar is rendered.
+    assert!(pane.contains("[File]"),
+        "app should stay alive after Ctrl+C (it must not quit)\n{}",
+        safe_slice(&pane, 1200));
+    // The cursor cell (A1) was copied: the formula bar reports "Copied A1",
+    // and (because the copy is routed through the app's clipboard) the value
+    // is available to Paste.  (tmux strips the raw OSC 52 sequence from
+    // capture-pane, so we assert the observable copy instead.)
+    assert!(pane.contains("Copied A1"),
+        "Ctrl+C should copy the cursor cell (status 'Copied A1')\n{}",
+        safe_slice(&pane, 1200));
+    tmux::kill_session(&session);
 }
 
 #[test]
