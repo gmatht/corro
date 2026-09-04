@@ -7,6 +7,29 @@ use std::sync::Arc;
 /// Opaque handler id returned when connecting signals
 pub type HandlerId = u64;
 
+/// A UI event dispatched through the widget tree.  Callbacks that return
+/// `CallbackResult::Skip` let the event propagate to the parent widget
+/// (mirrors wxEvent).
+#[derive(Clone, Debug)]
+pub enum Event {
+    /// Generic activation (button click, menu item, …).
+    Activate,
+    /// Pointer click at widget-local coordinates.
+    Click { x: u32, y: u32 },
+    /// Key press (backend key code).
+    Key { code: u32 },
+    /// Menu item activation by action name.
+    Menu { action: String },
+}
+
+/// Result of an event callback: `Handled` stops propagation, `Skip` lets the
+/// event bubble to the parent widget (mirrors wxEvent::Skip).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CallbackResult {
+    Handled,
+    Skip,
+}
+
 /// A named, stateful action: enable/disable and checked state shared across
 /// menu items, toolbars, and keybindings (mirrors wxAction).  Menu items
 /// reference actions by name; the toolkit keeps a registry so one action's

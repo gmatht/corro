@@ -750,6 +750,50 @@ mod tests {
     }
 
     #[test]
+    fn event_propagation_bubbles_to_parent() {
+        let win = create_window().unwrap();
+        let boxw = create_box(Orientation::Vertical, 0).unwrap();
+        let btn = create_button("Click").unwrap();
+        win.set_child(&boxw);
+        boxw.append(&btn);
+
+        // Child skips; parent handles.
+        let parent_fired = std::rc::Rc::new(std::cell::Cell::new(false));
+        let pf = parent_fired.clone();
+        crate::backends::pancurses::add_event_callback(boxw.id, Box::new(move |_ev| {
+            pf.set(true);
+            crate::CallbackResult::Handled
+        }));
+        crate::backends::pancurses::add_event_callback(btn.id, Box::new(|_ev| crate::CallbackResult::Skip));
+
+        let result = crate::backends::pancurses::fire_event(btn.id, &crate::Event::Activate);
+        assert_eq!(result, crate::CallbackResult::Handled);
+        assert!(parent_fired.get(), "parent should have received the bubbled event");
+    }
+
+    #[test]
+    fn event_propagation_stops_when_handled() {
+        let win = create_window().unwrap();
+        let boxw = create_box(Orientation::Vertical, 0).unwrap();
+        let btn = create_button("Click").unwrap();
+        win.set_child(&boxw);
+        boxw.append(&btn);
+
+        // Child handles; parent must NOT fire.
+        let parent_fired = std::rc::Rc::new(std::cell::Cell::new(false));
+        let pf = parent_fired.clone();
+        crate::backends::pancurses::add_event_callback(boxw.id, Box::new(move |_ev| {
+            pf.set(true);
+            crate::CallbackResult::Handled
+        }));
+        crate::backends::pancurses::add_event_callback(btn.id, Box::new(|_ev| crate::CallbackResult::Handled));
+
+        let result = crate::backends::pancurses::fire_event(btn.id, &crate::Event::Activate);
+        assert_eq!(result, crate::CallbackResult::Handled);
+        assert!(!parent_fired.get(), "parent should NOT fire when child handled the event");
+    }
+
+    #[test]
     fn menubar_collects_root_submenus() {
         let menubar = create_menu().unwrap();
         for (label, items) in [("File", &["open", "save"][..]), ("Edit", &["cut", "copy"][..])] {

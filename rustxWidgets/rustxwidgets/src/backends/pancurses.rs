@@ -131,6 +131,9 @@ mod pancurses_backend {
         pub menu_stack: Vec<usize>,
         pub spreadsheet_output: String,
         key_callbacks: Vec<(char, Box<dyn FnMut()>)>,
+        /// Event callbacks (opt-in propagation): return `CallbackResult::Skip`
+        /// to let the event bubble to the parent widget.
+        event_callbacks: Vec<(usize, Box<dyn FnMut(&crate::Event) -> crate::CallbackResult>)>,
         pub cursor_move_callbacks: Vec<Box<dyn FnMut(u32, u32)>>,
         pub commit_edit_callbacks: Vec<Box<dyn FnMut(u32, u32, String)>>,
         pub goto_callbacks: Vec<Box<dyn FnMut()>>,
@@ -159,6 +162,7 @@ mod pancurses_backend {
                 menu_stack: Vec::new(),
                 spreadsheet_output: String::new(),
                 key_callbacks: Vec::new(),
+                event_callbacks: Vec::new(),
                 cursor_move_callbacks: Vec::new(),
                 commit_edit_callbacks: Vec::new(),
                 goto_callbacks: Vec::new(),
@@ -3928,6 +3932,45 @@ mod pancurses_backend {
                 n.callbacks.push(cb);
             }
         });
+    }
+
+    /// Register an opt-in event callback.  Returning `CallbackResult::Skip`
+    /// lets the event bubble to the parent widget (mirrors wxEvent::Skip);
+    /// `Handled` stops it.  Existing `add_callback` closures (returning `()`)
+    /// are unaffected and do not participate in propagation.
+    pub fn add_event_callback(id: usize, cb: Box<dyn FnMut(&crate::Event) -> crate::CallbackResult>) {
+        with_state(|s| s.event_callbacks.push((id, cb)));
+    }
+
+    /// Dispatch an event to a widget's event callbacks.  If every callback
+    /// returns `Skip`, the event bubbles to the parent widget, recursively.
+    /// Returns `Handled` if any callback handled it, else `Skip`.
+    pub fn fire_event(id: usize, event: &crate::Event) -> crate::CallbackResult {
+        let mut result = crate::CallbackResult::Skip;
+        let cbs: Vec<Box<dyn FnMut(&crate::Event) -> crate::CallbackResult>> = with_state(|s| {
+            let mut out = Vec::new();
+            let mut i = 0;
+            while i < s.event_callbacks.len() {
+                if s.event_callbacks[i].0 == id {
+                    out.push(s.event_callbacks.swap_remove(i).1);
+                } else {
+                    i += 1;
+                }
+            }
+            out
+        });
+        for mut cb in cbs {
+            if cb(event) == crate::CallbackResult::Handled {
+                result = crate::CallbackResult::Handled;
+            }
+            with_state(|s| s.event_callbacks.push((id, cb)));
+        }
+        if result == crate::CallbackResult::Skip {
+            if let Some(parent) = with_state(|s| s.node(id).and_then(|n| n.parent)) {
+                return fire_event(parent, event);
+            }
+        }
+        result
     }
 
     pub fn set_entry_text(id: usize, text: &str) {
