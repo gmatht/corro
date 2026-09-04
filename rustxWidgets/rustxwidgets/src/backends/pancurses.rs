@@ -489,10 +489,7 @@ mod pancurses_backend {
                                 for (i, item) in items.iter().enumerate() {
                                     let bg = if li == last && i == item_idx && has_colors() { COLOR_PAIR(2) } else { 0 };
                                     if bg != 0 { root.attron(bg); }
-                                    let lbl = match item {
-                                        crate::MenuItem::Action { label, .. } => label.clone(),
-                                        crate::MenuItem::Submenu { label, .. } => format!("{label} \u{25b6}"),
-                                    };
+                                    let lbl = menu_item_label(item);
                                     root.mvaddstr(py + i as i32, px + 1, &lbl);
                                     if bg != 0 { root.attroff(bg); }
                                 }
@@ -563,14 +560,7 @@ mod pancurses_backend {
                                     out.push_str(&sgr_cup(py + i as i32, left + 1));
                                     out.push_str(if li == last && i == item_idx { sgr_row_cursor() } else { sgr_menu() });
                                     out.push(' ');
-                                    match item {
-                                        crate::MenuItem::Action { label, .. } => out.push_str(label),
-                                        crate::MenuItem::Submenu { label, .. } => {
-                                            out.push_str(label);
-                                            out.push(' ');
-                                            out.push('\u{25b6}');
-                                        }
-                                    }
+                                    out.push_str(&menu_item_label(item));
                                     out.push_str(SGR_RESET);
                                 }
                             }
@@ -763,10 +753,13 @@ mod pancurses_backend {
                             if state.menu_open {
                                 let item = menu_current_item(state).cloned();
                                 match item {
-                                    Some(crate::MenuItem::Action { action, .. }) => {
+                                    Some(crate::MenuItem::Action { action, .. })
+                                    | Some(crate::MenuItem::Check { action, .. })
+                                    | Some(crate::MenuItem::Radio { action, .. }) => {
                                         state.menu_open = false;
                                         Some(action)
                                     }
+                                    Some(crate::MenuItem::Separator) => None,
                                     Some(crate::MenuItem::Submenu { .. }) => {
                                         menu_enter_submenu(state);
                                         None
@@ -3015,11 +3008,28 @@ mod pancurses_backend {
 
     // ── Menu helpers (submenu support) ────────────────────────────────────────
 
-    /// Rendered width of a menu item (label + " ▶" for submenu items).
+    /// Rendered width of a menu item (label + glyph/arrow for non-plain kinds).
     fn menu_item_width(item: &crate::MenuItem) -> usize {
         match item {
             crate::MenuItem::Action { label, .. } => label.len(),
+            crate::MenuItem::Check { label, .. } => label.len() + 2,
+            crate::MenuItem::Radio { label, .. } => label.len() + 2,
+            crate::MenuItem::Separator => 1,
             crate::MenuItem::Submenu { label, .. } => label.len() + 2,
+        }
+    }
+
+    /// Rendered label for a menu item (check/radio glyph, separator line,
+    /// submenu arrow).
+    fn menu_item_label(item: &crate::MenuItem) -> String {
+        match item {
+            crate::MenuItem::Action { label, .. } => label.clone(),
+            crate::MenuItem::Check { label, checked, .. } => {
+                if *checked { format!("\u{2713} {label}") } else { format!("  {label}") }
+            }
+            crate::MenuItem::Radio { label, .. } => format!("\u{25cf} {label}"),
+            crate::MenuItem::Separator => "\u{2500}".repeat(8),
+            crate::MenuItem::Submenu { label, .. } => format!("{label} \u{25b6}"),
         }
     }
 

@@ -223,6 +223,31 @@ mod pancurses_adapter {
             self.items.borrow_mut().push(crate::MenuItem::Action {
                 label: label.to_string(),
                 action: action_name.to_string(),
+                shortcut: None,
+            });
+        }
+        pub fn append_with_shortcut(&self, label: &str, action_name: &str, shortcut: &str) {
+            self.items.borrow_mut().push(crate::MenuItem::Action {
+                label: label.to_string(),
+                action: action_name.to_string(),
+                shortcut: Some(shortcut.to_string()),
+            });
+        }
+        pub fn append_separator(&self) {
+            self.items.borrow_mut().push(crate::MenuItem::Separator);
+        }
+        pub fn append_check(&self, label: &str, action_name: &str, checked: bool) {
+            self.items.borrow_mut().push(crate::MenuItem::Check {
+                label: label.to_string(),
+                action: action_name.to_string(),
+                checked,
+            });
+        }
+        pub fn append_radio(&self, label: &str, action_name: &str, group: u32) {
+            self.items.borrow_mut().push(crate::MenuItem::Radio {
+                label: label.to_string(),
+                action: action_name.to_string(),
+                group,
             });
         }
         pub fn append_submenu(&self, label: &str, submenu: &Menu) {
@@ -243,7 +268,7 @@ mod pancurses_adapter {
             .iter()
             .filter_map(|item| match item {
                 crate::MenuItem::Submenu { label, items } => Some((label.clone(), items.clone())),
-                crate::MenuItem::Action { .. } => None,
+                _ => None,
             })
             .collect()
     }
@@ -677,3 +702,57 @@ mod pancurses_adapter {
 }
 
 pub use pancurses_adapter::*;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn menu_model_supports_item_kinds() {
+        let menu = create_menu().unwrap();
+        menu.append("Open", "open");
+        menu.append_with_shortcut("Save", "save", "Ctrl+S");
+        menu.append_separator();
+        menu.append_check("Bold", "bold", true);
+        menu.append_radio("Left", "align_left", 0);
+        let sub = create_menu().unwrap();
+        sub.append("TSV", "export_tsv");
+        menu.append_submenu("Export", &sub);
+
+        let items = menu.items.borrow();
+        assert_eq!(items.len(), 6);
+        assert!(matches!(&items[0],
+            crate::MenuItem::Action { label, action, shortcut }
+            if label == "Open" && action == "open" && shortcut.is_none()));
+        assert!(matches!(&items[1],
+            crate::MenuItem::Action { label, action, shortcut }
+            if label == "Save" && action == "save" && shortcut.as_deref() == Some("Ctrl+S")));
+        assert!(matches!(&items[2], crate::MenuItem::Separator));
+        assert!(matches!(&items[3],
+            crate::MenuItem::Check { label, action, checked }
+            if label == "Bold" && action == "bold" && *checked));
+        assert!(matches!(&items[4],
+            crate::MenuItem::Radio { label, action, group }
+            if label == "Left" && action == "align_left" && *group == 0));
+        assert!(matches!(&items[5],
+            crate::MenuItem::Submenu { label, items }
+            if label == "Export" && items.len() == 1));
+    }
+
+    #[test]
+    fn menubar_collects_root_submenus() {
+        let menubar = create_menu().unwrap();
+        for (label, items) in [("File", &["open", "save"][..]), ("Edit", &["cut", "copy"][..])] {
+            let sub = create_menu().unwrap();
+            for a in items {
+                sub.append(a, a);
+            }
+            menubar.append_submenu(label, &sub);
+        }
+        let roots = collect_menu_items(&menubar);
+        assert_eq!(roots.len(), 2);
+        assert_eq!(roots[0].0, "File");
+        assert_eq!(roots[0].1.len(), 2);
+        assert_eq!(roots[1].0, "Edit");
+    }
+}

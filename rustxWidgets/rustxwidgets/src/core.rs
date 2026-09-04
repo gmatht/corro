@@ -7,13 +7,20 @@ use std::sync::Arc;
 /// Opaque handler id returned when connecting signals
 pub type HandlerId = u64;
 
-/// A menu item in a backend-agnostic menu model: either an action (dispatches a
-/// named action string) or a submenu (a nested list of items).  Backends render
-/// and navigate this model with their own widgets; the model itself is shared so
-/// an application can build one menu and hand it to any backend.
+/// A menu item in a backend-agnostic menu model.  Backends render and navigate
+/// this model with their own widgets; the model itself is shared so an
+/// application can build one menu and hand it to any backend.
+///
+/// Item kinds mirror wxWidgets: plain actions, check items (boolean state),
+/// radio items (one-of-a-group), separators, and submenus.  `shortcut` is the
+/// accelerator text (e.g. "Ctrl+O") for backends that can wire real
+/// keybindings.
 #[derive(Clone, Debug)]
 pub enum MenuItem {
-    Action { label: String, action: String },
+    Action { label: String, action: String, shortcut: Option<String> },
+    Check { label: String, action: String, checked: bool },
+    Radio { label: String, action: String, group: u32 },
+    Separator,
     Submenu { label: String, items: Vec<MenuItem> },
 }
 
