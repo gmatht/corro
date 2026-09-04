@@ -28,6 +28,21 @@ pub enum DrawOp {
         rgba: (f64, f64, f64, f64),
         lw: f64,
     },
+    Line {
+        x1: f64,
+        y1: f64,
+        x2: f64,
+        y2: f64,
+        rgba: (f64, f64, f64, f64),
+        lw: f64,
+    },
+    Circle {
+        cx: f64,
+        cy: f64,
+        r: f64,
+        rgba: (f64, f64, f64, f64),
+        lw: f64,
+    },
     Text {
         x: f64,
         y: f64,
@@ -118,6 +133,12 @@ impl DrawContext for RecordingDrawContext {
     fn clear(&mut self, r: f64, g: f64, b: f64, a: f64) {
         self.ops.push(DrawOp::Clear(r, g, b, a));
     }
+    fn draw_line(&mut self, x1: f64, y1: f64, x2: f64, y2: f64, r: f64, g: f64, b: f64, a: f64, lw: f64) {
+        self.ops.push(DrawOp::Line { x1, y1, x2, y2, rgba: (r, g, b, a), lw });
+    }
+    fn draw_circle(&mut self, cx: f64, cy: f64, r: f64, red: f64, green: f64, blue: f64, alpha: f64, lw: f64) {
+        self.ops.push(DrawOp::Circle { cx, cy, r, rgba: (red, green, blue, alpha), lw });
+    }
     fn save(&mut self) {}
     fn restore(&mut self) {}
     fn clip(&mut self, _x: f64, _y: f64, _w: f64, _h: f64) {}
@@ -130,4 +151,19 @@ pub struct FillRect {
     pub w: f64,
     pub h: f64,
     pub rgba: (f64, f64, f64, f64),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn records_line_and_circle_ops() {
+        let mut dc = RecordingDrawContext::new();
+        dc.draw_line(0.0, 0.0, 10.0, 10.0, 1.0, 0.0, 0.0, 1.0, 1.0);
+        dc.draw_circle(5.0, 5.0, 3.0, 0.0, 0.0, 1.0, 1.0, 1.0);
+        assert_eq!(dc.ops.len(), 2);
+        assert_eq!(dc.ops[0], DrawOp::Line { x1: 0.0, y1: 0.0, x2: 10.0, y2: 10.0, rgba: (1.0, 0.0, 0.0, 1.0), lw: 1.0 });
+        assert_eq!(dc.ops[1], DrawOp::Circle { cx: 5.0, cy: 5.0, r: 3.0, rgba: (0.0, 0.0, 1.0, 1.0), lw: 1.0 });
+    }
 }

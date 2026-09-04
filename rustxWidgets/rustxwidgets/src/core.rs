@@ -137,6 +137,18 @@ pub trait DrawContext {
     fn save(&mut self);
     fn restore(&mut self);
     fn clip(&mut self, x: f64, y: f64, w: f64, h: f64);
+    /// Draw a line (default: no-op for backends without vector support).
+    fn draw_line(
+        &mut self,
+        _x1: f64, _y1: f64, _x2: f64, _y2: f64,
+        _r: f64, _g: f64, _b: f64, _a: f64, _lw: f64,
+    ) {}
+    /// Draw an outlined circle (default: no-op).
+    fn draw_circle(
+        &mut self,
+        _cx: f64, _cy: f64, _r: f64,
+        _red: f64, _green: f64, _blue: f64, _alpha: f64, _lw: f64,
+    ) {}
 }
 
 /// Top-level error type

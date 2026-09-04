@@ -192,6 +192,12 @@ names would provide it equally, so pick the idiomatic one.
   transforms, text measurement, images.
 - pancurses `Canvas` remains a no-op (TUI has no canvas) — documented.
 
+  **Done**: `DrawContext::draw_line`/`draw_circle` (default no-op impls, so
+  the 5 backends are unaffected); headless `RecordingDrawContext` records
+  `DrawOp::Line`/`DrawOp::Circle`; unit test
+  `records_line_and_circle_ops`.  **Pending**: transforms, images, path
+  primitives — only as a concrete need appears.
+
 ### Phase 7+ — Deferred
 - Declarative UI (wxXRC-like), threading, i18n, accessibility. Only if a
   concrete need appears.
