@@ -275,6 +275,9 @@ macro_rules! menu_items {
     ($label:literal => $action:ident) => {
         vec![MenuAction { label: $label, shortcut: "", action: MenuActionKind::$action, submenu: None }]
     };
+    ($label:literal => $action:ident ($shortcut:literal)) => {
+        vec![MenuAction { label: $label, shortcut: $shortcut, action: MenuActionKind::$action, submenu: None }]
+    };
     ($label:literal => $action:ident, $($rest:tt)*) => {
         {
             let mut v = vec![MenuAction { label: $label, shortcut: "", action: MenuActionKind::$action, submenu: None }];
@@ -282,12 +285,29 @@ macro_rules! menu_items {
             v
         }
     };
+    ($label:literal => $action:ident ($shortcut:literal), $($rest:tt)*) => {
+        {
+            let mut v = vec![MenuAction { label: $label, shortcut: $shortcut, action: MenuActionKind::$action, submenu: None }];
+            v.extend(menu_items!($($rest)*));
+            v
+        }
+    };
     ($label:literal => [ $($items:tt)* ]) => {
         vec![MenuAction { label: $label, shortcut: "", action: MenuActionKind::Submenu, submenu: Some(menu_items!($($items)*)) }]
+    };
+    ($label:literal => ($shortcut:literal) [ $($items:tt)* ]) => {
+        vec![MenuAction { label: $label, shortcut: $shortcut, action: MenuActionKind::Submenu, submenu: Some(menu_items!($($items)*)) }]
     };
     ($label:literal => [ $($items:tt)* ], $($rest:tt)*) => {
         {
             let mut v = vec![MenuAction { label: $label, shortcut: "", action: MenuActionKind::Submenu, submenu: Some(menu_items!($($items)*)) }];
+            v.extend(menu_items!($($rest)*));
+            v
+        }
+    };
+    ($label:literal => ($shortcut:literal) [ $($items:tt)* ], $($rest:tt)*) => {
+        {
+            let mut v = vec![MenuAction { label: $label, shortcut: $shortcut, action: MenuActionKind::Submenu, submenu: Some(menu_items!($($items)*)) }];
             v.extend(menu_items!($($rest)*));
             v
         }
@@ -300,84 +320,84 @@ macro_rules! menu_items {
 pub fn menu_bar() -> Vec<MenuAction> {
     menu_items! {
     "File" => [
-        "Open file"    => Open,
-        "Save as"      => SaveAs,
-        "Export"       => [
-            "TSV"         => ExportTsv,
-            "CSV"         => ExportCsv,
-            "ASCII table" => ExportAscii,
-            "Export all"  => ExportAll,
-            "ODS"         => ExportOds,
+        "Open file"    => Open ("O"),
+        "Save as"      => SaveAs ("A"),
+        "Export"       => ("T") [
+            "TSV"         => ExportTsv ("T"),
+            "CSV"         => ExportCsv ("C"),
+            "ASCII table" => ExportAscii ("A"),
+            "Export all"  => ExportAll ("L"),
+            "ODS"         => ExportOds ("D"),
         ],
-        "Width"        => [
-            "Default width" => SetMaxColWidth,
-            "Column width"  => SetColWidth,
+        "Width"        => ("C") [
+            "Default width" => SetMaxColWidth ("D"),
+            "Column width"  => SetColWidth ("C"),
         ],
-        "Sort view"    => SortView,
-        "Persist sort" => SaveSort,
-        "Exit"         => Quit,
-        "Replay"       => Replay,
+        "Sort view"    => SortView ("S"),
+        "Persist sort" => SaveSort ("P"),
+        "Exit"         => Quit ("X"),
+        "Replay"       => Replay ("R"),
     ],
     "Edit" => [
-        "Cut"         => Cut,
-        "Copy"        => Copy,
-        "Paste"       => Paste,
-        "Find"        => Find,
-        "Replace"     => Replace,
-        "Duplicate"   => Duplicate,
-        "Extrapolate" => Extrapolate,
+        "Cut"         => Cut ("X"),
+        "Copy"        => Copy ("C"),
+        "Paste"       => Paste ("P"),
+        "Find"        => Find ("F"),
+        "Replace"     => Replace ("R"),
+        "Duplicate"   => Duplicate ("D"),
+        "Extrapolate" => Extrapolate ("E"),
     ],
     "Insert" => [
-        "Rows"          => InsertRows,
-        "Mitosis (Row)" => InsertMitosisRow,
-        "Mitosis (Col)" => InsertMitosisCol,
-        "Cols"          => InsertCols,
-        "Special Char"  => InsertSpecialChars,
-        "Date"          => InsertDate,
-        "Time"          => InsertTime,
-        "Hyperlink"     => InsertHyperlink,
+        "Rows"          => InsertRows ("R"),
+        "Mitosis (Row)" => InsertMitosisRow ("M"),
+        "Mitosis (Col)" => InsertMitosisCol ("O"),
+        "Cols"          => InsertCols ("C"),
+        "Special Char"  => InsertSpecialChars ("S"),
+        "Date"          => InsertDate (";"),
+        "Time"          => InsertTime (":"),
+        "Hyperlink"     => InsertHyperlink ("H"),
     ],
     "Format" => [
-        "Scope"  => [
-            "All"        => FormatApplyAll,
-            "Full col"   => FormatApplyFullColumn,
-            "Data"       => FormatApplyData,
-            "Special"    => FormatApplySpecial,
-            "Cell"       => FormatApplyCell,
-            "Selection"  => FormatApplySelection,
+        "Scope"  => ("S") [
+            "All"        => FormatApplyAll ("A"),
+            "Full col"   => FormatApplyFullColumn ("F"),
+            "Data"       => FormatApplyData ("D"),
+            "Special"    => FormatApplySpecial ("S"),
+            "Cell"       => FormatApplyCell ("C"),
+            "Selection"  => FormatApplySelection ("L"),
         ],
-        "Number" => [
-            "Decimal (generic)" => FormatDecimalGeneric,
-            "Currency ($)"      => FormatCurrency,
-            "Rational"          => FormatRational,
-            "Fixed 0"           => FormatFixed0,
-            "Fixed 1"           => FormatFixed1,
-            "Fixed 2"           => FormatFixed2,
-            "Fixed n"           => FormatFixedCustom,
+        "Number" => ("N") [
+            "Decimal (generic)" => FormatDecimalGeneric ("D"),
+            "Currency ($)"      => FormatCurrency ("$"),
+            "Rational"          => FormatRational ("R"),
+            "Fixed 0"           => FormatFixed0 ("0"),
+            "Fixed 1"           => FormatFixed1 ("1"),
+            "Fixed 2"           => FormatFixed2 ("2"),
+            "Fixed n"           => FormatFixedCustom ("N"),
         ],
-        "Align"  => [
-            "Left"    => FormatAlignLeft,
-            "Center"  => FormatAlignCenter,
-            "Right"   => FormatAlignRight,
-            "Default" => FormatAlignDefault,
+        "Align"  => ("A") [
+            "Left"    => FormatAlignLeft ("L"),
+            "Center"  => FormatAlignCenter ("C"),
+            "Right"   => FormatAlignRight ("R"),
+            "Default" => FormatAlignDefault ("D"),
         ],
-        "Reset"  => FormatReset,
+        "Reset"  => FormatReset ("R"),
     ],
     "Sheet" => [
-        "Prev sheet"    => SheetPrev,
-        "Next sheet"    => SheetNext,
-        "New sheet"     => NewSheet,
-        "Rename sheet"  => RenameSheet,
-        "Copy sheet"    => CopySheet,
-        "Move sheet"    => MoveSheet,
-        "Go"            => GoToCell,
-        "Balance books" => BalanceBooks,
+        "Prev sheet"    => SheetPrev ("["),
+        "Next sheet"    => SheetNext ("]"),
+        "New sheet"     => NewSheet ("N"),
+        "Rename sheet"  => RenameSheet ("R"),
+        "Copy sheet"    => CopySheet ("C"),
+        "Move sheet"    => MoveSheet ("M"),
+        "Go"            => GoToCell ("G"),
+        "Balance books" => BalanceBooks ("B"),
     ],
     "Help" => [
-        "About"     => About,
-        "Row ops"   => HelpRows,
-        "Col ops"   => HelpCols,
-        "Full help" => HelpFull,
+        "About"     => About ("A"),
+        "Row ops"   => HelpRows ("R"),
+        "Col ops"   => HelpCols ("C"),
+        "Full help" => HelpFull ("H"),
     ],
 } }
 
@@ -389,9 +409,17 @@ pub fn build_menu_model(menu: &rustxwidgets::backends_pancurses_adapter::Menu, i
         if let Some(sub) = item.submenu.as_deref() {
             let sub_menu = rustxwidgets::backends_pancurses_adapter::create_menu().expect("create submenu");
             build_menu_model(&sub_menu, sub);
-            menu.append_submenu(item.label, &sub_menu);
+            if item.shortcut.is_empty() {
+                menu.append_submenu(item.label, &sub_menu);
+            } else {
+                menu.append_submenu_with_shortcut(item.label, item.shortcut, &sub_menu);
+            }
         } else {
-            menu.append(item.label, action_kind_to_name(item.action));
+            if item.shortcut.is_empty() {
+                menu.append(item.label, action_kind_to_name(item.action));
+            } else {
+                menu.append_with_shortcut(item.label, action_kind_to_name(item.action), item.shortcut);
+            }
         }
     }
 }

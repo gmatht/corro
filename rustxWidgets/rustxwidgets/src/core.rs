@@ -165,7 +165,7 @@ pub enum MenuItem {
     Check { label: String, action: String, checked: bool },
     Radio { label: String, action: String, group: u32 },
     Separator,
-    Submenu { label: String, items: Vec<MenuItem> },
+    Submenu { label: String, items: Vec<MenuItem>, shortcut: Option<String> },
 }
 
 /// Cross-platform 2D drawing surface.

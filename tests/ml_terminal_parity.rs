@@ -543,6 +543,17 @@ fn menu_file_parity_with_ratatui() {
     assert_eq!(pnc_items, rat_items,
         "pancurses File menu diverges from the ratatui reference\npancurses: {:?}\nratatui:   {:?}",
         pnc_items, rat_items);
+
+    // Structural rendering parity (not just item labels):
+    // - the open menu's label stays visible in the menu bar, bracketed like ratatui;
+    // - the popup top border carries the menu title (┌File───┐), so the popup
+    //   starts BELOW the menu bar instead of overwriting it.
+    assert!(pane.contains("[File]"),
+        "menu bar must keep [File] visible while the File menu is open\n{pane}");
+    assert!(pane.contains("┌File"),
+        "popup top border must carry the menu title (┌File…)\n{pane}");
+    assert!(!pane.lines().nth(0).map_or(false, |l| l.contains("┌┐")),
+        "popup must not overwrite the menu bar row");
 }
 
 #[test]

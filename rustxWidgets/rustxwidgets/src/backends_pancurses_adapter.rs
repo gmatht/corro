@@ -274,10 +274,14 @@ mod pancurses_adapter {
             });
         }
         pub fn append_submenu(&self, label: &str, submenu: &Menu) {
+            self.append_submenu_with_shortcut(label, "", submenu);
+        }
+        pub fn append_submenu_with_shortcut(&self, label: &str, shortcut: &str, submenu: &Menu) {
             let sub_items = submenu.items.borrow().clone();
             self.items.borrow_mut().push(crate::MenuItem::Submenu {
                 label: label.to_string(),
                 items: sub_items,
+                shortcut: if shortcut.is_empty() { None } else { Some(shortcut.to_string()) },
             });
         }
         pub fn append_item(&self, _label: &str, _action: &SimpleAction) {}
@@ -290,7 +294,7 @@ mod pancurses_adapter {
             .borrow()
             .iter()
             .filter_map(|item| match item {
-                crate::MenuItem::Submenu { label, items } => Some((label.clone(), items.clone())),
+                crate::MenuItem::Submenu { label, items, .. } => Some((label.clone(), items.clone())),
                 _ => None,
             })
             .collect()

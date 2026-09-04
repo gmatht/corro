@@ -546,9 +546,9 @@ mod pancurses_backend {
                             for (li, (py, px, items)) in levels.iter().enumerate() {
                                 let max_w = items.iter().map(menu_item_width).max().unwrap_or(4).max(4) as i32;
                                 if has_colors() { root.attron(COLOR_PAIR(4)); }
-                                // Clear the popup body plus a one-cell border so the
-                                // box-drawing characters are not overdrawn by grid content.
-                                for row in -1..items.len() as i32 + 1 {
+                                // Clear the popup body (top border row through bottom
+                                // border row) so box-drawing chars are not overdrawn.
+                                for row in 0..items.len() as i32 + 2 {
                                     for col in -1..max_w + 5 {
                                         root.mvaddch(py + row, px + col, ' ');
                                     }
@@ -558,7 +558,7 @@ mod pancurses_backend {
                                     let bg = if li == last && i == item_idx && has_colors() { COLOR_PAIR(2) } else { 0 };
                                     if bg != 0 { root.attron(bg); }
                                     let lbl = menu_item_label(item);
-                                    root.mvaddstr(py + i as i32, px + 1, &lbl);
+                                    root.mvaddstr(py + 1 + i as i32, px + 1, &lbl);
                                     if bg != 0 { root.attroff(bg); }
                                 }
                             }
@@ -580,18 +580,19 @@ mod pancurses_backend {
                         if let Some(levels) = menu_levels(state) {
                             let item_idx = state.active_item;
                             let last = levels.len() - 1;
+                            let root_title = menu_root_title(state);
                             let mut out = String::new();
                             for (li, (py, px, items)) in levels.iter().enumerate() {
                                 let max_w = items.iter().map(menu_item_width).max().unwrap_or(4).max(4) as i32;
                                 let bw = max_w + 4; // box width (2 padding + 2 borders)
                                 let left = *px;
                                 let right = left + bw - 1;
-                                let top = py - 1;
-                                let bottom = py + items.len() as i32;
+                                let top = *py;
+                                let bottom = py + items.len() as i32 + 1;
                                 // Popup background fill (inner area) + clear the grid's
                                 // left-edge column (left-1) so the grid border does not
                                 // show through behind the popup box.
-                                for row in 0..items.len() as i32 {
+                                for row in 1..items.len() as i32 + 1 {
                                     out.push_str(&sgr_cup(py + row, left - 1));
                                     out.push_str(SGR_RESET);
                                     out.push(' ');
@@ -604,13 +605,17 @@ mod pancurses_backend {
                                 out.push_str(&sgr_cup(bottom, left - 1));
                                 out.push_str(SGR_RESET);
                                 out.push(' ');
-                                // Box border
+                                // Box border; include the root menu title in the top
+                                // border (matching the ratatui popup, e.g. ┌File───┐).
+                                let title = if li == 0 { root_title.as_str() } else { "" };
                                 out.push_str(&sgr_cup(top, left));
                                 out.push_str(SGR_RESET);
                                 out.push('\u{250c}');
-                                out.push_str(&"\u{2500}".repeat((bw - 2).max(0) as usize));
+                                out.push_str(title);
+                                let dash_n = (bw - 2 - title.chars().count() as i32).max(0) as usize;
+                                out.push_str(&"\u{2500}".repeat(dash_n));
                                 out.push('\u{2510}');
-                                for row in 0..items.len() as i32 {
+                                for row in 1..items.len() as i32 + 1 {
                                     out.push_str(&sgr_cup(py + row, left));
                                     out.push_str(SGR_RESET);
                                     out.push('\u{2502}');
@@ -625,7 +630,7 @@ mod pancurses_backend {
                                 out.push('\u{2518}');
                                 // Labels (inside the box, with reverse-video highlight)
                                 for (i, item) in items.iter().enumerate() {
-                                    out.push_str(&sgr_cup(py + i as i32, left + 1));
+                                    out.push_str(&sgr_cup(py + 1 + i as i32, left + 1));
                                     out.push_str(if li == last && i == item_idx { sgr_row_cursor() } else { sgr_menu() });
                                     out.push(' ');
                                     out.push_str(&menu_item_label(item));
@@ -3116,11 +3121,15 @@ mod pancurses_backend {
     /// Rendered width of a menu item (label + glyph/arrow for non-plain kinds).
     fn menu_item_width(item: &crate::MenuItem) -> usize {
         match item {
-            crate::MenuItem::Action { label, .. } => label.len(),
+            crate::MenuItem::Action { label, shortcut, .. } => {
+                label.len() + if shortcut.as_ref().map_or(false, |s| !s.is_empty()) { 2 } else { 0 }
+            }
             crate::MenuItem::Check { label, .. } => label.len() + 2,
             crate::MenuItem::Radio { label, .. } => label.len() + 2,
             crate::MenuItem::Separator => 1,
-            crate::MenuItem::Submenu { label, .. } => label.len() + 2,
+            crate::MenuItem::Submenu { label, shortcut, .. } => {
+                label.len() + 2 + if shortcut.as_ref().map_or(false, |s| !s.is_empty()) { 2 } else { 0 }
+            }
         }
     }
 
@@ -3129,7 +3138,13 @@ mod pancurses_backend {
     /// the action is registered, else from the item's own model state.
     fn menu_item_label(item: &crate::MenuItem) -> String {
         match item {
-            crate::MenuItem::Action { label, .. } => label.clone(),
+            crate::MenuItem::Action { label, shortcut, .. } => {
+                if let Some(sc) = shortcut {
+                    if !sc.is_empty() { format!("{sc}\u{00b7}{label}") } else { label.clone() }
+                } else {
+                    label.clone()
+                }
+            }
             crate::MenuItem::Check { label, action, checked } => {
                 let checked = action_state(action).map(|(_, c)| c).unwrap_or(*checked);
                 if checked { format!("\u{2713} {label}") } else { format!("  {label}") }
@@ -3139,7 +3154,13 @@ mod pancurses_backend {
                 if checked { format!("\u{25cf} {label}") } else { format!("  {label}") }
             }
             crate::MenuItem::Separator => "\u{2500}".repeat(8),
-            crate::MenuItem::Submenu { label, .. } => format!("{label} \u{25b6}"),
+            crate::MenuItem::Submenu { label, shortcut, .. } => {
+                if let Some(sc) = shortcut {
+                    if !sc.is_empty() { format!("{sc}\u{00b7}{label} \u{25b6}") } else { format!("{label} \u{25b6}") }
+                } else {
+                    format!("{label} \u{25b6}")
+                }
+            }
         }
     }
 
@@ -3162,7 +3183,7 @@ mod pancurses_backend {
             let mut out = vec![(py, px, cur)];
             for &ix in &state.menu_stack {
                 let bw = cur.iter().map(menu_item_width).max().unwrap_or(4) as i32 + 4;
-                py += ix as i32;
+                py += 1 + ix as i32; // submenu top border at the parent item's row
                 px += bw + 1;
                 // Clamp so the submenu popup stays on screen (right edge).
                 if px + bw > win_w { px = (win_w - bw).max(0); }
@@ -3186,6 +3207,19 @@ mod pancurses_backend {
     /// The current (deepest) menu level's items.
     fn menu_current_items(state: &PcState) -> Option<&Vec<crate::MenuItem>> {
         menu_levels(state).and_then(|l| l.last().map(|(_, _, items)| *items))
+    }
+
+    /// The active root menu's title (e.g. "File").
+    fn menu_root_title(state: &PcState) -> String {
+        let mid = state.menu_bar_id.unwrap_or(0);
+        if let Some(n) = state.node(mid) {
+            if let PcWidgetKind::MenuBar { labels, .. } = &n.kind {
+                if state.active_submenu < labels.len() {
+                    return labels[state.active_submenu].clone();
+                }
+            }
+        }
+        String::new()
     }
 
     /// The highlighted item at the current menu level.
