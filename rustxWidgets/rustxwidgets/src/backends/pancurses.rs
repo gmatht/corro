@@ -226,6 +226,9 @@ mod pancurses_backend {
         static AFTER_REDRAW: RefCell<Option<Box<dyn FnMut()>>> = RefCell::new(None);
         /// Generic Alt+letter hook (see set_alt_key_callback).
         static ALT_KEY_CALLBACK: RefCell<Option<Box<dyn FnMut(char) -> bool>>> = RefCell::new(None);
+        /// Named-action registry (see register_action / set_action_*).
+        static ACTION_REGISTRY: RefCell<std::collections::HashMap<String, crate::Action>> =
+            RefCell::new(std::collections::HashMap::new());
     }
 
     /// Install (or clear with `None`) a host frame hook run on every main-loop
@@ -261,6 +264,43 @@ mod pancurses_backend {
             state.active_item = item;
             state.menu_open = true;
         });
+    }
+
+    /// Register a named action (mirrors wxAction).  Menu items reference
+    /// actions by name; the registry holds their shared enable/checked state.
+    pub fn register_action(name: &str, enabled: bool, checked: bool) {
+        ACTION_REGISTRY.with(|r| {
+            r.borrow_mut().insert(name.to_string(), crate::Action {
+                name: name.to_string(),
+                enabled,
+                checked,
+            });
+        });
+    }
+
+    /// Update an action's enabled state (greys the item everywhere it appears).
+    pub fn set_action_enabled(name: &str, enabled: bool) {
+        ACTION_REGISTRY.with(|r| {
+            if let Some(a) = r.borrow_mut().get_mut(name) {
+                a.enabled = enabled;
+            }
+        });
+    }
+
+    /// Update an action's checked state (toggles check/radio items).
+    pub fn set_action_checked(name: &str, checked: bool) {
+        ACTION_REGISTRY.with(|r| {
+            if let Some(a) = r.borrow_mut().get_mut(name) {
+                a.checked = checked;
+            }
+        });
+    }
+
+    /// Query an action's (enabled, checked) state, if registered.
+    pub fn action_state(name: &str) -> Option<(bool, bool)> {
+        ACTION_REGISTRY.with(|r| {
+            r.borrow().get(name).map(|a| (a.enabled, a.checked))
+        })
     }
 
     /// Show a modal info dialog (title + body) drawn via SGR so it appears on
@@ -3020,14 +3060,19 @@ mod pancurses_backend {
     }
 
     /// Rendered label for a menu item (check/radio glyph, separator line,
-    /// submenu arrow).
+    /// submenu arrow).  Check/radio state comes from the action registry when
+    /// the action is registered, else from the item's own model state.
     fn menu_item_label(item: &crate::MenuItem) -> String {
         match item {
             crate::MenuItem::Action { label, .. } => label.clone(),
-            crate::MenuItem::Check { label, checked, .. } => {
-                if *checked { format!("\u{2713} {label}") } else { format!("  {label}") }
+            crate::MenuItem::Check { label, action, checked } => {
+                let checked = action_state(action).map(|(_, c)| c).unwrap_or(*checked);
+                if checked { format!("\u{2713} {label}") } else { format!("  {label}") }
             }
-            crate::MenuItem::Radio { label, .. } => format!("\u{25cf} {label}"),
+            crate::MenuItem::Radio { label, action, .. } => {
+                let checked = action_state(action).map(|(_, c)| c).unwrap_or(false);
+                if checked { format!("\u{25cf} {label}") } else { format!("  {label}") }
+            }
             crate::MenuItem::Separator => "\u{2500}".repeat(8),
             crate::MenuItem::Submenu { label, .. } => format!("{label} \u{25b6}"),
         }

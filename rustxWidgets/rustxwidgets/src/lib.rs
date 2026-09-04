@@ -3,7 +3,7 @@
 
 pub mod prelude;
 pub mod core;
-pub use core::MenuItem;
+pub use core::{Action, MenuItem};
 pub mod spreadsheet;
 pub mod overflow;
 

@@ -7,6 +7,17 @@ use std::sync::Arc;
 /// Opaque handler id returned when connecting signals
 pub type HandlerId = u64;
 
+/// A named, stateful action: enable/disable and checked state shared across
+/// menu items, toolbars, and keybindings (mirrors wxAction).  Menu items
+/// reference actions by name; the toolkit keeps a registry so one action's
+/// state is reflected everywhere it appears.
+#[derive(Clone, Debug, Default)]
+pub struct Action {
+    pub name: String,
+    pub enabled: bool,
+    pub checked: bool,
+}
+
 /// A menu item in a backend-agnostic menu model.  Backends render and navigate
 /// this model with their own widgets; the model itself is shared so an
 /// application can build one menu and hand it to any backend.

@@ -740,6 +740,16 @@ mod tests {
     }
 
     #[test]
+    fn action_registry_tracks_state() {
+        crate::backends::pancurses::register_action("bold", true, false);
+        crate::backends::pancurses::set_action_checked("bold", true);
+        assert_eq!(crate::backends::pancurses::action_state("bold"), Some((true, true)));
+        crate::backends::pancurses::set_action_enabled("bold", false);
+        assert_eq!(crate::backends::pancurses::action_state("bold"), Some((false, true)));
+        assert_eq!(crate::backends::pancurses::action_state("missing"), None);
+    }
+
+    #[test]
     fn menubar_collects_root_submenus() {
         let menubar = create_menu().unwrap();
         for (label, items) in [("File", &["open", "save"][..]), ("Edit", &["cut", "copy"][..])] {
