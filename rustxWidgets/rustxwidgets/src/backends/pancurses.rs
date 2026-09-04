@@ -267,6 +267,16 @@ mod pancurses_backend {
         });
     }
 
+    /// Opt-in mouse capture.  Off by default so terminals keep native text
+    /// selection; enable only when the app has widgets that need pointer input.
+    pub fn set_mouse_enabled(enabled: bool) {
+        if enabled {
+            unsafe { mousemask(ALL_MOUSE_EVENTS, None); }
+        } else {
+            unsafe { mousemask(0, None); }
+        }
+    }
+
     /// Register a named action (mirrors wxAction).  Menu items reference
     /// actions by name; the registry holds their shared enable/checked state.
     pub fn register_action(name: &str, enabled: bool, checked: bool) {
@@ -445,7 +455,11 @@ mod pancurses_backend {
                     unsafe { define_key(seq.as_ptr() as *const c_char, code); }
                 }
             }
-            mousemask(ALL_MOUSE_EVENTS | REPORT_MOUSE_POSITION, None);
+            // Mouse capture is OFF by default: capturing the mouse (SGR mouse
+            // mode) makes terminals (Windows Terminal, etc.) swallow drag
+            // events and breaks text selection.  Apps that need pointer input
+            // call set_mouse_enabled(true).
+            mousemask(0, None);
             // Use `root.timeout(100)` so we can temporarily change it for Alt+key detection
             root.timeout(100);
             curs_set(0);
