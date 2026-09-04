@@ -24,7 +24,7 @@ mod pancurses_backend {
     fn sgr_cup(y: i32, x: i32) -> String {
         format!("\x1b[{};{}H", y + 1, x + 1)
     }
-    fn sgr_menu() -> &'static str { "\x1b[38;5;0m\x1b[48;5;6m" }
+    fn sgr_menu() -> &'static str { "\x1b[38;5;15m\x1b[48;5;0m" }
     fn sgr_formula() -> &'static str { "\x1b[38;5;6m\x1b[49m" }
     fn sgr_header_active() -> &'static str { "\x1b[1m\x1b[38;5;0m\x1b[48;5;3m" }
     fn sgr_header_inactive() -> &'static str { "\x1b[1m\x1b[38;5;6m" }
@@ -223,6 +223,10 @@ mod pancurses_backend {
         /// Message-box result callback fired when the dialog is dismissed.
         static DIALOG_RESULT: RefCell<Option<Box<dyn FnMut(crate::MessageBoxResult)>>> =
             RefCell::new(None);
+        /// When the user moves Up/Down within an open menu, only the highlight
+        /// changes.  Record (previous_item, new_item) here so the loop can
+        /// redraw just those two rows instead of the entire submenu (flicker).
+        static MENU_HIGHLIGHT: RefCell<Option<(usize, usize)>> = RefCell::new(None);
     }
 
     /// Install (or clear with `None`) a host frame hook run on every main-loop
@@ -1469,9 +1473,11 @@ mod pancurses_backend {
                         let new_pos = with_state(|state| {
                             if state.menu_open {
                                 let len = menu_current_items(state).map(|items| items.len()).unwrap_or(0);
+                                let old_item = state.active_item;
                                 if len > 0 && state.active_item > 0 {
                                     state.active_item -= 1;
                                 }
+                                MENU_HIGHLIGHT.with(|m| *m.borrow_mut() = Some((old_item, state.active_item)));
                                 None
                             } else if let Some(fid) = state.focus_id {
                                 if is_spreadsheet_focused(state, fid) {
@@ -1536,9 +1542,11 @@ mod pancurses_backend {
                         let new_pos = with_state(|state| {
                             if state.menu_open {
                                 let len = menu_current_items(state).map(|items| items.len()).unwrap_or(0);
+                                let old_item = state.active_item;
                                 if len > 0 && state.active_item + 1 < len {
                                     state.active_item += 1;
                                 }
+                                MENU_HIGHLIGHT.with(|m| *m.borrow_mut() = Some((old_item, state.active_item)));
                                 None
                             } else if let Some(fid) = state.focus_id {
                                 if is_spreadsheet_focused(state, fid) {
@@ -1760,7 +1768,23 @@ mod pancurses_backend {
                     // host callback (text would silently disappear).
                     with_state(|state| state.commit_edit_callbacks.append(&mut cbs));
                 }
-                            if input.is_some() { redraw_frame(&mut root); }
+                            if input.is_some() {
+                    // Up/Down inside an open menu only moves the highlight:
+                    // redraw just those two rows instead of the whole submenu
+                    // (which would clear + redraw everything and flicker).
+                    let highlight = MENU_HIGHLIGHT.with(|m| m.borrow_mut().take());
+                    if let Some((old, new)) = highlight {
+                        emit_menu_highlight(old, new);
+                        // Same contract as a full redraw: fire the after-redraw
+                        // hook so the idle marker advances and tests observe the
+                        // incremental frame.
+                        AFTER_REDRAW.with(|c| {
+                            if let Some(cb) = c.borrow_mut().as_mut() { cb(); }
+                        });
+                    } else {
+                        redraw_frame(&mut root);
+                    }
+                }
                 // Draw the active text prompt directly on top of the grid so it is
                 // always visible while a path/name is being entered.
                 if with_state(|state| state.prompt_action.is_some()) {
@@ -3223,6 +3247,49 @@ mod pancurses_backend {
             }
         }
         String::new()
+    }
+
+    /// Re-emit SGR for just the two affected item rows when the menu highlight
+    /// moved (Up/Down).  The grid and the rest of the popup are unchanged, so a
+    /// full submenu redraw (which clears + redraws everything) is unnecessary
+    /// and would flicker.
+    fn emit_menu_highlight(old: usize, new: usize) {
+        if old == new { return; }
+        let out = with_state(|state| {
+            if !state.menu_open { return String::new(); }
+            let Some(levels) = menu_levels(state) else { return String::new(); };
+            let (py, px, items) = levels[levels.len() - 1];
+            let max_w = items.iter().map(menu_item_width).max().unwrap_or(4).max(4) as i32;
+            let bw = max_w + 4;
+            let left = px;
+            let right = left + bw - 1;
+            let mut out = String::new();
+            for i in [old, new] {
+                if i >= items.len() { continue; }
+                let row = py + 1 + i as i32;
+                // background so grid content behind this row is covered
+                out.push_str(&sgr_cup(row, left - 1));
+                out.push_str(SGR_RESET);
+                out.push(' ');
+                out.push_str(&sgr_cup(row, left));
+                out.push_str(&" ".repeat(bw as usize));
+                // side borders
+                out.push_str(&sgr_cup(row, left));
+                out.push_str(SGR_RESET);
+                out.push('\u{2502}');
+                out.push_str(&sgr_cup(row, right));
+                out.push_str(SGR_RESET);
+                out.push('\u{2502}');
+                // label with the new highlight state
+                out.push_str(&sgr_cup(row, left + 1));
+                out.push_str(if i == new { sgr_row_cursor() } else { sgr_menu() });
+                out.push(' ');
+                out.push_str(&menu_item_label(&items[i]));
+                out.push_str(SGR_RESET);
+            }
+            out
+        });
+        if !out.is_empty() { emit_sgr(&out); }
     }
 
     /// The highlighted item at the current menu level.
