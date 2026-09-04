@@ -24,6 +24,9 @@ mod pancurses_backend {
     fn sgr_cup(y: i32, x: i32) -> String {
         format!("\x1b[{};{}H", y + 1, x + 1)
     }
+    /// Blue menu bar (black text on a cyan/blue background).
+    fn sgr_menu_bar() -> &'static str { "\x1b[38;5;0m\x1b[48;5;6m" }
+    /// Menu item: white text on black (the submenu items).
     fn sgr_menu() -> &'static str { "\x1b[38;5;15m\x1b[48;5;0m" }
     fn sgr_formula() -> &'static str { "\x1b[38;5;6m\x1b[49m" }
     fn sgr_header_active() -> &'static str { "\x1b[1m\x1b[38;5;0m\x1b[48;5;3m" }
@@ -2081,7 +2084,7 @@ mod pancurses_backend {
                     let max_chars = rect.w as usize;
                     let end = menu_text.char_indices().nth(max_chars).map(|(i, _)| i).unwrap_or(menu_text.len());
                     out.push_str(&sgr_cup(row_offset, rect.x));
-                    out.push_str(sgr_menu());
+                    out.push_str(sgr_menu_bar());
                     out.push_str(&menu_text[..end]);
                     let remaining = (rect.w as usize).saturating_sub(end);
                     if remaining > 0 {
