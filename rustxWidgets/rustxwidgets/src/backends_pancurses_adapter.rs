@@ -688,6 +688,16 @@ mod pancurses_adapter {
         crate::backends::pancurses::layout_sizer(sizer.id);
     }
 
+    pub fn set_client_data(widget: &impl AsRef<*mut c_void>, data: &str) {
+        let id = *widget.as_ref() as usize;
+        crate::backends::pancurses::set_client_data(id, data);
+    }
+
+    pub fn get_client_data(widget: &impl AsRef<*mut c_void>) -> Option<String> {
+        let id = *widget.as_ref() as usize;
+        crate::backends::pancurses::get_client_data(id)
+    }
+
     pub fn set_widget_rect(widget: &impl AsRef<*mut c_void>, x: i32, y: i32, w: i32, h: i32) {
         let id = *widget.as_ref() as usize;
         crate::backends::pancurses::set_widget_rect(id, x, y, w, h);
@@ -935,6 +945,17 @@ mod tests {
         })));
         close_dialog();
         assert_eq!(result.get(), Some(crate::MessageBoxResult::Ok));
+    }
+
+    #[test]
+    fn client_data_round_trip() {
+        let win = create_window().unwrap();
+        let btn = create_button("Click").unwrap();
+        win.set_child(&btn);
+        set_client_data(&btn, "my-data-42");
+        assert_eq!(get_client_data(&btn).as_deref(), Some("my-data-42"));
+        set_client_data(&btn, "updated");
+        assert_eq!(get_client_data(&btn).as_deref(), Some("updated"));
     }
 
     #[test]

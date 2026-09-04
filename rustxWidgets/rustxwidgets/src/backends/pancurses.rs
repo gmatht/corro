@@ -131,6 +131,8 @@ mod pancurses_backend {
         /// root menu's items followed by each submenu in the path.
         pub menu_stack: Vec<usize>,
         pub spreadsheet_output: String,
+        /// Arbitrary per-widget client data (mirrors wxWindow::SetClientData).
+        client_data: std::collections::HashMap<usize, String>,
         key_callbacks: Vec<(char, Box<dyn FnMut()>)>,
         /// Event callbacks (opt-in propagation): return `CallbackResult::Skip`
         /// to let the event bubble to the parent widget.
@@ -162,6 +164,7 @@ mod pancurses_backend {
                 active_item: 0,
                 menu_stack: Vec::new(),
                 spreadsheet_output: String::new(),
+                client_data: std::collections::HashMap::new(),
                 key_callbacks: Vec::new(),
                 event_callbacks: Vec::new(),
                 cursor_move_callbacks: Vec::new(),
@@ -4045,6 +4048,16 @@ mod pancurses_backend {
             }
         }
         result
+    }
+
+    /// Attach arbitrary string client data to a widget (mirrors wxWindow::SetClientData).
+    pub fn set_client_data(id: usize, data: &str) {
+        with_state(|s| { s.client_data.insert(id, data.to_string()); });
+    }
+
+    /// Retrieve a widget's client data (mirrors wxWindow::GetClientData).
+    pub fn get_client_data(id: usize) -> Option<String> {
+        with_state(|s| s.client_data.get(&id).cloned())
     }
 
     pub fn set_entry_text(id: usize, text: &str) {

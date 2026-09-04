@@ -184,6 +184,9 @@ names would provide it equally, so pick the idiomatic one.
   `wxWindow::SetClientData`, `wxMenu::SetClientData`).
 - **Tests:** attach/retrieve data round-trip.
 
+  **Done**: pancurses `set_client_data`/`get_client_data` (per-widget string
+  map); adapter API; unit test `client_data_round_trip`.
+
 ### Phase 6 — Drawing
 - Extend `DrawContext` toward `wxDC`/`wxGraphicsContext` coverage: paths,
   transforms, text measurement, images.
