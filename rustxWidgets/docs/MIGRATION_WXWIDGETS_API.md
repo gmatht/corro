@@ -97,8 +97,13 @@ names would provide it equally, so pick the idiomatic one.
 
 ### Phase 1 — Universal menu model (in progress)
 - `rustxwidgets::Menu` + `MenuItem` in the core; every backend converts it.
+  **Done**: `MenuItem` (Action/Submenu) in the core; pancurses + adapter
+  convert the same model; corro builds one `menu_bar()` tree.
 - Add item kinds: `Separator`, `Check { checked }`, `Radio { group }`.
+  **Done**: all three kinds + `Action { shortcut }` in the model; pancurses
+  renders them; adapter has `append_separator`/`append_check`/`append_radio`.
 - Add accelerators to the model (`MenuItem::Action { label, action, shortcut }`).
+  **Done**: `shortcut: Option<String>` on `Action`.
 - **Express menus as a nested tree** via a `menu!` macro — the tree *is* the
   menu, no separate submenu constants:
 
@@ -116,7 +121,7 @@ names would provide it equally, so pick the idiomatic one.
 
   The macro distinguishes an action (a name) from a submenu (a nested list)
   recursively; it replaces the separate `FILE_MENU`/`EXPORT_MENU`/… constants
-  in corro's `menu.rs`.
+  in corro's `menu.rs`.  **Done**: `menu_bar()` in corro's `menu.rs`.
 - Add a **standard item vocabulary** — a documented convention of generic
   action strings any app may use, so backends can give them consistent,
   platform-correct behavior without knowing the app:
@@ -129,7 +134,13 @@ names would provide it equally, so pick the idiomatic one.
   - The vocabulary is the *generic subset*; app-specific actions
     (`insert_date`, `balance_books`, …) are NOT in it. This is the
     toolkit-purity line: the toolkit knows about `exit`, not corro's menu.
+  **Done**: see `docs/STANDARD_ACTIONS.md`.
+- **First-class actions** — `Action { name, enabled, checked }` registry
+  (`register_action`, `set_action_enabled`, `set_action_checked`).
+  **Done**: `rustxwidgets::Action` + pancurses `ACTION_REGISTRY`.
 - **Tests:** menu parity across pancurses/ratatui; item-kind rendering.
+  **Done**: `menu_file_parity_with_ratatui`; rustxwidgets lib unit tests for
+  item kinds + action registry.
 
 ### Phase 2 — Event propagation
 - Add a small `Event` enum + `CallbackResult { Handled, Skip }` return; the
