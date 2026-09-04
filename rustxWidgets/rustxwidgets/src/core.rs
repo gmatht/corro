@@ -45,6 +45,24 @@ pub enum Sizer {
     FlexGrid { cols: usize, rows: usize, children: Vec<SizerChild> },
 }
 
+/// Message box kind (mirrors wxMessageBox style).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MessageBoxKind {
+    Info,
+    Warning,
+    Error,
+    Question,
+}
+
+/// Result of dismissing a message box (mirrors wxMessageBox return values).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MessageBoxResult {
+    Ok,
+    Cancel,
+    Yes,
+    No,
+}
+
 /// A UI event dispatched through the widget tree.  Callbacks that return
 /// `CallbackResult::Skip` let the event propagate to the parent widget
 /// (mirrors wxEvent).

@@ -173,6 +173,12 @@ names would provide it equally, so pick the idiomatic one.
   prompt/dialog overlay.
 - **Tests:** each dialog opens and returns a value in each backend.
 
+  **Done**: `MessageBoxKind`/`MessageBoxResult` in the core; pancurses
+  `message_box` (info-dialog overlay, result callback on dismissal),
+  `file_open_dialog`/`file_save_dialog` (path prompts); adapter API; unit
+  test `message_box_fires_result_on_close`.  **Pending**: color/font pickers,
+  Yes/No/Cancel button rows for Question-kind boxes, native GTK dialogs.
+
 ### Phase 5 — Client data
 - `set_data`/`get_data` on widgets and menu items (mirrors
   `wxWindow::SetClientData`, `wxMenu::SetClientData`).

@@ -234,6 +234,9 @@ mod pancurses_backend {
         /// Named-action registry (see register_action / set_action_*).
         static ACTION_REGISTRY: RefCell<std::collections::HashMap<String, crate::Action>> =
             RefCell::new(std::collections::HashMap::new());
+        /// Message-box result callback fired when the dialog is dismissed.
+        static DIALOG_RESULT: RefCell<Option<Box<dyn FnMut(crate::MessageBoxResult)>>> =
+            RefCell::new(None);
     }
 
     /// Install (or clear with `None`) a host frame hook run on every main-loop
@@ -315,9 +318,22 @@ mod pancurses_backend {
         ACTIVE_DIALOG.with(|d| *d.borrow_mut() = Some((title.to_string(), text.to_string())));
     }
 
-    /// Close the active info dialog.
+    /// Show a standard message box (mirrors wxMessageBox).  The pancurses
+    /// backend renders it with the info-dialog overlay; dismissing it (Escape)
+    /// fires `on_result` with Ok.  Higher-button kinds (Yes/No/Cancel) map to
+    /// Ok on dismissal for now — native backends provide full button rows.
+    pub fn message_box(title: &str, text: &str, _kind: crate::MessageBoxKind, on_result: Option<Box<dyn FnMut(crate::MessageBoxResult)>>) {
+        ACTIVE_DIALOG.with(|d| *d.borrow_mut() = Some((title.to_string(), text.to_string())));
+        DIALOG_RESULT.with(|r| *r.borrow_mut() = on_result);
+    }
+
+    /// Close the active info dialog, firing the message-box result callback.
     pub fn close_dialog() {
+        let result = DIALOG_RESULT.with(|r| r.borrow_mut().take());
         ACTIVE_DIALOG.with(|d| *d.borrow_mut() = None);
+        if let Some(mut cb) = result {
+            cb(crate::MessageBoxResult::Ok);
+        }
     }
 
     /// Erase the dialog box area (spaces) so closing it does not leave stale
@@ -357,6 +373,26 @@ mod pancurses_backend {
     /// Show a text prompt (label + current buffer) and remember the action to
     /// perform with the submitted text.  Key input is routed to the buffer while
     /// the prompt is active; Enter submits, Escape cancels.
+    /// Show a standard file-open dialog (mirrors wxFileDialog).  The pancurses
+    /// backend presents a path prompt; `on_path` fires with the submitted path.
+    pub fn file_open_dialog(on_path: Box<dyn FnMut(Option<String>)>) {
+        let mut on_path = on_path;
+        set_prompt("Open file", "__file_open");
+        set_prompt_callback(Box::new(move |action, text| {
+            if action == "__file_open" { on_path(Some(text)); }
+        }));
+    }
+
+    /// Show a standard file-save dialog (mirrors wxFileDialog).  The pancurses
+    /// backend presents a path prompt; `on_path` fires with the submitted path.
+    pub fn file_save_dialog(default_name: &str, on_path: Box<dyn FnMut(Option<String>)>) {
+        let mut on_path = on_path;
+        set_prompt(&format!("Save as ({default_name})"), "__file_save");
+        set_prompt_callback(Box::new(move |action, text| {
+            if action == "__file_save" { on_path(Some(text)); }
+        }));
+    }
+
     pub fn set_prompt(label: &str, action: &str) {
         with_state(|state| {
             state.prompt_label = label.to_string();
@@ -893,7 +929,7 @@ mod pancurses_backend {
                         // Escape closes the modal info dialog (About/Help).
                         if c == '\x1b' && ACTIVE_DIALOG.with(|d| d.borrow().is_some()) {
                                                         clear_dialog_area(&root);
-                            ACTIVE_DIALOG.with(|d| *d.borrow_mut() = None);
+                            close_dialog();
                             redraw_frame(&mut root);
                                                         continue;
                         }
@@ -1071,8 +1107,8 @@ mod pancurses_backend {
                                     // No following char within 300ms → bare Escape
                                     // Close any modal info dialog first.
                                     clear_dialog_area(&root);
-                                    ACTIVE_DIALOG.with(|d| *d.borrow_mut() = None);
-                                    with_state(|state| {
+      clear_dialog_area(&root);
+                                    close_dialog();     with_state(|state| {
                                         if let Some(fid) = state.focus_id {
                                             if is_spreadsheet_focused(state, fid) {
                                                 if let Some(n) = state.node_mut(fid) {

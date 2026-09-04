@@ -202,6 +202,29 @@ mod pancurses_adapter {
         }
     }
 
+    // -- Standard dialogs (wxMessageBox / wxFileDialog) --
+
+    pub fn message_box(
+        title: &str,
+        text: &str,
+        kind: crate::MessageBoxKind,
+        on_result: Option<Box<dyn FnMut(crate::MessageBoxResult)>>,
+    ) {
+        crate::backends::pancurses::message_box(title, text, kind, on_result);
+    }
+
+    pub fn close_dialog() {
+        crate::backends::pancurses::close_dialog();
+    }
+
+    pub fn file_open_dialog(on_path: Box<dyn FnMut(Option<String>)>) {
+        crate::backends::pancurses::file_open_dialog(on_path);
+    }
+
+    pub fn file_save_dialog(default_name: &str, on_path: Box<dyn FnMut(Option<String>)>) {
+        crate::backends::pancurses::file_save_dialog(default_name, on_path);
+    }
+
     // -- Menu --
 
     /// Backend-agnostic menu model: a list of items (actions or submenus).
@@ -901,6 +924,17 @@ mod tests {
         assert_eq!((x1, y1, w1, h1), (0, 0, 10, 1), "cell (0,0)");
         assert_eq!((x2, y2), (10, 0), "cell (1,0)");
         assert_eq!((x3, y3), (0, 1), "cell (0,1)");
+    }
+
+    #[test]
+    fn message_box_fires_result_on_close() {
+        let result = std::rc::Rc::new(std::cell::Cell::new(None));
+        let r = result.clone();
+        message_box("Test", "Hello world", crate::MessageBoxKind::Info, Some(Box::new(move |res| {
+            r.set(Some(res));
+        })));
+        close_dialog();
+        assert_eq!(result.get(), Some(crate::MessageBoxResult::Ok));
     }
 
     #[test]
