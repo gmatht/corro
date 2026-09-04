@@ -410,27 +410,10 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // same Menu type is used by every rustxwidgets backend, so the menu
     // definitions in crate::gui::menu are not tied to the pancurses backend.
     let menubar_model = rustxwidgets::backends_pancurses_adapter::create_menu()?;
-    for (label, items) in [
-        ("File", crate::gui::menu::FILE_MENU),
-        ("Edit", crate::gui::menu::EDIT_MENU),
-        ("Insert", crate::gui::menu::INSERT_MENU),
-        ("Format", crate::gui::menu::FORMAT_MENU),
-        ("Sheet", crate::gui::menu::SHEET_MENU),
-        ("Help", crate::gui::menu::HELP_MENU),
-    ] {
+    for root in crate::gui::menu::menu_bar() {
         let sub = rustxwidgets::backends_pancurses_adapter::create_menu()?;
-        for item in items {
-            if let Some(sub_items) = item.submenu {
-                let sub_sub = rustxwidgets::backends_pancurses_adapter::create_menu()?;
-                for sa in sub_items {
-                    sub_sub.append(sa.label, crate::gui::menu::action_kind_to_name(sa.action));
-                }
-                sub.append_submenu(item.label, &sub_sub);
-            } else {
-                sub.append(item.label, crate::gui::menu::action_kind_to_name(item.action));
-            }
-        }
-        menubar_model.append_submenu(label, &sub);
+        crate::gui::menu::build_menu_model(&sub, root.submenu.as_deref().unwrap_or(&[]));
+        menubar_model.append_submenu(root.label, &sub);
     }
     let _menubar = rustxwidgets::backends_pancurses_adapter::create_menubar(&menubar_model, std::ptr::null_mut())?;
 

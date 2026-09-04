@@ -950,37 +950,36 @@ fn build_menu(rxapp: &rustxwidgets::App, win: &Window, state: &Rc<GuiState>) -> 
 
     let action_group = rxapp.ensure_action_group()?;
 
-    let file_menu = menu::build_submenu(rxapp, menu::FILE_MENU, "app")?;
-    let edit_menu = menu::build_submenu(rxapp, menu::EDIT_MENU, "app")?;
-    let view_menu = menu::build_submenu(rxapp, menu::VIEW_MENU, "app")?;
-    let insert_menu = menu::build_submenu(rxapp, menu::INSERT_MENU, "app")?;
-    let format_menu = menu::build_submenu(rxapp, menu::FORMAT_MENU, "app")?;
-    let sheet_menu = menu::build_submenu(rxapp, menu::SHEET_MENU, "app")?;
-    let data_menu = menu::build_submenu(rxapp, menu::DATA_MENU, "app")?;
-    let help_menu = menu::build_submenu(rxapp, menu::HELP_MENU, "app")?;
-
     let mut menubar_model = rxapp.create_menu()?;
     // Prefix labels with U+3164 (Hangul Filler) to prevent GTK4's
     // GtkPopoverMenuBar from auto-assigning mnemonic accelerators
     // (Alt+F, Alt+E, etc.).
-    menubar_model.append_submenu("\u{3164}File", &file_menu);
-    menubar_model.append_submenu("\u{3164}Edit", &edit_menu);
-    menubar_model.append_submenu("\u{3164}View", &view_menu);
-    menubar_model.append_submenu("\u{3164}Insert", &insert_menu);
-    menubar_model.append_submenu("\u{3164}Format", &format_menu);
-    menubar_model.append_submenu("\u{3164}Sheet", &sheet_menu);
-    menubar_model.append_submenu("\u{3164}Data", &data_menu);
-    menubar_model.append_submenu("\u{3164}Help", &help_menu);
+    for root in menu::menu_bar() {
+        let sub = menu::build_submenu(rxapp, root.submenu.as_deref().unwrap_or(&[]), "app")?;
+        menubar_model.append_submenu(&format!("\u{3164}{}", root.label), &sub);
+    }
 
-    // Register action callbacks with state access
-    let s = state.clone();
-    for &items in &[menu::FILE_MENU, menu::EDIT_MENU, menu::VIEW_MENU, menu::INSERT_MENU, menu::FORMAT_MENU, menu::SHEET_MENU, menu::DATA_MENU, menu::HELP_MENU] {
+    // Register action callbacks with state access (walk the whole tree).
+    fn register_actions(
+        rxapp: &rustxwidgets::App,
+        items: &[menu::MenuAction],
+        s: &Rc<GuiState>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         for item in items {
-            let name = menu::action_kind_to_name(item.action);
-            let name_owned = name.to_string();
-            let state_cb = s.clone();
-            menu::register_action(rxapp, name, move || handle_menu_action(&name_owned, &state_cb))?;
+            if let Some(sub) = item.submenu {
+                register_actions(rxapp, sub, s)?;
+            } else {
+                let name = menu::action_kind_to_name(item.action);
+                let name_owned = name.to_string();
+                let state_cb = s.clone();
+                menu::register_action(rxapp, name, move || handle_menu_action(&name_owned, &state_cb))?;
+            }
         }
+        Ok(())
+    }
+    let s = state.clone();
+    for root in menu::menu_bar() {
+        register_actions(rxapp, root.submenu.as_deref().unwrap_or(&[]), &s)?;
     }
 
     let menubar = unsafe { rxapp.create_menubar(&menubar_model, action_group)? };
