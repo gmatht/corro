@@ -3,6 +3,7 @@
 
 pub mod prelude;
 pub mod core;
+pub use core::MenuItem;
 pub mod spreadsheet;
 pub mod overflow;
 

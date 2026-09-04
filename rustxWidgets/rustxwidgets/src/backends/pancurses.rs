@@ -66,7 +66,7 @@ mod pancurses_backend {
         RadioButton { label: String, checked: bool, group_id: usize },
         Dialog { title: String },
         Menu,
-        MenuBar { labels: Vec<String>, submenu_items: Vec<(String, Vec<(String, String)>)> },
+        MenuBar { labels: Vec<String>, submenu_items: Vec<(String, Vec<crate::MenuItem>)> },
         SimpleAction,
         DropDown { items: Vec<String>, selected: Option<usize> },
         TextView { text: String },
@@ -125,10 +125,23 @@ mod pancurses_backend {
         pub menu_open: bool,
         pub active_submenu: usize,
         pub active_item: usize,
+        /// Submenu path: indices of the submenu items entered from the root menu.
+        /// Empty = at the root menu level.  The current level's items are the
+        /// root menu's items followed by each submenu in the path.
+        pub menu_stack: Vec<usize>,
         pub spreadsheet_output: String,
         key_callbacks: Vec<(char, Box<dyn FnMut()>)>,
         pub cursor_move_callbacks: Vec<Box<dyn FnMut(u32, u32)>>,
         pub commit_edit_callbacks: Vec<Box<dyn FnMut(u32, u32, String)>>,
+        pub goto_callbacks: Vec<Box<dyn FnMut()>>,
+        /// Invoked (with the action name) when a menu item is activated.
+        pub menu_action_callback: Option<Box<dyn FnMut(String)>>,
+        /// Active text prompt (e.g. file path for Open/Save/Export).  When set,
+        /// key input is routed into `prompt_buffer` instead of the spreadsheet.
+        pub prompt_label: String,
+        pub prompt_buffer: String,
+        pub prompt_action: Option<String>,
+        prompt_callback: Option<Box<dyn FnMut(String, String)>>,
     }
 
     impl PcState {
@@ -143,10 +156,17 @@ mod pancurses_backend {
                 menu_open: false,
                 active_submenu: 0,
                 active_item: 0,
+                menu_stack: Vec::new(),
                 spreadsheet_output: String::new(),
                 key_callbacks: Vec::new(),
                 cursor_move_callbacks: Vec::new(),
                 commit_edit_callbacks: Vec::new(),
+                goto_callbacks: Vec::new(),
+                menu_action_callback: None,
+                prompt_label: String::new(),
+                prompt_buffer: String::new(),
+                prompt_action: None,
+                prompt_callback: None,
             }
         }
 
@@ -191,6 +211,21 @@ mod pancurses_backend {
         /// tree without its own timer thread (e.g. flush a chat transcript into
         /// a TextView before every refresh). Cleared automatically on quit.
         static FRAME_HOOK: RefCell<Option<Box<dyn FnMut()>>> = RefCell::new(None);
+        /// Commit-edit callbacks captured while inside a `with_state` call are stashed
+        /// here and fired *outside* any `with_state` borrow (in the main loop) on the
+        /// next iteration. The callbacks themselves call `with_state`-using adapter
+        /// functions, so firing them from inside `with_state` would panic with a
+        /// RefCell double-borrow (this is the same reason cursor-move callbacks are
+        /// fired outside `with_state`).
+        static DEFERRED_COMMIT: RefCell<Vec<(u32, u32, String, Vec<Box<dyn FnMut(u32, u32, String)>>)>> =
+            RefCell::new(Vec::new());
+        /// Active modal info dialog (title, body) drawn via SGR on top of the
+        /// spreadsheet output.  Shown by show_dialog(), dismissed by Escape.
+        static ACTIVE_DIALOG: RefCell<Option<(String, String)>> = RefCell::new(None);
+        /// Generic after-redraw callback (see set_after_redraw_callback).
+        static AFTER_REDRAW: RefCell<Option<Box<dyn FnMut()>>> = RefCell::new(None);
+        /// Generic Alt+letter hook (see set_alt_key_callback).
+        static ALT_KEY_CALLBACK: RefCell<Option<Box<dyn FnMut(char) -> bool>>> = RefCell::new(None);
     }
 
     /// Install (or clear with `None`) a host frame hook run on every main-loop
@@ -198,6 +233,97 @@ mod pancurses_backend {
     /// UI thread, so it may mutate widgets directly.
     pub fn set_frame_hook(hook: Option<Box<dyn FnMut()>>) {
         FRAME_HOOK.with(|h| *h.borrow_mut() = hook);
+    }
+
+    /// Generic after-redraw callback: invoked once per redraw, after all SGR
+    /// output has been flushed, so a caller that captures the terminal sees the
+    /// freshly-rendered frame.  Host applications use this for idle markers or
+    /// test synchronization; the toolkit itself never writes app-specific files.
+    pub fn set_after_redraw_callback(cb: Box<dyn FnMut()>) {
+        AFTER_REDRAW.with(|c| *c.borrow_mut() = Some(cb));
+    }
+
+    /// Generic Alt+letter hook: invoked when the user presses Alt+<letter> while
+    /// no menu is open.  The application decides what to open (e.g. a specific
+    /// menu or submenu) via `open_menu`; if no callback is installed the backend
+    /// falls back to opening the root menu whose label starts with the letter.
+    pub fn set_alt_key_callback(cb: Box<dyn FnMut(char) -> bool>) {
+        ALT_KEY_CALLBACK.with(|c| *c.borrow_mut() = Some(cb));
+    }
+
+    /// Open a menu path: root menu index, submenu stack (indices of the submenu
+    /// items entered from the root), and the highlighted item index.  Generic
+    /// toolkit API — applications use it from their Alt+letter callback.
+    pub fn open_menu(root: usize, stack: Vec<usize>, item: usize) {
+        with_state(|state| {
+            state.active_submenu = root;
+            state.menu_stack = stack;
+            state.active_item = item;
+            state.menu_open = true;
+        });
+    }
+
+    /// Show a modal info dialog (title + body) drawn via SGR so it appears on
+    /// top of the spreadsheet output (ncurses widgets get overwritten by the
+    /// spreadsheet's direct SGR writes).  Dismissed with Escape.
+    pub fn show_dialog(title: &str, text: &str) {
+        ACTIVE_DIALOG.with(|d| *d.borrow_mut() = Some((title.to_string(), text.to_string())));
+    }
+
+    /// Close the active info dialog.
+    pub fn close_dialog() {
+        ACTIVE_DIALOG.with(|d| *d.borrow_mut() = None);
+    }
+
+    /// Erase the dialog box area (spaces) so closing it does not leave stale
+    /// dialog text on the terminal (the spreadsheet SGR output does not
+    /// overwrite empty cells).
+    fn clear_dialog_area(root: &Window) {
+        if let Some((dtitle, dtext)) = ACTIVE_DIALOG.with(|d| d.borrow().clone()) {
+            let (my, mx) = root.get_max_yx();
+            let lines: Vec<&str> = dtext.lines().collect();
+            let maxlen = lines
+                .iter()
+                .map(|l| l.chars().count())
+                .chain(std::iter::once(dtitle.chars().count()))
+                .max()
+                .unwrap_or(16)
+                .max(16);
+            let w = (maxlen as i32 + 6).clamp(12, (mx - 2).max(12));
+            let h = (lines.len() as i32 + 4).clamp(5, (my - 2).max(5));
+            let x0 = (mx - w) / 2;
+            let y0 = (my - h) / 2;
+            let mut out = String::new();
+            for y in 0..h {
+                out.push_str(&sgr_cup(y0 + y, x0));
+                out.push_str(SGR_RESET);
+                out.push_str(&" ".repeat(w as usize));
+            }
+            emit_sgr(&out);
+        }
+    }
+
+    /// Register the callback invoked when a menu item is activated. The
+    /// callback receives the item's action name (see `gui::menu::action_kind_to_name`).
+    pub fn set_menu_action_callback(cb: Box<dyn FnMut(String)>) {
+        with_state(|state| state.menu_action_callback = Some(cb));
+    }
+
+    /// Show a text prompt (label + current buffer) and remember the action to
+    /// perform with the submitted text.  Key input is routed to the buffer while
+    /// the prompt is active; Enter submits, Escape cancels.
+    pub fn set_prompt(label: &str, action: &str) {
+        with_state(|state| {
+            state.prompt_label = label.to_string();
+            state.prompt_buffer.clear();
+            state.prompt_action = Some(action.to_string());
+        });
+    }
+
+    /// Register the callback invoked when a prompt is submitted. Receives the
+    /// action name and the entered text.
+    pub fn set_prompt_callback(cb: Box<dyn FnMut(String, String)>) {
+        with_state(|state| state.prompt_callback = Some(cb));
     }
 
     fn with_state<F, R>(f: F) -> R
@@ -343,36 +469,32 @@ mod pancurses_backend {
                     if !visible { continue; }
                     render_widget(&root, &kind, rect, id, focus_id);
                 }
-                // render active menu dropdown
+                // render active menu dropdown (all open levels: root + submenus)
                 with_state(|state| {
                     if state.menu_open {
-                        let mid = state.menu_bar_id.unwrap_or(0);
-                        let (sub_idx, item_idx) = (state.active_submenu, state.active_item);
-                        if let Some(n) = state.node(mid) {
-                            if let PcWidgetKind::MenuBar { labels, submenu_items } = &n.kind {
-                                if sub_idx < submenu_items.len() {
-                                    let (_, items) = &submenu_items[sub_idx];
-                                    let dy = n.rect.y + 1;
-                                    let dx = n.rect.x + 1;
-                                    // find horizontal position of this submenu label
-                                    let mut mx = n.rect.x + 1;
-                                    for i in 0..sub_idx {
-                                        mx += labels[i].len() as i32 + 2;
+                        if let Some(levels) = menu_levels(state) {
+                            let item_idx = state.active_item;
+                            let last = levels.len() - 1;
+                            for (li, (py, px, items)) in levels.iter().enumerate() {
+                                let max_w = items.iter().map(menu_item_width).max().unwrap_or(4).max(4) as i32;
+                                if has_colors() { root.attron(COLOR_PAIR(4)); }
+                                // Clear the popup body plus a one-cell border so the
+                                // box-drawing characters are not overdrawn by grid content.
+                                for row in -1..items.len() as i32 + 1 {
+                                    for col in -1..max_w + 5 {
+                                        root.mvaddch(py + row, px + col, ' ');
                                     }
-                                    let max_w = items.iter().map(|(l,_)| l.len()).max().unwrap_or(0).max(4) as i32;
-                                    if has_colors() { root.attron(COLOR_PAIR(4)); }
-                                    for row in 0..items.len() as i32 {
-                                        for col in 0..max_w + 2 {
-                                            root.mvaddch(dy + row, mx + col, ' ');
-                                        }
-                                    }
-                                    if has_colors() { root.attroff(COLOR_PAIR(4)); }
-                                    for (i, (lbl, _)) in items.iter().enumerate() {
-                                        let bg = if i == item_idx && has_colors() { COLOR_PAIR(2) } else { 0 };
-                                        if bg != 0 { root.attron(bg); }
-                                        root.mvaddstr(dy + i as i32, mx + 1, lbl);
-                                        if bg != 0 { root.attroff(bg); }
-                                    }
+                                }
+                                if has_colors() { root.attroff(COLOR_PAIR(4)); }
+                                for (i, item) in items.iter().enumerate() {
+                                    let bg = if li == last && i == item_idx && has_colors() { COLOR_PAIR(2) } else { 0 };
+                                    if bg != 0 { root.attron(bg); }
+                                    let lbl = match item {
+                                        crate::MenuItem::Action { label, .. } => label.clone(),
+                                        crate::MenuItem::Submenu { label, .. } => format!("{label} \u{25b6}"),
+                                    };
+                                    root.mvaddstr(py + i as i32, px + 1, &lbl);
+                                    if bg != 0 { root.attroff(bg); }
                                 }
                             }
                         }
@@ -390,41 +512,153 @@ mod pancurses_backend {
                 // spreadsheet cells) so it appears on top of the SGR output.
                 with_state(|state| {
                     if state.menu_open {
-                        if let Some(mid) = state.menu_bar_id {
-                            if let Some(n) = state.node(mid) {
-                                if let PcWidgetKind::MenuBar { labels, submenu_items } = &n.kind {
-                                    let (sub_idx, item_idx) = (state.active_submenu, state.active_item);
-                                    if sub_idx < submenu_items.len() {
-                                        let (_, items) = &submenu_items[sub_idx];
-                                        let dy = n.rect.y + 1;
-                                        let mut mx = n.rect.x + 1;
-                                        for i in 0..sub_idx {
-                                            mx += labels[i].len() as i32 + 2;
-                                        }
-                                        let max_w = items.iter().map(|(l,_)| l.len()).max().unwrap_or(0).max(4) as i32;
-                                        let mut out = String::new();
-                                        for row in 0..items.len() as i32 {
-                                            out.push_str(&sgr_cup(dy + row, mx));
-                                            out.push_str(SGR_RESET);
-                                            out.push_str(&" ".repeat((max_w + 2) as usize));
-                                        }
-                                        for (i, (lbl, _)) in items.iter().enumerate() {
-                                            out.push_str(&sgr_cup(dy + i as i32, mx));
-                                            out.push_str(if i == item_idx { sgr_row_cursor() } else { sgr_menu() });
+                        if let Some(levels) = menu_levels(state) {
+                            let item_idx = state.active_item;
+                            let last = levels.len() - 1;
+                            let mut out = String::new();
+                            for (li, (py, px, items)) in levels.iter().enumerate() {
+                                let max_w = items.iter().map(menu_item_width).max().unwrap_or(4).max(4) as i32;
+                                let bw = max_w + 4; // box width (2 padding + 2 borders)
+                                let left = *px;
+                                let right = left + bw - 1;
+                                let top = py - 1;
+                                let bottom = py + items.len() as i32;
+                                // Popup background fill (inner area) + clear the grid's
+                                // left-edge column (left-1) so the grid border does not
+                                // show through behind the popup box.
+                                for row in 0..items.len() as i32 {
+                                    out.push_str(&sgr_cup(py + row, left - 1));
+                                    out.push_str(SGR_RESET);
+                                    out.push(' ');
+                                    out.push_str(&sgr_cup(py + row, left));
+                                    out.push_str(&" ".repeat(bw as usize));
+                                }
+                                out.push_str(&sgr_cup(top, left - 1));
+                                out.push_str(SGR_RESET);
+                                out.push(' ');
+                                out.push_str(&sgr_cup(bottom, left - 1));
+                                out.push_str(SGR_RESET);
+                                out.push(' ');
+                                // Box border
+                                out.push_str(&sgr_cup(top, left));
+                                out.push_str(SGR_RESET);
+                                out.push('\u{250c}');
+                                out.push_str(&"\u{2500}".repeat((bw - 2).max(0) as usize));
+                                out.push('\u{2510}');
+                                for row in 0..items.len() as i32 {
+                                    out.push_str(&sgr_cup(py + row, left));
+                                    out.push_str(SGR_RESET);
+                                    out.push('\u{2502}');
+                                    out.push_str(&sgr_cup(py + row, right));
+                                    out.push_str(SGR_RESET);
+                                    out.push('\u{2502}');
+                                }
+                                out.push_str(&sgr_cup(bottom, left));
+                                out.push_str(SGR_RESET);
+                                out.push('\u{2514}');
+                                out.push_str(&"\u{2500}".repeat((bw - 2).max(0) as usize));
+                                out.push('\u{2518}');
+                                // Labels (inside the box, with reverse-video highlight)
+                                for (i, item) in items.iter().enumerate() {
+                                    out.push_str(&sgr_cup(py + i as i32, left + 1));
+                                    out.push_str(if li == last && i == item_idx { sgr_row_cursor() } else { sgr_menu() });
+                                    out.push(' ');
+                                    match item {
+                                        crate::MenuItem::Action { label, .. } => out.push_str(label),
+                                        crate::MenuItem::Submenu { label, .. } => {
+                                            out.push_str(label);
                                             out.push(' ');
-                                            out.push_str(lbl);
-                                            out.push_str(SGR_RESET);
+                                            out.push('\u{25b6}');
                                         }
-                                        emit_sgr(&out);
                                     }
+                                    out.push_str(SGR_RESET);
                                 }
                             }
+                            emit_sgr(&out);
                         }
                     }
                 });
 
-                
+            // Generic after-redraw hook: lets the host app run a callback once
+            // the frame is fully flushed (e.g. an idle marker for tests).  The
+            // toolkit itself never writes app-specific files.
+            AFTER_REDRAW.with(|c| {
+                if let Some(cb) = c.borrow_mut().as_mut() {
+                    cb();
+                }
+            });
+
+            // Modal info dialog (About/Help) drawn via SGR on top of everything.
+            if let Some((dtitle, dtext)) = ACTIVE_DIALOG.with(|d| d.borrow().clone()) {
+                let (my, mx) = root.get_max_yx();
+                let lines: Vec<&str> = dtext.lines().collect();
+                let maxlen = lines
+                    .iter()
+                    .map(|l| l.chars().count())
+                    .chain(std::iter::once(dtitle.chars().count()))
+                    .max()
+                    .unwrap_or(16)
+                    .max(16);
+                let w = (maxlen as i32 + 6).clamp(12, (mx - 2).max(12));
+                let h = (lines.len() as i32 + 4).clamp(5, (my - 2).max(5));
+                let x0 = (mx - w) / 2;
+                let y0 = (my - h) / 2;
+                let mut out = String::new();
+                for y in 0..h {
+                    out.push_str(&sgr_cup(y0 + y, x0));
+                    out.push_str(SGR_RESET);
+                    out.push_str(&" ".repeat(w as usize));
+                }
+                out.push_str(&sgr_cup(y0, x0));
+                out.push_str(SGR_RESET);
+                out.push('\u{250c}');
+                out.push_str(&"\u{2500}".repeat((w - 2) as usize));
+                out.push('\u{2510}');
+                out.push_str(&sgr_cup(y0, x0 + 1));
+                out.push_str(sgr_header_active());
+                let t: String = dtitle.chars().take((w - 4).max(1) as usize).collect();
+                out.push_str(&t);
+                out.push_str(SGR_RESET);
+                for (i, ln) in lines.iter().enumerate() {
+                    let y = y0 + 1 + i as i32;
+                    if y >= y0 + h - 1 { break; }
+                    out.push_str(&sgr_cup(y, x0));
+                    out.push_str(SGR_RESET);
+                    out.push('\u{2502}');
+                    out.push_str(&sgr_cup(y, x0 + w - 1));
+                    out.push_str(SGR_RESET);
+                    out.push('\u{2502}');
+                    let body: String = ln.chars().take((w - 4).max(1) as usize).collect();
+                    out.push_str(&sgr_cup(y, x0 + 2));
+                    out.push_str(SGR_RESET);
+                    out.push_str(&body);
+                }
+                out.push_str(&sgr_cup(y0 + h - 1, x0));
+                out.push_str(SGR_RESET);
+                out.push('\u{2514}');
+                out.push_str(&"\u{2500}".repeat((w - 2) as usize));
+                out.push('\u{2518}');
+                emit_sgr(&out);
+            }
             };
+
+            // Prompt overlay (Open/Save/Export path entry) — drawn whenever a
+            // text prompt is active, independent of the menu-open state.
+            with_state(|state| {
+                if state.prompt_action.is_some() {
+                    let mut out2 = String::new();
+                    let text = format!("{}: {}_", state.prompt_label, state.prompt_buffer);
+                    out2.push_str(&sgr_cup(1, 0));
+                    out2.push_str(SGR_RESET);
+                    out2.push_str(&" ".repeat(200));
+                    out2.push_str(&sgr_cup(1, 0));
+                    out2.push_str(sgr_prompt());
+                    out2.push_str(&text);
+                    out2.push_str(SGR_RESET);
+                    emit_sgr(&out2);
+                }
+            });
+
             redraw_frame(&mut root);
 
             while with_state(|s| s.running) {
@@ -502,29 +736,53 @@ mod pancurses_backend {
                             fire_callbacks(callbacks);
                         }
                     }
-                    Some(Input::Character('q')) | Some(Input::Character('Q')) => {
-                        // Cancel any active edit and quit
-                        with_state(|state| state.pending_quit = false);
-                        with_state(|state| {
-                            if let Some(fid) = state.focus_id {
-                                if is_spreadsheet_focused(state, fid) {
-                                    if let Some(n) = state.node_mut(fid) {
-                                        if let PcWidgetKind::Spreadsheet { ref mut editing, ref mut edit_buf, .. } = n.kind {
-                                            *editing = false;
-                                            edit_buf.clear();
-                                        }
-                                    }
-                                }
-                            }
-                        });
-                        with_state(|state| state.running = false);
-                    }
                     Some(Input::Character('\n')) | Some(Input::Character('\r')) => {
                         with_state(|state| state.pending_quit = false);
+                        // If a text prompt is active, submit it instead of the usual Enter.
+                        let prompt: Option<(String, String)> = with_state(|state| {
+                            if let Some(a) = state.prompt_action.take() {
+                                let t = std::mem::take(&mut state.prompt_buffer);
+                                Some((a, t))
+                            } else {
+                                None
+                            }
+                        });
+                        if let Some((action, text)) = prompt {
+                            let cb = with_state(|state| state.prompt_callback.take());
+                            if let Some(mut cb) = cb {
+                                cb(action, text);
+                                with_state(|state| state.prompt_callback = Some(cb));
+                            }
+                            redraw_frame(&mut root);
+                            continue;
+                        }
+                        // If a menu is open, capture the active item's action name and
+                        // dispatch it (instead of only closing the menu).  A submenu
+                        // item is entered instead (matching ratatui).
+                        let menu_action: Option<String> = with_state(|state| {
+                            if state.menu_open {
+                                let item = menu_current_item(state).cloned();
+                                match item {
+                                    Some(crate::MenuItem::Action { action, .. }) => {
+                                        state.menu_open = false;
+                                        Some(action)
+                                    }
+                                    Some(crate::MenuItem::Submenu { .. }) => {
+                                        menu_enter_submenu(state);
+                                        None
+                                    }
+                                    None => {
+                                        state.menu_open = false;
+                                        None
+                                    }
+                                }
+                            } else {
+                                None
+                            }
+                        });
                         // Process Enter action and collect toggle callbacks
                         let toggle_callbacks: Vec<Callback> = with_state(|state| {
-                            if state.menu_open {
-                                state.menu_open = false;
+                            if menu_action.is_some() {
                                 vec![]
                             } else if let Some(fid) = state.focus_id {
                                 if is_spreadsheet_focused(state, fid) {
@@ -539,37 +797,85 @@ mod pancurses_backend {
                             }
                         });
                         fire_callbacks(toggle_callbacks);
-                        // Fire cursor-move callbacks OUTSIDE with_state to avoid
-                        // double-borrow panic when callbacks call with_state (e.g.
-                        // fill_cells → spreadsheet.set_cell → with_state).
-                        let cursor_pos = with_state(|state| {
-                            if let Some(fid) = state.focus_id {
-                                if is_spreadsheet_focused(state, fid) {
-                                    let n = state.node(fid).unwrap();
-                                    if let PcWidgetKind::Spreadsheet { cursor_row, cursor_col, .. } = &n.kind {
-                                        Some((*cursor_row, *cursor_col))
-                                    } else {
-                                        None
+                        // Fire any deferred commit-edit callbacks BEFORE the cursor-move
+                        // callback re-fills cells, so the grid already holds the committed
+                        // value.  Otherwise the re-fill reads the stale pre-commit grid and
+                        // the display reverts to the old text until the next redraw (e.g.
+                        // overwriting A1 with "BBB" then moving Up/Down flickers between
+                        // "AAA" and "AAABBB").
+                        let deferred = DEFERRED_COMMIT.with(|d| d.borrow_mut().drain(..).collect::<Vec<_>>());
+                        for (r, c, val, mut cbs) in deferred {
+                            for cb in cbs.iter_mut() { cb(r, c, val.clone()); }
+                            with_state(|state| state.commit_edit_callbacks.append(&mut cbs));
+                        }
+                        // After Enter on a spreadsheet, fire the cursor-move callbacks
+                        // (outside any with_state borrow) so the host can sync the app
+                        // cursor and grow the grid — matching arrow-key behavior.  This
+                        // keeps the formula bar / row labels correct after commit+move.
+                        if menu_action.is_none() {
+                            let enter_pos: Option<(u32, u32)> = with_state(|state| {
+                                if let Some(fid) = state.focus_id {
+                                    if is_spreadsheet_focused(state, fid) {
+                                        if let Some(n) = state.node(fid) {
+                                            if let PcWidgetKind::Spreadsheet { cursor_row, cursor_col, .. } = &n.kind {
+                                                return Some((*cursor_row, *cursor_col));
+                                            }
+                                        }
                                     }
-                                } else {
-                                    None
                                 }
-                            } else {
                                 None
+                            });
+                            if let Some((row, col)) = enter_pos {
+                                let mut cbs = with_state(|state| std::mem::take(&mut state.cursor_move_callbacks));
+                                for cb in cbs.iter_mut() { cb(row, col); }
+                                with_state(|state| state.cursor_move_callbacks = cbs);
                             }
-                        });
-                        if let Some((row, col)) = cursor_pos {
-                            let mut cbs = with_state(|state| std::mem::take(&mut state.cursor_move_callbacks));
-                            for cb in cbs.iter_mut() { cb(row, col); }
-                            with_state(|state| state.cursor_move_callbacks = cbs);
+                        }
+                        if let Some(action) = menu_action {
+                            if action == "quit" {
+                                with_state(|state| state.running = false);
+                            } else {
+                                let cb = with_state(|state| state.menu_action_callback.take());
+                                if let Some(mut cb) = cb {
+                                    cb(action);
+                                    with_state(|state| state.menu_action_callback = Some(cb));
+                                }
+                            }
                         }
                     }
                     Some(Input::Character(c)) => {
                         with_state(|state| state.pending_quit = false);
+                        // Ctrl+Q quits (matching the ratatui backend); plain 'q'/'Q' are text.
+                        if c == '\x11' {
+                            with_state(|state| state.running = false);
+                            continue;
+                        }
+                        // While a prompt is active, route all input into the prompt buffer.
+                        // Escape closes the modal info dialog (About/Help).
+                        if c == '\x1b' && ACTIVE_DIALOG.with(|d| d.borrow().is_some()) {
+                                                        clear_dialog_area(&root);
+                            ACTIVE_DIALOG.with(|d| *d.borrow_mut() = None);
+                            redraw_frame(&mut root);
+                                                        continue;
+                        }
+                        if with_state(|state| state.prompt_action.is_some()) {
+                            if c == '\x1b' {
+                                with_state(|state| {
+                                    state.prompt_action = None;
+                                    state.prompt_buffer.clear();
+                                    state.prompt_label.clear();
+                                });
+                            } else {
+                                with_state(|state| state.prompt_buffer.push(c));
+                            }
+                            redraw_frame(&mut root);
+                            continue;
+                        }
                         if c == '\t' {
                             with_state(|state| {
                                 if state.menu_open {
                                     state.menu_open = false;
+                                    state.menu_stack.clear();
                                 } else if let Some(fid) = state.focus_id {
                                     if is_spreadsheet_focused(state, fid) {
                                         spreadsheet_commit_edit(state, fid);
@@ -633,7 +939,7 @@ mod pancurses_backend {
                                                                 spreadsheet_commit_edit(state, fid);
                                                                 let needs_sentinel = {
                                                                     if let Some(n) = state.node_mut(fid) {
-                                                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_row, ref mut cursor_col, total_rows, total_cols, .. } = n.kind {
+                                                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_row, ref mut cursor_col, total_rows, .. } = n.kind {
                                                                             match dir_char {
                                                                                 'A' => { if *cursor_row > 0 { *cursor_row -= 1; None } else { Some(u32::MAX) } }
                                                                                 'B' => { if *cursor_row + 1 < total_rows { *cursor_row += 1; None } else { Some(u32::MAX - 1) } }
@@ -693,24 +999,40 @@ mod pancurses_backend {
                                 }
                                 Some(Input::Character(ac)) => {
                                     with_state(|state| state.pending_quit = false);
-                                    // Alt+key — activate matching submenu
-                                    with_state(|state| {
-                                        if let Some(mid) = state.menu_bar_id {
-                                            if let Some(n) = state.node(mid) {
-                                                if let PcWidgetKind::MenuBar { labels, .. } = &n.kind {
-                                                    let lower = ac.to_ascii_lowercase();
-                                                    if let Some(pos) = labels.iter().position(|l| l.to_ascii_lowercase().starts_with(&lower.to_string())) {
-                                                        state.active_submenu = pos;
-                                                        state.active_item = 0;
-                                                        state.menu_open = true;
+                                    // Alt+key — let the host app decide what to open (e.g. a
+                                    // specific menu/submenu via `open_menu`).  If no callback
+                                    // is installed, fall back to opening the root menu whose
+                                    // label starts with the letter (generic behavior).
+                                    let handled = ALT_KEY_CALLBACK.with(|c| {
+                                        if let Some(cb) = c.borrow_mut().as_mut() {
+                                            cb(ac)
+                                        } else {
+                                            false
+                                        }
+                                    });
+                                    if !handled {
+                                        with_state(|state| {
+                                            if let Some(mid) = state.menu_bar_id {
+                                                if let Some(n) = state.node(mid) {
+                                                    if let PcWidgetKind::MenuBar { labels, .. } = &n.kind {
+                                                        let lower = ac.to_ascii_lowercase();
+                                                        if let Some(pos) = labels.iter().position(|l| l.to_ascii_lowercase().starts_with(&lower.to_string())) {
+                                                            state.active_submenu = pos;
+                                                            state.menu_stack.clear();
+                                                            state.active_item = 0;
+                                                            state.menu_open = true;
+                                                        }
                                                     }
                                                 }
                                             }
-                                        }
-                                    });
+                                        });
+                                    }
                                 }
                                 _ => {
                                     // No following char within 300ms → bare Escape
+                                    // Close any modal info dialog first.
+                                    clear_dialog_area(&root);
+                                    ACTIVE_DIALOG.with(|d| *d.borrow_mut() = None);
                                     with_state(|state| {
                                         if let Some(fid) = state.focus_id {
                                             if is_spreadsheet_focused(state, fid) {
@@ -739,16 +1061,20 @@ mod pancurses_backend {
                             // Ctrl+C — quit
                             with_state(|state| state.running = false);
                         } else if c == '\x07' {
-                            // Ctrl+G — Go to column 0, row 999 (shows as A1000)
+                            // Ctrl+G — Go to a target cell (the target is registered
+                            // by corro's pnc_backend, e.g. A1000) and re-render the
+                            // viewport around it.
+                            {
+                                let mut goto_cbs: Vec<Box<dyn FnMut()>> =
+                                    with_state(|state| std::mem::take(&mut state.goto_callbacks));
+                                for cb in goto_cbs.iter_mut() {
+                                    cb();
+                                }
+                                with_state(|state| state.goto_callbacks = goto_cbs);
+                            }
                             with_state(|state| {
                                 if let Some(fid) = state.focus_id {
                                     if is_spreadsheet_focused(state, fid) {
-                                        if let Some(n) = state.node_mut(fid) {
-                                            if let PcWidgetKind::Spreadsheet { ref mut cursor_row, ref mut cursor_col, .. } = n.kind {
-                                                *cursor_col = 0;
-                                                *cursor_row = 999;
-                                            }
-                                        }
                                         spreadsheet_scroll_to_cursor(state, fid);
                                     }
                                 }
@@ -849,6 +1175,11 @@ mod pancurses_backend {
                         }
                     }
                     Some(Input::KeyBackspace) => {
+                        if with_state(|state| state.prompt_action.is_some()) {
+                            with_state(|state| { state.prompt_buffer.pop(); });
+                            redraw_frame(&mut root);
+                            continue;
+                        }
                         with_state(|state| {
                             if let Some(fid) = state.focus_id {
                                 if is_spreadsheet_focused(state, fid) {
@@ -896,7 +1227,9 @@ mod pancurses_backend {
                         with_state(|state| state.pending_quit = false);
                         let new_pos = with_state(|state| {
                             if state.menu_open {
-                                if state.active_submenu > 0 {
+                                if !state.menu_stack.is_empty() {
+                                    menu_exit_submenu(state);
+                                } else if state.active_submenu > 0 {
                                     state.active_submenu -= 1;
                                     state.active_item = 0;
                                 }
@@ -907,24 +1240,57 @@ mod pancurses_backend {
                                         let n = state.node(fid).unwrap();
                                         matches!(&n.kind, PcWidgetKind::Spreadsheet { editing: true, .. })
                                     };
-                                    spreadsheet_prepare_move(state, fid, false);
-                                    spreadsheet_commit_edit(state, fid);
-                                    if let Some(n) = state.node_mut(fid) {
-                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_col, ref cursor_row, .. } = n.kind {
-                                            if *cursor_col > 0 { *cursor_col -= 1; }
-                                        }
-                                    }
-                                    // Re-enter edit mode if we were editing before (like ratatui)
                                     if was_editing {
-                                        spreadsheet_enter(state, fid);
+                                        // Edit mode: Left moves the edit caret within the
+                                        // buffer (matching ratatui).  Only when the caret is
+                                        // at the start does it discard the edit and move the
+                                        // cell cursor left.
+                                        let at_start = {
+                                            let n = state.node(fid).unwrap();
+                                            if let PcWidgetKind::Spreadsheet { edit_pos, .. } = &n.kind {
+                                                *edit_pos == 0
+                                            } else { true }
+                                        };
+                                        if !at_start {
+                                            if let Some(n) = state.node_mut(fid) {
+                                                if let PcWidgetKind::Spreadsheet { ref mut edit_pos, .. } = n.kind {
+                                                    *edit_pos -= 1;
+                                                }
+                                            }
+                                            return None;
+                                        } else {
+                                            // Discard the in-progress edit and move the cell left.
+                                            if let Some(n) = state.node_mut(fid) {
+                                                if let PcWidgetKind::Spreadsheet { ref mut editing, ref mut edit_buf, ref mut edit_pos, ref mut cursor_col, .. } = n.kind {
+                                                    *editing = false;
+                                                    edit_buf.clear();
+                                                    *edit_pos = 0;
+                                                    if *cursor_col > 0 { *cursor_col -= 1; }
+                                                }
+                                            }
+                                            let (row, col) = {
+                                                let n = state.node(fid).unwrap();
+                                                if let PcWidgetKind::Spreadsheet { cursor_row, cursor_col, .. } = &n.kind {
+                                                    (*cursor_row, *cursor_col)
+                                                } else { (0, 0) }
+                                            };
+                                            return Some((row, col));
+                                        }
+                                    } else {
+                                        // Not editing: move the cell cursor left.
+                                        if let Some(n) = state.node_mut(fid) {
+                                            if let PcWidgetKind::Spreadsheet { ref mut cursor_col, .. } = n.kind {
+                                                if *cursor_col > 0 { *cursor_col -= 1; }
+                                            }
+                                        }
+                                        let (row, col) = {
+                                            let n = state.node(fid).unwrap();
+                                            if let PcWidgetKind::Spreadsheet { cursor_row, cursor_col, .. } = &n.kind {
+                                                (*cursor_row, *cursor_col)
+                                            } else { (0, 0) }
+                                        };
+                                        return Some((row, col));
                                     }
-                                    let (row, col) = {
-                                        let n = state.node(fid).unwrap();
-                                        if let PcWidgetKind::Spreadsheet { cursor_row, cursor_col, .. } = &n.kind {
-                                            (*cursor_row, *cursor_col)
-                                        } else { (0, 0) }
-                                    };
-                                    return Some((row, col));
                                 } else if let Some(n) = state.node_mut(fid) {
                                     if let PcWidgetKind::Entry { ref mut cursor, .. } = n.kind {
                                         if *cursor > 0 { *cursor -= 1; }
@@ -945,12 +1311,17 @@ mod pancurses_backend {
                         with_state(|state| state.pending_quit = false);
                         let new_pos = with_state(|state| {
                             if state.menu_open {
-                                if let Some(mid) = state.menu_bar_id {
-                                    if let Some(n) = state.node(mid) {
-                                        if let PcWidgetKind::MenuBar { labels, .. } = &n.kind {
-                                            if state.active_submenu + 1 < labels.len() {
-                                                state.active_submenu += 1;
-                                                state.active_item = 0;
+                                if menu_current_is_submenu(state) {
+                                    menu_enter_submenu(state);
+                                } else {
+                                    state.menu_stack.clear();
+                                    if let Some(mid) = state.menu_bar_id {
+                                        if let Some(n) = state.node(mid) {
+                                            if let PcWidgetKind::MenuBar { labels, .. } = &n.kind {
+                                                if state.active_submenu + 1 < labels.len() {
+                                                    state.active_submenu += 1;
+                                                    state.active_item = 0;
+                                                }
                                             }
                                         }
                                     }
@@ -962,23 +1333,55 @@ mod pancurses_backend {
                                         let n = state.node(fid).unwrap();
                                         matches!(&n.kind, PcWidgetKind::Spreadsheet { editing: true, .. })
                                     };
-                                    spreadsheet_prepare_move(state, fid, false);
-                                    spreadsheet_commit_edit(state, fid);
-                                    if let Some(n) = state.node_mut(fid) {
-                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_row, ref mut cursor_col, .. } = n.kind {
-                                            *cursor_col += 1;
-                                        }
-                                    }
                                     if was_editing {
-                                        spreadsheet_enter(state, fid);
+                                        // Edit mode: Right moves the edit caret within the
+                                        // buffer (matching ratatui).  Only when the caret is
+                                        // at the end does it commit the edit, move the cell
+                                        // right, and exit edit mode.
+                                        let at_end = {
+                                            let n = state.node(fid).unwrap();
+                                            if let PcWidgetKind::Spreadsheet { edit_pos, edit_buf, .. } = &n.kind {
+                                                *edit_pos >= edit_buf.chars().count()
+                                            } else { true }
+                                        };
+                                        if !at_end {
+                                            if let Some(n) = state.node_mut(fid) {
+                                                if let PcWidgetKind::Spreadsheet { ref mut edit_pos, .. } = n.kind {
+                                                    *edit_pos += 1;
+                                                }
+                                            }
+                                            return None;
+                                        } else {
+                                            // Commit the edit, move the cell right, exit edit mode.
+                                            spreadsheet_commit_edit(state, fid);
+                                            if let Some(n) = state.node_mut(fid) {
+                                                if let PcWidgetKind::Spreadsheet { ref mut cursor_col, .. } = n.kind {
+                                                    *cursor_col += 1;
+                                                }
+                                            }
+                                            let (row, col) = {
+                                                let n = state.node(fid).unwrap();
+                                                if let PcWidgetKind::Spreadsheet { cursor_row, cursor_col, .. } = &n.kind {
+                                                    (*cursor_row, *cursor_col)
+                                                } else { (0, 0) }
+                                            };
+                                            return Some((row, col));
+                                        }
+                                    } else {
+                                        // Not editing: move the cell cursor right.
+                                        if let Some(n) = state.node_mut(fid) {
+                                            if let PcWidgetKind::Spreadsheet { ref mut cursor_col, .. } = n.kind {
+                                                *cursor_col += 1;
+                                            }
+                                        }
+                                        let (row, col) = {
+                                            let n = state.node(fid).unwrap();
+                                            if let PcWidgetKind::Spreadsheet { cursor_row, cursor_col, .. } = &n.kind {
+                                                (*cursor_row, *cursor_col)
+                                            } else { (0, 0) }
+                                        };
+                                        return Some((row, col));
                                     }
-                                    let (row, col) = {
-                                        let n = state.node(fid).unwrap();
-                                        if let PcWidgetKind::Spreadsheet { cursor_row, cursor_col, .. } = &n.kind {
-                                            (*cursor_row, *cursor_col)
-                                        } else { (0, 0) }
-                                    };
-                                    return Some((row, col));
                                 } else if let Some(n) = state.node_mut(fid) {
                                     if let PcWidgetKind::Entry { ref mut cursor, ref buffer } = n.kind {
                                         if *cursor < buffer.len() { *cursor += 1; }
@@ -999,15 +1402,9 @@ mod pancurses_backend {
                         with_state(|state| state.pending_quit = false);
                         let new_pos = with_state(|state| {
                             if state.menu_open {
-                                if let Some(mid) = state.menu_bar_id {
-                                    if let Some(n) = state.node(mid) {
-                                        if let PcWidgetKind::MenuBar { submenu_items, .. } = &n.kind {
-                                            let si = state.active_submenu;
-                                            if si < submenu_items.len() && state.active_item > 0 {
-                                                state.active_item -= 1;
-                                            }
-                                        }
-                                    }
+                                let len = menu_current_items(state).map(|items| items.len()).unwrap_or(0);
+                                if len > 0 && state.active_item > 0 {
+                                    state.active_item -= 1;
                                 }
                                 None
                             } else if let Some(fid) = state.focus_id {
@@ -1072,15 +1469,9 @@ mod pancurses_backend {
                         with_state(|state| state.pending_quit = false);
                         let new_pos = with_state(|state| {
                             if state.menu_open {
-                                if let Some(mid) = state.menu_bar_id {
-                                    if let Some(n) = state.node(mid) {
-                                        if let PcWidgetKind::MenuBar { submenu_items, .. } = &n.kind {
-                                            let si = state.active_submenu;
-                                            if si < submenu_items.len() && state.active_item + 1 < submenu_items[si].1.len() {
-                                                state.active_item += 1;
-                                            }
-                                        }
-                                    }
+                                let len = menu_current_items(state).map(|items| items.len()).unwrap_or(0);
+                                if len > 0 && state.active_item + 1 < len {
+                                    state.active_item += 1;
                                 }
                                 None
                             } else if let Some(fid) = state.focus_id {
@@ -1145,109 +1536,6 @@ mod pancurses_backend {
                             for cb in cbs.iter_mut() { cb(row, col); }
                             with_state(|state| state.cursor_move_callbacks = cbs);
                         }
-                    }
-                    Some(Input::KeyLeft) => {
-                        with_state(|state| {
-                            if state.menu_open {
-                                if state.active_submenu > 0 {
-                                    state.active_submenu -= 1;
-                                    state.active_item = 0;
-                                }
-                            } else if let Some(fid) = state.focus_id {
-                                if is_spreadsheet_focused(state, fid) {
-                                    spreadsheet_commit_edit(state, fid);
-                                    if let Some(n) = state.node_mut(fid) {
-                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_col, .. } = n.kind {
-                                            if *cursor_col > 0 { *cursor_col -= 1; }
-                                        }
-                                    }
-                                    spreadsheet_scroll_to_cursor(state, fid);
-                                } else if let Some(n) = state.node_mut(fid) {
-                                    if let PcWidgetKind::Entry { ref mut cursor, .. } = n.kind {
-                                        if *cursor > 0 { *cursor -= 1; }
-                                    }
-                                }
-                            }
-                        });
-                    }
-                    Some(Input::KeyRight) => {
-                        with_state(|state| {
-                            if state.menu_open {
-                                if let Some(mid) = state.menu_bar_id {
-                                    if let Some(n) = state.node(mid) {
-                                        if let PcWidgetKind::MenuBar { labels, .. } = &n.kind {
-                                            if state.active_submenu + 1 < labels.len() {
-                                                state.active_submenu += 1;
-                                                state.active_item = 0;
-                                            }
-                                        }
-                                    }
-                                }
-                            } else if let Some(fid) = state.focus_id {
-                                if is_spreadsheet_focused(state, fid) {
-                                    spreadsheet_commit_edit(state, fid);
-                                    if let Some(n) = state.node_mut(fid) {
-                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_col, total_cols, .. } = n.kind {
-                                            if *cursor_col + 1 < total_cols { *cursor_col += 1; }
-                                        }
-                                    }
-                                } else if let Some(n) = state.node_mut(fid) {
-                                    if let PcWidgetKind::Entry { ref mut cursor, ref buffer } = n.kind {
-                                        if *cursor < buffer.len() { *cursor += 1; }
-                                    }
-                                }
-                            }
-                        });
-                    }
-                    Some(Input::KeyUp) => {
-                        with_state(|state| {
-                            if state.menu_open {
-                                if let Some(mid) = state.menu_bar_id {
-                                    if let Some(n) = state.node(mid) {
-                                        if let PcWidgetKind::MenuBar { submenu_items, .. } = &n.kind {
-                                            let si = state.active_submenu;
-                                            if si < submenu_items.len() && state.active_item > 0 {
-                                                state.active_item -= 1;
-                                            }
-                                        }
-                                    }
-                                }
-                            } else if let Some(fid) = state.focus_id {
-                                if is_spreadsheet_focused(state, fid) {
-                                    spreadsheet_commit_edit(state, fid);
-                                    if let Some(n) = state.node_mut(fid) {
-                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_row, .. } = n.kind {
-                                            if *cursor_row > 0 { *cursor_row -= 1; }
-                                        }
-                                    }
-                                }
-                            }
-                        });
-                    }
-                    Some(Input::KeyDown) => {
-                        with_state(|state| {
-                            if state.menu_open {
-                                if let Some(mid) = state.menu_bar_id {
-                                    if let Some(n) = state.node(mid) {
-                                        if let PcWidgetKind::MenuBar { submenu_items, .. } = &n.kind {
-                                            let si = state.active_submenu;
-                                            if si < submenu_items.len() && state.active_item + 1 < submenu_items[si].1.len() {
-                                                state.active_item += 1;
-                                            }
-                                        }
-                                    }
-                                }
-                            } else if let Some(fid) = state.focus_id {
-                                if is_spreadsheet_focused(state, fid) {
-                                    spreadsheet_commit_edit(state, fid);
-                                    if let Some(n) = state.node_mut(fid) {
-                                        if let PcWidgetKind::Spreadsheet { ref mut cursor_row, total_rows, .. } = n.kind {
-                                            if *cursor_row + 1 < total_rows { *cursor_row += 1; }
-                                        }
-                                    }
-                                }
-                            }
-                        });
                     }
                     Some(Input::KeySLeft) => {
                         with_state(|state| {
@@ -1395,7 +1683,33 @@ mod pancurses_backend {
                     }
                     _ => {}
                 }
+                // Fire any commit-edit callbacks deferred during `with_state` (they call
+                // `with_state`-using adapter functions and must run outside the borrow).
+                let deferred = DEFERRED_COMMIT.with(|d| d.borrow_mut().drain(..).collect::<Vec<_>>());
+                for (r, c, val, mut cbs) in deferred {
+                    for cb in cbs.iter_mut() { cb(r, c, val.clone()); }
+                    // Restore the commit-edit callbacks: spreadsheet_commit_edit used
+                    // std::mem::take to stash them, so without restoring, the registry
+                    // is empty after the first commit and later edits never fire the
+                    // host callback (text would silently disappear).
+                    with_state(|state| state.commit_edit_callbacks.append(&mut cbs));
+                }
                             if input.is_some() { redraw_frame(&mut root); }
+                // Draw the active text prompt directly on top of the grid so it is
+                // always visible while a path/name is being entered.
+                if with_state(|state| state.prompt_action.is_some()) {
+                    let (label, buf) = with_state(|state| (state.prompt_label.clone(), state.prompt_buffer.clone()));
+                    let mut pout = String::new();
+                    let ptext = format!("{}: {}_", label, buf);
+                    pout.push_str(&sgr_cup(1, 0));
+                    pout.push_str(SGR_RESET);
+                    pout.push_str(&" ".repeat(200));
+                    pout.push_str(&sgr_cup(1, 0));
+                    pout.push_str(sgr_prompt());
+                    pout.push_str(&ptext);
+                    pout.push_str(SGR_RESET);
+                    emit_sgr(&pout);
+                }
 }
 
             endwin();
@@ -1928,7 +2242,7 @@ mod pancurses_backend {
                     // - normal rows: yellow fg
                     // - boundary (last main) row: underline + fg
                     let is_footer = label_str.starts_with('_');
-                    let is_header = label_str.starts_with('~');
+                    let _is_header = label_str.starts_with('~');
                     // Boundary rows: last header row and last main row before footers.
                     // Uses header_row_count/main_row_count directly (matching ratatui's
                     // last_display_main_row logic) instead of next-label heuristics
@@ -1998,7 +2312,7 @@ mod pancurses_backend {
                             }
                         }
                         // Determine last rendered x position for row-fill detection
-                        let last_col_end = if col_positions.is_empty() {
+                        let _last_col_end = if col_positions.is_empty() {
                             rect.x + 1 + 5
                         } else {
                             let last_idx = col_positions.len() - 1;
@@ -2614,7 +2928,7 @@ mod pancurses_backend {
                     let br = row_offset + max_data_rows as i32;
                     out.push_str(&sgr_cup(br, rect.x));
                     out.push_str("└");
-                    for i in 1..rect.w - 1 {
+                    for _i in 1..rect.w - 1 {
                         out.push('─');
                     }
                     out.push_str("┘");
@@ -2699,6 +3013,87 @@ mod pancurses_backend {
         state.node(fid).map_or(false, |n| matches!(n.kind, PcWidgetKind::Spreadsheet { .. }))
     }
 
+    // ── Menu helpers (submenu support) ────────────────────────────────────────
+
+    /// Rendered width of a menu item (label + " ▶" for submenu items).
+    fn menu_item_width(item: &crate::MenuItem) -> usize {
+        match item {
+            crate::MenuItem::Action { label, .. } => label.len(),
+            crate::MenuItem::Submenu { label, .. } => label.len() + 2,
+        }
+    }
+
+    /// All open menu levels: (popup_y, popup_x, items) for the root menu and
+    /// each submenu in `menu_stack`.  The root popup sits under the active root
+    /// label; each submenu popup sits to the right of the parent item.
+    fn menu_levels(state: &PcState) -> Option<Vec<(i32, i32, &Vec<crate::MenuItem>)>> {
+        let mid = state.menu_bar_id?;
+        let n = state.node(mid)?;
+        if let PcWidgetKind::MenuBar { labels, submenu_items } = &n.kind {
+            if state.active_submenu >= submenu_items.len() { return None; }
+            let win_w = n.rect.w as i32;
+            let dy = n.rect.y + 1;
+            let mut mx = n.rect.x + 1;
+            for i in 0..state.active_submenu {
+                mx += labels[i].len() as i32 + 2;
+            }
+            let (mut py, mut px) = (dy, mx);
+            let mut cur = &submenu_items[state.active_submenu].1;
+            let mut out = vec![(py, px, cur)];
+            for &ix in &state.menu_stack {
+                let bw = cur.iter().map(menu_item_width).max().unwrap_or(4) as i32 + 4;
+                py += ix as i32;
+                px += bw + 1;
+                // Clamp so the submenu popup stays on screen (right edge).
+                if px + bw > win_w { px = (win_w - bw).max(0); }
+                if ix < cur.len() {
+                    if let crate::MenuItem::Submenu { items, .. } = &cur[ix] {
+                        cur = items;
+                        out.push((py, px, cur));
+                    } else {
+                        return None;
+                    }
+                } else {
+                    return None;
+                }
+            }
+            Some(out)
+        } else {
+            None
+        }
+    }
+
+    /// The current (deepest) menu level's items.
+    fn menu_current_items(state: &PcState) -> Option<&Vec<crate::MenuItem>> {
+        menu_levels(state).and_then(|l| l.last().map(|(_, _, items)| *items))
+    }
+
+    /// The highlighted item at the current menu level.
+    fn menu_current_item(state: &PcState) -> Option<&crate::MenuItem> {
+        menu_current_items(state).and_then(|items| items.get(state.active_item))
+    }
+
+    /// True when the highlighted item at the current level is a submenu.
+    fn menu_current_is_submenu(state: &PcState) -> bool {
+        menu_current_item(state).map_or(false, |it| matches!(it, crate::MenuItem::Submenu { .. }))
+    }
+
+    /// Enter the highlighted submenu item (pushes onto the stack).
+    fn menu_enter_submenu(state: &mut PcState) {
+        if menu_current_is_submenu(state) {
+            state.menu_stack.push(state.active_item);
+            state.active_item = 0;
+        }
+    }
+
+    /// Exit the current submenu level (pops the stack).
+    fn menu_exit_submenu(state: &mut PcState) {
+        if !state.menu_stack.is_empty() {
+            state.menu_stack.pop();
+            state.active_item = 0;
+        }
+    }
+
     fn spreadsheet_enter(state: &mut PcState, fid: usize) {
         let result = {
             let n = state.node_mut(fid);
@@ -2766,21 +3161,24 @@ mod pancurses_backend {
             }
         };
         if let Some((r, c, val)) = result {
-            let mut cbs = std::mem::take(&mut state.commit_edit_callbacks);
-            for cb in cbs.iter_mut() { cb(r, c, val.clone()); }
-            state.commit_edit_callbacks = cbs;
+            // Defer firing to the main loop (outside any `with_state` borrow): these
+            // callbacks call `with_state`-using adapter functions, so firing them
+            // here (inside `with_state`) would panic with a double RefCell borrow.
+            let cbs = std::mem::take(&mut state.commit_edit_callbacks);
+            DEFERRED_COMMIT.with(|d| d.borrow_mut().push((r, c, val, cbs)));
         }
     }
 
     fn spreadsheet_scroll_to_cursor(state: &mut PcState, fid: usize) {
         if let Some(n) = state.node_mut(fid) {
-            if let PcWidgetKind::Spreadsheet { ref mut top_row, ref mut left_col, ref cursor_row, ref cursor_col, ref mut column_layout, ref cells, ref margin_cols, ref main_cols, .. } = n.kind {
+            if let PcWidgetKind::Spreadsheet { ref mut left_col, ref cursor_col, ref mut column_layout, ref cells, ref margin_cols, ref main_cols, .. } = n.kind {
                 // When a column layout was explicitly set (e.g. by corro's
                 // pnc_backend.rs), do not overwrite it — the application code
-                // has already computed the correct columns and widths.
-                if !column_layout.is_empty() {
-                    return;
-                }
+                // has already computed the correct columns and widths. Rebuild
+                // the dynamic layout only when it is empty (the widget-internal
+                // default); otherwise fall through and just refresh the formula
+                // bar so it tracks the current cursor.
+                if column_layout.is_empty() {
                 let lm = *margin_cols as usize;
                 let mc = *main_cols as usize;
                 let total = lm + mc + lm;
@@ -2872,6 +3270,7 @@ mod pancurses_backend {
                     let first_col = column_layout.first().map(|&(c, _, _)| c as usize).unwrap_or(0);
                     *left_col = first_col as u32;
                 }
+                }
             }
         }
         spreadsheet_update_formula_bar_inner(state, fid);
@@ -2909,9 +3308,11 @@ mod pancurses_backend {
             }
         };
         if let Some((r, c, val)) = result {
-            let mut cbs = std::mem::take(&mut state.commit_edit_callbacks);
-            for cb in cbs.iter_mut() { cb(r, c, val.clone()); }
-            state.commit_edit_callbacks = cbs;
+            // Defer firing to the main loop (outside any `with_state` borrow): these
+            // callbacks call `with_state`-using adapter functions, so firing them
+            // here (inside `with_state`) would panic with a double RefCell borrow.
+            let cbs = std::mem::take(&mut state.commit_edit_callbacks);
+            DEFERRED_COMMIT.with(|d| d.borrow_mut().push((r, c, val, cbs)));
         }
     }
 
@@ -3012,13 +3413,30 @@ mod pancurses_backend {
         Ok(with_state(|s| s.add_node(PcWidgetKind::SimpleAction, find_window_id(s))))
     }
 
-    pub unsafe fn create_menubar(submenu_items: Vec<(String, Vec<(String, String)>)>, _action_group: *mut c_void) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    pub unsafe fn create_menubar(submenu_items: Vec<(String, Vec<crate::MenuItem>)>, _action_group: *mut c_void) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
         let labels: Vec<String> = submenu_items.iter().map(|(l, _)| l.clone()).collect();
         Ok(with_state(|s| s.add_node(PcWidgetKind::MenuBar { labels, submenu_items }, find_window_id(s))))
     }
 
     pub fn create_dialog() -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(with_state(|s| s.add_node(PcWidgetKind::Dialog { title: String::new() }, find_window_id(s))))
+        Ok(with_state(|s| {
+            let id = s.add_node(PcWidgetKind::Dialog { title: String::new() }, find_window_id(s));
+            // Dialogs created at runtime otherwise keep a zero-size default rect and
+            // never render.  Give them a centered box sized to the window.
+            if let Some(win_id) = find_window_id(s) {
+                let (mw, mh) = s
+                    .node(win_id)
+                    .map(|w| (w.rect.w.max(40), w.rect.h.max(10)))
+                    .unwrap_or((80, 24));
+                if let Some(n) = s.node_mut(id) {
+                    let w = (mw * 3 / 4).clamp(20, (mw - 2).max(20));
+                    let h = (mh * 3 / 5).clamp(8, (mh - 2).max(8));
+                    n.rect = Rect { x: (mw - w) / 2, y: (mh - h) / 2, w, h };
+                    n.visible = true;
+                }
+            }
+            id
+        }))
     }
 
     pub fn create_dropdown(items: &[&str]) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
@@ -3269,6 +3687,12 @@ mod pancurses_backend {
         });
     }
 
+    pub fn spreadsheet_add_goto_callback<F: FnMut() + 'static>(f: F) {
+        with_state(|state| {
+            state.goto_callbacks.push(Box::new(f));
+        });
+    }
+
     pub fn spreadsheet_set_cursor(id: usize, row: u32, col: u32) {
         with_state(|s| {
             if let Some(n) = s.node_mut(id) {
@@ -3403,8 +3827,11 @@ mod pancurses_backend {
     pub fn set_window_title(id: usize, title: &str) {
         with_state(|s| {
             if let Some(n) = s.node_mut(id) {
-                if let PcWidgetKind::Window { title: ref mut t } = n.kind {
-                    *t = title.to_string();
+                match &mut n.kind {
+                    PcWidgetKind::Window { title: ref mut t } | PcWidgetKind::Dialog { title: ref mut t } => {
+                        *t = title.to_string();
+                    }
+                    _ => {}
                 }
             }
         });

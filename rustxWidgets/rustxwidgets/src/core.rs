@@ -7,6 +7,16 @@ use std::sync::Arc;
 /// Opaque handler id returned when connecting signals
 pub type HandlerId = u64;
 
+/// A menu item in a backend-agnostic menu model: either an action (dispatches a
+/// named action string) or a submenu (a nested list of items).  Backends render
+/// and navigate this model with their own widgets; the model itself is shared so
+/// an application can build one menu and hand it to any backend.
+#[derive(Clone, Debug)]
+pub enum MenuItem {
+    Action { label: String, action: String },
+    Submenu { label: String, items: Vec<MenuItem> },
+}
+
 /// Cross-platform 2D drawing surface.
 /// Each backend implements this trait with its own drawing primitives.
 pub trait DrawContext {

@@ -1,5 +1,5 @@
-use crate::grid::{CellAddr, ColumnAddr, GridBox, SheetCursor, HEADER_ROWS, MARGIN_COLS};
-use crate::ops::{Op, WorkbookOp};
+use crate::grid::{CellAddr, ColumnAddr, GridBox, SheetCursor, CellFormat, NumberFormat, TextAlign, HEADER_ROWS, MARGIN_COLS};
+use crate::ops::{Op, WorkbookOp, SheetState};
 use crate::ui_core;
 use std::collections::HashMap;
 use rustxwidgets::backends_pancurses_adapter::*;
@@ -56,9 +56,155 @@ fn fill_cells(
     );
 }
 
+
+/// Set a main cell value in the grid and log it to the live .corro file (if any).
+fn commit_cell(app: &mut super::App, addr: CellAddr, value: String) {
+    let sheet_id = app.core.workbook.sheet_id(app.core.workbook.active_sheet);
+    app.core.workbook.active_sheet_mut().grid.set(&addr, value.clone());
+    let op = Op::SetCell { addr, value };
+    let wbo = WorkbookOp::SheetOp { sheet_id, op };
+    if let Some(ref p) = app.core.path.clone() {
+        let mut active_sheet = sheet_id;
+        let _ = crate::io::commit_workbook_op(
+            p, &mut app.core.offset, &mut app.core.workbook, &mut active_sheet, &wbo,
+        );
+        app.core.ops_applied = app.core.ops_applied.saturating_add(1);
+    }
+}
+
+/// Simple A1-style label for a main cell (column letters + 1-indexed row).
+fn main_addr_label(row: u32, col: u32) -> String {
+    let mut name = String::new();
+    let mut c = col;
+    loop {
+        name.insert(0, (b'A' + (c % 26) as u8) as char);
+        if c < 26 { break; }
+        c = c / 26 - 1;
+    }
+    format!("{}{}", name, row + 1)
+}
+
+/// Apply `fmt` to a format target scope (0=Cell,1=All,2=Full column,3=Data,4=Special,5=Selection).
+fn apply_format(app: &mut super::App, scope: u8, main_row: u32, main_col: u32, fmt: CellFormat) {
+    let (mr, mc) = {
+        let sheet = app.core.workbook.active_sheet();
+        (sheet.grid.main_rows(), sheet.grid.main_cols())
+    };
+    let (r0, r1, c0, c1) = match scope {
+        1 | 3 | 4 => (0, mr, 0, mc),
+        2 => (0, mr, main_col as usize, main_col as usize + 1),
+        5 => {
+            let (ar, ac) = app.core.anchor
+                .map(|a| (a.row.saturating_sub(HEADER_ROWS), a.col.saturating_sub(MARGIN_COLS)))
+                .unwrap_or((main_row as usize, main_col as usize));
+            (
+                ar.min(main_row as usize),
+                ar.max(main_row as usize) + 1,
+                ac.min(main_col as usize),
+                ac.max(main_col as usize) + 1,
+            )
+        }
+        _ => (main_row as usize, main_row as usize + 1, main_col as usize, main_col as usize + 1),
+    };
+    for r in r0.min(mr)..r1.min(mr) {
+        for c in c0.min(mc)..c1.min(mc) {
+            app.core.workbook.active_sheet_mut().grid.set_cell_format(
+                CellAddr::Main { row: r as u32, col: c as u32 },
+                fmt,
+            );
+        }
+    }
+}
+
+/// Reorder the used main rows of the active sheet by `col` (ascending or descending).
+/// Returns the number of rows sorted.
+fn sort_sheet(app: &mut super::App, col: usize, asc: bool) -> usize {
+    let g = app.core.workbook.active_sheet().grid.clone();
+    let mr = g.main_rows();
+    let mc = g.main_cols();
+    if col >= mc || mr < 2 { return 0; }
+    let used: Vec<usize> = (0..mr)
+        .filter(|&r| (0..mc).any(|c| !g.get(&CellAddr::Main { row: r as u32, col: c as u32 }).unwrap_or_default().trim().is_empty()))
+        .collect();
+    if used.len() < 2 { return 0; }
+    let mut pairs: Vec<(usize, String)> = used.iter()
+        .map(|&r| (r, g.get(&CellAddr::Main { row: r as u32, col: col as u32 }).unwrap_or_default()))
+        .collect();
+    pairs.sort_by(|a, b| {
+        let na: Option<f64> = a.1.trim().parse().ok();
+        let nb: Option<f64> = b.1.trim().parse().ok();
+        let ord = match (na, nb) {
+            (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
+            _ => a.1.cmp(&b.1),
+        };
+        if asc { ord } else { ord.reverse() }
+    });
+    let mut cells: Vec<((usize, usize), String)> = Vec::new();
+    for &r in &used {
+        for c in 0..mc {
+            let v = g.get(&CellAddr::Main { row: r as u32, col: c as u32 }).unwrap_or_default();
+            if !v.trim().is_empty() {
+                cells.push(((r, c), v));
+            }
+        }
+    }
+    {
+        let g2 = app.core.workbook.active_sheet_mut();
+        for &r in &used {
+            for c in 0..mc {
+                g2.grid.set(&CellAddr::Main { row: r as u32, col: c as u32 }, String::new());
+            }
+        }
+    }
+    for (i, &(old, _)) in pairs.iter().enumerate() {
+        let new_row = used[i];
+        for ((r, c), v) in cells.iter() {
+            if *r == old {
+                app.core.workbook.active_sheet_mut().grid.set(
+                    &CellAddr::Main { row: new_row as u32, col: *c as u32 }, v.clone(),
+                );
+            }
+        }
+    }
+    used.len()
+}
+
+
+/// Show a modal info dialog (About / Help) in the pancurses UI.  The backend
+/// draws it via SGR on top of the spreadsheet output (ncurses widgets get
+/// overwritten by the spreadsheet's direct SGR writes).  Without this, Help ->
+/// About just set a status string and no dialog ever appeared.
+fn show_info_dialog(title: &str, text: &str) {
+    rustxwidgets::backends::pancurses::show_dialog(title, text);
+}
+
 pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Error>> {
     let _backend = rustxwidgets::backends::pancurses::init()
         .map_err(|e| format!("pancurses init failed: {e}"))?;
+
+    // Test-harness idle marker: the toolkit exposes a generic after-redraw
+    // callback; corro wires it to append to the CORRO_IDLE_MARKER file so a
+    // test can detect when a frame is fully flushed (instead of sleeping).
+    if let Ok(path) = std::env::var("CORRO_IDLE_MARKER") {
+        rustxwidgets::backends::pancurses::set_after_redraw_callback(Box::new(move || {
+            let _ = std::fs::OpenOptions::new().create(true).append(true).open(&path)
+                .and_then(|mut f| { use std::io::Write; writeln!(f, "idle") });
+        }));
+    }
+
+    // Alt+letter shortcuts matching the ratatui reference: Alt+O/T/W/A/X open
+    // specific File items/submenus.  The toolkit's generic alt-key callback
+    // lets the app decide; the backend itself knows nothing about corro's menus.
+    rustxwidgets::backends::pancurses::set_alt_key_callback(Box::new(|ch: char| {
+        match ch.to_ascii_lowercase() {
+            'o' => { rustxwidgets::backends::pancurses::open_menu(0, vec![], 0); true } // File -> Open file
+            't' => { rustxwidgets::backends::pancurses::open_menu(0, vec![2], 0); true } // File -> Export
+            'w' => { rustxwidgets::backends::pancurses::open_menu(0, vec![3], 0); true } // File -> Width
+            'a' => { rustxwidgets::backends::pancurses::open_menu(0, vec![2], 2); true } // File -> Export -> ASCII table
+            'x' => { rustxwidgets::backends::pancurses::open_menu(0, vec![3], 1); true } // File -> Width -> Column width
+            _ => false, // let the backend fall back to the root-menu prefix match
+        }
+    }));
 
     let win = create_window()?;
     win.set_title("corro");
@@ -260,28 +406,33 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // MenuBar via build_menu(). Without the widget, menu_bar_id is None and
     // Alt+key does nothing in the pancurses backend.
     spreadsheet.set_menu_text(" [File]   Edit    Insert    Format    Sheet    Help");
-    let submenu_items: Vec<(String, Vec<(String, String)>)> = [
+    // Build the menu bar from the shared, backend-agnostic menu model.  The
+    // same Menu type is used by every rustxwidgets backend, so the menu
+    // definitions in crate::gui::menu are not tied to the pancurses backend.
+    let menubar_model = rustxwidgets::backends_pancurses_adapter::create_menu()?;
+    for (label, items) in [
         ("File", crate::gui::menu::FILE_MENU),
         ("Edit", crate::gui::menu::EDIT_MENU),
-        ("View", crate::gui::menu::VIEW_MENU),
         ("Insert", crate::gui::menu::INSERT_MENU),
         ("Format", crate::gui::menu::FORMAT_MENU),
         ("Sheet", crate::gui::menu::SHEET_MENU),
-        ("Data", crate::gui::menu::DATA_MENU),
         ("Help", crate::gui::menu::HELP_MENU),
-    ]
-    .iter()
-    .map(|(label, items): &(&str, &[crate::gui::menu::MenuAction])| {
-        (
-            label.to_string(),
-            items
-                .iter()
-                .map(|a| (a.label.to_string(), crate::gui::menu::action_kind_to_name(a.action).to_string()))
-                .collect(),
-        )
-    })
-    .collect();
-    let mb_res = unsafe { rustxwidgets::backends::pancurses::create_menubar(submenu_items, std::ptr::null_mut()) };
+    ] {
+        let sub = rustxwidgets::backends_pancurses_adapter::create_menu()?;
+        for item in items {
+            if let Some(sub_items) = item.submenu {
+                let sub_sub = rustxwidgets::backends_pancurses_adapter::create_menu()?;
+                for sa in sub_items {
+                    sub_sub.append(sa.label, crate::gui::menu::action_kind_to_name(sa.action));
+                }
+                sub.append_submenu(item.label, &sub_sub);
+            } else {
+                sub.append(item.label, crate::gui::menu::action_kind_to_name(item.action));
+            }
+        }
+        menubar_model.append_submenu(label, &sub);
+    }
+    let _menubar = rustxwidgets::backends_pancurses_adapter::create_menubar(&menubar_model, std::ptr::null_mut())?;
 
     // Formula bar trailing: show app status text (matches ratatui's
     // mode_prompt_widget which appends "   ·  {status}" after the cell value).
@@ -300,10 +451,472 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // keys scrolls the visible columns/rows and the grid extent grows as needed.
     let display_rows_for_cb = std::rc::Rc::new(std::cell::RefCell::new(display_rows.clone()));
     let display_rows_for_ce = display_rows_for_cb.clone();
+    // Clones captured by the go-to (Ctrl+G) callback, taken here BEFORE the
+    // cursor-move / commit-edit closures move the originals below.
+    let dr_for_goto_cb = display_rows_for_cb.clone();
+    let dr_for_goto_ce = display_rows_for_ce.clone();
     let mut col_ixs_cb = col_ixs.clone();
     let sheet_cb = spreadsheet.clone();
     let sid = spreadsheet.id();
     let app_ptr: *mut super::App = app;
+
+    // Wire menu item activation: when a menu item is chosen in the pancurses UI,
+    // dispatch its action here.  "quit" is handled by the backend itself
+    // (sets running=false); everything else performs the corresponding op on the
+    // App or records status so the user sees the action fired.  Previously the
+    // pancurses Enter handler just closed the menu and did nothing.
+    let menu_ss = spreadsheet.clone();
+    // Persist the pending format target across the Scope/Number/Align picks,
+    // mirroring the ratatui menu (scope is chosen first, then the format).
+    let pending_scope: std::rc::Rc<std::cell::RefCell<u8>> = std::rc::Rc::new(std::cell::RefCell::new(0));
+    // Simple session clipboard for Copy/Cut/Paste.
+    let clipboard: std::rc::Rc<std::cell::RefCell<String>> = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+    rustxwidgets::backends::pancurses::set_menu_action_callback(Box::new(move |name: String| {
+        let app = unsafe { &mut *app_ptr };
+        let hr = HEADER_ROWS;
+        let lm = MARGIN_COLS;
+        let main_row = app.core.cursor.row.saturating_sub(hr) as u32;
+        let main_col = app.core.cursor.col.saturating_sub(lm) as u32;
+        let addr = CellAddr::Main { row: main_row, col: main_col };
+        let mut status: String = String::new();
+        // ── Actions that need a text prompt (path / name / search text) ──
+        match name.as_str() {
+            "open" | "save_as" | "export_tsv" | "export_csv" | "export_ods" | "export_ascii"
+            | "export_all" | "set_col_width" | "set_max_col_width" | "go_to_cell"
+            | "find" | "replace" | "rename_sheet" | "copy_sheet" | "delete_sheet"
+            | "insert_special_chars" | "insert_hyperlink" => {
+                let label = match name.as_str() {
+                    "open" => "Open file",
+                    "save_as" => "Save as",
+                    "export_tsv" => "Export TSV",
+                    "export_csv" => "Export CSV",
+                    "export_ods" => "Export ODS",
+                    "export_ascii" => "Export ASCII",
+                    "export_all" => "Export all to",
+                    "set_col_width" => "Column width",
+                    "set_max_col_width" => "Default width",
+                    "go_to_cell" => "Go to cell",
+                    "find" => "Find",
+                    "replace" => "Replace (find|replacement)",
+                    "rename_sheet" => "Rename sheet to",
+                    "copy_sheet" => "Copy sheet as",
+                    "delete_sheet" => "Delete sheet named",
+                    "insert_special_chars" => "Insert special char",
+                    "insert_hyperlink" => "Insert hyperlink",
+                    _ => "File",
+                };
+                rustxwidgets::backends::pancurses::set_prompt(label, &name);
+                return;
+            }
+            "save" => {
+                if let Some(ref p) = app.core.path.clone() {
+                    let snap = crate::ops::WorkbookSnapshot::from_workbook(&app.core.workbook);
+                    match crate::io::save_workbook(p, &snap) {
+                        Ok(()) => { app.core.status = "Saved".into(); menu_ss.set_formula_bar_trailing("   ·  Saved"); }
+                        Err(e) => { app.core.status = format!("Save error: {e}"); menu_ss.set_formula_bar_trailing(&format!("   ·  Save error: {e}")); }
+                    }
+                } else {
+                    rustxwidgets::backends::pancurses::set_prompt("Save as", "save_as");
+                }
+                return;
+            }
+            _ => {}
+        }
+        // ── Real operations ──
+        match name.as_str() {
+            "insert_rows" | "insert_mitosis_row" => {
+                app.core.workbook.active_sheet_mut().grid.grow_main_row_at_bottom();
+                status = "Inserted row".into();
+            }
+            "insert_cols" | "insert_mitosis_col" => {
+                app.core.workbook.active_sheet_mut().grid.grow_main_col_at_right();
+                status = format!("Inserted column ({name})");
+            }
+            "insert_date" => {
+                let d = chrono::Local::now().format("%Y-%m-%d").to_string();
+                commit_cell(app, addr.clone(), d.clone());
+                status = format!("Inserted date {d} at {}", main_addr_label(main_row, main_col));
+            }
+            "insert_time" => {
+                let t = chrono::Local::now().format("%H:%M:%S").to_string();
+                commit_cell(app, addr.clone(), t.clone());
+                status = format!("Inserted time {t} at {}", main_addr_label(main_row, main_col));
+            }
+            "delete_cell" | "delete" => {
+                commit_cell(app, addr.clone(), String::new());
+                status = format!("Cleared {}", main_addr_label(main_row, main_col));
+            }
+            "select_all" => {
+                let (mr, mc) = {
+                    let sheet = app.core.workbook.active_sheet();
+                    (sheet.grid.main_rows(), sheet.grid.main_cols())
+                };
+                if mr > 0 && mc > 0 {
+                    app.core.anchor = Some(SheetCursor { row: HEADER_ROWS, col: MARGIN_COLS });
+                    app.core.cursor = SheetCursor {
+                        row: HEADER_ROWS + mr.saturating_sub(1),
+                        col: MARGIN_COLS + mc.saturating_sub(1),
+                    };
+                }
+                status = "Selected all".into();
+            }
+            "new_sheet" => {
+                let id = app.core.workbook.next_sheet_id;
+                let title = format!("Sheet {id}");
+                let idx = app.core.workbook.add_sheet(title.clone(), SheetState::new(1, 1));
+                app.core.workbook.active_sheet = idx;
+                app.core.view_sheet_id = id;
+                app.core.cursor = SheetCursor { row: HEADER_ROWS, col: MARGIN_COLS };
+                let wbo = WorkbookOp::NewSheet { id, title: title.clone() };
+                if let Some(ref p) = app.core.path.clone() {
+                    let mut active_sheet = id;
+                    let _ = crate::io::commit_workbook_op(p, &mut app.core.offset, &mut app.core.workbook, &mut active_sheet, &wbo);
+                    app.core.ops_applied = app.core.ops_applied.saturating_add(1);
+                }
+                status = format!("New sheet created ({title})");
+            }
+            "copy" => {
+                let val = app.core.workbook.active_sheet().grid.get(&addr).unwrap_or_default();
+                *clipboard.borrow_mut() = val;
+                status = format!("Copied {}", main_addr_label(main_row, main_col));
+            }
+            "cut" => {
+                let val = app.core.workbook.active_sheet().grid.get(&addr).unwrap_or_default();
+                *clipboard.borrow_mut() = val;
+                commit_cell(app, addr.clone(), String::new());
+                status = format!("Cut {}", main_addr_label(main_row, main_col));
+            }
+            "paste" => {
+                let val = clipboard.borrow().clone();
+                if val.is_empty() {
+                    status = "Clipboard empty (use Copy/Cut first)".into();
+                } else {
+                    commit_cell(app, addr.clone(), val);
+                    status = format!("Pasted at {}", main_addr_label(main_row, main_col));
+                }
+            }
+            "sort_asc" | "sort_desc" | "sort_view" => {
+                let asc = name != "sort_desc";
+                let n = sort_sheet(app, main_col as usize, asc);
+                status = if n > 0 {
+                    format!("Sorted {n} rows by column {}", main_addr_label(0, main_col))
+                } else {
+                    "Nothing to sort".into()
+                };
+            }
+            "persist_sort" => status = "Persist sort: not available in the pancurses build".into(),
+            "replay" => status = "Replay: not available in the pancurses build".into(),
+            "extrapolate" => status = "Extrapolate: not available in the pancurses build".into(),
+            "duplicate" => {
+                let val = app.core.workbook.active_sheet().grid.get(&addr).unwrap_or_default();
+                if val.is_empty() {
+                    status = "Nothing to duplicate".into();
+                } else {
+                    let below = CellAddr::Main { row: main_row + 1, col: main_col };
+                    commit_cell(app, below.clone(), val);
+                    status = format!("Duplicated {} to {}", main_addr_label(main_row, main_col), main_addr_label(main_row + 1, main_col));
+                }
+            }
+            "sheet_prev" | "sheet_next" => {
+                let n = app.core.workbook.sheet_count();
+                if n > 1 {
+                    let delta = if name == "sheet_prev" { -1i32 } else { 1i32 };
+                    let cur = app.core.workbook.active_sheet as i32;
+                    let next = (cur + delta).rem_euclid(n as i32) as usize;
+                    app.core.workbook.active_sheet = next;
+                    app.core.view_sheet_id = app.core.workbook.sheet_id(next);
+                    app.core.cursor = SheetCursor { row: HEADER_ROWS, col: MARGIN_COLS };
+                    status = format!("Sheet: {}", app.core.workbook.sheet_title(next));
+                } else {
+                    status = "Only one sheet".into();
+                }
+            }
+            "move_sheet" => {
+                let n = app.core.workbook.sheet_count();
+                if n > 1 {
+                    let cur = app.core.workbook.active_sheet;
+                    let rec = app.core.workbook.sheets.remove(cur);
+                    app.core.workbook.sheets.push(rec);
+                    app.core.workbook.active_sheet = n - 1;
+                    app.core.view_sheet_id = app.core.workbook.sheet_id(n - 1);
+                    status = format!("Moved sheet to end ({})", app.core.workbook.sheet_title(n - 1));
+                } else {
+                    status = "Only one sheet".into();
+                }
+            }
+            "help_rows" => {
+                show_info_dialog(
+                    "Row ops",
+                    "Insert rows: Insert menu → Rows\nMitosis (Row): Insert menu → Mitosis (Row)\nCtrl+arrows move the cursor",
+                );
+                status = "Help: Row ops".into();
+            }
+            "help_cols" => {
+                show_info_dialog(
+                    "Col ops",
+                    "Insert cols: Insert menu → Cols\nMitosis (Col): Insert menu → Mitosis (Col)\nCtrl+arrows move the cursor",
+                );
+                status = "Help: Col ops".into();
+            }
+            "help_full" => {
+                show_info_dialog(
+                    "Full help",
+                    "F2 edit\narrows move\nEnter commit\nCtrl+G go-to\nCtrl+Q quit\nAlt+letter opens a menu",
+                );
+                status = "Help: Full help".into();
+            }
+            "format_apply_all" => { *pending_scope.borrow_mut() = 1; status = "Format scope: All".into(); }
+            "format_apply_full_column" => { *pending_scope.borrow_mut() = 2; status = "Format scope: Full column".into(); }
+            "format_apply_data" => { *pending_scope.borrow_mut() = 3; status = "Format scope: Data".into(); }
+            "format_apply_special" => { *pending_scope.borrow_mut() = 4; status = "Format scope: Special".into(); }
+            "format_apply_cell" => { *pending_scope.borrow_mut() = 0; status = "Format scope: Cell".into(); }
+            "format_apply_selection" => { *pending_scope.borrow_mut() = 5; status = "Format scope: Selection".into(); }
+            "format_decimal_generic" => { apply_format(app, *pending_scope.borrow(), main_row, main_col, CellFormat { number: Some(NumberFormat::DecimalGeneric), align: None }); status = "Format: Decimal (generic)".into(); }
+            "format_currency" => { apply_format(app, *pending_scope.borrow(), main_row, main_col, CellFormat { number: Some(NumberFormat::Currency { decimals: 2 }), align: None }); status = "Format: Currency ($)".into(); }
+            "format_rational" => { apply_format(app, *pending_scope.borrow(), main_row, main_col, CellFormat { number: Some(NumberFormat::Rational), align: None }); status = "Format: Rational".into(); }
+            "format_fixed_0" => { apply_format(app, *pending_scope.borrow(), main_row, main_col, CellFormat { number: Some(NumberFormat::Fixed { decimals: 0 }), align: None }); status = "Format: Fixed 0".into(); }
+            "format_fixed_1" => { apply_format(app, *pending_scope.borrow(), main_row, main_col, CellFormat { number: Some(NumberFormat::Fixed { decimals: 1 }), align: None }); status = "Format: Fixed 1".into(); }
+            "format_fixed_2" => { apply_format(app, *pending_scope.borrow(), main_row, main_col, CellFormat { number: Some(NumberFormat::Fixed { decimals: 2 }), align: None }); status = "Format: Fixed 2".into(); }
+            "format_fixed_custom" => { apply_format(app, *pending_scope.borrow(), main_row, main_col, CellFormat { number: Some(NumberFormat::Fixed { decimals: 2 }), align: None }); status = "Format: Fixed n".into(); }
+            "format_align_left" => { apply_format(app, *pending_scope.borrow(), main_row, main_col, CellFormat { number: None, align: Some(TextAlign::Left) }); status = "Format: Align Left".into(); }
+            "format_align_center" => { apply_format(app, *pending_scope.borrow(), main_row, main_col, CellFormat { number: None, align: Some(TextAlign::Center) }); status = "Format: Align Center".into(); }
+            "format_align_right" => { apply_format(app, *pending_scope.borrow(), main_row, main_col, CellFormat { number: None, align: Some(TextAlign::Right) }); status = "Format: Align Right".into(); }
+            "format_align_default" => { apply_format(app, *pending_scope.borrow(), main_row, main_col, CellFormat { number: None, align: Some(TextAlign::Default) }); status = "Format: Align Default".into(); }
+            "format_reset" => { apply_format(app, *pending_scope.borrow(), main_row, main_col, CellFormat { number: None, align: None }); status = "Format reset".into(); }
+            "about" => {
+                show_info_dialog(
+                    "About corro",
+                    "corro v0.6.0 — spreadsheet TUI (pancurses backend)",
+                );
+                status = "About".into();
+            }
+            "help_keybinds" => {
+                show_info_dialog(
+                    "Keybindings",
+                    "F2 edit\narrows move\nEnter commit\nCtrl+G go-to\nCtrl+Q quit",
+                );
+                status = "Help".into();
+            }
+            "toggle_headers" | "toggle_margins" => status = format!("Toggle: {name} (fixed chrome in this build)"),
+            "balance_books" => status = "Balance books: create a report from a data sheet — not available in the pancurses build".into(),
+            "undo" | "redo" => status = format!("{name}: no undo/redo history in the pancurses build yet"),
+            _ => status = format!("Menu action: {name}"),
+        }
+        if !status.is_empty() {
+            app.core.status = status.clone();
+            menu_ss.set_formula_bar_trailing(&format!("   ·  {}", status));
+        }
+    }));
+
+    // Prompt callback: perform the real file operation for path/name actions
+    // (Open/Save As/Export) submitted via the TUI text prompt.
+    let prompt_ss = spreadsheet.clone();
+    rustxwidgets::backends::pancurses::set_prompt_callback(Box::new(move |action: String, text: String| {
+        let app = unsafe { &mut *app_ptr };
+        let path = text.trim().to_string();
+        match action.as_str() {
+            "open" => {
+                if !path.is_empty() {
+                    match crate::io::load_workbook_snapshot(std::path::Path::new(&path)) {
+                        Ok(snap) => {
+                            app.core.workbook = crate::ops::WorkbookState::from_snapshot(&snap);
+                            app.core.offset = 0;
+                            app.core.ops_applied = 0;
+                            app.core.path = Some(std::path::PathBuf::from(path.clone()));
+                            app.core.status = format!("Opened {}", path);
+                        }
+                        Err(e) => app.core.status = format!("Open error: {e}"),
+                    }
+                }
+            }
+            "save_as" => {
+                if !path.is_empty() {
+                    let p = std::path::Path::new(&path);
+                    let snap = crate::ops::WorkbookSnapshot::from_workbook(&app.core.workbook);
+                    match crate::io::save_workbook(p, &snap) {
+                        Ok(()) => {
+                            app.core.path = Some(std::path::PathBuf::from(path.clone()));
+                            app.core.status = format!("Saved to {}", path);
+                        }
+                        Err(e) => app.core.status = format!("Save error: {e}"),
+                    }
+                }
+            }
+            "export_tsv" | "export_csv" | "export_ods" | "export_ascii" | "export_all" => {
+                if !path.is_empty() {
+                    let g = app.core.workbook.active_sheet().grid.clone();
+                    match std::fs::File::create(&path) {
+                        Ok(mut f) => {
+                            let r: Result<(), String> = match action.as_str() {
+                                "export_tsv" => { crate::export::export_tsv(&g, &mut f); Ok(()) }
+                                "export_csv" => { crate::export::export_csv(&g, &mut f); Ok(()) }
+                                "export_ascii" => { crate::export::export_ascii_table(&g, &mut f, true); Ok(()) }
+                                "export_ods" => match crate::ods::export_ods_bytes(&g) {
+                                    Ok(bytes) => std::io::Write::write_all(&mut f, &bytes).map_err(|e| e.to_string()),
+                                    Err(e) => Err(e.to_string()),
+                                },
+                                "export_all" => { crate::export::export_tsv(&g, &mut f); Ok(()) }
+                                _ => Ok(()),
+                            };
+                            match r {
+                                Ok(()) => app.core.status = format!("Exported {} to {}", action, path),
+                                Err(e) => app.core.status = format!("Export error: {e}"),
+                            }
+                        }
+                        Err(e) => app.core.status = format!("Export error: {e}"),
+                    }
+                }
+            }
+            "set_col_width" | "set_max_col_width" => {
+                if let Ok(w) = path.trim().parse::<u32>() {
+                    app.core.status = format!("Column width set to {w} (applied on next render)");
+                } else {
+                    app.core.status = "Column width: enter a number".into();
+                }
+            }
+            "go_to_cell" => {
+                if !path.is_empty() {
+                    if let Some((addr, _, _)) = crate::addr::parse_cell_ref_at(&path, 0) {
+                        match addr {
+                            crate::grid::CellAddr::Main { row, col } => {
+                                app.core.cursor.row = HEADER_ROWS + row as usize;
+                                app.core.cursor.col = MARGIN_COLS + col as usize;
+                                app.core.status = format!("Go to {}", path);
+                            }
+                            _ => app.core.status = format!("Unknown cell '{}'", path),
+                        }
+                    } else {
+                        app.core.status = format!("Unknown cell '{}'", path);
+                    }
+                }
+            }
+            "find" => {
+                if !path.is_empty() {
+                    let g = app.core.workbook.active_sheet().grid.clone();
+                    let mut found = None;
+                    'find_loop: for r in 0..g.main_rows() {
+                        for c in 0..g.main_cols() {
+                            let v = g.get(&CellAddr::Main { row: r as u32, col: c as u32 }).unwrap_or_default();
+                            if !v.trim().is_empty() && v.contains(&path) {
+                                found = Some((r, c));
+                                break 'find_loop;
+                            }
+                        }
+                    }
+                    if let Some((r, c)) = found {
+                        app.core.cursor.row = HEADER_ROWS + r;
+                        app.core.cursor.col = MARGIN_COLS + c;
+                        app.core.status = format!("Found '{}' at {}", path, main_addr_label(r as u32, c as u32));
+                    } else {
+                        app.core.status = format!("'{}' not found", path);
+                    }
+                }
+            }
+            "replace" => {
+                let (find, repl) = match path.split_once('|') {
+                    Some((f, r)) => (f.to_string(), r.to_string()),
+                    None => (path.clone(), String::new()),
+                };
+                if find.is_empty() {
+                    app.core.status = "Replace: enter find|replacement".into();
+                } else {
+                    let g = app.core.workbook.active_sheet().grid.clone();
+                    let mr = g.main_rows();
+                    let mc = g.main_cols();
+                    let mut count = 0usize;
+                    for r in 0..mr {
+                        for c in 0..mc {
+                            let v = g.get(&CellAddr::Main { row: r as u32, col: c as u32 }).unwrap_or_default();
+                            if v.contains(&find) {
+                                let nv = v.replace(&find, &repl);
+                                commit_cell(app, CellAddr::Main { row: r as u32, col: c as u32 }, nv);
+                                count += 1;
+                            }
+                        }
+                    }
+                    app.core.status = format!("Replaced {count} occurrence(s)");
+                }
+            }
+            "rename_sheet" => {
+                if !path.is_empty() {
+                    let id = app.core.workbook.sheet_id(app.core.workbook.active_sheet);
+                    if let Some(sheet) = app.core.workbook.sheets.iter_mut().find(|s| s.id == id) {
+                        sheet.title = path.clone();
+                    }
+                    let wbo = WorkbookOp::RenameSheet { id, title: path.clone() };
+                    if let Some(ref p) = app.core.path.clone() {
+                        let mut active_sheet = id;
+                        let _ = crate::io::commit_workbook_op(p, &mut app.core.offset, &mut app.core.workbook, &mut active_sheet, &wbo);
+                        app.core.ops_applied = app.core.ops_applied.saturating_add(1);
+                    }
+                    app.core.status = format!("Renamed sheet to {}", path);
+                }
+            }
+            "copy_sheet" => {
+                if !path.is_empty() {
+                    let source_id = app.core.workbook.sheet_id(app.core.workbook.active_sheet);
+                    let id = app.core.workbook.next_sheet_id;
+                    if let Some(source) = app.core.workbook.sheets.iter().find(|s| s.id == source_id) {
+                        let nidx = app.core.workbook.add_sheet_record(crate::ops::SheetRecord {
+                            id,
+                            title: path.clone(),
+                            state: source.state.clone(),
+                            linked_source: source.linked_source.clone(),
+                        });
+                        app.core.workbook.active_sheet = nidx;
+                    }
+                    let wbo = WorkbookOp::CopySheet { source_id, id, title: path.clone() };
+                    if let Some(ref p) = app.core.path.clone() {
+                        let mut active_sheet = source_id;
+                        let _ = crate::io::commit_workbook_op(p, &mut app.core.offset, &mut app.core.workbook, &mut active_sheet, &wbo);
+                        app.core.ops_applied = app.core.ops_applied.saturating_add(1);
+                    }
+                    app.core.status = format!("Copied sheet as {}", path);
+                }
+            }
+            "delete_sheet" => {
+                if app.core.workbook.sheets.len() > 1 {
+                    let idx = if path.is_empty() {
+                        app.core.workbook.active_sheet
+                    } else {
+                        app.core.workbook.sheets.iter().position(|s| s.title == path).unwrap_or(app.core.workbook.active_sheet)
+                    };
+                    let id = app.core.workbook.sheets[idx].id;
+                    let wbo = WorkbookOp::DeleteSheet { id };
+                    if let Some(ref p) = app.core.path.clone() {
+                        let mut active_sheet = app.core.workbook.sheet_id(app.core.workbook.active_sheet);
+                        let _ = crate::io::commit_workbook_op(p, &mut app.core.offset, &mut app.core.workbook, &mut active_sheet, &wbo);
+                        app.core.ops_applied = app.core.ops_applied.saturating_add(1);
+                    }
+                    app.core.workbook.sheets.remove(idx);
+                    if app.core.workbook.active_sheet >= idx {
+                        app.core.workbook.active_sheet = app.core.workbook.active_sheet.saturating_sub(1);
+                    }
+                    app.core.status = if path.is_empty() { "Deleted active sheet".into() } else { format!("Deleted sheet {}", path) };
+                } else {
+                    app.core.status = "Cannot delete the last sheet".into();
+                }
+            }
+            "insert_special_chars" | "insert_hyperlink" => {
+                if !path.is_empty() {
+                    let hr = HEADER_ROWS;
+                    let lm = MARGIN_COLS;
+                    let addr = CellAddr::Main {
+                        row: app.core.cursor.row.saturating_sub(hr) as u32,
+                        col: app.core.cursor.col.saturating_sub(lm) as u32,
+                    };
+                    commit_cell(app, addr.clone(), path.clone());
+                    app.core.status = if action == "insert_special_chars" {
+                        format!("Inserted '{}'", path)
+                    } else {
+                        format!("Inserted hyperlink {}", path)
+                    };
+                }
+            }
+            _ => { app.core.status = format!("Menu: {}", action); }
+        }
+        prompt_ss.set_formula_bar_trailing(&format!("   ·  {}", app.core.status));
+    }));
     let hr_cb = hr;
     let hr_ce = hr;
     let mr_cb = mr;
@@ -493,7 +1106,14 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
             // row-growth condition at line ~753 already fired.
             let cur_mr = sheet.grid.main_rows();
             if logical_row >= hr_cb + cur_mr {
-                sheet.grid.grow_main_row_at_bottom();
+                // Grow the grid so the cursor row becomes a main row (matching
+                // ratatui's move_cursor_one_row_vertical, which extends the grid
+                // when the cursor moves down past the last main row).  Growing by
+                // one is not enough when the cursor jumps several rows at once.
+                let need = logical_row.saturating_sub(hr_cb) + 1;
+                if sheet.grid.main_rows() < need {
+                    sheet.grid.set_main_size(need, sheet.grid.main_cols());
+                }
             }
             sheet.grid.ensure_extent_for_cursor(logical_row, _display_col as usize);
             if sheet.grid.main_rows() != prev_mr || sheet.grid.main_cols() != prev_mc {
@@ -623,8 +1243,12 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         let main_row = logical_row.saturating_sub(hr_ce);
         let main_col = col.saturating_sub(lm_ce as u32);
         let addr = CellAddr::Main { row: main_row as u32, col: main_col as u32 };
+        crate::debug_log::log(&format!(
+            "COMMIT_CB display_row={} col={} logical_row={} hr_ce={} lm_ce={} main_row={} main_col={} addr={:?} value={:?} app_cursor_row={} app_cursor_col={}",
+            display_row, col, logical_row, hr_ce, lm_ce, main_row, main_col, addr, value, app.core.cursor.row, app.core.cursor.col
+        ));
         let sheet_id = app.core.workbook.sheet_id(app.core.workbook.active_sheet);
-        let op = Op::SetCell { addr, value };
+        let op = Op::SetCell { addr, value: value.clone() };
         let wbo = WorkbookOp::SheetOp { sheet_id, op };
         if let Some(ref p) = app.core.path.clone() {
             let mut active_sheet = sheet_id;
@@ -635,6 +1259,12 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                 &mut active_sheet,
                 &wbo,
             );
+            app.core.ops_applied = app.core.ops_applied.saturating_add(1);
+        } else {
+            // No live file: apply the value to the in-memory grid directly so the
+            // committed text is visible (commit_workbook_op is skipped without a
+            // path, which previously made the text vanish after Enter).
+            app.core.workbook.active_sheet_mut().grid.set(&addr, value);
             app.core.ops_applied = app.core.ops_applied.saturating_add(1);
         }
         // Re-align the committed cell's display text (spreadsheet_commit_edit
@@ -659,6 +1289,107 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
             };
             commit_sheet.set_cell(display_row, col, &aligned);
         }
+    });
+
+    // ── Go-to (Ctrl+G) callback ───────────────────────────────────────────
+    // The ratatui reference jump target for Ctrl+G is A1000. This callback
+    // recomputes the visible viewport around that cell, repopulates the
+    // widget, and positions the widget cursor there so the formula bar shows
+    // the target address (e.g. `A1000`).
+    let goto_sheet = spreadsheet.clone();
+    let app_ptr_goto = app_ptr;
+    let hr_goto = hr;
+    let lm_goto = MARGIN_COLS;
+    let sid_goto = sid;
+    add_goto_callback(move || {
+        let app = unsafe { &mut *app_ptr_goto };
+        let cursor = crate::grid::SheetCursor {
+            row: crate::grid::HEADER_ROWS + 999,
+            col: lm_goto,
+        };
+        // Ensure the jump target (A1000) actually exists in the grid so it is
+        // treated as a main row (label "1000") rather than spilling into a
+        // footer row. This mirrors ratatui's Go-To, which extends the grid to
+        // the jump target; without it, on a small workbook the far cursor is
+        // clamped to a footer label (e.g. `_996`) instead of `A1000`.
+        {
+            let sht = app.core.workbook.active_sheet_mut();
+            let target_main_row = cursor.row - crate::grid::HEADER_ROWS + 1; // = 1000
+            if sht.grid.main_rows() < target_main_row {
+                sht.grid.set_main_size(target_main_row, sht.grid.main_cols());
+            }
+        }
+        // Recompute the viewport around the target cell.
+        let (new_display_rows, new_mr, new_mc, new_ixs) = {
+            let rec = app.core.workbook.active_sheet().clone();
+            let (ndr, _) = crate::ui_core::visible_row_indices(&rec, cursor, data_rows_cb, 0);
+            let nmr = rec.grid.main_rows();
+            let nmc = rec.grid.main_cols();
+            let (mut nix, _) = crate::ui_core::visible_col_indices(&rec, cursor, data_cols_cb, 0);
+            {
+                let sht = app.core.workbook.active_sheet_mut();
+                crate::ui_core::trim_visible_cols_to_width(
+                    &mut sht.grid, &mut nix, cursor.col, data_width_cb,
+                );
+            }
+            (ndr, nmr, nmc, nix)
+        };
+        let rec = app.core.workbook.active_sheet().clone();
+        let target_logical = crate::grid::HEADER_ROWS + 999;
+        let display_ri = new_display_rows
+            .iter()
+            .position(|&r| r == target_logical)
+            .unwrap_or(0);
+        app.core.cursor = cursor;
+        let boundary_title = format!(
+            "corro  {}r × {}c  ops {}",
+            new_mr, new_mc, app.core.ops_applied
+        );
+        spreadsheet_set_border_title(sid_goto, &boundary_title);
+        let new_labels: Vec<(u32, String)> = new_display_rows
+            .iter()
+            .enumerate()
+            .map(|(idx, &r)| (idx as u32, crate::addr::ui_row_label(r, new_mr)))
+            .collect();
+        spreadsheet_set_row_labels(sid_goto, new_labels);
+        let g = &rec.grid;
+        let new_layout: Vec<(u32, u32, String)> = new_ixs
+            .iter()
+            .map(|&c| {
+                let w = g.col_width(c).max(1);
+                let label = crate::addr::ui_column_fragment(c, new_mc);
+                (c as u32, w as u32, label)
+            })
+            .collect();
+        spreadsheet_set_column_layout(sid_goto, new_layout);
+        spreadsheet_set_grid_config(sid_goto, lm_goto as u32, new_mc as u32);
+        let new_col_widths: HashMap<usize, usize> =
+            new_ixs.iter().map(|&c| (c, rec.grid.col_width(c).max(1))).collect();
+        let new_row_agg = compute::compute_row_agg_func(&rec.grid, &new_display_rows, hr_goto, new_mr);
+        fill_cells(
+            &goto_sheet,
+            &new_display_rows,
+            &new_ixs,
+            &new_col_widths,
+            &rec.grid,
+            hr_goto,
+            new_mr,
+            new_mc,
+            MARGIN_COLS,
+            data_width_cb,
+            cursor.row,
+            cursor.col,
+            &new_row_agg,
+        );
+        // Position the widget cursor on the target cell (A1000).
+        goto_sheet.set_cursor(display_ri as u32, lm_goto as u32);
+        let target_val = rec
+            .grid
+            .get(&CellAddr::Main { row: 999, col: 0 })
+            .unwrap_or_default();
+        goto_sheet.set_raw_cell(display_ri as u32, lm_goto as u32, &target_val);
+        *dr_for_goto_cb.borrow_mut() = new_display_rows.clone();
+        *dr_for_goto_ce.borrow_mut() = new_display_rows.clone();
     });
 
     _backend.run().map_err(|e| format!("pancurses error: {e}"))?;

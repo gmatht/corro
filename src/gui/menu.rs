@@ -6,6 +6,8 @@ pub struct MenuAction {
     pub label: &'static str,
     pub shortcut: &'static str,
     pub action: MenuActionKind,
+    /// When set, this item opens a submenu instead of dispatching an action.
+    pub submenu: Option<&'static [MenuAction]>,
 }
 
 #[derive(Clone, Copy)]
@@ -65,6 +67,29 @@ pub enum MenuActionKind {
     FormatAlignRight,
     FormatAlignDefault,
     FormatReset,
+    // Submenu placeholder (item opens a submenu; never dispatched)
+    Submenu,
+    // File menu (ratatui parity)
+    SortView,
+    SaveSort,
+    Replay,
+    SetMaxColWidth,
+    SetColWidth,
+    ExportAll,
+    ExportOdt,
+    // Edit menu (ratatui parity)
+    Duplicate,
+    Extrapolate,
+    // Sheet menu (ratatui parity)
+    SheetPrev,
+    SheetNext,
+    CopySheet,
+    MoveSheet,
+    GoToCell,
+    // Help menu (ratatui parity)
+    HelpRows,
+    HelpCols,
+    HelpFull,
 }
 
 pub fn action_kind_to_name(kind: MenuActionKind) -> &'static str {
@@ -122,15 +147,38 @@ pub fn action_kind_to_name(kind: MenuActionKind) -> &'static str {
         MenuActionKind::FormatAlignRight => "format_align_right",
         MenuActionKind::FormatAlignDefault => "format_align_default",
         MenuActionKind::FormatReset => "format_reset",
+        MenuActionKind::Submenu => "submenu",
+        MenuActionKind::SortView => "sort_view",
+        MenuActionKind::SaveSort => "persist_sort",
+        MenuActionKind::Replay => "replay",
+        MenuActionKind::SetMaxColWidth => "set_max_col_width",
+        MenuActionKind::SetColWidth => "set_col_width",
+        MenuActionKind::ExportAll => "export_all",
+        MenuActionKind::ExportOdt => "export_ods",
+        MenuActionKind::Duplicate => "duplicate",
+        MenuActionKind::Extrapolate => "extrapolate",
+        MenuActionKind::SheetPrev => "sheet_prev",
+        MenuActionKind::SheetNext => "sheet_next",
+        MenuActionKind::CopySheet => "copy_sheet",
+        MenuActionKind::MoveSheet => "move_sheet",
+        MenuActionKind::GoToCell => "go_to_cell",
+        MenuActionKind::HelpRows => "help_rows",
+        MenuActionKind::HelpCols => "help_cols",
+        MenuActionKind::HelpFull => "help_full",
     }
 }
 
 /// Build a submenu model from action descriptors.
 pub fn build_submenu(rxapp: &App, items: &[MenuAction], prefix: &str) -> Result<Menu, Box<dyn std::error::Error>> {
-    let mut menu = rxapp.create_menu()?;
+    let menu = rxapp.create_menu()?;
     for item in items {
-        let name = action_kind_to_name(item.action);
-        menu.append(item.label, &format!("{}.{}", prefix, name));
+        if let Some(sub) = item.submenu {
+            let sub_menu = build_submenu(rxapp, sub, prefix)?;
+            menu.append_submenu(item.label, &sub_menu);
+        } else {
+            let name = action_kind_to_name(item.action);
+            menu.append(item.label, &format!("{}.{}", prefix, name));
+        }
     }
     Ok(menu)
 }
@@ -219,78 +267,108 @@ pub fn handle_action(name: &str) {
 }
 
 pub const FILE_MENU: &[MenuAction] = &[
-    MenuAction { label: "Open",     shortcut: "Ctrl+O", action: MenuActionKind::Open },
-    MenuAction { label: "Save",     shortcut: "Ctrl+S", action: MenuActionKind::Save },
-    MenuAction { label: "Save As",  shortcut: "Ctrl+Shift+S", action: MenuActionKind::SaveAs },
-    MenuAction { label: "Export TSV",  shortcut: "", action: MenuActionKind::ExportTsv },
-    MenuAction { label: "Export CSV",  shortcut: "", action: MenuActionKind::ExportCsv },
-    MenuAction { label: "Export ODS",  shortcut: "", action: MenuActionKind::ExportOds },
-    MenuAction { label: "Export ASCII", shortcut: "", action: MenuActionKind::ExportAscii },
-    MenuAction { label: "Quit",     shortcut: "Ctrl+Q", action: MenuActionKind::Quit },
+    MenuAction { label: "Open file",    shortcut: "Ctrl+O", action: MenuActionKind::Open, submenu: None },
+    MenuAction { label: "Save as",      shortcut: "Ctrl+S", action: MenuActionKind::SaveAs, submenu: None },
+    MenuAction { label: "Export",       shortcut: "", action: MenuActionKind::Submenu, submenu: Some(EXPORT_MENU) },
+    MenuAction { label: "Width",        shortcut: "", action: MenuActionKind::Submenu, submenu: Some(WIDTH_MENU) },
+    MenuAction { label: "Sort view",    shortcut: "", action: MenuActionKind::SortView, submenu: None },
+    MenuAction { label: "Persist sort", shortcut: "", action: MenuActionKind::SaveSort, submenu: None },
+    MenuAction { label: "Exit",         shortcut: "Ctrl+Q", action: MenuActionKind::Quit, submenu: None },
+    MenuAction { label: "Replay",       shortcut: "", action: MenuActionKind::Replay, submenu: None },
+];
+
+pub const EXPORT_MENU: &[MenuAction] = &[
+    MenuAction { label: "TSV",         shortcut: "", action: MenuActionKind::ExportTsv, submenu: None },
+    MenuAction { label: "CSV",         shortcut: "", action: MenuActionKind::ExportCsv, submenu: None },
+    MenuAction { label: "ASCII table", shortcut: "", action: MenuActionKind::ExportAscii, submenu: None },
+    MenuAction { label: "Export all",  shortcut: "", action: MenuActionKind::ExportAll, submenu: None },
+    MenuAction { label: "ODS",         shortcut: "", action: MenuActionKind::ExportOdt, submenu: None },
+];
+
+pub const WIDTH_MENU: &[MenuAction] = &[
+    MenuAction { label: "Default width", shortcut: "", action: MenuActionKind::SetMaxColWidth, submenu: None },
+    MenuAction { label: "Column width",  shortcut: "", action: MenuActionKind::SetColWidth, submenu: None },
 ];
 
 pub const EDIT_MENU: &[MenuAction] = &[
-    MenuAction { label: "Undo",         shortcut: "Ctrl+Z", action: MenuActionKind::Undo },
-    MenuAction { label: "Redo",         shortcut: "Ctrl+Y", action: MenuActionKind::Redo },
-    MenuAction { label: "Cut",          shortcut: "Ctrl+X", action: MenuActionKind::Cut },
-    MenuAction { label: "Copy",         shortcut: "Ctrl+C", action: MenuActionKind::Copy },
-    MenuAction { label: "Paste",        shortcut: "Ctrl+V", action: MenuActionKind::Paste },
-    MenuAction { label: "Delete",       shortcut: "Del",    action: MenuActionKind::DeleteCell },
-    MenuAction { label: "Select All",   shortcut: "Ctrl+A", action: MenuActionKind::SelectAll },
-    MenuAction { label: "Find",         shortcut: "Ctrl+F", action: MenuActionKind::Find },
-    MenuAction { label: "Replace",      shortcut: "Ctrl+H", action: MenuActionKind::Replace },
+    MenuAction { label: "Cut",         shortcut: "Ctrl+X", action: MenuActionKind::Cut, submenu: None },
+    MenuAction { label: "Copy",        shortcut: "Ctrl+C", action: MenuActionKind::Copy, submenu: None },
+    MenuAction { label: "Paste",       shortcut: "Ctrl+V", action: MenuActionKind::Paste, submenu: None },
+    MenuAction { label: "Find",        shortcut: "Ctrl+F", action: MenuActionKind::Find, submenu: None },
+    MenuAction { label: "Replace",     shortcut: "Ctrl+H", action: MenuActionKind::Replace, submenu: None },
+    MenuAction { label: "Duplicate",   shortcut: "", action: MenuActionKind::Duplicate, submenu: None },
+    MenuAction { label: "Extrapolate", shortcut: "", action: MenuActionKind::Extrapolate, submenu: None },
 ];
 
 pub const VIEW_MENU: &[MenuAction] = &[
-    MenuAction { label: "Toggle Headers", shortcut: "", action: MenuActionKind::ToggleHeaders },
-    MenuAction { label: "Toggle Margins", shortcut: "", action: MenuActionKind::ToggleMargins },
+    MenuAction { label: "Toggle Headers", shortcut: "", action: MenuActionKind::ToggleHeaders, submenu: None },
+    MenuAction { label: "Toggle Margins", shortcut: "", action: MenuActionKind::ToggleMargins, submenu: None },
 ];
 
 pub const SHEET_MENU: &[MenuAction] = &[
-    MenuAction { label: "New Sheet",   shortcut: "", action: MenuActionKind::NewSheet },
-    MenuAction { label: "Rename Sheet",shortcut: "", action: MenuActionKind::RenameSheet },
-    MenuAction { label: "Delete Sheet",shortcut: "", action: MenuActionKind::DeleteSheet },
+    MenuAction { label: "Prev sheet",    shortcut: "", action: MenuActionKind::SheetPrev, submenu: None },
+    MenuAction { label: "Next sheet",    shortcut: "", action: MenuActionKind::SheetNext, submenu: None },
+    MenuAction { label: "New sheet",     shortcut: "", action: MenuActionKind::NewSheet, submenu: None },
+    MenuAction { label: "Rename sheet",  shortcut: "", action: MenuActionKind::RenameSheet, submenu: None },
+    MenuAction { label: "Copy sheet",    shortcut: "", action: MenuActionKind::CopySheet, submenu: None },
+    MenuAction { label: "Move sheet",    shortcut: "", action: MenuActionKind::MoveSheet, submenu: None },
+    MenuAction { label: "Go",            shortcut: "", action: MenuActionKind::GoToCell, submenu: None },
+    MenuAction { label: "Balance books", shortcut: "", action: MenuActionKind::BalanceBooks, submenu: None },
 ];
 
 pub const INSERT_MENU: &[MenuAction] = &[
-    MenuAction { label: "Rows",          shortcut: "", action: MenuActionKind::InsertRows },
-    MenuAction { label: "Mitosis (Row)", shortcut: "", action: MenuActionKind::InsertMitosisRow },
-    MenuAction { label: "Mitosis (Col)", shortcut: "", action: MenuActionKind::InsertMitosisCol },
-    MenuAction { label: "Cols",          shortcut: "", action: MenuActionKind::InsertCols },
-    MenuAction { label: "Special Char",  shortcut: "", action: MenuActionKind::InsertSpecialChars },
-    MenuAction { label: "Date",          shortcut: "", action: MenuActionKind::InsertDate },
-    MenuAction { label: "Time",          shortcut: "", action: MenuActionKind::InsertTime },
-    MenuAction { label: "Hyperlink",     shortcut: "", action: MenuActionKind::InsertHyperlink },
+    MenuAction { label: "Rows",          shortcut: "", action: MenuActionKind::InsertRows, submenu: None },
+    MenuAction { label: "Mitosis (Row)", shortcut: "", action: MenuActionKind::InsertMitosisRow, submenu: None },
+    MenuAction { label: "Mitosis (Col)", shortcut: "", action: MenuActionKind::InsertMitosisCol, submenu: None },
+    MenuAction { label: "Cols",          shortcut: "", action: MenuActionKind::InsertCols, submenu: None },
+    MenuAction { label: "Special Char",  shortcut: "", action: MenuActionKind::InsertSpecialChars, submenu: None },
+    MenuAction { label: "Date",          shortcut: "", action: MenuActionKind::InsertDate, submenu: None },
+    MenuAction { label: "Time",          shortcut: "", action: MenuActionKind::InsertTime, submenu: None },
+    MenuAction { label: "Hyperlink",     shortcut: "", action: MenuActionKind::InsertHyperlink, submenu: None },
 ];
 
 pub const FORMAT_MENU: &[MenuAction] = &[
-    MenuAction { label: "Scope: All",        shortcut: "", action: MenuActionKind::FormatApplyAll },
-    MenuAction { label: "Scope: Full Col",   shortcut: "", action: MenuActionKind::FormatApplyFullColumn },
-    MenuAction { label: "Scope: Data",       shortcut: "", action: MenuActionKind::FormatApplyData },
-    MenuAction { label: "Scope: Special",    shortcut: "", action: MenuActionKind::FormatApplySpecial },
-    MenuAction { label: "Scope: Cell",       shortcut: "", action: MenuActionKind::FormatApplyCell },
-    MenuAction { label: "Scope: Selection",  shortcut: "", action: MenuActionKind::FormatApplySelection },
-    MenuAction { label: "Decimal (generic)", shortcut: "", action: MenuActionKind::FormatDecimalGeneric },
-    MenuAction { label: "Currency ($)",      shortcut: "", action: MenuActionKind::FormatCurrency },
-    MenuAction { label: "Rational",          shortcut: "", action: MenuActionKind::FormatRational },
-    MenuAction { label: "Fixed 0",           shortcut: "", action: MenuActionKind::FormatFixed0 },
-    MenuAction { label: "Fixed 1",           shortcut: "", action: MenuActionKind::FormatFixed1 },
-    MenuAction { label: "Fixed 2",           shortcut: "", action: MenuActionKind::FormatFixed2 },
-    MenuAction { label: "Fixed n",           shortcut: "", action: MenuActionKind::FormatFixedCustom },
-    MenuAction { label: "Align Left",        shortcut: "", action: MenuActionKind::FormatAlignLeft },
-    MenuAction { label: "Align Center",      shortcut: "", action: MenuActionKind::FormatAlignCenter },
-    MenuAction { label: "Align Right",       shortcut: "", action: MenuActionKind::FormatAlignRight },
-    MenuAction { label: "Align Default",     shortcut: "", action: MenuActionKind::FormatAlignDefault },
-    MenuAction { label: "Reset",             shortcut: "", action: MenuActionKind::FormatReset },
+    MenuAction { label: "Scope",  shortcut: "", action: MenuActionKind::Submenu, submenu: Some(FORMAT_SCOPE_MENU) },
+    MenuAction { label: "Number", shortcut: "", action: MenuActionKind::Submenu, submenu: Some(FORMAT_NUMBER_MENU) },
+    MenuAction { label: "Align",  shortcut: "", action: MenuActionKind::Submenu, submenu: Some(FORMAT_ALIGN_MENU) },
+    MenuAction { label: "Reset",  shortcut: "", action: MenuActionKind::FormatReset, submenu: None },
+];
+
+pub const FORMAT_SCOPE_MENU: &[MenuAction] = &[
+    MenuAction { label: "All",        shortcut: "", action: MenuActionKind::FormatApplyAll, submenu: None },
+    MenuAction { label: "Full col",   shortcut: "", action: MenuActionKind::FormatApplyFullColumn, submenu: None },
+    MenuAction { label: "Data",       shortcut: "", action: MenuActionKind::FormatApplyData, submenu: None },
+    MenuAction { label: "Special",    shortcut: "", action: MenuActionKind::FormatApplySpecial, submenu: None },
+    MenuAction { label: "Cell",       shortcut: "", action: MenuActionKind::FormatApplyCell, submenu: None },
+    MenuAction { label: "Selection",  shortcut: "", action: MenuActionKind::FormatApplySelection, submenu: None },
+];
+
+pub const FORMAT_NUMBER_MENU: &[MenuAction] = &[
+    MenuAction { label: "Decimal (generic)", shortcut: "", action: MenuActionKind::FormatDecimalGeneric, submenu: None },
+    MenuAction { label: "Currency ($)",      shortcut: "", action: MenuActionKind::FormatCurrency, submenu: None },
+    MenuAction { label: "Rational",          shortcut: "", action: MenuActionKind::FormatRational, submenu: None },
+    MenuAction { label: "Fixed 0",           shortcut: "", action: MenuActionKind::FormatFixed0, submenu: None },
+    MenuAction { label: "Fixed 1",           shortcut: "", action: MenuActionKind::FormatFixed1, submenu: None },
+    MenuAction { label: "Fixed 2",           shortcut: "", action: MenuActionKind::FormatFixed2, submenu: None },
+    MenuAction { label: "Fixed n",           shortcut: "", action: MenuActionKind::FormatFixedCustom, submenu: None },
+];
+
+pub const FORMAT_ALIGN_MENU: &[MenuAction] = &[
+    MenuAction { label: "Left",    shortcut: "", action: MenuActionKind::FormatAlignLeft, submenu: None },
+    MenuAction { label: "Center",  shortcut: "", action: MenuActionKind::FormatAlignCenter, submenu: None },
+    MenuAction { label: "Right",   shortcut: "", action: MenuActionKind::FormatAlignRight, submenu: None },
+    MenuAction { label: "Default", shortcut: "", action: MenuActionKind::FormatAlignDefault, submenu: None },
 ];
 
 pub const DATA_MENU: &[MenuAction] = &[
-    MenuAction { label: "Sort Ascending",  shortcut: "", action: MenuActionKind::SortAsc },
-    MenuAction { label: "Sort Descending", shortcut: "", action: MenuActionKind::SortDesc },
-    MenuAction { label: "Balance Books",   shortcut: "", action: MenuActionKind::BalanceBooks },
+    MenuAction { label: "Sort Ascending",  shortcut: "", action: MenuActionKind::SortAsc, submenu: None },
+    MenuAction { label: "Sort Descending", shortcut: "", action: MenuActionKind::SortDesc, submenu: None },
+    MenuAction { label: "Balance Books",   shortcut: "", action: MenuActionKind::BalanceBooks, submenu: None },
 ];
 
 pub const HELP_MENU: &[MenuAction] = &[
-    MenuAction { label: "Keybindings", shortcut: "F1", action: MenuActionKind::HelpKeybinds },
-    MenuAction { label: "About",       shortcut: "",   action: MenuActionKind::About },
+    MenuAction { label: "About",     shortcut: "", action: MenuActionKind::About, submenu: None },
+    MenuAction { label: "Row ops",   shortcut: "", action: MenuActionKind::HelpRows, submenu: None },
+    MenuAction { label: "Col ops",   shortcut: "", action: MenuActionKind::HelpCols, submenu: None },
+    MenuAction { label: "Full help", shortcut: "", action: MenuActionKind::HelpFull, submenu: None },
 ];

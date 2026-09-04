@@ -204,10 +204,12 @@ mod pancurses_adapter {
 
     // -- Menu --
 
+    /// Backend-agnostic menu model: a list of items (actions or submenus).
+    /// The same model is used by every rustxwidgets backend, so an application
+    /// can build one menu and hand it to any backend's `create_menubar`.
     pub struct Menu {
         pub(crate) id: usize,
-        pub(crate) items: std::cell::RefCell<Vec<(String, String)>>,
-        submenu_data: std::cell::RefCell<Vec<(String, Vec<(String, String)>)>>,
+        pub(crate) items: std::cell::RefCell<Vec<crate::MenuItem>>,
     }
 
     impl AsRef<*mut c_void> for Menu {
@@ -218,25 +220,32 @@ mod pancurses_adapter {
 
     impl Menu {
         pub fn append(&self, label: &str, action_name: &str) {
-            self.items.borrow_mut().push((label.to_string(), action_name.to_string()));
+            self.items.borrow_mut().push(crate::MenuItem::Action {
+                label: label.to_string(),
+                action: action_name.to_string(),
+            });
         }
         pub fn append_submenu(&self, label: &str, submenu: &Menu) {
             let sub_items = submenu.items.borrow().clone();
-            self.submenu_data.borrow_mut().push((label.to_string(), sub_items));
+            self.items.borrow_mut().push(crate::MenuItem::Submenu {
+                label: label.to_string(),
+                items: sub_items,
+            });
         }
         pub fn append_item(&self, _label: &str, _action: &SimpleAction) {}
         pub fn append_section(&self, _label: &str) {}
     }
 
-    pub(crate) fn collect_menu_items(menu: &Menu) -> (Vec<String>, Vec<Vec<(String, String)>>) {
-        let submenus = menu.submenu_data.borrow();
-        let mut labels = Vec::new();
-        let mut items_list = Vec::new();
-        for (label, items) in submenus.iter() {
-            labels.push(label.clone());
-            items_list.push(items.clone());
-        }
-        (labels, items_list)
+    /// Extract the menubar model: (root label, items) for each root menu.
+    pub(crate) fn collect_menu_items(menu: &Menu) -> Vec<(String, Vec<crate::MenuItem>)> {
+        menu.items
+            .borrow()
+            .iter()
+            .filter_map(|item| match item {
+                crate::MenuItem::Submenu { label, items } => Some((label.clone(), items.clone())),
+                crate::MenuItem::Action { .. } => None,
+            })
+            .collect()
     }
 
     // -- MenuBar --
@@ -581,13 +590,12 @@ mod pancurses_adapter {
 
     pub fn create_menu() -> Result<Menu, Error> {
         crate::backends::pancurses::create_menu()
-            .map(|id| Menu { id, items: std::cell::RefCell::new(vec![]), submenu_data: std::cell::RefCell::new(vec![]) })
+            .map(|id| Menu { id, items: std::cell::RefCell::new(vec![]) })
             .map_err(|e| Error::Backend(format!("{}", e)))
     }
 
     pub fn create_menubar(model: &Menu, _action_group: *mut c_void) -> Result<MenuBar, Error> {
-        let (labels, itemss) = collect_menu_items(model);
-        let submenu_items: Vec<(String, Vec<(String, String)>)> = labels.into_iter().zip(itemss.into_iter()).collect();
+        let submenu_items = collect_menu_items(model);
         let id = unsafe { crate::backends::pancurses::create_menubar(submenu_items, _action_group) }
             .map_err(|e| Error::Backend(format!("{}", e)))?;
         Ok(MenuBar { id })
@@ -641,6 +649,9 @@ mod pancurses_adapter {
     }
     pub fn add_commit_edit_callback<F: FnMut(u32, u32, String) + 'static>(f: F) {
         crate::backends::pancurses::spreadsheet_add_commit_edit_callback(f);
+    }
+    pub fn add_goto_callback<F: FnMut() + 'static>(f: F) {
+        crate::backends::pancurses::spreadsheet_add_goto_callback(f);
     }
     pub fn spreadsheet_set_cell(id: usize, r: u32, c: u32, text: &str) {
         crate::backends::pancurses::spreadsheet_set_cell(id, r, c, text);
