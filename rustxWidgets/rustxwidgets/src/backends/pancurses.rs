@@ -318,6 +318,7 @@ mod pancurses_backend {
     /// top of the spreadsheet output (ncurses widgets get overwritten by the
     /// spreadsheet's direct SGR writes).  Dismissed with Escape.
     pub fn show_dialog(title: &str, text: &str) {
+        let _ = std::fs::write("/tmp/corro-dbg-show.txt", format!("show_dialog: {title}\n"));
         ACTIVE_DIALOG.with(|d| *d.borrow_mut() = Some((title.to_string(), text.to_string())));
     }
 
@@ -332,6 +333,7 @@ mod pancurses_backend {
 
     /// Close the active info dialog, firing the message-box result callback.
     pub fn close_dialog() {
+        let _ = std::fs::write("/tmp/corro-dbg-close.txt", format!("close_dialog called\n"));
         let result = DIALOG_RESULT.with(|r| r.borrow_mut().take());
         ACTIVE_DIALOG.with(|d| *d.borrow_mut() = None);
         if let Some(mut cb) = result {
@@ -341,27 +343,17 @@ mod pancurses_backend {
 
     /// Erase the dialog box area (spaces) so closing it does not leave stale
     /// dialog text on the terminal (the spreadsheet SGR output does not
-    /// overwrite empty cells).
+    /// overwrite empty cells).  The dialog fills the grid area (below the menu
+    /// bar and formula bar), so clear that whole region.
     fn clear_dialog_area(root: &Window) {
-        if let Some((dtitle, dtext)) = ACTIVE_DIALOG.with(|d| d.borrow().clone()) {
+        if ACTIVE_DIALOG.with(|d| d.borrow().is_some()) {
             let (my, mx) = root.get_max_yx();
-            let lines: Vec<&str> = dtext.lines().collect();
-            let maxlen = lines
-                .iter()
-                .map(|l| l.chars().count())
-                .chain(std::iter::once(dtitle.chars().count()))
-                .max()
-                .unwrap_or(16)
-                .max(16);
-            let w = (maxlen as i32 + 6).clamp(12, (mx - 2).max(12));
-            let h = (lines.len() as i32 + 4).clamp(5, (my - 2).max(5));
-            let x0 = (mx - w) / 2;
-            let y0 = (my - h) / 2;
+            let y0 = 2;
             let mut out = String::new();
-            for y in 0..h {
-                out.push_str(&sgr_cup(y0 + y, x0));
+            for y in y0..my {
+                out.push_str(&sgr_cup(y, 0));
                 out.push_str(SGR_RESET);
-                out.push_str(&" ".repeat(w as usize));
+                out.push_str(&" ".repeat(mx as usize));
             }
             emit_sgr(&out);
         }
@@ -673,26 +665,49 @@ mod pancurses_backend {
             });
 
             // Modal info dialog (About/Help) drawn via SGR on top of everything.
+            // It fills the grid area (below the menu bar and formula bar) and
+            // word-wraps long lines, matching the ratatui reference's full-width
+            // bordered box (render parity).
             if let Some((dtitle, dtext)) = ACTIVE_DIALOG.with(|d| d.borrow().clone()) {
                 let (my, mx) = root.get_max_yx();
-                let lines: Vec<&str> = dtext.lines().collect();
-                let maxlen = lines
-                    .iter()
-                    .map(|l| l.chars().count())
-                    .chain(std::iter::once(dtitle.chars().count()))
-                    .max()
-                    .unwrap_or(16)
-                    .max(16);
-                let w = (maxlen as i32 + 6).clamp(12, (mx - 2).max(12));
-                let h = (lines.len() as i32 + 4).clamp(5, (my - 2).max(5));
-                let x0 = (mx - w) / 2;
-                let y0 = (my - h) / 2;
+                // The grid area starts at row 2 (menu bar row 0, formula bar row 1)
+                // and leaves the last row for the hints/status line, matching the
+                // ratatui reference's grid_area (rows 2..my-1).
+                let y0 = 2;
+                let h = (my - y0 - 1).max(3);
+                let x0 = 0;
+                let w = mx;
+                // The body fills the box's inner area: it starts right after the
+                // left border (x0+1) and is w-2 wide, matching the ratatui
+                // reference's `block.inner(grid_area)` so long lines wrap at the
+                // same point (render parity).
+                let inner = (w - 2).max(1) as usize;
+                // Word-wrap the body to the inner width (ratatui wraps, it does
+                // not truncate).
+                let mut wrapped: Vec<String> = Vec::new();
+                for ln in dtext.lines() {
+                    let mut cur = String::new();
+                    for word in ln.split(' ') {
+                        if cur.is_empty() {
+                            cur = word.to_string();
+                        } else if cur.chars().count() + 1 + word.chars().count() <= inner {
+                            cur.push(' ');
+                            cur.push_str(word);
+                        } else {
+                            wrapped.push(cur);
+                            cur = word.to_string();
+                        }
+                    }
+                    wrapped.push(cur);
+                }
                 let mut out = String::new();
-                for y in 0..h {
-                    out.push_str(&sgr_cup(y0 + y, x0));
+                // Clear the whole grid area behind the dialog.
+                for y in y0..my {
+                    out.push_str(&sgr_cup(y, x0));
                     out.push_str(SGR_RESET);
                     out.push_str(&" ".repeat(w as usize));
                 }
+                // Top border with the title.
                 out.push_str(&sgr_cup(y0, x0));
                 out.push_str(SGR_RESET);
                 out.push('\u{250c}');
@@ -703,20 +718,31 @@ mod pancurses_backend {
                 let t: String = dtitle.chars().take((w - 4).max(1) as usize).collect();
                 out.push_str(&t);
                 out.push_str(SGR_RESET);
-                for (i, ln) in lines.iter().enumerate() {
+                // Body lines (wrapped), each with left/right borders.  The box
+                // has a fixed height (`body_rows`), so EVERY body row must carry
+                // both borders — including empty rows below the wrapped text.
+                // Previously this loop iterated `wrapped.iter()` directly, so a
+                // short body (e.g. About with ~8 wrapped lines) left all rows
+                // below the content as bare cleared grid lines with no `│`
+                // borders, diverging from the ratatui reference (which draws
+                // `│` on every row of the box).
+                let body_rows = (h - 2).max(0) as usize;
+                for i in 0..body_rows {
                     let y = y0 + 1 + i as i32;
-                    if y >= y0 + h - 1 { break; }
                     out.push_str(&sgr_cup(y, x0));
                     out.push_str(SGR_RESET);
                     out.push('\u{2502}');
                     out.push_str(&sgr_cup(y, x0 + w - 1));
                     out.push_str(SGR_RESET);
                     out.push('\u{2502}');
-                    let body: String = ln.chars().take((w - 4).max(1) as usize).collect();
-                    out.push_str(&sgr_cup(y, x0 + 2));
-                    out.push_str(SGR_RESET);
-                    out.push_str(&body);
+                    if let Some(ln) = wrapped.get(i) {
+                        let body: String = ln.chars().take(inner).collect();
+                        out.push_str(&sgr_cup(y, x0 + 1));
+                        out.push_str(SGR_RESET);
+                        out.push_str(&body);
+                    }
                 }
+                // Bottom border.
                 out.push_str(&sgr_cup(y0 + h - 1, x0));
                 out.push_str(SGR_RESET);
                 out.push('\u{2514}');
@@ -927,11 +953,23 @@ mod pancurses_backend {
                                     cb(action);
                                     with_state(|state| state.menu_action_callback = Some(cb));
                                 }
+                                // The menu action may have mutated the workbook (e.g.
+                                // Insert -> Date writes a cell).  Re-render the frame so
+                                // the grid reflects the change immediately, instead of
+                                // staying stale until the next key press.
+                                redraw_frame(&mut root);
                             }
                         }
                     }
                     Some(Input::Character(c)) => {
-                        with_state(|state| state.pending_quit = false);
+                        let _ = std::fs::write("/tmp/corro-dbg-char.txt", format!("char={:?} dialog={}\n", c, ACTIVE_DIALOG.with(|d| d.borrow().is_some())));
+                        // Any real keypress cancels a pending quit — EXCEPT Escape itself,
+                        // which the bare-Escape branch below consumes to arm/trigger the
+                        // quick-quit.  Resetting it here for Escape would clobber the flag
+                        // the quit logic relies on, so a second/third Escape could never quit.
+                        if c != '\x1b' {
+                            with_state(|state| state.pending_quit = false);
+                        }
                         // Ctrl+Q quits (matching the ratatui backend); plain 'q'/'Q' are text.
                         if c == '\x11' {
                             with_state(|state| state.running = false);
@@ -940,6 +978,7 @@ mod pancurses_backend {
                         // While a prompt is active, route all input into the prompt buffer.
                         // Escape closes the modal info dialog (About/Help).
                         if c == '\x1b' && ACTIVE_DIALOG.with(|d| d.borrow().is_some()) {
+                            let _ = std::fs::write("/tmp/corro-dbg-line962.txt", "reached\n");
                                                         clear_dialog_area(&root);
                             close_dialog();
                             redraw_frame(&mut root);
@@ -2246,8 +2285,12 @@ mod pancurses_backend {
                                 let is_boundary = lm > 0 && (*ci == (lm - 1) as u32 || *ci == (lm + mc - 1) as u32);
                                 out.push_str(&sgr_cup(hr, hx));
                                 if is_boundary {
-                                    out.push_str("│");
-                                    hx += 1;
+                                    // Match ratatui: a boundary pipe is followed by
+                                    // a space (`│ `) so column labels stay aligned.
+                                    // Emitting just `│` shifted every later label left
+                                    // by one column.
+                                    out.push_str("│ ");
+                                    hx += 2;
                                 } else {
                                     out.push_str(" ");
                                     hx += 1;
@@ -2792,14 +2835,12 @@ mod pancurses_backend {
                                 }
                             }
                             let display = if text_width > total_avail {
-                                if overflow_cols == 0 {
-                                    display_source.chars().take(total_avail).collect::<String>()
-                                } else {
-                                    let trunc = total_avail.saturating_sub(1).max(1);
-                                    let mut s: String = display_source.chars().take(trunc).collect();
-                                    if text_width > trunc { s.push('…'); }
-                                    s
-                                }
+                                // Ratatui's spill path fills the available chunk
+                                // with the actual text and does NOT append an
+                                // ellipsis (only the non-spill fallback ever adds
+                                // `…`, via truncate_with_ellipsis).  So match: take
+                                // the full available columns from the source.
+                                display_source.chars().take(total_avail).collect::<String>()
                             } else { display_source.to_string() };
                             // Cell SGR style matching ratatui priority:
                             //   1. cursor cell → bg(DarkGray)
@@ -2927,6 +2968,17 @@ mod pancurses_backend {
                                 let last_ov_col = column_layout[gap_target].0 as usize;
                                 lm > 0 && (last_ov_col == lm - 1 || last_ov_col == lm + mc - 1)
                             };
+                            // When a LAST-MAIN-COLUMN cell overflows across the
+                            // main→right-margin boundary, its text spills into the
+                            // right margin and REPLACES the structural `│` there.
+                            // ratatui draws no pipe in that case (the overflow text
+                            // fills the boundary column); the pipe only survives when
+                            // the overflow stops before the boundary.
+                            let crosses_right_boundary = can_overflow
+                                && overflow_cols > 0
+                                && (col_idx as usize) == lm + mc - 1
+                                && gap_target < n
+                                && (column_layout[gap_target].0 as usize) >= lm + mc;
                             if real_gap > 0 || overflow_boundary {
                                 let is_sep_col = if overflow_boundary {
                                     true
@@ -2936,7 +2988,12 @@ mod pancurses_backend {
                                 // When overflow text partially fills the gap and
                                 // consumed the pipe position, only draw spaces
                                 // (no pipe) for the remaining gap characters.
-                                if is_sep_col && overflow_into_gap == 0 {
+                                // Also suppress the pipe entirely when the source
+                                // cell's text spills across the main→right-margin
+                                // boundary (crosses_right_boundary): the overflow
+                                // text occupies the boundary column and there is
+                                // no structural pipe there (matching ratatui).
+                                if is_sep_col && overflow_into_gap == 0 && !crosses_right_boundary {
                                     out.push_str(sgr_sep());
                                     out.push('│');
                                     out.push_str(SGR_FG_DEFAULT);
