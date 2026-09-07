@@ -1,6 +1,17 @@
 [workspace]
 members = ["balance-core", "rustxWidgets/rustxwidgets"]
 
+# Vendored Win95-compatibility patches (see vendor/*/  — the patches resolve
+# Vista+/Win2000+ APIs dynamically instead of importing them statically, which
+# would make the Windows 95 loader reject the exe):
+#   notify    — KERNEL32!CancelIo + ReadDirectoryChangesW missing on Win95
+#   chrono    — KERNEL32!GetTimeZoneInformationForYear (Vista+)
+#   crossterm — USER32!ToUnicodeEx (Win2000+)
+[patch.crates-io]
+notify = { path = "vendor/notify" }
+chrono = { path = "vendor/chrono" }
+crossterm = { path = "vendor/crossterm" }
+
 [toolchain]
 channel = "nightly"
 
@@ -71,6 +82,14 @@ opt-level = 2
 inherits = "release"
 opt-level = "z"
 strip = "symbols"
+
+# Win95 build profile (used by build95.sh/run95.sh): dev-like iteration speed,
+# but panic = "abort" — unwind support needs at least VC8 (VS2005) and the
+# vintage rust9x toolchain links the VC6 (MSVC 6.0) CRT, so an unwinding
+# panic aborts with "abnormal program termination" before the TUI starts.
+[profile.win95]
+inherits = "dev"
+panic = "abort"
 
 # Override the inherited O2 per-package settings from release back to "z".
 [profile.tiny.package.balance-core]

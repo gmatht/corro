@@ -1,0 +1,37 @@
+# rust9x build configuration (mirrors /root/src/lsl-usb/rust9x/nwg-test/.cargo/config.toml,
+# which is modeled on https://github.com/rust9x/rust9x-sample)
+#
+# Build with:  cargo +rust9x build --target i586-rust9x-windows-msvc
+#
+# The vintage MSVC import libraries live on this machine at:
+#   - /opt/msvc-toolchains/sdk71a/Lib   Windows SDK v7.1A import libs (incl. unicows.lib)
+#   - /opt/msvc-toolchains/vc6/VC98Lib  VC6 (MSVC 6.0) static CRT (libcmt.lib)
+# Lowercase *.lib symlinks exist in sdk71a/Lib because rust-lld looks up
+# e.g. "kernel32.lib" verbatim on a case-sensitive filesystem.
+#
+# Everything is scoped to cfg(all(target_family="rust9x", target_env="msvc")),
+# so normal msvc / linux targets are unaffected.
+
+[build]
+
+[target.'cfg(all(target_family = "rust9x", target_env = "msvc"))']
+rustflags = [
+  # Console subsystem (corro is a TUI app; it needs stdin/stdout).
+  # Version 4.0 = Windows 95 and up, NT3.5 and up.
+  '-Clink-arg=/SUBSYSTEM:CONSOLE,4.0',
+  '-Clink-arg=/OSVERSION:3.1',          # work as far back as NT 3.1
+  '-Clink-arg=/STACK:131072',           # 128KiB stack (NT3.51 ignores 1MiB)
+  '-Ctarget-feature=+crt-static',       # statically linked VC6 CRT
+
+  # VC6-era CRT has no unwinder support and no SAFESEH.
+  # NOTE: also needs panic="abort" in the profile (already set for release).
+  '-Clink-arg=/SAFESEH:NO',
+
+  # Import-library search paths (SDK first so import libs resolve there,
+  # CRT libs fall through to the VC6 path — the SDK ships no CRT libs).
+  # stubs/ holds empty archives for libs missing from v7.1A that rustc asks
+  # for by name (e.g. synchronization.lib) but nothing actually imports from.
+  '-Clink-arg=/LIBPATH:/opt/msvc-toolchains/sdk71a/Lib',
+  '-Clink-arg=/LIBPATH:/opt/msvc-toolchains/vc6/VC98Lib',
+  '-Clink-arg=/LIBPATH:/opt/msvc-toolchains/stubs',
+]

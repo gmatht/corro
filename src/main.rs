@@ -1,5 +1,11 @@
 //! corro — append-only collaborative spreadsheet TUI.
 
+// Win95 (rust9x targets): std::rt initialization hangs inside KERNEL32 on
+// Windows 95 (DBCS conversion loop). With `no_main`, the VC6 CRT startup
+// calls our `main` directly, skipping std::rt entirely. Normal targets keep
+// the standard Rust entry (and `cargo test` keeps working).
+#![cfg_attr(all(target_family = "rust9x", target_env = "msvc"), no_main)]
+
 #[cfg(feature = "ratatui")]
 use corro::ui::App as TuiApp;
 #[cfg(any(feature = "gui", feature = "pancurses"))]
@@ -55,6 +61,58 @@ fn determine_default_ui() -> UiKind {
     { UiKind::Pancurses }
 }
 
+// Win95-safe command line: `GetCommandLineW` is a no-op stub on Windows 95
+// (returns NULL), so `std::env::args()` cannot be used there. Read the ANSI
+// command line instead. DBCS bytes decode lossily, which is fine for the
+// ASCII-only options corro takes.
+#[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+fn cli_args() -> impl Iterator<Item = String> {
+    win95_args().into_iter().skip(1)
+}
+
+#[cfg(not(all(target_family = "rust9x", target_env = "msvc")))]
+fn cli_args() -> impl Iterator<Item = String> {
+    std::env::args().skip(1)
+}
+
+#[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+fn win95_args() -> Vec<String> {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCommandLineA() -> *const u8;
+    }
+    unsafe {
+        let p = GetCommandLineA();
+        if p.is_null() {
+            return Vec::new();
+        }
+        let mut raw = Vec::new();
+        let mut i = 0usize;
+        while *p.add(i) != 0 {
+            raw.push(*p.add(i));
+            i += 1;
+        }
+        let mut out: Vec<String> = Vec::new();
+        let mut cur = String::new();
+        let mut in_quotes = false;
+        for &b in &raw {
+            match b {
+                b'"' => in_quotes = !in_quotes,
+                b' ' | b'\t' if !in_quotes => {
+                    if !cur.is_empty() {
+                        out.push(std::mem::take(&mut cur));
+                    }
+                }
+                _ => cur.push(b as char),
+            }
+        }
+        if !cur.is_empty() {
+            out.push(cur);
+        }
+        out
+    }
+}
+
 fn parse_args() -> Result<Args, String> {
     let mut revision = None;
     let mut export = None;
@@ -69,7 +127,7 @@ fn parse_args() -> Result<Args, String> {
     let mut capture_html = None;
     let mut convert_ansi = None;
     let mut positional = Vec::new();
-    let mut it = std::env::args().skip(1).peekable();
+    let mut it = cli_args().peekable();
 
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -151,7 +209,22 @@ fn parse_args() -> Result<Args, String> {
     })
 }
 
+// Win95 entry point (rust9x msvc targets only; see the no_main note above).
+// The VC6 CRT startup calls this directly. Errors still exit non-zero via
+// std::process::exit inside corro_main.
+#[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+#[no_mangle]
+pub extern "C" fn main() -> i32 {
+    corro_main();
+    0
+}
+
+#[cfg(not(all(target_family = "rust9x", target_env = "msvc")))]
 fn main() {
+    corro_main();
+}
+
+fn corro_main() {
     let (res, exit_message) = try_main();
     if let Some(msg) = exit_message {
         // Print to both stderr and stdout and flush so the message is
