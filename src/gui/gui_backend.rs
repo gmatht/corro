@@ -10,6 +10,7 @@ use crate::ops::{Op, WorkbookOp};
 use crate::ui_core;
 
 use super::compute::{self, CellDisplayStyle};
+use super::actions::{dispatch_menu_action, menu_action_needs_prompt, run_prompt_action, MenuDispatch};
 use super::dialogs;
 use super::render::{self, CellSink};
 
@@ -164,6 +165,8 @@ struct GuiState {
     prev_key: Cell<u32>,
     menu_nav: Cell<MenuNavState>,
     alt_f_detected: Cell<bool>,
+    format_scope: Cell<u8>,
+    clipboard: RefCell<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -989,193 +992,140 @@ fn build_menu(rxapp: &rustxwidgets::App, win: &Window, state: &Rc<GuiState>) -> 
 }
 
 fn handle_menu_action(name: &str, state: &GuiState) {
-    let app = unsafe { &mut *state.app };
-    match name {
-        "open" => {
-            if let Some(path) = dialogs::file_open_dialog() {
-                match crate::io::load_workbook_snapshot(&path) {
-                    Ok(snapshot) => {
-                        app.core.workbook = crate::ops::WorkbookState::from_snapshot(&snapshot);
-                        app.core.offset = 0;
-                        app.core.ops_applied = 0;
-                        app.core.path = Some(path);
-                        app.core.status = "Opened file".into();
-                        recompute_viewport(state);
-                        state.canvas.queue_redraw();
+    // `quit` leaves the main loop directly.
+    if name == "quit" {
+        #[cfg(all(unix, feature = "gui"))]
+        let _ = rustxwidgets::backends_gtk_adapter::quit_main_loop();
+        #[cfg(windows)]
+        rustxwidgets::backends_nwg_adapter::quit_main_loop();
+        return;
+    }
+
+    // Prompt-needing actions are collected via GTK native dialogs; the entered
+    // value is then fed through the shared prompt dispatcher. We capture the raw
+    // app pointer (Copy) rather than `state` so the dialog callbacks do not hold
+    // a borrowed reference past the function body.
+    if let Some(_label) = menu_action_needs_prompt(name) {
+        let app_ptr = state.app;
+        match name {
+            "open" => {
+                if let Some(path) = dialogs::file_open_dialog() {
+                    let app = unsafe { &mut *app_ptr };
+                    run_prompt_action(app, "open", &path.to_string_lossy().into_owned());
+                    recompute_viewport(state);
+                    state.canvas.queue_redraw();
+                }
+            }
+            "save_as" => {
+                if let Some(path) = dialogs::file_save_dialog() {
+                    let app = unsafe { &mut *app_ptr };
+                    run_prompt_action(app, "save_as", &path.to_string_lossy().into_owned());
+                    recompute_viewport(state);
+                    state.canvas.queue_redraw();
+                }
+            }
+            "export_tsv" | "export_csv" | "export_ods" | "export_ascii" | "export_all" => {
+                if let Some(path) = dialogs::file_save_dialog() {
+                    let app = unsafe { &mut *app_ptr };
+                    run_prompt_action(app, name, &path.to_string_lossy().into_owned());
+                    recompute_viewport(state);
+                    state.canvas.queue_redraw();
+                }
+            }
+            "set_col_width" | "set_max_col_width" => {
+                let action = name.to_string();
+                dialogs::find_dialog(move |result| {
+                    if let Some(text) = result {
+                        let app = unsafe { &mut *app_ptr };
+                        run_prompt_action(app, &action, &text);
                     }
-                    Err(e) => app.core.status = format!("Open error: {e}"),
+                });
+            }
+            "go_to_cell" => dialogs::find_dialog(move |result| {
+                if let Some(text) = result {
+                    let app = unsafe { &mut *app_ptr };
+                    run_prompt_action(app, "go_to_cell", &text);
                 }
-            }
-        }
-        "save" => {
-            if let Some(ref p) = app.core.path.clone() {
-                let snapshot = crate::ops::WorkbookSnapshot::from_workbook(&app.core.workbook);
-                match crate::io::save_workbook(p, &snapshot) {
-                    Ok(()) => app.core.status = "Saved".into(),
-                    Err(e) => app.core.status = format!("Save error: {e}"),
+            }),
+            "find" => dialogs::find_dialog(move |result| {
+                if let Some(text) = result {
+                    let app = unsafe { &mut *app_ptr };
+                    run_prompt_action(app, "find", &text);
                 }
-            }
-        }
-        "save_as" => {
-            if let Some(path) = dialogs::file_save_dialog() {
-                app.core.path = Some(path.clone());
-                let snapshot = crate::ops::WorkbookSnapshot::from_workbook(&app.core.workbook);
-                match crate::io::save_workbook(&path, &snapshot) {
-                    Ok(()) => app.core.status = format!("Saved to {}", path.display()),
-                    Err(e) => app.core.status = format!("Save error: {e}"),
+            }),
+            "replace" => dialogs::replace_dialog(move |result| {
+                if let Some((find, repl)) = result {
+                    let app = unsafe { &mut *app_ptr };
+                    run_prompt_action(app, "replace", &format!("{find}|{repl}"));
                 }
-            }
-        }
-        "quit" => {
-            #[cfg(all(unix, feature = "gui"))]
-            let _ = rustxwidgets::backends_gtk_adapter::quit_main_loop();
-            #[cfg(windows)]
-            rustxwidgets::backends_nwg_adapter::quit_main_loop();
-        }
-        "find" => dialogs::find_dialog(|result| {
-            if let Some(text) = result {
-                app.core.status = format!("Find: {text}");
-            }
-        }),
-        "replace" => dialogs::replace_dialog(|result| {
-            if let Some((find, replace)) = result {
-                app.core.status = format!("Replace: '{find}' with '{replace}'");
-            }
-        }),
-        "sort_asc" => {
-            let wb = crate::ops::WorkbookState::default();
-            dialogs::sort_dialog(&wb, |result| {
-                if let Some((col, asc)) = result {
-                    app.sort_by_column(col, asc);
-                    app.core.status = format!("Sorted col {col} {}", if asc { "asc" } else { "desc" });
+            }),
+            "rename_sheet" => dialogs::find_dialog(move |result| {
+                if let Some(text) = result {
+                    let app = unsafe { &mut *app_ptr };
+                    run_prompt_action(app, "rename_sheet", &text);
                 }
-            });
-        }
-        "sort_desc" => {
-            let wb = crate::ops::WorkbookState::default();
-            dialogs::sort_dialog(&wb, |result| {
-                if let Some((col, _asc)) = result {
-                    app.sort_by_column(col, false);
-                    app.core.status = format!("Sorted col {col} desc");
+            }),
+            "copy_sheet" => dialogs::find_dialog(move |result| {
+                if let Some(text) = result {
+                    let app = unsafe { &mut *app_ptr };
+                    run_prompt_action(app, "copy_sheet", &text);
                 }
-            });
+            }),
+            "delete_sheet" => dialogs::find_dialog(move |result| {
+                if let Some(text) = result {
+                    let app = unsafe { &mut *app_ptr };
+                    run_prompt_action(app, "delete_sheet", &text);
+                }
+            }),
+            "insert_special_chars" => dialogs::find_dialog(move |result| {
+                if let Some(text) = result {
+                    let app = unsafe { &mut *app_ptr };
+                    run_prompt_action(app, "insert_special_chars", &text);
+                }
+            }),
+            "insert_hyperlink" => dialogs::find_dialog(move |result| {
+                if let Some(text) = result {
+                    let app = unsafe { &mut *app_ptr };
+                    run_prompt_action(app, "insert_hyperlink", &text);
+                }
+            }),
+            _ => {}
         }
-        "balance_books" => dialogs::balance_dialog(|result| {
-            if let Some(col) = result {
-                app.core.status = format!("Balance col: {col}");
+        update_formula_bar(state, state.last_row.get(), state.last_col.get());
+        return;
+    }
+
+    // Immediate actions go through the shared dispatcher so GTK matches the
+    // pancurses and ratatui backends exactly (render parity).
+    let app = unsafe { &mut *state.app };
+    let mut scope = state.format_scope.get();
+    let mut clip = state.clipboard.borrow_mut().clone();
+    let result = dispatch_menu_action(app, name, &mut scope, &mut clip);
+    state.format_scope.set(scope);
+    *state.clipboard.borrow_mut() = clip;
+    match result {
+        MenuDispatch::Status(s) => {
+            if !s.is_empty() {
+                app.core.status = s;
+                recompute_viewport(state);
+                state.canvas.queue_redraw();
             }
-        }),
-        "about" => dialogs::show_about_dialog(),
-        "help_keybinds" => dialogs::show_keybinds_help(),
-        "rename_sheet" => dialogs::find_dialog(|result| {
-            if let Some(name) = result {
-                app.core.status = format!("Rename sheet to: {name}");
-            }
-        }),
-        "undo" => {
-            app.core.status = "Undo not yet implemented".into();
-            state.canvas.queue_redraw();
         }
-        "redo" => {
-            app.core.status = "Redo not yet implemented".into();
-            state.canvas.queue_redraw();
-        }
-        "cut" => {
-            app.core.status = "Cut not yet implemented".into();
-        }
-        "copy" => {
-            app.core.status = "Copy not yet implemented".into();
-        }
-        "paste" => {
-            app.core.status = "Paste not yet implemented".into();
-        }
-        "delete_cell" => {
-            handle_delete(state);
-        }
-        "select_all" => {
-            app.core.status = "Select All".into();
-            app.core.anchor = None;
-            state.canvas.queue_redraw();
-        }
-        "toggle_headers" => {
-            app.core.status = "Toggle headers not yet implemented".into();
-        }
-        "toggle_margins" => {
-            app.core.status = "Toggle margins not yet implemented".into();
-        }
-        "new_sheet" => {
-            app.core.status = "New sheet not yet implemented".into();
-        }
-        "delete_sheet" => {
-            app.core.status = "Delete sheet not yet implemented".into();
-        }
-        "export_tsv" => {
+        MenuDispatch::Prompt(_label, _action) => {
+            // Only `save` degrades to a prompt (no file loaded).
             if let Some(path) = dialogs::file_save_dialog() {
-                app.core.status = format!("Exporting TSV to {}", path.display());
+                let app2 = unsafe { &mut *state.app };
+                run_prompt_action(app2, "save_as", &path.to_string_lossy().into_owned());
+                recompute_viewport(state);
+                state.canvas.queue_redraw();
             }
         }
-        "export_csv" => {
-            if let Some(path) = dialogs::file_save_dialog() {
-                app.core.status = format!("Exporting CSV to {}", path.display());
-            }
-        }
-        "export_ods" => {
-            if let Some(path) = dialogs::file_save_dialog() {
-                app.core.status = format!("Exporting ODS to {}", path.display());
-            }
-        }
-        "export_ascii" => {
-            if let Some(path) = dialogs::file_save_dialog() {
-                app.core.status = format!("Exporting ASCII to {}", path.display());
-            }
-        }
-        "insert_rows" => {
-            app.core.status = "Insert rows not yet implemented".into();
-        }
-        "insert_mitosis_row" => {
-            app.core.status = "Insert mitosis row not yet implemented".into();
-        }
-        "insert_mitosis_col" => {
-            app.core.status = "Insert mitosis col not yet implemented".into();
-        }
-        "insert_cols" => {
-            app.core.status = "Insert cols not yet implemented".into();
-        }
-        "insert_special_chars" => {
-            app.core.status = "Insert special chars not yet implemented".into();
-        }
-        "insert_date" => {
-            app.core.status = "Insert date not yet implemented".into();
-        }
-        "insert_time" => {
-            app.core.status = "Insert time not yet implemented".into();
-        }
-        "insert_hyperlink" => {
-            app.core.status = "Insert hyperlink not yet implemented".into();
-        }
-        "format_apply_all" | "format_apply_full_column" | "format_apply_data"
-        | "format_apply_special" | "format_apply_cell" | "format_apply_selection" => {
-            app.core.status = format!("Format scope: {name}");
-        }
-        "format_decimal_generic" | "format_currency" | "format_rational"
-        | "format_fixed_0" | "format_fixed_1" | "format_fixed_2" | "format_fixed_custom" => {
-            app.core.status = format!("Format number: {name}");
-        }
-        "format_align_left" | "format_align_center" | "format_align_right"
-        | "format_align_default" => {
-            app.core.status = format!("Format align: {name}");
-        }
-        "format_reset" => {
-            app.core.status = "Format reset".into();
-        }
-        _ => {
-            app.core.status = format!("Menu action: {name}");
-        }
+        MenuDispatch::About { .. } => dialogs::show_about_dialog(),
+        MenuDispatch::HelpFull { .. } => dialogs::show_keybinds_help(),
+        MenuDispatch::HelpKeybinds { .. } => dialogs::show_keybinds_help(),
     }
     update_formula_bar(state, state.last_row.get(), state.last_col.get());
-}
-
-// ---------------------------------------------------------------------------
+}// ---------------------------------------------------------------------------
 // Formula entry change callback
 // ---------------------------------------------------------------------------
 
@@ -1269,6 +1219,8 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         prev_key: Cell::new(0),
         menu_nav: Cell::new(MenuNavState::Inactive),
         alt_f_detected: Cell::new(false),
+        format_scope: Cell::new(0),
+        clipboard: RefCell::new(String::new()),
     });
 
     // Build menu

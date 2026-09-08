@@ -11,6 +11,12 @@ members = ["balance-core", "rustxWidgets/rustxwidgets"]
 notify = { path = "vendor/notify" }
 chrono = { path = "vendor/chrono" }
 crossterm = { path = "vendor/crossterm" }
+# Win95 pancurses support: pdcurses-sys build.rs compiles the win32 console
+# flavor (ANSI APIs; win32a's ExtTextOutW is a no-op stub on Win95) without
+# PDC_WIDE for rust9x targets; pancurses selects its win32 module for the
+# same targets. See vendor/*/ and tools/zig-cc-msvc586.
+pdcurses-sys = { path = "vendor/pdcurses-sys" }
+pancurses = { path = "vendor/pancurses" }
 
 [toolchain]
 channel = "nightly"
@@ -90,6 +96,12 @@ strip = "symbols"
 [profile.win95]
 inherits = "dev"
 panic = "abort"
+# Win9x: the optional UB/overflow debug checks (assert_unsafe_precondition)
+# fire spuriously in std paths on 9x (e.g. a ptr::write alignment precondition
+# aborting at first redraw) and add runtime overhead; the debug checks are
+# explicitly "optional and cannot be relied on for safety".
+debug-assertions = false
+overflow-checks = false
 
 # Override the inherited O2 per-package settings from release back to "z".
 [profile.tiny.package.balance-core]

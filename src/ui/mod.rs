@@ -1605,70 +1605,16 @@ impl App {
         None
     }
 
-    fn help_page_body(&self) -> String {
-        let body = String::from(
-            "Corro Help\n\n\
-Basics\n\
-- Arrow keys or hjkl move the cursor; PageUp/PageDown move by one screen of rows.\n\
-- Home and End jump to the leftmost and rightmost non-blank cells in the current row.\n\
-- Enter or e starts editing the current cell.\n\
-- Header/footer/margin cells use the active address syntax.\n\
-- Any printable key starts editing with that character.\n\
-- = followed by arrows builds a formula reference.\n\n\
-Selection and movement\n\
-- v toggles a cell selection.\n\
-- Shift+Arrow grows the selection one cell at a time.\n\
-- Ctrl/Cmd+Shift+Arrow extends the selection to the edge of the current nonblank run.\n\
-- Ctrl+Shift+= inserts rows above the current row or selected rows.\n\
-- r moves selected rows.\n\
-- c exports CSV when nothing is selected, or moves selected columns when columns are selected.\n\
-- Alt+arrows move selected rows or columns by one cell.\n\n\
-Menus\n\
-- Alt+F opens File.\n\
-- Format is available from the menu bar.\n\
-- Alt+I opens Insert.\n\
-- Alt+H opens Help.\n\
-- Ctrl+; inserts the date and Ctrl+Shift+; inserts the time.\n\
-- Right opens the highlighted submenu.\n\
-- Left goes back one menu level.\n\
- - Enter or the shortcut letter opens the selected item.\n\n\
-File menu\n\
- - Open file loads a .corro, .csv, .tsv, or .ods file. Use `link <file> <revision>` to open a log at a revision.\n\
- - New sheet adds another sheet to the workbook.\n\
- - Ctrl+PageUp and Ctrl+PageDown switch between workbook tabs.\n\
-- Export opens TSV, CSV, ASCII, full export, or ODS prompts; ODS includes every sheet as a separate table (Calc tab) by default. Alt+F / Alt+V / Alt+G choose formulas, values, or generic interop; Alt+X copies the current export to the clipboard (TSV, CSV, ASCII, or full/selection TSV, not ODS).\n\
-- Width opens default width and per-column width prompts.\n\
-- Sort view changes the visible order of main rows.\n\
-- Exit opens the quit prompt.\n\n\
-Help menu\n\
-- About shows the version and a short description.\n\
-- Row ops and Col ops show quick move tips.\n\
-- Full help opens this page.\n\n\
-Address syntax\n\
-  - Main cell: A1\n\
-  - Header cell: A~1\n\
-  - Footer cell: A_1\n\
-  - Left margin: [A1\n\
-  - Right margin: ]A1\n\
-  - Cross-sheet refs use numeric IDs like #2!A1 or $2:A1.\n\
-- Logs and saved files use this syntax only.\n\n\
-Quit\n\
-- q opens the quit prompt.\n\
-- Ctrl+Q exits immediately.\n\
-- Esc closes menus, prompts, help, and about.\n\
-- ? opens this help page.\n",
-        );
-        body
+    pub fn help_page_body(&self) -> String {
+        // Single source of truth lives in ui_core so the pancurses backend
+        // (which builds without the ratatui feature) renders the same text.
+        crate::ui_core::help_page_body()
     }
 
-    fn about_page_body(&self) -> String {
-        format!(
-            "{name}\n\nVersion: {version}\n\n{about}\n\n{details}",
-            name = env!("CARGO_PKG_NAME"),
-            version = env!("CARGO_PKG_VERSION"),
-            about = env!("CARGO_PKG_DESCRIPTION"),
-            details = "Corro is a terminal spreadsheet with an append-only text log, sparse sheet storage, menu-driven exports, and undo via inverse ops.",
-        )
+    pub fn about_page_body(&self) -> String {
+        // Single source of truth lives in ui_core so the pancurses backend
+        // (which builds without the ratatui feature) renders the same text.
+        crate::ui_core::about_page_body()
     }
 
     fn render_menu_popup(

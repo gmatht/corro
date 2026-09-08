@@ -42,9 +42,357 @@ mod pancurses_backend {
     fn sgr_prompt() -> &'static str { "\x1b[38;5;15m\x1b[48;5;8m" }
     fn sgr_caret() -> &'static str { "\x1b[38;5;0m\x1b[48;5;3m" }
 
+    /// -1 = disabled; a valid descriptor read from INPUT_TRACE_FD at init.
+    static INPUT_TRACE_FD: std::sync::atomic::AtomicI32 =
+        std::sync::atomic::AtomicI32::new(-1);
+
+    /// App-settable trace path (set_input_trace_file). Used instead of the
+    /// INPUT_TRACE_FILE env var when the host calls the setter (e.g. on
+    /// platforms where environment variables are unavailable).
+    static INPUT_TRACE_PATH_LEN: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    static mut INPUT_TRACE_PATH: [u8; 256] = [0u8; 256];
+
+    /// Enable the generic input trace, writing one line per getch result to
+    /// `path`. App-level equivalent of setting INPUT_TRACE_FILE.
+    pub fn set_input_trace_file(path: &str) {
+        unsafe {
+            let b = path.as_bytes();
+            let n = b.len().min(INPUT_TRACE_PATH.len());
+            INPUT_TRACE_PATH[..n].copy_from_slice(&b[..n]);
+        }
+        INPUT_TRACE_PATH_LEN.store(path.as_bytes().len().min(256), std::sync::atomic::Ordering::Relaxed);
+        INPUT_TRACE_FD.store(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn input_trace_path() -> String {
+        let n = INPUT_TRACE_PATH_LEN.load(std::sync::atomic::Ordering::Relaxed);
+        if n == 0 {
+            return std::env::var("INPUT_TRACE_FILE").unwrap_or_default();
+        }
+        unsafe { String::from_utf8_lossy(&INPUT_TRACE_PATH[..n]).into_owned() }
+    }
+
+    fn trace_input_line(input: &Option<Input>) {
+        let line = match input {
+            Some(Input::Character(c)) => format!("char {:?}\n", c),
+            Some(other) => format!("key {:?}\n", other),
+            None => format!("err\n"),
+        };
+        let path = input_trace_path();
+        if path.is_empty() {
+            return;
+        }
+        append_file_raw(&path, line.as_bytes());
+    }
+
+    /// Append `bytes` to `path`, creating it if needed. On rust9x (Windows 9x)
+    /// this uses CreateFileA directly because std::fs routes through
+    /// CreateFileW, which is an unimplemented stub on 9x (OS error 120).
+    fn append_file_raw(path: &str, bytes: &[u8]) {
+        #[cfg(target_family = "rust9x")]
+        unsafe {
+            use std::os::raw::c_void;
+            unsafe extern "system" {
+                fn CreateFileA(
+                    name: *const u8,
+                    access: u32,
+                    share: u32,
+                    sa: *mut c_void,
+                    disp: u32,
+                    flags: u32,
+                    tmpl: *mut c_void,
+                ) -> *mut c_void;
+                fn WriteFile(h: *mut c_void, buf: *const u8, len: u32, written: *mut u32, ov: *mut c_void) -> i32;
+                fn CloseHandle(h: *mut c_void) -> i32;
+            }
+            let mut pathz = path.as_bytes().to_vec();
+            pathz.push(0);
+            const GENERIC_WRITE: u32 = 0x4000_0000;
+            const FILE_SHARE_READ: u32 = 1;
+            const OPEN_ALWAYS: u32 = 4;
+            const INVALID: isize = -1;
+            let h = CreateFileA(
+                pathz.as_ptr(),
+                GENERIC_WRITE,
+                FILE_SHARE_READ,
+                std::ptr::null_mut(),
+                OPEN_ALWAYS,
+                0x80, // FILE_ATTRIBUTE_NORMAL
+                std::ptr::null_mut(),
+            );
+            if h.is_null() || h as isize == INVALID {
+                return;
+            }
+            let mut written = 0u32;
+            WriteFile(h, bytes.as_ptr(), bytes.len() as u32, &mut written, std::ptr::null_mut());
+            CloseHandle(h);
+        }
+        #[cfg(not(target_family = "rust9x"))]
+        {
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .and_then(|mut f| std::io::Write::write_all(&mut f, bytes));
+        }
+    }
+
     fn emit_sgr(s: &str) {
+        if sgr_stream_is_ansi_unusable() {
+            // Win9x: draw through curses instead of stdout.
+            emit_sgr_via_curses(s);
+            return;
+        }
         let _ = std::io::stdout().write_all(s.as_bytes());
         let _ = std::io::stdout().flush();
+    }
+
+    // ── Win9x SGR→curses interpreter ────────────────────────────
+    // Windows 9x DOS boxes neither interpret ANSI/SGR output (no ANSI.SYS
+    // in the console) nor switch screen buffers reliably, and the host app
+    // may have redirected stdout to a log file anyway. On 9x the direct-
+    // write SGR stream (spreadsheet cells, menus, dialogs, prompts) is
+    // translated into PDCurses calls onto the visible buffer instead.
+    // Supported vocabulary: CUP (ESC[y;xH), SGR (ESC[...m: 0,1,4,22,24,
+    // 38;5;n, 48;5;n, 39, 49), plain UTF-8 text, and OSC sequences (ignored).
+
+    #[cfg(windows)]
+    fn sgr_stream_is_ansi_unusable() -> bool {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetVersion() -> u32;
+        }
+        static DETECTED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+        use std::sync::atomic::Ordering;
+        match DETECTED.load(Ordering::Relaxed) {
+            1 => false,
+            2 => true,
+            _ => {
+                let win9x = (unsafe { GetVersion() } & 0x8000_0000) != 0;
+                DETECTED.store(if win9x { 2 } else { 1 }, Ordering::Relaxed);
+                win9x
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn sgr_stream_is_ansi_unusable() -> bool {
+        false
+    }
+
+    // Fixed table, const-initialized (no thread_local/LazyCell machinery —
+    // fragile on Win9x). All callers run on the single curses/UI thread.
+    // Slot 0 unused; slots 1..=63 map (fg, bg) → PDCurses pair index.
+    static mut SGR_PAIR_FG: [i16; 64] = [-1; 64];
+    static mut SGR_PAIR_BG: [i16; 64] = [-1; 64];
+    static SGR_PAIR_NEXT: std::sync::atomic::AtomicI16 = std::sync::atomic::AtomicI16::new(1);
+
+    fn sgr_pair(fg: i16, bg: i16) -> chtype {
+        if !has_colors() {
+            return 0;
+        }
+        let existing = (1..64).find(|&i| unsafe { SGR_PAIR_FG[i as usize] == fg && SGR_PAIR_BG[i as usize] == bg });
+        let p = match existing {
+            Some(p) => p,
+            None => {
+                // PDCurses win32 provides 64 color pairs; pair 0 is fixed.
+                let p = SGR_PAIR_NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed).min(63);
+                init_pair(p, fg, bg);
+                unsafe {
+                    SGR_PAIR_FG[p as usize] = fg;
+                    SGR_PAIR_BG[p as usize] = bg;
+                }
+                p
+            }
+        };
+        COLOR_PAIR(p as chtype)
+    }
+
+    fn sgr_current_attr(fg: i16, bg: i16, bold: bool, uline: bool, dim: bool) -> chtype {
+        let mut a: chtype = 0;
+        if bold {
+            a |= A_BOLD;
+        }
+        if uline {
+            a |= A_UNDERLINE;
+        }
+        if dim {
+            a |= A_DIM;
+        }
+        if has_colors() {
+            // PDCurses win32 has 8 colors (0 black … 7 white). Map the
+            // xterm-256 palette indices used by the SGR stream onto them:
+            // 8 (dark gray) → dim white, 15 (bright white) → bold white.
+            let f: i16 = match fg {
+                -1 | 8 | 15 => 7,
+                n => n & 7,
+            };
+            let b: i16 = match bg {
+                -1 => 0,
+                8 => 7,
+                n => n & 7,
+            };
+            a |= sgr_pair(f, b);
+        }
+        a
+    }
+
+    fn sgr_apply(params: &str, fg: &mut i16, bg: &mut i16, bold: &mut bool, uline: &mut bool, dim: &mut bool) {
+        if params.is_empty() {
+            *fg = -1;
+            *bg = -1;
+            *bold = false;
+            *uline = false;
+            *dim = false;
+            return;
+        }
+        let mut it = params.split(';');
+        while let Some(tok) = it.next() {
+            let code = if tok.is_empty() {
+                0
+            } else {
+                match tok.parse::<i32>() {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                }
+            };
+            match code {
+                0 => {
+                    *fg = -1;
+                    *bg = -1;
+                    *bold = false;
+                    *uline = false;
+                    *dim = false;
+                }
+                1 => *bold = true,
+                4 => *uline = true,
+                22 => *bold = false,
+                24 => *uline = false,
+                39 => *fg = -1,
+                49 => *bg = -1,
+                38 | 48 => {
+                    let _mode = it.next(); // "5"
+                    let n = it.next().and_then(|v| v.parse::<i16>().ok()).unwrap_or(0);
+                    if code == 38 {
+                        *fg = n;
+                    } else {
+                        *bg = n;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn emit_sgr_via_curses(s: &str) {
+        let bytes = s.as_bytes();
+        let mut i = 0usize;
+        let (mut y, mut x) = (0i32, 0i32);
+        let (mut fg, mut bg) = (-1i16, -1i16);
+        let (mut bold, mut uline, mut dim) = (false, false, false);
+        let mut attr: chtype = 0;
+        let mut attr_valid = false;
+        let (lines, cols) = unsafe { (pdcurses::LINES, pdcurses::COLS) };
+        if lines <= 0 || cols <= 0 {
+            return;
+        }
+        while i < bytes.len() {
+            match bytes[i] {
+                0x1b if i + 1 < bytes.len() && bytes[i + 1] == b'[' => {
+                    let start = i + 2;
+                    let mut j = start;
+                    while j < bytes.len() && !(0x40..=0x7e).contains(&bytes[j]) {
+                        j += 1;
+                    }
+                    if j >= bytes.len() {
+                        break;
+                    }
+                    let params = std::str::from_utf8(&bytes[start..j]).unwrap_or("");
+                    match bytes[j] {
+                        b'H' | b'f' => {
+                            let mut ps = params.split(';');
+                            let row = ps.next().and_then(|v| v.parse::<i32>().ok()).unwrap_or(1).max(1);
+                            let col = ps.next().and_then(|v| v.parse::<i32>().ok()).unwrap_or(1).max(1);
+                            y = row - 1;
+                            x = col - 1;
+                        }
+                        b'm' => {
+                            sgr_apply(params, &mut fg, &mut bg, &mut bold, &mut uline, &mut dim);
+                            attr_valid = false;
+                        }
+                        _ => {}
+                    }
+                    i = j + 1;
+                }
+                0x1b if i + 1 < bytes.len() && bytes[i + 1] == b']' => {
+                    // OSC (e.g. clipboard set): skip to BEL or ST (ESC \)
+                    let mut j = i + 2;
+                    while j < bytes.len() && bytes[j] != 0x07 {
+                        if bytes[j] == 0x1b && j + 1 < bytes.len() && bytes[j + 1] == b'\\' {
+                            break;
+                        }
+                        j += 1;
+                    }
+                    i = if j < bytes.len() { j + 1 } else { bytes.len() };
+                }
+                _ => {
+                    // decode one UTF-8 char
+                    let (n, ch) = match std::str::from_utf8(&bytes[i..]) {
+                        Ok(t) => {
+                            let c = t.chars().next().unwrap();
+                            (c.len_utf8(), c)
+                        }
+                        Err(e) if e.valid_up_to() > 0 => {
+                            let t = std::str::from_utf8(&bytes[i..i + e.valid_up_to()]).unwrap();
+                            let c = t.chars().next().unwrap();
+                            (c.len_utf8(), c)
+                        }
+                        Err(_) => (1, '\u{fffd}'),
+                    };
+                    i += n;
+                    match ch {
+                        '\n' => {
+                            y += 1;
+                            x = 0;
+                        }
+                        '\r' => {
+                            x = 0;
+                        }
+                        _ => {
+                            if y < lines && x < cols {
+                                if !attr_valid {
+                                    attr = sgr_current_attr(fg, bg, bold, uline, dim);
+                                    attr_valid = true;
+                                }
+                                // PDCurses win32 is not wide: box-drawing glyphs
+                                // have no portable codepoint mapping, so fall
+                                // back to their ASCII equivalents.
+                                let c8: u32 = match ch as u32 {
+                                    0x20..=0x7e => ch as u32,
+                                    0x2500 => b'-' as u32,
+                                    0x2502 => b'|' as u32,
+                                    0x2501..=0x257f => b'+' as u32,
+                                    0x25bc => b'v' as u32,
+                                    _ => b'?' as u32,
+                                };
+                                unsafe {
+                                    pdcurses::mvaddch(y, x, (c8 as chtype) | attr);
+                                }
+                            }
+                            x += 1;
+                            if x >= cols {
+                                x = 0;
+                                y += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        unsafe {
+            pdcurses::refresh();
+        }
     }
 
     pub type Callback = Box<dyn FnMut()>;
@@ -318,7 +666,6 @@ mod pancurses_backend {
     /// top of the spreadsheet output (ncurses widgets get overwritten by the
     /// spreadsheet's direct SGR writes).  Dismissed with Escape.
     pub fn show_dialog(title: &str, text: &str) {
-        let _ = std::fs::write("/tmp/corro-dbg-show.txt", format!("show_dialog: {title}\n"));
         ACTIVE_DIALOG.with(|d| *d.borrow_mut() = Some((title.to_string(), text.to_string())));
     }
 
@@ -333,7 +680,6 @@ mod pancurses_backend {
 
     /// Close the active info dialog, firing the message-box result callback.
     pub fn close_dialog() {
-        let _ = std::fs::write("/tmp/corro-dbg-close.txt", format!("close_dialog called\n"));
         let result = DIALOG_RESULT.with(|r| r.borrow_mut().take());
         ACTIVE_DIALOG.with(|d| *d.borrow_mut() = None);
         if let Some(mut cb) = result {
@@ -344,13 +690,15 @@ mod pancurses_backend {
     /// Erase the dialog box area (spaces) so closing it does not leave stale
     /// dialog text on the terminal (the spreadsheet SGR output does not
     /// overwrite empty cells).  The dialog fills the grid area (below the menu
-    /// bar and formula bar), so clear that whole region.
+    /// bar and formula bar), so clear that whole region — but NOT the last row
+    /// (the hints/status line), which stays visible, matching ratatui.
     fn clear_dialog_area(root: &Window) {
         if ACTIVE_DIALOG.with(|d| d.borrow().is_some()) {
             let (my, mx) = root.get_max_yx();
             let y0 = 2;
+            let y1 = (my - 1).max(y0 + 1); // leave the hints row (my-1) alone
             let mut out = String::new();
-            for y in y0..my {
+            for y in y0..y1 {
                 out.push_str(&sgr_cup(y, 0));
                 out.push_str(SGR_RESET);
                 out.push_str(&" ".repeat(mx as usize));
@@ -413,10 +761,33 @@ mod pancurses_backend {
 
     impl crate::backends::BackendApp for PcApp {
         fn run(self: Box<Self>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            // ncurses holds a bare Escape key for ESCDELAY (default 1000 ms)
+            // before delivering it, to disambiguate it from escape sequences
+            // (arrow keys etc.).  That made dismissing a modal dialog (About /
+            // Help) with Esc take ~1 s.  Set a short delay BEFORE initscr() so
+            // bare Esc is delivered promptly; sequence recognition is unaffected
+            // because complete sequences arrive as consecutive bytes.
+            // Windows: skip it — SetEnvironmentVariableW is a stub returning
+            // ERROR_CALL_NOT_IMPLEMENTED (120) on Win9x/ME, which makes
+            // std::env::set_var PANIC there, and PDCurses doesn't read
+            // ESCDELAY at all (ncurses-only knob).
+            #[cfg(unix)]
+            if std::env::var_os("ESCDELAY").is_none() {
+                std::env::set_var("ESCDELAY", "25");
+            }
             let mut root = initscr();
             raw();
             noecho();
             root.keypad(true);
+            // Generic input tracing (see trace_input_line): enabled when the
+            // host sets INPUT_TRACE_FILE to a writable path.
+            if std::env::var("INPUT_TRACE_FILE").is_ok() {
+                INPUT_TRACE_FD.store(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            // Drop any console input records left over before we started (e.g.
+            // the keystrokes typed to launch the app in a Win9x DOS box); a
+            // stale Enter would otherwise be delivered to the app as input.
+            flushinp();
             // Register CSI-form arrow keys so that \x1b[A etc. are
             // recognized even when terminfo uses SS3 (\x1bOA etc.).
             // screen-256color lacks kri/kind/kLFT/kRIT, so also register
@@ -677,6 +1048,17 @@ mod pancurses_backend {
                 let h = (my - y0 - 1).max(3);
                 let x0 = 0;
                 let w = mx;
+                // Clear only the rows the dialog covers (y0..y0+h); the last
+                // row (my-1) is the hints/status line and must stay visible,
+                // matching the ratatui reference (its overlay covers only
+                // grid_area, not the hints row).
+                let y1 = (y0 + h).min(my);
+                let mut out = String::new();
+                for y in y0..y1 {
+                    out.push_str(&sgr_cup(y, x0));
+                    out.push_str(SGR_RESET);
+                    out.push_str(&" ".repeat(w as usize));
+                }
                 // The body fills the box's inner area: it starts right after the
                 // left border (x0+1) and is w-2 wide, matching the ratatui
                 // reference's `block.inner(grid_area)` so long lines wrap at the
@@ -699,13 +1081,6 @@ mod pancurses_backend {
                         }
                     }
                     wrapped.push(cur);
-                }
-                let mut out = String::new();
-                // Clear the whole grid area behind the dialog.
-                for y in y0..my {
-                    out.push_str(&sgr_cup(y, x0));
-                    out.push_str(SGR_RESET);
-                    out.push_str(&" ".repeat(w as usize));
                 }
                 // Top border with the title.
                 out.push_str(&sgr_cup(y0, x0));
@@ -775,6 +1150,15 @@ mod pancurses_backend {
                 // Block for input first; only redraw when a key/event arrives
                 // (avoids flicker from redrawing every 100ms timeout).
                 let input = root.getch();
+
+                // Generic input tracing hook: if INPUT_TRACE_FD is set, the
+                // backend writes one line per getch result (raw curses code or
+                // decoded Input) so host test harnesses can diagnose input
+                // delivery. The toolkit itself knows nothing about the file's
+                // purpose.
+                if INPUT_TRACE_FD.load(std::sync::atomic::Ordering::Relaxed) >= 0 {
+                    trace_input_line(&input);
+                }
 
                 // Host frame hook: lets a host app mirror external state into the
                 // widget tree on the main thread (e.g. flush a transcript into a
@@ -962,7 +1346,6 @@ mod pancurses_backend {
                         }
                     }
                     Some(Input::Character(c)) => {
-                        let _ = std::fs::write("/tmp/corro-dbg-char.txt", format!("char={:?} dialog={}\n", c, ACTIVE_DIALOG.with(|d| d.borrow().is_some())));
                         // Any real keypress cancels a pending quit — EXCEPT Escape itself,
                         // which the bare-Escape branch below consumes to arm/trigger the
                         // quick-quit.  Resetting it here for Escape would clobber the flag
@@ -975,10 +1358,85 @@ mod pancurses_backend {
                             with_state(|state| state.running = false);
                             continue;
                         }
+                        // While a menu is open, a printable key activates the item
+                        // whose shortcut matches it (case-insensitive), like the
+                        // ratatui reference's shortcut-letter selection.  Without
+                        // this the letter fell through to the grid and started a
+                        // cell edit instead of firing the menu item.  Control keys
+                        // (Esc, Tab, ...) are excluded so their own handling below
+                        // (close menu / alt-detection) is preserved.
+                        if c >= ' ' && c != '\x7f' && with_state(|state| state.menu_open) {
+                            let mut shortcut_action: Option<String> = None;
+                            let mut entered_submenu = false;
+                            with_state(|state| {
+                                let lower = c.to_ascii_lowercase();
+                                // Find the shortcut match with an immutable borrow,
+                                // then apply state changes (avoids borrow conflict).
+                                let found: Option<(usize, bool, Option<String>)> = {
+                                    let items = match menu_current_items(state) {
+                                        Some(v) => v,
+                                        None => return,
+                                    };
+                                    let mut hit = None;
+                                    for (i, it) in items.iter().enumerate() {
+                                        let sc = match it {
+                                            crate::MenuItem::Action { shortcut, .. }
+                                            | crate::MenuItem::Submenu { shortcut, .. } => {
+                                                shortcut.as_deref().unwrap_or("")
+                                            }
+                                            _ => "",
+                                        };
+                                        if !sc.is_empty() && sc.eq_ignore_ascii_case(&lower.to_string()) {
+                                            match it {
+                                                crate::MenuItem::Submenu { .. } => {
+                                                    hit = Some((i, true, None));
+                                                }
+                                                crate::MenuItem::Action { action, .. } => {
+                                                    hit = Some((i, false, Some(action.clone())));
+                                                }
+                                                _ => {}
+                                            }
+                                            break;
+                                        }
+                                    }
+                                    hit
+                                };
+                                if let Some((i, is_submenu, action)) = found {
+                                    state.active_item = i;
+                                    if is_submenu {
+                                        menu_enter_submenu(state);
+                                        entered_submenu = true;
+                                    } else if let Some(action) = action {
+                                        shortcut_action = Some(action);
+                                        state.menu_open = false;
+                                    }
+                                }
+                            });
+                            if entered_submenu {
+                                redraw_frame(&mut root);
+                                continue;
+                            }
+                            if let Some(action) = shortcut_action {
+                                if action == "quit" {
+                                    with_state(|state| state.running = false);
+                                } else {
+                                    let cb = with_state(|state| state.menu_action_callback.take());
+                                    if let Some(mut cb) = cb {
+                                        cb(action);
+                                        with_state(|state| state.menu_action_callback = Some(cb));
+                                    }
+                                    // The action may have mutated the workbook; re-render.
+                                    redraw_frame(&mut root);
+                                }
+                                continue;
+                            }
+                            // No shortcut matched: the menu stays open and the key
+                            // is ignored for menu purposes (falls through).
+                            continue;
+                        }
                         // While a prompt is active, route all input into the prompt buffer.
                         // Escape closes the modal info dialog (About/Help).
                         if c == '\x1b' && ACTIVE_DIALOG.with(|d| d.borrow().is_some()) {
-                            let _ = std::fs::write("/tmp/corro-dbg-line962.txt", "reached\n");
                                                         clear_dialog_area(&root);
                             close_dialog();
                             redraw_frame(&mut root);
@@ -1228,8 +1686,12 @@ mod pancurses_backend {
                                         if let Some(n) = state.node_mut(fid) {
                                             if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let editing = &mut grid.editing; let edit_buf = &mut grid.edit_buf; let edit_pos = &mut grid.edit_pos;
                                                 if *editing {
-                                                    edit_buf.insert(*edit_pos, ' ');
-                                                    *edit_pos += 1;
+                                                    // Keep edit_pos on a valid index (a mid-char or
+                                                    // out-of-range insert would panic; Win9x consoles
+                                                    // can deliver garbage key events).
+                                                    let pos = (*edit_pos).min(edit_buf.len());
+                                                    edit_buf.insert(pos, ' ');
+                                                    *edit_pos = pos + 1;
                                                     return vec![];
                                                 }
                                             }
@@ -1298,16 +1760,25 @@ mod pancurses_backend {
                                                      }
                                                      if *editing {
                                                          // Still check editing in case we just entered edit mode above
-                                                        // In edit mode — append character
-                                                        edit_buf.insert(*edit_pos, c);
-                                                        *edit_pos += 1;
-                                                    }
+                                                         // In edit mode — append character. Corro cells are
+                                                         // ASCII; Win9x consoles can deliver garbage key
+                                                         // events, so reject non-printable/non-ASCII chars
+                                                         // and insert on a UTF-8 char boundary.
+                                                         if c.is_ascii_graphic() || c == ' ' {
+                                                             let pos = (*edit_pos).min(edit_buf.len());
+                                                             edit_buf.insert(pos, c);
+                                                             *edit_pos = pos + c.len_utf8();
+                                                         }
+                                                     }
                                                 }
                                             }
                                         } else if let Some(n) = state.node_mut(fid) {
                                             if let PcWidgetKind::Entry { ref mut buffer, ref mut cursor } = n.kind {
-                                                buffer.insert(*cursor, c);
-                                                *cursor += 1;
+                                                if c.is_ascii_graphic() || c == ' ' {
+                                                    let pos = (*cursor).min(buffer.len());
+                                                    buffer.insert(pos, c);
+                                                    *cursor = pos + c.len_utf8();
+                                                }
                                             }
                                         }
                                     }

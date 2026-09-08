@@ -7,7 +7,9 @@ use std::path::Path;
 use crate::ops::WorkbookState;
 use std::path::PathBuf;
 
+pub mod actions;
 pub mod clipboard;
+pub mod viewport;
 pub mod compute;
 pub mod dialogs;
 pub mod edit;

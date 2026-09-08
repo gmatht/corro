@@ -248,7 +248,16 @@ impl App {
             action_group: Rc::new(RefCell::new(None)),
         });
         #[cfg(feature = "pancurses")]
-        return Ok(App { inner: Arc::new(b) });
+        return Ok(App {
+            inner: Arc::new(b),
+            // The struct has these unconditionally on windows (added for the
+            // NWG backend); the pancurses initializer must provide them too —
+            // this path was simply never built on windows before.
+            #[cfg(windows)]
+            parent_cell: Rc::new(RefCell::new(None)),
+            #[cfg(windows)]
+            action_registry: Rc::new(RefCell::new(HashMap::new())),
+        });
     }
 
     // -- Linux paths --

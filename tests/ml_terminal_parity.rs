@@ -124,8 +124,18 @@ fn ratatui_send(app: &mut corro::ui::App, code: crossterm::event::KeyCode, mods:
 /// Operates on a COPY of the source file so the original .corro log is not mutated.
 fn render_via_ratatui_with_keys(rel_path: &str, key_codes: &[crossterm::event::KeyCode]) -> String {
     let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel_path);
-    let tmp = std::env::temp_dir().join("corro-test-tmp.corro");
-    std::fs::copy(&src, &tmp).ok();
+    // Unique per call: tests run in parallel within one process, and a fixed
+    // shared temp path would let a stale leftover from an earlier run (or a
+    // sandbox that blocks overwriting it) be loaded silently, diverging the
+    // ratatui render from the pancurses side for harness reasons.  Fail loudly
+    // on copy error instead of masking it.
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let tmp = std::env::temp_dir().join(format!(
+        "corro-ml-rt-{}-{}.corro",
+        std::process::id(),
+        id
+    ));
+    std::fs::copy(&src, &tmp).expect("copy ratatui fixture");
     let mut app = corro::ui::App::new(Some(tmp));
     app.load_initial().unwrap();
 
@@ -796,11 +806,14 @@ fn help_about_shows_dialog() {
     tmux::send_keys(&session, "Enter"); // About is item index 0 (already highlighted)
     std::thread::sleep(Duration::from_millis(600));
     let pane = tmux::capture_pane(&session);
-    assert!(pane.contains("About corro"),
+    // Title matches the ratatui reference (" About " with spaces, not "About corro").
+    assert!(pane.contains(" About "),
         "Help -> About did not display a dialog (title missing)
 --- pane ---
 {}", safe_slice(&pane, 2000));
-    assert!(pane.contains("spreadsheet TUI"),
+    // Body matches the ratatui reference about_page_body ("Corro is a terminal
+    // spreadsheet…"), not a pancurses-specific blurb.
+    assert!(pane.contains("Corro is a terminal spreadsheet"),
         "Help -> About dialog body missing
 --- pane ---
 {}", safe_slice(&pane, 2000));
@@ -810,21 +823,30 @@ fn help_about_shows_dialog() {
         "About dialog is not a box (missing top/bottom border)
 --- pane ---
 {}", safe_slice(&pane, 2000));
-    // Escape must dismiss the dialog.  (Retry: the app's Escape delivery can be
-    // timing-sensitive, but the dialog must be dismissible.)
+    // Structural: the bottom hints/status line must STAY visible while the
+    // dialog is open (ratatui's overlay covers only grid_area, not the hints
+    // row).  Regression: the dialog's clear pass erased the hints line.
+    let hints_row = pane.lines().nth(39).unwrap_or("");
+    assert!(hints_row.contains("type/F2"),
+        "bottom hints line must stay visible while the About dialog is open\n--- hints row ---\n{}\n--- pane ---\n{}",
+        hints_row, safe_slice(&pane, 2000));
+    // Escape must dismiss the dialog PROMPTLY.  A bare Esc used to be held by
+    // ncurses for ESCDELAY (default 1000 ms) before delivery, so dismissal took
+    // ~1 s.  Dismissal must complete well under that (the backend sets
+    // ESCDELAY=25 ms; allow 600 ms for scheduling slack under tmux load).
+    let t0 = std::time::Instant::now();
     let mut dismissed = false;
-    for _ in 0..3 {
+    while t0.elapsed() < Duration::from_millis(600) {
         tmux::send_keys(&session, "Escape");
-        std::thread::sleep(Duration::from_millis(300));
+        std::thread::sleep(Duration::from_millis(80));
         let p = tmux::capture_pane(&session);
-        if !p.contains("About corro") { dismissed = true; break; }
+        if !p.contains(" About ") { dismissed = true; break; }
     }
     let pane2 = tmux::capture_pane(&session);
     tmux::kill_session(&session);
     assert!(dismissed,
-        "Escape should dismiss the About dialog
---- pane ---
-{}", safe_slice(&pane2, 2000));
+        "Escape should dismiss the About dialog within 600 ms (took {:?}; ncurses ESCDELAY regression?)\n--- pane ---\n{}",
+        t0.elapsed(), safe_slice(&pane2, 2000));
 }
 
 /// Help -> Full help must also display a dialog (not a status string).
@@ -850,10 +872,281 @@ fn help_full_shows_dialog() {
     std::thread::sleep(Duration::from_millis(600));
     let pane = tmux::capture_pane(&session);
     tmux::kill_session(&session);
-    assert!(pane.contains("Full help"),
+    // Title matches the ratatui reference (" Help " with spaces).
+    assert!(pane.contains(" Help "),
         "Help -> Full help did not display a dialog
 --- pane ---
 {}", safe_slice(&pane, 2000));
+    // Body matches the ratatui reference help_page_body ("Corro Help").
+    assert!(pane.contains("Corro Help"),
+        "Help -> Full help dialog body missing
+--- pane ---
+{}", safe_slice(&pane, 2000));
+}
+
+/// Extract the text inside a bordered dialog box (the `┌…┐` … `└…┘` region)
+/// from a rendered frame.  Works for both the pancurses pane capture and the
+/// ratatui TestBackend render.  `title` is the dialog title (e.g. " About ")
+/// that appears on the box's top border, used to pick the dialog box out of a
+/// frame that also contains the spreadsheet grid's own `┌` border.  Returns the
+/// boxed lines (title + body) with the border characters stripped.
+fn extract_dialog_lines(render: &str, title: &str) -> Vec<String> {
+    let lines: Vec<&str> = render.lines().collect();
+    // Find the box whose top border carries the title (e.g. "┌ About ──…").
+    let top = match lines.iter().position(|l| l.contains('\u{250c}') && l.contains(title)) {
+        Some(i) => i,
+        None => return Vec::new(),
+    };
+    let left = match lines[top].chars().position(|c| c == '\u{250c}') { Some(i) => i, None => return Vec::new() };
+    let right = match lines[top].chars().position(|c| c == '\u{2510}') { Some(i) => i, None => return Vec::new() };
+    let mut out = Vec::new();
+    for line in &lines[top + 1..] {
+        if line.contains('\u{2514}') { break; }
+        if line.chars().count() > right {
+            let s: String = line.chars().skip(left + 1).take((right - left - 1).max(0)).collect();
+            out.push(s.trim_end().to_string());
+        }
+    }
+    out
+}
+
+/// Rendering parity: the pancurses About dialog must show the SAME title and
+/// body as the ratatui reference (`crate::ui::App::about_page_body`).
+#[test]
+fn help_about_parity_with_ratatui() {
+    // ── ratatui reference: Alt+H opens Help, Enter fires About ──
+    let mut app = corro::ui::App::new(None);
+    app.load_initial().unwrap();
+    ratatui_send(&mut app, crossterm::event::KeyCode::Char('h'), crossterm::event::KeyModifiers::ALT);
+    ratatui_send(&mut app, crossterm::event::KeyCode::Enter, crossterm::event::KeyModifiers::NONE);
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal.draw(|f| app.bench_draw(f)).unwrap();
+    let buffer = terminal.backend().buffer();
+    let rat_render: String = (0..buffer.area.height)
+        .map(|y| (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let rat_lines = extract_dialog_lines(&rat_render, " About ");
+    assert!(!rat_lines.is_empty(), "ratatui About dialog not rendered");
+
+    // ── pancurses: Escape, h opens Help, Enter fires About ──
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let session = format!("corro-parity-{}", id);
+    let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
+    let fixture = menu_fixture();
+    tmux::new_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
+    std::thread::sleep(Duration::from_millis(1500));
+    tmux::send_keys(&session, "Escape");
+    std::thread::sleep(Duration::from_millis(120));
+    tmux::send_keys(&session, "h");
+    std::thread::sleep(Duration::from_millis(400));
+    tmux::send_keys(&session, "Enter");
+    std::thread::sleep(Duration::from_millis(600));
+    let pane = tmux::capture_pane(&session);
+    tmux::kill_session(&session);
+    let pnc_lines = extract_dialog_lines(&pane, " About ");
+    assert!(!pnc_lines.is_empty(), "pancurses About dialog not rendered\n--- pane ---\n{}", safe_slice(&pane, 2000));
+
+    let rat_content: Vec<String> = rat_lines.iter().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
+    let pnc_content: Vec<String> = pnc_lines.iter().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
+    assert_eq!(pnc_content, rat_content,
+        "pancurses About dialog diverges from the ratatui reference\npancurses: {:?}\nratatui:   {:?}",
+        pnc_content, rat_content);
+}
+
+/// Rendering parity: the pancurses Full-help dialog must show the SAME title
+/// and body as the ratatui reference (`crate::ui::App::help_page_body`).
+#[test]
+fn help_full_parity_with_ratatui() {
+    // ── ratatui reference: Alt+H opens Help, Down x3 + Enter fires Full help ──
+    let mut app = corro::ui::App::new(None);
+    app.load_initial().unwrap();
+    ratatui_send(&mut app, crossterm::event::KeyCode::Char('h'), crossterm::event::KeyModifiers::ALT);
+    for _ in 0..3 {
+        ratatui_send(&mut app, crossterm::event::KeyCode::Down, crossterm::event::KeyModifiers::NONE);
+    }
+    ratatui_send(&mut app, crossterm::event::KeyCode::Enter, crossterm::event::KeyModifiers::NONE);
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal.draw(|f| app.bench_draw(f)).unwrap();
+    let buffer = terminal.backend().buffer();
+    let rat_render: String = (0..buffer.area.height)
+        .map(|y| (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let rat_lines = extract_dialog_lines(&rat_render, " Help ");
+    assert!(!rat_lines.is_empty(), "ratatui Full-help dialog not rendered");
+
+    // ── pancurses: Escape, h opens Help, Down x3 + Enter fires Full help ──
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let session = format!("corro-parity-{}", id);
+    let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
+    let fixture = menu_fixture();
+    tmux::new_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
+    std::thread::sleep(Duration::from_millis(1500));
+    tmux::send_keys(&session, "Escape");
+    std::thread::sleep(Duration::from_millis(120));
+    tmux::send_keys(&session, "h");
+    std::thread::sleep(Duration::from_millis(400));
+    for _ in 0..3 {
+        tmux::send_keys(&session, "Down");
+        std::thread::sleep(Duration::from_millis(120));
+    }
+    tmux::send_keys(&session, "Enter");
+    std::thread::sleep(Duration::from_millis(600));
+    let pane = tmux::capture_pane(&session);
+    tmux::kill_session(&session);
+    let pnc_lines = extract_dialog_lines(&pane, " Help ");
+    assert!(!pnc_lines.is_empty(), "pancurses Full-help dialog not rendered\n--- pane ---\n{}", safe_slice(&pane, 2000));
+
+    let rat_content: Vec<String> = rat_lines.iter().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
+    let pnc_content: Vec<String> = pnc_lines.iter().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
+    assert_eq!(pnc_content, rat_content,
+        "pancurses Full-help dialog diverges from the ratatui reference\npancurses: {:?}\nratatui:   {:?}",
+        pnc_content, rat_content);
+}
+
+/// Insert -> Date must update the GRID immediately (not just the formula-bar
+/// status).  Regression: the menu action mutated the workbook but nothing
+/// re-filled the spreadsheet widget's cell buffers, so the new value appeared
+/// only after arrowing away.  The old smoke test asserted only the status
+/// string ("Inserted date") and could not detect this.
+#[test]
+fn menu_insert_date_shows_cell_immediately() {
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let session = format!("corro-date-{}", id);
+    let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
+    let fixture = menu_fixture();
+    tmux::new_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
+    std::thread::sleep(Duration::from_millis(1200));
+    // Insert menu (Alt+I), Date is item index 5.
+    tmux::send_keys(&session, "Escape");
+    std::thread::sleep(Duration::from_millis(120));
+    tmux::send_keys(&session, "i");
+    std::thread::sleep(Duration::from_millis(400));
+    for _ in 0..5 {
+        tmux::send_keys(&session, "Down");
+        std::thread::sleep(Duration::from_millis(120));
+    }
+    tmux::send_keys(&session, "Enter");
+    std::thread::sleep(Duration::from_millis(600));
+    let pane = tmux::capture_pane(&session);
+    tmux::kill_session(&session);
+    // The cursor cell is A1, whose old value is "Hello World!".  The grid row
+    // for main row 1 (pane row index 5) must show a date (YYYY-MM-DD) and NOT
+    // the old value — with NO cursor movement after Enter.
+    let a1_row = pane.lines().nth(5).unwrap_or("");
+    assert!(!a1_row.contains("Hello World!"),
+        "A1 must not show the old value after Insert -> Date (stale cell buffers?)\n--- A1 row ---\n{}\n--- pane ---\n{}",
+        a1_row, safe_slice(&pane, 2000));
+    let date_re = |s: &str| {
+        let b = s.as_bytes();
+        (0..s.len()).any(|i| {
+            i + 10 <= s.len()
+                && b[i..i + 4].iter().all(|c| c.is_ascii_digit())
+                && b[i + 4] == b'-'
+                && b[i + 5..i + 7].iter().all(|c| c.is_ascii_digit())
+                && b[i + 7] == b'-'
+                && b[i + 8..i + 10].iter().all(|c| c.is_ascii_digit())
+        })
+    };
+    assert!(date_re(a1_row),
+        "A1 grid row must show the inserted date (YYYY-MM-DD) immediately after Enter\n--- A1 row ---\n{}\n--- pane ---\n{}",
+        a1_row, safe_slice(&pane, 2000));
+}
+
+/// Insert -> Mitosis (Row) must COPY the cursor row's values into a new row
+/// below it (shifting lower rows down), like the ratatui reference's
+/// insert_mitosis_row_after_cursor (Op::DuplicateRow).  Regression: the GUI
+/// action layer aliased mitosis to "grow a blank row at the bottom" — nothing
+/// was copied.  The old coverage only walked the item's label (never
+/// activated it), so the silent no-op went undetected.
+#[test]
+fn menu_mitosis_row_copies_row_values() {
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let session = format!("corro-mit-r-{}", id);
+    let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
+    let fixture = menu_fixture();
+    tmux::new_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
+    std::thread::sleep(Duration::from_millis(1200));
+    // Cursor starts at A1 ("Hello World!").  Insert menu (Alt+I);
+    // Mitosis (Row) is item index 1.
+    tmux::send_keys(&session, "Escape");
+    std::thread::sleep(Duration::from_millis(120));
+    tmux::send_keys(&session, "i");
+    std::thread::sleep(Duration::from_millis(400));
+    tmux::send_keys(&session, "Down");
+    std::thread::sleep(Duration::from_millis(200));
+    // Enter can occasionally be lost under tmux load (the menu is then still
+    // open on capture).  Retry the activation a bounded number of times instead
+    // of papering over it: if the action never fires, the test still fails.
+    let mut pane = String::new();
+    let mut fired = false;
+    for _ in 0..5 {
+        tmux::send_keys(&session, "Enter");
+        std::thread::sleep(Duration::from_millis(500));
+        pane = tmux::capture_pane(&session);
+        if pane.contains("Inserted mitosis row") {
+            fired = true;
+            break;
+        }
+    }
+    tmux::kill_session(&session);
+    assert!(fired, "Enter on Mitosis (Row) never fired the action (menu stuck open?)\n--- pane ---\n{}",
+        safe_slice(&pane, 2000));
+    // No cursor movement after Enter: assertions must hold immediately.
+    let row1 = pane.lines().nth(5).unwrap_or("");
+    let row2 = pane.lines().nth(6).unwrap_or("");
+    assert!(row1.contains("Hello World!"),
+        "main row 1 must keep its value after row mitosis\n--- row1 ---\n{}\n--- pane ---\n{}",
+        row1, safe_slice(&pane, 2000));
+    assert!(row2.contains("Hello World!"),
+        "main row 2 must be the COPY of row 1 after row mitosis (got: {:?})\n--- row2 ---\n{}\n--- pane ---\n{}",
+        row2, row2, safe_slice(&pane, 2000));
+    // The cursor moves onto the duplicate (A2), matching ratatui.
+    let bar = pane.lines().nth(1).unwrap_or("");
+    assert!(bar.contains("A2"),
+        "formula bar must show A2 (cursor on the duplicate row) after row mitosis\n--- formula bar ---\n{}\n--- pane ---\n{}",
+        bar, safe_slice(&pane, 2000));
+}
+
+/// Insert -> Mitosis (Col) must COPY the cursor column's values into a new
+/// column to its right (shifting columns right), like the ratatui reference's
+/// insert_mitosis_col_after_cursor (Op::DuplicateCol).  Regression: aliased to
+/// "grow a blank column at the right" — nothing was copied.
+#[test]
+fn menu_mitosis_col_copies_col_values() {
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let session = format!("corro-mit-c-{}", id);
+    let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
+    let fixture = menu_fixture();
+    tmux::new_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
+    std::thread::sleep(Duration::from_millis(1200));
+    // Cursor starts at A1 ("Hello World!").  Insert menu (Alt+I), then the
+    // item's SHORTCUT letter 'o' (the user's exact key sequence Alt+I > O) —
+    // this must fire the item, not fall through into the grid as a cell edit.
+    tmux::send_keys(&session, "Escape");
+    std::thread::sleep(Duration::from_millis(120));
+    tmux::send_keys(&session, "i");
+    std::thread::sleep(Duration::from_millis(400));
+    tmux::send_keys(&session, "o");
+    std::thread::sleep(Duration::from_millis(600));
+    let pane = tmux::capture_pane(&session);
+    tmux::kill_session(&session);
+    // Main row 1 must now show the value TWICE: original in column A and the
+    // copy in the new column B.  (Column A may truncate the trailing '!', so
+    // count the "Hello World" prefix, not the full string.)
+    let row1 = pane.lines().nth(5).unwrap_or("");
+    let copies = row1.matches("Hello World").count();
+    assert!(copies >= 2,
+        "main row 1 must show the copied value in the duplicate column (found {} occurrence(s))\n--- row1 ---\n{}\n--- pane ---\n{}",
+        copies, copies, safe_slice(&pane, 2000));
+    // The cursor moves onto the duplicate (B1), matching ratatui.
+    let bar = pane.lines().nth(1).unwrap_or("");
+    assert!(bar.contains("B1"),
+        "formula bar must show B1 (cursor on the duplicate column) after col mitosis\n--- formula bar ---\n{}\n--- pane ---\n{}",
+        bar, safe_slice(&pane, 2000));
 }
 
 /// The File menu popup must render as a bordered box (not a bare text overlay

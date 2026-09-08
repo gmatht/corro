@@ -232,6 +232,7 @@ CHAR_MAP = {
     ";": ["semicolon"],
     "'": ["apostrophe"],
     ":": ["shift", "semicolon"],
+    "_": ["shift", "shift-minus"],
     "\\": ["less"],  # this layout maps backslash to the ISO key ('less' qcode)
     "": ["spc"],
 }

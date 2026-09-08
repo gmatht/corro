@@ -215,8 +215,78 @@ fn parse_args() -> Result<Args, String> {
 #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
 #[no_mangle]
 pub extern "C" fn main() -> i32 {
+    win9x_redirect_console_output();
     corro_main();
     0
+}
+
+// Windows 9x only: std's console layer writes through WriteConsoleW, a no-op
+// stub on Windows 95/98/ME — every eprintln!/println! panics ("failed
+// printing to stderr") and aborts under panic="abort". Redirect
+// STDOUT/ERROR to a log file with SetStdHandle so all std console macros
+// write via WriteFile instead. The NT line (Win2000+) has real W console
+// APIs and keeps its console handles (the crossterm TUI needs them there).
+#[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+fn win9x_redirect_console_output() {
+    use std::os::raw::c_void;
+    #[repr(C)]
+    struct OsVersionInfoA {
+        size: u32,
+        major: u32,
+        minor: u32,
+        build: u32,
+        platform: u32,
+        csd: [u8; 128],
+    }
+    unsafe extern "system" {
+        fn GetVersionExA(info: *mut c_void) -> i32;
+        fn CreateFileA(
+            name: *const u8,
+            access: u32,
+            share: u32,
+            sa: *mut c_void,
+            disp: u32,
+            flags: u32,
+            tmpl: *mut c_void,
+        ) -> *mut c_void;
+        fn SetStdHandle(which: u32, handle: *mut c_void) -> i32;
+    }
+    const VER_PLATFORM_WIN32_WINDOWS: u32 = 1; // 95/98/ME
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const FILE_SHARE_READ: u32 = 1;
+    const OPEN_ALWAYS: u32 = 4;
+    const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+    const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
+    const STD_ERROR_HANDLE: u32 = -12i32 as u32;
+    unsafe {
+        let mut vi = OsVersionInfoA {
+            size: std::mem::size_of::<OsVersionInfoA>() as u32,
+            major: 0,
+            minor: 0,
+            build: 0,
+            platform: 0,
+            csd: [0; 128],
+        };
+        if GetVersionExA(&mut vi as *mut _ as *mut c_void) == 0
+            || vi.platform != VER_PLATFORM_WIN32_WINDOWS
+        {
+            return; // NT line: keep the real console handles
+        }
+        let h = CreateFileA(
+            b"c:\\corro-win95.log\0".as_ptr(),
+            GENERIC_WRITE,
+            FILE_SHARE_READ,
+            std::ptr::null_mut(),
+            OPEN_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        );
+        if h.is_null() || h as isize == -1 {
+            return;
+        }
+        SetStdHandle(STD_OUTPUT_HANDLE, h);
+        SetStdHandle(STD_ERROR_HANDLE, h);
+    }
 }
 
 #[cfg(not(all(target_family = "rust9x", target_env = "msvc")))]

@@ -1,0 +1,31 @@
+#!/bin/sh
+# zig-cc wrapper: cross-compiles C for i586-pc-windows-msvc (used by the
+# pdcurses-sys build script for the rust9x/Win95 pancurses build).
+#
+# Why a wrapper: the `cc` crate passes host-gcc-style flags (-m32, -static)
+# that zig cc rejects, and the target must be pinned so no SSE/integer-SIMD
+# instructions sneak in — Windows 95 never enables CR4.OSFXSR, so any SSE
+# instruction faults regardless of the CPU model. zig's x86 baseline
+# (i686) is already SSE-free; -mcpu=pentium pins it to plain i586.
+#
+# The C objects are COFF with MSVC symbol decoration, linked by rustc's
+# rust-lld against the vintage VC6 CRT (see .cargo/config.toml). We compile
+# with zig's *mingw* headers (x86-windows-gnu) because zig ships no libc
+# headers for msvc targets — but the object ABI (cdecl, _-decorated symbols,
+# Win32 structs) is identical, and any mingw-only CRT symbol gaps are shimmed
+# in the pdcurses-sys build (see its build.rs, rust9x branch).
+set -eu
+ZIG=${ZIG:-/snap/bin/zig}
+args=
+for a in "$@"; do
+    case "$a" in
+        -m32|-m64|-static|-shared|-march*) ;;
+        # cc-rs passes its own --target (e.g. i586-pc-windows-msvc); zig's
+        # target parser calls the arch "x86", so drop it and use ours below.
+        --target=*) ;;
+        *) args="$args $a" ;;
+    esac
+done
+exec "$ZIG" cc --target=x86-windows-gnu -mcpu=pentium \
+    -fno-stack-protector -fno-sanitize=undefined -fno-sanitize=address \
+    $args
