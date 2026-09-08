@@ -1,15 +1,18 @@
 // High-level ergonomic wrappers over gtk_compat for the rustxwidgets API
-#[cfg(target_os = "linux")]
+#[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
 mod gtk_adapter {
     use std::os::raw::c_void;
     use std::cell::RefCell;
     use std::rc::Rc;
     use crate::core::{Error, Widget};
-    use gtk_dynamic_loader::{Window as GWindow, Button as GButton, Label as GLabel, BoxWidget as GBox, Grid as GGrid, Entry as GEntry, Dialog as GDialog, DropDown as GDropDown, CheckButton as GCheckButton, RadioButton as GRadioButton, TextView as GTextView};
+    use gtk_dynamic_loader::{Window as GWindow, Button as GButton, Label as GLabel, BoxWidget as GBox, Grid as GGrid, Entry as GEntry, Dialog as GDialog, DropDown as GDropDown, CheckButton as GCheckButton, RadioButton as GRadioButton, TextView as GTextView, ScrolledWindow as GScrolledWindow};
 
-    /// A thin transparent wrapper around gtk_compat::Window
-    #[repr(transparent)]
-    pub struct Window(pub GWindow);
+    /// Window wrapper around gtk_compat::Window.
+    /// Stores event controllers in _controllers so that on_event_key
+    /// (which adds a GtkEventControllerKey to the window) keeps the
+    /// Rust-side wrapper alive.  Without this the controller is dropped
+    /// while still owned by the window, causing a segfault later.
+    pub struct Window(pub GWindow, pub Rc<RefCell<Vec<Box<dyn std::any::Any>>>>);
 
     impl Widget for Window {
         fn raw_handle(&self) -> *mut c_void { *self.0.as_ref() }
@@ -17,7 +20,26 @@ mod gtk_adapter {
 
     impl AsRef<*mut c_void> for Window { fn as_ref(&self) -> &*mut c_void { self.0.as_ref() } }
 
+    impl Clone for Window { fn clone(&self) -> Self { Window(self.0.clone(), self.1.clone()) } }
+
     impl Window {
+        pub fn set_title(&self, title: &str) {
+            self.0.set_title(title);
+        }
+
+        pub fn set_default_size(&self, w: i32, h: i32) {
+            self.0.set_default_size(w, h);
+        }
+
+        pub fn set_child(&self, child: &impl AsRef<*mut c_void>) {
+            self.0.set_child(child);
+        }
+        pub fn set_child_box(&self, bx: &BoxWidget) { self.set_child(bx); }
+
+        pub fn present(&self) {
+            self.0.present();
+        }
+
         /// Queue a redraw of the entire window.  On GTK4 the DrawingArea
         /// may have its own draw function, but forcing a window-level
         /// queue_draw cascades to all children (including the canvas),
@@ -34,7 +56,29 @@ mod gtk_adapter {
             }
         }
 
-        /// Connect a close handler: GTK4 uses `close-request`, GTK3 `delete-event`.
+        /// # Safety
+        /// `group_ptr` must be a valid GActionGroup pointer or null.
+        pub unsafe fn insert_action_group(&self, name: &str, group_ptr: *mut std::os::raw::c_void) {
+            self.0.insert_action_group(name, group_ptr);
+        }
+
+        pub fn hwnd(&self) -> *mut c_void {
+            *self.0.as_ref()
+        }
+        pub fn on_event(&self, cb: Box<dyn FnMut(*mut c_void) -> i32>) {
+            if let Some(loader) = crate::backends::gtk::loader() {
+                let win_ptr = *self.0.as_ref();
+                if !win_ptr.is_null() {
+                    let l = loader.clone();
+                    unsafe {
+                        let _ = gtk_dynamic_loader::widget_connect_signal_bool(
+                            &l, win_ptr, "event", cb,
+                        );
+                    }
+                }
+            }
+        }
+
         pub fn on_close(&self, cb: Box<dyn FnMut()>) {
             if let Some(loader) = crate::backends::gtk::loader() {
                 let win_ptr = *self.0.as_ref();
@@ -55,35 +99,112 @@ mod gtk_adapter {
                 }
             }
         }
-    }
-
-    impl Window {
-        pub fn set_title(&self, title: &str) {
-            self.0.set_title(title);
-        }
-
-        pub fn set_child(&self, child: &impl AsRef<*mut c_void>) {
-            self.0.set_child(child);
-        }
-
-        pub fn present(&self) {
-            self.0.present();
-        }
-
-        /// # Safety
-        /// `group_ptr` must be a valid GActionGroup pointer or null.
-        pub unsafe fn insert_action_group(&self, name: &str, group_ptr: *mut std::os::raw::c_void) {
-            self.0.insert_action_group(name, group_ptr);
-        }
-
-        pub fn set_default_size(&self, width: i32, height: i32) {
-            self.0.set_default_size(width, height);
+        pub fn on_event_key(&self, mut cb: Box<dyn FnMut(u32, u32) -> i32>) {
+            if let Some(loader) = crate::backends::gtk::loader() {
+                let win_ptr = *self.0.as_ref();
+                if !win_ptr.is_null() {
+                    let l = loader.clone();
+                    let is_gtk4 = l.symbols.gtk_drawing_area_set_draw_func.is_some();
+                    // Shared callback wrapper used by both GTK4 and GTK3 paths.
+                    let shared_cb: Rc<RefCell<Option<Box<dyn FnMut(u32, u32) -> i32>>>> = Rc::new(RefCell::new(Some(cb)));
+                    if is_gtk4 {
+                        // CAPTURE-phase controller: handles ALL keys (not just navigation keys).
+                        // On GTK4/WSLg, when the formula entry doesn't have keyboard focus,
+                        // keyboard events are silently dropped because there's no focused
+                        // widget to receive them.  By processing ALL keys in the window
+                        // CAPTURE phase, we ensure every keystroke reaches our key handler
+                        // regardless of focus state.
+                        //
+                        // We always call the application callback and return its result
+                        // (GDK_EVENT_STOP for handled keys, GDK_EVENT_PROPAGATE otherwise).
+                        // For printable characters, the application's callback now returns
+                        // STOP (1) because start_edit_with/set_text updates the entry widget
+                        // directly — there's no need for the event to reach the entry widget.
+                        //
+                        // Mutual-exclusion flag: the CAPTURE controller sets this before
+                        // returning STOP; the BUBBLE controller checks it to avoid
+                        // processing the same event twice.  On some GTK4/WSLg versions
+                        // the BUBBLE controller fires even when CAPTURE returns STOP,
+                        // so a simple GDK_EVENT_STOP return is not sufficient — we need
+                        // this explicit handshake.
+                        let capture_handled: std::cell::Cell<bool> = std::cell::Cell::new(false);
+                        let capture_handled = std::rc::Rc::new(capture_handled);
+                        if let Ok(ctrl) = gtk_dynamic_loader::EventControllerKey::new(l.clone()) {
+                            ctrl.set_propagation_phase_capture();
+                            let sc = shared_cb.clone();
+                            let ch = capture_handled.clone();
+                            let _ = ctrl.connect_key_pressed(Box::new(move |keyval: u32, state: u32| -> i32 {
+                                ch.set(false);
+                                let result = if let Some(ref mut f) = *sc.borrow_mut() {
+                                    f(keyval, state)
+                                } else {
+                                    0
+                                };
+                                if result != 0 {
+                                    ch.set(true);
+                                }
+                                result
+                            }));
+                            ctrl.add_to_widget(&self.0);
+                            self.1.borrow_mut().push(Box::new(ctrl));
+                        }
+                        // BUBBLE-phase controller: safety net.  The CAPTURE-phase controller
+                        // above handles all keys and sets capture_handled=true.  If BUBBLE
+                        // fires despite CAPTURE having returned STOP (a known issue on some
+                        // GTK4/WSLg versions), we check the flag and skip.
+                        if let Ok(ctrl) = gtk_dynamic_loader::EventControllerKey::new(l.clone()) {
+                            let sc = shared_cb.clone();
+                            let ch = capture_handled.clone();
+                            let _ = ctrl.connect_key_pressed(Box::new(move |keyval: u32, state: u32| -> i32 {
+                                if ch.get() {
+                                    ch.set(false);
+                                    return 0;
+                                }
+                                if let Some(ref mut f) = *sc.borrow_mut() {
+                                    f(keyval, state)
+                                } else {
+                                    0
+                                }
+                            }));
+                            ctrl.add_to_widget(&self.0);
+                            self.1.borrow_mut().push(Box::new(ctrl));
+                        }
+                    } else {
+                        unsafe {
+                            let sc = shared_cb.clone();
+                            let _ = gtk_dynamic_loader::widget_connect_signal_bool(
+                                &l.clone(), win_ptr, "event",
+                                Box::new(move |ev: *mut c_void| -> i32 {
+                                    let mut keyval: u32 = 0;
+                                    if let Some(get_kv) = l.symbols.gdk_event_get_keyval {
+                                        if get_kv(ev, &mut keyval) == 0 {
+                                            return 0;
+                                        }
+                                    } else {
+                                        return 0;
+                                    }
+                                    let mut state: u32 = 0;
+                                    if let Some(get_st) = l.symbols.gdk_event_get_state {
+                                        get_st(ev, &mut state);
+                                    }
+                                    if let Some(ref mut f) = *sc.borrow_mut() {
+                                        f(keyval, state)
+                                    } else {
+                                        0
+                                    }
+                                }),
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 
     #[repr(transparent)]
     pub struct Button(pub GButton);
 
+    impl Widget for Button { fn raw_handle(&self) -> *mut c_void { *self.0.as_ref() } }
     impl AsRef<*mut c_void> for Button { fn as_ref(&self) -> &*mut c_void { self.0.as_ref() } }
 
     impl Button {
@@ -99,6 +220,9 @@ mod gtk_adapter {
         pub fn set_visible(&self, visible: bool) { self.0.set_visible(visible); }
         pub fn set_hexpand(&self, expand: bool) { self.0.set_hexpand(expand); }
         pub fn set_vexpand(&self, expand: bool) { self.0.set_vexpand(expand); }
+        pub fn set_font_style(&self, weight: i32, italic: bool) { self.0.set_font_style(weight, italic); }
+        pub fn add_class(&self, class_name: &str) { self.0.add_class(class_name); }
+        pub fn remove_class(&self, class_name: &str) { self.0.remove_class(class_name); }
     }
 
     impl Clone for Button { fn clone(&self) -> Self { Button(self.0.clone()) } }
@@ -106,6 +230,7 @@ mod gtk_adapter {
     #[repr(transparent)]
     pub struct Label(pub GLabel);
 
+    impl Widget for Label { fn raw_handle(&self) -> *mut c_void { *self.0.as_ref() } }
     impl AsRef<*mut c_void> for Label { fn as_ref(&self) -> &*mut c_void { self.0.as_ref() } }
 
     impl Label {
@@ -125,16 +250,18 @@ mod gtk_adapter {
         pub fn set_size_request(&self, w: i32, h: i32) { self.0.set_size_request(w, h); }
         /// Set the x alignment of the label's text (0.0 left .. 1.0 right)
         pub fn set_xalign(&self, x: f32) { self.0.set_xalign(x); }
+        pub fn raw_handle(&self) -> *mut c_void { *self.0.as_ref() }
     }
 
     impl Clone for Label { fn clone(&self) -> Self { Label(self.0.clone()) } }
-    impl Widget for Label { fn raw_handle(&self) -> *mut c_void { *self.0.as_ref() } }
 
     #[repr(transparent)]
     pub struct BoxWidget(pub GBox);
 
     impl Widget for BoxWidget { fn raw_handle(&self) -> *mut c_void { *self.0.as_ref() } }
     impl AsRef<*mut c_void> for BoxWidget { fn as_ref(&self) -> &*mut c_void { self.0.as_ref() } }
+
+    impl Clone for BoxWidget { fn clone(&self) -> Self { BoxWidget(self.0.clone()) } }
 
     impl BoxWidget {
         pub fn append(&self, child: &impl AsRef<*mut c_void>) {
@@ -145,12 +272,29 @@ mod gtk_adapter {
         pub fn set_vexpand(&self, expand: bool) { self.0.set_vexpand(expand); }
         pub fn set_hexpand(&self, expand: bool) { self.0.set_hexpand(expand); }
         pub fn set_visible(&self, visible: bool) { self.0.set_visible(visible); }
+        pub fn set_child_hexpand(&self, child: &impl AsRef<*mut c_void>, expand: bool) {
+            if let Some(loader) = crate::backends::gtk::loader() {
+                let child_ptr = *child.as_ref();
+                if !child_ptr.is_null() {
+                    unsafe { gtk_dynamic_loader::widget_set_hexpand(&loader, child_ptr, expand); }
+                }
+            }
+        }
+        pub fn set_child_vexpand(&self, child: &impl AsRef<*mut c_void>, expand: bool) {
+            if let Some(loader) = crate::backends::gtk::loader() {
+                let child_ptr = *child.as_ref();
+                if !child_ptr.is_null() {
+                    unsafe { gtk_dynamic_loader::widget_set_vexpand(&loader, child_ptr, expand); }
+                }
+            }
+        }
     }
 
     #[repr(transparent)]
     pub struct Grid(pub GGrid);
     impl Widget for Grid { fn raw_handle(&self) -> *mut c_void { *self.0.as_ref() } }
     impl AsRef<*mut c_void> for Grid { fn as_ref(&self) -> &*mut c_void { self.0.as_ref() } }
+    impl Clone for Grid { fn clone(&self) -> Self { Grid(self.0.clone()) } }
 
     impl Grid {
         pub fn attach(&self, child: &impl AsRef<*mut c_void>, left: i32, top: i32, width: i32, height: i32) {
@@ -162,42 +306,95 @@ mod gtk_adapter {
         pub fn set_size_request(&self, w: i32, h: i32) { self.0.set_size_request(w, h); }
     }
 
-    #[repr(transparent)]
-    pub struct Entry(pub GEntry);
-    impl Widget for Entry { fn raw_handle(&self) -> *mut c_void { *self.0.as_ref() } }
-    impl AsRef<*mut c_void> for Entry { fn as_ref(&self) -> &*mut c_void { self.0.as_ref() } }
+    pub struct Entry {
+        inner: GEntry,
+        _controllers: Rc<RefCell<Vec<Box<dyn std::any::Any>>>>,
+    }
+    impl Widget for Entry { fn raw_handle(&self) -> *mut c_void { *self.inner.as_ref() } }
+    impl AsRef<*mut c_void> for Entry { fn as_ref(&self) -> &*mut c_void { self.inner.as_ref() } }
 
     impl Entry {
-        pub fn set_text(&self, text: &str) { self.0.set_text(text); }
-        pub fn get_text(&self) -> Option<String> { self.0.get_text() }
-        pub fn set_width_chars(&self, n: i32) { self.0.set_width_chars(n); }
-        pub fn set_size_request(&self, w: i32, h: i32) { self.0.set_size_request(w, h); }
-        pub fn connect_changed(&self, f: impl FnMut() + 'static) -> Result<u64, Error> { self.0.connect_changed(f).map_err(|e| Error::Backend(format!("{}", e))) }
+        pub fn set_text(&self, text: &str) { self.inner.set_text(text); }
+        pub fn get_text(&self) -> Option<String> { self.inner.get_text() }
+        pub fn set_width_chars(&self, n: i32) { self.inner.set_width_chars(n); }
+        pub fn set_size_request(&self, w: i32, h: i32) { self.inner.set_size_request(w, h); }
+        pub fn connect_changed(&self, f: impl FnMut() + 'static) -> Result<u64, Error> { self.inner.connect_changed(f).map_err(|e| Error::Backend(format!("{}", e))) }
         pub fn connect_activate<F: FnMut(*mut c_void) + 'static>(&self, f: F) -> Result<u64, Error> {
-            self.0.connect_activate(f).map_err(|e| Error::Backend(format!("{}", e)))
+            self.inner.connect_activate(f).map_err(|e| Error::Backend(format!("{}", e)))
         }
-        pub fn connect_button_press(&self, f: impl FnMut() + 'static) -> Result<u64, Error> { self.0.connect_button_press(f).map_err(|e| Error::Backend(format!("{}", e))) }
-        pub fn add_class(&self, class_name: &str) { self.0.add_class(class_name); }
-        pub fn remove_class(&self, class_name: &str) { self.0.remove_class(class_name); }
-        pub fn grab_focus(&self) { self.0.grab_focus(); }
+        pub fn connect_button_press(&self, f: impl FnMut() + 'static) -> Result<u64, Error> { self.inner.connect_button_press(f).map_err(|e| Error::Backend(format!("{}", e))) }
+        pub fn add_class(&self, class_name: &str) { self.inner.add_class(class_name); }
+        pub fn remove_class(&self, class_name: &str) { self.inner.remove_class(class_name); }
+        pub fn grab_focus(&self) { self.inner.grab_focus(); }
         pub fn connect_focus_in_event<F: FnMut(*mut c_void) -> i32 + 'static>(&self, f: F) -> Result<u64, Error> {
-            self.0.connect_focus_in_event(f).map_err(|e| Error::Backend(format!("{}", e)))
+            self.inner.connect_focus_in_event(f).map_err(|e| Error::Backend(format!("{}", e)))
         }
         pub fn connect_focus_out_event<F: FnMut(*mut c_void) -> i32 + 'static>(&self, f: F) -> Result<u64, Error> {
-            self.0.connect_focus_out_event(f).map_err(|e| Error::Backend(format!("{}", e)))
+            self.inner.connect_focus_out_event(f).map_err(|e| Error::Backend(format!("{}", e)))
         }
-        pub fn set_margin_start(&self, margin: i32) { self.0.set_margin_start(margin); }
-        pub fn set_margin_top(&self, margin: i32) { self.0.set_margin_top(margin); }
-        pub fn set_halign(&self, align: i32) { self.0.set_halign(align); }
-        pub fn set_valign(&self, align: i32) { self.0.set_valign(align); }
-        pub fn set_visible(&self, visible: bool) { self.0.set_visible(visible); }
-        pub fn set_hexpand(&self, expand: bool) { self.0.set_hexpand(expand); }
-        pub fn set_vexpand(&self, expand: bool) { self.0.set_vexpand(expand); }
-        /// Set the cursor position (character index) within the entry's text.
-        pub fn set_position(&self, position: i32) { self.0.set_position(position); }
+        pub fn set_margin_start(&self, margin: i32) { self.inner.set_margin_start(margin); }
+        pub fn set_margin_top(&self, margin: i32) { self.inner.set_margin_top(margin); }
+        pub fn set_halign(&self, align: i32) { self.inner.set_halign(align); }
+        pub fn set_valign(&self, align: i32) { self.inner.set_valign(align); }
+        pub fn set_visible(&self, visible: bool) { self.inner.set_visible(visible); }
+        pub fn set_hexpand(&self, expand: bool) { self.inner.set_hexpand(expand); }
+        pub fn set_vexpand(&self, expand: bool) { self.inner.set_vexpand(expand); }
+        pub fn on_key_raw(&self, cb: Box<dyn FnMut(u32, u32) -> bool>) {
+            if let Some(loader) = crate::backends::gtk::loader() {
+                let entry_ptr = *self.inner.as_ref();
+                if !entry_ptr.is_null() {
+                    let symbols = &loader.symbols;
+                    let is_gtk4 = symbols.gtk_drawing_area_set_draw_func.is_some();
+                    if is_gtk4 {
+                        // GTK4: GtkEntry's internal EventControllerKey (CAPTURE phase) consumes
+                        // RETURN/TAB/ESCAPE/arrows before a BUBBLE-phase EventControllerKey can
+                        // fire.  We use CAPTURE phase here so our controller fires BEFORE the
+                        // internal handler, intercepting RETURN directly instead of relying on
+                        // the "activate" signal (which doesn't fire reliably on WSLg/WSL).
+                        //
+                        // For printable characters our callback returns GDK_EVENT_PROPAGATE (false),
+                        // letting the internal handler insert the character normally.
+                        // The "changed" signal then fires on_formula_entry_changed as before.
+                        let shared_cb = std::rc::Rc::new(std::cell::RefCell::new(Some(cb)));
+                        self._controllers.borrow_mut().push(Box::new(shared_cb.clone()));
+                        if let Ok(ctrl) = gtk_dynamic_loader::EventControllerKey::new(loader.clone()) {
+                            ctrl.set_propagation_phase_capture();
+                            let sc = shared_cb.clone();
+                            let _ = ctrl.connect_key_pressed(Box::new(move |keyval: u32, state: u32| -> i32 {
+                                if let Some(ref mut f) = *sc.borrow_mut() {
+                                    if f(keyval, state) { 1 } else { 0 }
+                                } else { 0 }
+                            }));
+                            ctrl.add_to_widget(&self.inner);
+                            self._controllers.borrow_mut().push(Box::new(ctrl));
+                        }
+                        // NOTE: The application-level connect_activate callback in gui_backend.rs
+                        // is retained as a secondary fallback.  With CAPTURE phase we handle RETURN
+                        // directly and stop propagation, so "activate" is never emitted — but if
+                        // the CAPTURE controller somehow doesn't fire (e.g., older GTK), the
+                        // connect_activate path still works.
+                    } else {
+                        // GTK3 path: connect to raw "key-press-event" signal
+                        let l = loader.clone();
+                        let mut cb = cb;
+                        unsafe {
+                            let _ = gtk_dynamic_loader::widget_connect_signal_bool(
+                                &l.clone(), entry_ptr, "key-press-event",
+                                Box::new(move |ev: *mut c_void| -> i32 {
+                                    let keyval = gtk_dynamic_loader::EventControllerKey::get_keyval_static(&l, ev);
+                                    if keyval == 0 { return 0; }
+                                    let state = gtk_dynamic_loader::EventControllerKey::get_state_static(&l, ev);
+                                    if cb(keyval, state) { 1 } else { 0 }
+                                }),
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
-    impl Clone for Entry { fn clone(&self) -> Self { Entry(self.0.clone()) } }
+    impl Clone for Entry { fn clone(&self) -> Self { Entry { inner: self.inner.clone(), _controllers: self._controllers.clone() } } }
     impl Clone for DropDown { fn clone(&self) -> Self { DropDown(self.0.clone()) } }
     impl Clone for CheckButton { fn clone(&self) -> Self { CheckButton(self.0.clone()) } }
     impl Clone for RadioButton { fn clone(&self) -> Self { RadioButton(self.0.clone()) } }
@@ -206,7 +403,7 @@ mod gtk_adapter {
     // Factories delegate to backend so they share the App-owned loader
     pub fn create_window() -> Result<Window, Error> {
         let gw = crate::backends::gtk::create_window().map_err(|e| Error::Backend(format!("{}", e)))?;
-        Ok(Window(gw))
+        Ok(Window(gw, Rc::new(RefCell::new(Vec::new()))))
     }
 
     pub fn create_button(label: &str) -> Result<Button, Error> {
@@ -231,13 +428,15 @@ mod gtk_adapter {
 
     pub fn create_entry() -> Result<Entry, Error> {
         let e = crate::backends::gtk::create_entry().map_err(|e| Error::Backend(format!("{}", e)))?;
-        Ok(Entry(e))
+        Ok(Entry { inner: e, _controllers: Rc::new(RefCell::new(Vec::new())) })
     }
 
     // ---- Menu types ----
 
     #[repr(transparent)]
     pub struct Menu(pub gtk_dynamic_loader::Menu);
+
+    impl Clone for Menu { fn clone(&self) -> Self { Menu(self.0.clone()) } }
 
     impl Menu {
         pub fn append(&mut self, label: &str, detailed_action: &str) {
@@ -257,8 +456,32 @@ mod gtk_adapter {
     #[repr(transparent)]
     pub struct MenuBar(pub gtk_dynamic_loader::MenuBar);
 
+    impl Clone for MenuBar { fn clone(&self) -> Self { MenuBar(self.0.clone()) } }
     impl Widget for MenuBar { fn raw_handle(&self) -> *mut c_void { *self.0.as_ref() } }
     impl AsRef<*mut c_void> for MenuBar { fn as_ref(&self) -> &*mut c_void { self.0.as_ref() } }
+    impl MenuBar {
+        pub fn activate_submenu_by_mnemonic(&self, keyval: u32) -> bool {
+            self.0.activate_submenu_by_mnemonic(keyval)
+        }
+        pub fn activate_submenu_item_by_mnemonic(&self, keyval: u32) -> bool {
+            self.0.activate_submenu_item_by_mnemonic(keyval)
+        }
+        pub unsafe fn insert_action_group(&self, name: &str, group_ptr: *mut std::os::raw::c_void) {
+            self.0.insert_action_group(name, group_ptr);
+        }
+        pub fn handle_mnemonic_key(&self, keyval: u32) -> bool {
+            self.0.handle_mnemonic_key(keyval)
+        }
+        pub fn handle_menu_key(&self, keyval: u32, modifiers: u32) -> bool {
+            self.0.handle_menu_key(keyval, modifiers)
+        }
+        pub fn menu_active(&self) -> bool {
+            self.0.menu_active()
+        }
+        pub fn menu_close(&self) {
+            self.0.menu_close();
+        }
+    }
 
     /// # Safety
     /// `action_group` must be a valid GActionGroup pointer or null.
@@ -269,6 +492,8 @@ mod gtk_adapter {
 
     #[repr(transparent)]
     pub struct SimpleAction(pub gtk_dynamic_loader::SimpleAction);
+
+    impl Clone for SimpleAction { fn clone(&self) -> Self { SimpleAction(self.0.clone()) } }
 
     impl SimpleAction {
         pub fn connect_activate<F: FnMut(*mut c_void) + 'static>(&self, f: F) -> Result<u64, Error> {
@@ -281,13 +506,38 @@ mod gtk_adapter {
         Ok(SimpleAction(a))
     }
 
+    // ---- Application (action group host for menus) ----
+
+    #[repr(transparent)]
+    pub struct Application(pub gtk_dynamic_loader::Application);
+
+    impl Application {
+        pub fn register(&self) -> Result<(), Error> {
+            self.0.register().map_err(|e| Error::Backend(format!("{}", e)))
+        }
+        pub fn as_ptr(&self) -> *mut c_void {
+            self.0.as_ptr()
+        }
+        pub fn add_action(&self, action: &SimpleAction) -> Result<(), Error> {
+            self.0.add_action(&action.0).map_err(|e| Error::Backend(format!("{}", e)))
+        }
+    }
+
+    pub fn create_application() -> Result<Application, Error> {
+        let loader = crate::backends::gtk::loader()
+            .ok_or_else(|| Error::Backend("GTK loader not initialized".into()))?;
+        let app = gtk_dynamic_loader::Application::new(loader, Some("org.corro.Corro"))
+            .map_err(|e| Error::Backend(format!("{}", e)))?;
+        Ok(Application(app))
+    }
+
     // ---- Dialog ----
 
     #[repr(transparent)]
     pub struct Dialog(pub GDialog);
+    impl Clone for Dialog { fn clone(&self) -> Self { Dialog(self.0.clone()) } }
     impl Widget for Dialog { fn raw_handle(&self) -> *mut c_void { *self.0.as_ref() } }
     impl AsRef<*mut c_void> for Dialog { fn as_ref(&self) -> &*mut c_void { self.0.as_ref() } }
-    impl Clone for Dialog { fn clone(&self) -> Self { Dialog(self.0.clone()) } }
 
     impl Dialog {
         pub fn set_title(&self, title: &str) { self.0.set_title(title); }
@@ -296,10 +546,12 @@ mod gtk_adapter {
         pub fn get_content_area(&self) -> *mut c_void { self.0.get_content_area() }
         pub fn append_content_area(&self, child: &impl AsRef<*mut c_void>) { self.0.append_content_area(child); }
         pub fn present(&self) { self.0.present(); }
-        pub fn close(&self) { self.0.close(); }
         pub fn connect_response<F: FnMut(i32) + 'static>(&self, f: F) -> Result<u64, Error> {
             self.0.connect_response(f).map_err(|e| Error::Backend(format!("{}", e)))
         }
+        pub fn close(&self) { self.0.close(); }
+        pub fn mark_destroyed(&self) { self.0.mark_destroyed(); }
+
     }
 
     pub fn create_dialog() -> Result<Dialog, Error> {
@@ -315,7 +567,9 @@ mod gtk_adapter {
     impl AsRef<*mut c_void> for DropDown { fn as_ref(&self) -> &*mut c_void { self.0.as_ref() } }
 
     impl DropDown {
-        pub fn set_active(&self, index: u32) { self.0.set_active(index); }
+        pub fn set_active(&self, index: Option<u32>) {
+            if let Some(idx) = index { self.0.set_active(idx); }
+        }
         pub fn get_active(&self) -> i32 { self.0.get_active() }
         pub fn connect_changed<F: FnMut() + 'static>(&self, f: F) -> Result<u64, Error> {
             self.0.connect_changed(f).map_err(|e| Error::Backend(format!("{}", e)))
@@ -391,19 +645,6 @@ mod gtk_adapter {
         pub fn set_text(&self, text: &str) { self.0.set_text(text); }
         pub fn get_text(&self) -> Option<String> { self.0.get_text() }
         pub fn set_wrap_mode(&self, wrap_mode: i32) { self.0.set_wrap_mode(wrap_mode); }
-        /// Append Pango markup (e.g. `<span foreground="#e06c75">text</span>`)
-        /// at the end of the buffer.
-        pub fn append_markup(&self, markup: &str) { self.0.append_markup(markup); }
-        /// Append plain (unstyled) text at the end of the buffer.
-        pub fn append_text(&self, text: &str) { self.0.append_text_plain(text); }
-        /// Number of characters in the buffer.
-        pub fn char_count(&self) -> usize { self.0.char_count() }
-        /// Scroll the view so the end of the buffer is visible.
-        pub fn scroll_to_end(&self) { self.0.scroll_to_end(); }
-        pub fn set_editable(&self, editable: bool) { self.0.set_editable(editable); }
-        pub fn get_editable(&self) -> bool { self.0.get_editable() }
-        pub fn set_can_focus(&self, can_focus: bool) { self.0.set_can_focus(can_focus); }
-        pub fn get_can_focus(&self) -> bool { self.0.get_can_focus() }
         pub fn set_size_request(&self, w: i32, h: i32) { self.0.set_size_request(w, h); }
         pub fn set_hexpand(&self, expand: bool) { self.0.set_hexpand(expand); }
         pub fn set_vexpand(&self, expand: bool) { self.0.set_vexpand(expand); }
@@ -443,19 +684,29 @@ mod gtk_adapter {
             self.draw_text_styled(x, y, text, font, size, r, g, b, a, 0, 0)
         }
         fn draw_text_styled(&mut self, x: f64, y: f64, text: &str, font: &str, size: f64, r: f64, g: f64, b: f64, a: f64, slant: i32, weight: i32) {
+            self.cc.save();
             self.cc.set_source_rgba(r, g, b, a);
             self.cc.select_font_face(font, slant, weight);
             self.cc.set_font_size(size);
-            self.cc.move_to(x, y);
+            // Cairo's move_to(x, y) treats y as the text BASELINE.
+            // The callers pass y as the TEXT TOP (matching GDI semantics).
+            // Convert: baseline = top - y_bearing (y_bearing is negative,
+            // so this ADDS the ascent to top).
+            let e = self.cc.text_extents(text);
+            let baseline = y - e.y_bearing;
+            self.cc.move_to(x, baseline);
             self.cc.show_text(text);
+            self.cc.restore();
         }
         fn text_extents(&self, text: &str, font: &str, size: f64) -> (f64, f64, f64, f64) {
             self.text_extents_styled(text, font, size, 0, 0)
         }
         fn text_extents_styled(&self, text: &str, font: &str, size: f64, slant: i32, weight: i32) -> (f64, f64, f64, f64) {
+            self.cc.save();
             self.cc.select_font_face(font, slant, weight);
             self.cc.set_font_size(size);
             let e = self.cc.text_extents(text);
+            self.cc.restore();
             (e.x_bearing, e.y_bearing, e.width, e.height)
         }
         fn clear(&mut self, r: f64, g: f64, b: f64, a: f64) {
@@ -473,8 +724,11 @@ mod gtk_adapter {
     /// Canvas wraps a DrawingArea into the cross-platform Canvas API.
     /// Stores event controllers in a reference-counted slot so they outlive
     /// the constructor scope (GTK4 controllers are freed if dropped).
+    /// Also stores a copy of the draw callback for the `force_draw` fallback
+    /// that renders directly to the window surface (bypassing the frame clock).
     pub struct Canvas {
         pub drawing_area: gtk_dynamic_loader::DrawingArea,
+        draw_cb: Rc<RefCell<Option<Box<dyn FnMut(&mut dyn crate::core::DrawContext, i32, i32)>>>>,
         _controllers: Rc<RefCell<Vec<Box<dyn std::any::Any>>>>,
     }
 
@@ -482,6 +736,7 @@ mod gtk_adapter {
         fn clone(&self) -> Self {
             Canvas {
                 drawing_area: self.drawing_area.clone(),
+                draw_cb: self.draw_cb.clone(),
                 _controllers: self._controllers.clone(),
             }
         }
@@ -495,41 +750,158 @@ mod gtk_adapter {
 
     impl Canvas {
         pub fn set_draw_callback(&self, cb: Box<dyn FnMut(&mut dyn crate::core::DrawContext, i32, i32)>) {
+            // Store the callback for force_draw fallback
+            *self.draw_cb.borrow_mut() = Some(cb);
+
             let loader = crate::backends::gtk::loader()
                 .expect("GTK loader not initialized after Canvas creation");
-            let mut cb = cb;
             let symbols = &loader.symbols;
             if symbols.gtk_drawing_area_set_draw_func.is_some() {
-                // GTK4 path
+                // GTK4 path — use draw_cb so force_draw can also invoke it
+                let cb_stored = self.draw_cb.clone();
+                let loader_clone = loader.clone();
                 let _ = self.drawing_area.set_draw_func(Box::new(move |cr: *mut c_void, w: i32, h: i32| {
-                    let mut ctx = GtkDrawContext::new(cr, &loader);
-                    cb(&mut ctx, w, h);
+                    let mut ctx = GtkDrawContext::new(cr, &loader_clone);
+                    if let Some(ref mut cb) = *cb_stored.borrow_mut() {
+                        cb(&mut ctx, w, h);
+                    }
                 }));
+                // Request an immediate initial redraw.  On GTK4 the frame clock
+                // may not tick immediately (especially with the Cairo renderer
+                // or on virtual displays such as WSL), so we explicitly queue a
+                // redraw after setting the draw func to kickstart the first frame.
+                self.drawing_area.queue_draw();
             } else {
-                // GTK3 path
-                let _ = self.drawing_area.connect_draw_gtk3(Box::new(move |_widget: *mut c_void, cr: *mut c_void| -> i32 {
-                    let mut ctx = GtkDrawContext::new(cr, &loader);
-                    cb(&mut ctx, 0, 0);
+                // GTK3 path — use widget allocation to provide real w/h
+                let cb_stored = self.draw_cb.clone();
+                let loader_clone = loader.clone();
+                let _ = self.drawing_area.connect_draw_gtk3(Box::new(move |widget: *mut c_void, cr: *mut c_void| -> i32 {
+                    let w = if let Some(f) = loader_clone.symbols.gtk_widget_get_allocated_width {
+                        unsafe { f(widget) }
+                    } else { 0 };
+                    let h = if let Some(f) = loader_clone.symbols.gtk_widget_get_allocated_height {
+                        unsafe { f(widget) }
+                    } else { 0 };
+                    let mut ctx = GtkDrawContext::new(cr, &loader_clone);
+                    if let Some(ref mut cb) = *cb_stored.borrow_mut() {
+                        cb(&mut ctx, w, h);
+                    }
                     0
                 }));
             }
         }
 
-        pub fn queue_redraw(&self) {
-            self.drawing_area.queue_draw();
+        /// Force an immediate draw of the canvas content directly to the window
+        /// surface, bypassing the GTK4 frame clock.  This is a fallback for
+        /// virtual displays (WSL, Xvfb) where the frame clock may never tick.
+        /// `window_ptr` must be a valid GtkWindow pointer.
+        ///
+        /// `fallback_w`/`fallback_h` are used when the surface reports zero
+        /// dimensions (the X11/Wayland surface hasn't been configured yet
+        /// even though GTK widget allocation already reflects the requested
+        /// default size from `set_default_size`).
+        ///
+        /// Two rendering paths are tried:
+        /// 1. `gdk_surface_create_cairo_context` (GTK 4.14+) — preferred, creates
+        ///    a GdkCairoContext that draws directly to the surface buffer.
+        /// 2. `gdk_surface_begin_draw_frame` + `gdk_draw_context_get_cairo_context`
+        ///    + `gdk_surface_end_draw_frame` (GTK 4.0-4.14) — deprecated but
+        ///    present on older GTK4 (e.g. Ubuntu 24.04 with GTK 4.12).
+        ///
+        /// After rendering, `gdk_display_sync` is called to flush the display.
+        pub fn force_draw(&self, window_ptr: *mut c_void, fallback_w: i32, fallback_h: i32) {
+            let loader = match crate::backends::gtk::loader() {
+                Some(l) => l,
+                None => return,
+            };
+            let symbols = &loader.symbols;
+            let get_surface = match symbols.gtk_native_get_surface {
+                Some(f) => f,
+                None => return,
+            };
+            let get_w = match symbols.gdk_surface_get_width {
+                Some(f) => f,
+                None => return,
+            };
+            let get_h = match symbols.gdk_surface_get_height {
+                Some(f) => f,
+                None => return,
+            };
+
+            let surface = unsafe { get_surface(window_ptr) };
+            if surface.is_null() { return; }
+            let mut w = unsafe { get_w(surface) };
+            let mut h = unsafe { get_h(surface) };
+            if w <= 0 || h <= 0 {
+                // Surface not yet configured by display server.  Use caller-provided
+                // fallback dimensions so the draw callback still runs and the canvas
+                // claims focus despite the absent server-side configuration.
+                w = fallback_w;
+                h = fallback_h;
+                if w <= 0 || h <= 0 { return; }
+            }
+
+            // Approach A (GTK 4.14+): gdk_surface_create_cairo_context
+            if let Some(create_cairo) = symbols.gdk_surface_create_cairo_context {
+                let cairo_destroy = match symbols.cairo_destroy {
+                    Some(f) => f,
+                    None => return,
+                };
+                let cr = unsafe { create_cairo(surface) };
+                if cr.is_null() { return; }
+                let mut ctx = GtkDrawContext::new(cr, &loader);
+                if let Some(ref mut cb) = *self.draw_cb.borrow_mut() {
+                    cb(&mut ctx, w, h);
+                }
+                unsafe { cairo_destroy(cr); }
+            } else {
+                // Approach B (GTK 4.0-4.14): begin_draw_frame + end_draw_frame
+                let begin_frame = match symbols.gdk_surface_begin_draw_frame {
+                    Some(f) => f,
+                    None => return,
+                };
+                let get_cr = match symbols.gdk_draw_context_get_cairo_context {
+                    Some(f) => f,
+                    None => return,
+                };
+                let end_frame = match symbols.gdk_surface_end_draw_frame {
+                    Some(f) => f,
+                    None => return,
+                };
+                let cairo_destroy = match symbols.cairo_destroy {
+                    Some(f) => f,
+                    None => return,
+                };
+                let context = unsafe { begin_frame(surface, std::ptr::null_mut()) };
+                if context.is_null() { return; }
+                let cr = unsafe { get_cr(context) };
+                if cr.is_null() {
+                    unsafe { end_frame(surface, context); }
+                    return;
+                }
+                let mut ctx = GtkDrawContext::new(cr, &loader);
+                if let Some(ref mut cb) = *self.draw_cb.borrow_mut() {
+                    cb(&mut ctx, w, h);
+                }
+                unsafe { cairo_destroy(cr); }
+                unsafe { end_frame(surface, context); }
+            }
+
+            // Sync the display to ensure the rendered content reaches the
+            // display server (X11: XFlush; Wayland: wl_display_flush).
+            if let (Some(get_disp), Some(disp_sync)) = (
+                symbols.gtk_widget_get_display,
+                symbols.gdk_display_sync,
+            ) {
+                let display = unsafe { get_disp(window_ptr) };
+                if !display.is_null() {
+                    unsafe { disp_sync(display); }
+                }
+            }
         }
 
-        pub fn set_hexpand(&self, expand: bool) {
-            let loader = crate::backends::gtk::loader();
-            if let Some(f) = loader.and_then(|l| l.symbols.gtk_widget_set_hexpand) {
-                unsafe { f(*self.drawing_area.as_ref(), if expand { 1 } else { 0 }) };
-            }
-        }
-        pub fn set_vexpand(&self, expand: bool) {
-            let loader = crate::backends::gtk::loader();
-            if let Some(f) = loader.and_then(|l| l.symbols.gtk_widget_set_vexpand) {
-                unsafe { f(*self.drawing_area.as_ref(), if expand { 1 } else { 0 }) };
-            }
+        pub fn queue_redraw(&self) {
+            self.drawing_area.queue_draw();
         }
 
         pub fn set_size_request(&self, w: i32, h: i32) {
@@ -546,7 +918,8 @@ mod gtk_adapter {
                 .expect("GTK loader not initialized after Canvas creation");
             let symbols = &loader.symbols;
             let inner = *self.drawing_area.as_ref();
-            let is_gtk4 = symbols.gtk_gesture_click_new.is_some();
+            // gtk_drawing_area_set_draw_func is GTK4-only; gtk_gesture_click_new exists in GTK3 >= 3.24
+            let is_gtk4 = symbols.gtk_drawing_area_set_draw_func.is_some();
             if is_gtk4 {
                 // GTK4: use GestureClick — store in _controllers to keep alive
                 if let Ok(gesture) = gtk_dynamic_loader::GestureClick::new(loader.clone()) {
@@ -579,24 +952,23 @@ mod gtk_adapter {
             }
         }
 
-        pub fn on_key(&self, cb: Box<dyn FnMut(u32) -> bool>) {
+        pub fn on_key(&self, cb: Box<dyn FnMut(u32, u32) -> bool>) {
             let loader = crate::backends::gtk::loader()
                 .expect("GTK loader not initialized after Canvas creation");
             let symbols = &loader.symbols;
             let inner = *self.drawing_area.as_ref();
-            let is_gtk4 = symbols.gtk_gesture_click_new.is_some();
+            // gtk_drawing_area_set_draw_func is GTK4-only; gtk_gesture_click_new exists in GTK3 >= 3.24
+            let is_gtk4 = symbols.gtk_drawing_area_set_draw_func.is_some();
             if is_gtk4 {
-                // GTK4: use EventControllerKey — store pointer to keep alive
                 if let Ok(ctrl) = gtk_dynamic_loader::EventControllerKey::new(loader.clone()) {
                     let mut cb = cb;
-                    let _ = ctrl.connect_key_pressed(Box::new(move |keyval: u32| -> i32 {
-                        if cb(keyval) { 1 } else { 0 }
+                    let _ = ctrl.connect_key_pressed(Box::new(move |keyval: u32, state: u32| -> i32 {
+                        if cb(keyval, state) { 1 } else { 0 }
                     }));
                     ctrl.add_to_widget(&self.drawing_area);
                     self._controllers.borrow_mut().push(Box::new(ctrl));
                 }
             } else {
-                // GTK3: use key-press-event signal (no controller lifetime issue)
                 let mut cb = cb;
                 let l2 = loader.clone();
                 let l3 = l2.clone();
@@ -605,11 +977,25 @@ mod gtk_adapter {
                         &l3, inner, "key-press-event",
                         Box::new(move |ev: *mut c_void| -> i32 {
                             let keyval = gtk_dynamic_loader::EventControllerKey::get_keyval_static(&l2, ev);
-                            if cb(keyval) { 1 } else { 0 }
+                            if keyval == 0 { return 0; }
+                            let state = gtk_dynamic_loader::EventControllerKey::get_state_static(&l2, ev);
+                            if cb(keyval, state) { 1 } else { 0 }
                         }),
                     );
                 }
             }
+        }
+
+        pub fn on_key_raw(&self, cb: Box<dyn FnMut(u32, u32) -> bool>) {
+            self.on_key(cb);
+        }
+
+        pub fn grab_focus(&self) {
+            self.drawing_area.grab_focus();
+        }
+
+        pub fn set_can_focus(&self, can: bool) {
+            self.drawing_area.set_can_focus(can);
         }
     }
 
@@ -617,8 +1003,39 @@ mod gtk_adapter {
         let da = crate::backends::gtk::create_drawing_area().map_err(|e| Error::Backend(format!("{}", e)))?;
         Ok(Canvas {
             drawing_area: da,
+            draw_cb: Rc::new(RefCell::new(None)),
             _controllers: Rc::new(RefCell::new(Vec::new())),
         })
+    }
+
+    // ---- ScrolledWindow ----
+
+    #[repr(transparent)]
+    pub struct ScrolledWindow(pub GScrolledWindow);
+
+    impl Clone for ScrolledWindow { fn clone(&self) -> Self { ScrolledWindow(self.0.clone()) } }
+
+    impl ScrolledWindow {
+        pub fn set_child(&self, child: &impl AsRef<*mut c_void>) {
+            self.0.set_child(child);
+        }
+        pub fn set_policy(&self, hscroll: u32, vscroll: u32) {
+            self.0.set_policy(hscroll, vscroll);
+        }
+        pub fn set_hexpand(&self, expand: bool) { self.0.set_hexpand(expand); }
+        pub fn set_vexpand(&self, expand: bool) { self.0.set_vexpand(expand); }
+        pub fn set_size_request(&self, w: i32, h: i32) { self.0.set_size_request(w, h); }
+    }
+
+    impl AsRef<*mut c_void> for ScrolledWindow { fn as_ref(&self) -> &*mut c_void { self.0.as_ref() } }
+    impl Widget for ScrolledWindow { fn raw_handle(&self) -> *mut c_void { *self.0.as_ref() } }
+
+    pub fn create_scrolled_window() -> Result<ScrolledWindow, Error> {
+        let loader = crate::backends::gtk::loader()
+            .ok_or_else(|| Error::Backend("GTK loader not initialized".into()))?;
+        let sw = gtk_dynamic_loader::ScrolledWindow::new(loader.clone())
+            .map_err(|e| Error::Backend(format!("{}", e)))?;
+        Ok(ScrolledWindow(sw))
     }
 
     // ---- Overlay (cross-platform stacking container) ----
@@ -646,10 +1063,12 @@ mod gtk_adapter {
         pub fn show_all(&self) {
             self.0.show_all();
         }
+        pub fn set_size_request(&self, w: i32, h: i32) { self.0.set_size_request(w, h); }
         pub fn set_hexpand(&self, expand: bool) { self.0.set_hexpand(expand); }
         pub fn set_vexpand(&self, expand: bool) { self.0.set_vexpand(expand); }
     }
 
+    /// Creates a new GTK Overlay widget.
     pub fn create_overlay() -> Result<Overlay, Error> {
         let loader = crate::backends::gtk::loader()
             .ok_or_else(|| Error::Backend("GTK loader not initialized".into()))?;
@@ -660,6 +1079,7 @@ mod gtk_adapter {
 
     // ---- File dialogs ----
 
+    /// Opens a file dialog and returns the selected file path.
     pub fn open_file(title: &str) -> Result<Option<String>, Error> {
         let loader = crate::backends::gtk::loader()
             .ok_or_else(|| Error::Backend("GTK loader not initialized".into()))?;
@@ -671,6 +1091,7 @@ mod gtk_adapter {
         Ok(None)
     }
 
+    /// Opens a file save dialog and returns the selected file path.
     pub fn save_file(title: &str) -> Result<Option<String>, Error> {
         let loader = crate::backends::gtk::loader()
             .ok_or_else(|| Error::Backend("GTK loader not initialized".into()))?;
@@ -682,172 +1103,110 @@ mod gtk_adapter {
         Ok(None)
     }
 
-    // ---- Spreadsheet (cross-platform grid widget, rendered via Canvas DrawContext) ----
+    // ---- Spreadsheet (cross-platform grid widget) ----
 
-    pub struct Spreadsheet(pub Canvas, pub Overlay, pub crate::spreadsheet::SharedModel);
+    /// A spreadsheet widget that combines a canvas with an overlay for cross-platform grid rendering.
+    pub struct Spreadsheet(pub Canvas, pub Overlay);
 
-    impl Clone for Spreadsheet {
-        fn clone(&self) -> Self { Spreadsheet(self.0.clone(), self.1.clone(), self.2.clone()) }
-    }
-    impl AsRef<*mut c_void> for Spreadsheet { fn as_ref(&self) -> &*mut c_void { self.0.as_ref() } }
-    impl Widget for Spreadsheet { fn raw_handle(&self) -> *mut c_void { *self.0.as_ref() } }
+    impl Clone for Spreadsheet { fn clone(&self) -> Self { Spreadsheet(self.0.clone(), self.1.clone()) } }
+    // The overlay is the outer container; as_ref/Widget must return its handle
+    // so that adding the spreadsheet to a parent container adds the overlay
+    // (which wraps the canvas), not the canvas itself.
+    impl AsRef<*mut c_void> for Spreadsheet { fn as_ref(&self) -> &*mut c_void { self.1.as_ref() } }
+    impl Widget for Spreadsheet { fn raw_handle(&self) -> *mut c_void { *self.1.as_ref() } }
 
     impl Spreadsheet {
-        pub fn id(&self) -> usize { std::rc::Rc::as_ptr(&self.2) as usize }
-        pub fn set_cell(&self, row: u32, col: u32, text: &str) {
-            self.2.borrow_mut().set_cell(row, col, text);
-            self.0.queue_redraw();
-        }
-        pub fn get_cell(&self, row: u32, col: u32) -> Option<String> { self.2.borrow().get_cell(row, col) }
-        pub fn set_raw_cell(&self, row: u32, col: u32, text: &str) {
-            self.2.borrow_mut().set_raw_cell(row, col, text);
-            self.0.queue_redraw();
-        }
-        pub fn set_cell_style(&self, row: u32, col: u32, style: u8) {
-            self.2.borrow_mut().set_cell_style(row, col, style);
-            self.0.queue_redraw();
-        }
-        pub fn cursor_position(&self) -> Option<(u32, u32)> { self.2.borrow().cursor_position() }
-        pub fn set_cursor(&self, row: u32, col: u32) {
-            self.2.borrow_mut().set_cursor(row, col);
-            self.0.queue_redraw();
-        }
-        pub fn set_editing(&self, editing: bool, edit_buf: &str, edit_pos: usize) {
-            self.2.borrow_mut().set_editing(editing, edit_buf, edit_pos);
-            self.0.queue_redraw();
-        }
-        pub fn set_grid_config(&self, margin_cols: u32, main_cols: u32) {
-            self.2.borrow_mut().set_grid_config(margin_cols, main_cols);
-            self.0.queue_redraw();
-        }
-        pub fn set_row_counts(&self, header_rows: u32, main_rows: u32) {
-            self.2.borrow_mut().set_row_counts(header_rows, main_rows);
-            self.0.queue_redraw();
-        }
-        pub fn set_column_layout(&self, layout: Vec<(u32, u32, String)>) {
-            self.2.borrow_mut().set_column_layout(layout);
-            self.0.queue_redraw();
-        }
-        pub fn set_row_labels(&self, labels: Vec<(u32, String)>) {
-            self.2.borrow_mut().set_row_labels(labels);
-            self.0.queue_redraw();
-        }
-        pub fn set_menu_text(&self, text: &str) {
-            self.2.borrow_mut().set_menu_text(text);
-            self.0.queue_redraw();
-        }
-        pub fn set_border_title(&self, text: &str) {
-            self.2.borrow_mut().set_border_title(text);
-            self.0.queue_redraw();
-        }
-        pub fn set_status_text(&self, text: &str) {
-            self.2.borrow_mut().set_status_text(text);
-            self.0.queue_redraw();
-        }
-        pub fn set_formula_bar_trailing(&self, text: &str) {
-            self.2.borrow_mut().set_formula_bar_trailing(text);
-            self.0.queue_redraw();
-        }
-        pub fn set_tab_data(&self, titles: &[String], active: usize) {
-            self.2.borrow_mut().set_tab_data(titles, active);
-            self.0.queue_redraw();
-        }
-        pub fn set_formula_bar(&self, address_label: &Label, entry: &Entry) {
-            let addr = address_label.get_text().unwrap_or_default();
-            let txt = entry.get_text().unwrap_or_default();
-            self.2.borrow_mut().set_formula_bar(&addr, &txt);
-            self.0.queue_redraw();
-        }
-        pub fn commit_formula_bar(&self) {
-            self.2.borrow_mut().commit_formula_bar();
-            self.0.queue_redraw();
-        }
+        /// Sets the text content of a cell. User manages data via callbacks.
+        pub fn set_cell(&self, _row: usize, _col: usize, _text: &str) { /* user manages data via callbacks */ }
+        /// Gets the text content of a cell. Returns None as user manages data via callbacks.
+        pub fn get_cell(&self, _row: usize, _col: usize) -> Option<String> { None }
+        /// Queues the canvas for a redraw.
         pub fn queue_redraw(&self) { self.0.queue_redraw(); }
+
+        /// Sets a callback for drawing the spreadsheet content.
         pub fn set_draw_callback(&self, cb: Box<dyn FnMut(&mut dyn crate::core::DrawContext, i32, i32)>) {
             self.0.set_draw_callback(cb);
         }
-        pub fn on_click(&self, mut cb: Box<dyn FnMut(f64, f64)>) {
-            let model = self.2.clone();
-            self.0.on_click(Box::new(move |x, y| {
-                let (r, c) = match crate::spreadsheet::cell_at(&model.borrow(), x, y) {
-                    Some((r, c)) => (r as f64, c as f64),
-                    None => (x, y),
-                };
-                cb(r, c);
-            }));
-        }
+
+        /// Sets a callback for handling keyboard input.
         pub fn on_key(&self, cb: Box<dyn FnMut(u32, u32) -> bool>) {
-            let mut cb = cb;
-            self.0.on_key(Box::new(move |key: u32| { cb(key, 0u32) }));
+            self.0.on_key(cb);
         }
-        /// Return a reference to the underlying `Canvas` used for spreadsheet rendering.
-        pub fn canvas(&self) -> &Canvas { &self.0 }
-        /// Return a reference to the `Overlay` that hosts the editing `Entry` widgets.
-        pub fn overlay(&self) -> &Overlay { &self.1 }
+
+        /// Sets a callback for handling mouse click events.
+        pub fn on_click(&self, cb: Box<dyn FnMut(f64, f64)>) {
+            self.0.on_click(cb);
+        }
+
+        /// Sets whether the spreadsheet should expand horizontally.
+        pub fn set_hexpand(&self, expand: bool) { self.1.set_hexpand(expand); }
+        /// Sets whether the spreadsheet should expand vertically.
+        pub fn set_vexpand(&self, expand: bool) { self.1.set_vexpand(expand); }
+
+        /// Returns a reference to the underlying canvas widget.
+        pub fn canvas(&self) -> &Canvas {
+            &self.0
+        }
+
+        /// Returns a reference to the overlay widget.
+        pub fn overlay(&self) -> &Overlay {
+            &self.1
+        }
     }
 
-    /// Build a cross-platform `Spreadsheet` widget backed by a `Canvas` + `Overlay`
-    /// and a shared [`crate::spreadsheet`] data model. `rows`/`cols` are the
-    /// number of main (data) rows/columns; the widget paints itself through the
-    /// model's `DrawContext` callback.
+    /// Creates a new spreadsheet widget with the specified number of rows and columns.
     pub fn create_spreadsheet(rows: usize, cols: usize) -> Result<Spreadsheet, Error> {
         let canvas = create_canvas()?;
         let overlay = create_overlay()?;
-        let model = crate::spreadsheet::new_shared_model(rows as u32, cols as u32);
-        let mdraw = model.clone();
-        canvas.set_draw_callback(Box::new(move |dc: &mut dyn crate::core::DrawContext, w: i32, h: i32| {
-            crate::spreadsheet::paint(&mdraw.borrow(), dc, w, h);
-        }));
         let cw = 150i32; let ch = 28i32; let chw = 46i32;
         let total_w = chw + cols as i32 * cw;
         let total_h = ch + rows as i32 * ch;
         canvas.set_size_request(total_w, total_h);
         canvas.set_content_size(total_w, total_h);
         overlay.set_child(&canvas);
-        Ok(Spreadsheet(canvas, overlay, model))
+        Ok(Spreadsheet(canvas, overlay))
     }
 
-    /// Register a backend-wide callback invoked whenever the spreadsheet cursor
-    /// moves (row, col). Mirrors [`crate::spreadsheet::add_global_cursor_move_callback`].
-    pub fn add_cursor_move_callback<F: FnMut(u32, u32) + 'static>(f: F) {
-        crate::spreadsheet::add_global_cursor_move_callback(Box::new(f));
-    }
-    /// Register a backend-wide callback invoked when a cell edit is committed
-    /// (row, col, new_text). Mirrors [`crate::spreadsheet::add_global_commit_edit_callback`].
-    pub fn add_commit_edit_callback<F: FnMut(u32, u32, String) + 'static>(f: F) {
-        crate::spreadsheet::add_global_commit_edit_callback(Box::new(f));
-    }
-
-    /// Exit the GTK main loop, terminating the application.
+    /// Quits the GTK main event loop.
     pub fn quit_main_loop() -> Result<(), Error> {
         crate::backends::gtk::quit_main_loop().map_err(|e| Error::Backend(format!("{}", e)))
     }
 
-}
-
-/// Pump the GLib main context `count` iterations so pending redraws /
-/// focus changes are processed before the main loop starts.  Prevents
-/// WINDOW_DRAWN=false on slow virtual displays (Xvfb/WSL) where the
-/// frame clock timer hasn't fired yet.
-#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
-pub fn pump_main_context(count: usize) {
-    if let Some(loader) = crate::backends::gtk::loader() {
-        if let Some(glib_lib) = loader.libs.get("libglib") {
-            type Iteration = unsafe extern "C" fn(*mut std::ffi::c_void, i32) -> i32;
-            if let Ok(iter_fn) = unsafe { glib_lib.get::<Iteration>(b"g_main_context_iteration") } {
-                let iter = *iter_fn;
-                unsafe {
-                    for _ in 0..count {
-                        iter(std::ptr::null_mut(), 1);
+    /// Pump the GTK main context for `count` iterations.
+    /// All iterations use blocking waits so poll() returns as soon as
+    /// the X11 server or frame clock timer fires.  This ensures frame
+    /// clock ticks are actually waited for rather than skipped.
+    ///
+    /// On a 60fps display each blocking iteration may take up to ~16ms
+    /// (the frame clock interval).  500 blocking iterations = ~8s max.
+    /// Callers should use a reasonable count (e.g. 500) to cover slow
+    /// virtual displays (WSLg, Xvfb) without excessive delay.
+    pub fn pump_main_context(count: usize) {
+        if let Some(loader) = crate::backends::gtk::loader() {
+            if let Some(glib_lib) = loader.libs.get("libglib") {
+                type Iteration = unsafe extern "C" fn(*mut std::ffi::c_void, i32) -> i32;
+                if let Ok(iter_fn) = unsafe { glib_lib.get::<Iteration>(b"g_main_context_iteration") } {
+                    let iter = *iter_fn;
+                    unsafe {
+                        // All blocking iterations: on virtual displays (WSLg, Xvfb)
+                        // the frame clock timer only fires during blocking waits.
+                        // Non-blocking iterations return immediately and skip timer
+                        // sources, so the draw callback never fires.  500 blocking
+                        // iterations = ~8s max wait at 16ms/tick, which covers even
+                        // the slowest virtual compositors.
+                        for _ in 0..count {
+                            iter(std::ptr::null_mut(), 1);
+                        }
                     }
                 }
             }
         }
     }
+
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
 pub use gtk_adapter::*;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
 pub use gtk_dynamic_loader::Orientation;

@@ -1,21 +1,23 @@
 use crate::gui::sheet::SharedState;
 
-pub const KEY_RETURN: u32 = 0xFF0D;
-pub const KEY_ENTER: u32 = 0xFF8D;
-pub const KEY_ESC: u32 = 0xFF1B;
-pub const KEY_BACKSPACE: u32 = 0xFF08;
-pub const KEY_DELETE: u32 = 0xFFFF;
-pub const KEY_LEFT: u32 = 0xFF51;
-pub const KEY_UP: u32 = 0xFF52;
-pub const KEY_RIGHT: u32 = 0xFF53;
-pub const KEY_DOWN: u32 = 0xFF54;
-pub const KEY_TAB: u32 = 0xFF09;
-pub const KEY_HOME: u32 = 0xFF50;
-pub const KEY_END: u32 = 0xFF57;
-pub const KEY_PAGE_UP: u32 = 0xFF55;
-pub const KEY_PAGE_DOWN: u32 = 0xFF56;
-pub const KEY_F1: u32 = 0xFFBE;
-pub const KEY_F2: u32 = 0xFFBF;
+pub use rustxwidgets::core::key::{
+    RETURN as KEY_RETURN,
+    ESCAPE as KEY_ESC,
+    BACKSPACE as KEY_BACKSPACE,
+    DELETE as KEY_DELETE,
+    LEFT as KEY_LEFT,
+    UP as KEY_UP,
+    RIGHT as KEY_RIGHT,
+    DOWN as KEY_DOWN,
+    TAB as KEY_TAB,
+    HOME as KEY_HOME,
+    END as KEY_END,
+    PAGE_UP as KEY_PAGE_UP,
+    PAGE_DOWN as KEY_PAGE_DOWN,
+    F1 as KEY_F1,
+    F2 as KEY_F2,
+};
+pub use rustxwidgets::core::key::ENTER as KEY_ENTER;
 
 pub enum EditAction {
     Commit(String),
@@ -25,6 +27,7 @@ pub enum EditAction {
 
 pub fn handle_edit_input(keyval: u32, shared: &SharedState, redraw: &dyn Fn()) -> EditAction {
     match keyval {
+        #[allow(unreachable_patterns)]
         KEY_RETURN | KEY_ENTER => {
             let text = shared.edit_buf.borrow().clone();
             shared.editing.set(false);

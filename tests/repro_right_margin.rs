@@ -6,7 +6,7 @@ fn parse_and_write_right_margin_header_addr() {
     // Construct a grid and write to the right-margin header cell directly
     let mut g = Grid::from(corro::grid::Grid::new(2, 3));
     let mc = g.main_cols();
-    let right_a_global = MARGIN_COLS + mc; // global column index of ]A
+    let _right_a_global = MARGIN_COLS + mc; // global column index of ]A
     let header_addr = CellAddr::Header {
         row: (HEADER_ROWS - 1) as u32,
         col: ColumnAddr::Right(0),

@@ -174,6 +174,7 @@ fn debug_subtotal_b11_inspect() {
     };
     let (_m, c0, _c1, dr) = delimited_export_matrix(g0, &opts);
     eprintln!("export col_start={c0} data_rows[0]={:?}", dr.first());
+    let mc = g0.main_cols();
     let h703 = CellAddr::Header {
         row: (HEADER_ROWS - 1) as u32,
         col: ColumnAddr::Main(703),
@@ -230,7 +231,7 @@ fn debug_subtotal_b11_inspect() {
     let _g2 = set_eval_context(&wa);
     eprintln!("Main (10,1) eff after: {:?}", cell_effective_display(ga, &b11));
     for (a, t) in ga.iter_nonempty() {
-        if let CellAddr::Header { row, col } = a {
+        if let CellAddr::Header { row, col: _ } = a {
             if row == (HEADER_ROWS - 1) as u32 && (t.contains("TAX") || t.contains("0.1")) {
                 eprintln!("header ~1 row with tax-ish: {a:?} => {:?}", t);
             }

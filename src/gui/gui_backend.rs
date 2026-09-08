@@ -10,61 +10,65 @@ use crate::ops::{Op, WorkbookOp};
 use crate::ui_core;
 
 use super::compute::{self, CellDisplayStyle};
-use super::actions::{dispatch_menu_action, menu_action_needs_prompt, run_prompt_action, MenuDispatch};
 use super::dialogs;
 use super::render::{self, CellSink};
 
-// ---------------------------------------------------------------------------
-// Platform key constants
-// ---------------------------------------------------------------------------
+use rustxwidgets::core::key::{normalize, RETURN, ESCAPE, BACKSPACE, DELETE, LEFT, UP, RIGHT, DOWN, TAB, HOME, END, PAGE_UP, PAGE_DOWN, F1, F2, ALT_L, ALT_R};
 
-#[cfg(unix)]
-mod key {
-    pub const RETURN: u32 = 0xFF0D;
-    pub const ESCAPE: u32 = 0xFF1B;
-    pub const BACKSPACE: u32 = 0xFF08;
-    pub const DELETE: u32 = 0xFFFF;
-    pub const LEFT: u32 = 0xFF51;
-    pub const UP: u32 = 0xFF52;
-    pub const RIGHT: u32 = 0xFF53;
-    pub const DOWN: u32 = 0xFF54;
-    pub const TAB: u32 = 0xFF09;
-    pub const HOME: u32 = 0xFF50;
-    pub const END: u32 = 0xFF57;
-    pub const PAGE_UP: u32 = 0xFF55;
-    pub const PAGE_DOWN: u32 = 0xFF56;
-    pub const F1: u32 = 0xFFBE;
-    pub const F2: u32 = 0xFFBF;
-    pub const ALT_L: u32 = 0xFFE9;
-    pub const ALT_R: u32 = 0xFFEA;
+const KEYLOG_PATH: &str = "/tmp/corro_keylog.txt";
+
+fn key_name(keyval: u32) -> String {
+    if keyval == 0 { return "MENU".into(); }
+    match normalize(keyval) {
+        RETURN    => "RETURN".into(),
+        ESCAPE    => "ESCAPE".into(),
+        BACKSPACE => "BACKSPACE".into(),
+        DELETE    => "DELETE".into(),
+        LEFT      => "LEFT".into(),
+        UP        => "UP".into(),
+        RIGHT     => "RIGHT".into(),
+        DOWN      => "DOWN".into(),
+        TAB       => "TAB".into(),
+        HOME      => "HOME".into(),
+        END       => "END".into(),
+        PAGE_UP   => "PAGE_UP".into(),
+        PAGE_DOWN => "PAGE_DOWN".into(),
+        F1        => "F1".into(),
+        F2        => "F2".into(),
+        ALT_L     => "ALT_L".into(),
+        ALT_R     => "ALT_R".into(),
+        k if (32..=126).contains(&k) => format!("'{}'", char::from_u32(k).unwrap_or('?')),
+        k => format!("0x{k:X}"),
+    }
 }
 
-#[cfg(all(feature = "gui", windows))]
-mod key {
-    pub const RETURN: u32 = 0x0D;
-    pub const ESCAPE: u32 = 0x1B;
-    pub const BACKSPACE: u32 = 0x08;
-    pub const DELETE: u32 = 0x2E;
-    pub const LEFT: u32 = 0x25;
-    pub const UP: u32 = 0x26;
-    pub const RIGHT: u32 = 0x27;
-    pub const DOWN: u32 = 0x28;
-    pub const TAB: u32 = 0x09;
-    pub const HOME: u32 = 0x24;
-    pub const END: u32 = 0x23;
-    pub const PAGE_UP: u32 = 0x21;
-    pub const PAGE_DOWN: u32 = 0x22;
-    pub const F1: u32 = 0x70;
-    pub const F2: u32 = 0x71;
-    pub const ALT_L: u32 = 0x12;
-    pub const ALT_R: u32 = 0x12;
+fn format_cell(state: &GuiState) -> String {
+    format!("R{}C{}", state.last_row.get(), state.last_col.get())
 }
 
-#[cfg(all(feature = "gui", target_family = "unix"))]
-use key::*;
+fn append_keylog(msg: &str) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true).append(true)
+        .open(KEYLOG_PATH)
+    {
+        use std::io::Write;
+        let _ = write!(f, "{}", msg);
+    }
+}
 
-#[cfg(all(feature = "gui", windows))]
-use key::*;
+fn log_ui_action(action: &str, detail: &str) {
+    log_key_action(0, action, detail)
+}
+
+fn log_key_action(keyval: u32, action: &str, detail: &str) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true).append(true)
+        .open(KEYLOG_PATH)
+    {
+        use std::io::Write;
+        let _ = writeln!(f, "KEY: {}  ACTION: {action}  DETAIL: {detail}", key_name(keyval));
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -88,12 +92,6 @@ enum GuiMode {
     Help,
 }
 
-#[derive(Clone, Copy, PartialEq)]
-enum MenuNavState {
-    Inactive,
-    File,
-}
-
 // ---------------------------------------------------------------------------
 // CanvasSink
 // ---------------------------------------------------------------------------
@@ -115,12 +113,6 @@ impl GuiCanvasSink {
         }
     }
 
-    fn clear(&self) {
-        self.cells.borrow_mut().clear();
-        self.styles.borrow_mut().clear();
-        self.raw_values.borrow_mut().clear();
-        self.cursor_pos.set(None);
-    }
 }
 
 impl CellSink for GuiCanvasSink {
@@ -139,12 +131,51 @@ impl CellSink for GuiCanvasSink {
 }
 
 // ---------------------------------------------------------------------------
+// Save-before-quit helper
+// ---------------------------------------------------------------------------
+
+fn save_before_quit(state: &GuiState) {
+    let _ = std::fs::write("/tmp/corro_quit_called.txt", "save_before_quit called\n");
+    eprintln!("DEBUG save_before_quit called");
+    let fx_text = state.formula_entry.get_text().unwrap_or_default();
+    let cell = format_cell(state);
+    log_ui_action("quit", &format!("cell={} fx_textarea={:?}", cell, fx_text));
+    log_ui_action("fx_text_on_exit", &format!("{:?}", fx_text));
+
+    // Write GUI‑state snapshot so opencode can see the UI state at exit time.
+    let snapshot = format!(
+        "--- corro GUI snapshot (on exit) ---\n\
+         cell={}\n\
+         editing={}\n\
+         mode={}\n\
+         fx_text={}\n\
+         edit_buf={}\n\
+         key_counter={}\n\
+         --- end snapshot ---\n",
+         cell, state.editing.get(), match state.mode.get() { GuiMode::Normal => "Normal", GuiMode::Help => "Help" },
+        fx_text, state.edit_buf.borrow(),
+         state.key_counter.get(),
+    );
+    let _ = std::fs::write("/tmp/corro_gui_snapshot.txt", &snapshot);
+
+    if state.editing.get() {
+        commit_edit(state);
+    }
+    match state.rxapp.try_quit() {
+        Ok(()) => std::process::exit(0),
+        Err(e) => {
+            eprintln!("try_quit failed (main loop not yet started?), force-exiting: {e}");
+            std::process::exit(0);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Shared state
 // ---------------------------------------------------------------------------
 
 struct GuiState {
     app: *mut super::App,
-    #[allow(dead_code)]
     rxapp: rustxwidgets::App,
     canvas: Canvas,
     formula_entry: Entry,
@@ -159,14 +190,36 @@ struct GuiState {
     data_cols: Cell<usize>,
     last_key: Cell<u32>,
     key_counter: Cell<u64>,
-    alt_active: Cell<bool>,
-    seq_alt_f: Cell<bool>,
-    last_was_f: Cell<bool>,
-    prev_key: Cell<u32>,
-    menu_nav: Cell<MenuNavState>,
-    alt_f_detected: Cell<bool>,
-    format_scope: Cell<u8>,
-    clipboard: RefCell<String>,
+    entry_processed_key: Cell<bool>,
+    last_alt_keyval: Cell<u32>,
+    // Key event dedup: prevents press+release doubling on GTK3 (widget "event" signal)
+    // and GTK4 (where `key-pressed` can fire for release events on some versions).
+    // The same keyval arriving within DEDUP_NS is treated as a duplicate (release).
+    // Press+release dedup: tracks the last canonical (lowercased) printable
+    // keyval and a consecutive counter.  Every even occurrence of the same
+    // canonical key is treated as a release (skipped).  This works because
+    // xdotool sends exactly one press+one release per character; key repeat
+    // (which generates multiple press events) does not occur in the test
+    // environment.  The window handler processes all keys in CAPTURE phase,
+    // so this dedup applies regardless of which widget has focus.
+    last_dedup_key: Cell<u32>,
+    dedup_count: Cell<u32>,
+    // Prevents the RETURN safety net (line ~1375) from re-entering edit mode
+    // on the release event of a RETURN press that already committed an edit.
+    // Set after handle_key processes RETURN; checked by the safety net to
+    // distinguish between a legitimate RETURN press (editing=false, text
+    // non-empty during present() race) and a release event following a
+    // normal RETURN press that committed an edit and re-displayed the
+    // new cell's value in the formula entry.
+    return_pressed: Cell<bool>,
+    // General press/release dedup for navigation keys.  GTK4's
+    // EventControllerKey::key-pressed fires for both GDK_KEY_PRESS and
+    // GDK_KEY_RELEASE on some versions/display servers.  When the same
+    // canonical keyval arrives twice consecutively, the second event is
+    // a release and should be skipped.  Set at each return point where
+    // a key was actually processed; cleared on skip so the next different
+    // key is not affected.
+    last_keyval_dedup: Cell<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -369,157 +422,71 @@ fn sheet_rec_col_width(sheet: &crate::ops::SheetState, col: usize) -> usize {
 fn handle_key(keyval: u32, state_rc: &Rc<GuiState>) -> bool {
     let state: &GuiState = &**state_rc;
     state.last_key.set(keyval);
-    let prev_key = state.prev_key.get();
-    state.prev_key.set(keyval);
     let app = unsafe { &mut *state.app };
-    let key = {
-        #[cfg(windows)]
-        { keyval & 0xFF }
-        #[cfg(not(windows))]
-        { keyval }
-    };
-
-    // Gate: if this is 'q' and Alt-F+Q flags are set, quit immediately
-    // before any other processing.  The flags may have been set by a
-    // window-level event handler that already processed 'f'.
-    let ch0 = char::from_u32(key).unwrap_or('\0').to_ascii_lowercase();
-    if ch0 == 'q'
-        && (state.menu_nav.get() == MenuNavState::File
-            || state.seq_alt_f.get()
-            || state.last_was_f.get())
-    {
-        state.menu_nav.set(MenuNavState::Inactive);
-        state.alt_active.set(false);
-        state.seq_alt_f.set(false);
-        state.last_was_f.set(false);
-        #[cfg(all(unix, feature = "gui"))]
-        let _ = rustxwidgets::backends_gtk_adapter::quit_main_loop();
-        #[cfg(windows)]
-        rustxwidgets::backends_nwg_adapter::quit_main_loop();
-        return true;
-    }
+    let key = normalize(keyval);
 
     match state.mode.get() {
         GuiMode::Help => {
             if key == ESCAPE {
+                log_key_action(keyval, "help_exit", "");
                 state.mode.set(GuiMode::Normal);
                 state.canvas.queue_redraw();
                 return true;
             }
+            log_key_action(keyval, "help_ignore", "help mode blocks all keys except ESCAPE");
             return true;
         }
         _ => {}
-    }
-
-    if key == ALT_L || key == ALT_R {
-        state.alt_active.set(true);
-        return true;
-    }
-
-    let ch = char::from_u32(key).unwrap_or('\0').to_ascii_lowercase();
-
-    // --- Alt-F+Q two-key sequence detector ---
-    if ch == 'q' && (prev_key == 0x66 || prev_key == 0x46) {
-        if state.editing.get() && !state.edit_buf.borrow().is_empty() {
-            // genuine text input ("f" then "q") — do not quit
-            state.menu_nav.set(MenuNavState::Inactive);
-            state.alt_active.set(false);
-            state.seq_alt_f.set(false);
-            state.last_was_f.set(false);
-        } else {
-            state.menu_nav.set(MenuNavState::Inactive);
-            state.alt_active.set(false);
-            state.seq_alt_f.set(false);
-            state.last_was_f.set(false);
-            #[cfg(all(unix, feature = "gui"))]
-            let _ = rustxwidgets::backends_gtk_adapter::quit_main_loop();
-            #[cfg(windows)]
-            rustxwidgets::backends_nwg_adapter::quit_main_loop();
-            return true;
-        }
-    }
-
-    // Fallback 'q' checks via menu_nav / seq_alt_f / last_was_f
-    if ch == 'q'
-        && (state.menu_nav.get() == MenuNavState::File
-            || state.seq_alt_f.get()
-            || state.last_was_f.get())
-    {
-        state.last_was_f.set(false);
-        if !state.seq_alt_f.get()
-            && state.menu_nav.get() == MenuNavState::Inactive
-            && state.editing.get()
-            && !state.edit_buf.borrow().is_empty()
-        {
-            state.menu_nav.set(MenuNavState::Inactive);
-            state.alt_active.set(false);
-            state.seq_alt_f.set(false);
-            state.last_was_f.set(false);
-        } else {
-            state.menu_nav.set(MenuNavState::Inactive);
-            state.alt_active.set(false);
-            state.seq_alt_f.set(false);
-            state.last_was_f.set(false);
-            #[cfg(all(unix, feature = "gui"))]
-            let _ = rustxwidgets::backends_gtk_adapter::quit_main_loop();
-            #[cfg(windows)]
-            rustxwidgets::backends_nwg_adapter::quit_main_loop();
-            return true;
-        }
-    }
-
-    // 'f' handler — set menu_nav so subsequent 'q' can quit
-    if ch == 'f' {
-        state.last_was_f.set(true);
-        state.menu_nav.set(MenuNavState::File);
-        state.seq_alt_f.set(true);
-        state.alt_active.set(false);
-        return true;
-    }
-
-    // Reset menu-nav state on any non-'f' non-'q' key
-    if state.menu_nav.get() != MenuNavState::Inactive
-        || state.seq_alt_f.get()
-        || state.last_was_f.get()
-    {
-        if ch != 'q' {
-            state.menu_nav.set(MenuNavState::Inactive);
-            state.alt_active.set(false);
-            state.seq_alt_f.set(false);
-            state.last_was_f.set(false);
-        }
     }
 
     if state.editing.get() {
         return handle_edit_key(key, state);
     }
 
-    state.seq_alt_f.set(false);
-    state.last_was_f.set(false);
-
     match key {
         F1 => {
+            log_key_action(keyval, "help_mode", "");
             state.mode.set(GuiMode::Help);
             state.canvas.queue_redraw();
             true
         }
         F2 => {
+            log_key_action(keyval, "start_edit", &format!("cell={}", format_cell(state)));
             start_edit(state);
             true
         }
         RETURN => {
+            // When editing=false but the formula entry has non-empty text, the
+            // user typed characters but editing state was not established yet
+            // (GTK4 timing race during present()).  Start editing and commit
+            // immediately to avoid losing the edit.
+            if !state.editing.get() {
+                if let Some(text) = state.formula_entry.get_text() {
+                    if !text.is_empty() {
+                        state.editing.set(true);
+                        *state.edit_buf.borrow_mut() = text;
+                        return handle_edit_key(key, state);
+                    }
+                }
+                // When window CAPTURE consumed printable chars and pushed to
+                // edit_buf directly (bypassing the entry widget), the entry
+                // text is empty but edit_buf has content.  Commit from there.
+                if !state.edit_buf.borrow().is_empty() {
+                    state.editing.set(true);
+                    return handle_edit_key(key, state);
+                }
+            }
+            log_key_action(keyval, "move_cursor_down", &format!("cell={}", format_cell(state)));
             move_cursor(state, 1, 0);
             true
         }
         TAB => {
+            log_key_action(keyval, "move_cursor_right", &format!("cell={}", format_cell(state)));
             move_cursor(state, 0, 1);
             true
         }
         ESCAPE => {
-            state.menu_nav.set(MenuNavState::Inactive);
-            state.alt_active.set(false);
-            state.seq_alt_f.set(false);
-            state.last_was_f.set(false);
+            log_key_action(keyval, "cancel_nav", "");
             app.core.anchor = Some(SheetCursor {
                 row: state.last_row.get(),
                 col: state.last_col.get(),
@@ -528,34 +495,41 @@ fn handle_key(keyval: u32, state_rc: &Rc<GuiState>) -> bool {
             true
         }
         LEFT => {
+            log_key_action(keyval, "move_cursor_left", &format!("cell={}", format_cell(state)));
             move_cursor(state, 0, -1);
             true
         }
         RIGHT => {
+            log_key_action(keyval, "move_cursor_right", &format!("cell={}", format_cell(state)));
             move_cursor(state, 0, 1);
             true
         }
         UP => {
+            log_key_action(keyval, "move_cursor_up", &format!("cell={}", format_cell(state)));
             if state.last_row.get() > HEADER_ROWS {
                 move_cursor(state, -1, 0);
             }
             true
         }
         DOWN => {
+            log_key_action(keyval, "move_cursor_down", &format!("cell={}", format_cell(state)));
             move_cursor(state, 1, 0);
             true
         }
         HOME => {
+            log_key_action(keyval, "move_cursor_home", &format!("cell={}", format_cell(state)));
             state.last_col.set(MARGIN_COLS);
             update_state_cursor(state, state.last_row.get(), MARGIN_COLS);
             true
         }
         END => {
+            log_key_action(keyval, "move_cursor_end", &format!("cell={}", format_cell(state)));
             state.last_col.set(state.last_col.get() + 10);
             update_state_cursor(state, state.last_row.get(), state.last_col.get());
             true
         }
         PAGE_UP => {
+            log_key_action(keyval, "move_cursor_page_up", &format!("cell={}", format_cell(state)));
             let dr = state.data_rows.get();
             let new_row = state.last_row.get().saturating_sub(dr);
             state.last_row.set(new_row.max(HEADER_ROWS));
@@ -563,21 +537,30 @@ fn handle_key(keyval: u32, state_rc: &Rc<GuiState>) -> bool {
             true
         }
         PAGE_DOWN => {
+            log_key_action(keyval, "move_cursor_page_down", &format!("cell={}", format_cell(state)));
             let dr = state.data_rows.get();
             state.last_row.set(state.last_row.get() + dr);
             update_state_cursor(state, state.last_row.get(), state.last_col.get());
             true
         }
         DELETE => {
+            log_key_action(keyval, "delete_cell", &format!("cell={}", format_cell(state)));
             handle_delete(state);
             true
         }
         BACKSPACE => {
+            log_key_action(keyval, "delete_cell", &format!("cell={}", format_cell(state)));
             handle_delete(state);
             true
         }
         _ if (32..=126).contains(&key) => {
             let ch = char::from_u32(key).unwrap_or('?');
+            // Prime the dedup tracker so the upcoming release event is skipped
+            // by handle_edit_key (the release arrives after editing is established).
+            let dk = ch.to_ascii_lowercase() as u32;
+            state.last_dedup_key.set(dk);
+            state.dedup_count.set(1);
+            log_key_action(keyval, "start_edit_with", &format!("char={ch} cell={}", format_cell(state)));
             start_edit_with(state, ch);
             true
         }
@@ -586,43 +569,15 @@ fn handle_key(keyval: u32, state_rc: &Rc<GuiState>) -> bool {
 }
 
 fn handle_edit_key(key: u32, state: &GuiState) -> bool {
-    let ch = char::from_u32(key).unwrap_or('\0').to_ascii_lowercase();
-    if ch == 'q'
-        && (state.seq_alt_f.get()
-            || state.last_was_f.get()
-            || state.menu_nav.get() == MenuNavState::File)
-    {
-        if !state.seq_alt_f.get()
-            && state.menu_nav.get() == MenuNavState::Inactive
-            && !state.edit_buf.borrow().is_empty()
-        {
-            state.menu_nav.set(MenuNavState::Inactive);
-            state.alt_active.set(false);
-            state.seq_alt_f.set(false);
-            state.last_was_f.set(false);
-        } else {
-            state.menu_nav.set(MenuNavState::Inactive);
-            state.alt_active.set(false);
-            state.seq_alt_f.set(false);
-            state.last_was_f.set(false);
-            #[cfg(all(unix, feature = "gui"))]
-            let _ = rustxwidgets::backends_gtk_adapter::quit_main_loop();
-            #[cfg(windows)]
-            rustxwidgets::backends_nwg_adapter::quit_main_loop();
-            return true;
-        }
-    }
-    if ch != 'f' {
-        state.seq_alt_f.set(false);
-        state.last_was_f.set(false);
-    }
     match key {
-        RETURN | 0x0D => {
+        RETURN => {
+            log_key_action(key, "commit_edit", &format!("cell={} mode=edit", format_cell(state)));
             commit_edit(state);
             move_cursor(state, 1, 0);
             true
         }
         ESCAPE => {
+            log_key_action(key, "cancel_edit", &format!("cell={} mode=edit", format_cell(state)));
             state.editing.set(false);
             state.edit_buf.borrow_mut().clear();
             state.mode.set(GuiMode::Normal);
@@ -631,21 +586,25 @@ fn handle_edit_key(key: u32, state: &GuiState) -> bool {
             true
         }
         TAB => {
+            log_key_action(key, "commit_edit_tab", &format!("cell={} mode=edit", format_cell(state)));
             commit_edit(state);
             move_cursor(state, 0, 1);
             true
         }
         BACKSPACE => {
+            log_key_action(key, "edit_backspace", &format!("cell={} mode=edit", format_cell(state)));
             state.edit_buf.borrow_mut().pop();
             state.canvas.queue_redraw();
             true
         }
         DELETE => {
+            log_key_action(key, "edit_clear", &format!("cell={} mode=edit", format_cell(state)));
             state.edit_buf.borrow_mut().clear();
             state.canvas.queue_redraw();
             true
         }
         LEFT => {
+            log_key_action(key, "commit_edit_left", &format!("cell={} mode=edit", format_cell(state)));
             commit_edit(state);
             let c = state.last_col.get();
             if c > 0 {
@@ -655,12 +614,14 @@ fn handle_edit_key(key: u32, state: &GuiState) -> bool {
             true
         }
         RIGHT => {
+            log_key_action(key, "commit_edit_right", &format!("cell={} mode=edit", format_cell(state)));
             commit_edit(state);
             state.last_col.set(state.last_col.get() + 1);
             update_state_cursor(state, state.last_row.get(), state.last_col.get());
             true
         }
         UP => {
+            log_key_action(key, "commit_edit_up", &format!("cell={} mode=edit", format_cell(state)));
             commit_edit(state);
             if state.last_row.get() > HEADER_ROWS {
                 state.last_row.set(state.last_row.get() - 1);
@@ -669,13 +630,31 @@ fn handle_edit_key(key: u32, state: &GuiState) -> bool {
             true
         }
         DOWN => {
+            log_key_action(key, "commit_edit_down", &format!("cell={} mode=edit", format_cell(state)));
             commit_edit(state);
             state.last_row.set(state.last_row.get() + 1);
             update_state_cursor(state, state.last_row.get(), state.last_col.get());
             true
         }
         _ if (32..=126).contains(&key) => {
+            // Press+release dedup: on the GTK3 path (and some GTK4 versions) the
+            // `key-pressed` signal fires for both GDK_KEY_PRESS and GDK_KEY_RELEASE.
+            // We skip every even occurrence of the same canonical (lowercased) key
+            // because xdotool generates exactly one press + one release per character.
+            let dedup_key = char::from_u32(key).map(|c| c.to_ascii_lowercase() as u32).unwrap_or(key);
+            if dedup_key == state.last_dedup_key.get() {
+                let cnt = state.dedup_count.get() + 1;
+                state.dedup_count.set(cnt);
+                // Skip every even occurrence (the release event)
+                if cnt % 2 == 0 {
+                    return true;
+                }
+            } else {
+                state.last_dedup_key.set(dedup_key);
+                state.dedup_count.set(1);
+            }
             let ch = char::from_u32(key).unwrap_or('?');
+            log_key_action(key, "edit_insert", &format!("char={ch} cell={} mode=edit", format_cell(state)));
             state.edit_buf.borrow_mut().push(ch);
             state.canvas.queue_redraw();
             true
@@ -697,35 +676,38 @@ fn start_edit(state: &GuiState) {
 }
 
 fn start_edit_with(state: &GuiState, ch: char) {
+    let already_editing = state.editing.get();
     state.editing.set(true);
-    state.edit_buf.borrow_mut().clear();
     let s = ch.to_string();
-    state.edit_buf.borrow_mut().push_str(&s);
-    state.formula_entry.set_text(&s);
-    state.formula_entry.grab_focus();
-    state.canvas.queue_redraw();
-}
-
-fn save_before_quit(state: &GuiState) {
-    // Commit any pending edit first so committed ops are written to the
-    // CORRO_LOG file via commit_workbook_op.
-    if state.editing.get() {
-        commit_edit(state);
+    if state.edit_buf.borrow().is_empty() {
+        state.edit_buf.borrow_mut().push_str(&s);
+    } else {
+        let mut buf = state.edit_buf.borrow_mut();
+        buf.push_str(&s);
     }
-    #[cfg(all(unix, feature = "gui"))]
-    let _ = rustxwidgets::backends_gtk_adapter::quit_main_loop();
-    #[cfg(windows)]
-    rustxwidgets::backends_nwg_adapter::quit_main_loop();
+    if !already_editing {
+        // Set the entry text to the typed character so it is visible in the
+        // formula bar.  Using set_text(&s) instead of set_text("") ensures
+        // the entry displays the first character (important when the window
+        // CAPTURE-phase controller handles the key and stops propagation,
+        // preventing the entry's default handler from inserting the char).
+        //
+        // set_text() triggers connect_changed -> on_formula_entry_changed,
+        // which would overwrite edit_buf with the entry text.  The starts_with
+        // guard in on_formula_entry_changed accepts this because the entry
+        // text ("4") is a forward extension of current edit_buf (""), and
+        // after restoring the saved value the result is identical.
+        let saved = state.edit_buf.borrow().clone();
+        state.formula_entry.set_text(&s);
+        *state.edit_buf.borrow_mut() = saved;
+        state.formula_entry.grab_focus();
+    }
+    state.canvas.queue_redraw();
 }
 
 fn commit_edit(state: &GuiState) {
     state.editing.set(false);
     state.mode.set(GuiMode::Normal);
-    if let Some(text) = state.formula_entry.get_text() {
-        if !text.is_empty() {
-            *state.edit_buf.borrow_mut() = text;
-        }
-    }
     let val = state.edit_buf.borrow().clone();
     if !val.is_empty() {
         let app = unsafe { &mut *state.app };
@@ -740,11 +722,14 @@ fn commit_edit(state: &GuiState) {
         let wbo = WorkbookOp::SheetOp { sheet_id, op };
         if let Some(ref p) = app.core.path.clone() {
             let mut active_sheet = sheet_id;
-            let _ = crate::io::commit_workbook_op(
+            if let Err(e) = crate::io::commit_workbook_op(
                 p, &mut app.core.offset, &mut app.core.workbook,
                 &mut active_sheet, &wbo,
-            );
-            app.core.ops_applied = app.core.ops_applied.saturating_add(1);
+            ) {
+                eprintln!("ERROR: commit_workbook_op failed: {e} (path={})", p.display());
+            } else {
+                app.core.ops_applied = app.core.ops_applied.saturating_add(1);
+            }
         }
         let main_rows = crate::addr::MainRows(app.core.workbook.active_sheet().grid.main_rows());
         let main_cols = crate::addr::MainCols(app.core.workbook.active_sheet().grid.main_cols());
@@ -758,27 +743,6 @@ fn commit_edit(state: &GuiState) {
     }
     state.edit_buf.borrow_mut().clear();
     state.canvas.queue_redraw();
-
-    // Return keyboard focus to the canvas so subsequent Alt-F+Q key
-    // sequences are handled by the canvas key controller rather than
-    // the formula entry, where GTK's internal mnemonic monitor may
-    // intercept the Alt modifier before our controller can process it.
-    #[cfg(unix)]
-    focus_canvas(state);
-}
-
-#[cfg(all(unix, feature = "gui"))]
-fn focus_canvas(state: &GuiState) {
-    if let Some(loader) = rustxwidgets::backends::gtk::loader() {
-        unsafe {
-            if let Some(set_can_focus) = loader.symbols.gtk_widget_set_can_focus {
-                set_can_focus(state.canvas.raw_handle(), 1);
-            }
-            if let Some(grab) = loader.symbols.gtk_widget_grab_focus {
-                grab(state.canvas.raw_handle());
-            }
-        }
-    }
 }
 
 fn handle_delete(state: &GuiState) {
@@ -809,11 +773,14 @@ fn handle_delete(state: &GuiState) {
             let wbo = WorkbookOp::SheetOp { sheet_id, op };
             if let Some(ref p) = app.core.path.clone() {
                 let mut active_sheet = sheet_id;
-                let _ = crate::io::commit_workbook_op(
+                if let Err(e) = crate::io::commit_workbook_op(
                     p, &mut app.core.offset, &mut app.core.workbook,
                     &mut active_sheet, &wbo,
-                );
-                app.core.ops_applied = app.core.ops_applied.saturating_add(1);
+                ) {
+                    eprintln!("ERROR: commit_workbook_op failed: {e} (path={})", p.display());
+                } else {
+                    app.core.ops_applied = app.core.ops_applied.saturating_add(1);
+                }
             }
             app.core.status = "Cleared selection".into();
             recompute_viewport(state);
@@ -828,11 +795,14 @@ fn handle_delete(state: &GuiState) {
     let wbo = WorkbookOp::SheetOp { sheet_id, op };
     if let Some(ref p) = app.core.path.clone() {
         let mut active_sheet = sheet_id;
-        let _ = crate::io::commit_workbook_op(
+        if let Err(e) = crate::io::commit_workbook_op(
             p, &mut app.core.offset, &mut app.core.workbook,
             &mut active_sheet, &wbo,
-        );
-        app.core.ops_applied = app.core.ops_applied.saturating_add(1);
+        ) {
+            eprintln!("ERROR: commit_workbook_op failed: {e} (path={})", p.display());
+        } else {
+            app.core.ops_applied = app.core.ops_applied.saturating_add(1);
+        }
     }
     recompute_viewport(state);
     state.canvas.queue_redraw();
@@ -953,179 +923,236 @@ fn build_menu(rxapp: &rustxwidgets::App, win: &Window, state: &Rc<GuiState>) -> 
 
     let action_group = rxapp.ensure_action_group()?;
 
-    let mut menubar_model = rxapp.create_menu()?;
-    // Prefix labels with U+3164 (Hangul Filler) to prevent GTK4's
-    // GtkPopoverMenuBar from auto-assigning mnemonic accelerators
-    // (Alt+F, Alt+E, etc.).
-    for root in menu::menu_bar() {
-        let sub = menu::build_submenu(rxapp, root.submenu.as_deref().unwrap_or(&[]), "app")?;
-        menubar_model.append_submenu(&format!("\u{3164}{}", root.label), &sub);
-    }
+    // Build the full menu tree from shared definitions (rustxwidgets).
+    // Prefix submenu labels with "_" so GTK4 assigns mnemonic accelerators
+    // (ALT+F for File, ALT+E for Edit, etc.).
+    let menubar_model = rxapp.build_menu_model(&menu::all_submenus(), "_")?;
 
-    // Register action callbacks with state access (walk the whole tree).
-    fn register_actions(
-        rxapp: &rustxwidgets::App,
-        items: &[menu::MenuAction],
-        s: &Rc<GuiState>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        for item in items {
-            if let Some(sub) = item.submenu {
-                register_actions(rxapp, sub, s)?;
-            } else {
-                let name = menu::action_kind_to_name(item.action);
-                let name_owned = name.to_string();
-                let state_cb = s.clone();
-                menu::register_action(rxapp, name, move || handle_menu_action(&name_owned, &state_cb))?;
-            }
-        }
-        Ok(())
-    }
+    // Register action callbacks with state access
     let s = state.clone();
-    for root in menu::menu_bar() {
-        register_actions(rxapp, root.submenu.as_deref().unwrap_or(&[]), &s)?;
+    for &items in &[menu::FILE_MENU, menu::EDIT_MENU, menu::VIEW_MENU, menu::INSERT_MENU, menu::FORMAT_MENU, menu::SHEET_MENU, menu::DATA_MENU, menu::TOOLS_MENU, menu::HELP_MENU] {
+        for item in items {
+            let name = menu::action_kind_to_name(item.action);
+            let name_owned = name.to_string();
+            let state_cb = s.clone();
+            menu::register_action(rxapp, name, move || handle_menu_action(&name_owned, &state_cb))?;
+        }
     }
 
-    let menubar = unsafe { rxapp.create_menubar(&menubar_model, action_group)? };
-    unsafe { win.insert_action_group("app", action_group); }
+    let menubar = rxapp.new_menubar(&menubar_model, action_group)?;
+    // Insert the action group on both the window and the menubar widget.
+    // The menubar insertion is critical: when the popover surface processes
+    // mnemonic key presses, gtk_widget_activate_action walks the popover's
+    // parent chain (popover -> bar_item -> menubar -> ... -> window).  Without
+    // the action group on the menubar, the walk may stop before reaching the
+    // window on some GTK4 versions/configurations.
+    win.insert_action_group("app", action_group);
+    unsafe { menubar.insert_action_group("app", action_group); }
 
     Ok(menubar)
 }
 
 fn handle_menu_action(name: &str, state: &GuiState) {
-    // `quit` leaves the main loop directly.
-    if name == "quit" {
-        #[cfg(all(unix, feature = "gui"))]
-        let _ = rustxwidgets::backends_gtk_adapter::quit_main_loop();
-        #[cfg(windows)]
-        rustxwidgets::backends_nwg_adapter::quit_main_loop();
-        return;
-    }
-
-    // Prompt-needing actions are collected via GTK native dialogs; the entered
-    // value is then fed through the shared prompt dispatcher. We capture the raw
-    // app pointer (Copy) rather than `state` so the dialog callbacks do not hold
-    // a borrowed reference past the function body.
-    if let Some(_label) = menu_action_needs_prompt(name) {
-        let app_ptr = state.app;
-        match name {
-            "open" => {
-                if let Some(path) = dialogs::file_open_dialog() {
-                    let app = unsafe { &mut *app_ptr };
-                    run_prompt_action(app, "open", &path.to_string_lossy().into_owned());
-                    recompute_viewport(state);
-                    state.canvas.queue_redraw();
-                }
-            }
-            "save_as" => {
-                if let Some(path) = dialogs::file_save_dialog() {
-                    let app = unsafe { &mut *app_ptr };
-                    run_prompt_action(app, "save_as", &path.to_string_lossy().into_owned());
-                    recompute_viewport(state);
-                    state.canvas.queue_redraw();
-                }
-            }
-            "export_tsv" | "export_csv" | "export_ods" | "export_ascii" | "export_all" => {
-                if let Some(path) = dialogs::file_save_dialog() {
-                    let app = unsafe { &mut *app_ptr };
-                    run_prompt_action(app, name, &path.to_string_lossy().into_owned());
-                    recompute_viewport(state);
-                    state.canvas.queue_redraw();
-                }
-            }
-            "set_col_width" | "set_max_col_width" => {
-                let action = name.to_string();
-                dialogs::find_dialog(move |result| {
-                    if let Some(text) = result {
-                        let app = unsafe { &mut *app_ptr };
-                        run_prompt_action(app, &action, &text);
-                    }
-                });
-            }
-            "go_to_cell" => dialogs::find_dialog(move |result| {
-                if let Some(text) = result {
-                    let app = unsafe { &mut *app_ptr };
-                    run_prompt_action(app, "go_to_cell", &text);
-                }
-            }),
-            "find" => dialogs::find_dialog(move |result| {
-                if let Some(text) = result {
-                    let app = unsafe { &mut *app_ptr };
-                    run_prompt_action(app, "find", &text);
-                }
-            }),
-            "replace" => dialogs::replace_dialog(move |result| {
-                if let Some((find, repl)) = result {
-                    let app = unsafe { &mut *app_ptr };
-                    run_prompt_action(app, "replace", &format!("{find}|{repl}"));
-                }
-            }),
-            "rename_sheet" => dialogs::find_dialog(move |result| {
-                if let Some(text) = result {
-                    let app = unsafe { &mut *app_ptr };
-                    run_prompt_action(app, "rename_sheet", &text);
-                }
-            }),
-            "copy_sheet" => dialogs::find_dialog(move |result| {
-                if let Some(text) = result {
-                    let app = unsafe { &mut *app_ptr };
-                    run_prompt_action(app, "copy_sheet", &text);
-                }
-            }),
-            "delete_sheet" => dialogs::find_dialog(move |result| {
-                if let Some(text) = result {
-                    let app = unsafe { &mut *app_ptr };
-                    run_prompt_action(app, "delete_sheet", &text);
-                }
-            }),
-            "insert_special_chars" => dialogs::find_dialog(move |result| {
-                if let Some(text) = result {
-                    let app = unsafe { &mut *app_ptr };
-                    run_prompt_action(app, "insert_special_chars", &text);
-                }
-            }),
-            "insert_hyperlink" => dialogs::find_dialog(move |result| {
-                if let Some(text) = result {
-                    let app = unsafe { &mut *app_ptr };
-                    run_prompt_action(app, "insert_hyperlink", &text);
-                }
-            }),
-            _ => {}
-        }
-        update_formula_bar(state, state.last_row.get(), state.last_col.get());
-        return;
-    }
-
-    // Immediate actions go through the shared dispatcher so GTK matches the
-    // pancurses and ratatui backends exactly (render parity).
     let app = unsafe { &mut *state.app };
-    let mut scope = state.format_scope.get();
-    let mut clip = state.clipboard.borrow_mut().clone();
-    let result = dispatch_menu_action(app, name, &mut scope, &mut clip);
-    state.format_scope.set(scope);
-    *state.clipboard.borrow_mut() = clip;
-    match result {
-        MenuDispatch::Status(s) => {
-            if !s.is_empty() {
-                app.core.status = s;
-                recompute_viewport(state);
-                state.canvas.queue_redraw();
+    log_ui_action("menu_action", name);
+    match name {
+        "open" => {
+            if let Some(path) = dialogs::file_open_dialog() {
+                match crate::io::load_workbook_snapshot(&path) {
+                    Ok(snapshot) => {
+                        app.core.workbook = crate::ops::WorkbookState::from_snapshot(&snapshot);
+                        app.core.offset = 0;
+                        app.core.ops_applied = 0;
+                        app.core.path = Some(path);
+                        app.core.status = "Opened file".into();
+                        recompute_viewport(state);
+                        state.canvas.queue_redraw();
+                    }
+                    Err(e) => app.core.status = format!("Open error: {e}"),
+                }
             }
         }
-        MenuDispatch::Prompt(_label, _action) => {
-            // Only `save` degrades to a prompt (no file loaded).
+        "save" => {
+            if let Some(ref p) = app.core.path.clone() {
+                let snapshot = crate::ops::WorkbookSnapshot::from_workbook(&app.core.workbook);
+                match crate::io::save_workbook(p, &snapshot) {
+                    Ok(()) => app.core.status = "Saved".into(),
+                    Err(e) => app.core.status = format!("Save error: {e}"),
+                }
+            }
+        }
+        "save_as" => {
             if let Some(path) = dialogs::file_save_dialog() {
-                let app2 = unsafe { &mut *state.app };
-                run_prompt_action(app2, "save_as", &path.to_string_lossy().into_owned());
-                recompute_viewport(state);
-                state.canvas.queue_redraw();
+                app.core.path = Some(path.clone());
+                let snapshot = crate::ops::WorkbookSnapshot::from_workbook(&app.core.workbook);
+                match crate::io::save_workbook(&path, &snapshot) {
+                    Ok(()) => app.core.status = format!("Saved to {}", path.display()),
+                    Err(e) => app.core.status = format!("Save error: {e}"),
+                }
             }
         }
-        MenuDispatch::About { .. } => dialogs::show_about_dialog(),
-        MenuDispatch::HelpFull { .. } => dialogs::show_keybinds_help(),
-        MenuDispatch::HelpKeybinds { .. } => dialogs::show_keybinds_help(),
+        "corro_quit" => {
+            eprintln!("DEBUG handle_menu_action: corro_quit activated");
+            save_before_quit(state);
+        }
+        "find" => dialogs::find_dialog(|result| {
+            if let Some(text) = result {
+                app.core.status = format!("Find: {text}");
+            }
+        }),
+        "replace" => dialogs::replace_dialog(|result| {
+            if let Some((find, replace)) = result {
+                app.core.status = format!("Replace: '{find}' with '{replace}'");
+            }
+        }),
+        "sort_asc" => {
+            let wb = crate::ops::WorkbookState::default();
+            dialogs::sort_dialog(&wb, |result| {
+                if let Some((col, asc)) = result {
+                    app.core.status = format!("Sort col {col} asc: {asc}");
+                }
+            });
+        }
+        "sort_desc" => {
+            let wb = crate::ops::WorkbookState::default();
+            dialogs::sort_dialog(&wb, |result| {
+                if let Some((col, asc)) = result {
+                    app.core.status = format!("Sort col {col} desc: {}", !asc);
+                }
+            });
+        }
+        "balance_books" => dialogs::balance_dialog(|result| {
+            if let Some(col) = result {
+                app.core.status = format!("Balance col: {col}");
+            }
+        }),
+        "about" => {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static ABOUT_COUNT: AtomicUsize = AtomicUsize::new(0);
+            let n = ABOUT_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
+            let _ = std::fs::write("/tmp/corro_about_count.txt", format!("about called: {n}\n"));
+            dialogs::show_about_dialog();
+        }
+        "help_keybinds" => {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static KB_COUNT: AtomicUsize = AtomicUsize::new(0);
+            let n = KB_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
+            let _ = std::fs::write("/tmp/corro_kb_count.txt", format!("help_keybinds called: {n}\n"));
+            dialogs::show_keybinds_help();
+        }
+        "rename_sheet" => dialogs::find_dialog(|result| {
+            if let Some(name) = result {
+                app.core.status = format!("Rename sheet to: {name}");
+            }
+        }),
+        "undo" => {
+            app.core.status = "Undo not yet implemented".into();
+            state.canvas.queue_redraw();
+        }
+        "redo" => {
+            app.core.status = "Redo not yet implemented".into();
+            state.canvas.queue_redraw();
+        }
+        "cut" => {
+            app.core.status = "Cut not yet implemented".into();
+        }
+        "copy" => {
+            app.core.status = "Copy not yet implemented".into();
+        }
+        "paste" => {
+            app.core.status = "Paste not yet implemented".into();
+        }
+        "delete_cell" => {
+            handle_delete(state);
+        }
+        "select_all" => {
+            app.core.status = "Select All".into();
+            app.core.anchor = None;
+            state.canvas.queue_redraw();
+        }
+        "toggle_headers" => {
+            app.core.status = "Toggle headers not yet implemented".into();
+        }
+        "toggle_margins" => {
+            app.core.status = "Toggle margins not yet implemented".into();
+        }
+        "new_sheet" => {
+            app.core.status = "New sheet not yet implemented".into();
+        }
+        "delete_sheet" => {
+            app.core.status = "Delete sheet not yet implemented".into();
+        }
+        "export_tsv" => {
+            if let Some(path) = dialogs::file_save_dialog() {
+                app.core.status = format!("Exporting TSV to {}", path.display());
+            }
+        }
+        "export_csv" => {
+            if let Some(path) = dialogs::file_save_dialog() {
+                app.core.status = format!("Exporting CSV to {}", path.display());
+            }
+        }
+        "export_ods" => {
+            if let Some(path) = dialogs::file_save_dialog() {
+                app.core.status = format!("Exporting ODS to {}", path.display());
+            }
+        }
+        "export_ascii" => {
+            if let Some(path) = dialogs::file_save_dialog() {
+                app.core.status = format!("Exporting ASCII to {}", path.display());
+            }
+        }
+        "export_all" => {
+            app.core.status = "Export All".into();
+            state.canvas.queue_redraw();
+        }
+        "insert_rows" => {
+            app.core.status = "Insert rows not yet implemented".into();
+        }
+        "insert_mitosis_row" => {
+            app.core.status = "Insert mitosis row not yet implemented".into();
+        }
+        "insert_mitosis_col" => {
+            app.core.status = "Insert mitosis col not yet implemented".into();
+        }
+        "insert_cols" => {
+            app.core.status = "Insert cols not yet implemented".into();
+        }
+        "insert_special_chars" => {
+            app.core.status = "Insert special chars not yet implemented".into();
+        }
+        "insert_date" => {
+            app.core.status = "Insert date not yet implemented".into();
+        }
+        "insert_time" => {
+            app.core.status = "Insert time not yet implemented".into();
+        }
+        "insert_hyperlink" => {
+            app.core.status = "Insert hyperlink not yet implemented".into();
+        }
+        "format_apply_all" | "format_apply_full_column" | "format_apply_data"
+        | "format_apply_special" | "format_apply_cell" | "format_apply_selection" => {
+            app.core.status = format!("Format scope: {name}");
+        }
+        "format_decimal_generic" | "format_currency" | "format_rational"
+        | "format_fixed_0" | "format_fixed_1" | "format_fixed_2" | "format_fixed_custom" => {
+            app.core.status = format!("Format number: {name}");
+        }
+        "format_align_left" | "format_align_center" | "format_align_right"
+        | "format_align_default" => {
+            app.core.status = format!("Format align: {name}");
+        }
+        "format_reset" => {
+            app.core.status = "Format reset".into();
+        }
+        _ => {
+            app.core.status = format!("Menu action: {name}");
+        }
     }
     update_formula_bar(state, state.last_row.get(), state.last_col.get());
-}// ---------------------------------------------------------------------------
+}
+
+// ---------------------------------------------------------------------------
 // Formula entry change callback
 // ---------------------------------------------------------------------------
 
@@ -1134,7 +1161,20 @@ fn on_formula_entry_changed(state: &GuiState) {
         return;
     }
     if let Some(text) = state.formula_entry.get_text() {
-        *state.edit_buf.borrow_mut() = text;
+        let current = state.edit_buf.borrow();
+        // Safety check: only overwrite edit_buf from entry text when the
+        // entry text is a forward or backward extension of the current
+        // edit_buf.  This prevents data corruption when keystrokes from
+        // the window-level handler (start_edit_with/handle_edit_key) race
+        // with the entry's "changed" signal — a scenario where edit_buf
+        // contains "4" (from window handler) but the entry text is "2"
+        // (just arrived via entry default handler after grab_focus took
+        // effect).  Without this guard, edit_buf would be overwritten to
+        // "2", silently dropping the "4".
+        if text.starts_with(&*current) || current.starts_with(&text) {
+            drop(current);
+            *state.edit_buf.borrow_mut() = text;
+        }
         state.canvas.queue_redraw();
     }
 }
@@ -1144,14 +1184,15 @@ fn on_formula_entry_changed(state: &GuiState) {
 // ---------------------------------------------------------------------------
 
 pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Error>> {
+    rustxwidgets::core::install_debug_crash_handlers();
     let rxapp = rustxwidgets::App::init()
         .map_err(|e| format!("GUI init failed: {e}"))?;
 
-    let win = rxapp.create_window()?;
+    let win = rxapp.new_window()?;
     win.set_title(&format!("corro {}", env!("CARGO_PKG_VERSION")));
     win.set_default_size(1200, 800);
 
-    let mut vbox = rxapp.create_box(Orientation::Vertical, 0)?;
+    let mut vbox = rxapp.new_box(Orientation::Vertical, 0)?;
 
     // Fit column widths to rendered content
     corro_app.fit_main_columns_to_max_width();
@@ -1164,38 +1205,29 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     corro_app.core.cursor.col = cursor_col;
     corro_app.core.anchor = Some(SheetCursor { row: hr, col: lm });
 
-    let _data_width = 200usize;
     let data_rows = 30usize;
     let data_cols = 12usize;
 
     // Formula bar
-    let mut formula_bar = rxapp.create_box(Orientation::Horizontal, 2)?;
-    let addr_label = rxapp.create_label("A1")?;
-    let f_label = rxapp.create_label("  fx  ")?;
-    let formula_entry = rxapp.create_entry()?;
+    let mut formula_bar = rxapp.new_box(Orientation::Horizontal, 2)?;
+    let addr_label = rxapp.new_label("A1")?;
+    let f_label = rxapp.new_label("  fx  ")?;
+    let formula_entry = rxapp.new_entry()?;
     formula_entry.set_hexpand(true);
     formula_bar.append(&addr_label);
     formula_bar.append(&f_label);
     formula_bar.append(&formula_entry);
-    formula_entry.set_hexpand(true);
+    formula_bar.set_child_hexpand(&formula_entry, true);
 
     // Canvas
-    let canvas = rxapp.create_canvas()?;
+    let canvas = rxapp.new_canvas()?;
     canvas.set_size_request(800, 600);
-    // Ensure the canvas can receive keyboard focus (needed for focus_canvas
-    // to succeed after commit_edit — GtkDrawingArea does not accept focus
-    // by default).
-    #[cfg(all(unix, feature = "gui"))]
-    if let Some(loader) = rustxwidgets::backends::gtk::loader() {
-        unsafe {
-            if let Some(set_can_focus) = loader.symbols.gtk_widget_set_can_focus {
-                set_can_focus(canvas.raw_handle(), 1);
-            }
-        }
-    }
+    // Ensure the canvas can receive keyboard focus (needed after commit_edit
+    // to return focus — GtkDrawingArea does not accept focus by default).
+    canvas.set_can_focus(true);
 
     // Status label
-    let status_label = rxapp.create_label("Ready")?;
+    let status_label = rxapp.new_label("Ready")?;
 
     let shared = Rc::new(GuiState {
         app: corro_app as *mut super::App,
@@ -1213,300 +1245,398 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         data_cols: Cell::new(data_cols),
         last_key: Cell::new(0),
         key_counter: Cell::new(0),
-        alt_active: Cell::new(false),
-        seq_alt_f: Cell::new(false),
-        last_was_f: Cell::new(false),
-        prev_key: Cell::new(0),
-        menu_nav: Cell::new(MenuNavState::Inactive),
-        alt_f_detected: Cell::new(false),
-        format_scope: Cell::new(0),
-        clipboard: RefCell::new(String::new()),
+        entry_processed_key: Cell::new(false),
+        last_alt_keyval: Cell::new(0),
+        last_dedup_key: Cell::new(0),
+        dedup_count: Cell::new(0),
+        return_pressed: Cell::new(false),
+        last_keyval_dedup: Cell::new(0),
     });
 
     // Build menu
     let menubar = build_menu(&rxapp, &win, &shared)?;
+    let menubar_cb = menubar.clone();
     vbox.append(&menubar);
 
-    // Draw callback
-    let shared_draw = shared.clone();
-    canvas.set_draw_callback(Box::new(move |dc: &mut dyn DrawContext, w: i32, h: i32| {
-        render_grid(dc, &shared_draw, w, h);
-    }));
-
-    // Keyboard
+    // Keyboard: canvas.on_key, win.on_event_key, etc.
     let shared_key = shared.clone();
-    let alt_f_armed = Rc::new(Cell::new(false));
     canvas.on_key(Box::new(move |keyval: u32| -> bool {
-        let ch = char::from_u32(keyval).unwrap_or('\0').to_ascii_lowercase();
-
-        let s: &GuiState = &*shared_key;
-        if ch == 'q'
-            && (alt_f_armed.get()
-                || s.seq_alt_f.get()
-                || s.menu_nav.get() == MenuNavState::File)
-        {
-            alt_f_armed.set(false);
-            s.seq_alt_f.set(false);
-            s.menu_nav.set(MenuNavState::Inactive);
-            s.last_was_f.set(false);
-            #[cfg(all(unix, feature = "gui"))]
-            let _ = rustxwidgets::backends_gtk_adapter::quit_main_loop();
-            #[cfg(windows)]
-            rustxwidgets::backends_nwg_adapter::quit_main_loop();
-            return true;
-        }
-
-        if ch == 'f' {
-            alt_f_armed.set(true);
-            return handle_key(keyval, &shared_key);
-        }
-
-        if keyval == ALT_L || keyval == ALT_R {
-            return handle_key(keyval, &shared_key);
-        }
-
-        alt_f_armed.set(false);
         handle_key(keyval, &shared_key)
     }));
 
     // Click
     let shared_click = shared.clone();
-    canvas.on_click(Box::new(move |x: f64, y: f64| {
-        handle_click(x, y, &shared_click);
-    }));
+    canvas.on_click(Box::new(move |x: f64, y: f64| { handle_click(x, y, &shared_click); }));
 
     // Formula entry change
     let shared_entry = shared.clone();
-    // GTK4: Return in the formula entry fires "activate" (the Entry on_key
-    // key-press-event path is GTK3-only).  Without this, cell edits typed in
-    // the formula bar are never committed — the root cause of
-    // "GTK4 cell edit not producing recording output" in the mainloop fork.
-    {
-        let shared_a = shared.clone();
-        let _ = formula_entry.connect_activate(move |_ev| {
-            handle_key(key::RETURN, &shared_a);
-        });
-    }
+    formula_entry.connect_changed(move || { on_formula_entry_changed(&shared_entry); })?;
 
-    formula_entry.connect_changed(move || {
-        on_formula_entry_changed(&shared_entry);
-    })?;
+    // Direct RETURN handling via connect_activate.  On GTK4 the entry's
+    // internal CAPTURE-phase EventControllerKey consumes RETURN before
+    // our BUBBLE-phase EventControllerKey (registered by on_key_raw)
+    // ever fires.  The "activate" signal is the only path RETURN reaches
+    // our code.  This handler provides a second, independent path that
+    // does NOT go through the shared-callback RefCell in the GTK adapter's
+    // on_key_raw, making it robust against any RefCell-borrow failures in
+    // that path.  On NWG this is a no-op (connect_activate returns Ok(0)).
+    let shared_act = shared.clone();
+    formula_entry.connect_activate(Box::new(move |_entry: *mut std::os::raw::c_void| {
+        handle_key(0xFF0D, &shared_act);
+    }))?;
 
-    // Window-level GTK event interception to catch Alt-F+Q before the
-    // menu bar's mnemonic accelerator can steal the keystrokes.
-    #[cfg(all(unix, feature = "gui"))]
+    // Window-level event interception: fallback for keys that escape the
+    // focused widget.  The EventControllerKey is now stored in Window's
+    // _controllers field so it stays alive.
+    //
+    // On GTK4 the entry's BUBBLE controller fires before the window's
+    // BUBBLE controller.  For printable chars the entry marks
+    // entry_processed_key; the window checks it here to avoid duplicating
+    // the handle_key call (which would double characters in edit_buf).
+    // On NWG the window's raw handler fires independently of the entry's
+    // (only when no child has focus) so no doubling occurs.
     {
-        if let Some(loader) = rustxwidgets::backends::gtk::loader() {
-            let win_ptr = win.raw_handle();
-            if !win_ptr.is_null() {
-                let l_for_sig = loader.clone();
-                let l_for_cb = loader.clone();
-                let state_w = shared.clone();
-                unsafe {
-                    let _ = rustxwidgets::gtk_dynamic_loader::widget_connect_signal_bool(
-                        &l_for_sig,
-                        win_ptr,
-                        "event",
-                        Box::new(move |event: *mut std::ffi::c_void| -> i32 {
-                            let s: &GuiState = &*state_w;
-                            let keyval = l_for_cb.symbols.gdk_event_get_keyval
-                                .map(|f| unsafe { f(event) })
-                                .unwrap_or(0);
-                            if keyval == 0 {
-                                return 0;
-                            }
-                            let state = l_for_cb.symbols.gdk_event_get_state
-                                .map(|f| unsafe { f(event) })
-                                .unwrap_or(0);
-                            let alt_held = (state & 0x8) != 0;
-                            if alt_held || keyval == ALT_L || keyval == ALT_R {
-                                s.alt_active.set(true);
-                            }
-                            if keyval == ALT_L || keyval == ALT_R {
-                                return 1;
-                            }
-                            let ch = char::from_u32(keyval).unwrap_or('\0').to_ascii_lowercase();
-                            if (state & 0x4) != 0 && ch == 'q' {
-                                s.seq_alt_f.set(false);
-                                #[cfg(all(unix, feature = "gui"))]
-                                let _ = rustxwidgets::backends_gtk_adapter::quit_main_loop();
-                                return 1;
-                            }
-                            if (alt_held || s.alt_active.get()) && ch == 'f' {
-                                s.menu_nav.set(MenuNavState::File);
-                                s.seq_alt_f.set(true);
-                                s.alt_active.set(false);
-                                s.alt_f_detected.set(true);
-                                return 1;
-                            }
-                            if !s.editing.get() && ch == 'f' {
-                                s.menu_nav.set(MenuNavState::File);
-                                s.seq_alt_f.set(true);
-                                s.alt_active.set(false);
-                                s.alt_f_detected.set(true);
-                                return 1;
-                            }
-                            if ch == 'q'
-                                && (s.menu_nav.get() == MenuNavState::File
-                                    || s.seq_alt_f.get())
-                            {
-                                #[cfg(all(unix, feature = "gui"))]
-                                let _ = rustxwidgets::backends_gtk_adapter::quit_main_loop();
-                                return 1;
-                            }
-                            if !alt_held {
-                                s.alt_active.set(false);
-                                s.seq_alt_f.set(false);
-                            }
-                            0
-                        }),
-                    );
+        let state_w = shared.clone();
+        win.on_event_key(Box::new(move |keyval: u32, state: u32| -> i32 {
+            let s: &GuiState = &*state_w;
+            s.key_counter.set(s.key_counter.get() + 1);
+
+            append_keylog(&format!("WINDOW_KEY: keyval={keyval} state={state} key_counter={}\n",
+                s.key_counter.get()));
+
+            // Propagate ALT key itself so GTK shows mnemonic hints
+            if keyval == ALT_L || keyval == ALT_R {
+                append_keylog("ALT alone, propagating\n");
+                return 0;
+            }
+
+            // Clear the return_pressed flag when a non-RETURN key arrives.
+            // This prevents the flag from persisting across unrelated key
+            // sequences (e.g., RETURN press with no release event, followed
+            // by a legitimate later RETURN press that should be handled).
+            let nk = normalize(keyval);
+            if nk != RETURN {
+                s.return_pressed.set(false);
+            }
+
+            let ch = char::from_u32(keyval).unwrap_or('\0').to_ascii_lowercase();
+            let alt_held = (state & 0x8) != 0;
+            let ctrl_held = (state & 0x4) != 0;
+
+            // General press/release dedup: EventControllerKey::key-pressed fires for
+            // both GDK_KEY_PRESS and GDK_KEY_RELEASE on some GTK4 versions/display
+            // servers (e.g., WSLg XWayland).  When the same canonical keyval arrives
+            // twice consecutively, the second event is a release and should be skipped.
+            // This catches navigation keys (Down, Escape, etc.) and other non-printable
+            // keys that are not covered by entry_processed_key or return_pressed.
+            if nk != 0 && nk == s.last_keyval_dedup.get() {
+                s.last_keyval_dedup.set(0);
+                append_keylog(&format!("dedup: skipping keyval={nk} release\n"));
+                return 1;
+            }
+
+            // Ctrl+Q: quit
+            if ctrl_held && ch == 'q' {
+                eprintln!("DEBUG window key handler: Ctrl+Q detected");
+                save_before_quit(s);
+                return 1;
+            }
+
+            // ALT+letter: open menu via handle_menu_key.  This tries GTK's
+            // activate_submenu_by_mnemonic first, then falls back to the
+            // Rust-side model scan via keyboard_menu_active.  The fallback
+            // works even when GTK's popover system is blocked by the
+            // CAPTURE-phase controller.
+            if alt_held && (32..=126).contains(&keyval) {
+                let ok = menubar_cb.handle_menu_key(keyval, state);
+                append_keylog(&format!("Alt+letter keyval={keyval} handle_menu_key={ok}\n"));
+                if ok {
+                    s.last_alt_keyval.set(keyval);
+                    return 1;
+                }
+                return 0;
+            }
+
+            // Check whether the entry already processed this printable
+            // character.  On GTK4 BUBBLE phase, the entry's on_key_raw
+            // fires first (line ~1405), calls handle_key, and sets
+            // entry_processed_key=true.  Without this guard the window
+            // handler would call handle_key again, doubling the character
+            // in edit_buf ("4422" instead of "42").  This is the fix
+            // described in Attempt 195 of the idea log.
+            if (32..=126).contains(&nk) && s.entry_processed_key.get() {
+                s.entry_processed_key.set(false);
+                return 0;
+            }
+
+            // When the keyboard menu is active (Alt+letter opened a submenu
+            // via handle_menu_key's Rust-side fallback), route unmodified
+            // printable keys through handle_menu_key which calls
+            // handle_mnemonic_key to select items by mnemonic.  This avoids
+            // the character being typed into the formula entry instead.
+            //
+            // Skip if the key matches the Alt+letter that opened the menu:
+            // on GTK, both key-press and key-release events fire the window
+            // callback.  After Alt+S opens the Sheet submenu, the subsequent
+            // 's' release event (or a second press from xdotool) arrives with
+            // state=0 and must not be routed as a menu mnemonic — doing so
+            // causes handle_mnemonic_key to globally search all submenus,
+            // find "Save" (File → Save, mnemonic _s), and close the menu
+            // before the intended mnemonic (e.g., 'b' for Balance Books)
+            // arrives.
+            if menubar_cb.menu_active() && !alt_held && !ctrl_held
+                && (32..=126).contains(&nk)
+            {
+                if nk == s.last_alt_keyval.get() {
+                    return 1;
+                }
+                let consumed = menubar_cb.handle_menu_key(keyval, state);
+                if consumed {
+                    // Mark this printable key as processed so the BUBBLE-phase
+                    // fallthrough (handle_key) doesn't re-process it.  Without
+                    // this guard, if a second key-press event for the same
+                    // character arrives (autorepeat or BUBBLE re-entry), it
+                    // would fall through to handle_key and start editing with
+                    // that character, corrupting the test.
+                    s.entry_processed_key.set(true);
+                    return 1;
                 }
             }
+
+            // Escape when keyboard menu is active: close it via handle_menu_key.
+            if nk == ESCAPE && menubar_cb.menu_active() {
+                menubar_cb.handle_menu_key(keyval, state);
+                return 1;
+            }
+
+            // Safety net for RETURN: if editing is false but the formula entry
+            // has text or edit_buf has content (e.g., from CAPTURE-phase key
+            // processing on GTK where the entry widget never received the key),
+            // set editing=true before delegating to handle_key so the edit is
+            // committed instead of moving the cursor.
+            //
+            // On GTK, the CAPTURE-phase EventControllerKey fires for both
+            // GDK_KEY_PRESS and GDK_KEY_RELEASE of the same physical key.
+            // The press event commits the edit (editing=true → handle_key →
+            // commit_edit → editing=false).  After commit_edit, move_cursor
+            // calls update_formula_bar which sets the formula entry text to
+            // the new cell's value (e.g., "2").  The release event then
+            // arrives with editing=false, sees text="2", and re-enters edit
+            // mode via this safety net — committing "2" instead of "Hello".
+            // The return_pressed flag is set after handle_key processes a
+            // RETURN (below).  When the safety net fires on the release
+            // event, return_pressed is true and we skip to prevent the
+            // spurious second commit.
+            if nk == RETURN && !s.editing.get() {
+                if s.return_pressed.get() {
+                    s.return_pressed.set(false);
+                    append_keylog("return_pressed: skipping RETURN release\n");
+                    return 1;
+                }
+                let text = s.formula_entry.get_text().unwrap_or_default();
+                if !text.is_empty() || !s.edit_buf.borrow().is_empty() {
+                    s.editing.set(true);
+                    if !text.is_empty() {
+                        *s.edit_buf.borrow_mut() = text;
+                    }
+                }
+            }
+    let hk = handle_key(keyval, &state_w);
+    append_keylog(&format!("handle_key={hk}\n"));
+    if hk {
+        // Mark printable chars as entry-processed so the entry CAPTURE
+        // controller (which fires after window CAPTURE on some GTK
+        // versions despite GDK_EVENT_STOP) skips its duplicate handle_key
+        // call.  This prevents window+entry character doubling.
+        if (32..=126).contains(&nk) {
+            s.entry_processed_key.set(true);
         }
+        if nk == RETURN {
+            s.return_pressed.set(true);
+            append_keylog(&format!("window handler returned 1 for RETURN, editing={} text={:?} edit_buf={:?}\n",
+                s.editing.get(),
+                s.formula_entry.get_text().unwrap_or_default(),
+                *s.edit_buf.borrow()));
+        }
+        // Set dedup keyval so the release event (same keyval arriving next)
+        // is caught by the guard at line 1327 and skipped.
+        s.last_keyval_dedup.set(nk);
+        1 
+    } else {
+        s.last_keyval_dedup.set(0);
+        0 
+    }
+        }));
     }
 
-    // Register save-before-quit on window close (WM_CLOSE on NWG).
-    // This ensures the replayer tests that use WM_CLOSE (instead of
-    // Alt+F+Q) still commit pending edits to the output file.
+    // Register save-before-quit on close
     {
         let state_c = shared.clone();
-        win.on_close(Box::new(move || {
-            save_before_quit(&*state_c);
+        win.on_close(Box::new(move || { save_before_quit(&*state_c); }));
+    }
+
+    // Intercept Enter/Escape from formula entry
+    {
+        let shared_k = shared.clone();
+        let shared_k_cnt = shared.clone();
+        formula_entry.on_key_raw(Box::new(move |keyval: u32, state: u32| -> bool {
+            shared_k_cnt.last_key.set(keyval);
+            let k = normalize(keyval);
+            match k {
+                RETURN | ESCAPE | TAB | LEFT | RIGHT | UP | DOWN | HOME | END | PAGE_UP | PAGE_DOWN => {
+                    handle_key(keyval, &shared_k);
+                    true
+                }
+                _ if (32..=126).contains(&k) => {
+                    // When the window CAPTURE controller (which fires before
+                    // this entry CAPTURE controller) already processed this key
+                    // and set entry_processed_key, skip the duplicate.  On some
+                    // GTK versions GDK_EVENT_STOP from CAPTURE doesn't stop
+                    // propagation to child widgets, so both the window CAPTURE
+                    // and the entry CAPTURE fire for the same key event.
+                    if shared_k.entry_processed_key.get() {
+                        shared_k.entry_processed_key.set(false);
+                        return false;
+                    }
+                    // Process the key to update edit_buf (via handle_key →
+                    // handle_edit_key or start_edit_with), then let the event
+                    // propagate so the entry's default handler inserts the
+                    // character and fires "changed" → on_formula_entry_changed.
+                    // The starts_with guard in on_formula_entry_changed prevents
+                    // the (already-correct) edit_buf from being overwritten by
+                    // stale entry text in the mixed-flow scenario (first char
+                    // via window handler, subsequent chars via entry handler
+                    // after grab_focus).
+                    //
+                    // For keys with Ctrl (0x4) or Alt (0x8) modifiers, do NOT
+                    // claim the key so the event bubbles to the window BUBBLE
+                    // handler which processes Ctrl+Q.
+                    if (state & (0x4 | 0x8)) != 0 {
+                        return false;
+                    }
+                    handle_key(keyval, &shared_k);
+                    shared_k.entry_processed_key.set(true);
+                    false
+                }
+                _ => false,
+            }
         }));
     }
 
-    // Intercept Enter/Escape from formula entry during editing
-    #[cfg(all(unix, feature = "gui"))]
-    {
-        if let Some(loader) = rustxwidgets::backends::gtk::loader() {
-            let entry_ptr = formula_entry.raw_handle();
-            if !entry_ptr.is_null() {
-                let l2 = loader.clone();
-                let l2_for_cb = l2.clone();
-                let state_k = shared.clone();
-                unsafe {
-                    let _ = rustxwidgets::gtk_dynamic_loader::widget_connect_signal_bool(
-                        &l2,
-                        entry_ptr,
-                        "event",
-                        Box::new(move |ev: *mut std::ffi::c_void| -> i32 {
-                            let keyval =
-                                rustxwidgets::gtk_dynamic_loader::EventControllerKey::get_keyval_static(
-                                    &l2_for_cb, ev,
-                                );
-                            if keyval == 0 {
-                                return 0;
-                            }
-                            let state =
-                                rustxwidgets::gtk_dynamic_loader::EventControllerKey::get_state_static(
-                                    &l2_for_cb, ev,
-                                );
-                            let alt_held = (state & 0x8) != 0;
-                            if alt_held || keyval == ALT_L || keyval == ALT_R {
-                                state_k.alt_active.set(true);
-                            }
-                            if keyval == ALT_L || keyval == ALT_R {
-                                return 1;
-                            }
-                            let ch =
-                                char::from_u32(keyval).unwrap_or('\0').to_ascii_lowercase();
-                            if (alt_held || state_k.alt_active.get()) && ch == 'f' {
-                                state_k.last_was_f.set(true);
-                                state_k.menu_nav.set(MenuNavState::File);
-                                state_k.seq_alt_f.set(true);
-                                state_k.alt_active.set(false);
-                                state_k.alt_f_detected.set(true);
-                                let _ = handle_key(keyval, &state_k);
-                                return 1;
-                            }
-                            if !state_k.editing.get() && ch == 'f' {
-                                state_k.last_was_f.set(true);
-                                state_k.menu_nav.set(MenuNavState::File);
-                                state_k.seq_alt_f.set(true);
-                                state_k.alt_active.set(false);
-                                state_k.alt_f_detected.set(true);
-                                let _ = handle_key(keyval, &state_k);
-                                return 1;
-                            }
-                            if ch == 'q'
-                                && (state_k.menu_nav.get() == MenuNavState::File
-                                    || state_k.seq_alt_f.get()
-                                    || state_k.last_was_f.get())
-                            {
-                                if !state_k.seq_alt_f.get()
-                                    && state_k.menu_nav.get() == MenuNavState::Inactive
-                                    && state_k.editing.get()
-                                    && !state_k.edit_buf.borrow().is_empty()
-                                {
-                                    state_k.menu_nav.set(MenuNavState::Inactive);
-                                    state_k.alt_active.set(false);
-                                    state_k.seq_alt_f.set(false);
-                                } else {
-                                    #[cfg(all(unix, feature = "gui"))]
-                                    let _ = rustxwidgets::backends_gtk_adapter::quit_main_loop();
-                                    #[cfg(windows)]
-                                    rustxwidgets::backends_nwg_adapter::quit_main_loop();
-                                    return 1;
-                                }
-                            }
-                            if handle_key(keyval, &state_k) {
-                                1
-                            } else {
-                                0
-                            }
-                        }),
-                    );
-                }
+// Assemble layout
+    vbox.append(&formula_bar);
+    vbox.append(&canvas);
+    vbox.set_child_vexpand(&canvas, true);
+    vbox.append(&status_label);
+
+    // Register the draw callback BEFORE present() so the extensive event
+    // pumping inside present() — which waits for the frame clock to fire
+    // its first tick (up to 500+500 blocking iterations) — actually calls
+    // our draw function.  When set_draw_callback was placed AFTER present(),
+    // the initial 1050+ iterations did nothing because no draw function
+    // was registered yet.  On virtual displays (WSLg, Xvfb) the next
+    // frame clock tick may be delayed enough for a replayer to find the
+    // window visible but blank ("WINDOW_DRAWN=false (blank window)").
+    //
+    // gtk_drawing_area_set_draw_func stores the callback in widget instance
+    // data and works correctly whether the DrawingArea is realized or not;
+    // the callback is invoked on the first frame clock tick after realization.
+    let shared_draw = shared.clone();
+    eprintln!("PHASE: before_set_draw_callback");
+    let _ = std::fs::write("/tmp/gui_setup_phase1.txt", "before_set_draw_callback\n");
+    canvas.set_draw_callback(Box::new(move |dc: &mut dyn DrawContext, w: i32, h: i32| {
+        eprintln!("DRAW_CALLBACK called: w={} h={}", w, h);
+        let _ = std::fs::write("/tmp/dim.txt", format!("{} {}\n", w, h));
+        render_grid(dc, &shared_draw, w, h);
+        // Test marker: 8x8 square of 0xFEEDBE at top-left, drawn AFTER render_grid
+        // so it appears on top of the grid background and is visible in screenshots.
+        dc.fill_rect(0.0, 0.0, 8.0, 8.0, 254.0/255.0, 237.0/255.0, 190.0/255.0, 1.0);
+    }));
+    eprintln!("PHASE: after_set_draw_callback");
+    let _ = std::fs::write("/tmp/gui_setup_phase2.txt", "after_set_draw_callback\n");
+
+    log_ui_action("gui_started", &format!("title={}", env!("CARGO_PKG_VERSION")));
+
+    win.set_child_box(&vbox);
+    // Grab focus on the formula entry BEFORE present() so the entry receives
+    // initial keyboard focus when the window is mapped.  This ensures that
+    // keystrokes from the external replayer (which detects the window during
+    // present()'s event pumping) go through the entry's CAPTURE-phase
+    // EventControllerKey, where printable characters are handled by
+    // on_formula_entry_changed and RETURN is intercepted directly.  Without
+    // this, the entry may not have focus during present(), causing keystrokes
+    // to be processed by the window-level BUBBLE handler — which can race
+    // with a later grab_focus() call and produce a mixed-flow data corruption
+    // where edit_buf gets overwritten by incomplete entry text.
+    formula_entry.grab_focus();
+    eprintln!("PHASE: about_to_present");
+    win.present();
+    eprintln!("PHASE: after_present");
+    let _ = std::fs::write("/tmp/gui_setup_phase3.txt", "after_present\n");
+
+    // Queue an explicit redraw on the toplevel window: on GTK4 with the
+    // Cairo GSK renderer, a canvas-only queue_draw may not cascade to
+    // the toplevel's frame clock.  Marking the window dirty ensures the
+    // frame clock is armed before the start_edit() canvas queue_redraw.
+    win.queue_redraw();
+
+    // Start editing at A1: grab_focus on the formula entry.
+    // The draw callback was already registered before present(),
+    // so the initial frame clock tick inside present() draws the grid.
+    //
+    // Keystrokes from the external replayer may arrive during present()'s
+    // event pumping, before start_edit() is called.  Those keystrokes
+    // processed via handle_key -> start_edit_with or handle_key ->
+    // handle_edit_key establish editing state (editing=true, edit_buf
+    // non-empty).  If we unconditionally call start_edit() here, it
+    // clears edit_buf and destroys the in-flight edit — causing
+    // OUTPUT_EXISTS=false when a subsequent RETURN commits an empty
+    // buffer.  Guard the call: if editing is already in progress with
+    // content, just grab focus and redraw without clearing.
+    if shared.editing.get() && !shared.edit_buf.borrow().is_empty() {
+        shared.formula_entry.grab_focus();
+        shared.canvas.queue_redraw();
+    } else {
+        start_edit(&shared);
+    }
+
+    // Pump events after start_edit() to ensure the frame clock processes
+    // the pending redraw (from queue_redraw/queue_draw) and the focus
+    // change (from grab_focus) BEFORE the main loop starts.  This
+    // prevents WINDOW_DRAWN=false on slow virtual displays where the
+    // frame clock timer hasn't fired yet.
+
+    // Pre-create the main loop so quit_main_loop finds a valid pointer
+    // even if the user clicks Quit during the warm-up phase below.
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+    if let Some(loader) = rustxwidgets::backends::gtk::loader() {
+        if let Some(loop_new) = loader.symbols.g_main_loop_new {
+            let early_loop = unsafe { loop_new(std::ptr::null_mut(), 0) };
+            if !early_loop.is_null() {
+                *loader.main_loop.lock().unwrap() = early_loop as usize;
             }
         }
     }
-    #[cfg(windows)]
-    {
-        let shared_k = shared.clone();
-        let shared_k2 = shared.clone();
-        formula_entry.on_key(Box::new(move |keyval: u32| -> bool {
-            shared_k2.key_counter.set(shared_k2.key_counter.get() + 1);
-            shared_k2.last_key.set(keyval);
-            // Compare the FULL keyval against the platform constants:
-            // on Unix RETURN is 0xFF0D, so masking with 0xFF (0x0D) never
-            // matched and Return in the formula entry was silently dropped.
-            if keyval == RETURN || keyval == ESCAPE {
-                handle_key(keyval, &shared_k);
-                true
-            } else {
-                false
-            }
-        }));
 
-        // WM_CHAR for Enter/Escape is consumed in the NWG adapter's _key_handler
-        // to prevent the Edit control from beeping. The on_key callback above handles
-        // WM_KEYDOWN for Enter/Escape by calling handle_key and returning true (consumed).
-    }
-
-    // Assemble layout
-    vbox.append(&formula_bar);
-    vbox.append(&canvas);
-    canvas.set_vexpand(true);
-    vbox.append(&status_label);
-
-    win.set_child(&vbox);
-    win.present();
-
-    // Queue an explicit redraw on the toplevel window: a canvas-only
-    // queue_draw may not cascade to the toplevel's frame clock.  Marking
-    // the window dirty ensures the frame clock is armed before the
-    // start_edit() canvas queue_redraw.
-    win.queue_redraw();
-
-    // Start editing at A1 immediately so typing goes into the cell
-    start_edit(&shared);
-
-    // Pump events after start_edit() so the frame clock processes the
-    // pending redraw and the focus change BEFORE the main loop starts.
-    // Prevents blank windows on slow virtual displays (Xvfb/WSL).
     rxapp.pump_events(500);
 
+    // Second safety net: queue another redraw and pump again.  Some
+    // virtual displays (WSLg, Xvfb) need multiple pump cycles before
+    // the frame clock tick is dispatched, even with all-blocking
+    // pumping inside present().
+    win.queue_redraw();
+    canvas.queue_redraw();
+    rxapp.pump_events(500);
+
+    // Final fallback: force an immediate draw directly to the GdkSurface,
+    // bypassing the frame clock entirely.  This is only needed when the
+    // frame clock timer never fires (some WSLg/Xvfb configurations with
+    // GSK_RENDERER=cairo).  The 1200x800 fallback dimensions match the
+    // window default size, used when the surface reports zero size.
+    canvas.force_draw(win.hwnd(), 1200, 800);
+
+    // Move rxapp.run() earlier — before pump_events — so the main loop
+    // pointer is available for quit_main_loop before any user interaction.
     rxapp.run()?;
     Ok(())
 }

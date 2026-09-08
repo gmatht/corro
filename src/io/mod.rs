@@ -5,10 +5,12 @@ use crate::ops::{
     append_line, apply_line, apply_log_line_to_workbook, apply_workbook_op, Op, SheetState,
     WorkbookOp, WorkbookSnapshot, WorkbookState, LOG_HEADER_PREFIX, LOG_VERSION,
 };
+#[cfg(not(target_arch = "wasm32"))]
 use notify::{RecursiveMode, Watcher};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::mpsc::Receiver;
 use thiserror::Error;
 
@@ -16,6 +18,7 @@ use thiserror::Error;
 pub enum IoError {
     #[error("I/O: {0}")]
     Io(#[from] std::io::Error),
+    #[cfg(not(target_arch = "wasm32"))]
     #[error("Notify: {0}")]
     Notify(#[from] notify::Error),
 }
@@ -78,15 +81,23 @@ fn collect_workbook_log_lines(data: &str) -> Result<Vec<(usize, String)>, std::i
 }
 
 fn ensure_log_header(path: &Path) -> Result<(), IoError> {
-    let missing_or_empty = match fs::metadata(path) {
-        Ok(meta) => meta.len() == 0,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
-        Err(err) => return Err(err.into()),
-    };
-    if missing_or_empty {
-        fs::write(path, format!("{LOG_HEADER_PREFIX} {LOG_VERSION}\n"))?;
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = path;
+        return Ok(());
     }
-    Ok(())
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let missing_or_empty = match fs::metadata(path) {
+            Ok(meta) => meta.len() == 0,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+            Err(err) => return Err(err.into()),
+        };
+        if missing_or_empty {
+            fs::write(path, format!("{LOG_HEADER_PREFIX} {LOG_VERSION}\n"))?;
+        }
+        Ok(())
+    }
 }
 
 /// Load at most `limit` log entries from disk and replay into a workbook snapshot.
@@ -483,27 +494,35 @@ pub fn tail_apply_workbook(
     workbook: &mut WorkbookState,
     active_sheet: &mut u32,
 ) -> Result<u64, IoError> {
-    let meta = fs::metadata(path)?;
-    let len = meta.len();
-    if len < byte_offset {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "file shrank; full reload required",
-        )
-        .into());
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (path, byte_offset, workbook, active_sheet);
+        return Ok(0);
     }
-    if len == byte_offset {
-        return Ok(byte_offset);
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let meta = fs::metadata(path)?;
+        let len = meta.len();
+        if len < byte_offset {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "file shrank; full reload required",
+            )
+            .into());
+        }
+        if len == byte_offset {
+            return Ok(byte_offset);
+        }
+        let mut f = fs::File::open(path)?;
+        f.seek(SeekFrom::Start(byte_offset))?;
+        let mut rest = String::new();
+        f.read_to_string(&mut rest)?;
+        let logical_lines = collect_workbook_log_lines(&rest)?;
+        for (_, line) in logical_lines {
+            apply_log_line_to_workbook(&line, workbook, active_sheet)?;
+        }
+        Ok(len)
     }
-    let mut f = fs::File::open(path)?;
-    f.seek(SeekFrom::Start(byte_offset))?;
-    let mut rest = String::new();
-    f.read_to_string(&mut rest)?;
-    let logical_lines = collect_workbook_log_lines(&rest)?;
-    for (_, line) in logical_lines {
-        apply_log_line_to_workbook(&line, workbook, active_sheet)?;
-    }
-    Ok(len)
 }
 
 // ── Tabular import ───────────────────────────────────────────────────────────
@@ -647,14 +666,16 @@ fn parse_csv_line(line: &str) -> Vec<String> {
 }
 
 /// Watches `path` for changes; poll [`LogWatcher::poll_dirty`].
+#[cfg(not(target_arch = "wasm32"))]
 pub struct LogWatcher {
     _watcher: notify::RecommendedWatcher,
     pub path: PathBuf,
     rx: Receiver<notify::Result<notify::Event>>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl LogWatcher {
-    pub fn new(path: PathBuf) -> Result<Self, notify::Error> {
+    pub fn new(path: PathBuf) -> Result<Self, IoError> {
         let (tx, rx) = std::sync::mpsc::channel();
         let mut watcher = notify::recommended_watcher(move |ev| {
             let _ = tx.send(ev);
@@ -677,6 +698,31 @@ impl LogWatcher {
             }
         }
         dirty
+    }
+}
+
+/// WASM fallback: polls file size instead of using notify.
+#[cfg(target_arch = "wasm32")]
+pub struct LogWatcher {
+    pub path: PathBuf,
+    offset: u64,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl LogWatcher {
+    pub fn new(path: PathBuf) -> Result<Self, IoError> {
+        let offset = if path.exists() {
+            std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0)
+        } else {
+            0
+        };
+        Ok(LogWatcher { path, offset })
+    }
+
+    pub fn poll_dirty(&self) -> bool {
+        std::fs::metadata(&self.path)
+            .map(|m| m.len() > self.offset)
+            .unwrap_or(false)
     }
 }
 
@@ -735,8 +781,8 @@ use crate::grid::{CellAddr, ColumnAddr};
         let path = tmp.path().to_path_buf();
         // Write header
         fs::write(&path, format!("{LOG_HEADER_PREFIX} {LOG_VERSION}\n")).unwrap();
-        let mut w = LogWatcher::new(path.clone()).unwrap();
-        let mut offset = fs::metadata(&path).unwrap().len();
+        let w = LogWatcher::new(path.clone()).unwrap();
+        let offset = fs::metadata(&path).unwrap().len();
 
         // Append a SET line as an external writer
         {
@@ -782,8 +828,8 @@ use crate::grid::{CellAddr, ColumnAddr};
         let path = tmp.path().to_path_buf();
         // Write header
         fs::write(&path, format!("{LOG_HEADER_PREFIX} {LOG_VERSION}\n")).unwrap();
-        let mut w = LogWatcher::new(path.clone()).unwrap();
-        let mut offset = fs::metadata(&path).unwrap().len();
+        let w = LogWatcher::new(path.clone()).unwrap();
+        let offset = fs::metadata(&path).unwrap().len();
 
         // Create a replacement file in same dir then rename over
         let dir = path.parent().unwrap();

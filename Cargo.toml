@@ -32,6 +32,8 @@ default = ["ratatui"]
 nightly = []
 ratatui = ["dep:ratatui", "dep:crossterm", "dep:unicode-truncate", "dep:unicode-segmentation"]
 gui = ["dep:rustxwidgets", "rustxwidgets/gtk", "dep:gtk_dynamic_loader"]
+gtk4 = ["gui", "rustxwidgets/gtk4-rs"]
+wasm = ["dep:rustxwidgets"]
 pancurses = ["rustxwidgets/pancurses"]
 gtk = ["gui"]
 combined-gui = ["gui", "pancurses"]
@@ -46,8 +48,8 @@ unicode-truncate = { version = "1", optional = true }
 crossterm = { version = "0.28", optional = true }
 unicode-segmentation = { version = "1", optional = true }
 rustxwidgets = { path = "rustxWidgets/rustxwidgets", optional = true, default-features = false }
+gtk_dynamic_loader = { path = "rustxWidgets/gtk_dynamic_loader", optional = true }
 serde = { version = "1", features = ["derive"] }
-notify = "7"
 thiserror = "2"
 zip = { version = "0.6", default-features = false, features = ["deflate"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
@@ -57,13 +59,56 @@ num-bigint = "0.4"
 num-rational = { version = "0.4", default-features = false, features = ["std", "num-bigint"] }
 num-traits = "0.2"
 num-complex = "0.4"
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+notify = "7"
 libc = "0.2"
-[target.'cfg(unix)'.dependencies]
-gtk_dynamic_loader = { path = "rustxWidgets/gtk_dynamic_loader", optional = true }
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "=0.2.122"
 
 [dev-dependencies]
 tempfile = "3"
 zip = { version = "0.6", default-features = false, features = ["deflate"] }
+
+[patch."https://github.com/gtk-rs/gtk-rs-core"]
+glib-sys = { path = "/root/tmp/gtk4-rs/generated/glib-sys-dlopen" }
+gobject-sys = { path = "/root/tmp/gtk4-rs/generated/gobject-sys-dlopen" }
+gio-sys = { path = "/root/tmp/gtk4-rs/generated/gio-sys-dlopen" }
+cairo-sys-rs = { path = "/root/tmp/gtk4-rs/generated/cairo-sys-rs-dlopen" }
+pango-sys = { path = "/root/tmp/gtk4-rs/generated/pango-sys-dlopen" }
+gdk-pixbuf-sys = { path = "/root/tmp/gtk4-rs/generated/gdk-pixbuf-sys-dlopen" }
+graphene-sys = { path = "/root/tmp/gtk4-rs/generated/graphene-sys-dlopen" }
+
+[[bin]]
+name = "render_ref"
+required-features = ["ratatui"]
+
+[[bin]]
+name = "pgo_mix_benchmark"
+required-features = ["ratatui"]
+
+[[bin]]
+name = "repro_tmp_move"
+required-features = ["ratatui"]
+
+[[bin]]
+name = "test_render"
+required-features = ["ratatui"]
+
+[[bin]]
+name = "gtk_a11y_dump"
+required-features = ["gui"]
+
+[[example]]
+name = "dump_render"
+required-features = ["ratatui"]
+
+[[example]]
+name = "render_date"
+required-features = ["ratatui"]
+
+[[example]]
+name = "test_ref"
+required-features = ["ratatui"]
 
 [profile.release]
 opt-level = "z"

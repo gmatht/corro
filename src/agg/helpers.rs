@@ -1,5 +1,5 @@
 use crate::formula::cell_effective_display;
-use crate::grid::{CellAddr, ColumnAddr, GridBox as Grid, MainRange, MARGIN_COLS};
+use crate::grid::{CellAddr, GridBox as Grid, MainRange, MARGIN_COLS};
 use crate::ops::{AggFunc, AggregateDef};
 
 // Re-exported for the always-compiled default UI (ui/mod.rs, ui_core.rs) which

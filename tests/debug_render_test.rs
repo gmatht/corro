@@ -1,7 +1,7 @@
+#![cfg(feature = "ratatui")]
+
 use std::path::PathBuf;
-use std::collections::HashMap;
 use corro::grid::{CellAddr, MARGIN_COLS, HEADER_ROWS};
-use corro::ui_core;
 
 fn main() {
     let path = PathBuf::from("test_rec5.corro");

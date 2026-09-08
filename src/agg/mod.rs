@@ -143,7 +143,7 @@ pub fn cell_display(grid: &Grid, addr: &CellAddr) -> String {
 mod tests {
     use super::*;
     use crate::grid::GridBox;
-    use crate::grid::{Grid, HEADER_ROWS, MARGIN_COLS};
+    use crate::grid::{Grid, HEADER_ROWS};
 
     #[test]
     fn sum_mean() {

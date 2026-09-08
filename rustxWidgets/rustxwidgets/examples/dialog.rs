@@ -3,17 +3,17 @@ use rustxwidgets::prelude::*;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = App::init()?;
 
-    let dialog = app.create_dialog()?;
+    let dialog = app.new_dialog()?;
     dialog.set_title("Widget Test Dialog");
     dialog.set_default_size(450, 500);
 
-    let vbox = app.create_box(
+    let mut vbox = app.new_box(
         rustxwidgets::prelude::Orientation::Vertical, 1,
     )?;
 
     // --- DropDown ---
     let dd = app.create_dropdown(&["Choice 1", "Choice 2", "Choice 3"])?;
-    dd.set_active(1);
+    dd.set_active(Some(1));
     assert_eq!(dd.get_active(), 1);
     println!("DropDown: OK (active={})", dd.get_active());
     let dd_cb = dd.clone();
@@ -49,7 +49,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     vbox.append(&rb_c);
 
     // --- Entry ---
-    let entry = app.create_entry()?;
+    let entry = app.new_entry()?;
     entry.set_text("Hello");
     assert_eq!(entry.get_text(), Some("Hello".to_string()));
     entry.set_text("World");

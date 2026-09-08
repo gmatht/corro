@@ -1,3 +1,5 @@
+#![cfg(feature = "ratatui")]
+
 use ratatui::style::{Color, Modifier};
 use std::path::PathBuf;
 

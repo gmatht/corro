@@ -1,5 +1,7 @@
 
 
+#![cfg(all(target_os = "linux", feature = "pancurses", feature = "ratatui"))]
+
 mod tmux {
     use std::process::Command;
 

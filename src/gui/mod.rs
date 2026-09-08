@@ -18,7 +18,7 @@ pub mod menu;
 pub mod render;
 pub mod sheet;
 
-#[cfg(feature = "gui")]
+#[cfg(any(feature = "gui", all(feature = "wasm", target_arch = "wasm32")))]
 mod gui_backend;
 #[cfg(all(feature = "gui", target_os = "android"))]
 mod android_backend;
@@ -211,7 +211,7 @@ impl App {
     }
 
     pub fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        #[cfg(feature = "gui")]
+        #[cfg(any(feature = "gui", all(feature = "wasm", target_arch = "wasm32")))]
         if self.backend.as_ref().map_or(true, |b| matches!(b, Backend::Gui)) {
             return gui_backend::run_gui(self);
         }

@@ -3,7 +3,7 @@
 
 pub mod prelude;
 pub mod core;
-pub use core::{Action, Align, CallbackResult, Event, MessageBoxKind, MessageBoxResult, MenuItem, Sizer, SizerChild, SizerFlags};
+pub mod common;
 pub mod spreadsheet;
 pub mod overflow;
 
@@ -19,9 +19,9 @@ pub mod backends_gtk_adapter {
     // Source is in backends_gtk4_adapter.rs
     include!("backends_gtk4_adapter.rs");
 }
-#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
+#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork"), not(feature = "gtk4-rs")))]
 mod backends_gtk_adapter_impl;
-#[cfg(all(feature = "gtk", not(feature = "pancurses"), not(feature = "zork")))]
+#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork"), not(feature = "gtk4-rs")))]
 pub mod backends_gtk_adapter;
 #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
 pub mod backends_nwg_adapter;

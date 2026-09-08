@@ -29,6 +29,50 @@ mod wasm_adapter {
         document().create_element(tag).unwrap()
     }
 
+    pub fn quit_main_loop() {
+        // On WASM there is no message loop to quit.  Signal the test
+        // framework that the app has quit, and try to close the tab.
+        if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
+            // Set document title as a signal for test frameworks
+            // that may poll for it.
+            doc.set_title("CORRO_QUIT");
+        }
+        if let Some(win) = web_sys::window() {
+            let _ = win.close();
+        }
+    }
+
+    /// Store a line of output in a JS global (`window.__corro_output`).
+    /// The browser test framework can read this variable after the app quits
+    /// to verify the recording replay output.
+    pub fn append_wasm_output_line(line: &str) {
+        if let Some(win) = web_sys::window() {
+            let js_val = wasm_bindgen::JsValue::from_str(line);
+            let _ = js_sys::Reflect::set(
+                &win,
+                &wasm_bindgen::JsValue::from_str("__corro_output_dirty"),
+                &wasm_bindgen::JsValue::TRUE,
+            );
+            let current = js_sys::Reflect::get(
+                &win,
+                &wasm_bindgen::JsValue::from_str("__corro_output"),
+            )
+            .ok()
+            .and_then(|v| v.as_string())
+            .unwrap_or_default();
+            let new = if current.is_empty() {
+                line.to_string()
+            } else {
+                format!("{}\n{}", current, line)
+            };
+            let _ = js_sys::Reflect::set(
+                &win,
+                &wasm_bindgen::JsValue::from_str("__corro_output"),
+                &wasm_bindgen::JsValue::from_str(&new),
+            );
+        }
+    }
+
     fn set_css(elem: &Element, prop: &str, val: &str) {
         if let Some(html) = elem.dyn_ref::<HtmlElement>() {
             html.style().set_property(prop, val).ok();
@@ -91,11 +135,23 @@ mod wasm_adapter {
     // -----------------------------------------------------------------------
     // Window
     // -----------------------------------------------------------------------
-    pub struct Window {
-        elem: HtmlDivElement,
-    }
+pub struct Window {
+    elem: HtmlDivElement,
+    event_key_cb: Rc<RefCell<Option<Box<dyn FnMut(u32, u32) -> i32>>>>,
+    closures: Rc<RefCell<Vec<Box<dyn Any>>>>,
+}
 
-    impl AsElement for Window {
+impl Clone for Window {
+    fn clone(&self) -> Self {
+        Window {
+            elem: self.elem.clone(),
+            event_key_cb: self.event_key_cb.clone(),
+            closures: self.closures.clone(),
+        }
+    }
+}
+
+impl AsElement for Window {
         fn as_element(&self) -> &Element {
             self.elem.as_ref()
         }
@@ -107,10 +163,16 @@ mod wasm_adapter {
         }
     }
 
-    impl Window {
-        pub fn set_title(&self, title: &str) {
-            document().set_title(title);
+    impl AsRef<*mut c_void> for Window {
+        fn as_ref(&self) -> &*mut c_void {
+            unsafe { &*(&self.raw_handle() as *const *mut c_void) }
         }
+    }
+
+impl Window {
+    pub fn set_title(&self, title: &str) {
+        self.elem.set_text_content(Some(title));
+    }
 
         pub fn set_child(&self, child: &impl AsElement) {
             while let Some(c) = self.elem.first_child() {
@@ -132,6 +194,34 @@ mod wasm_adapter {
 
         /// # Safety – kept for API compatibility; no‑op on WASM.
         pub unsafe fn insert_action_group(&self, _name: &str, _group_ptr: *mut c_void) {}
+        pub fn on_event(&self, _cb: Box<dyn FnMut(*mut c_void) -> i32>) {}
+        pub fn on_close(&self, _cb: Box<dyn FnMut()>) {}
+        pub fn queue_redraw(&self) {}
+        pub fn on_event_key(&self, mut cb: Box<dyn FnMut(u32, u32) -> i32>) {
+            *self.event_key_cb.borrow_mut() = Some(cb);
+            let cb2 = self.event_key_cb.clone();
+            let closure = Closure::<dyn FnMut(KeyboardEvent)>::new(move |evt: KeyboardEvent| {
+                let keyval = evt.key_code() as u32;
+                let mut state = 0u32;
+                if evt.alt_key() {
+                    state |= 0x8; // GDK_MOD1_MASK / ALT
+                }
+                if let Some(cb) = cb2.borrow_mut().as_mut() {
+                    if cb(keyval, state) != 0 {
+                        evt.prevent_default();
+                    }
+                }
+            });
+            let listener = wasm_bindgen::JsCast::unchecked_into::<js_sys::Function>(
+                closure.as_ref().clone(),
+            );
+            web_sys::window()
+                .and_then(|w| w.document())
+                .map(|doc| {
+                    doc.add_event_listener_with_callback("keydown", &listener).ok();
+                });
+            self.closures.borrow_mut().push(Box::new(closure));
+        }
     }
 
     pub fn create_window() -> Result<Window, Error> {
@@ -142,7 +232,11 @@ mod wasm_adapter {
         body().append_child(div.as_ref()).map_err(|e| {
             Error::Backend(format!("create_window append: {:?}", e))
         })?;
-        Ok(Window { elem: div })
+        Ok(Window {
+            elem: div,
+            event_key_cb: Rc::new(RefCell::new(None)),
+            closures: Rc::new(RefCell::new(Vec::new())),
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -231,6 +325,18 @@ mod wasm_adapter {
         }
     }
 
+    impl Widget for Label {
+        fn raw_handle(&self) -> *mut c_void {
+            &self.elem as *const Element as *mut c_void
+        }
+    }
+
+    impl AsRef<*mut c_void> for Label {
+        fn as_ref(&self) -> &*mut c_void {
+            unsafe { &*(&self.raw_handle() as *const *mut c_void) }
+        }
+    }
+
     impl Label {
         pub fn set_text(&self, text: &str) {
             self.elem.set_text_content(Some(text));
@@ -285,11 +391,17 @@ mod wasm_adapter {
     // -----------------------------------------------------------------------
     // BoxWidget
     // -----------------------------------------------------------------------
-    pub struct BoxWidget {
-        elem: HtmlDivElement,
-    }
+pub struct BoxWidget {
+    elem: HtmlDivElement,
+}
 
-    impl AsElement for BoxWidget {
+impl Clone for BoxWidget {
+    fn clone(&self) -> Self {
+        BoxWidget { elem: self.elem.clone() }
+    }
+}
+
+impl AsElement for BoxWidget {
         fn as_element(&self) -> &Element {
             self.elem.as_ref()
         }
@@ -301,9 +413,45 @@ mod wasm_adapter {
         }
     }
 
+    impl AsRef<*mut c_void> for BoxWidget {
+        fn as_ref(&self) -> &*mut c_void {
+            unsafe { &*(&self.raw_handle() as *const *mut c_void) }
+        }
+    }
+
+    fn as_element_from_ptr(ptr: *mut c_void) -> &'static Element {
+        unsafe { &*(ptr as *const Element) }
+    }
+
+    fn as_html_element(ptr: *mut c_void) -> Option<&'static HtmlElement> {
+        unsafe { (*(ptr as *const Element)).dyn_ref::<HtmlElement>() }
+    }
+
     impl BoxWidget {
-        pub fn append(&self, child: &impl AsElement) {
-            self.elem.append_child(child.as_element()).ok();
+        pub fn append(&self, child: &impl AsRef<*mut c_void>) {
+            self.elem.append_child(as_element_from_ptr(*child.as_ref())).ok();
+        }
+
+        pub fn set_child_vexpand(&self, child: &impl AsRef<*mut c_void>, expand: bool) {
+            if let Some(html) = as_html_element(*child.as_ref()) {
+                if expand {
+                    html.style().set_property("flex-grow", "1").ok();
+                    html.style().set_property("align-self", "stretch").ok();
+                } else {
+                    html.style().set_property("flex-grow", "0").ok();
+                }
+            }
+        }
+
+        pub fn set_child_hexpand(&self, child: &impl AsRef<*mut c_void>, expand: bool) {
+            if let Some(html) = as_html_element(*child.as_ref()) {
+                if expand {
+                    html.style().set_property("align-self", "stretch").ok();
+                }
+            }
+        }
+
+        pub fn set_hexpand(&self, _expand: bool) {
         }
     }
 
@@ -373,6 +521,7 @@ mod wasm_adapter {
     // -----------------------------------------------------------------------
     pub struct Entry {
         elem: HtmlInputElement,
+        key_cb: Rc<RefCell<Option<Box<dyn FnMut(u32, u32) -> bool>>>>,
         closures: Rc<RefCell<Vec<Box<dyn Any>>>>,
         next_id: Rc<RefCell<u64>>,
     }
@@ -393,9 +542,16 @@ mod wasm_adapter {
         fn clone(&self) -> Self {
             Entry {
                 elem: self.elem.clone(),
+                key_cb: self.key_cb.clone(),
                 closures: self.closures.clone(),
                 next_id: self.next_id.clone(),
             }
+        }
+    }
+
+    impl AsRef<*mut c_void> for Entry {
+        fn as_ref(&self) -> &*mut c_void {
+            unsafe { &*(&self.raw_handle() as *const *mut c_void) }
         }
     }
 
@@ -419,6 +575,9 @@ mod wasm_adapter {
             if h > 0 {
                 set_css(self.elem.as_ref(), "height", &format!("{}px", h));
             }
+        }
+
+        pub fn set_hexpand(&self, _expand: bool) {
         }
 
         pub fn connect_changed(&self, f: impl FnMut() + 'static) -> Result<u64, Error> {
@@ -484,6 +643,22 @@ mod wasm_adapter {
             let _ = self.elem.focus();
         }
 
+        pub fn on_key_raw(&self, cb: Box<dyn FnMut(u32, u32) -> bool>) {
+            *self.key_cb.borrow_mut() = Some(cb);
+            let cb2 = self.key_cb.clone();
+            let closure = Closure::<dyn FnMut(KeyboardEvent)>::new(move |evt: KeyboardEvent| {
+                if let Some(ref mut f) = *cb2.borrow_mut() {
+                    if f(evt.key_code(), 0) {
+                        evt.prevent_default();
+                    }
+                }
+            });
+            self.elem
+                .add_event_listener_with_callback("keydown", closure.as_ref().unchecked_ref())
+                .ok();
+            store_closure(Box::new(closure));
+        }
+
         pub fn connect_focus_in_event<F: FnMut(*mut c_void) -> i32 + 'static>(
             &self,
             f: F,
@@ -528,6 +703,7 @@ mod wasm_adapter {
         elem.set_type("text");
         Ok(Entry {
             elem,
+            key_cb: Rc::new(RefCell::new(None)),
             closures: Rc::new(RefCell::new(Vec::new())),
             next_id: Rc::new(RefCell::new(1)),
         })
@@ -542,11 +718,12 @@ mod wasm_adapter {
         Submenu { label: String, items: Vec<MenuItem> },
     }
 
-    pub struct Menu {
-        items: Vec<MenuItem>,
-    }
+#[derive(Clone)]
+pub struct Menu {
+    items: Vec<MenuItem>,
+}
 
-    impl Menu {
+impl Menu {
         pub fn append(&mut self, label: &str, detailed_action: &str) {
             let action = detailed_action
                 .split('(')
@@ -571,11 +748,17 @@ mod wasm_adapter {
         Ok(Menu { items: Vec::new() })
     }
 
-    pub struct MenuBar {
-        elem: HtmlDivElement,
-    }
+pub struct MenuBar {
+    elem: HtmlDivElement,
+}
 
-    impl AsElement for MenuBar {
+impl Clone for MenuBar {
+    fn clone(&self) -> Self {
+        MenuBar { elem: self.elem.clone() }
+    }
+}
+
+impl AsElement for MenuBar {
         fn as_element(&self) -> &Element {
             self.elem.as_ref()
         }
@@ -586,6 +769,19 @@ mod wasm_adapter {
             &self.elem as *const HtmlDivElement as *mut c_void
         }
     }
+
+    impl AsRef<*mut c_void> for MenuBar {
+        fn as_ref(&self) -> &*mut c_void {
+            unsafe { &*(&self.raw_handle() as *const *mut c_void) }
+        }
+    }
+
+     impl MenuBar {
+         pub fn handle_mnemonic_key(&self, _keyval: u32) -> bool { false }
+         pub fn handle_menu_key(&self, _keyval: u32, _mod: u32) -> bool { false }
+         pub fn menu_active(&self) -> bool { false }
+         pub fn menu_close(&self) {}
+     }
 
     pub fn create_menubar(model: &Menu, _action_group: *mut c_void) -> Result<MenuBar, Error> {
         let bar: HtmlDivElement = create_element("div").dyn_into().map_err(|e| {
@@ -694,11 +890,12 @@ mod wasm_adapter {
         Ok(MenuBar { elem: bar })
     }
 
-    pub struct SimpleAction {
-        name: String,
-    }
+#[derive(Clone)]
+pub struct SimpleAction {
+    name: String,
+}
 
-    impl SimpleAction {
+impl SimpleAction {
         pub fn connect_activate<F: FnMut(*mut c_void) + 'static>(
             &self,
             f: F,
@@ -732,6 +929,12 @@ mod wasm_adapter {
     impl Widget for Dialog {
         fn raw_handle(&self) -> *mut c_void {
             &self.elem as *const HtmlDialogElement as *mut c_void
+        }
+    }
+
+    impl AsRef<*mut c_void> for Dialog {
+        fn as_ref(&self) -> &*mut c_void {
+            unsafe { &*(&self.raw_handle() as *const *mut c_void) }
         }
     }
 
@@ -771,12 +974,12 @@ mod wasm_adapter {
             &self.content_area as *const HtmlDivElement as *mut c_void
         }
 
-        pub fn append_content_area(&self, child: &impl AsElement) {
-            self.content_area.append_child(child.as_element()).ok();
+        pub fn append_content_area(&self, child: &impl AsRef<*mut c_void>) {
+            self.content_area.append_child(as_element_from_ptr(*child.as_ref())).ok();
         }
 
         pub fn present(&self) {
-            let _ = self.elem.show_modal();
+            let _ = self.elem.show();
         }
 
         pub fn connect_response<F: FnMut(i32) + 'static>(&self, f: F) -> Result<u64, Error> {
@@ -1119,6 +1322,376 @@ mod wasm_adapter {
             closures: Rc::new(RefCell::new(Vec::new())),
             next_id: Rc::new(RefCell::new(1)),
         })
+    }
+
+    // -----------------------------------------------------------------------
+    // DrawContext (Canvas 2D)
+    // -----------------------------------------------------------------------
+    pub struct WasmDrawContext {
+        ctx: web_sys::CanvasRenderingContext2d,
+    }
+
+    impl WasmDrawContext {
+        fn set_font(&self, font: &str, size: f64, slant: i32, weight: i32) {
+            let weight_str = if weight != 0 { "bold" } else { "" };
+            let slant_str = if slant != 0 { "italic " } else { "" };
+            let size_str = format!("{}px", size);
+            let f = format!("{}{} {} {}", slant_str, weight_str, size_str, font);
+            let _ = self.ctx.set_font(&f);
+        }
+
+        fn rgba(r: f64, g: f64, b: f64, a: f64) -> String {
+            format!("rgba({},{},{},{})", (r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8, a)
+        }
+    }
+
+    impl crate::core::DrawContext for WasmDrawContext {
+        fn fill_rect(&mut self, x: f64, y: f64, w: f64, h: f64, r: f64, g: f64, b: f64, a: f64) {
+            let _ = self.ctx.set_fill_style_str(&Self::rgba(r, g, b, a));
+            self.ctx.fill_rect(x, y, w, h);
+        }
+
+        fn stroke_rect(&mut self, x: f64, y: f64, w: f64, h: f64, r: f64, g: f64, b: f64, a: f64, lw: f64) {
+            let _ = self.ctx.set_stroke_style_str(&Self::rgba(r, g, b, a));
+            self.ctx.set_line_width(lw);
+            self.ctx.stroke_rect(x, y, w, h);
+        }
+
+        fn draw_text_styled(&mut self, x: f64, y: f64, text: &str, font: &str, size: f64,
+                            r: f64, g: f64, b: f64, a: f64, slant: i32, weight: i32) {
+            self.set_font(font, size, slant, weight);
+            let _ = self.ctx.set_fill_style_str(&Self::rgba(r, g, b, a));
+            let _ = self.ctx.fill_text(text, x, y);
+        }
+
+        fn text_extents_styled(&self, text: &str, font: &str, size: f64, slant: i32, weight: i32) -> (f64, f64, f64, f64) {
+            let weight_str = if weight != 0 { "bold" } else { "" };
+            let slant_str = if slant != 0 { "italic " } else { "" };
+            let size_str = format!("{}px", size);
+            let f = format!("{}{} {} {}", slant_str, weight_str, size_str, font);
+            self.ctx.save();
+            let _ = self.ctx.set_font(&f);
+            let metrics = self.ctx.measure_text(text).expect("measure_text failed");
+            self.ctx.restore();
+            let w = metrics.width();
+            let xb = -metrics.actual_bounding_box_left();
+            let yb = -metrics.actual_bounding_box_ascent();
+            let h = metrics.actual_bounding_box_ascent() + metrics.actual_bounding_box_descent();
+            (xb, yb, w, h)
+        }
+
+        fn clear(&mut self, r: f64, g: f64, b: f64, a: f64) {
+            let _ = self.ctx.set_fill_style_str(&Self::rgba(r, g, b, a));
+            let canvas = self.ctx.canvas().unwrap();
+            let w = canvas.width() as f64;
+            let h = canvas.height() as f64;
+            self.ctx.fill_rect(0.0, 0.0, w, h);
+        }
+
+        fn save(&mut self) { self.ctx.save(); }
+        fn restore(&mut self) { self.ctx.restore(); }
+
+        fn clip(&mut self, x: f64, y: f64, w: f64, h: f64) {
+            self.ctx.begin_path();
+            self.ctx.rect(x, y, w, h);
+            self.ctx.clip();
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Canvas
+    // -----------------------------------------------------------------------
+    pub struct Canvas {
+        elem: HtmlCanvasElement,
+        draw_cb: Rc<RefCell<Option<Box<dyn FnMut(&mut dyn crate::core::DrawContext, i32, i32)>>>>,
+        click_cb: Rc<RefCell<Option<Box<dyn FnMut(f64, f64)>>>>,
+        key_cb: Rc<RefCell<Option<Box<dyn FnMut(u32) -> bool>>>>,
+        closures: Rc<RefCell<Vec<Box<dyn Any>>>>,
+    }
+
+    impl AsElement for Canvas {
+        fn as_element(&self) -> &Element {
+            self.elem.as_ref()
+        }
+    }
+
+    impl Widget for Canvas {
+        fn raw_handle(&self) -> *mut c_void {
+            &self.elem as *const HtmlCanvasElement as *mut c_void
+        }
+    }
+
+    impl AsRef<*mut c_void> for Canvas {
+        fn as_ref(&self) -> &*mut c_void {
+            unsafe { &*(&self.raw_handle() as *const *mut c_void) }
+        }
+    }
+
+    impl Clone for Canvas {
+        fn clone(&self) -> Self {
+            Canvas {
+                elem: self.elem.clone(),
+                draw_cb: self.draw_cb.clone(),
+                click_cb: self.click_cb.clone(),
+                key_cb: self.key_cb.clone(),
+                closures: self.closures.clone(),
+            }
+        }
+    }
+
+    impl Canvas {
+        pub fn set_draw_callback(&self, cb: Box<dyn FnMut(&mut dyn crate::core::DrawContext, i32, i32)>) {
+            *self.draw_cb.borrow_mut() = Some(cb);
+            self.queue_redraw();
+        }
+
+        pub fn queue_redraw(&self) {
+            if let Some(ref mut draw_fn) = *self.draw_cb.borrow_mut() {
+                let ctx = self.elem.get_context("2d")
+                    .ok().flatten()
+                    .and_then(|o| o.dyn_into::<web_sys::CanvasRenderingContext2d>().ok());
+                if let Some(ctx) = ctx {
+                    let w = self.elem.width() as i32;
+                    let h = self.elem.height() as i32;
+                    let mut dc = WasmDrawContext { ctx };
+                    draw_fn(&mut dc, w, h);
+                }
+            }
+        }
+
+        pub fn set_size_request(&self, w: i32, h: i32) {
+            if w > 0 { self.elem.set_width(w as u32); }
+            if h > 0 { self.elem.set_height(h as u32); }
+            set_css(self.elem.as_ref(), "width", &format!("{}px", w));
+            set_css(self.elem.as_ref(), "height", &format!("{}px", h));
+        }
+
+        pub fn set_content_size(&self, w: i32, h: i32) {
+            self.elem.set_width(w as u32);
+            self.elem.set_height(h as u32);
+        }
+
+        pub fn on_click(&self, cb: Box<dyn FnMut(f64, f64)>) {
+            *self.click_cb.borrow_mut() = Some(cb);
+            let cb2 = self.click_cb.clone();
+            let closure = Closure::<dyn FnMut(MouseEvent)>::new(move |evt: MouseEvent| {
+                if let Some(ref mut f) = *cb2.borrow_mut() {
+                    f(evt.offset_x() as f64, evt.offset_y() as f64);
+                }
+            });
+            self.elem
+                .add_event_listener_with_callback("mousedown", closure.as_ref().unchecked_ref())
+                .ok();
+            store_closure(Box::new(closure));
+        }
+
+        pub fn on_key(&self, cb: Box<dyn FnMut(u32) -> bool>) {
+            *self.key_cb.borrow_mut() = Some(cb);
+            let cb2 = self.key_cb.clone();
+            let closure = Closure::<dyn FnMut(KeyboardEvent)>::new(move |evt: KeyboardEvent| {
+                if let Some(ref mut f) = *cb2.borrow_mut() {
+                    if f(evt.key_code()) {
+                        evt.prevent_default();
+                    }
+                }
+            });
+            self.elem
+                .add_event_listener_with_callback("keydown", closure.as_ref().unchecked_ref())
+                .ok();
+            store_closure(Box::new(closure));
+            // Make canvas focusable
+            self.elem.set_tab_index(0);
+        }
+        pub fn on_key_raw(&self, cb: Box<dyn FnMut(u32, u32) -> bool>) {
+            let mut cb = cb;
+            self.on_key(Box::new(move |k: u32| -> bool { cb(k, 0) }));
+        }
+        pub fn grab_focus(&self) {
+            let _ = self.elem.focus();
+        }
+        pub fn set_can_focus(&self, _can: bool) {}
+        pub fn force_draw(&self, _window_ptr: *mut c_void, _fallback_w: i32, _fallback_h: i32) {}
+    }
+
+    pub fn create_canvas() -> Result<Canvas, Error> {
+        let elem: HtmlCanvasElement = create_element("canvas").dyn_into().map_err(|e| {
+            Error::Backend(format!("create_canvas: {:?}", e))
+        })?;
+        let ctx = elem.get_context("2d")
+            .ok().flatten()
+            .and_then(|o| o.dyn_into::<web_sys::CanvasRenderingContext2d>().ok())
+            .ok_or_else(|| Error::Backend("getContext('2d') failed".into()))?;
+        // Use default font that will be overridden per draw call
+        let _ = ctx.set_font("12px monospace");
+        Ok(Canvas {
+            elem,
+            draw_cb: Rc::new(RefCell::new(None)),
+            click_cb: Rc::new(RefCell::new(None)),
+            key_cb: Rc::new(RefCell::new(None)),
+            closures: Rc::new(RefCell::new(Vec::new())),
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Overlay (stacking container using position:relative + absolute overlays)
+    // -----------------------------------------------------------------------
+    pub struct Overlay {
+        elem: HtmlDivElement,
+        children: Rc<RefCell<Vec<Element>>>,
+    }
+
+    impl AsElement for Overlay {
+        fn as_element(&self) -> &Element {
+            self.elem.as_ref()
+        }
+    }
+
+    impl Widget for Overlay {
+        fn raw_handle(&self) -> *mut c_void {
+            &self.elem as *const HtmlDivElement as *mut c_void
+        }
+    }
+
+    impl Clone for Overlay {
+        fn clone(&self) -> Self {
+            Overlay {
+                elem: self.elem.clone(),
+                children: self.children.clone(),
+            }
+        }
+    }
+
+    impl Overlay {
+        pub fn set_child(&self, child: &impl AsElement) {
+            while let Some(c) = self.elem.first_child() {
+                self.elem.remove_child(&c).ok();
+            }
+            self.children.borrow_mut().clear();
+            self.children.borrow_mut().push(child.as_element().clone());
+            self.elem.append_child(child.as_element()).ok();
+        }
+
+        pub fn add_overlay(&self, child: &impl AsElement) {
+            self.children.borrow_mut().push(child.as_element().clone());
+            set_css(child.as_element(), "position", "absolute");
+            set_css(child.as_element(), "z-index", "10");
+            self.elem.append_child(child.as_element()).ok();
+        }
+
+        pub fn set_overlay_pass_through(&self, child: &impl AsElement, pass: bool) {
+            if pass {
+                set_css(child.as_element(), "pointer-events", "none");
+            } else {
+                set_css(child.as_element(), "pointer-events", "auto");
+            }
+        }
+
+        pub fn remove(&self, child: &impl AsElement) {
+            self.elem.remove_child(child.as_element()).ok();
+            self.children.borrow_mut().retain(|c| c != child.as_element());
+        }
+
+        pub fn show_all(&self) {
+            for c in self.children.borrow().iter() {
+                if let Some(html) = c.dyn_ref::<HtmlElement>() {
+                    html.style().set_property("display", "").ok();
+                }
+            }
+        }
+
+        pub fn set_size_request(&self, w: i32, h: i32) {
+            if w > 0 { set_css(self.elem.as_ref(), "width", &format!("{}px", w)); }
+            if h > 0 { set_css(self.elem.as_ref(), "height", &format!("{}px", h)); }
+        }
+
+        pub fn set_vexpand(&self, expand: bool) {
+            if expand {
+                set_css(self.elem.as_ref(), "flex-grow", "1");
+            } else {
+                set_css(self.elem.as_ref(), "flex-grow", "0");
+            }
+        }
+
+        pub fn set_hexpand(&self, expand: bool) {
+            if expand {
+                set_css(self.elem.as_ref(), "align-self", "stretch");
+            }
+        }
+    }
+
+    pub fn create_overlay() -> Result<Overlay, Error> {
+        let div: HtmlDivElement = create_element("div").dyn_into().map_err(|e| {
+            Error::Backend(format!("create_overlay: {:?}", e))
+        })?;
+        set_css(div.as_ref(), "position", "relative");
+        div.style().set_property("overflow", "hidden").ok();
+        Ok(Overlay {
+            elem: div,
+            children: Rc::new(RefCell::new(Vec::new())),
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // ScrolledWindow
+    // -----------------------------------------------------------------------
+    pub struct ScrolledWindow {
+        elem: HtmlDivElement,
+    }
+
+    impl AsElement for ScrolledWindow {
+        fn as_element(&self) -> &Element {
+            self.elem.as_ref()
+        }
+    }
+
+    impl Widget for ScrolledWindow {
+        fn raw_handle(&self) -> *mut c_void {
+            &self.elem as *const HtmlDivElement as *mut c_void
+        }
+    }
+
+    impl Clone for ScrolledWindow {
+        fn clone(&self) -> Self {
+            ScrolledWindow { elem: self.elem.clone() }
+        }
+    }
+
+    impl ScrolledWindow {
+        pub fn set_policy(&self, hscroll: i32, vscroll: i32) {
+            let h = match hscroll { 0 => "hidden", 1 => "scroll", _ => "auto" };
+            let v = match vscroll { 0 => "hidden", 1 => "scroll", _ => "auto" };
+            self.elem.style().set_property("overflow-x", h).ok();
+            self.elem.style().set_property("overflow-y", v).ok();
+        }
+
+        pub fn set_child(&self, child: &impl AsElement) {
+            while let Some(c) = self.elem.first_child() {
+                self.elem.remove_child(&c).ok();
+            }
+            self.elem.append_child(child.as_element()).ok();
+        }
+
+        pub fn set_vexpand(&self, expand: bool) {
+            if expand {
+                set_css(self.elem.as_ref(), "flex-grow", "1");
+                set_css(self.elem.as_ref(), "align-self", "stretch");
+            }
+        }
+
+        pub fn set_hexpand(&self, expand: bool) {
+            if expand {
+                set_css(self.elem.as_ref(), "align-self", "stretch");
+            }
+        }
+    }
+
+    pub fn create_scrolled_window() -> Result<ScrolledWindow, Error> {
+        let div: HtmlDivElement = create_element("div").dyn_into().map_err(|e| {
+            Error::Backend(format!("create_scrolled_window: {:?}", e))
+        })?;
+        div.style().set_property("overflow", "auto").ok();
+        div.style().set_property("position", "relative").ok();
+        Ok(ScrolledWindow { elem: div })
     }
 }
 

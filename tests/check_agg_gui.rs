@@ -1,6 +1,7 @@
-#![cfg(feature = "gui")]
+#![cfg(any(feature = "gui", feature = "pancurses", target_arch = "wasm32"))]
+
 use corro::grid::{
-    CellAddr, ColumnAddr, Grid, GridBox, SheetCursor, HEADER_ROWS, MARGIN_COLS, FOOTER_ROWS,
+    CellAddr, ColumnAddr, Grid, GridBox, SheetCursor, HEADER_ROWS, MARGIN_COLS,
 };
 use corro::gui::compute::{self, CellDisplayStyle, right_col_agg};
 use corro::gui::render::CellSink;
@@ -158,6 +159,8 @@ fn test_full_agg_pipeline() {
     raw.set(&CellAddr::Main { row: 3, col: 1 }, "54.5".into());
     raw.set(&CellAddr::Main { row: 4, col: 0 }, "3".into());
     raw.set(&CellAddr::Main { row: 4, col: 1 }, "109".into());
+    raw.set(&CellAddr::Main { row: 5, col: 0 }, "7".into());
+    raw.set(&CellAddr::Main { row: 5, col: 1 }, "8".into());
     raw.set(&CellAddr::Main { row: 6, col: 0 }, "1".into());
     raw.set(&CellAddr::Main { row: 6, col: 1 }, "2".into());
 
@@ -169,7 +172,7 @@ fn test_full_agg_pipeline() {
     // Footer cell to trigger footer row visibility
     raw.set(&CellAddr::Footer { row: 0, col: ColumnAddr::Main(0) }, "footer".into());
 
-    let mut state = SheetState::from_grid(raw);
+    let state = SheetState::from_grid(raw);
     let gb: &GridBox = &state.grid;
     let hr = HEADER_ROWS;
     let mr = gb.main_rows();

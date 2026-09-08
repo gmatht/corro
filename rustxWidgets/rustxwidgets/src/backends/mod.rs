@@ -9,6 +9,16 @@ pub trait BackendApp {
     fn run(self: Box<Self>) -> Result<(), BackendError>;
 }
 
+/// Priority chain: each backend module is always compiled when its feature is on,
+/// but `init` is re-exported only for the highest-priority backend available.
+/// Platform-specific backends (gtk, nwg, wasm, android) naturally exclude each
+/// other. Pancurses is a fallback when no platform-native backend applies.
+///
+/// At runtime, `BACKEND` env var selects between compiled backends:
+///   BACKEND=gtk4     uses the new gtk4-rs/dlopen backend
+///   BACKEND=gtk3     uses the old gtk_dynamic_loader backend (GTK3/GTK4)
+///   (unset)          defaults to gtk4-rs if available, otherwise gtk3
+
 #[cfg(all(feature = "gtk4-rs", target_os = "linux", not(feature = "zork")))]
 pub mod gtk4_rs;
 #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]

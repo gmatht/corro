@@ -41,6 +41,14 @@ mod pancurses_adapter {
         pub fn insert_action_group(&self, _name: &str, _group_ptr: *mut c_void) {}
 
         pub fn set_default_size(&self, _width: i32, _height: i32) {}
+
+        pub fn hwnd(&self) -> *mut c_void {
+            std::ptr::null_mut()
+        }
+        pub fn on_event(&self, _cb: Box<dyn FnMut(*mut c_void) -> i32>) {}
+        pub fn on_event_key(&self, _cb: Box<dyn FnMut(u32, u32) -> i32>) {}
+        pub fn on_close(&self, _cb: Box<dyn FnMut()>) {}
+        pub fn queue_redraw(&self) {}
     }
 
     // -- Button --
@@ -202,6 +210,18 @@ mod pancurses_adapter {
         }
     }
 
+        pub fn set_halign(&self, _align: i32) {}
+        pub fn set_valign(&self, _align: i32) {}
+        pub fn set_visible(&self, _visible: bool) {}
+        pub fn set_size_request(&self, _w: i32, _h: i32) {}
+        pub fn set_width_chars(&self, _w: i32) {}
+        pub fn set_margin_start(&self, _margin: i32) {}
+        pub fn set_margin_top(&self, _margin: i32) {}
+        pub fn add_class(&self, _class_name: &str) {}
+        pub fn remove_class(&self, _class_name: &str) {}
+        pub fn grab_focus(&self) {}
+        pub fn on_key_raw(&self, _cb: Box<dyn FnMut(u32, u32) -> bool>) {}
+
     // -- Standard dialogs (wxMessageBox / wxFileDialog) --
 
     pub fn message_box(
@@ -316,6 +336,13 @@ mod pancurses_adapter {
         fn as_ref(&self) -> &*mut c_void {
             unsafe { &*(&self.id as *const usize as *const *mut c_void) }
         }
+    }
+
+    impl MenuBar {
+        pub fn handle_mnemonic_key(&self, _keyval: u32) -> bool { false }
+        pub fn handle_menu_key(&self, _keyval: u32, _mod: u32) -> bool { false }
+        pub fn menu_active(&self) -> bool { false }
+        pub fn menu_close(&self) {}
     }
 
     // -- SimpleAction --
@@ -540,6 +567,118 @@ mod pancurses_adapter {
             &self.id as *const usize as *mut c_void
         }
     }
+
+    // -- Canvas --
+
+    pub struct Canvas {
+        pub(crate) id: usize,
+    }
+
+    impl Clone for Canvas {
+        fn clone(&self) -> Self { Canvas { id: self.id } }
+    }
+
+    impl AsRef<*mut c_void> for Canvas {
+        fn as_ref(&self) -> &*mut c_void {
+            unsafe { &*(&self.id as *const usize as *const *mut c_void) }
+        }
+    }
+
+    impl Widget for Canvas {
+        fn raw_handle(&self) -> *mut c_void {
+            &self.id as *const usize as *mut c_void
+        }
+    }
+
+    impl Canvas {
+        pub fn set_size_request(&self, _w: i32, _h: i32) {}
+        pub fn set_content_size(&self, _w: i32, _h: i32) {}
+        pub fn queue_redraw(&self) {}
+        pub fn set_draw_callback(&self, _cb: Box<dyn FnMut(&mut dyn crate::core::DrawContext, i32, i32)>) {}
+        pub fn on_click(&self, _cb: Box<dyn FnMut(f64, f64)>) {}
+        pub fn on_key(&self, _cb: Box<dyn FnMut(u32) -> bool>) {}
+        pub fn on_key_raw(&self, _cb: Box<dyn FnMut(u32, u32) -> bool>) {}
+        pub fn grab_focus(&self) {}
+        pub fn set_can_focus(&self, _can: bool) {}
+        pub fn force_draw(&self, _window_ptr: *mut c_void, _fallback_w: i32, _fallback_h: i32) {}
+    }
+
+    // -- Overlay --
+
+    pub struct Overlay {
+        pub(crate) id: usize,
+    }
+
+    impl Clone for Overlay {
+        fn clone(&self) -> Self { Overlay { id: self.id } }
+    }
+
+    impl AsRef<*mut c_void> for Overlay {
+        fn as_ref(&self) -> &*mut c_void {
+            unsafe { &*(&self.id as *const usize as *const *mut c_void) }
+        }
+    }
+
+    impl Widget for Overlay {
+        fn raw_handle(&self) -> *mut c_void {
+            &self.id as *const usize as *mut c_void
+        }
+    }
+
+    impl Overlay {
+        pub fn set_child(&self, child: &impl AsRef<*mut c_void>) {
+            let child_ptr = *child.as_ref();
+            let child_id = child_ptr as usize;
+            crate::backends::pancurses::set_child(self.id, child_id);
+        }
+        pub fn add_overlay(&self, child: &impl AsRef<*mut c_void>) {
+            let child_ptr = *child.as_ref();
+            let child_id = child_ptr as usize;
+            crate::backends::pancurses::set_child(self.id, child_id);
+        }
+        pub fn set_overlay_pass_through(&self, _child: &impl AsRef<*mut c_void>, _pass: bool) {}
+        pub fn remove(&self, _child: &impl AsRef<*mut c_void>) {}
+        pub fn show_all(&self) {}
+        pub fn set_size_request(&self, _w: i32, _h: i32) {}
+    }
+
+    // -- ScrolledWindow --
+
+    pub struct ScrolledWindow {
+        pub(crate) id: usize,
+    }
+
+    impl AsRef<*mut c_void> for ScrolledWindow {
+        fn as_ref(&self) -> &*mut c_void {
+            unsafe { &*(&self.id as *const usize as *const *mut c_void) }
+        }
+    }
+
+    impl Widget for ScrolledWindow {
+        fn raw_handle(&self) -> *mut c_void {
+            &self.id as *const usize as *mut c_void
+        }
+    }
+
+    impl ScrolledWindow {
+        pub fn set_child(&self, child: &impl AsRef<*mut c_void>) {
+            let child_ptr = *child.as_ref();
+            let child_id = child_ptr as usize;
+            crate::backends::pancurses::set_child(self.id, child_id);
+        }
+        pub fn set_policy(&self, _hscroll: u32, _vscroll: u32) {}
+        pub fn set_vexpand(&self, _expand: bool) {}
+        pub fn set_hexpand(&self, _expand: bool) {}
+    }
+
+    // ── Cell style constants (match cell_style_to_attrs in pancurses.rs) ──
+    pub const CELL_STYLE_DEFAULT: u8 = 0;
+    pub const CELL_STYLE_CURSOR: u8 = 1;
+    pub const CELL_STYLE_AGGREGATE: u8 = 2;
+    pub const CELL_STYLE_FOOTER_AGGREGATE: u8 = 3;
+    pub const CELL_STYLE_SELECTED: u8 = 4;
+    pub const CELL_STYLE_ACTIVE_HEADER: u8 = 5;
+    pub const CELL_STYLE_INACTIVE_HEADER: u8 = 6;
 
     impl Spreadsheet {
         pub fn id(&self) -> usize { self.id }

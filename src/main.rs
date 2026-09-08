@@ -50,16 +50,20 @@ fn cli_option_suggestion(arg: &str) -> Option<&'static str> {
     }
 }
 
-fn determine_default_ui() -> UiKind {
-    #[cfg(feature = "ratatui")]
-    { UiKind::Ratatui }
-    #[cfg(not(feature = "ratatui"))]
-    #[cfg(feature = "gui")]
-    { UiKind::Gui }
-    #[cfg(not(any(feature = "ratatui", feature = "gui")))]
-    #[cfg(feature = "pancurses")]
-    { UiKind::Pancurses }
-}
+#[cfg(any(target_arch = "wasm32", feature = "gui"))]
+fn determine_default_ui() -> UiKind { UiKind::Gui }
+
+#[cfg(all(
+    not(any(target_arch = "wasm32", feature = "gui")),
+    feature = "pancurses"
+))]
+fn determine_default_ui() -> UiKind { UiKind::Pancurses }
+
+#[cfg(all(
+    not(any(target_arch = "wasm32", feature = "gui")),
+    not(feature = "pancurses")
+))]
+fn determine_default_ui() -> UiKind { UiKind::Ratatui }
 
 // Win95-safe command line: `GetCommandLineW` is a no-op stub on Windows 95
 // (returns NULL), so `std::env::args()` cannot be used there. Read the ANSI
@@ -289,7 +293,35 @@ fn win9x_redirect_console_output() {
     }
 }
 
-#[cfg(not(all(target_family = "rust9x", target_env = "msvc")))]
+#[cfg(target_arch = "wasm32")]
+fn main() {
+    let mut app = if let Some(path) = std::env::args().nth(1) {
+        let mut a = corro::gui::App::new_with_paths(vec![std::path::PathBuf::from(path)]);
+        if let Err(e) = a.load_initial() {
+            eprintln!("corro: load error: {e}");
+        }
+        a
+    } else {
+        let mut a = corro::gui::App::new_with_paths(vec![]);
+        let _ = a.load_initial();
+        a
+    };
+    // Leak the App so its memory stays valid after main() returns.
+    // The GuiState holds a raw pointer to this App; DOM event listeners
+    // registered by the WASM adapter continue to fire after main() exits
+    // because their closures are stored in a global static (CLOSURES).
+    // If we let the App drop, the raw pointer becomes dangling and keyboard
+    // callbacks would access freed memory (undefined behavior).
+    let app: &'static mut corro::gui::App = Box::leak(Box::new(app));
+    if let Err(e) = app.run() {
+        eprintln!("corro: run error: {e}");
+    }
+}
+
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    not(all(target_family = "rust9x", target_env = "msvc"))
+))]
 fn main() {
     corro_main();
 }
@@ -347,6 +379,7 @@ fn corro_main() {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn try_main() -> (Result<(), Box<dyn std::error::Error>>, Option<String>) {
     // Parse args; return early with no exit message on CLI errors/help/version.
     let args = match parse_args() {

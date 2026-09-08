@@ -1,7 +1,7 @@
 use crate::agg::compute_aggregate;
 use crate::agg::helpers::{
-    data_main_col_count, fold_numbers, left_margin_main_col_aggregate,
-    left_margin_special_col_aggregate, parse_num, previous_raw_block,
+    data_main_col_count, left_margin_main_col_aggregate,
+    left_margin_special_col_aggregate, previous_raw_block,
 };
 use crate::formula::cell_effective_display;
 use crate::grid::{CellAddr, ColumnAddr, GridBox, MainRange, HEADER_ROWS, MARGIN_COLS};
@@ -65,56 +65,7 @@ pub fn right_col_agg(grid: &GridBox, global_col: usize) -> Option<AggFunc> {
     None
 }
 
-/// Compute a footer aggregate value across all main rows for a given column.
-pub fn footer_special_col_aggregate(
-    grid: &GridBox,
-    footer_func: AggFunc,
-    global_col: usize,
-    main_rows: usize,
-    main_cols: usize,
-) -> Option<String> {
-    let row_func = right_col_agg(grid, global_col);
-    let data_cols = data_main_col_count(grid);
-    let mut samples: Vec<f64> = Vec::new();
-    for r in 0..main_rows {
-        let row_val = if let Some(func) = row_func {
-            compute_aggregate(
-                grid,
-                &AggregateDef {
-                    func,
-                    source: MainRange {
-                        row_start: r as u32,
-                        row_end: r as u32 + 1,
-                        col_start: 0,
-                        col_end: data_cols as u32,
-                    },
-                },
-            )
-        } else if global_col < MARGIN_COLS {
-            String::new()
-        } else if global_col < MARGIN_COLS + main_cols {
-            cell_effective_display(
-                grid,
-                &CellAddr::Main {
-                    row: r as u32,
-                    col: (global_col - MARGIN_COLS) as u32,
-                },
-            )
-        } else {
-            cell_effective_display(
-                grid,
-                &CellAddr::Right {
-                    col: (global_col - MARGIN_COLS - main_cols),
-                    row: r as u32,
-                },
-            )
-        };
-        if let Some(n) = parse_num(&row_val) {
-            samples.push(n);
-        }
-    }
-    Some(fold_numbers(footer_func, &samples))
-}
+pub(crate) use crate::agg::helpers::footer_special_col_aggregate;
 
 /// Find the start of the aggregate block for a given main row (the row after
 /// the preceding left-margin aggregate marker), matching ratatui's

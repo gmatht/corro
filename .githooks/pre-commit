@@ -1,0 +1,25 @@
+#!/bin/sh
+# Pre-commit hook: reject commits that add elloH/estT to the test-data files.
+# These are stale artifacts from replayer test sessions that modify the
+# file in-place.  They must never be committed.
+
+for f in docs/tests/subtotal-tiny.corro test_rec5.corro; do
+    if git diff --cached -- "$f" | grep -q -E '^\+.*elloH|^\+.*estT'; then
+        echo "ERROR: $f contains stale replayer output (elloH/estT)."
+        echo "  Run 'git checkout -- $f' to restore,"
+        echo "  or 'git diff --cached -- $f' to inspect."
+        exit 1
+    fi
+done
+
+# Also ensure the two data files stay byte-identical.
+if git diff --cached -- docs/tests/subtotal-tiny.corro test_rec5.corro | grep -q .; then
+    # At least one of them is staged — check they match.
+    f1=$(git show :docs/tests/subtotal-tiny.corro 2>/dev/null | md5sum)
+    f2=$(git show :test_rec5.corro 2>/dev/null | md5sum)
+    if [ "$f1" != "$f2" ]; then
+        echo "ERROR: docs/tests/subtotal-tiny.corro and test_rec5.corro differ."
+        echo "  They must be byte-identical.  Sync before committing."
+        exit 1
+    fi
+fi

@@ -3,6 +3,8 @@ use crate::error::Error;
 use std::ffi::CString;
 use std::marker::PhantomData;
 use std::os::raw::c_void;
+use std::collections::HashMap;
+use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -68,6 +70,15 @@ pub struct BoxWidget {
 
 #[derive(Clone, Copy)]
 pub enum Orientation { Horizontal = 0, Vertical = 1 }
+
+impl Clone for BoxWidget {
+    fn clone(&self) -> Self {
+        if let Some(gref) = self.loader.symbols.g_object_ref {
+            unsafe { gref(self.inner); }
+        }
+        BoxWidget { inner: self.inner, loader: self.loader.clone(), orientation: self.orientation, _not_send: PhantomData }
+    }
+}
 
 impl BoxWidget {
     pub fn new(loader: Arc<Loader>, orientation: Orientation, spacing: i32) -> Result<Self, Error> {
@@ -140,6 +151,15 @@ pub struct Window {
     _not_send: PhantomData<Rc<()>>,
 }
 
+impl Clone for Window {
+    fn clone(&self) -> Self {
+        if let Some(gref) = self.loader.symbols.g_object_ref {
+            unsafe { gref(self.inner); }
+        }
+        Window { inner: self.inner, loader: self.loader.clone(), _not_send: PhantomData }
+    }
+}
+
 impl Window {
     pub fn new(loader: Arc<Loader>) -> Result<Self, Error> {
         let symbols = &loader.symbols;
@@ -180,14 +200,109 @@ impl Window {
         }
         if let Some(present) = loader.symbols.gtk_window_present {
             unsafe { present(self.inner); }
-            // GTK4: gtk_window_present defers layout to the next loop iteration.
-            // Force one iteration so widgets appear immediately, not a frame later.
-            if loader.symbols.gtk_widget_show_all.is_none() {
-                if let Some(glib_lib) = loader.libs.get("libglib") {
-                    type Iteration = unsafe extern "C" fn(*mut std::ffi::c_void, i32) -> i32;
-                    if let Ok(iter_fn) = unsafe { glib_lib.get::<Iteration>(b"g_main_context_iteration") } {
-                        let iter = *iter_fn;
-                        unsafe { iter(std::ptr::null_mut(), 0); }
+            // Pump the main context to complete the window mapping round-trip
+            // and allow the frame clock to fire its first tick.
+            //
+            // On GTK4/Wayland (including WSLg) the configure/acknowledge
+            // round-trip is asynchronous — the window and its children are
+            // not mapped/allocated until the main loop processes the configure
+            // event.  Without pumping events here, grab_focus() (called by
+            // start_edit in gui_backend.rs) silently fails because the target
+            // widget isn't mapped yet, and no widget in the window ever
+            // receives keyboard focus.
+            //
+            // Furthermore, on both GTK3 and GTK4 the initial draw (expose
+            // event or frame clock tick) is deferred until the main loop
+            // processes it.  Without sufficient event pumping here, the canvas
+            // draw callback may not have fired by the time present() returns,
+            // causing replayers to report "WINDOW_DRAWN=false (blank window)".
+            if let Some(glib_lib) = loader.libs.get("libglib") {
+                type Iteration = unsafe extern "C" fn(*mut std::ffi::c_void, i32) -> i32;
+                if let Ok(iter_fn) = unsafe { glib_lib.get::<Iteration>(b"g_main_context_iteration") } {
+                    let iter = *iter_fn;
+                    let get_aw = loader.symbols.gtk_widget_get_allocated_width;
+                    let get_mapped = loader.symbols.gtk_widget_get_mapped;
+                    unsafe {
+                        // Phase 1: pump blocking iterations until the window
+                        // is both allocated and mapped.  On Wayland (including
+                        // WSLg) the configure/acknowledge round-trip is
+                        // asynchronous — the compositor sends width/height in
+                        // a configure event that must be processed by the main
+                        // context.  Without sufficient pumping here the window
+                        // never becomes receptive to grab_focus().
+                        //
+                        // 500 iterations is generous: each blocking iteration
+                        // waits for and dispatches one source.  WSLg virtual
+                        // compositors can be slow to respond, so we err on
+                        // the side of over-pumping rather than under-pumping.
+                        for _ in 0..500 {
+                            let allocated = get_aw.map_or(1, |f| f(self.inner));
+                            let mapped = get_mapped.map_or(1, |f| f(self.inner));
+                            if allocated > 0 && mapped != 0 { break; }
+                            iter(std::ptr::null_mut(), 1);
+                        }
+                        // Phase 2: all blocking iterations.  On virtual displays
+                        // (WSLg, Xvfb) the frame clock timer sources are only
+                        // dispatched during blocking waits.  Non-blocking
+                        // iterations return immediately and skip timer sources,
+                        // so the draw callback never fires.  500 blocking
+                        // iterations = ~8s max wait at 16ms/tick, covering
+                        // even the slowest virtual compositors.
+                        for _ in 0..500 {
+                            iter(std::ptr::null_mut(), 1);
+                        }
+                        // Force a redraw on the window to ensure the canvas
+                        // draw callback runs at least once.  On X11 this
+                        // schedules an idle handler that calls snapshot() on
+                        // the widget tree, which invokes our draw function.
+                        if let Some(qd) = loader.symbols.gtk_widget_queue_draw {
+                            unsafe { qd(self.inner); }
+                        }
+                        // Phase 3: all blocking iterations for the queued
+                        // redraw to be processed (allocation idle, frame
+                        // clock tick dispatch).
+                        for _ in 0..500 {
+                            iter(std::ptr::null_mut(), 1);
+                        }
+                        // Phase 4: Force a frame clock cycle via
+                        // gdk_frame_clock_request_phase (GTK4).  On virtual
+                        // displays (WSLg, Xvfb) the frame clock timer may
+                        // not tick automatically, so the draw function
+                        // registered by set_draw_func never fires.  By
+                        // explicitly requesting a PAINT phase we force the
+                        // frame clock to process the pending redraw.
+                        if let (Some(get_fc), Some(request_phase)) = (
+                            loader.symbols.gtk_widget_get_frame_clock,
+                            loader.symbols.gdk_frame_clock_request_phase,
+                        ) {
+                            let clock = unsafe { get_fc(self.inner) };
+                            if !clock.is_null() {
+                                // GDK_FRAME_CLOCK_PHASE_PAINT = 16 triggers
+                                // the snapshot/paint cycle which calls the
+                                // DrawingArea draw function.
+                                unsafe { request_phase(clock, 16); }
+                                // All blocking iterations to let the frame
+                                // clock process the requested phase.  On
+                                // virtual displays only blocking iterations
+                                // dispatch timer sources.
+                                for _ in 0..500 {
+                                    iter(std::ptr::null_mut(), 1);
+                                }
+                            }
+                        }
+                        // Sync with the display server (X11: XFlush; Wayland:
+                        // wl_display_flush).  This ensures pending MapWindow,
+                        // ConfigureWindow, and drawing commands reach the
+                        // compositor before present() returns.
+                        if let (Some(get_disp), Some(disp_sync)) = (
+                            loader.symbols.gtk_widget_get_display,
+                            loader.symbols.gdk_display_sync,
+                        ) {
+                            let display = unsafe { get_disp(self.inner) };
+                            if !display.is_null() {
+                                unsafe { disp_sync(display); }
+                            }
+                        }
                     }
                 }
             }
@@ -299,6 +414,42 @@ impl Button {
         guard_widget!(self, "Button", "set_vexpand");
         if let Some(set) = self.loader.symbols.gtk_widget_set_vexpand {
             unsafe { set(self.inner, if expand { 1 } else { 0 }); }
+        }
+    }
+
+    pub fn set_font_style(&self, weight: i32, italic: bool) {
+        guard_widget!(self, "Button", "set_font_style");
+        let weight_str = if weight >= 600 { "bold" } else { "normal" };
+        let style_str = if italic { "italic" } else { "normal" };
+        let css = format!("button {{ font-weight: {}; font-style: {}; }}", weight_str, style_str);
+        if let Some(provider) = crate::wrappers::create_css_provider(&self.loader, &css) {
+            crate::wrappers::add_provider_to_widget(&self.loader, self.inner, provider, 800);
+        }
+    }
+
+    pub fn add_class(&self, class_name: &str) {
+        guard_widget!(self, "Button", "add_class");
+        if let Some(get_ctx) = self.loader.symbols.gtk_widget_get_style_context {
+            if let Some(add_class) = self.loader.symbols.gtk_style_context_add_class {
+                let c = CString::new(class_name).unwrap();
+                unsafe {
+                    let ctx = get_ctx(self.inner);
+                    if !ctx.is_null() { add_class(ctx, c.as_ptr()); }
+                }
+            }
+        }
+    }
+
+    pub fn remove_class(&self, class_name: &str) {
+        guard_widget!(self, "Button", "remove_class");
+        if let Some(get_ctx) = self.loader.symbols.gtk_widget_get_style_context {
+            if let Some(remove_class) = self.loader.symbols.gtk_style_context_remove_class {
+                let c = CString::new(class_name).unwrap();
+                unsafe {
+                    let ctx = get_ctx(self.inner);
+                    if !ctx.is_null() { remove_class(ctx, c.as_ptr()); }
+                }
+            }
         }
     }
 }
@@ -537,6 +688,14 @@ impl Application {
 pub struct Grid {
     inner: *mut c_void,
     loader: Arc<Loader>,
+}
+impl Clone for Grid {
+    fn clone(&self) -> Self {
+        if let Some(gref) = self.loader.symbols.g_object_ref {
+            unsafe { gref(self.inner); }
+        }
+        Grid { inner: self.inner, loader: self.loader.clone() }
+    }
 }
 
 impl Grid {
@@ -795,6 +954,19 @@ impl DrawingArea {
         }
     }
 
+    pub fn set_can_focus(&self, can: bool) {
+        guard_widget!(self, "DrawingArea", "set_can_focus");
+        if let Some(f) = self.loader.symbols.gtk_widget_set_can_focus {
+            unsafe { f(self.inner, if can { 1 } else { 0 }); }
+        }
+    }
+    pub fn grab_focus(&self) {
+        guard_widget!(self, "DrawingArea", "grab_focus");
+        if let Some(f) = self.loader.symbols.gtk_widget_grab_focus {
+            unsafe { f(self.inner); }
+        }
+    }
+
     /// GTK3: connect to the "draw" signal. The closure receives (widget_ptr, cairo_t*) and returns gboolean.
     pub fn connect_draw_gtk3(&self, cb: Box<dyn FnMut(*mut std::ffi::c_void, *mut std::ffi::c_void) -> i32>) -> Result<u64, String> {
         guard_widget_or!(self, "DrawingArea", "connect_draw_gtk3", Err("drawing area dropped".into()));
@@ -998,9 +1170,9 @@ impl EventControllerKey {
         Ok(EventControllerKey { inner, loader, _not_send: PhantomData })
     }
 
-    pub fn connect_key_pressed<F: FnMut(u32) -> i32 + 'static>(&self, f: F) -> Result<u64, Error> {
+    pub fn connect_key_pressed<F: FnMut(u32, u32) -> i32 + 'static>(&self, f: F) -> Result<u64, Error> {
         guard_widget_or!(self, "EventControllerKey", "connect_key_pressed", Err(Error::Other("key controller dropped".into())));
-        let boxed: Box<Box<dyn FnMut(u32) -> i32>> = Box::new(Box::new(f));
+        let boxed: Box<Box<dyn FnMut(u32, u32) -> i32>> = Box::new(Box::new(f));
         let raw = Box::into_raw(boxed) as *mut c_void;
         unsafe { self.connect_key_pressed_raw(raw) }
     }
@@ -1039,6 +1211,14 @@ impl EventControllerKey {
         }
     }
 
+    /// GTK_PHASE_CAPTURE = 1
+    pub fn set_propagation_phase_capture(&self) {
+        guard_widget!(self, "EventControllerKey", "set_propagation_phase");
+        if let Some(f) = self.loader.symbols.gtk_event_controller_set_propagation_phase {
+            unsafe { f(self.inner, 1); }
+        }
+    }
+
     /// Get the keyval from a GDK key event
     ///
     /// # Safety
@@ -1053,17 +1233,21 @@ impl EventControllerKey {
     /// `event` must be a valid GDK key event pointer.
     pub unsafe fn get_keyval_static(loader: &Arc<Loader>, event: *mut c_void) -> u32 {
         if let Some(get_kv) = loader.symbols.gdk_event_get_keyval {
-            unsafe { get_kv(event) }
+            let mut keyval: u32 = 0;
+            get_kv(event, &mut keyval);
+            keyval
         } else { 0 }
     }
 
-    /// Get the modifier state from a GDK key event
+    /// Static version of get_state that doesn't need a controller instance
     ///
     /// # Safety
     /// `event` must be a valid GDK key event pointer.
     pub unsafe fn get_state_static(loader: &Arc<Loader>, event: *mut c_void) -> u32 {
         if let Some(get_st) = loader.symbols.gdk_event_get_state {
-            unsafe { get_st(event) }
+            let mut state: u32 = 0;
+            get_st(event, &mut state);
+            state
         } else { 0 }
     }
 }
@@ -1311,6 +1495,11 @@ impl Entry {
         None
     }
 
+    pub fn set_position(&self, position: i32) {
+        guard_widget!(self, "Entry", "set_position");
+        if let Some(f) = self.loader.symbols.gtk_editable_set_position { unsafe { f(self.inner, position); } }
+    }
+
     pub fn set_width_chars(&self, n: i32) {
         guard_widget!(self, "Entry", "set_width_chars");
         if let Some(w) = self.loader.symbols.gtk_entry_set_width_chars { unsafe { w(self.inner, n); } }
@@ -1336,8 +1525,14 @@ impl Entry {
 
     pub fn connect_activate<F: FnMut(*mut c_void) + 'static>(&self, f: F) -> Result<u64, Error> {
         guard_widget_or!(self, "Entry", "connect_activate", Err(Error::Other("entry dropped".into())));
-        let boxed: Box<Box<dyn FnMut(*mut c_void)>> = Box::new(Box::new(f));
-        let res = unsafe { crate::signals::connect_signal_param(&self.loader.symbols, self.inner, "activate", boxed) };
+        // GtkEntry::activate has 0 signal parameters (GLib calls with instance + user_data only).
+        // connect_signal_param uses a 3-arg trampoline (instance, param, user_data), but GLib
+        // passes only 2 C args.  On x86-64 the 3rd register (RDX) is undefined — typically 0,
+        // causing the trampoline's null-check on user_data to silently bail out.  Use
+        // connect_signal (2-arg trampoline) instead, wrapping the FnMut(*mut c_void) as FnMut().
+        let mut f = f;
+        let wrapper: Box<dyn FnMut()> = Box::new(move || { f(std::ptr::null_mut()); });
+        let res = unsafe { crate::signals::connect_signal(&self.loader.symbols, self.inner, "activate", wrapper, 2) };
         match res {
             Ok(id) => Ok(id),
             Err(e) => Err(Error::Other(e)),
@@ -1431,15 +1626,6 @@ impl Entry {
         guard_widget!(self, "Entry", "set_vexpand");
         if let Some(set) = self.loader.symbols.gtk_widget_set_vexpand {
             unsafe { set(self.inner, if expand { 1 } else { 0 }); }
-        }
-    }
-
-    /// Set the cursor position (character index) within the entry's text.
-    /// -1 means the end. Uses `gtk_editable_set_position`.
-    pub fn set_position(&self, position: i32) {
-        guard_widget!(self, "Entry", "set_position");
-        if let Some(set_pos) = self.loader.symbols.gtk_editable_set_position {
-            unsafe { set_pos(self.inner, position); }
         }
     }
 
@@ -1674,13 +1860,6 @@ pub unsafe fn widget_set_can_target(loader: &Arc<Loader>, widget: *mut c_void, c
     }
 }
 
-/// Set whether a widget can take keyboard focus (`gtk_widget_set_can_focus`).
-pub unsafe fn widget_set_can_focus(loader: &Arc<Loader>, widget: *mut c_void, can_focus: bool) {
-    if let Some(set) = loader.symbols.gtk_widget_set_can_focus {
-        unsafe { set(widget, if can_focus { 1 } else { 0 }); }
-    }
-}
-
 /// Set widget visibility
 pub unsafe fn widget_set_visible(loader: &Arc<Loader>, widget: *mut c_void, visible: bool) {
     if let Some(f) = loader.symbols.gtk_widget_set_visible {
@@ -1703,68 +1882,6 @@ pub unsafe fn idle_add_once(loader: &Arc<Loader>, cb: Box<dyn FnMut()>) {
     } else {
         let mut cb = cb;
         cb();
-    }
-}
-
-extern "C" fn timeout_trampoline(data: *mut c_void) -> i32 {
-    unsafe {
-        if data.is_null() {
-            return 0;
-        }
-        let boxed: Box<Box<dyn FnMut()>> = Box::from_raw(data as *mut Box<dyn FnMut()>);
-        let mut cb = boxed;
-        (*cb)();
-    }
-    0 // one-shot: removed after firing
-}
-
-extern "C" fn timeout_recurring_trampoline(data: *mut c_void) -> i32 {
-    unsafe {
-        if data.is_null() {
-            return 0;
-        }
-        let boxed: &mut Box<dyn FnMut()> = &mut *(data as *mut Box<dyn FnMut()>);
-        (*boxed)();
-    }
-    1 // keep firing
-}
-
-/// Schedule `cb` to run once on the main loop after `interval_ms`
-/// milliseconds (via glib `g_timeout_add`). Falls back to running it inline if
-/// the symbol is unavailable.
-pub unsafe fn timeout_add_once(loader: &Arc<Loader>, interval_ms: u32, cb: Box<dyn FnMut()>) {
-    if let Some(timeout_add) = loader.symbols.g_timeout_add {
-        let raw = Box::into_raw(Box::new(cb)) as *mut c_void;
-        unsafe { timeout_add(interval_ms, Some(timeout_trampoline), raw); }
-    } else {
-        let mut cb = cb;
-        cb();
-    }
-}
-
-/// Schedule `cb` to run *repeatedly* every `interval_ms` milliseconds until it
-/// returns false (i.e. the callback stops by returning). The closure receives
-/// nothing; it must self-terminate by dropping its own handle / checking a flag
-/// it captured (the trampoline keeps it alive as long as it returns true).
-///
-/// The closure should check a shared "stop" flag it captured (e.g. an
-/// `Arc<AtomicBool>`) and simply return early (or schedule its own
-/// `quit_main_loop`) when it no longer wants to fire. Returns the glib source
-/// id, or 0 if the symbol is unavailable (in which case the callback is run
-/// once inline as a degraded fallback).
-pub unsafe fn timeout_add_recurring(
-    loader: &Arc<Loader>,
-    interval_ms: u32,
-    cb: Box<dyn FnMut()>,
-) -> u32 {
-    if let Some(timeout_add) = loader.symbols.g_timeout_add {
-        let raw = Box::into_raw(Box::new(cb)) as *mut c_void;
-        unsafe { timeout_add(interval_ms, Some(timeout_recurring_trampoline), raw) }
-    } else {
-        // No glib timer available: run once as a best-effort fallback.
-        let mut cb = cb;
-        cb();
-        0
     }
 }
 
@@ -1994,10 +2111,6 @@ pub struct SimpleAction {
 }
 
 impl SimpleAction {
-    /// Raw GAction pointer (for adding to a GActionMap / action group).
-    pub fn inner_ptr(&self) -> *mut c_void {
-        self.inner
-    }
     pub fn new(loader: Arc<Loader>, name: &str) -> Result<Self, Error> {
         let symbols = &loader.symbols;
         let ctor = symbols.g_simple_action_new.ok_or(Error::MissingSymbol("g_simple_action_new".into()))?;
@@ -2048,7 +2161,30 @@ impl Clone for SimpleAction {
 pub struct MenuBar {
     inner: *mut c_void,
     loader: Arc<Loader>,
+    mnemonic_index: HashMap<char, usize>,
+    model_items: Vec<MenuItem>,
+    action_group: *mut c_void,
+    keyboard_menu_active: Rc<Cell<bool>>,
+    active_submenu_idx: Rc<Cell<Option<usize>>>,
     _not_send: PhantomData<Rc<()>>,
+}
+
+impl Clone for MenuBar {
+    fn clone(&self) -> Self {
+        if let Some(gref) = self.loader.symbols.g_object_ref {
+            unsafe { gref(self.inner); }
+        }
+        MenuBar {
+            inner: self.inner,
+            loader: self.loader.clone(),
+            mnemonic_index: self.mnemonic_index.clone(),
+            model_items: self.model_items.clone(),
+            action_group: self.action_group,
+            keyboard_menu_active: self.keyboard_menu_active.clone(),
+            active_submenu_idx: self.active_submenu_idx.clone(),
+            _not_send: PhantomData,
+        }
+    }
 }
 
 impl MenuBar {
@@ -2056,14 +2192,29 @@ impl MenuBar {
     /// `action_group` must be a valid GActionGroup pointer or null.
     pub unsafe fn new(loader: Arc<Loader>, model: &Menu, action_group: *mut c_void) -> Result<Self, Error> {
         let symbols = &loader.symbols;
-        // GTK4: GtkPopoverMenuBar — uses the GMenuModel directly
+        // GTK4: GtkPopoverMenuBar — uses the GMenuModel directly.
+        // Do NOT replace with build_simple_menubar (the manual fallback).
         if let Some(ctor) = symbols.gtk_popover_menu_bar_new_from_model {
             let inner = unsafe { ctor(model.ptr()) };
             if inner.is_null() {
                 return Err(Error::Other("gtk_popover_menu_bar_new_from_model returned null".into()));
             }
             take_ownership(&symbols, &loader.version, inner);
-            return Ok(MenuBar { inner, loader, _not_send: PhantomData });
+            let mut mnemonic_index = HashMap::new();
+            for (i, item) in model.items.iter().enumerate() {
+                // label is "_File" → skip '_' → mnemonic is first remaining char 'F'
+                // If no '_' is found, fall back to the first character of the label.
+                let m = item.label.chars()
+                    .skip_while(|&c| c != '_')
+                    .skip(1)  // skip the '_' itself
+                    .next()   // take the mnemonic character
+                    .or_else(|| item.label.chars().next())
+                    .map(|c| c.to_ascii_uppercase());
+                if let Some(m) = m {
+                    mnemonic_index.entry(m).or_insert(i);
+                }
+            }
+            return Ok(MenuBar { inner, loader, mnemonic_index, model_items: model.items.clone(), action_group, keyboard_menu_active: Rc::new(Cell::new(false)), active_submenu_idx: Rc::new(Cell::new(None)), _not_send: PhantomData });
         }
         // GTK3: build GtkMenuBar from the Rust-side items
         if let (Some(menu_bar_new), Some(_), Some(_)) = (
@@ -2077,7 +2228,7 @@ impl MenuBar {
             }
             Self::build_gtk3(&loader, inner, &model.items, &symbols, action_group);
             take_ownership(&symbols, &loader.version, inner);
-            return Ok(MenuBar { inner, loader, _not_send: PhantomData });
+            return Ok(MenuBar { inner, loader, mnemonic_index: HashMap::new(), model_items: model.items.clone(), action_group, keyboard_menu_active: Rc::new(Cell::new(false)), active_submenu_idx: Rc::new(Cell::new(None)), _not_send: PhantomData });
         }
         Err(Error::MissingSymbol("gtk_popover_menu_bar_new_from_model".into()))
     }
@@ -2094,8 +2245,13 @@ impl MenuBar {
                 Ok(c) => c,
                 Err(_) => continue,
             };
-            if let Some(new_item) = symbols.gtk_menu_item_new_with_label {
-                let gtk_item = unsafe { new_item(c_label.as_ptr()) };
+            // Use gtk_menu_item_new_with_mnemonic so underscores are
+            // interpreted as mnemonics (e.g. _File shows as File with
+            // underlined F).  Fall back to the label variant.
+            let new_item = symbols.gtk_menu_item_new_with_mnemonic
+                .map(|f| unsafe { f(c_label.as_ptr()) })
+                .or_else(|| symbols.gtk_menu_item_new_with_label.map(|f| unsafe { f(c_label.as_ptr()) }));
+            if let Some(gtk_item) = new_item {
                 if let Some(ref submenu) = item.submenu {
                     // Submenu item: create GtkMenu and recurse
                     if let Some(menu_new) = symbols.gtk_menu_new {
@@ -2107,35 +2263,117 @@ impl MenuBar {
                     }
                 } else if !item.detailed_action.is_empty() && !action_group.is_null() {
                     let _ = set_detailed_action_name(symbols, gtk_item, &item.detailed_action);
-                    if let (Some(lookup), Some(activate_fn)) = (
-                        symbols.g_action_map_lookup_action,
-                        symbols.g_action_activate,
-                    ) {
-                        let action_name = item.detailed_action.rsplit('.').next()
-                            .unwrap_or(&item.detailed_action).to_string();
-                        // Connect to "button-release-event" (GtkWidget signal, always fires on click)
-                        let cb_action = action_name.clone();
-                        let cb_group = action_group;
-                        let cb_lookup = lookup;
-                        let cb_activate = activate_fn;
-                        let cb = Box::new(move |_event: *mut c_void| -> i32 {
-                            let c = CString::new(cb_action.as_str()).unwrap();
-                            let gaction = unsafe { cb_lookup(cb_group, c.as_ptr()) };
-                            if !gaction.is_null() {
-                                unsafe { cb_activate(gaction, std::ptr::null_mut()); }
-                            }
-                            0 // FALSE = let event propagate to GtkMenuItem default handler
-                        });
-                        let _ = unsafe { crate::signals::connect_signal_bool(
-                            symbols, gtk_item, "button-release-event", cb,
-                        )};
-                    }
                 }
                 if let Some(append) = symbols.gtk_menu_shell_append {
                     unsafe { append(shell, gtk_item); }
                 }
             }
         }
+    }
+
+    /// Activate the submenu whose mnemonic label matches `keyval`.
+    /// Returns true if a matching button was found and activated.
+    pub fn activate_submenu_by_mnemonic(&self, keyval: u32) -> bool {
+        let symbols = &self.loader.symbols;
+        let get_first = match symbols.gtk_widget_get_first_child {
+            Some(f) => f,
+            None => return false,
+        };
+        let get_next = match symbols.gtk_widget_get_next_sibling {
+            Some(f) => f,
+            None => return false,
+        };
+        let activate = match symbols.gtk_widget_activate {
+            Some(f) => f,
+            None => return false,
+        };
+
+        let key_upper = char::from_u32(keyval)
+            .map(|c| c.to_ascii_uppercase())
+            .unwrap_or('\0');
+        let &idx = match self.mnemonic_index.get(&key_upper) {
+            Some(i) => i,
+            None => return false,
+        };
+
+        // The GtkPopoverMenuBar has a single child: a GtkBox that contains the
+        // menu item buttons.  Get the box, then iterate its children.
+        let box_widget = unsafe { get_first(self.inner) };
+        if box_widget.is_null() { return false; }
+        let mut child = unsafe { get_first(box_widget) };
+        let mut i = 0usize;
+        while !child.is_null() && i < idx {
+            child = unsafe { get_next(child) };
+            i += 1;
+        }
+        if child.is_null() {
+            return false;
+        }
+
+        unsafe { activate(child); }
+        true
+    }
+
+    /// Activate a submenu item whose mnemonic matches `keyval` when a popover
+    /// is already open.  Returns true if a matching item was found and activated.
+    /// Recursively searches nested submenus to find items at any depth.
+    pub fn activate_submenu_item_by_mnemonic(&self, keyval: u32) -> bool {
+        let symbols = &self.loader.symbols;
+        let activate_action = match symbols.g_action_group_activate_action {
+            Some(f) => f,
+            None => return false,
+        };
+
+        if self.action_group.is_null() {
+            return false;
+        }
+        let action_group = self.action_group;
+
+        let key_upper = char::from_u32(keyval)
+            .map(|c| c.to_ascii_uppercase())
+            .unwrap_or('\0');
+
+        fn search_items(items: &[MenuItem], key_upper: char,
+            activate_action: unsafe extern "C" fn(*mut c_void, *const i8, *mut c_void),
+            action_group: *mut c_void) -> bool
+        {
+            for sub_item in items {
+                if let Some(m) = sub_item.label.chars()
+                    .skip_while(|&c| c != '_')
+                    .nth(1)
+                    .map(|c| c.to_ascii_uppercase())
+                {
+                    if m == key_upper && !sub_item.detailed_action.is_empty() {
+                        let action_name = sub_item.detailed_action
+                            .rsplit('.')
+                            .next()
+                            .unwrap_or(&sub_item.detailed_action);
+                        let c_action = match std::ffi::CString::new(action_name) {
+                            Ok(c) => c,
+                            Err(_) => continue,
+                        };
+                        unsafe { activate_action(action_group, c_action.as_ptr(), std::ptr::null_mut()); }
+                        return true;
+                    }
+                }
+                if let Some(ref children) = sub_item.submenu {
+                    if search_items(&children.items, key_upper, activate_action, action_group) {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+
+        for bar_item in &self.model_items {
+            if let Some(ref submenu) = bar_item.submenu {
+                if search_items(&submenu.items, key_upper, activate_action, action_group) {
+                    return true;
+                }
+            }
+        }
+
+        false
     }
 }
 
@@ -2149,6 +2387,363 @@ fn set_detailed_action_name(symbols: &crate::symbols::Symbols, item: *mut c_void
 
 impl AsRef<*mut c_void> for MenuBar { fn as_ref(&self) -> &*mut c_void { &self.inner } }
 
+impl MenuBar {
+    /// Insert an action group on the underlying menubar widget so that
+    /// popover children can find actions by walking the parent chain.
+    pub fn insert_action_group(&self, name: &str, group_ptr: *mut c_void) {
+        guard_widget!(self, "MenuBar", "insert_action_group");
+        if let Some(insert) = self.loader.symbols.gtk_widget_insert_action_group {
+            let c = CString::new(name).unwrap();
+            unsafe { insert(self.inner, c.as_ptr(), group_ptr); }
+        }
+    }
+
+    /// Directly insert the action group on each bar item's popover.
+    /// Traverses the widget tree: bar → bar_item → (menu_button → popover child or button's internal popover).
+    pub fn insert_action_group_on_popovers(&self, name: &str, group_ptr: *mut c_void) -> usize {
+        let symbols = &self.loader.symbols;
+        let get_first = match symbols.gtk_widget_get_first_child {
+            Some(f) => f,
+            None => return 0,
+        };
+        let get_next = match symbols.gtk_widget_get_next_sibling {
+            Some(f) => f,
+            None => return 0,
+        };
+        let get_popover = match symbols.gtk_menu_button_get_popover {
+            Some(f) => f,
+            None => return 0,
+        };
+        let insert = match symbols.gtk_widget_insert_action_group {
+            Some(f) => f,
+            None => return 0,
+        };
+        let c_name = match std::ffi::CString::new(name) {
+            Ok(n) => n,
+            Err(_) => return 0,
+        };
+        let mut count = 0;
+        unsafe {
+            let mut child = get_first(self.inner);
+            while !child.is_null() {
+                let menu_btn = get_first(child);
+                if menu_btn.is_null() {
+                    child = get_next(child);
+                    continue;
+                }
+                // Try getting the popover via gtk_menu_button_get_popover
+                let mut popover = get_popover(menu_btn);
+                // If that fails, try the first child of the menu button (popover is parented there)
+                if popover.is_null() {
+                    popover = get_first(menu_btn);
+                }
+                if !popover.is_null() {
+                    insert(popover, c_name.as_ptr(), group_ptr);
+                    count += 1;
+                }
+                child = get_next(child);
+            }
+        }
+        count
+    }
+
+    /// Handle a mnemonic keypress when a submenu popover may be visible.
+    /// Searches all leaf menu items for a matching mnemonic.
+    /// If found, activates the action and closes all visible popovers.
+    /// Returns true if the key was consumed.
+    pub fn handle_mnemonic_key(&self, keyval: u32) -> bool {
+        let symbols = &self.loader.symbols;
+        let activate_action = match symbols.g_action_group_activate_action {
+            Some(f) => f,
+            None => return false,
+        };
+        if self.action_group.is_null() { return false; }
+        let action_group = self.action_group;
+        let key_upper = char::from_u32(keyval)
+            .map(|c| c.to_ascii_uppercase())
+            .unwrap_or('\0');
+
+        fn search_items(items: &[MenuItem], key_upper: char,
+            activate_action: unsafe extern "C" fn(*mut c_void, *const i8, *mut c_void),
+            action_group: *mut c_void) -> Option<String>
+        {
+            for sub_item in items {
+                if let Some(m) = sub_item.label.chars()
+                    .skip_while(|&c| c != '_')
+                    .nth(1)
+                    .map(|c| c.to_ascii_uppercase())
+                {
+                    if m == key_upper && !sub_item.detailed_action.is_empty() {
+                        let action_name = sub_item.detailed_action
+                            .rsplit('.')
+                            .next()
+                            .unwrap_or(&sub_item.detailed_action)
+                            .to_string();
+                        return Some(action_name);
+                    }
+                }
+                if let Some(ref children) = sub_item.submenu {
+                    if let Some(found) = search_items(&children.items, key_upper, activate_action, action_group) {
+                        return Some(found);
+                    }
+                }
+            }
+            None
+        }
+
+        // Search only the active submenu (opened by Alt+letter), not all submenus.
+        // Without this scoping, a letter key would match the FIRST submenu globally
+        // that contains an item with that mnemonic, which may be different from the
+        // submenu the user is currently navigating (e.g., 'l' matches Format→Ce_ll
+        // instead of Tools→Export Al_l, since Format appears before Tools in the bar).
+        let mut found_action: Option<String> = None;
+        if let Some(idx) = self.active_submenu_idx.get() {
+            if let Some(ref submenu) = self.model_items[idx].submenu {
+                found_action = search_items(&submenu.items, key_upper, activate_action, action_group);
+            }
+        } else {
+            // Legacy fallback: search all submenus (used when no Alt+letter was pressed)
+            for bar_item in &self.model_items {
+                if let Some(ref submenu) = bar_item.submenu {
+                    if let Some(action) = search_items(&submenu.items, key_upper, activate_action, action_group) {
+                        found_action = Some(action);
+                        break;
+                    }
+                }
+            }
+        }
+
+        if let Some(action_name) = found_action {
+            if let Ok(c_action) = std::ffi::CString::new(action_name.as_str()) {
+                unsafe { activate_action(action_group, c_action.as_ptr(), std::ptr::null_mut()); }
+            }
+            // Clear the keyboard menu flag: after the action is activated,
+            // the menu interaction is complete.  If this flag stays true,
+            // subsequent printable keys (e.g., an autorepeat of the same
+            // character) will be re-routed through the menu system, causing
+            // double-activation.
+            self.keyboard_menu_active.set(false);
+            self.active_submenu_idx.set(None);
+            // Close all visible bar popovers
+            if let (Some(get_first), Some(get_next), Some(get_popover), Some(set_visible)) = (
+                symbols.gtk_widget_get_first_child,
+                symbols.gtk_widget_get_next_sibling,
+                symbols.gtk_menu_button_get_popover,
+                symbols.gtk_widget_set_visible,
+            ) {
+                unsafe {
+                    let mut child = get_first(self.inner);
+                    while !child.is_null() {
+                        let menu_btn = get_first(child);
+                        if !menu_btn.is_null() {
+                            let popover = get_popover(menu_btn);
+                            if !popover.is_null() {
+                                set_visible(popover, 0);
+                            }
+                        }
+                        child = get_next(child);
+                    }
+                }
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Handle any menu-related key: Alt+letter opens a submenu,
+    /// Escape closes, printable selects an item.
+    pub fn handle_menu_key(&self, keyval: u32, modifiers: u32) -> bool {
+        const ALT_MASK: u32 = 8;
+        let alt_held = (modifiers & ALT_MASK) != 0;
+        // Alt+letter: open submenu
+        if alt_held && (32..=126).contains(&keyval) {
+            if self.activate_submenu_by_mnemonic(keyval) {
+                self.keyboard_menu_active.set(true);
+                let key_upper = char::from_u32(keyval)
+                    .map(|c| c.to_ascii_uppercase()).unwrap_or('\0');
+                self.active_submenu_idx.set(self.mnemonic_index.get(&key_upper).copied());
+                return true;
+            }
+            // GTK popover path failed — try Rust-side by treating as mnemonic
+            let key_upper = char::from_u32(keyval)
+                .map(|c| c.to_ascii_uppercase()).unwrap_or('\0');
+            for (i, item) in self.model_items.iter().enumerate() {
+                // Look for _<char> mnemonic; if no '_' found, use first char as mnemonic.
+                let m = item.label.chars()
+                    .skip_while(|&c| c != '_').nth(1)
+                    .or_else(|| item.label.chars().next())
+                    .map(|c| c.to_ascii_uppercase());
+                if let Some(m) = m {
+                    if m == key_upper {
+                        self.keyboard_menu_active.set(true);
+                        self.active_submenu_idx.set(Some(i));
+                        return true;
+                    }
+                }
+            }
+            self.active_submenu_idx.set(None);
+            return false;
+        }
+        // Escape: close keyboard menu
+        if keyval == 0xFF1B && self.keyboard_menu_active.get() {
+            self.keyboard_menu_active.set(false);
+            self.active_submenu_idx.set(None);
+            // Close visible popovers too
+            if let (Some(get_first), Some(get_next), Some(get_popover), Some(set_visible)) = (
+                self.loader.symbols.gtk_widget_get_first_child,
+                self.loader.symbols.gtk_widget_get_next_sibling,
+                self.loader.symbols.gtk_menu_button_get_popover,
+                self.loader.symbols.gtk_widget_set_visible,
+            ) {
+                unsafe {
+                    let mut child = get_first(self.inner);
+                    while !child.is_null() {
+                        let menu_btn = get_first(child);
+                        if !menu_btn.is_null() {
+                            let popover = get_popover(menu_btn);
+                            if !popover.is_null() {
+                                set_visible(popover, 0);
+                            }
+                        }
+                        child = get_next(child);
+                    }
+                }
+            }
+            return true;
+        }
+        // Printable when menu active: try mnemonic
+        if self.keyboard_menu_active.get() && !alt_held && (32..=126).contains(&keyval) {
+            return self.handle_mnemonic_key(keyval);
+        }
+        false
+    }
+
+    pub fn menu_active(&self) -> bool {
+        self.keyboard_menu_active.get()
+    }
+
+    pub fn menu_close(&self) {
+        self.keyboard_menu_active.set(false);
+        self.active_submenu_idx.set(None);
+        if let (Some(get_first), Some(get_next), Some(get_popover), Some(set_visible)) = (
+            self.loader.symbols.gtk_widget_get_first_child,
+            self.loader.symbols.gtk_widget_get_next_sibling,
+            self.loader.symbols.gtk_menu_button_get_popover,
+            self.loader.symbols.gtk_widget_set_visible,
+        ) {
+            unsafe {
+                let mut child = get_first(self.inner);
+                while !child.is_null() {
+                    let menu_btn = get_first(child);
+                    if !menu_btn.is_null() {
+                        let popover = get_popover(menu_btn);
+                        if !popover.is_null() {
+                            set_visible(popover, 0);
+                        }
+                    }
+                    child = get_next(child);
+                }
+            }
+        }
+    }
+
+    /// Diagnostic: check which action names exist in the given GActionMap.
+    pub fn debug_check_actions(&self, group_ptr: *mut c_void, out_path: &str) {
+        use std::io::Write;
+        let symbols = &self.loader.symbols;
+        let lookup = match symbols.g_action_map_lookup_action {
+            Some(f) => f,
+            None => return,
+        };
+        let mut s = String::new();
+        for &name in &["open", "save", "corro_quit", "about", "sort_asc", "help_keybinds", "quit"] {
+            let c = match std::ffi::CString::new(name) {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+            let found = unsafe { lookup(group_ptr, c.as_ptr()) };
+            s.push_str(&format!("action_lookup: {name}={}\n", !found.is_null()));
+        }
+        let _ = std::fs::write(out_path, &s);
+    }
+
+    /// Diagnostic: check if submenu links exist for all root GMenu items.
+    pub fn debug_check_submenu_links(model_ptr: *mut c_void, loader: &crate::loader::Loader, out_path: &str) {
+        use std::io::Write;
+        let symbols = &loader.symbols;
+        let get_n_items = match symbols.g_menu_model_get_n_items {
+            Some(f) => f,
+            None => return,
+        };
+        let get_link = match symbols.g_menu_model_get_item_link {
+            Some(f) => f,
+            None => return,
+        };
+        let n = unsafe { get_n_items(model_ptr) };
+        let mut s = format!("g_menu_model_get_n_items: {n}\n");
+        for i in 0..n {
+            let link = unsafe { get_link(model_ptr, i as i32, b"submenu\0".as_ptr() as *const i8) };
+            s.push_str(&format!("  item[{i}]: submenu_link={}\n", !link.is_null()));
+        }
+        let _ = std::fs::write(out_path, &s);
+    }
+
+    /// Diagnostic: count children of the menubar and their sub-children.
+    pub fn debug_widget_tree(&self, out_path: &str) {
+        let symbols = &self.loader.symbols;
+        let get_first = match symbols.gtk_widget_get_first_child {
+            Some(f) => f,
+            None => return,
+        };
+        let get_next = match symbols.gtk_widget_get_next_sibling {
+            Some(f) => f,
+            None => return,
+        };
+        let get_popover = match symbols.gtk_menu_button_get_popover {
+            Some(f) => f,
+            None => return,
+        };
+        let mut s = String::new();
+        unsafe {
+            let mut i = 0u32;
+            let mut child = get_first(self.inner);
+            while !child.is_null() {
+                let menu_btn = get_first(child);
+                let popover_via_getter = if !menu_btn.is_null() {
+                    get_popover(menu_btn)
+                } else {
+                    std::ptr::null_mut()
+                };
+                let popover_via_get_first = if !menu_btn.is_null() {
+                    get_first(menu_btn)
+                } else {
+                    std::ptr::null_mut()
+                };
+                let btn_first_child = if !menu_btn.is_null() {
+                    get_first(menu_btn)
+                } else {
+                    std::ptr::null_mut()
+                };
+                let btn_second_child = if !btn_first_child.is_null() {
+                    get_next(btn_first_child)
+                } else {
+                    std::ptr::null_mut()
+                };
+                s.push_str(&format!(
+                    "  child[{}]: bar={:#x} btn={:#x} popover_getter={:#x} popover_first_child={:#x} btn_fc={:#x} btn_sc={:#x}\n",
+                    i, child as usize, menu_btn as usize,
+                    popover_via_getter as usize, popover_via_get_first as usize,
+                    btn_first_child as usize, btn_second_child as usize
+                ));
+                child = get_next(child);
+                i += 1;
+            }
+            s.insert_str(0, &format!("n_children: {}\n", i));
+        }
+        let _ = std::fs::write(out_path, &s);
+    }
+}
+
 impl Drop for MenuBar {
     fn drop(&mut self) {
         unsafe { crate::wrappers::unref_widget(&self.loader, self.inner); }
@@ -2156,11 +2751,11 @@ impl Drop for MenuBar {
 }
 
 // ---- Dialog ----
-#[derive(Clone)]
 pub struct Dialog {
     inner: *mut c_void,
     loader: Arc<Loader>,
     _not_send: PhantomData<Rc<()>>,
+    dropped: std::cell::Cell<bool>,
 }
 
 impl Dialog {
@@ -2170,7 +2765,7 @@ impl Dialog {
         let inner = unsafe { ctor() };
         if inner.is_null() { return Err(Error::Other("gtk_dialog_new returned null".into())); }
         unsafe { take_ownership(&symbols, &loader.version, inner); }
-        Ok(Dialog { inner, loader, _not_send: PhantomData })
+        Ok(Dialog { inner, loader, _not_send: PhantomData, dropped: std::cell::Cell::new(false) })
     }
 
     pub fn set_title(&self, title: &str) {
@@ -2183,7 +2778,7 @@ impl Dialog {
 
     pub fn set_default_size(&self, width: i32, height: i32) {
         guard_widget!(self, "Dialog", "set_default_size");
-        if let Some(set_size) = self.loader.symbols.gtk_dialog_set_default_size {
+        if let Some(set_size) = self.loader.symbols.gtk_window_set_default_size {
             unsafe { set_size(self.inner, width, height); }
         }
     }
@@ -2275,10 +2870,12 @@ impl Dialog {
         }
     }
 
-    /// Dismiss/destroy the dialog widget.
     pub fn close(&self) {
-        if let Some(destroy) = self.loader.symbols.gtk_widget_destroy {
-            unsafe { destroy(self.inner); }
+        guard_widget!(self, "Dialog", "close");
+        if let Some(window_close) = self.loader.symbols.gtk_window_close {
+            unsafe { window_close(self.inner); }
+        } else if let Some(widget_destroy) = self.loader.symbols.gtk_widget_destroy {
+            unsafe { widget_destroy(self.inner); }
         }
     }
 
@@ -2293,12 +2890,31 @@ impl Dialog {
     }
 }
 
+impl Clone for Dialog {
+    fn clone(&self) -> Self {
+        if let Some(gref) = self.loader.symbols.g_object_ref {
+            unsafe { gref(self.inner); }
+        }
+        Dialog { inner: self.inner, loader: self.loader.clone(), _not_send: PhantomData, dropped: std::cell::Cell::new(self.dropped.get()) }
+    }
+}
+
 impl AsRef<*mut c_void> for Dialog { fn as_ref(&self) -> &*mut c_void { &self.inner } }
 
 impl Drop for Dialog {
     fn drop(&mut self) {
-        unsafe { crate::wrappers::unref_widget(&self.loader, self.inner); }
+        if !self.dropped.get() {
+            unsafe { crate::wrappers::unref_widget(&self.loader, self.inner); }
+        }
         self.inner = std::ptr::null_mut();
+    }
+}
+
+impl Dialog {
+    /// Mark this dialog as having been destroyed by GTK already.
+    /// After this, Drop will skip the g_object_unref, preventing a double-free.
+    pub fn mark_destroyed(&self) {
+        self.dropped.set(true);
     }
 }
 
@@ -2688,116 +3304,6 @@ impl TextView {
         if let Some(set_wrap) = self.loader.symbols.gtk_text_view_set_wrap_mode {
             unsafe { set_wrap(self.inner, wrap_mode); }
         }
-    }
-
-    /// Append Pango markup at the end of the buffer (`insert_markup` applies
-    /// `<span foreground=...>`-style tags inline). Falls back to plain text
-    /// when the symbol is unavailable. A trailing newline is NOT added — pass
-    /// it inside `markup` when wanted.
-    pub fn append_markup(&self, markup: &str) {
-        guard_widget!(self, "TextView", "append_markup");
-        let symbols = &self.loader.symbols;
- if let Some(get_buf) = symbols.gtk_text_view_get_buffer {
-            let buf = unsafe { get_buf(self.inner) };
-            if !buf.is_null() {
-                if let (Some(get_end), Some(insert)) = (symbols.gtk_text_buffer_get_end_iter, symbols.gtk_text_buffer_insert_markup) {
-                    // GtkTextIter is opaque; allocate generously (256 bytes).
-                    let mut end_iter = [0u8; 256];
-                    unsafe {
-                        get_end(buf, end_iter.as_mut_ptr() as *mut c_void);
-                        let c = CString::new(markup).unwrap();
-                        insert(buf, end_iter.as_mut_ptr() as *mut c_void, c.as_ptr(), -1);
-                    }
-                    return;
-                }
-            }
-        }
-        // Degraded fallback: plain text (markup tags would show literally, so
-        // strip them by only using the raw text).
-        self.append_text_plain(markup);
-    }
-
-    /// Append raw text (no markup) at the end of the buffer.
-    pub fn append_text_plain(&self, text: &str) {
-        guard_widget!(self, "TextView", "append_text_plain");
-        let symbols = &self.loader.symbols;
-        if let (Some(get_buf), Some(get_end)) = (symbols.gtk_text_view_get_buffer, symbols.gtk_text_buffer_get_end_iter) {
-            if let Some(insert) = symbols.gtk_text_buffer_insert {
-                let buf = unsafe { get_buf(self.inner) };
-                if !buf.is_null() {
-                    let mut end_iter = [0u8; 256];
-                    unsafe {
-                        get_end(buf, end_iter.as_mut_ptr() as *mut c_void);
-                        let c = CString::new(text).unwrap();
-                        insert(buf, end_iter.as_mut_ptr() as *mut c_void, c.as_ptr(), -1);
-                    }
-                }
-            }
-        }
-    }
-
-    /// Number of characters currently in the buffer.
-    pub fn char_count(&self) -> usize {
-        guard_widget_or!(self, "TextView", "char_count", 0);
-        let symbols = &self.loader.symbols;
-        if let (Some(get_buf), Some(count)) = (symbols.gtk_text_view_get_buffer, symbols.gtk_text_buffer_get_char_count) {
-            let buf = unsafe { get_buf(self.inner) };
-            if !buf.is_null() {
-                return unsafe { count(buf) } as usize;
-            }
-        }
-        0
-    }
-
-    /// Scroll so the end of the buffer is visible (follow streaming output).
-    pub fn scroll_to_end(&self) {
-        guard_widget!(self, "TextView", "scroll_to_end");
-        let symbols = &self.loader.symbols;
-        if let (Some(get_buf), Some(get_end), Some(scroll)) = (
-            symbols.gtk_text_view_get_buffer,
-            symbols.gtk_text_buffer_get_end_iter,
-            symbols.gtk_text_view_scroll_to_iter,
-        ) {
-            let buf = unsafe { get_buf(self.inner) };
-            if !buf.is_null() {
-                let mut end_iter = [0u8; 256];
-                unsafe {
-                    get_end(buf, end_iter.as_mut_ptr() as *mut c_void);
-                    scroll(self.inner, end_iter.as_mut_ptr() as *mut c_void, 0.0, 0, 0.0, 1.0);
-                }
-            }
-        }
-    }
-
-    pub fn set_editable(&self, editable: bool) {
-        guard_widget!(self, "TextView", "set_editable");
-        if let Some(set_edit) = self.loader.symbols.gtk_text_view_set_editable {
-            unsafe { set_edit(self.inner, if editable { 1 } else { 0 }); }
-        }
-    }
-
-    /// Return whether the text view currently accepts input (`gtk_text_view_get_editable`).
-    pub fn get_editable(&self) -> bool {
-        guard_widget_or!(self, "TextView", "get_editable", false);
-        if let Some(get_edit) = self.loader.symbols.gtk_text_view_get_editable {
-            unsafe { get_edit(self.inner) != 0 }
-        } else { false }
-    }
-
-    /// Set whether the text view can take keyboard focus (so a click can't
-    /// steal typing away from the prompt Entry).
-    pub fn set_can_focus(&self, can_focus: bool) {
- guard_widget!(self, "TextView", "set_can_focus");
-        unsafe { widget_set_can_focus(&self.loader, self.inner, can_focus); }
-    }
-
-    /// Return whether the text view can take keyboard focus
-    /// (`gtk_widget_get_can_focus`).
-    pub fn get_can_focus(&self) -> bool {
-        guard_widget_or!(self, "TextView", "get_can_focus", false);
-        if let Some(get_cf) = self.loader.symbols.gtk_widget_get_can_focus {
-            unsafe { get_cf(self.inner) != 0 }
-        } else { false }
     }
 
     pub fn set_size_request(&self, w: i32, h: i32) {

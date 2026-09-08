@@ -1,8 +1,15 @@
 use crate::error::Error;
 use crate::symbols::Symbols;
-use libloading::os::unix::Library;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+#[cfg(feature = "gtk4rs")]
+use crate::backend_gtk4rs;
+
+#[cfg(unix)]
+use libloading::os::unix::Library;
+#[cfg(windows)]
+use libloading::os::windows::Library;
 
 pub type RawLib = Library;
 
@@ -14,6 +21,7 @@ pub struct Loader {
     pub libs: HashMap<String, Arc<RawLib>>,
     pub symbols: Arc<Symbols>,
     pub version: Version,
+    pub main_loop: std::sync::Mutex<usize>,
 }
 
 impl Loader {
@@ -48,6 +56,16 @@ impl Loader {
         let libcairo = open_first(&cairo_cands);
         if let Some(c) = libcairo { libs.insert("libcairo".into(), Arc::new(c)); }
 
+        // Force X11 backend to avoid Wayland's asynchronous window configure round-trip.
+        // On Wayland (including WSLg), gtk_window_present() returns before the compositor
+        // acknowledges the configure request, so gtk_widget_get_mapped and
+        // gtk_widget_get_allocated_width return 0 even after event pumping.  The X11
+        // backend maps windows synchronously, eliminating this race condition entirely.
+        // Users who prefer Wayland can override this by setting GDK_BACKEND=wayland.
+        if std::env::var_os("GDK_BACKEND").is_none() {
+            std::env::set_var("GDK_BACKEND", "x11");
+        }
+
         // Prefer software/cairo rendering to avoid GL/X11 SHM issues on headless or restricted hosts.
         // Set before loading libgtk so the renderer selection observes these env vars early.
         if std::env::var_os("GSK_RENDERER").is_none() {
@@ -65,10 +83,12 @@ impl Loader {
             std::env::set_var("GDK_PIXBUF_USE_SHM", "0");
         }
 
-        // Try GTK4 then GTK3 by default. Honor GTK_DLOPEN_PREFER_GTK3=1 to reverse.
+        // Default to GTK3.  Set GTK_DLOPEN_PREFER_GTK3=0 to try GTK4 first.
+        // corro's GTK4 code path has unresolved stability issues (use-after-free
+        // in widget lifecycle, layout-recursion crashes).  GTK3 is fully stable.
         let prefer_gtk3 = match std::env::var_os("GTK_DLOPEN_PREFER_GTK3") {
             Some(v) => v != "0",
-            None => false,
+            None => true,  // default to GTK3
         };
 
         let (libgtk, version) = if prefer_gtk3 {
@@ -76,6 +96,16 @@ impl Loader {
         } else {
             if let Some(l) = open_first(&gtk4_cands) { (l, Version::Gtk4) } else if let Some(l) = open_first(&gtk3_cands) { (l, Version::Gtk3) } else { return Err(Error::NoGtkFound); }
         };
+
+        // GTK4 stability warning
+        if version == Version::Gtk4 {
+            use std::io::Write;
+            let msg = "\n\x1b[1;33mWARNING: corro is using GTK4 which has known stability issues\n\
+                       (widget lifecycle crashes).  Set GTK_DLOPEN_PREFER_GTK3=1 or\n\
+                       unset the variable to use the stable GTK3 backend.\x1b[0m\n";
+            let _ = std::io::stderr().write_all(msg.as_bytes());
+            let _ = std::io::stderr().flush();
+        }
         libs.insert("libgtk".into(), Arc::new(libgtk));
 
         // Open libgdk (separate library in GTK3; GTK4 bundles GDK into libgtk-4)
@@ -127,7 +157,18 @@ impl Loader {
             }
         }
 
-        Ok(Arc::new(Loader { libs, symbols: Arc::new(symbols), version }))
+        Ok(Arc::new(Loader { libs, symbols: Arc::new(symbols), version, main_loop: std::sync::Mutex::new(0) }))
+    }
+
+    #[cfg(feature = "gtk4rs")]
+    pub fn new_gtk4rs() -> Result<Arc<Self>, Error> {
+        let symbols = backend_gtk4rs::try_build().map_err(|e| Error::Other(e))?;
+        Ok(Arc::new(Loader {
+            libs: HashMap::new(),
+            symbols: Arc::new(symbols),
+            version: Version::Gtk4,
+            main_loop: std::sync::Mutex::new(0),
+        }))
     }
 
     pub fn version(&self) -> Version { self.version }
@@ -137,9 +178,12 @@ fn open_first(cands: &[&str]) -> Option<RawLib> {
     for &name in cands {
         // try to open with RTLD_NOW | RTLD_GLOBAL
         unsafe {
-            // If available, add RTLD_NODELETE to avoid unloading libraries while GTK may still use them
+            #[cfg(unix)]
             let flags = libc::RTLD_NOW | libc::RTLD_GLOBAL
                 | { #[allow(non_upper_case_globals)] { libc::RTLD_NODELETE } };
+            #[cfg(windows)]
+            let flags = libloading::os::windows::DEFAULT;
+
             match Library::open(Some(name), flags) {
                 Ok(lib) => return Some(lib),
                 Err(_) => continue,
