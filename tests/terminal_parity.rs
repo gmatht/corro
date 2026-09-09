@@ -1267,6 +1267,57 @@ fn menu_bar_bracket_tracks_open_menu_and_popup_position() {
     }
 }
 
+/// Tab-bar parity: after creating a second sheet, the bottom tab bar must
+/// render identically in pancurses and ratatui (same titles, same order,
+/// same spacing). Regression guard for the multi-sheet chrome.
+#[test]
+fn tab_bar_parity_after_new_sheet() {
+    // ── ratatui reference: Alt+s (Sheet), Down Down (New sheet), Enter ──
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs/tests/overflow.corro");
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let tmp = std::env::temp_dir().join(format!("corro-tab-{}-{}.corro", std::process::id(), id));
+    std::fs::copy(&src, &tmp).expect("copy tab fixture");
+    let mut app = corro::ui::App::new(Some(tmp.clone()));
+    app.load_initial().unwrap();
+    ratatui_send(&mut app, crossterm::event::KeyCode::Char('s'), crossterm::event::KeyModifiers::ALT);
+    ratatui_send(&mut app, crossterm::event::KeyCode::Down, crossterm::event::KeyModifiers::NONE);
+    ratatui_send(&mut app, crossterm::event::KeyCode::Down, crossterm::event::KeyModifiers::NONE);
+    ratatui_send(&mut app, crossterm::event::KeyCode::Enter, crossterm::event::KeyModifiers::NONE);
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal.draw(|f| app.bench_draw(f)).unwrap();
+    let buf = terminal.backend().buffer().clone();
+    let rat_tab: String = (0..120).map(|x| buf[(x, 39)].symbol()).collect();
+    let _ = std::fs::remove_file(&tmp);
+
+    // ── pancurses: M-s, Down Down, Enter ──
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let session = format!("corro-tab-{}-{}", std::process::id(), id);
+    let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
+    let fixture = menu_fixture();
+    tmux::new_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
+    wait_for_text(&session, "[File]");
+    send_settled(&session, "M-s");
+    send_settled(&session, "Down");
+    send_settled(&session, "Down");
+    send_settled(&session, "Enter");
+    // Poll for the tab bar (the new sheet's tab appears after the action).
+    let mut pnc_tab = String::new();
+    for _ in 0..40 {
+        pnc_tab = tmux::capture_pane(&session).lines().nth(39).unwrap_or("").to_string();
+        if pnc_tab.contains("Sheet2") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    tmux::kill_session(&session);
+    // Trailing width-fill differs (ratatui pads with plain spaces; tmux
+    // trims pancurses' styled trailing spaces), so compare the trimmed tab
+    // content — titles, order and inter-tab spacing are the parity surface.
+    assert_eq!(pnc_tab.trim_end(), rat_tab.trim_end(),
+        "tab bar diverges after New sheet\npancurses: |{pnc_tab}|\nratatui:   |{rat_tab}|");
+}
+
 
 /// Reproduce: type AAA, Enter, Up, type BBB, Enter, then move Up/Down.
 /// The displayed value at A1 must be CONSISTENT (not flicker between "AAA" and
