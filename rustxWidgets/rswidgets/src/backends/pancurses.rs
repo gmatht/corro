@@ -923,6 +923,11 @@ mod pancurses_backend {
                     }
                 });
 
+                // Menu-bar bracket tracking: derive the bar line from the
+                // menubar widget (open menu bracketed, first root when
+                // closed) so it matches the ratatui reference. Computed
+                // once per frame outside any state borrow.
+                let menu_bar_text = with_state(|s| derived_menu_bar_text(s));
                 // render
                 for i in 0..with_state(|s| s.nodes.len()) {
                     let (kind, rect, visible, id, focus_id) = with_state(|s| {
@@ -930,7 +935,7 @@ mod pancurses_backend {
                         (n.kind.clone(), n.rect, n.visible, n.id, s.focus_id)
                     });
                     if !visible { continue; }
-                    render_widget(&root, &kind, rect, id, focus_id);
+                    render_widget(&root, &kind, rect, id, focus_id, menu_bar_text.as_deref());
                 }
                 // render active menu dropdown (all open levels: root + submenus)
                 with_state(|state| {
@@ -2362,7 +2367,7 @@ mod pancurses_backend {
         }
     }
 
-    fn render_widget(root: &Window, kind: &PcWidgetKind, rect: Rect, id: usize, focus_id: Option<usize>) {
+    fn render_widget(root: &Window, kind: &PcWidgetKind, rect: Rect, id: usize, focus_id: Option<usize>, menu_bar_text: Option<&str>) {
         match kind {
             PcWidgetKind::Window { title } => {
                 if has_colors() {
@@ -2631,13 +2636,16 @@ mod pancurses_backend {
                 out.push_str(SGR_RESET);
                 let mut row_offset = rect.y;
 
-                // Menu bar: black fg on cyan bg
-                if !menu_text.is_empty() {
+                // Menu bar: black fg on cyan bg. Prefer the widget-derived
+                // line (bracket tracks the open menu); fall back to the
+                // app-set text when no menubar widget exists.
+                let menu_line: &str = menu_bar_text.unwrap_or(menu_text);
+                if !menu_line.is_empty() {
                     let max_chars = rect.w as usize;
-                    let end = menu_text.char_indices().nth(max_chars).map(|(i, _)| i).unwrap_or(menu_text.len());
+                    let end = menu_line.char_indices().nth(max_chars).map(|(i, _)| i).unwrap_or(menu_line.len());
                     out.push_str(&sgr_cup(row_offset, rect.x));
                     out.push_str(sgr_menu_bar());
-                    out.push_str(&menu_text[..end]);
+                    out.push_str(&menu_line[..end]);
                     let remaining = (rect.w as usize).saturating_sub(end);
                     if remaining > 0 {
                         out.push_str(&" ".repeat(remaining));
@@ -3820,6 +3828,46 @@ mod pancurses_backend {
             }
         }
         String::new()
+    }
+
+    /// Menu-bar line derived from the menubar widget: `" [File]  Edit  ..."`
+    /// with the open menu bracketed (first root when closed), matching the
+    /// ratatui `menu_bar_line` layout exactly (`" {a}  {b}  ..."` with each
+    /// item `[Label]` or ` Label `). Returns None when no menubar widget
+    /// exists, in which case callers render the app-set text as before.
+    /// Generic over labels (no app-specific content): any menubar gets
+    /// bracket tracking for free.
+    fn derived_menu_bar_text(state: &PcState) -> Option<String> {
+        let mid = state.menu_bar_id?;
+        let n = state.node(mid)?;
+        if let PcWidgetKind::MenuBar { labels, .. } = &n.kind {
+            if labels.is_empty() {
+                return None;
+            }
+            let active = if state.menu_open {
+                state.active_submenu.min(labels.len() - 1)
+            } else {
+                0
+            };
+            let mut s = String::from(" ");
+            for (i, l) in labels.iter().enumerate() {
+                if i > 0 {
+                    s.push_str("  ");
+                }
+                if i == active {
+                    s.push('[');
+                    s.push_str(l);
+                    s.push(']');
+                } else {
+                    s.push(' ');
+                    s.push_str(l);
+                    s.push(' ');
+                }
+            }
+            Some(s)
+        } else {
+            None
+        }
     }
 
     /// Re-emit SGR for just the two affected item rows when the menu highlight
@@ -5273,10 +5321,11 @@ mod pancurses_backend {
             let sep = '│';
             let mut row = 0usize;
 
-            // Menu bar
-            if !menu_text.is_empty() {
+            // Menu bar (widget-derived when a menubar exists, else app text).
+            let menu_line: String = derived_menu_bar_text(state).unwrap_or_else(|| menu_text.clone());
+            if !menu_line.is_empty() {
                 if row < height {
-                    let display = &menu_text[..menu_text.len().min(width)];
+                    let display = &menu_line[..menu_line.len().min(width)];
                     buf[row] = display.to_string();
                 }
                 row += 1;

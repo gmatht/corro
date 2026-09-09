@@ -1208,6 +1208,65 @@ fn menu_popup_has_border() {
 {}", safe_slice(&pane, 2000));
 }
 
+/// Char index of `needle` inside `hay` (box-drawing chars are multibyte, so
+/// byte indices would miscompare against bar-label columns).
+fn char_idx(hay: &str, needle: &str) -> Option<usize> {
+    let h: Vec<char> = hay.chars().collect();
+    let n: Vec<char> = needle.chars().collect();
+    (0..=h.len().saturating_sub(n.len()))
+        .find(|&i| h[i..i + n.len()] == n[..])
+}
+
+/// Structural rendering parity: the menu-bar bracket tracks the OPEN menu
+/// (not stuck on File), and each popup sits directly beneath its label
+/// (popup left border column == bracket column). Regression: the bar kept
+/// showing `[File]` while another menu was open. Reference: ratatui shows
+/// `  File   [Edit] …` with the popup `┌` under the `[`, and resets to
+/// `[File]` on close.
+#[test]
+fn menu_bar_bracket_tracks_open_menu_and_popup_position() {
+    for (key, label) in [("e", "Edit"), ("s", "Sheet"), ("h", "Help")] {
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let session = format!("corro-bracket-{}-{}", std::process::id(), id);
+        let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
+        let fixture = menu_fixture();
+        tmux::new_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
+        wait_for_text(&session, "[File]");
+        // Atomic chord (see open_root_menu): two sends can exceed the
+        // backend's ESC-letter window and type into the grid instead.
+        send_settled(&session, &format!("M-{key}"));
+        let pane = tmux::capture_pane(&session);
+        let bar = pane.lines().next().unwrap_or("");
+        let bracket = format!("[{label}]");
+        assert!(bar.contains(&bracket),
+            "bar must bracket the open menu ({label})\n--- bar ---\n{bar}");
+        let bx = char_idx(bar, &bracket).expect("bracket present");
+        // Popup top border carries the title (`┌Edit`); find it in the top
+        // rows (never the grid border, which carries no title).
+        let title = format!("┌{label}");
+        let prow = pane.lines().take(4).find(|l| l.contains(&title)).unwrap_or("").to_string();
+        assert!(!prow.is_empty(),
+            "no titled popup top border ({title}) for open menu\n--- pane ---\n{}", safe_slice(&pane, 1000));
+        let px = char_idx(&prow, &title).expect("title present");
+        assert_eq!(px, bx,
+            "popup must sit under its menu label (popup ┌ at col {px}, [{label}] at col {bx})");
+        // Escape closes the menu and the bracket resets to File. Poll for
+        // the reset (capture_settled can return a stale pre-redraw frame).
+        tmux::send_keys(&session, "Escape");
+        let mut bar2 = String::new();
+        for _ in 0..40 {
+            bar2 = tmux::capture_pane(&session).lines().next().unwrap_or("").to_string();
+            if bar2.contains("[File]") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(bar2.contains("[File]"),
+            "bar bracket must reset to [File] after close\n--- bar ---\n{bar2}");
+        tmux::kill_session(&session);
+    }
+}
+
 
 /// Reproduce: type AAA, Enter, Up, type BBB, Enter, then move Up/Down.
 /// The displayed value at A1 must be CONSISTENT (not flicker between "AAA" and
