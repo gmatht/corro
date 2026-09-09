@@ -53,6 +53,39 @@ use std::time::Duration;
 
 static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Serialises the CORRO_IDLE_MARKER handoff between the two walk tests.
+/// `std::env::set_var` is process-global while tests run on parallel
+/// threads: without this lock, walk A could set the var, stall before
+/// spawning, walk B could overwrite it, and A's app would then bind B's
+/// marker file (waits time out despite a healthy app). The marker *files*
+/// are per-test and need no sharing — only the var handoff is critical.
+/// Hold from `set_var` until the first marker lands (proving the app bound
+/// its own file), then drop. Poisoning is tolerated (a dead startup already
+/// fails loudly on its own).
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Poll the pane until it contains `needle` (the app actually rendered it),
+/// instead of sleeping a fixed amount and hoping. Fail-loud on timeout.
+#[track_caller]
+fn wait_for_text(session: &str, needle: &str) {
+    for _ in 0..75 {
+        if tmux::capture_pane(session).contains(needle) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    panic!("timed out waiting for pane to contain {needle:?}\n--- pane ---\n{}", safe_slice(&tmux::capture_pane(session), 1500));
+}
+
+/// Send one key, then wait for the frame it produces to settle (two
+/// consecutive identical captures). Under parallel-tmux load a blind
+/// follow-up key can land mid-render and get swallowed; settling makes
+/// navigation deterministic without fixed sleeps.
+fn send_settled(session: &str, key: &str) {
+    tmux::send_keys(session, key);
+    capture_settled(session, 30);
+}
+
 /// Slice `s` to at most `n` chars, never splitting a UTF-8 codepoint
 /// (the pancurses pane contains multi-byte box-drawing characters).
 fn safe_slice(s: &str, n: usize) -> &str {
@@ -389,27 +422,31 @@ fn menu_fixture() -> String {
 /// Right-navigation from Format would enter the Format->Scope submenu (the
 /// first Format item is a submenu, and Right on a submenu item enters it).
 fn open_root_menu(session: &str, sm: usize) {
-    tmux::send_keys(session, "Escape");
-    std::thread::sleep(Duration::from_millis(120));
+    // Every send is followed by a settle wait: under parallel-tmux load a
+    // blind follow-up key can land mid-render and get swallowed (observed:
+    // activation Enter hitting a half-open popup, silently doing nothing).
+    // The menu-open goes out as ONE atomic tmux invocation (M-<letter>).
+    // Background: the backend treats ESC followed within ~300ms by a letter
+    // as Alt+letter (open menu), but a bare Escape followed later by a letter
+    // as cancel-then-type (the letter lands in the grid!). Two separate sends
+    // can exceed the window under load — and a *preceding* standalone Escape
+    // is actively harmful here (ESC ESC s parses as Alt+Escape, then s types).
+    // Fresh sessions need no dismissal, so there is no leading Escape at all.
     match sm {
-        0 => tmux::send_keys(session, "f"), // File
-        1 => tmux::send_keys(session, "e"), // Edit
-        2 => tmux::send_keys(session, "i"), // Insert
+        0 => send_settled(session, "M-f"), // File
+        1 => send_settled(session, "M-e"), // Edit
+        2 => send_settled(session, "M-i"), // Insert
         3 => { // Format: File -> Edit -> Insert -> Format (Right on action items)
-            tmux::send_keys(session, "f");
-            std::thread::sleep(Duration::from_millis(400));
+            send_settled(session, "M-f");
             for _ in 0..3 {
-                tmux::send_keys(session, "Right");
-                std::thread::sleep(Duration::from_millis(150));
+                send_settled(session, "Right");
             }
-            std::thread::sleep(Duration::from_millis(300));
             return;
         }
-        4 => tmux::send_keys(session, "s"), // Sheet
-        5 => tmux::send_keys(session, "h"), // Help
+        4 => send_settled(session, "M-s"), // Sheet
+        5 => send_settled(session, "M-h"), // Help
         _ => {}
     }
-    std::thread::sleep(Duration::from_millis(400));
 }
 
 /// Open root submenu `sm` (0=File,1=Edit,2=Insert,3=Format,4=Sheet,5=Help)
@@ -417,13 +454,12 @@ fn open_root_menu(session: &str, sm: usize) {
 /// visible while highlighted.  Returns the session name (caller kills it).
 fn walk_menu_items(sm: usize, labels: &[&str]) -> String {
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let session = format!("corro-walk-{}", id);
+    let session = format!("corro-walk-{}-{}", std::process::id(), id);
     let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
     let fixture = menu_fixture();
     tmux::new_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
-    std::thread::sleep(Duration::from_millis(1200));
+    wait_for_text(&session, "[File]");
     open_root_menu(&session, sm);
-    std::thread::sleep(Duration::from_millis(300));
     for (i, &label) in labels.iter().enumerate() {
         // Retry the capture a few times to tolerate transient render delays
         // (e.g. when many tmux sessions contend for the shared server).
@@ -440,8 +476,9 @@ fn walk_menu_items(sm: usize, labels: &[&str]) -> String {
             sm, label, i, safe_slice(&pane, 1500)
         );
         // Highlight the next item so it scrolls into view / is rendered.
-        tmux::send_keys(&session, "Down");
-        std::thread::sleep(Duration::from_millis(120));
+        // Settled (not a fixed sleep): a blind Down into a half-rendered
+        // popup gets swallowed and every later index shifts by one.
+        send_settled(&session, "Down");
     }
     tmux::send_keys(&session, "Escape");
     session
@@ -498,19 +535,16 @@ fn menu_help_items() {
 /// and the app is expected to actually terminate.
 fn activate_menu_item(sm: usize, idx: usize, label: &str, expected: &str, quit: bool) {
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let session = format!("corro-act-{}", id);
+    let session = format!("corro-act-{}-{}", std::process::id(), id);
     let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
     let fixture = menu_fixture();
     tmux::new_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
-    std::thread::sleep(Duration::from_millis(1200));
+    wait_for_text(&session, "[File]");
     open_root_menu(&session, sm);
     for _ in 0..idx {
-        tmux::send_keys(&session, "Down");
-        std::thread::sleep(Duration::from_millis(120));
+        send_settled(&session, "Down");
     }
-    std::thread::sleep(Duration::from_millis(200));
-    tmux::send_keys(&session, "Enter");
-    std::thread::sleep(Duration::from_millis(600));
+    send_settled(&session, "Enter");
     if quit {
         // The app should have terminated (running=false set by the Quit action).
         // The tmux session command ends with `; sleep 2`, so the session lingers
@@ -593,17 +627,16 @@ fn menu_file_parity_with_ratatui() {
         .join("\n");
     let rat_items = extract_popup_items(&rat_render);
 
-    // ── pancurses: Escape, f opens the File menu ──
+    // ── pancurses: Alt+F opens the File menu (atomic M-f chord + settle;
+    // two separate sends can exceed the backend's ~300ms ESC-letter window
+    // under load and the letter gets typed into the grid instead) ──
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let session = format!("corro-parity-{}", id);
+    let session = format!("corro-parity-{}-{}", std::process::id(), id);
     let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
     let fixture = menu_fixture();
     tmux::new_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
-    std::thread::sleep(Duration::from_millis(1200));
-    tmux::send_keys(&session, "Escape");
-    std::thread::sleep(Duration::from_millis(120));
-    tmux::send_keys(&session, "f");
-    std::thread::sleep(Duration::from_millis(400));
+    wait_for_text(&session, "[File]");
+    send_settled(&session, "M-f");
     let pane = tmux::capture_pane(&session);
     tmux::kill_session(&session);
     let pnc_items = extract_popup_items(&pane);
@@ -640,28 +673,21 @@ fn menu_item_activation_smoke() {
 #[test]
 fn menu_export_tsv_writes_file() {
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let session = format!("corro-act-{}", id);
+    let session = format!("corro-act-{}-{}", std::process::id(), id);
     let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
     let fixture = menu_fixture();
     let export_path = std::env::temp_dir().join(format!("corro-export-{}.tsv", std::process::id()));
     let _ = std::fs::remove_file(&export_path);
     tmux::new_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
-    std::thread::sleep(Duration::from_millis(1200));
-    tmux::send_keys(&session, "Escape");
-    std::thread::sleep(Duration::from_millis(120));
-    tmux::send_keys(&session, "f");
-    std::thread::sleep(Duration::from_millis(400));
+    wait_for_text(&session, "[File]");
+    send_settled(&session, "M-f");
     // File -> Export -> TSV: Down to Export (idx 2), Right to enter the
     // submenu, then Enter on TSV (idx 0).
     for _ in 0..2 {
-        tmux::send_keys(&session, "Down");
-        std::thread::sleep(Duration::from_millis(120));
+        send_settled(&session, "Down");
     }
-    std::thread::sleep(Duration::from_millis(200));
-    tmux::send_keys(&session, "Right"); // enter the Export submenu
-    std::thread::sleep(Duration::from_millis(300));
-    tmux::send_keys(&session, "Enter"); // opens the path prompt
-    std::thread::sleep(Duration::from_millis(500));
+    send_settled(&session, "Right"); // enter the Export submenu
+    send_settled(&session, "Enter"); // opens the path prompt
     let pane = tmux::capture_pane(&session);
     assert!(pane.contains("Export TSV:"),
         "Export TSV should open a path prompt
@@ -697,18 +723,16 @@ fn menu_open_loads_file() {
     corro::io::save_workbook(&snap_path, &snap).unwrap();
 
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let session = format!("corro-act-{}", id);
+    let session = format!("corro-act-{}-{}", std::process::id(), id);
     let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
     let fixture = menu_fixture();
     tmux::new_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
-    std::thread::sleep(Duration::from_millis(1200));
-    tmux::send_keys(&session, "Escape");
-    std::thread::sleep(Duration::from_millis(120));
-    tmux::send_keys(&session, "f");
-    std::thread::sleep(Duration::from_millis(400));
+    wait_for_text(&session, "[File]");
+    send_settled(&session, "M-f");
     // Open is the first item (idx 0) — already highlighted.
-    std::thread::sleep(Duration::from_millis(200));
-    tmux::send_keys(&session, "Enter"); // opens the Open-file prompt
+    send_settled(&session, "Enter"); // opens the Open-file prompt
+    // Fixed sleep (not settle): the prompt needs a beat before it routes
+    // typed input (see activate_menu_item_prompt).
     std::thread::sleep(Duration::from_millis(500));
     let path_str = snap_path.to_str().unwrap().to_string();
     for ch in path_str.chars() {
@@ -730,18 +754,21 @@ fn menu_open_loads_file() {
 /// actually ran on the workbook).
 fn activate_menu_item_prompt(sm: usize, idx: usize, label: &str, input: &str, expected: &str) {
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let session = format!("corro-act-{}", id);
+    let session = format!("corro-act-{}-{}", std::process::id(), id);
     let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
     let fixture = menu_fixture();
     tmux::new_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
-    std::thread::sleep(Duration::from_millis(1200));
+    wait_for_text(&session, "[File]");
     open_root_menu(&session, sm);
     for _ in 0..idx {
-        tmux::send_keys(&session, "Down");
-        std::thread::sleep(Duration::from_millis(120));
+        send_settled(&session, "Down");
     }
-    std::thread::sleep(Duration::from_millis(200));
-    tmux::send_keys(&session, "Enter"); // opens the prompt
+    send_settled(&session, "Enter"); // opens the prompt
+    // Fixed sleep here (not settle): the prompt needs a beat after opening
+    // before it routes typed input. Settling on pixels alone returns while
+    // the prompt box is drawn but not yet armed, and the first characters
+    // are silently lost (deterministic failure observed). The sleeps below
+    // are load-independent protocol delays, not render races.
     std::thread::sleep(Duration::from_millis(500));
     for ch in input.chars() {
         tmux::send_keys(&session, &ch.to_string());
@@ -1482,19 +1509,16 @@ fn full_screen_about_dialog_border_exact() {
     terminal.draw(|f| app.bench_draw(f)).unwrap();
     let buf = terminal.backend().buffer().clone();
 
-    // ── pancurses: Escape, h, Enter → About ──
+    // ── pancurses: Alt+H, Enter → About (atomic M-h chord + settle; see
+    // open_root_menu for why two separate sends are wrong here) ──
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let session = format!("corro-fullscr-{}", id);
+    let session = format!("corro-fullscr-{}-{}", std::process::id(), id);
     let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
     let fixture = menu_fixture();
     tmux::new_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
-    std::thread::sleep(Duration::from_millis(1200));
-    tmux::send_keys(&session, "Escape");
-    std::thread::sleep(Duration::from_millis(120));
-    tmux::send_keys(&session, "h");
-    std::thread::sleep(Duration::from_millis(400));
-    tmux::send_keys(&session, "Enter");
-    std::thread::sleep(Duration::from_millis(600));
+    wait_for_text(&session, "[File]");
+    send_settled(&session, "M-h");
+    send_settled(&session, "Enter");
     let pane = tmux::capture_pane(&session);
     tmux::kill_session(&session);
     let _ = std::fs::remove_file(&fixture);
@@ -1527,15 +1551,14 @@ fn full_screen_about_dialog_border_exact() {
 }
 
 /// Drive both backends and compare the full screen after EACH keypress.
-/// NOTE: this test is disabled by marking it `#[ignore]` because it chases a
-/// deep, pre-existing overflow-renderer divergence in the pancurses backend
-/// (a cursor-dependent stale char when a long cell spills into the right
-/// margin) that is unrelated to the dialog-box border regression it was meant
-/// to guard.  The base-grid and About-dialog char-exact tests above ARE the
-/// authoritative, deterministic regressions guards.  Re-enable this once the
-/// overflow renderer is fully converged; until then it is intentionally ignored.
+/// NOTE: this test used to be `#[ignore]`d for a suspected overflow-renderer
+/// divergence, but the actual failure was border op-count staleness: the
+/// commit path wrote the op to the file without re-rendering the border
+/// title, so the counter lagged ratatui by one until the next scroll. Fixed
+/// by refreshing the border title in the commit-edit callback; the walk has
+/// been green since, so the ignore is removed for good (a failing test that
+/// finds broken behavior is a deliverable, not a nuisance).
 #[test]
-#[ignore]
 fn full_screen_shared_session_walk_char_exact() {
     use crossterm::event::KeyCode;
     let keys: &[KeyCode] = &[
@@ -1547,30 +1570,38 @@ fn full_screen_shared_session_walk_char_exact() {
                               "Enter","Left","Up"];
 
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let session = format!("corro-shared-{}", id);
+    let session = format!("corro-shared-{}-{}", std::process::id(), id);
     let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
     let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs/tests/overflow.corro");
-    let shared_tmp = std::env::temp_dir().join(format!("corro-shared-fixture-{}.corro", id));
+    let shared_tmp = std::env::temp_dir().join(format!("corro-shared-fixture-{}-{}.corro", std::process::id(), id));
     std::fs::copy(&src, &shared_tmp).expect("copy shared fixture");
 
     // Idle marker: the app appends a line per redraw, so we can send the next
     // key as soon as the previous frame is fully flushed (no fixed sleeps).
-    let marker = std::env::temp_dir().join(format!("corro-shared-idle-{}.marker", id));
+    let marker = std::env::temp_dir().join(format!("corro-shared-idle-{}-{}.marker", std::process::id(), id));
     let _ = std::fs::remove_file(&marker);
-    std::env::set_var("CORRO_IDLE_MARKER", &marker);
-
-    tmux::new_session(&session, &format!("{} --pancurses {}; sleep 2", bin, shared_tmp.display()));
-    // Wait for the initial redraw before driving keys.
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
-    loop {
-        let count = std::fs::read_to_string(&marker).map(|s| s.lines().count()).unwrap_or(0);
-        if count >= 1 { break; }
-        if std::time::Instant::now() > deadline {
-            tmux::kill_session(&session);
-            panic!("walk: pancurses did not produce the initial redraw marker");
+    // Hold ENV_LOCK from set_var until the first marker lands: the var is
+    // process-global and the pseudorandom walk sets it too. Without the
+    // lock this app could bind the other walk's marker file. Startup is
+    // retried like the pseudorandom walk (slow start under parallel load).
+    let env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut started = false;
+    for _attempt in 0..3 {
+        std::env::set_var("CORRO_IDLE_MARKER", &marker);
+        tmux::new_session(&session, &format!("{} --pancurses {}; sleep 2", bin, shared_tmp.display()));
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let count = std::fs::read_to_string(&marker).map(|s| s.lines().count()).unwrap_or(0);
+            if count >= 1 { started = true; break; }
+            if std::time::Instant::now() > deadline { break; }
+            std::thread::sleep(Duration::from_millis(50));
         }
-        std::thread::sleep(Duration::from_millis(5));
+        if started { break; }
+        tmux::kill_session(&session);
+        std::thread::sleep(Duration::from_millis(500));
     }
+    drop(env_guard);
+    assert!(started, "walk: pancurses did not produce the initial redraw marker (3 attempts)");
 
     // ratatui app advanced in lockstep, loading the SAME fixture file so the
     // formula-bar loaded path matches.
@@ -1636,7 +1667,7 @@ fn pseudorandom_walk_matches_ratatui() {
 
     // ── pancurses (tmux) ──
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let session = format!("corro-walk-{}", id);
+    let session = format!("corro-walk-{}-{}", std::process::id(), id);
     let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
     let fixture = menu_fixture();
     // Idle marker: the app appends a line to this file after every redraw, so we
@@ -1645,6 +1676,9 @@ fn pseudorandom_walk_matches_ratatui() {
     // app can keep up, and removes the parallel-tmux timing flakiness.
     let marker = std::env::temp_dir().join(format!("corro-idle-{}-{}.marker", std::process::id(), id));
     let _ = std::fs::remove_file(&marker);
+    // Same ENV_LOCK protocol as the shared walk (see above): hold from
+    // set_var until this app binds its own marker file.
+    let env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     std::env::set_var("CORRO_IDLE_MARKER", &marker);
     // Start the app and wait for the initial redraw marker.  Under parallel-tmux
     // load a session can fail to start, so retry a few times.
@@ -1666,6 +1700,7 @@ fn pseudorandom_walk_matches_ratatui() {
         std::thread::sleep(Duration::from_millis(500));
     }
     assert!(started, "pancurses app did not start (idle marker never appeared)");
+    drop(env_guard);
     let mut pnc_addrs: Vec<(String, String)> = Vec::new();
     for (i, key) in pnc_keys.iter().enumerate() {
         tmux::send_keys(&session, key);

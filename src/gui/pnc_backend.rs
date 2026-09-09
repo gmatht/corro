@@ -868,6 +868,8 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // the RAW value in the cells HashMap, but display text must be aligned).
     let commit_sheet = spreadsheet.clone();
     let app_ptr_ce = app_ptr;
+    // Widget id for the post-commit border refresh below.
+    let sid_ce = sid;
     add_commit_edit_callback(move |display_row, col, value| {
         let app = app_from_raw(app_ptr_ce);
         let dr = display_rows_for_ce.borrow();
@@ -882,6 +884,19 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         // Commit the edited value to the workbook via the shared helper
         // (logs to the live .corro file when one is open, else applies in-memory).
         commit_cell(app, addr, value);
+        // Refresh the border op-count so the screen reflects the commit
+        // immediately. Without this the border keeps showing the pre-commit
+        // op count until the next scroll-driven viewport recompute.
+        // Border-only by design: a full viewport refill must not run inside
+        // the deferred commit drain (it stalls the main loop there), and a
+        // cell commit touches neither row labels, column layout nor tabs.
+        // Dims come straight from the grid, mirroring initial setup.
+        {
+            let sheet = app.core.workbook.active_sheet();
+            let (mr, mc) = (sheet.grid.main_rows(), sheet.grid.main_cols());
+            let total_ops = app.core.ops_applied;
+            spreadsheet_set_border_title(sid_ce, &format!("corro  {mr}r × {mc}c  ops {total_ops}"));
+        }
         // Re-align the committed cell's display text (spreadsheet_commit_edit
         // stored the raw value, but we need the aligned version).
         let rec = app.core.workbook.active_sheet().clone();
