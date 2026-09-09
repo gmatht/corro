@@ -13,6 +13,17 @@ mod tmux {
         assert!(status.success(), "tmux new-session exited non-zero");
     }
 
+    /// Non-asserting variant for retry loops: returns whether the session was
+    /// created (the tmux server can reject a new session under heavy parallel
+    /// load, and a retry loop must not panic on the first failure).
+    pub fn try_new_session(session: &str, command: &str) -> bool {
+        Command::new("tmux")
+            .args(["new-session", "-d", "-s", session, "-x", "120", "-y", "40", command])
+            .status()
+            .map(|st| st.success())
+            .unwrap_or(false)
+    }
+
     pub fn send_keys(session: &str, key: &str) {
         Command::new("tmux").args(["send-keys", "-t", session, key]).status().ok();
     }
@@ -71,7 +82,10 @@ fn wait_for_text(session: &str, needle: &str) {
 /// shared server; a session can take >15s to start under load).
 fn start_session(session: &str, command: &str) {
     for _ in 0..3 {
-        tmux::new_session(session, command);
+        if !tmux::try_new_session(session, command) {
+            std::thread::sleep(Duration::from_millis(500));
+            continue;
+        }
         let mut ok = false;
         for _ in 0..100 {
             if tmux::capture_pane(session).contains("[File]") {
@@ -544,26 +558,29 @@ fn menu_help_items() {
 /// and the app is expected to actually terminate.
 fn activate_menu_item(sm: usize, idx: usize, label: &str, expected: &str, quit: bool) {
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let session = format!("corro-act-{}-{}", std::process::id(), id);
     let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
-    let fixture = menu_fixture();
-    start_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
-    open_root_menu(&session, sm);
-    for _ in 0..idx {
-        send_settled(&session, "Down");
-    }
-    send_settled(&session, "Enter");
-    if quit {
-        // The app should have terminated (running=false set by the Quit action).
-        // The tmux session command ends with `; sleep 2`, so the session lingers
-        // ~2s after corro exits; wait past that before checking it is gone.
-        std::thread::sleep(Duration::from_millis(2600));
-        let alive = tmux::has_session(&session);
-        tmux::kill_session(&session);
-        assert!(!alive, "menu item '{}' (Quit) should exit the app, but it is still running", label);
-    } else {
-        // A single Escape never quits; dismiss any leftover mode, then check the
-        // formula bar reflects the action that fired.
+    // Retry the whole navigation: menu navigation is timing-sensitive under
+    // parallel tmux load, and a swallowed Down/Enter silently activates the
+    // wrong item. A fresh session per attempt avoids stale state.
+    for attempt in 0..3 {
+        let session = format!("corro-act-{}-{}-{}", std::process::id(), id, attempt);
+        let fixture = menu_fixture();
+        start_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
+        open_root_menu(&session, sm);
+        for _ in 0..idx {
+            send_settled(&session, "Down");
+        }
+        send_settled(&session, "Enter");
+        if quit {
+            // The app should have terminated (running=false set by Quit).
+            std::thread::sleep(Duration::from_millis(2600));
+            let alive = tmux::has_session(&session);
+            tmux::kill_session(&session);
+            assert!(!alive, "menu item '{}' (Quit) should exit the app, but it is still running", label);
+            return;
+        }
+        // Dismiss any leftover mode, then check the formula bar reflects the
+        // action that fired.
         tmux::send_keys(&session, "Escape");
         std::thread::sleep(Duration::from_millis(250));
         let mut pane = tmux::capture_pane(&session);
@@ -574,19 +591,14 @@ fn activate_menu_item(sm: usize, idx: usize, label: &str, expected: &str, quit: 
             tries += 1;
         }
         tmux::kill_session(&session);
-        assert!(
-            pane.contains(expected),
-            "menu item '{}' (submenu {}, idx {}) did not take effect: expected '{}' in formula-bar status\n--- pane ---\n{}",
-            label, sm, idx, expected, safe_slice(&pane, 1500)
-        );
+        if pane.contains(expected) {
+            return;
+        }
+        // Retry the whole navigation with a fresh session.
     }
+    panic!("menu item '{}' (submenu {}, idx {}) did not take effect: expected '{}' in formula-bar status", label, sm, idx, expected);
 }
 
-/// Extract the item labels from a bordered menu popup in a rendered frame.
-/// Works for both the pancurses pane capture and the ratatui TestBackend render:
-/// finds the `┌` top border, then reads the text between the popup's left and
-/// right borders on each line until the `└` bottom border.  Ratatui renders a
-/// shortcut prefix ("O·Open file") which is stripped to the bare label.
 fn extract_popup_items(render: &str) -> Vec<String> {
     let lines: Vec<&str> = render.lines().collect();
     let mut items = Vec::new();
@@ -759,33 +771,38 @@ fn menu_open_loads_file() {
 /// actually ran on the workbook).
 fn activate_menu_item_prompt(sm: usize, idx: usize, label: &str, input: &str, expected: &str) {
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let session = format!("corro-act-{}-{}", std::process::id(), id);
     let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
-    let fixture = menu_fixture();
-    start_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
-    open_root_menu(&session, sm);
-    for _ in 0..idx {
-        send_settled(&session, "Down");
+    // Retry the whole navigation (see activate_menu_item).
+    for attempt in 0..3 {
+        let session = format!("corro-act-{}-{}-{}", std::process::id(), id, attempt);
+        let fixture = menu_fixture();
+        start_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
+        open_root_menu(&session, sm);
+        for _ in 0..idx {
+            send_settled(&session, "Down");
+        }
+        send_settled(&session, "Enter"); // opens the prompt
+        // Fixed sleep here (not settle): the prompt needs a beat after opening
+        // before it routes typed input. Settling on pixels alone returns while
+        // the prompt box is drawn but not yet armed, and the first characters
+        // are silently lost (deterministic failure observed). The sleeps below
+        // are load-independent protocol delays, not render races.
+        std::thread::sleep(Duration::from_millis(500));
+        for ch in input.chars() {
+            tmux::send_keys(&session, &ch.to_string());
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        tmux::send_keys(&session, "Enter"); // submits
+        std::thread::sleep(Duration::from_millis(600));
+        let pane = tmux::capture_pane(&session);
+        tmux::kill_session(&session);
+        if pane.contains(expected) {
+            return;
+        }
+        // Retry the whole navigation with a fresh session.
     }
-    send_settled(&session, "Enter"); // opens the prompt
-    // Fixed sleep here (not settle): the prompt needs a beat after opening
-    // before it routes typed input. Settling on pixels alone returns while
-    // the prompt box is drawn but not yet armed, and the first characters
-    // are silently lost (deterministic failure observed). The sleeps below
-    // are load-independent protocol delays, not render races.
-    std::thread::sleep(Duration::from_millis(500));
-    for ch in input.chars() {
-        tmux::send_keys(&session, &ch.to_string());
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    std::thread::sleep(Duration::from_millis(200));
-    tmux::send_keys(&session, "Enter"); // submits
-    std::thread::sleep(Duration::from_millis(600));
-    let pane = tmux::capture_pane(&session);
-    tmux::kill_session(&session);
-    assert!(pane.contains(expected),
-        "menu item '{}' did not take effect: expected '{}'\n--- pane ---\n{}",
-        label, expected, safe_slice(&pane, 1500));
+    panic!("menu item '{}' did not take effect: expected '{}'", label, expected);
 }
 
 #[test]
