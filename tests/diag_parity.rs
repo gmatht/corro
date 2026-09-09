@@ -57,20 +57,6 @@ fn send_settled(session: &str, key: &str) {
     }
 }
 
-/// Copy an in-repo fixture to a unique temp file (the pancurses backend
-/// writes commits through to the open file, so never open a checked-in
-/// fixture in place).
-fn fixture_temp_copy(rel: &str) -> String {    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let src = manifest.join(rel);
-    let dst = std::env::temp_dir().join(format!(
-        "diagp-{}-{}.corro",
-        std::process::id(),
-        COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-    ));
-    std::fs::copy(&src, &dst).expect("copy fixture to temp");
-    dst.to_string_lossy().to_string()
-}
-
 /// Map the Alt-letter to the root menu title (for popup-title waits).
 fn menu_title(alt: &str) -> &'static str {
     match alt {
@@ -112,34 +98,50 @@ const ITEMS: &[(&str, usize, &str)] = &[
 fn diag_parity() {
     let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs/tests/overflow.corro");
     for &(alt, idx, label) in ITEMS {
-        // ── ratatui reference ──
-        let tmp = std::env::temp_dir().join(format!("diagp-rt-{}-{}.corro", std::process::id(), idx));
+        // One shared temp fixture per item so the "Loaded workbook {path}"
+        // status is identical in both backends (a path difference is a test
+        // artifact, not a parity signal).
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let tmp = std::env::temp_dir().join(format!("diagp-{}-{}.corro", std::process::id(), id));
         std::fs::copy(&src, &tmp).ok();
+
+        // ── ratatui reference ──
         let mut app = corro::ui::App::new(Some(tmp.clone()));
         app.load_initial().unwrap();
         ratatui_send(&mut app, crossterm::event::KeyCode::Char(alt.chars().next().unwrap()), crossterm::event::KeyModifiers::ALT);
         for _ in 0..idx { ratatui_send(&mut app, crossterm::event::KeyCode::Down, crossterm::event::KeyModifiers::NONE); }
         ratatui_send(&mut app, crossterm::event::KeyCode::Enter, crossterm::event::KeyModifiers::NONE);
         let rat_row1 = ratatui_row1(&mut app);
-        let _ = std::fs::remove_file(&tmp);
 
         // ── pancurses (atomic M-letter chord + settle; see open_root_menu) ──
-        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let session = format!("diagp-{}-{}", std::process::id(), id);
         let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
-        let fixture = fixture_temp_copy("docs/tests/overflow.corro");
-        tmux::new_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
+        tmux::new_session(&session, &format!("{} --pancurses {}; sleep 2", bin, tmp.display()));
         wait_for_text(&session, "[File]");
         send_settled(&session, &format!("M-{alt}"));
         // Wait for the popup to actually open (send_settled can return before
         // the menu is interactive; a blind Enter then gets swallowed).
         let popup_title = format!("┌{}", menu_title(alt));
         wait_for_text(&session, &popup_title);
+        // Settle once more so the popup is fully interactive before Enter.
+        send_settled(&session, "Escape");
+        send_settled(&session, &format!("M-{alt}"));
+        wait_for_text(&session, &popup_title);
         for _ in 0..idx { send_settled(&session, "Down"); }
         send_settled(&session, "Enter");
-        let pane = tmux::capture_pane(&session);
+        // Wait for the popup to close (the action fires and the popup close
+        // redraw can lag the capture; a stale popup-open frame is a test
+        // artifact, not a parity signal).
+        let mut pane = String::new();
+        for _ in 0..40 {
+            pane = tmux::capture_pane(&session);
+            if !pane.contains(&popup_title) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
         tmux::kill_session(&session);
-        let _ = std::fs::remove_file(&fixture);
+        let _ = std::fs::remove_file(&tmp);
         let pnc_row1 = pane.lines().nth(1).unwrap_or("").to_string();
 
         let rat_trim: String = rat_row1.trim().to_string();

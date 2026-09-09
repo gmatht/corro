@@ -27,6 +27,23 @@ pub fn commit_cell(app: &mut App, addr: CellAddr, value: String) {
     }
 }
 
+/// Apply a single sheet op to the active sheet, committing to the live file
+/// when one is open (matching ratatui's commit_workbook_op path).
+pub fn apply_sheet_op(app: &mut App, op: Op) {
+    let sheet_id = app.core.workbook.sheet_id(app.core.workbook.active_sheet);
+    let wbo = WorkbookOp::SheetOp { sheet_id, op };
+    if let Some(ref p) = app.core.path.clone() {
+        let mut active_sheet = sheet_id;
+        let _ = crate::io::commit_workbook_op(
+            p, &mut app.core.offset, &mut app.core.workbook, &mut active_sheet, &wbo,
+        );
+        app.core.ops_applied = app.core.ops_applied.saturating_add(1);
+    } else {
+        let mut active = sheet_id;
+        let _ = crate::ops::apply_workbook_op(&mut app.core.workbook, &mut active, wbo);
+    }
+}
+
 /// Simple A1-style label for a main cell (column letters + 1-indexed row).
 pub fn main_addr_label(row: u32, col: u32) -> String {
     let mut name = String::new();
@@ -161,6 +178,10 @@ pub enum MenuDispatch {
     Status(String),
     /// Backend should open a text prompt with (label, action name).
     Prompt(&'static str, &'static str),
+    /// Backend should enter edit mode on the cursor cell with `value` as the
+    /// in-progress buffer (matching ratatui's start_edit_mode actions such as
+    /// Insert Date / Insert Time).
+    Edit { value: String },
     /// Render the About dialog (backend-specific); show `status`.
     About { status: String },
     /// Render the Full-help dialog (backend-specific); show `status`.
@@ -201,8 +222,22 @@ pub fn dispatch_menu_action(
             }
         }
         "insert_rows" => {
-            app.core.workbook.active_sheet_mut().grid.grow_main_row_at_bottom();
-            MenuDispatch::Status("Inserted row".into())
+            // Insert a blank row ABOVE the cursor (matching ratatui's
+            // insert_rows_above_cursor): grow the grid, then move the rows
+            // below the cursor down to make room. Status text matches.
+            let original_main_rows = app.core.workbook.active_sheet().grid.main_rows() as u32;
+            let row = main_row;
+            if (row as usize) < original_main_rows as usize {
+                let main_cols = app.core.workbook.active_sheet().grid.main_cols() as u32;
+                apply_sheet_op(app, Op::SetMainSize { main_rows: original_main_rows + 1, main_cols });
+                apply_sheet_op(app, Op::MoveRowRange { from: row, count: original_main_rows - row, to: original_main_rows + 1 });
+                app.core.cursor = SheetCursor { row: hr + row as usize, col: app.core.cursor.col };
+                MenuDispatch::Status(format!("Inserted 1 row above row {row}"))
+            } else {
+                // Cursor outside the main band: fall back to a plain grow.
+                app.core.workbook.active_sheet_mut().grid.grow_main_row_at_bottom();
+                MenuDispatch::Status("Inserted row".into())
+            }
         }
         "insert_mitosis_row" => {
             // Mitosis COPIES the cursor's main row into a new row below it
@@ -236,8 +271,22 @@ pub fn dispatch_menu_action(
             }
         }
         "insert_cols" => {
-            app.core.workbook.active_sheet_mut().grid.grow_main_col_at_right();
-            MenuDispatch::Status("Inserted column".into())
+            // Insert a blank column LEFT of the cursor (matching ratatui's
+            // insert_cols_left_of_cursor): grow the grid, then move the
+            // columns right of the cursor right to make room.
+            let original_main_cols = app.core.workbook.active_sheet().grid.main_cols() as u32;
+            let col = main_col;
+            if (col as usize) < original_main_cols as usize {
+                let main_rows = app.core.workbook.active_sheet().grid.main_rows() as u32;
+                apply_sheet_op(app, Op::SetMainSize { main_rows, main_cols: original_main_cols + 1 });
+                apply_sheet_op(app, Op::MoveColRange { from: col, count: original_main_cols - col, to: original_main_cols + 1 });
+                app.core.cursor = SheetCursor { row: app.core.cursor.row, col: lm + col as usize };
+                MenuDispatch::Status(format!("Inserted 1 column left of column {col}"))
+            } else {
+                // Cursor outside the main band: fall back to a plain grow.
+                app.core.workbook.active_sheet_mut().grid.grow_main_col_at_right();
+                MenuDispatch::Status("Inserted column".into())
+            }
         }
         "insert_mitosis_col" => {
             // Mitosis COPIES the cursor's main column into a new column to its
@@ -268,14 +317,17 @@ pub fn dispatch_menu_action(
             }
         }
         "insert_date" => {
+            // Enter edit mode with the date as the in-progress buffer,
+            // matching ratatui's InsertDate (start_edit_mode). The user
+            // presses Enter to commit.
             let d = chrono::Local::now().format("%Y-%m-%d").to_string();
-            commit_cell(app, addr.clone(), d.clone());
-            MenuDispatch::Status(format!("Inserted date {d} at {}", main_addr_label(main_row, main_col)))
+            MenuDispatch::Edit { value: d }
         }
         "insert_time" => {
+            // Enter edit mode with the time as the in-progress buffer,
+            // matching ratatui's InsertTime.
             let t = chrono::Local::now().format("%H:%M:%S").to_string();
-            commit_cell(app, addr.clone(), t.clone());
-            MenuDispatch::Status(format!("Inserted time {t} at {}", main_addr_label(main_row, main_col)))
+            MenuDispatch::Edit { value: t }
         }
         "delete_cell" | "delete" => {
             commit_cell(app, addr.clone(), String::new());
@@ -364,9 +416,11 @@ pub fn dispatch_menu_action(
                 app.core.workbook.active_sheet = next;
                 app.core.view_sheet_id = app.core.workbook.sheet_id(next);
                 app.core.cursor = SheetCursor { row: HEADER_ROWS, col: MARGIN_COLS };
-                MenuDispatch::Status(format!("Sheet: {}", app.core.workbook.sheet_title(next)))
+                MenuDispatch::Status(format!("Sheet {} of {}", next + 1, n))
             } else {
-                MenuDispatch::Status("Only one sheet".into())
+                // Single sheet: no-op, keep the current status (matching
+                // ratatui's switch_sheet early return).
+                MenuDispatch::Status(String::new())
             }
         }
         "move_sheet" => {

@@ -615,6 +615,12 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         };
         match result {
             MenuDispatch::Status(s) => apply_status(&s),
+            MenuDispatch::Edit { value } => {
+                // Enter edit mode on the cursor cell with `value` as the
+                // in-progress buffer (matching ratatui's start_edit_mode for
+                // Insert Date / Insert Time). The user presses Enter to commit.
+                menu_ss.set_editing(true, &value, value.len());
+            }
             MenuDispatch::Prompt(label, action) => {
                 rswidgets::backends::pancurses::set_prompt(label, action);
             }

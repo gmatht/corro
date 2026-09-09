@@ -651,7 +651,7 @@ fn menu_item_activation_smoke() {
     // Each call asserts the action actually fired (status appears in the formula bar)
     // rather than the menu silently closing. This verifies menu items really work,
     // not just that the app survives.
-    activate_menu_item(2, 0, "Rows", "Inserted row", false);
+    activate_menu_item(2, 0, "Rows", "Inserted 1 row above row 0", false);
     activate_menu_item(5, 0, "About", "About", false);
     activate_menu_item(3, 3, "Reset", "Format reset", false);
     activate_menu_item(1, 0, "Cut", "Cut A1", false);
@@ -775,8 +775,10 @@ fn activate_menu_item_prompt(sm: usize, idx: usize, label: &str, input: &str, ex
 
 #[test]
 fn menu_insert_date() {
-    // Insert -> Date: writes the current date into the cursor cell.
-    activate_menu_item(2, 5, "Date", "Inserted date", false);
+    // Insert -> Date: enters edit mode with the current date as the buffer
+    // (matching ratatui). The formula bar shows the date being edited.
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    activate_menu_item(2, 5, "Date", &today, false);
 }
 
 #[test]
@@ -1047,22 +1049,20 @@ fn help_full_parity_with_ratatui() {
 #[test]
 fn menu_insert_date_shows_cell_immediately() {
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let session = format!("corro-date-{}", id);
+    let session = format!("corro-date-{}-{}", std::process::id(), id);
     let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
     let fixture = menu_fixture();
     tmux::new_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
-    std::thread::sleep(Duration::from_millis(1200));
+    wait_for_text(&session, "[File]");
     // Insert menu (Alt+I), Date is item index 5.
-    tmux::send_keys(&session, "Escape");
-    std::thread::sleep(Duration::from_millis(120));
-    tmux::send_keys(&session, "i");
-    std::thread::sleep(Duration::from_millis(400));
+    send_settled(&session, "M-i");
+    wait_for_text(&session, "┌Insert");
     for _ in 0..5 {
-        tmux::send_keys(&session, "Down");
-        std::thread::sleep(Duration::from_millis(120));
+        send_settled(&session, "Down");
     }
-    tmux::send_keys(&session, "Enter");
-    std::thread::sleep(Duration::from_millis(600));
+    send_settled(&session, "Enter"); // activates Date -> enters edit mode
+    // The date is now the in-progress edit buffer; Enter commits it.
+    send_settled(&session, "Enter");
     let pane = tmux::capture_pane(&session);
     tmux::kill_session(&session);
     // The cursor cell is A1, whose old value is "Hello World!".  The grid row
