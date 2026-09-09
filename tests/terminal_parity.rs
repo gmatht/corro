@@ -53,17 +53,6 @@ use std::time::Duration;
 
 static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Serialises the CORRO_IDLE_MARKER handoff between the two walk tests.
-/// `std::env::set_var` is process-global while tests run on parallel
-/// threads: without this lock, walk A could set the var, stall before
-/// spawning, walk B could overwrite it, and A's app would then bind B's
-/// marker file (waits time out despite a healthy app). The marker *files*
-/// are per-test and need no sharing — only the var handoff is critical.
-/// Hold from `set_var` until the first marker lands (proving the app bound
-/// its own file), then drop. Poisoning is tolerated (a dead startup already
-/// fails loudly on its own).
-static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 /// Poll the pane until it contains `needle` (the app actually rendered it),
 /// instead of sleeping a fixed amount and hoping. Fail-loud on timeout.
 #[track_caller]
@@ -1580,15 +1569,16 @@ fn full_screen_shared_session_walk_char_exact() {
     // key as soon as the previous frame is fully flushed (no fixed sleeps).
     let marker = std::env::temp_dir().join(format!("corro-shared-idle-{}-{}.marker", std::process::id(), id));
     let _ = std::fs::remove_file(&marker);
-    // Hold ENV_LOCK from set_var until the first marker lands: the var is
-    // process-global and the pseudorandom walk sets it too. Without the
-    // lock this app could bind the other walk's marker file. Startup is
-    // retried like the pseudorandom walk (slow start under parallel load).
-    let env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // The marker path goes on the session command line (`VAR=path app ...`),
+    // NOT via std::env::set_var: tmux sessions inherit the long-lived
+    // SERVER's environment, not the spawning test process's, so a set_var
+    // before spawn is silently ignored whenever the server predates it
+    // (observed: healthy app, zero markers in the expected file). A shell
+    // assignment prefix is evaluated in-session and always wins.
+    // Startup is retried like the pseudorandom walk (slow start in parallel).
     let mut started = false;
     for _attempt in 0..3 {
-        std::env::set_var("CORRO_IDLE_MARKER", &marker);
-        tmux::new_session(&session, &format!("{} --pancurses {}; sleep 2", bin, shared_tmp.display()));
+        tmux::new_session(&session, &format!("CORRO_IDLE_MARKER={} {} --pancurses {}; sleep 2", marker.display(), bin, shared_tmp.display()));
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
             let count = std::fs::read_to_string(&marker).map(|s| s.lines().count()).unwrap_or(0);
@@ -1600,8 +1590,10 @@ fn full_screen_shared_session_walk_char_exact() {
         tmux::kill_session(&session);
         std::thread::sleep(Duration::from_millis(500));
     }
-    drop(env_guard);
-    assert!(started, "walk: pancurses did not produce the initial redraw marker (3 attempts)");
+    if !started {
+        tmux::kill_session(&session);
+        panic!("walk: pancurses did not produce the initial redraw marker (3 attempts)");
+    }
 
     // ratatui app advanced in lockstep, loading the SAME fixture file so the
     // formula-bar loaded path matches.
@@ -1676,15 +1668,14 @@ fn pseudorandom_walk_matches_ratatui() {
     // app can keep up, and removes the parallel-tmux timing flakiness.
     let marker = std::env::temp_dir().join(format!("corro-idle-{}-{}.marker", std::process::id(), id));
     let _ = std::fs::remove_file(&marker);
-    // Same ENV_LOCK protocol as the shared walk (see above): hold from
-    // set_var until this app binds its own marker file.
-    let env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::set_var("CORRO_IDLE_MARKER", &marker);
+    // Marker path goes on the command line (see shared walk above): tmux
+    // sessions inherit the server environment, not set_var from this process.
+    let marker_arg = format!("CORRO_IDLE_MARKER={}", marker.display());
     // Start the app and wait for the initial redraw marker.  Under parallel-tmux
     // load a session can fail to start, so retry a few times.
     let mut started = false;
     for _attempt in 0..3 {
-        tmux::new_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
+        tmux::new_session(&session, &format!("{} {} --pancurses {}; sleep 2", marker_arg, bin, fixture));
         std::thread::sleep(Duration::from_millis(2000));
         if tmux::has_session(&session) {
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -1700,7 +1691,6 @@ fn pseudorandom_walk_matches_ratatui() {
         std::thread::sleep(Duration::from_millis(500));
     }
     assert!(started, "pancurses app did not start (idle marker never appeared)");
-    drop(env_guard);
     let mut pnc_addrs: Vec<(String, String)> = Vec::new();
     for (i, key) in pnc_keys.iter().enumerate() {
         tmux::send_keys(&session, key);

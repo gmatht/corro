@@ -1422,12 +1422,16 @@ fn pseudorandom_walk_matches_ratatui() {
     // app can keep up, and removes the parallel-tmux timing flakiness.
     let marker = std::env::temp_dir().join(format!("corro-idle-{}-{}.marker", std::process::id(), id));
     let _ = std::fs::remove_file(&marker);
-    std::env::set_var("CORRO_IDLE_MARKER", &marker);
+    // Marker path goes on the command line, NOT via set_var: tmux sessions
+    // inherit the long-lived server environment, not this process's, so a
+    // set_var before spawn is silently ignored whenever the server predates
+    // it (healthy app, zero markers in the expected file).
+    let marker_arg = format!("CORRO_IDLE_MARKER={}", marker.display());
     // Start the app and wait for the initial redraw marker.  Under parallel-tmux
     // load a session can fail to start, so retry a few times.
     let mut started = false;
     for _attempt in 0..3 {
-        tmux::new_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
+        tmux::new_session(&session, &format!("{} {} --pancurses {}; sleep 2", marker_arg, bin, fixture));
         std::thread::sleep(Duration::from_millis(2000));
         if tmux::has_session(&session) {
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
