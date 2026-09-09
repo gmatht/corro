@@ -27,7 +27,7 @@ android {
 
     sourceSets {
         getByName("main") {
-            jniLibs.srcDirs("../../../rustxwidgets/target/x86_64-linux-android/release/")
+            jniLibs.srcDirs("../../../rswidgets/target/x86_64-linux-android/release/")
         }
     }
 }

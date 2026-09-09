@@ -6,8 +6,8 @@ fn main() {
 
 #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
 fn gtk_main() -> Result<(), Box<dyn std::error::Error>> {
-    use rustxwidgets::prelude::*;
-    use rustxwidgets::backends_gtk_adapter as gtk;
+    use rswidgets::prelude::*;
+    use rswidgets::backends_gtk_adapter as gtk;
     use std::rc::Rc;
     use std::cell::RefCell;
 
@@ -23,7 +23,7 @@ fn gtk_main() -> Result<(), Box<dyn std::error::Error>> {
             rows.push(r);
         }
 
-        rustxwidgets::overflow::compute_spans_from_model(&rows, per_cell_px, |widget_key, s| {
+        rswidgets::overflow::compute_spans_from_model(&rows, per_cell_px, |widget_key, s| {
             let ptr = widget_key as *mut std::os::raw::c_void;
             unsafe { gtk_dynamic_loader::measure_text_px(loader, Some(ptr), s) }
         })
@@ -67,11 +67,11 @@ fn gtk_main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--prefer-gtk3" || a == "-3") { std::env::set_var("GTK_DLOPEN_PREFER_GTK3", "1"); }
-    let loader = match rustxwidgets::backends::gtk::loader() {
+    let loader = match rswidgets::backends::gtk::loader() {
         Some(l) => l,
         None => {
             let _ = App::init()?;
-            rustxwidgets::backends::gtk::loader().expect("GTK loader not initialized after App::init")
+            rswidgets::backends::gtk::loader().expect("GTK loader not initialized after App::init")
         }
     };
 
@@ -80,7 +80,7 @@ fn gtk_main() -> Result<(), Box<dyn std::error::Error>> {
     let win = app.create_window()?; win.set_title("Spreadsheet-like overflow demo");
 
     let grid_widget = gtk::create_grid()?;
-    let overlay = gtk_dynamic_loader::Overlay::new(rustxwidgets::backends::gtk::loader().expect("loader"))?;
+    let overlay = gtk_dynamic_loader::Overlay::new(rswidgets::backends::gtk::loader().expect("loader"))?;
     overlay.add_main_child(&grid_widget);
     for c in 0..COLS { let header = app.create_label(&format!("{}", (b'A' + (c as u8)) as char))?; header.set_text(&format!("{}", (b'A' + (c as u8)) as char)); grid_widget.attach(&header, (c+1) as i32, 0, 1, 1); }
 
@@ -139,7 +139,7 @@ fn gtk_main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    if let Some(loader2) = rustxwidgets::backends::gtk::loader() {
+    if let Some(loader2) = rswidgets::backends::gtk::loader() {
         let css = r#"
         label.rwx-overlay { background-color: transparent; padding: 2px; }
         "#;

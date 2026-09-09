@@ -6,13 +6,13 @@ fn main() {
 
 #[cfg(target_arch = "wasm32")]
 fn wasm_main() {
-    use rustxwidgets::prelude::*;
+    use rswidgets::prelude::*;
     use std::rc::Rc;
     use std::cell::RefCell;
 
     let app = App::init().expect("init");
     let win = app.create_window().expect("window");
-    win.set_title("rustxwidgets WASM demo");
+    win.set_title("rswidgets WASM demo");
 
     let hbox = app.create_box(Orientation::Horizontal, 6).expect("box");
     let label = app.create_label("Count: 0").expect("label");

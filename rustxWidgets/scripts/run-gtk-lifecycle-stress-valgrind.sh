@@ -14,7 +14,7 @@ PREFER_GTK3="${PREFER_GTK3:-1}"
 # smoke envelope; larger step counts are useful for bug-finding but can hit
 # known GTK3 lifecycle crashes before memory diagnostics complete.
 
-cargo build -p rustxwidgets --example gtk-lifecycle-stress --manifest-path "$ROOT_DIR/Cargo.toml"
+cargo build -p rswidgets --example gtk-lifecycle-stress --manifest-path "$ROOT_DIR/Cargo.toml"
 
 cmd=(
     valgrind

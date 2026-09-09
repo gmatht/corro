@@ -9,16 +9,16 @@ fn main() {
 
 #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
 fn demo_main() -> Result<(), Box<dyn std::error::Error>> {
-    use rustxwidgets::prelude::*;
+    use rswidgets::prelude::*;
     use std::rc::Rc;
     use std::cell::RefCell;
 
     let app = App::init()?;
     let win = app.create_window()?;
-    win.set_title("Rust rustxwidgets demo");
+    win.set_title("Rust rswidgets demo");
 
-    let hbox = rustxwidgets::backends_gtk_adapter::create_box(
-        rustxwidgets::backends_gtk_adapter::Orientation::Horizontal,
+    let hbox = rswidgets::backends_gtk_adapter::create_box(
+        rswidgets::backends_gtk_adapter::Orientation::Horizontal,
         6,
     )?;
     let label = app.create_label("Count: 0")?;

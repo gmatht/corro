@@ -1,6 +1,6 @@
 #![cfg(feature = "gtk")]
-use rustxwidgets::prelude::*;
-use rustxwidgets::backends_gtk_adapter as gtk;
+use rswidgets::prelude::*;
+use rswidgets::backends_gtk_adapter as gtk;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -135,7 +135,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     formula_bar.append(&formula_entry);
 
     // Load the GTK backend loader for CSS/compat checks
-    let gtk_loader = rustxwidgets::backends::gtk::loader()
+    let gtk_loader = rswidgets::backends::gtk::loader()
         .expect("GTK loader not initialized");
     let is_gtk4 = gtk_loader.symbols.gtk_container_add.is_none();
 

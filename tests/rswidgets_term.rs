@@ -3,13 +3,13 @@
 //! `SpreadsheetModel` through the same `render::fill_cells` pipeline the
 //! pancurses backend uses. Rendered via the headless recorder, the model must
 //! contain corro's cell text, sheet tab and border title.
-#![cfg(feature = "rustxwidgets-term")]
+#![cfg(feature = "rswidgets-term")]
 
 use corro::grid::{CellAddr, Grid, GridBox};
-use corro::rustxwidgets_term::{corro_to_model, from_gridbox, render_headless};
+use corro::rswidgets_term::{corro_to_model, from_gridbox, render_headless};
 
 #[test]
-fn corro_grid_renders_through_rustxwidgets_model() {
+fn corro_grid_renders_through_rswidgets_model() {
     let mut g = GridBox::new(Grid::new(3, 3));
     g.set(&CellAddr::Main { row: 1, col: 1 }, "Hello".to_string());
     g.set(&CellAddr::Main { row: 2, col: 2 }, "World".to_string());

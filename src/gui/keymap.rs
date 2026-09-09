@@ -1,5 +1,5 @@
 use crate::core::action::Action;
-use rustxwidgets::core::key::{LEFT, RIGHT, UP, DOWN, RETURN, ENTER, ESCAPE, TAB,
+use rswidgets::core::key::{LEFT, RIGHT, UP, DOWN, RETURN, ENTER, ESCAPE, TAB,
     HOME, END, PAGE_UP, PAGE_DOWN, DELETE, F2};
 
 pub fn keyval_to_action(keyval: u32, _state: &KeyState) -> Option<Action> {

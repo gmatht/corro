@@ -15,7 +15,7 @@ VERBOSE="${VERBOSE:-0}"
 # Raising STEPS turns this into a crash-finding fuzz run and may reproduce
 # known lifecycle bugs still being investigated.
 
-cargo build -p rustxwidgets --example gtk-lifecycle-stress --manifest-path "$ROOT_DIR/Cargo.toml"
+cargo build -p rswidgets --example gtk-lifecycle-stress --manifest-path "$ROOT_DIR/Cargo.toml"
 
 for ((offset=0; offset<SEED_COUNT; offset++)); do
     seed=$((SEED_START + offset))

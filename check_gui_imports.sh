@@ -1,5 +1,5 @@
 #!/bin/bash
-# Lint: ensure src/gui/ only uses rustxwidgets abstractions, never raw backend crates.
+# Lint: ensure src/gui/ only uses rswidgets abstractions, never raw backend crates.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -26,7 +26,7 @@ if [[ $errors -eq 0 ]]; then
 fi
 
 echo ""
-echo "=== Check 2: No concrete rustxwidgets::App / rustxwidgets::Window in shared files ==="
+echo "=== Check 2: No concrete rswidgets::App / rswidgets::Window in shared files ==="
 
 shared_files=(
     "$gui_dir/clipboard.rs"
@@ -41,10 +41,10 @@ for f in "${shared_files[@]}"; do
         continue
     fi
     results=$(rg -n \
-        -e 'rustxwidgets::(App|Window)' \
+        -e 'rswidgets::(App|Window)' \
         "$f" 2>/dev/null || true)
     if [[ -n "$results" ]]; then
-        echo "WARNING: $f references concrete rustxwidgets type:"
+        echo "WARNING: $f references concrete rswidgets type:"
         echo "$results"
         errors=1
     fi
@@ -54,8 +54,8 @@ if [[ $errors -eq 1 ]]; then
     echo ""
     echo "FAIL: Backend abstractions violated."
 else
-    echo "  PASS: No concrete rustxwidgets types in shared files."
+    echo "  PASS: No concrete rswidgets types in shared files."
     echo ""
-    echo "OK: src/gui/ uses only rustxwidgets abstractions."
+    echo "OK: src/gui/ uses only rswidgets abstractions."
 fi
 exit $errors

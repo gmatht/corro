@@ -48,7 +48,7 @@ fn gui_no_raw_backend_crate_imports() {
                 }
             }
             // Check 3: Fully qualified `banned_crate::` — only when it's the top-level crate,
-            // not when nested under rustxwidgets::...
+            // not when nested under rswidgets::...
             for b in banned {
                 let needle = format!("{}::", b);
                 let mut search_start = 0;
@@ -72,13 +72,13 @@ fn gui_no_raw_backend_crate_imports() {
     let v: Vec<&str> = violations.iter().map(|s| s.as_str()).collect();
     assert!(
         violations.is_empty(),
-        "src/gui/ contains direct backend crate references (use rustxwidgets instead):\n{}",
+        "src/gui/ contains direct backend crate references (use rswidgets instead):\n{}",
         v.join("\n")
     );
 }
 
 #[test]
-fn gui_shared_files_no_concrete_rustxwidgets_types() {
+fn gui_shared_files_no_concrete_rswidgets_types() {
     let gui_dir = Path::new("src/gui");
     let shared: &[&str] = &[
         "clipboard.rs",
@@ -87,7 +87,7 @@ fn gui_shared_files_no_concrete_rustxwidgets_types() {
         "mod.rs",
         "sheet.rs",
     ];
-    let concrete_types: &[&str] = &["rustxwidgets::App", "rustxwidgets::Window"];
+    let concrete_types: &[&str] = &["rswidgets::App", "rswidgets::Window"];
 
     let mut violations: Vec<String> = Vec::new();
 
@@ -118,7 +118,7 @@ fn gui_shared_files_no_concrete_rustxwidgets_types() {
     let v: Vec<&str> = violations.iter().map(|s| s.as_str()).collect();
     assert!(
         violations.is_empty(),
-        "Shared src/gui/ files must not reference concrete rustxwidgets types like App/Window;\
+        "Shared src/gui/ files must not reference concrete rswidgets types like App/Window;\
          define internal traits instead:\n{}",
         v.join("\n")
     );

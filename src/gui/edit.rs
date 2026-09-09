@@ -1,6 +1,6 @@
 use crate::gui::sheet::SharedState;
 
-pub use rustxwidgets::core::key::{
+pub use rswidgets::core::key::{
     RETURN as KEY_RETURN,
     ESCAPE as KEY_ESC,
     BACKSPACE as KEY_BACKSPACE,
@@ -17,7 +17,7 @@ pub use rustxwidgets::core::key::{
     F1 as KEY_F1,
     F2 as KEY_F2,
 };
-pub use rustxwidgets::core::key::ENTER as KEY_ENTER;
+pub use rswidgets::core::key::ENTER as KEY_ENTER;
 
 pub enum EditAction {
     Commit(String),

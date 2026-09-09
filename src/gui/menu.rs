@@ -1,5 +1,5 @@
 use crate::gui::dialogs;
-use rustxwidgets::common::{SimpleAction, MenuItemDef, SubmenuDef};
+use rswidgets::common::{SimpleAction, MenuItemDef, SubmenuDef};
 
 pub struct MenuAction {
     pub label: &'static str,
@@ -128,7 +128,7 @@ pub fn action_kind_to_name(kind: MenuActionKind) -> &'static str {
 
 /// Create a SimpleAction, connect its callback, and register it.
 pub fn register_action<F: FnMut() + 'static>(
-    rxapp: &rustxwidgets::App,
+    rxapp: &rswidgets::App,
     name: &str,
     mut f: F,
 ) -> Result<SimpleAction, Box<dyn std::error::Error>> {
@@ -143,7 +143,7 @@ pub fn register_action<F: FnMut() + 'static>(
 /// Currently unused — the GUI backend uses its own `handle_menu_action` in
 /// `gui_backend.rs`. Keep the `eprintln!` stubs until real logic is wired.
 #[allow(dead_code)]
-pub fn handle_action(name: &str, rxapp: &rustxwidgets::App) {
+pub fn handle_action(name: &str, rxapp: &rswidgets::App) {
     match name {
         "open" => {
             if let Some(path) = dialogs::file_open_dialog() {
@@ -294,7 +294,7 @@ fn actions_to_defs(items: &[MenuAction]) -> Vec<MenuItemDef> {
     }).collect()
 }
 
-/// All submenus as SubmenuDef slices — used by rustxwidgets::App::build_menu_model().
+/// All submenus as SubmenuDef slices — used by rswidgets::App::build_menu_model().
 pub fn all_submenus() -> Vec<SubmenuDef> {
     // Deliberately leak Vec backing buffers so the returned slices live forever.
     vec![

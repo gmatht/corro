@@ -205,7 +205,7 @@ impl App {
     }
 
     /// Borrow the active workbook. Used by the rustxWidgets terminal adapter
-    /// (`crate::ui::rustxwidgets_term`) to build a `SpreadsheetModel`.
+    /// (`crate::ui::rswidgets_term`) to build a `SpreadsheetModel`.
     pub fn workbook(&self) -> &WorkbookState {
         &self.core.workbook
     }

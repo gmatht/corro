@@ -6,9 +6,9 @@ fn main() {
 
 #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
 fn gtk_main() -> Result<(), Box<dyn std::error::Error>> {
-    use rustxwidgets::backends_gtk_adapter as gtk;
-    use rustxwidgets::lifecycle_stress::Op;
-    use rustxwidgets::prelude::*;
+    use rswidgets::backends_gtk_adapter as gtk;
+    use rswidgets::lifecycle_stress::Op;
+    use rswidgets::prelude::*;
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
     use std::sync::Arc;
@@ -217,7 +217,7 @@ fn gtk_main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = App::init()?;
     let loader =
-        rustxwidgets::backends::gtk::loader().expect("GTK loader missing after App::init");
+        rswidgets::backends::gtk::loader().expect("GTK loader missing after App::init");
 
     let win = app.create_window()?;
     win.set_title("GTK Lifecycle Stress");

@@ -11,9 +11,9 @@
 
 #![cfg(feature = "pancurses")]
 
-use rustxwidgets::backends::pancurses_draw::render_model_to_grid;
-use rustxwidgets::core::InputEvent;
-use rustxwidgets::spreadsheet::SpreadsheetModel;
+use rswidgets::backends::pancurses_draw::render_model_to_grid;
+use rswidgets::core::InputEvent;
+use rswidgets::spreadsheet::SpreadsheetModel;
 
 /// Build a 3-row single-column model (rows 1..=3) holding the given values.
 /// Values go in model column 1 (column 0 is the row-label margin), and we use
@@ -28,7 +28,7 @@ fn column_model(values: [&str; 3]) -> SpreadsheetModel {
 }
 
 /// Find the first display row (y) that contains `val` in the painted grid.
-fn first_row_with(grid: &rustxwidgets::backends::pancurses_draw::CellGrid, val: &str) -> Option<usize> {
+fn first_row_with(grid: &rswidgets::backends::pancurses_draw::CellGrid, val: &str) -> Option<usize> {
     grid.cells
         .iter()
         .position(|row| row.iter().any(|c| c.ch.to_string() == val))
@@ -206,7 +206,7 @@ fn drive_pancurses_multi_column() {
 /// widget; set/get must round-trip (this is what the paint path writes into).
 #[test]
 fn drive_pancurses_widget_cell_roundtrip() {
-    let ss = rustxwidgets::backends_pancurses_adapter::create_spreadsheet(10, 5)
+    let ss = rswidgets::backends_pancurses_adapter::create_spreadsheet(10, 5)
         .expect("create_spreadsheet");
     ss.set_cell(2, 3, "hello");
     assert_eq!(ss.get_cell(2, 3).as_deref(), Some("hello"));
@@ -218,7 +218,7 @@ fn drive_pancurses_widget_cell_roundtrip() {
 /// Widget store: cursor position (the navigation target) must round-trip.
 #[test]
 fn drive_pancurses_widget_cursor_nav() {
-    let ss = rustxwidgets::backends_pancurses_adapter::create_spreadsheet(24, 26)
+    let ss = rswidgets::backends_pancurses_adapter::create_spreadsheet(24, 26)
         .expect("create_spreadsheet");
     ss.set_cursor(5, 4);
     assert_eq!(ss.cursor_position(), Some((5, 4)));
@@ -232,7 +232,7 @@ fn drive_pancurses_widget_cursor_nav() {
 /// `fill_cells` uses when populating the widget.
 #[test]
 fn drive_pancurses_widget_grid_config() {
-    let ss = rustxwidgets::backends_pancurses_adapter::create_spreadsheet(24, 30)
+    let ss = rswidgets::backends_pancurses_adapter::create_spreadsheet(24, 30)
         .expect("create_spreadsheet");
     ss.set_grid_config(2, 3); // margin_cols=2, main_cols=3
     ss.set_cell(0, 2, "mainA");

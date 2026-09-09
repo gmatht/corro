@@ -15,7 +15,7 @@ rm -rf "$BUILD_DIR" && mkdir -p "$BUILD_DIR"/{classes,dex,staging}
 # 1. Build Rust .so
 echo "==> Building Rust .so for x86_64..."
 cd "$PROJECT_ROOT"
-cargo ndk -t x86_64 build --release -p rustxwidgets_android_demo 2>&1 | tail -1
+cargo ndk -t x86_64 build --release -p rswidgets_android_demo 2>&1 | tail -1
 
 # 2. Compile Java sources
 echo "==> Compiling Java..."
@@ -44,7 +44,7 @@ echo "==> Adding DEX and native lib..."
 mkdir -p "$BUILD_DIR/staging/lib/x86_64"
 unzip -qo "$BUILD_DIR/unsigned.apk" -d "$BUILD_DIR/staging"
 cp "$BUILD_DIR/dex/classes.dex" "$BUILD_DIR/staging/"
-cp "$PROJECT_ROOT/target/x86_64-linux-android/release/librustxwidgets_android_demo.so" \
+cp "$PROJECT_ROOT/target/x86_64-linux-android/release/librswidgets_android_demo.so" \
   "$BUILD_DIR/staging/lib/x86_64/"
 cd "$BUILD_DIR/staging" && zip -qr "$BUILD_DIR/unsigned_with_libs.apk" . && cd /tmp
 

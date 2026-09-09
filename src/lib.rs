@@ -27,5 +27,5 @@ pub use ui_core::format_cell_display;
 pub mod ui;
 #[cfg(any(feature = "gui", feature = "pancurses", target_arch = "wasm32"))]
 pub mod gui;
-#[cfg(feature = "rustxwidgets-term")]
-pub mod rustxwidgets_term;
+#[cfg(feature = "rswidgets-term")]
+pub mod rswidgets_term;

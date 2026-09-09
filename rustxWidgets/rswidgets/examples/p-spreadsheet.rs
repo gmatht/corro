@@ -1,4 +1,4 @@
-use rustxwidgets::prelude::*;
+use rswidgets::prelude::*;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = App::init()?;

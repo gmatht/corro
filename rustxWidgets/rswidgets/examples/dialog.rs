@@ -1,4 +1,4 @@
-use rustxwidgets::prelude::*;
+use rswidgets::prelude::*;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = App::init()?;
@@ -8,7 +8,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     dialog.set_default_size(450, 500);
 
     let mut vbox = app.new_box(
-        rustxwidgets::prelude::Orientation::Vertical, 1,
+        rswidgets::prelude::Orientation::Vertical, 1,
     )?;
 
     // --- DropDown ---

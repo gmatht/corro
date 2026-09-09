@@ -1,6 +1,6 @@
-# Migration plan: a wxWidgets-like API for rustxwidgets
+# Migration plan: a wxWidgets-like API for rswidgets
 
-**Goal:** reshape rustxwidgets' API along wxWidgets' proven designs, while
+**Goal:** reshape rswidgets' API along wxWidgets' proven designs, while
 keeping Rust idioms (native primitives, closures, modules, memory safety).
 Where the two conflict, prefer the wxWidgets *shape* over our handrolled
 versions; where they don't, use native Rust.
@@ -8,7 +8,7 @@ versions; where they don't, use native Rust.
 ## Naming: no `rx*` prefix
 
 wxWidgets uses the `wx` prefix because C++ has no namespaces. Rust has
-modules, so the prefix is redundant — `rustxwidgets::BoxSizer` is already
+modules, so the prefix is redundant — `rswidgets::BoxSizer` is already
 namespaced. **Adopt wxWidgets' type names, drop the prefix:**
 
 | Current (handrolled) | wxWidgets name | Proposed |
@@ -46,16 +46,16 @@ The `Sizer` hierarchy is the one real rename: `BoxWidget`/`Grid` become
 - `wxPoint` — misleading: implies a wxWidgets type. We borrow wxWidgets'
   *design*, not its types.
 - `rxPoint` — redundant: the `wx` prefix exists because C++ has no
-  namespaces; Rust modules already namespace `rustxwidgets::Point`.
+  namespaces; Rust modules already namespace `rswidgets::Point`.
 - `Point` — idiomatic. If an app has its own `Point`, it aliases:
-  `use rustxwidgets::Point as RxPoint;`.
+  `use rswidgets::Point as RxPoint;`.
 
 The type safety comes from the struct fields, not the prefix — all three
 names would provide it equally, so pick the idiomatic one.
 
 ## Where the proposed design differs from wxWidgets
 
-| Area | wxWidgets | rustxwidgets (proposed) | Why |
+| Area | wxWidgets | rswidgets (proposed) | Why |
 |---|---|---|---|
 | **Data types** | `wxString`, `wxPoint`, `wxSize`, `wxColour` | Rust types: `String`, `Point { x, y }`, `Size { w, h }`, `Colour { r, g, b, a }` | Rust structs encode the same type info as wx classes, with Rust ergonomics |
 | **Events** | Event tables + handlers | Closures + propagation | Closures are idiomatic; propagation added for the wxWidgets benefit |
@@ -96,7 +96,7 @@ names would provide it equally, so pick the idiomatic one.
 - Adopt the design principles as a documented policy.
 
 ### Phase 1 — Universal menu model (in progress)
-- `rustxwidgets::Menu` + `MenuItem` in the core; every backend converts it.
+- `rswidgets::Menu` + `MenuItem` in the core; every backend converts it.
   **Done**: `MenuItem` (Action/Submenu) in the core; pancurses + adapter
   convert the same model; corro builds one `menu_bar()` tree.
 - Add item kinds: `Separator`, `Check { checked }`, `Radio { group }`.
@@ -137,9 +137,9 @@ names would provide it equally, so pick the idiomatic one.
   **Done**: see `docs/STANDARD_ACTIONS.md`.
 - **First-class actions** — `Action { name, enabled, checked }` registry
   (`register_action`, `set_action_enabled`, `set_action_checked`).
-  **Done**: `rustxwidgets::Action` + pancurses `ACTION_REGISTRY`.
+  **Done**: `rswidgets::Action` + pancurses `ACTION_REGISTRY`.
 - **Tests:** menu parity across pancurses/ratatui; item-kind rendering.
-  **Done**: `menu_file_parity_with_ratatui`; rustxwidgets lib unit tests for
+  **Done**: `menu_file_parity_with_ratatui`; rswidgets lib unit tests for
   item kinds + action registry.
 
 ### Phase 2 — Event propagation

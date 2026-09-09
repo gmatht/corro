@@ -248,7 +248,7 @@ mod pancurses_adapter {
     // -- Menu --
 
     /// Backend-agnostic menu model: a list of items (actions or submenus).
-    /// The same model is used by every rustxwidgets backend, so an application
+    /// The same model is used by every rswidgets backend, so an application
     /// can build one menu and hand it to any backend's `create_menubar`.
     pub struct Menu {
         pub(crate) id: usize,

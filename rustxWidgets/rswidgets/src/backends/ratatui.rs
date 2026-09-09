@@ -1,6 +1,6 @@
 //! Ratatui backend for rustxWidgets.
 //!
-//! This makes `rustxwidgets` usable as a real terminal GUI backend: `App::init()`
+//! This makes `rswidgets` usable as a real terminal GUI backend: `App::init()`
 //! returns a `RatatuiApp` that runs a crossterm event loop, and
 //! [`RatatuiDrawContext`] implements [`crate::core::DrawContext`] by mapping the
 //! pixel-based paint coordinate space onto a terminal cell grid. Because the

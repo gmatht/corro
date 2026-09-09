@@ -2,12 +2,12 @@
 resolver = "2"
 members = [
     "gtk_dynamic_loader",
-    "rustxwidgets",
+    "rswidgets",
     "examples/android",
 ]
 default-members = [
     "gtk_dynamic_loader",
-    "rustxwidgets",
+    "rswidgets",
 ]
 
 [profile.release]

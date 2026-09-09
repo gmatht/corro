@@ -4,12 +4,12 @@
 //! `--no-default-features --features ratatui,headless,pancurses`.
 #![cfg(any(all(feature = "ratatui", feature = "headless"), feature = "pancurses"))]
 
-use rustxwidgets::spreadsheet::{paint, SpreadsheetModel};
+use rswidgets::spreadsheet::{paint, SpreadsheetModel};
 
 #[cfg(all(feature = "ratatui", feature = "headless"))]
-use rustxwidgets::backends::headless::RecordingDrawContext;
+use rswidgets::backends::headless::RecordingDrawContext;
 #[cfg(all(feature = "ratatui", feature = "headless"))]
-use rustxwidgets::backends::ratatui::{demo_model, render_demo_to_test_backend};
+use rswidgets::backends::ratatui::{demo_model, render_demo_to_test_backend};
 
 /// Build a small spreadsheet with content in real data cells.
 fn model_with(title: &str, cells: &[((u32, u32), &str)]) -> SpreadsheetModel {
@@ -41,7 +41,7 @@ fn headless_records_clear_and_rects() {
     let mut dc = RecordingDrawContext::new();
     paint(&m, &mut dc, 80, 24);
 
-    assert!(dc.ops.iter().any(|o| matches!(o, rustxwidgets::backends::headless::DrawOp::Clear(..))));
+    assert!(dc.ops.iter().any(|o| matches!(o, rswidgets::backends::headless::DrawOp::Clear(..))));
     assert!(!dc.fill_rects().is_empty(), "background regions should be filled");
 }
 
@@ -87,7 +87,7 @@ fn ratatui_and_headless_agree_on_content() {
 #[cfg(feature = "pancurses")]
 #[test]
 fn pancurses_backend_renders_same_model() {
-    use rustxwidgets::backends::pancurses_draw::{render_model_to_grid, GridCell};
+    use rswidgets::backends::pancurses_draw::{render_model_to_grid, GridCell};
 
     // A representative model with content in real data cells.
     let mut m = SpreadsheetModel::new(6, 4);
@@ -99,7 +99,7 @@ fn pancurses_backend_renders_same_model() {
     m.set_cell(3, 3, "=SUM(A1:A3)");
     m.set_cursor(1, 1);
 
-    let grid = rustxwidgets::backends::pancurses_draw::render_model_to_grid(&m, 80, 24);
+    let grid = rswidgets::backends::pancurses_draw::render_model_to_grid(&m, 80, 24);
     let rows: Vec<String> = grid.row_strings();
     for (i, r) in rows.iter().enumerate() {
         if r.trim_end().chars().any(|c| c != ' ') {
@@ -141,7 +141,7 @@ fn tabs_and_footer_parity_across_all_backends() {
         dc.texts().iter().map(|s| s.to_string()).collect();
 
     // ratatui terminal backend
-    let buf = rustxwidgets::backends::ratatui::render_model_to_test_backend(&m, 80, 24);
+    let buf = rswidgets::backends::ratatui::render_model_to_test_backend(&m, 80, 24);
     let ratatui_rows: Vec<String> = (0..buf.area.height)
         .map(|y| {
             (0..buf.area.width)
@@ -152,7 +152,7 @@ fn tabs_and_footer_parity_across_all_backends() {
     let ratatui_joined = ratatui_rows.join("");
 
     // pancurses terminal-grid backend
-    let grid = rustxwidgets::backends::pancurses_draw::render_model_to_grid(&m, 80, 24);
+    let grid = rswidgets::backends::pancurses_draw::render_model_to_grid(&m, 80, 24);
     let pancurses_joined = grid.row_strings().join("");
 
     for token in ["Alpha", "Beta", "READY 42/100", "B2", "Hello", "World"] {
@@ -180,7 +180,7 @@ fn row_strings(buf: &ratatui::buffer::Buffer) -> Vec<String> {
 #[test]
 fn input_event_from_crossterm() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use rustxwidgets::core::InputEvent;
+    use rswidgets::core::InputEvent;
     assert_eq!(
         InputEvent::from_crossterm(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
         InputEvent::Quit
@@ -198,7 +198,7 @@ fn input_event_from_crossterm() {
 #[cfg(feature = "pancurses")]
 #[test]
 fn input_event_from_pancurses() {
-    use rustxwidgets::core::InputEvent;
+    use rswidgets::core::InputEvent;
     assert_eq!(InputEvent::from_pancurses(pancurses::Input::Character('x')), InputEvent::Char('x'));
     assert_eq!(InputEvent::from_pancurses(pancurses::Input::KeyUp), InputEvent::ArrowUp);
     assert_eq!(InputEvent::from_pancurses(pancurses::Input::KeyF1), InputEvent::F(1));
@@ -207,7 +207,7 @@ fn input_event_from_pancurses() {
 /// Grab the rendered terminal screen from the ratatui canvas backend.
 #[cfg(all(feature = "ratatui", feature = "headless"))]
 fn grab_ratatui(model: &SpreadsheetModel, w: u16, h: u16) -> Vec<String> {
-    let buf = rustxwidgets::backends::ratatui::render_model_to_test_backend(model, w, h);
+    let buf = rswidgets::backends::ratatui::render_model_to_test_backend(model, w, h);
     (0..buf.area.height)
         .map(|y| {
             (0..buf.area.width)
@@ -220,7 +220,7 @@ fn grab_ratatui(model: &SpreadsheetModel, w: u16, h: u16) -> Vec<String> {
 /// Grab the rendered terminal screen from the pancurses cell-grid backend.
 #[cfg(feature = "pancurses")]
 fn grab_pancurses(model: &SpreadsheetModel, w: u16, h: u16) -> Vec<String> {
-    rustxwidgets::backends::pancurses_draw::render_model_to_grid(model, w, h).row_strings()
+    rswidgets::backends::pancurses_draw::render_model_to_grid(model, w, h).row_strings()
 }
 
 /// Extract the multiset of whitespace-delimited tokens from a grabbed screen.

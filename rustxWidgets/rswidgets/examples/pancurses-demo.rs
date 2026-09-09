@@ -1,4 +1,4 @@
-use rustxwidgets::prelude::*;
+use rswidgets::prelude::*;
 use std::rc::Rc;
 use std::cell::RefCell;
 

@@ -14,7 +14,7 @@
 //! ```
 //! use std::rc::Rc;
 //! use std::cell::Cell;
-//! use rustxwidgets::backends::zork::harness::Harness;
+//! use rswidgets::backends::zork::harness::Harness;
 //!
 //! let h = Harness::new();
 //! let label = h.create_label("count: 0");

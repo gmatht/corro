@@ -1,4 +1,4 @@
-use rustxwidgets::prelude::*;
+use rswidgets::prelude::*;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = App::init()?;
@@ -30,7 +30,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Pack menubar + status label in a vertical box
     let vbox = app.create_box(
-        rustxwidgets::prelude::Orientation::Vertical, 0,
+        rswidgets::prelude::Orientation::Vertical, 0,
     )?;
     vbox.append(&menubar);
     vbox.append(&status_label);

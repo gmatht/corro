@@ -515,7 +515,7 @@ def main():
         return 1
     # Warn if binary may be stale
     bin_mtime = os.path.getmtime(binary)
-    src_patterns = ["src/**/*.rs", "rustxWidgets/**/*.rs", "Cargo.toml", "rustxWidgets/rustxwidgets/Cargo.toml"]
+    src_patterns = ["src/**/*.rs", "rustxWidgets/**/*.rs", "Cargo.toml", "rustxWidgets/rswidgets/Cargo.toml"]
     newest_src = 0
     for pat in src_patterns:
         for f in glob.glob(pat, recursive=True):

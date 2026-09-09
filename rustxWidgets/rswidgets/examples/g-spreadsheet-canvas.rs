@@ -6,8 +6,8 @@ fn main() {
 
 #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
 fn gtk_main() -> Result<(), Box<dyn std::error::Error>> {
-    use rustxwidgets::prelude::*;
-    use rustxwidgets::backends_gtk_adapter as gtk;
+    use rswidgets::prelude::*;
+    use rswidgets::backends_gtk_adapter as gtk;
     use std::rc::Rc;
     use std::cell::RefCell;
 
@@ -316,7 +316,7 @@ fn gtk_main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let app = App::init()?;
-    let loader = rustxwidgets::backends::gtk::loader().expect("no GTK loader after App::init");
+    let loader = rswidgets::backends::gtk::loader().expect("no GTK loader after App::init");
     let is_gtk4 = loader.symbols.gtk_container_add.is_none();
     let win = app.create_window()?;
     win.set_title("Spreadsheet");
@@ -454,7 +454,7 @@ fn gtk_main() -> Result<(), Box<dyn std::error::Error>> {
     let total_h = CELL_H + VISIBLE_ROWS as i32 * CELL_H;
     drawing_area.set_size_request(total_w, total_h);
 
-    if let Some(loader2) = rustxwidgets::backends::gtk::loader() {
+    if let Some(loader2) = rswidgets::backends::gtk::loader() {
         let css = r#"
         button { font-size: 11px; padding: 1px 8px; min-height: 20px; }
         entry { padding: 0; border: none; font-family: monospace; font-size: 13px; min-height: 0; }

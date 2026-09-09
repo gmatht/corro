@@ -7,7 +7,7 @@ import android.widget.TextView;
 
 public class MainActivity extends Activity {
     static {
-        System.loadLibrary("rustxwidgets_android_demo");
+        System.loadLibrary("rswidgets_android_demo");
     }
 
     // Pass the activity AND its content view to Rust

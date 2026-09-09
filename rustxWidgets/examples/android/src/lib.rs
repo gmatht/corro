@@ -9,11 +9,11 @@ pub extern "system" fn Java_com_example_MainActivity_nativeInit(
     root_layout: JObject,
 ) {
     // Initialize backend with JVM, Activity, and root ViewGroup
-    rustxwidgets::backends::android::init_with_layout(&mut env, &activity, &root_layout)
+    rswidgets::backends::android::init_with_layout(&mut env, &activity, &root_layout)
         .expect("Backend init failed");
 
     // Create the App (non-blocking on Android)
-    let app = rustxwidgets::prelude::App::init()
+    let app = rswidgets::prelude::App::init()
         .expect("App init failed");
 
     // Create and configure widgets
@@ -24,7 +24,7 @@ pub extern "system" fn Java_com_example_MainActivity_nativeInit(
     let btn = app.create_button("Click me!").expect("Button failed");
 
     btn.on_click(move || {
-        let _ = rustxwidgets::backends::android::with_env_and_activity(|env, _activity| {
+        let _ = rswidgets::backends::android::with_env_and_activity(|env, _activity| {
             let log_cls = env.find_class("android/util/Log")?;
             let tag = env.new_string("RustxWidgets")?;
             let msg = env.new_string("Button clicked from Rust!")?;

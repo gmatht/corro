@@ -1,5 +1,5 @@
 [workspace]
-members = ["balance-core", "rustxWidgets/rustxwidgets"]
+members = ["balance-core", "rustxWidgets/rswidgets"]
 
 # Vendored Win95-compatibility patches (see vendor/*/  — the patches resolve
 # Vista+/Win2000+ APIs dynamically instead of importing them statically, which
@@ -31,15 +31,15 @@ default-run = "corro"
 default = ["ratatui"]
 nightly = []
 ratatui = ["dep:ratatui", "dep:crossterm", "dep:unicode-truncate", "dep:unicode-segmentation"]
-gui = ["dep:rustxwidgets", "rustxwidgets/gtk", "dep:gtk_dynamic_loader"]
-gtk4 = ["gui", "rustxwidgets/gtk4-rs"]
-wasm = ["dep:rustxwidgets"]
-pancurses = ["rustxwidgets/pancurses"]
+gui = ["dep:rswidgets", "rswidgets/gtk", "dep:gtk_dynamic_loader"]
+gtk4 = ["gui", "rswidgets/gtk4-rs"]
+wasm = ["dep:rswidgets"]
+pancurses = ["rswidgets/pancurses"]
 gtk = ["gui"]
 combined-gui = ["gui", "pancurses"]
 # Converge corro's terminal spreadsheet view onto rustxWidgets
 # (backend-agnostic SpreadsheetModel), keeping `src/ui` as the reference fork.
-rustxwidgets-term = ["gui", "rustxwidgets/ratatui", "rustxwidgets/headless"]
+rswidgets-term = ["gui", "rswidgets/ratatui", "rswidgets/headless"]
 
 [dependencies]
 ratatui = { version = "0.29", optional = true }
@@ -47,7 +47,7 @@ unicode-width = "0.2.0"
 unicode-truncate = { version = "1", optional = true }
 crossterm = { version = "0.28", optional = true }
 unicode-segmentation = { version = "1", optional = true }
-rustxwidgets = { path = "rustxWidgets/rustxwidgets", optional = true, default-features = false }
+rswidgets = { path = "rustxWidgets/rswidgets", optional = true, default-features = false }
 gtk_dynamic_loader = { path = "rustxWidgets/gtk_dynamic_loader", optional = true }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"

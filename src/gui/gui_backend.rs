@@ -1,5 +1,5 @@
-use rustxwidgets::prelude::*;
-use rustxwidgets::core::DrawContext;
+use rswidgets::prelude::*;
+use rswidgets::core::DrawContext;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -13,7 +13,7 @@ use super::compute::{self, CellDisplayStyle};
 use super::dialogs;
 use super::render::{self, CellSink};
 
-use rustxwidgets::core::key::{normalize, RETURN, ESCAPE, BACKSPACE, DELETE, LEFT, UP, RIGHT, DOWN, TAB, HOME, END, PAGE_UP, PAGE_DOWN, F1, F2, ALT_L, ALT_R};
+use rswidgets::core::key::{normalize, RETURN, ESCAPE, BACKSPACE, DELETE, LEFT, UP, RIGHT, DOWN, TAB, HOME, END, PAGE_UP, PAGE_DOWN, F1, F2, ALT_L, ALT_R};
 
 const KEYLOG_PATH: &str = "/tmp/corro_keylog.txt";
 
@@ -176,7 +176,7 @@ fn save_before_quit(state: &GuiState) {
 
 struct GuiState {
     app: *mut super::App,
-    rxapp: rustxwidgets::App,
+    rxapp: rswidgets::App,
     canvas: Canvas,
     formula_entry: Entry,
     addr_label: Label,
@@ -918,12 +918,12 @@ fn handle_click(x: f64, y: f64, state_rc: &Rc<GuiState>) {
 // Menu building
 // ---------------------------------------------------------------------------
 
-fn build_menu(rxapp: &rustxwidgets::App, win: &Window, state: &Rc<GuiState>) -> Result<MenuBar, Box<dyn std::error::Error>> {
+fn build_menu(rxapp: &rswidgets::App, win: &Window, state: &Rc<GuiState>) -> Result<MenuBar, Box<dyn std::error::Error>> {
     use crate::gui::menu;
 
     let action_group = rxapp.ensure_action_group()?;
 
-    // Build the full menu tree from shared definitions (rustxwidgets).
+    // Build the full menu tree from shared definitions (rswidgets).
     // Prefix submenu labels with "_" so GTK4 assigns mnemonic accelerators
     // (ALT+F for File, ALT+E for Edit, etc.).
     let menubar_model = rxapp.build_menu_model(&menu::all_submenus(), "_")?;
@@ -1184,8 +1184,8 @@ fn on_formula_entry_changed(state: &GuiState) {
 // ---------------------------------------------------------------------------
 
 pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Error>> {
-    rustxwidgets::core::install_debug_crash_handlers();
-    let rxapp = rustxwidgets::App::init()
+    rswidgets::core::install_debug_crash_handlers();
+    let rxapp = rswidgets::App::init()
         .map_err(|e| format!("GUI init failed: {e}"))?;
 
     let win = rxapp.new_window()?;
@@ -1609,7 +1609,7 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // Pre-create the main loop so quit_main_loop finds a valid pointer
     // even if the user clicks Quit during the warm-up phase below.
     #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
-    if let Some(loader) = rustxwidgets::backends::gtk::loader() {
+    if let Some(loader) = rswidgets::backends::gtk::loader() {
         if let Some(loop_new) = loader.symbols.g_main_loop_new {
             let early_loop = unsafe { loop_new(std::ptr::null_mut(), 0) };
             if !early_loop.is_null() {

@@ -1,4 +1,4 @@
-//! Headless `zork` backend for rustxwidgets.
+//! Headless `zork` backend for rswidgets.
 //!
 //! The backend is split into three pieces:
 //!

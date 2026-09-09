@@ -1,20 +1,20 @@
 //! rustxWidgets-backed terminal UI for corro.
 //!
 //! Converges corro's spreadsheet view onto the backend-agnostic
-//! `rustxwidgets::SpreadsheetModel`. The exact same `render::fill_cells`
+//! `rswidgets::SpreadsheetModel`. The exact same `render::fill_cells`
 //! pipeline used by the pancurses backend feeds a `SpreadsheetModel`, so the
 //! rendered content matches the reference fork in `crate::ui`; only the final
 //! `DrawContext` differs (headless recorder / ratatui terminal / pancurses grid).
 //!
 //! This module coexists with `crate::ui` (the ratatui-direct reference fork),
 //! which is intentionally kept for behaviour comparison.
-#![cfg(feature = "rustxwidgets-term")]
+#![cfg(feature = "rswidgets-term")]
 
 use crate::grid::{GridBox, HEADER_ROWS, MARGIN_COLS};
 use crate::gui::compute::{self, CellDisplayStyle};
 use crate::gui::render::{fill_cells, CellSink};
 use crate::ops::{AggFunc, WorkbookState};
-use rustxwidgets::spreadsheet::{paint, SpreadsheetModel};
+use rswidgets::spreadsheet::{paint, SpreadsheetModel};
 use std::collections::HashMap;
 
 /// Number of header rows / margin columns in corro's viewport (the grid's
@@ -141,14 +141,14 @@ pub fn from_app(app: &crate::gui::App) -> SpreadsheetModel {
 /// Render and run a `SpreadsheetModel` through the rustxWidgets terminal
 /// backend (ratatui by default; pancurses when that feature is active).
 pub fn run_model(model: SpreadsheetModel) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let rxw = rustxwidgets::backends::ratatui::RatatuiApp::init_with_model(model)?;
+    let rxw = rswidgets::backends::ratatui::RatatuiApp::init_with_model(model)?;
     rxw.run()?;
     Ok(())
 }
 
 /// Headless helper: paint a model into a recording context (no terminal).
-pub fn render_headless(model: &SpreadsheetModel, w: u16, h: u16) -> rustxwidgets::backends::headless::RecordingDrawContext {
-    let mut dc = rustxwidgets::backends::headless::RecordingDrawContext::new();
+pub fn render_headless(model: &SpreadsheetModel, w: u16, h: u16) -> rswidgets::backends::headless::RecordingDrawContext {
+    let mut dc = rswidgets::backends::headless::RecordingDrawContext::new();
     paint(model, &mut dc, w as i32, h as i32);
     dc
 }

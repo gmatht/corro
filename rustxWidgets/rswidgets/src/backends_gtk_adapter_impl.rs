@@ -1,4 +1,4 @@
-// High-level ergonomic wrappers over gtk_compat for the rustxwidgets API
+// High-level ergonomic wrappers over gtk_compat for the rswidgets API
 #[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
 mod gtk_adapter {
     use std::os::raw::c_void;

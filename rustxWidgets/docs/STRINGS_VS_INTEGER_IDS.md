@@ -1,12 +1,12 @@
 # Menu item IDs: strings vs integers
 
-**Status:** design decision — rustxwidgets uses **string action names** as the
+**Status:** design decision — rswidgets uses **string action names** as the
 universal menu-item ID.
 
 ## Context
 
-rustxwidgets is moving to a single, backend-agnostic menu model
-(`rustxwidgets::Menu` + `rustxwidgets::MenuItem`) that every backend renders
+rswidgets is moving to a single, backend-agnostic menu model
+(`rswidgets::Menu` + `rswidgets::MenuItem`) that every backend renders
 with its own native widgets. A menu item needs an **ID** — the identity used
 for dispatch, state queries (`enable`, `is_checked`), and cross-backend parity
 testing. The two candidate ID types are:
@@ -74,7 +74,7 @@ It is not about performance — a `HashMap<String, u16>` is trivial. It is about
 Either choice leaves exactly one family of backends doing a conversion;
 strings just pick the family that is currently least important.
 
-## Why strings win for rustxwidgets
+## Why strings win for rswidgets
 
 1. **The two backends that matter most today — GTK on Linux and pancurses for
    the TUI — are both string-native.** No conversion on the primary paths.

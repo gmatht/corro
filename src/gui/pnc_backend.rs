@@ -2,8 +2,8 @@ use crate::grid::{CellAddr, ColumnAddr, GridBox, SheetCursor, HEADER_ROWS, MARGI
 use crate::ops::{Op, WorkbookOp};
 use crate::ui_core;
 use std::collections::HashMap;
-use rustxwidgets::backends_pancurses_adapter::*;
-use rustxwidgets::core::terminal_size;
+use rswidgets::backends_pancurses_adapter::*;
+use rswidgets::core::terminal_size;
 
 use unicode_width::UnicodeWidthStr;
 
@@ -58,7 +58,7 @@ fn fill_cells(
 }
 
 pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Error>> {
-    let _backend = rustxwidgets::backends::pancurses::init()
+    let _backend = rswidgets::backends::pancurses::init()
         .map_err(|e| format!("pancurses init failed: {e}"))?;
 
     let win = create_window()?;
@@ -253,7 +253,7 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     }
 
     win.set_child(&spreadsheet);
-    rustxwidgets::backends::pancurses::set_focus(spreadsheet.id());
+    rswidgets::backends::pancurses::set_focus(spreadsheet.id());
     win.present();
 
     // ── Cursor move callback: grow grid extent + update viewport ─────────

@@ -13,5 +13,5 @@ dependencyResolution {
     }
 }
 
-rootProject.name = "rustxwidgets-android-demo"
+rootProject.name = "rswidgets-android-demo"
 include(":app")

@@ -10,7 +10,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use rustxwidgets::backends::zork::harness::Harness;
+use rswidgets::backends::zork::harness::Harness;
 
 #[test]
 fn button_click_fires_callback_and_updates_label() {

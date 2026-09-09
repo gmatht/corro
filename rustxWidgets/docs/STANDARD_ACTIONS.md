@@ -1,6 +1,6 @@
 # Standard action vocabulary
 
-A documented **convention** of generic action strings that any rustxwidgets
+A documented **convention** of generic action strings that any rswidgets
 app may use, so backends can give them consistent, platform-correct behavior
 without knowing the app.  This is the *generic subset* — app-specific actions
 (`insert_date`, `balance_books`, …) are **not** part of it.

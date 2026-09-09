@@ -35,7 +35,7 @@ pub fn show_about_dialog() {
     #[cfg(feature = "gui")]
     {
         log_dialog_action("about_dialog", "");
-        if let Ok(rxapp) = rustxwidgets::App::init() {
+        if let Ok(rxapp) = rswidgets::App::init() {
             if let Ok(dialog) = rxapp.new_dialog() {
                 if let Ok(label) = rxapp.new_label(&format!(
                     "corro {}\n\nAppend-only collaborative spreadsheet",
@@ -60,7 +60,7 @@ pub fn show_keybinds_help() {
     #[cfg(feature = "gui")]
     {
         log_dialog_action("keybinds_help", "");
-        if let Ok(rxapp) = rustxwidgets::App::init() {
+        if let Ok(rxapp) = rswidgets::App::init() {
             if let Ok(dialog) = rxapp.new_dialog() {
                 if let Ok(tv) = rxapp.create_textview() {
                     dialog.set_title("Keybindings");
@@ -97,8 +97,8 @@ pub fn show_keybinds_help() {
 pub fn find_dialog<F: FnOnce(Option<String>) + 'static>(on_result: F) {
     #[cfg(feature = "gui")]
     {
-        use rustxwidgets::common::Entry as CommonEntry;
-        if let Ok(rxapp) = rustxwidgets::App::init() {
+        use rswidgets::common::Entry as CommonEntry;
+        if let Ok(rxapp) = rswidgets::App::init() {
             if let Ok(dialog) = rxapp.new_dialog() {
                 if let Ok(entry) = rxapp.new_entry() {
                     dialog.set_title("Find");
@@ -135,9 +135,9 @@ pub fn find_dialog<F: FnOnce(Option<String>) + 'static>(on_result: F) {
 pub fn replace_dialog<F: FnOnce(Option<(String, String)>) + 'static>(on_result: F) {
     #[cfg(feature = "gui")]
     {
-        use rustxwidgets::common::Entry as CommonEntry;
-        use rustxwidgets::prelude::Orientation;
-        if let Ok(rxapp) = rustxwidgets::App::init() {
+        use rswidgets::common::Entry as CommonEntry;
+        use rswidgets::prelude::Orientation;
+        if let Ok(rxapp) = rswidgets::App::init() {
             if let (Ok(dialog), Ok(find_entry), Ok(replace_entry), Ok(vbox)) =
                 (rxapp.new_dialog(), rxapp.new_entry(), rxapp.new_entry(), rxapp.new_box(Orientation::Vertical, 4))
             {
@@ -188,9 +188,9 @@ pub fn replace_dialog<F: FnOnce(Option<(String, String)>) + 'static>(on_result: 
 pub fn sort_dialog<F: FnOnce(Option<(usize, bool)>) + 'static>(_workbook: &WorkbookState, on_result: F) {
     #[cfg(feature = "gui")]
     {
-        use rustxwidgets::prelude::*;
+        use rswidgets::prelude::*;
         let cols: &[&str] = &["Column A", "Column B", "Column C", "Column D", "Column E"];
-        if let Ok(rxapp) = rustxwidgets::App::init() {
+        if let Ok(rxapp) = rswidgets::App::init() {
             if let (Ok(dialog), Ok(sort_col), Ok(ascending), Ok(vbox)) =
                 (rxapp.new_dialog(), rxapp.create_dropdown(cols), rxapp.create_checkbutton("Ascending"),
                  rxapp.new_box(Orientation::Vertical, 4))
@@ -240,8 +240,8 @@ pub fn sort_dialog<F: FnOnce(Option<(usize, bool)>) + 'static>(_workbook: &Workb
 pub fn balance_dialog<F: FnOnce(Option<String>) + 'static>(on_result: F) {
     #[cfg(feature = "gui")]
     {
-        use rustxwidgets::common::Entry as CommonEntry;
-        if let Ok(rxapp) = rustxwidgets::App::init() {
+        use rswidgets::common::Entry as CommonEntry;
+        if let Ok(rxapp) = rswidgets::App::init() {
             if let (Ok(dialog), Ok(entry)) = (rxapp.new_dialog(), rxapp.new_entry()) {
                 dialog.set_title("Balance Books");
                 if let Ok(label) = rxapp.new_label("Column to balance:") {

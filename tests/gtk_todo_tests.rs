@@ -221,6 +221,6 @@ fn gui_spreadsheet_scrollbars() {
     // This compiles only when the GTK backend is active; the runtime
     // call will fail (loader not initialized) unless a prior init()
     // has been made — the test just checks the function is present.
-    let _has_scrolled_window = rustxwidgets::backends::gtk::create_scrolled_window().is_ok();
+    let _has_scrolled_window = rswidgets::backends::gtk::create_scrolled_window().is_ok();
     // Scrollbars should be provided when content exceeds viewport
 }
