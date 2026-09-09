@@ -24,3 +24,8 @@
 *.dll binary
 *.so binary
 *.pyc binary
+
+# Vendored third-party sources keep their upstream bytes verbatim (many
+# ship CRLF); normalising them would fake a whole-tree diff and diverge
+# from upstream. The build (rustc/cc) accepts either ending.
+vendor/** -text
