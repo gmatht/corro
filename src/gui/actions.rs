@@ -166,6 +166,7 @@ pub fn menu_action_needs_prompt(name: &str) -> Option<&'static str> {
         "insert_hyperlink" => "Insert hyperlink",
         "sort_view" => "sort cols [A,B,C]",
         "persist_sort" => "sort cols [A,B,C] (save)",
+        "balance_books" => "Balance column",
         _ => return None,
     })
 }
@@ -365,13 +366,18 @@ pub fn dispatch_menu_action(
         "copy" => {
             let val = app.core.workbook.active_sheet().grid.get(&addr).unwrap_or_default();
             *clipboard = val.clone();
-            MenuDispatch::Status(format!("Copied {}", main_addr_label(main_row, main_col)))
+            // ratatui's Copy sets no status (keeps the current one).
+            MenuDispatch::Status(String::new())
         },
         "cut" => {
             let val = app.core.workbook.active_sheet().grid.get(&addr).unwrap_or_default();
-            *clipboard = val.clone();
-            commit_cell(app, addr.clone(), String::new());
-            MenuDispatch::Status(format!("Cut {}", main_addr_label(main_row, main_col)))
+            if val.is_empty() {
+                MenuDispatch::Status("Nothing to cut".into())
+            } else {
+                *clipboard = val.clone();
+                commit_cell(app, addr.clone(), String::new());
+                MenuDispatch::Status("Selection cut".into())
+            }
         },
         "paste" => {
             let val = clipboard.clone();
@@ -379,7 +385,8 @@ pub fn dispatch_menu_action(
                 MenuDispatch::Status("Clipboard empty (use Copy/Cut first)".into())
             } else {
                 commit_cell(app, addr.clone(), val);
-                MenuDispatch::Status(format!("Pasted at {}", main_addr_label(main_row, main_col)))
+                // ratatui's Paste sets no status (keeps the current one).
+                MenuDispatch::Status(String::new())
             }
         }
         "sort_asc" | "sort_desc" => {
@@ -391,20 +398,69 @@ pub fn dispatch_menu_action(
                 "Nothing to sort".into()
             })
         }
-        "replay" => MenuDispatch::Status("Replay: not available in the pancurses build".into()),
-        "extrapolate" => MenuDispatch::Status("Extrapolate: not available in the pancurses build".into()),
-        "duplicate" => {
+        "replay" => {
+            // Replay the current file (reload all revisions), matching
+            // ratatui's Replay action. Status text matches.
+            if let Some(ref p) = app.core.path.clone() {
+                if p.exists() {
+                    let mut workbook = crate::ops::WorkbookState::new();
+                    let mut active_sheet = workbook.sheet_id(workbook.active_sheet);
+                    match crate::io::load_workbook_revisions_partial(p, usize::MAX, &mut workbook, &mut active_sheet) {
+                        Ok((off, replay)) => {
+                            app.core.workbook = workbook;
+                            app.core.offset = off;
+                            app.core.ops_applied = replay.op_count;
+                            app.core.cursor = SheetCursor { row: HEADER_ROWS, col: MARGIN_COLS };
+                            MenuDispatch::Status(format!("Replayed {} @ revision {}", p.display(), replay.op_count))
+                        }
+                        Err(e) => MenuDispatch::Status(format!("Replay error: {e}")),
+                    }
+                } else {
+                    MenuDispatch::Status("Replay: file not found".into())
+                }
+            } else {
+                MenuDispatch::Status("Replay: no file loaded".into())
+            }
+        }
+        "extrapolate" => {
+            // Extrapolate the cursor cell's value one step down (matching
+            // ratatui's Extrapolate on a single-cell seed).
             let val = app.core.workbook.active_sheet().grid.get(&addr).unwrap_or_default();
             if val.is_empty() {
-                MenuDispatch::Status("Nothing to duplicate".into())
+                MenuDispatch::Status("Select cells with a pattern, then Extrapolate".into())
             } else {
-                let below = CellAddr::Main { row: main_row + 1, col: main_col };
-                commit_cell(app, below.clone(), val);
-                MenuDispatch::Status(format!(
-                    "Duplicated {} to {}",
-                    main_addr_label(main_row, main_col),
-                    main_addr_label(main_row + 1, main_col),
-                ))
+                let seed = vec![val];
+                let main_cols = app.core.workbook.active_sheet().grid.main_cols();
+                if let Some(filled) = crate::extrapolate::infer_fill_value(
+                    &seed, 1, crate::extrapolate::FillDirection::Down, main_cols,
+                ) {
+                    let below = CellAddr::Main { row: main_row + 1, col: main_col };
+                    commit_cell(app, below, filled);
+                    MenuDispatch::Status("Extrapolated selection".into())
+                } else {
+                    MenuDispatch::Status("Select cells with a pattern, then Extrapolate".into())
+                }
+            }
+        }
+        "duplicate" => {
+            // Duplicate the cursor row (matching ratatui's Duplicate mode
+            // Enter on a single cell, which inserts a mitosis row).
+            let sheet_id = app.core.workbook.sheet_id(app.core.workbook.active_sheet);
+            let main_rows = app.core.workbook.active_sheet().grid.main_rows();
+            if (main_row as usize) < main_rows {
+                let wbo = WorkbookOp::SheetOp { sheet_id, op: Op::DuplicateRow { row: main_row } };
+                if let Some(ref p) = app.core.path.clone() {
+                    let mut active_sheet = sheet_id;
+                    let _ = crate::io::commit_workbook_op(p, &mut app.core.offset, &mut app.core.workbook, &mut active_sheet, &wbo);
+                    app.core.ops_applied = app.core.ops_applied.saturating_add(1);
+                } else {
+                    let mut active = sheet_id;
+                    let _ = crate::ops::apply_workbook_op(&mut app.core.workbook, &mut active, wbo);
+                }
+                app.core.cursor = SheetCursor { row: hr + main_row as usize + 1, col: app.core.cursor.col };
+                MenuDispatch::Status("Duplicated row".into())
+            } else {
+                MenuDispatch::Status("Nothing to duplicate".into())
             }
         }
         "sheet_prev" | "sheet_next" => {
@@ -460,7 +516,6 @@ pub fn dispatch_menu_action(
         "about" => MenuDispatch::About { status: "About".into() },
         "help_keybinds" => MenuDispatch::HelpKeybinds { status: "Help".into() },
         "toggle_headers" | "toggle_margins" => MenuDispatch::Status(format!("Toggle: {name} (fixed chrome in this build)")),
-        "balance_books" => MenuDispatch::Status("Balance books: create a report from a data sheet — not available in the pancurses build".into()),
         "undo" | "redo" => MenuDispatch::Status(format!("{name}: no undo/redo history in the pancurses build yet")),
         _ => MenuDispatch::Status(format!("Menu action: {name}")),
     }
@@ -597,6 +652,50 @@ pub fn run_prompt_action(app: &mut App, action: &str, text: &str) {
                 app.core.ops_applied = app.core.ops_applied.saturating_add(1);
             }
             app.core.status = "View sort saved".into();
+        }
+        "balance_books" => {
+            // Generate a balance report sheet from the chosen amount column,
+            // matching ratatui's BalanceBooks (persist=true).
+            let col = if path.trim().is_empty() {
+                crate::balance::choose_balance_column(&app.core.workbook.active_sheet().grid)
+            } else {
+                crate::addr::parse_excel_column(path.trim()).map(|c| c as usize)
+            };
+            let Some(col) = col else {
+                app.core.status = "No balance column found".into();
+                return;
+            };
+            let direction = crate::balance::BalanceDirection::PosToNeg;
+            let report = crate::balance::build_balance_report(
+                &app.core.workbook.active_sheet().grid, col, direction,
+            );
+            let source_sheet_id = app.core.workbook.sheet_id(app.core.workbook.active_sheet);
+            let source_title = app.core.workbook.sheet_title(app.core.workbook.active_sheet).to_string();
+            let title = format!("Balance-{}", app.core.workbook.next_sheet_id);
+            let id = app.core.workbook.next_sheet_id;
+            let plan = crate::balance::balance_copy_plan(
+                source_sheet_id, source_title.clone(), id, title.clone(), col,
+                app.core.workbook.active_sheet().grid.main_rows(), &report, true,
+            );
+            let report_sheet = crate::balance::materialize_report_sheet(
+                &app.core.workbook.active_sheet().clone(), &plan,
+            );
+            app.core.workbook.add_sheet(title.clone(), report_sheet);
+            app.core.workbook.active_sheet = app.core.workbook.sheet_index_by_id(id).unwrap_or(app.core.workbook.active_sheet);
+            app.core.view_sheet_id = id;
+            if let Some(ref p) = app.core.path.clone() {
+                let mut active_sheet = id;
+                let wbo = WorkbookOp::BalanceReport {
+                    id, title: title.clone(), source_sheet_id, amount_col: col, direction,
+                    row_order: plan.row_order.clone(),
+                    show_unmatched_heading: plan.show_unmatched_heading,
+                    unmatched_start: plan.unmatched_start,
+                    preserve_formulas: true,
+                };
+                let _ = crate::io::commit_workbook_op(p, &mut app.core.offset, &mut app.core.workbook, &mut active_sheet, &wbo);
+                app.core.ops_applied = app.core.ops_applied.saturating_add(1);
+            }
+            app.core.status = format!("Balance report saved as {title}");
         }
         "go_to_cell" => {
             if !path.is_empty() {

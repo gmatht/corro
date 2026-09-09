@@ -227,7 +227,7 @@ fn overflow_renders_cell_text() {
 #[test]
 fn menu_up_wraps_to_last_item() {
     let pane = run_in_tmux("--pancurses docs/tests/overflow.corro", &["Escape", "f", "Up", "Enter"], 2200);
-    assert!(pane.contains("Replay:"),
+    assert!(pane.contains("Replayed"),
         "Up on the first item should wrap to the last (Replay) and Enter fire it\n{}",
         safe_slice(&pane, 1500));
 }
@@ -679,7 +679,7 @@ fn menu_item_activation_smoke() {
     activate_menu_item(2, 0, "Rows", "Inserted 1 row above row 0", false);
     activate_menu_item(5, 0, "About", "About", false);
     activate_menu_item(3, 3, "Reset", "Format reset", false);
-    activate_menu_item(1, 0, "Cut", "Cut A1", false);
+    activate_menu_item(1, 0, "Cut", "Selection cut", false);
     activate_menu_item(4, 2, "New sheet", "New sheet created", false);
     // Quit must actually terminate the app.
     activate_menu_item(0, 6, "Exit", "", true);
@@ -827,7 +827,7 @@ fn menu_rename_sheet() {
 #[test]
 fn menu_edit_cut_clears_cell() {
     // Edit -> Cut: copies the cursor cell to the clipboard and clears it.
-    activate_menu_item(1, 0, "Cut", "Cut", false);
+    activate_menu_item(1, 0, "Cut", "Selection cut", false);
 }
 
 #[test]
