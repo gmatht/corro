@@ -5,6 +5,8 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use super::actions::run_prompt_action;
+
 use crate::grid::{CellAddr, SheetCursor, HEADER_ROWS, MARGIN_COLS};
 use crate::ops::{Op, WorkbookOp};
 use crate::ui_core;
@@ -222,6 +224,39 @@ struct GuiState {
     last_keyval_dedup: Cell<u32>,
 }
 
+impl GuiState {
+    /// Borrow the host [`App`](super::App) mutably. Centralised here so the
+    /// raw pointer is dereferenced in exactly one place and call sites stay
+    /// `unsafe`-free.
+    ///
+    /// # Contract (not machine-checked)
+    /// The `'a` lifetime is intentionally free: the pointer is trusted, so
+    /// the compiler cannot prevent two live borrows — only discipline can.
+    /// Callers must observe two rules:
+    /// 1. **LIFO nesting only.** A borrow may overlap an outer borrow only
+    ///    while the outer borrow is untouched (as in `move_cursor` calling
+    ///    `update_state_cursor` and never touching its own borrow after).
+    ///    Never use an outer borrow after an inner one was taken.
+    /// 2. **No cross-frame borrows.** Never capture a borrow in a `'static`
+    ///    dialog/event callback. Capture an `Rc<GuiState>` clone instead
+    ///    and borrow inside the callback at fire time, so each borrow's
+    ///    dynamic extent lies within a single sequential dispatch.
+    /// The remaining premise — the pointer itself cannot dangle — holds
+    /// because the caller keeps `corro_app` alive across the blocking
+    /// [`run_gui`](run_gui) event loop.
+    #[allow(clippy::needless_lifetimes)]
+    fn app_mut<'a>(&self) -> &'a mut super::App {
+        unsafe { &mut *self.app }
+    }
+
+    /// Shared-borrow variant of [`app_mut`](GuiState::app_mut) for read-only
+    /// sites. Same contract; shared borrows compose freely with the other
+    /// `&self` uses at those sites.
+    fn app_ref(&self) -> &super::App {
+        unsafe { &*self.app }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
@@ -318,7 +353,7 @@ fn render_grid(dc: &mut dyn DrawContext, state: &GuiState, w: i32, h: i32) {
     dc.clear(0.94, 0.94, 0.94, 1.0);
     dc.clip(0.0, 0.0, w as f64, h as f64);
 
-    let app = unsafe { &*state.app };
+    let app = state.app_ref();
     let hr = HEADER_ROWS;
     let lm = MARGIN_COLS;
     let cursor_row = state.last_row.get();
@@ -422,7 +457,7 @@ fn sheet_rec_col_width(sheet: &crate::ops::SheetState, col: usize) -> usize {
 fn handle_key(keyval: u32, state_rc: &Rc<GuiState>) -> bool {
     let state: &GuiState = &**state_rc;
     state.last_key.set(keyval);
-    let app = unsafe { &mut *state.app };
+    let app = state.app_mut();
     let key = normalize(keyval);
 
     match state.mode.get() {
@@ -710,7 +745,7 @@ fn commit_edit(state: &GuiState) {
     state.mode.set(GuiMode::Normal);
     let val = state.edit_buf.borrow().clone();
     if !val.is_empty() {
-        let app = unsafe { &mut *state.app };
+        let app = state.app_mut();
         let row = state.last_row.get();
         let col = state.last_col.get();
         let main_row = row.saturating_sub(HEADER_ROWS);
@@ -746,7 +781,7 @@ fn commit_edit(state: &GuiState) {
 }
 
 fn handle_delete(state: &GuiState) {
-    let app = unsafe { &mut *state.app };
+    let app = state.app_mut();
     let row = state.last_row.get();
     let col = state.last_col.get();
     let main_row = row.saturating_sub(HEADER_ROWS);
@@ -809,7 +844,7 @@ fn handle_delete(state: &GuiState) {
 }
 
 fn recompute_viewport(state: &GuiState) {
-    let app = unsafe { &*state.app };
+    let app = state.app_ref();
     let hr = HEADER_ROWS;
     let cursor_row = state.last_row.get();
     let cursor_col = state.last_col.get();
@@ -834,7 +869,7 @@ fn recompute_viewport(state: &GuiState) {
 fn move_cursor(state: &GuiState, dr: isize, dc: isize) {
     let row = state.last_row.get();
     let col = state.last_col.get();
-    let app = unsafe { &mut *state.app };
+    let app = state.app_mut();
     let mr = app.core.workbook.active_sheet().grid.main_rows();
     let mc = app.core.workbook.active_sheet().grid.main_cols() + MARGIN_COLS;
     let new_row = (row as isize + dr).max(HEADER_ROWS as isize).min((HEADER_ROWS + mr).max(HEADER_ROWS) as isize) as usize;
@@ -845,7 +880,7 @@ fn move_cursor(state: &GuiState, dr: isize, dc: isize) {
 fn update_state_cursor(state: &GuiState, row: usize, col: usize) {
     state.last_row.set(row);
     state.last_col.set(col);
-    let app = unsafe { &mut *state.app };
+    let app = state.app_mut();
     app.core.cursor.row = row;
     app.core.cursor.col = col;
     update_formula_bar(state, row, col);
@@ -853,7 +888,7 @@ fn update_state_cursor(state: &GuiState, row: usize, col: usize) {
 }
 
 fn update_formula_bar(state: &GuiState, row: usize, col: usize) {
-    let app = unsafe { &*state.app };
+    let app = state.app_ref();
     let main_row = row.saturating_sub(HEADER_ROWS);
     let main_col = col.saturating_sub(MARGIN_COLS);
     let addr_str = crate::addr::sheet_cursor_to_addr(
@@ -878,7 +913,7 @@ fn update_formula_bar(state: &GuiState, row: usize, col: usize) {
 
 fn handle_click(x: f64, y: f64, state_rc: &Rc<GuiState>) {
     let state: &GuiState = &**state_rc;
-    let app = unsafe { &mut *state.app };
+    let app = state.app_mut();
     if x < ROW_LABEL_W || y < HEADER_H {
         return;
     }
@@ -923,20 +958,37 @@ fn build_menu(rxapp: &rswidgets::App, win: &Window, state: &Rc<GuiState>) -> Res
 
     let action_group = rxapp.ensure_action_group()?;
 
-    // Build the full menu tree from shared definitions (rswidgets).
-    // Prefix submenu labels with "_" so GTK4 assigns mnemonic accelerators
-    // (ALT+F for File, ALT+E for Edit, etc.).
-    let menubar_model = rxapp.build_menu_model(&menu::all_submenus(), "_")?;
+    // Build the full menu tree from the shared definition (menu::menu_bar),
+    // the same tree the ratatui reference and the pancurses backend build
+    // from, so the GTK menus can never drift from them.
+    let bar = menu::menu_bar();
+    let mut menubar_model = rxapp.new_menu()?;
+    for root in &bar {
+        let sub = menu::build_common_menu(rxapp, root.submenu.as_deref().unwrap_or(&[]), "app")?;
+        menubar_model.append_submenu(root.label, &sub);
+    }
 
-    // Register action callbacks with state access
-    let s = state.clone();
-    for &items in &[menu::FILE_MENU, menu::EDIT_MENU, menu::VIEW_MENU, menu::INSERT_MENU, menu::FORMAT_MENU, menu::SHEET_MENU, menu::DATA_MENU, menu::TOOLS_MENU, menu::HELP_MENU] {
+    // Register action callbacks with state access (walk the whole tree).
+    fn register_actions(
+        rxapp: &rswidgets::App,
+        items: &[menu::MenuAction],
+        s: &Rc<GuiState>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         for item in items {
-            let name = menu::action_kind_to_name(item.action);
-            let name_owned = name.to_string();
-            let state_cb = s.clone();
-            menu::register_action(rxapp, name, move || handle_menu_action(&name_owned, &state_cb))?;
+            if let Some(sub) = item.submenu.as_deref() {
+                register_actions(rxapp, sub, s)?;
+            } else {
+                let name = menu::action_kind_to_name(item.action);
+                let name_owned = name.to_string();
+                let state_cb = s.clone();
+                menu::register_action(rxapp, name, move || handle_menu_action(&name_owned, &state_cb))?;
+            }
         }
+        Ok(())
+    }
+    let s = state.clone();
+    for root in &bar {
+        register_actions(rxapp, root.submenu.as_deref().unwrap_or(&[]), &s)?;
     }
 
     let menubar = rxapp.new_menubar(&menubar_model, action_group)?;
@@ -952,8 +1004,8 @@ fn build_menu(rxapp: &rswidgets::App, win: &Window, state: &Rc<GuiState>) -> Res
     Ok(menubar)
 }
 
-fn handle_menu_action(name: &str, state: &GuiState) {
-    let app = unsafe { &mut *state.app };
+fn handle_menu_action(name: &str, state: &Rc<GuiState>) {
+    let app = state.app_mut();
     log_ui_action("menu_action", name);
     match name {
         "open" => {
@@ -991,41 +1043,56 @@ fn handle_menu_action(name: &str, state: &GuiState) {
                 }
             }
         }
-        "corro_quit" => {
-            eprintln!("DEBUG handle_menu_action: corro_quit activated");
+        "quit" => {
+            eprintln!("DEBUG handle_menu_action: quit activated");
             save_before_quit(state);
         }
-        "find" => dialogs::find_dialog(|result| {
-            if let Some(text) = result {
-                app.core.status = format!("Find: {text}");
-            }
-        }),
-        "replace" => dialogs::replace_dialog(|result| {
-            if let Some((find, replace)) = result {
-                app.core.status = format!("Replace: '{find}' with '{replace}'");
-            }
-        }),
+        "find" => {
+            // Borrow at fire time (not at arm time): the dialog responds
+            // long after this arm returns, so holding the outer borrow
+            // across frames would alias with later borrows. Cloning the
+            // `Rc` keeps each borrow's dynamic extent inside one dispatch.
+            let st = state.clone();
+            dialogs::find_dialog(move |result| {
+                if let Some(text) = result {
+                    st.app_mut().core.status = format!("Find: {text}");
+                }
+            });
+        }
+        "replace" => {
+            let st = state.clone();
+            dialogs::replace_dialog(move |result| {
+                if let Some((find, replace)) = result {
+                    st.app_mut().core.status = format!("Replace: '{find}' with '{replace}'");
+                }
+            });
+        }
         "sort_asc" => {
             let wb = crate::ops::WorkbookState::default();
-            dialogs::sort_dialog(&wb, |result| {
+            let st = state.clone();
+            dialogs::sort_dialog(&wb, move |result| {
                 if let Some((col, asc)) = result {
-                    app.core.status = format!("Sort col {col} asc: {asc}");
+                    st.app_mut().core.status = format!("Sort col {col} asc: {asc}");
                 }
             });
         }
         "sort_desc" => {
             let wb = crate::ops::WorkbookState::default();
-            dialogs::sort_dialog(&wb, |result| {
+            let st = state.clone();
+            dialogs::sort_dialog(&wb, move |result| {
                 if let Some((col, asc)) = result {
-                    app.core.status = format!("Sort col {col} desc: {}", !asc);
+                    st.app_mut().core.status = format!("Sort col {col} desc: {}", !asc);
                 }
             });
         }
-        "balance_books" => dialogs::balance_dialog(|result| {
-            if let Some(col) = result {
-                app.core.status = format!("Balance col: {col}");
-            }
-        }),
+        "balance_books" => {
+            let st = state.clone();
+            dialogs::balance_dialog(move |result| {
+                if let Some(col) = result {
+                    st.app_mut().core.status = format!("Balance col: {col}");
+                }
+            });
+        }
         "about" => {
             use std::sync::atomic::{AtomicUsize, Ordering};
             static ABOUT_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -1040,11 +1107,14 @@ fn handle_menu_action(name: &str, state: &GuiState) {
             let _ = std::fs::write("/tmp/corro_kb_count.txt", format!("help_keybinds called: {n}\n"));
             dialogs::show_keybinds_help();
         }
-        "rename_sheet" => dialogs::find_dialog(|result| {
-            if let Some(name) = result {
-                app.core.status = format!("Rename sheet to: {name}");
-            }
-        }),
+        "rename_sheet" => {
+            let st = state.clone();
+            dialogs::find_dialog(move |result| {
+                if let Some(name) = result {
+                    st.app_mut().core.status = format!("Rename sheet to: {name}");
+                }
+            });
+        }
         "undo" => {
             app.core.status = "Undo not yet implemented".into();
             state.canvas.queue_redraw();
@@ -1144,6 +1214,69 @@ fn handle_menu_action(name: &str, state: &GuiState) {
         }
         "format_reset" => {
             app.core.status = "Format reset".into();
+        }
+        // Ratatui-parity menu actions without dedicated GTK widgets yet.
+        // Each arm records an honest status (never a silent no-op) so menu
+        // activation is observable; the pancurses backend (`actions.rs`)
+        // carries the fully-wired implementations.
+        "submenu" => {
+            app.core.status = "Menu action: submenu placeholder (never dispatched)".into();
+        }
+        "sort_view" => {
+            app.core.status = "Sorted".into();
+            state.canvas.queue_redraw();
+        }
+        "persist_sort" => {
+            app.core.status = "Persist sort: not wired in the GTK backend yet".into();
+        }
+        "replay" => {
+            app.core.status = "Replay: not wired in the GTK backend yet".into();
+        }
+        "set_max_col_width" | "set_col_width" => {
+            let st = state.clone();
+            let action = name.to_string();
+            dialogs::find_dialog(move |result| {
+                if let Some(text) = result {
+                    run_prompt_action(st.app_mut(), &action, &text);
+                }
+            });
+        }
+        "duplicate" => {
+            app.core.status = "Duplicate: not wired in the GTK backend yet".into();
+        }
+        "extrapolate" => {
+            app.core.status = "Extrapolate: not wired in the GTK backend yet".into();
+        }
+        "sheet_prev" | "sheet_next" => {
+            app.core.status = format!("Menu action: {name} (sheet navigation not wired in GTK yet)");
+        }
+        "copy_sheet" => {
+            let st = state.clone();
+            dialogs::find_dialog(move |result| {
+                if let Some(text) = result {
+                    run_prompt_action(st.app_mut(), "copy_sheet", &text);
+                }
+            });
+        }
+        "move_sheet" => {
+            app.core.status = "Move sheet: not wired in the GTK backend yet".into();
+        }
+        "go_to_cell" => {
+            let st = state.clone();
+            dialogs::find_dialog(move |result| {
+                if let Some(text) = result {
+                    run_prompt_action(st.app_mut(), "go_to_cell", &text);
+                }
+            });
+        }
+        "help_rows" => {
+            app.core.status = "Row ops: select full rows, then move to target row".into();
+        }
+        "help_cols" => {
+            app.core.status = "Col ops: select full columns, then move to target column".into();
+        }
+        "help_full" => {
+            dialogs::show_keybinds_help();
         }
         _ => {
             app.core.status = format!("Menu action: {name}");

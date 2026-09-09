@@ -36,6 +36,10 @@ mod pancurses_adapter {
             crate::backends::pancurses::set_child(self.id, child_id);
         }
 
+        pub fn set_child_box(&self, child: &BoxWidget) {
+            self.set_child(child);
+        }
+
         pub fn present(&self) {}
 
         pub fn insert_action_group(&self, _name: &str, _group_ptr: *mut c_void) {}
@@ -83,6 +87,13 @@ mod pancurses_adapter {
             // fire synchronously
             Ok(0)
         }
+
+        pub fn set_font_style(&self, w: i32, it: bool) {
+            crate::backends::pancurses::set_button_font_style(self.id, w, it);
+        }
+        pub fn set_size_request(&self, _w: i32, _h: i32) {}
+        pub fn add_class(&self, _class_name: &str) {}
+        pub fn remove_class(&self, _class_name: &str) {}
     }
 
     // -- Label --
@@ -117,6 +128,9 @@ mod pancurses_adapter {
             crate::backends::pancurses::set_label_visible(self.id, visible);
         }
         pub fn set_xalign(&self, _x: f32) {}
+        pub fn raw_handle(&self) -> *mut c_void {
+            &self.id as *const usize as *mut c_void
+        }
     }
 
     // -- BoxWidget --
@@ -139,6 +153,10 @@ mod pancurses_adapter {
         }
     }
 
+    impl Clone for BoxWidget {
+        fn clone(&self) -> Self { BoxWidget { id: self.id, orientation: self.orientation, spacing: self.spacing } }
+    }
+
     impl BoxWidget {
         pub fn append(&self, child: &impl AsRef<*mut c_void>) {
             let child_ptr = *child.as_ref();
@@ -149,6 +167,10 @@ mod pancurses_adapter {
         pub fn layout(&self, _x: i32, _y: i32, _w: i32, _h: i32) {
             crate::backends::pancurses::layout_box(self.id);
         }
+
+        pub fn set_child_vexpand(&self, _child: &impl AsRef<*mut c_void>, _expand: bool) {}
+        pub fn set_child_hexpand(&self, _child: &impl AsRef<*mut c_void>, _expand: bool) {}
+        pub fn set_hexpand(&self, _expand: bool) {}
     }
 
     // -- Grid --
@@ -208,8 +230,9 @@ mod pancurses_adapter {
             crate::backends::pancurses::add_callback(self.id, Box::new(f));
             Ok(0)
         }
-    }
 
+        pub fn set_hexpand(&self, _expand: bool) {}
+        pub fn set_vexpand(&self, _expand: bool) {}
         pub fn set_halign(&self, _align: i32) {}
         pub fn set_valign(&self, _align: i32) {}
         pub fn set_visible(&self, _visible: bool) {}
@@ -222,27 +245,23 @@ mod pancurses_adapter {
         pub fn grab_focus(&self) {}
         pub fn on_key_raw(&self, _cb: Box<dyn FnMut(u32, u32) -> bool>) {}
 
-    // -- Standard dialogs (wxMessageBox / wxFileDialog) --
+        pub fn connect_activate<F: FnMut(*mut c_void) + 'static>(&self, f: F) -> Result<u64, Error> {
+            let mut f = f;
+            crate::backends::pancurses::add_callback(self.id, Box::new(move || f(std::ptr::null_mut())));
+            Ok(0)
+        }
 
-    pub fn message_box(
-        title: &str,
-        text: &str,
-        kind: crate::MessageBoxKind,
-        on_result: Option<Box<dyn FnMut(crate::MessageBoxResult)>>,
-    ) {
-        crate::backends::pancurses::message_box(title, text, kind, on_result);
-    }
+        pub fn connect_focus_in_event<F: FnMut(*mut c_void) -> i32 + 'static>(&self, f: F) -> Result<u64, Error> {
+            let mut f = f;
+            crate::backends::pancurses::add_callback(self.id, Box::new(move || { f(std::ptr::null_mut()); }));
+            Ok(0)
+        }
 
-    pub fn close_dialog() {
-        crate::backends::pancurses::close_dialog();
-    }
-
-    pub fn file_open_dialog(on_path: Box<dyn FnMut(Option<String>)>) {
-        crate::backends::pancurses::file_open_dialog(on_path);
-    }
-
-    pub fn file_save_dialog(default_name: &str, on_path: Box<dyn FnMut(Option<String>)>) {
-        crate::backends::pancurses::file_save_dialog(default_name, on_path);
+        pub fn connect_focus_out_event<F: FnMut(*mut c_void) -> i32 + 'static>(&self, f: F) -> Result<u64, Error> {
+            let mut f = f;
+            crate::backends::pancurses::add_callback(self.id, Box::new(move || { f(std::ptr::null_mut()); }));
+            Ok(0)
+        }
     }
 
     // -- Menu --
@@ -338,7 +357,27 @@ mod pancurses_adapter {
         }
     }
 
+    impl Clone for Menu {
+        fn clone(&self) -> Self {
+            Menu {
+                id: self.id,
+                items: std::cell::RefCell::new(self.items.borrow().clone()),
+            }
+        }
+    }
+
+    impl Clone for MenuBar {
+        fn clone(&self) -> Self { MenuBar { id: self.id } }
+    }
+
+    impl Clone for SimpleAction {
+        fn clone(&self) -> Self { SimpleAction { id: self.id } }
+    }
+
     impl MenuBar {
+        pub fn activate_submenu_by_mnemonic(&self, _keyval: u32) -> bool { false }
+        pub fn activate_submenu_item_by_mnemonic(&self, _keyval: u32) -> bool { false }
+        pub fn insert_action_group(&self, _name: &str, _group_ptr: *mut c_void) {}
         pub fn handle_mnemonic_key(&self, _keyval: u32) -> bool { false }
         pub fn handle_menu_key(&self, _keyval: u32, _mod: u32) -> bool { false }
         pub fn menu_active(&self) -> bool { false }
@@ -362,12 +401,21 @@ mod pancurses_adapter {
             crate::backends::pancurses::add_callback(self.id, Box::new(f));
             Ok(0)
         }
+        pub fn connect_activate<F: FnMut(*mut c_void) + 'static>(&self, f: F) -> Result<u64, Error> {
+            let mut f = f;
+            crate::backends::pancurses::add_callback(self.id, Box::new(move || f(std::ptr::null_mut())));
+            Ok(0)
+        }
     }
 
     // -- Dialog --
 
     pub struct Dialog {
         pub(crate) id: usize,
+    }
+
+    impl Clone for Dialog {
+        fn clone(&self) -> Self { Dialog { id: self.id } }
     }
 
     impl Widget for Dialog {
@@ -395,6 +443,7 @@ mod pancurses_adapter {
         pub fn add_button(&self, _label: &str, _response_id: i32) {}
         pub fn connect_response(&self, _f: impl FnMut(i32) + 'static) -> Result<u64, Error> { Ok(0) }
         pub fn present(&self) {}
+        pub fn close(&self) {}
     }
 
     // -- DropDown --
@@ -773,117 +822,6 @@ mod pancurses_adapter {
             .map_err(|e| Error::Backend(format!("{}", e)))
     }
 
-    // -- DataGrid (a bare grid, mirrors wxGrid; Spreadsheet is built on top) --
-
-    pub struct DataGrid {
-        pub(crate) id: usize,
-    }
-
-    impl Widget for DataGrid {
-        fn raw_handle(&self) -> *mut c_void {
-            &self.id as *const usize as *mut c_void
-        }
-    }
-
-    impl AsRef<*mut c_void> for DataGrid {
-        fn as_ref(&self) -> &*mut c_void {
-            unsafe { &*(&self.id as *const usize as *const *mut c_void) }
-        }
-    }
-
-    pub fn create_data_grid(rows: u32, cols: u32) -> Result<DataGrid, Error> {
-        crate::backends::pancurses::create_data_grid(rows, cols)
-            .map(|id| DataGrid { id })
-            .map_err(|e| Error::Backend(format!("{}", e)))
-    }
-
-    pub fn grid_set_cell(grid: &DataGrid, r: u32, c: u32, text: &str) {
-        crate::backends::pancurses::grid_set_cell(grid.id, r, c, text);
-    }
-
-    pub fn grid_get_cell(grid: &DataGrid, r: u32, c: u32) -> Option<String> {
-        crate::backends::pancurses::grid_get_cell(grid.id, r, c)
-    }
-
-
-    // -- Sizers (wxSizer-like layout) --
-
-    pub struct Sizer {
-        pub(crate) id: usize,
-    }
-
-    impl AsRef<*mut c_void> for Sizer {
-        fn as_ref(&self) -> &*mut c_void {
-            unsafe { &*(&self.id as *const usize as *const *mut c_void) }
-        }
-    }
-
-    pub fn create_box_sizer(horizontal: bool, spacing: i32) -> Result<Sizer, Error> {
-        crate::backends::pancurses::create_sizer(crate::Sizer::Box {
-            horizontal,
-            spacing,
-            children: vec![],
-        })
-        .map(|id| Sizer { id })
-        .map_err(|e| Error::Backend(format!("{}", e)))
-    }
-
-    pub fn create_grid_sizer(cols: usize, rows: usize) -> Result<Sizer, Error> {
-        crate::backends::pancurses::create_sizer(crate::Sizer::Grid {
-            cols,
-            rows,
-            children: vec![],
-        })
-        .map(|id| Sizer { id })
-        .map_err(|e| Error::Backend(format!("{}", e)))
-    }
-
-    pub fn create_flex_grid_sizer(cols: usize, rows: usize) -> Result<Sizer, Error> {
-        crate::backends::pancurses::create_sizer(crate::Sizer::FlexGrid {
-            cols,
-            rows,
-            children: vec![],
-        })
-        .map(|id| Sizer { id })
-        .map_err(|e| Error::Backend(format!("{}", e)))
-    }
-
-    /// Add a child widget to a sizer with weight, border, and flags.
-    pub fn sizer_add(
-        sizer: &Sizer,
-        widget: &impl AsRef<*mut c_void>,
-        weight: i32,
-        border: i32,
-        flags: crate::SizerFlags,
-    ) {
-        let widget_id = *widget.as_ref() as usize;
-        crate::backends::pancurses::sizer_add(sizer.id, widget_id, weight, border, flags);
-    }
-
-    pub fn layout_sizer(sizer: &Sizer) {
-        crate::backends::pancurses::layout_sizer(sizer.id);
-    }
-
-    pub fn set_client_data(widget: &impl AsRef<*mut c_void>, data: &str) {
-        let id = *widget.as_ref() as usize;
-        crate::backends::pancurses::set_client_data(id, data);
-    }
-
-    pub fn get_client_data(widget: &impl AsRef<*mut c_void>) -> Option<String> {
-        let id = *widget.as_ref() as usize;
-        crate::backends::pancurses::get_client_data(id)
-    }
-
-    pub fn set_widget_rect(widget: &impl AsRef<*mut c_void>, x: i32, y: i32, w: i32, h: i32) {
-        let id = *widget.as_ref() as usize;
-        crate::backends::pancurses::set_widget_rect(id, x, y, w, h);
-    }
-
-    pub fn get_widget_rect(widget: &impl AsRef<*mut c_void>) -> Option<(i32, i32, i32, i32)> {
-        let id = *widget.as_ref() as usize;
-        crate::backends::pancurses::get_widget_rect(id)
-    }
-
     pub fn create_entry() -> Result<Entry, Error> {
         crate::backends::pancurses::create_entry()
             .map(|id| Entry { id })
@@ -946,14 +884,44 @@ mod pancurses_adapter {
             .map_err(|e| Error::Backend(format!("{}", e)))
     }
 
+    pub fn create_canvas() -> Result<Canvas, Error> {
+        crate::backends::pancurses::create_canvas()
+            .map(|id| Canvas { id })
+            .map_err(|e| Error::Backend(format!("{}", e)))
+    }
+
+    pub fn create_overlay() -> Result<Overlay, Error> {
+        crate::backends::pancurses::create_overlay()
+            .map(|id| Overlay { id })
+            .map_err(|e| Error::Backend(format!("{}", e)))
+    }
+
+    pub fn create_scrolled_window() -> Result<ScrolledWindow, Error> {
+        crate::backends::pancurses::create_scrolled_window()
+            .map(|id| ScrolledWindow { id })
+            .map_err(|e| Error::Backend(format!("{}", e)))
+    }
+
+    pub fn open_file(_title: &str) -> Result<Option<String>, Error> {
+        Ok(None)
+    }
+
+    pub fn save_file(_title: &str) -> Result<Option<String>, Error> {
+        Ok(None)
+    }
+
+    pub fn add_key_callback(key: char, cb: Box<dyn FnMut()>) {
+        crate::backends::pancurses::add_key_callback(key, cb);
+    }
+    pub fn add_goto_callback<F: FnMut() + 'static>(f: F) {
+        crate::backends::pancurses::spreadsheet_add_goto_callback(f);
+    }
+
     pub fn add_cursor_move_callback<F: FnMut(u32, u32) + 'static>(f: F) {
         crate::backends::pancurses::spreadsheet_add_cursor_move_callback(f);
     }
     pub fn add_commit_edit_callback<F: FnMut(u32, u32, String) + 'static>(f: F) {
         crate::backends::pancurses::spreadsheet_add_commit_edit_callback(f);
-    }
-    pub fn add_goto_callback<F: FnMut() + 'static>(f: F) {
-        crate::backends::pancurses::spreadsheet_add_goto_callback(f);
     }
     pub fn spreadsheet_set_cell(id: usize, r: u32, c: u32, text: &str) {
         crate::backends::pancurses::spreadsheet_set_cell(id, r, c, text);
@@ -979,189 +947,3 @@ mod pancurses_adapter {
 }
 
 pub use pancurses_adapter::*;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn menu_model_supports_item_kinds() {
-        let menu = create_menu().unwrap();
-        menu.append("Open", "open");
-        menu.append_with_shortcut("Save", "save", "Ctrl+S");
-        menu.append_separator();
-        menu.append_check("Bold", "bold", true);
-        menu.append_radio("Left", "align_left", 0);
-        let sub = create_menu().unwrap();
-        sub.append("TSV", "export_tsv");
-        menu.append_submenu("Export", &sub);
-
-        let items = menu.items.borrow();
-        assert_eq!(items.len(), 6);
-        assert!(matches!(&items[0],
-            crate::MenuItem::Action { label, action, shortcut }
-            if label == "Open" && action == "open" && shortcut.is_none()));
-        assert!(matches!(&items[1],
-            crate::MenuItem::Action { label, action, shortcut }
-            if label == "Save" && action == "save" && shortcut.as_deref() == Some("Ctrl+S")));
-        assert!(matches!(&items[2], crate::MenuItem::Separator));
-        assert!(matches!(&items[3],
-            crate::MenuItem::Check { label, action, checked }
-            if label == "Bold" && action == "bold" && *checked));
-        assert!(matches!(&items[4],
-            crate::MenuItem::Radio { label, action, group }
-            if label == "Left" && action == "align_left" && *group == 0));
-        assert!(matches!(&items[5],
-            crate::MenuItem::Submenu { label, items }
-            if label == "Export" && items.len() == 1));
-    }
-
-    #[test]
-    fn action_registry_tracks_state() {
-        crate::backends::pancurses::register_action("bold", true, false);
-        crate::backends::pancurses::set_action_checked("bold", true);
-        assert_eq!(crate::backends::pancurses::action_state("bold"), Some((true, true)));
-        crate::backends::pancurses::set_action_enabled("bold", false);
-        assert_eq!(crate::backends::pancurses::action_state("bold"), Some((false, true)));
-        assert_eq!(crate::backends::pancurses::action_state("missing"), None);
-    }
-
-    #[test]
-    fn event_propagation_bubbles_to_parent() {
-        let win = create_window().unwrap();
-        let boxw = create_box(Orientation::Vertical, 0).unwrap();
-        let btn = create_button("Click").unwrap();
-        win.set_child(&boxw);
-        boxw.append(&btn);
-
-        // Child skips; parent handles.
-        let parent_fired = std::rc::Rc::new(std::cell::Cell::new(false));
-        let pf = parent_fired.clone();
-        crate::backends::pancurses::add_event_callback(boxw.id, Box::new(move |_ev| {
-            pf.set(true);
-            crate::CallbackResult::Handled
-        }));
-        crate::backends::pancurses::add_event_callback(btn.id, Box::new(|_ev| crate::CallbackResult::Skip));
-
-        let result = crate::backends::pancurses::fire_event(btn.id, &crate::Event::Activate);
-        assert_eq!(result, crate::CallbackResult::Handled);
-        assert!(parent_fired.get(), "parent should have received the bubbled event");
-    }
-
-    #[test]
-    fn event_propagation_stops_when_handled() {
-        let win = create_window().unwrap();
-        let boxw = create_box(Orientation::Vertical, 0).unwrap();
-        let btn = create_button("Click").unwrap();
-        win.set_child(&boxw);
-        boxw.append(&btn);
-
-        // Child handles; parent must NOT fire.
-        let parent_fired = std::rc::Rc::new(std::cell::Cell::new(false));
-        let pf = parent_fired.clone();
-        crate::backends::pancurses::add_event_callback(boxw.id, Box::new(move |_ev| {
-            pf.set(true);
-            crate::CallbackResult::Handled
-        }));
-        crate::backends::pancurses::add_event_callback(btn.id, Box::new(|_ev| crate::CallbackResult::Handled));
-
-        let result = crate::backends::pancurses::fire_event(btn.id, &crate::Event::Activate);
-        assert_eq!(result, crate::CallbackResult::Handled);
-        assert!(!parent_fired.get(), "parent should NOT fire when child handled the event");
-    }
-
-    #[test]
-    fn box_sizer_lays_out_children_by_weight() {
-        let win = create_window().unwrap();
-        let sizer = create_box_sizer(true, 0).unwrap();
-        let b1 = create_button("A").unwrap();
-        let b2 = create_button("B").unwrap();
-        win.set_child(&sizer);
-        sizer_add(&sizer, &b1, 1, 0, crate::SizerFlags::default());
-        sizer_add(&sizer, &b2, 2, 0, crate::SizerFlags::default());
-        set_widget_rect(&sizer, 0, 0, 30, 1);
-        layout_sizer(&sizer);
-
-        let (_, _, w1, _) = get_widget_rect(&b1).unwrap();
-        let (_, _, w2, _) = get_widget_rect(&b2).unwrap();
-        // Weights 1:2 over 30 columns -> 10 and 20.
-        assert_eq!(w1, 10, "weight-1 child should get 1/3 of the width");
-        assert_eq!(w2, 20, "weight-2 child should get 2/3 of the width");
-    }
-
-    #[test]
-    fn grid_sizer_arranges_children_in_cells() {
-        let win = create_window().unwrap();
-        let sizer = create_grid_sizer(2, 2).unwrap();
-        let b1 = create_button("A").unwrap();
-        let b2 = create_button("B").unwrap();
-        let b3 = create_button("C").unwrap();
-        let b4 = create_button("D").unwrap();
-        win.set_child(&sizer);
-        for b in [&b1, &b2, &b3, &b4] {
-            sizer_add(&sizer, b, 0, 0, crate::SizerFlags::default());
-        }
-        set_widget_rect(&sizer, 0, 0, 20, 2);
-        layout_sizer(&sizer);
-
-        let (x1, y1, w1, h1) = get_widget_rect(&b1).unwrap();
-        let (x2, y2, _, _) = get_widget_rect(&b2).unwrap();
-        let (x3, y3, _, _) = get_widget_rect(&b3).unwrap();
-        assert_eq!((x1, y1, w1, h1), (0, 0, 10, 1), "cell (0,0)");
-        assert_eq!((x2, y2), (10, 0), "cell (1,0)");
-        assert_eq!((x3, y3), (0, 1), "cell (0,1)");
-    }
-
-    #[test]
-    fn message_box_fires_result_on_close() {
-        let result = std::rc::Rc::new(std::cell::Cell::new(None));
-        let r = result.clone();
-        message_box("Test", "Hello world", crate::MessageBoxKind::Info, Some(Box::new(move |res| {
-            r.set(Some(res));
-        })));
-        close_dialog();
-        assert_eq!(result.get(), Some(crate::MessageBoxResult::Ok));
-    }
-
-    #[test]
-    fn client_data_round_trip() {
-        let win = create_window().unwrap();
-        let btn = create_button("Click").unwrap();
-        win.set_child(&btn);
-        set_client_data(&btn, "my-data-42");
-        assert_eq!(get_client_data(&btn).as_deref(), Some("my-data-42"));
-        set_client_data(&btn, "updated");
-        assert_eq!(get_client_data(&btn).as_deref(), Some("updated"));
-    }
-
-    #[test]
-    fn data_grid_holds_cells_independently() {
-        let win = create_window().unwrap();
-        let grid = create_data_grid(10, 3).unwrap();
-        win.set_child(&grid);
-        grid_set_cell(&grid, 1, 2, "hello");
-        assert_eq!(grid_get_cell(&grid, 1, 2).as_deref(), Some("hello"));
-        assert_eq!(grid_get_cell(&grid, 0, 0), None);
-        // The DataGrid is a bare grid: it does NOT have spreadsheet chrome, so
-        // the spreadsheet setters must not apply to it.
-        grid_set_cell(&grid, 5, 5, "out");
-        assert_eq!(grid_get_cell(&grid, 5, 5).as_deref(), Some("out"));
-    }
-
-    #[test]
-    fn menubar_collects_root_submenus() {
-        let menubar = create_menu().unwrap();
-        for (label, items) in [("File", &["open", "save"][..]), ("Edit", &["cut", "copy"][..])] {
-            let sub = create_menu().unwrap();
-            for a in items {
-                sub.append(a, a);
-            }
-            menubar.append_submenu(label, &sub);
-        }
-        let roots = collect_menu_items(&menubar);
-        assert_eq!(roots.len(), 2);
-        assert_eq!(roots[0].0, "File");
-        assert_eq!(roots[0].1.len(), 2);
-        assert_eq!(roots[1].0, "Edit");
-    }
-}

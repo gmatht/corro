@@ -5,6 +5,8 @@ pub struct MenuAction {
     pub label: &'static str,
     pub shortcut: &'static str,
     pub action: MenuActionKind,
+    /// When set, this item opens a submenu instead of dispatching an action.
+    pub submenu: Option<Vec<MenuAction>>,
 }
 
 #[derive(Clone, Copy)]
@@ -65,6 +67,28 @@ pub enum MenuActionKind {
     FormatAlignDefault,
     FormatReset,
     ExportAll,
+    // Submenu placeholder (item opens a submenu; never dispatched)
+    Submenu,
+    // File menu (ratatui parity)
+    SortView,
+    SaveSort,
+    Replay,
+    SetMaxColWidth,
+    SetColWidth,
+    ExportOdt,
+    // Edit menu (ratatui parity)
+    Duplicate,
+    Extrapolate,
+    // Sheet menu (ratatui parity)
+    SheetPrev,
+    SheetNext,
+    CopySheet,
+    MoveSheet,
+    GoToCell,
+    // Help menu (ratatui parity)
+    HelpRows,
+    HelpCols,
+    HelpFull,
 }
 
 pub fn action_kind_to_name(kind: MenuActionKind) -> &'static str {
@@ -72,7 +96,7 @@ pub fn action_kind_to_name(kind: MenuActionKind) -> &'static str {
         MenuActionKind::Open => "open",
         MenuActionKind::Save => "save",
         MenuActionKind::SaveAs => "save_as",
-        MenuActionKind::Quit => "corro_quit",
+        MenuActionKind::Quit => "quit",
         MenuActionKind::Undo => "undo",
         MenuActionKind::Redo => "redo",
         MenuActionKind::Cut => "cut",
@@ -123,6 +147,23 @@ pub fn action_kind_to_name(kind: MenuActionKind) -> &'static str {
         MenuActionKind::FormatAlignDefault => "format_align_default",
         MenuActionKind::FormatReset => "format_reset",
         MenuActionKind::ExportAll => "export_all",
+        MenuActionKind::Submenu => "submenu",
+        MenuActionKind::SortView => "sort_view",
+        MenuActionKind::SaveSort => "persist_sort",
+        MenuActionKind::Replay => "replay",
+        MenuActionKind::SetMaxColWidth => "set_max_col_width",
+        MenuActionKind::SetColWidth => "set_col_width",
+        MenuActionKind::ExportOdt => "export_ods",
+        MenuActionKind::Duplicate => "duplicate",
+        MenuActionKind::Extrapolate => "extrapolate",
+        MenuActionKind::SheetPrev => "sheet_prev",
+        MenuActionKind::SheetNext => "sheet_next",
+        MenuActionKind::CopySheet => "copy_sheet",
+        MenuActionKind::MoveSheet => "move_sheet",
+        MenuActionKind::GoToCell => "go_to_cell",
+        MenuActionKind::HelpRows => "help_rows",
+        MenuActionKind::HelpCols => "help_cols",
+        MenuActionKind::HelpFull => "help_full",
     }
 }
 
@@ -205,124 +246,215 @@ pub fn handle_action(name: &str, rxapp: &rswidgets::App) {
     }
 }
 
-pub const FILE_MENU: &[MenuAction] = &[
-    MenuAction { label: "_Open",        shortcut: "Ctrl+O",       action: MenuActionKind::Open },
-    MenuAction { label: "_Save",        shortcut: "Ctrl+S",       action: MenuActionKind::Save },
-    MenuAction { label: "Save _As",     shortcut: "Ctrl+Shift+S", action: MenuActionKind::SaveAs },
-    MenuAction { label: "_Quit",        shortcut: "Ctrl+Q",       action: MenuActionKind::Quit },
-];
+/// Build a `Vec<MenuAction>` from a nested tree of items. An item is
+/// `"Label" => ActionKind`, optionally with a shortcut in parens, or
+/// `"Label" => [ items ]` for a submenu. The tree *is* the menu — no
+/// separate submenu constants.
+macro_rules! menu_items {
+    () => { Vec::new() };
+    ($label:literal => $action:ident) => {
+        vec![MenuAction { label: $label, shortcut: "", action: MenuActionKind::$action, submenu: None }]
+    };
+    ($label:literal => $action:ident ($shortcut:literal)) => {
+        vec![MenuAction { label: $label, shortcut: $shortcut, action: MenuActionKind::$action, submenu: None }]
+    };
+    ($label:literal => $action:ident, $($rest:tt)*) => {
+        {
+            let mut v = vec![MenuAction { label: $label, shortcut: "", action: MenuActionKind::$action, submenu: None }];
+            v.extend(menu_items!($($rest)*));
+            v
+        }
+    };
+    ($label:literal => $action:ident ($shortcut:literal), $($rest:tt)*) => {
+        {
+            let mut v = vec![MenuAction { label: $label, shortcut: $shortcut, action: MenuActionKind::$action, submenu: None }];
+            v.extend(menu_items!($($rest)*));
+            v
+        }
+    };
+    ($label:literal => [ $($items:tt)* ]) => {
+        vec![MenuAction { label: $label, shortcut: "", action: MenuActionKind::Submenu, submenu: Some(menu_items!($($items)*)) }]
+    };
+    ($label:literal => ($shortcut:literal) [ $($items:tt)* ]) => {
+        vec![MenuAction { label: $label, shortcut: $shortcut, action: MenuActionKind::Submenu, submenu: Some(menu_items!($($items)*)) }]
+    };
+    ($label:literal => [ $($items:tt)* ], $($rest:tt)*) => {
+        {
+            let mut v = vec![MenuAction { label: $label, shortcut: "", action: MenuActionKind::Submenu, submenu: Some(menu_items!($($items)*)) }];
+            v.extend(menu_items!($($rest)*));
+            v
+        }
+    };
+    ($label:literal => ($shortcut:literal) [ $($items:tt)* ], $($rest:tt)*) => {
+        {
+            let mut v = vec![MenuAction { label: $label, shortcut: $shortcut, action: MenuActionKind::Submenu, submenu: Some(menu_items!($($items)*)) }];
+            v.extend(menu_items!($($rest)*));
+            v
+        }
+    };
+}
 
-pub const TOOLS_MENU: &[MenuAction] = &[
-    MenuAction { label: "Export T_SV",  shortcut: "",             action: MenuActionKind::ExportTsv },
-    MenuAction { label: "Export _Csv",  shortcut: "",             action: MenuActionKind::ExportCsv },
-    MenuAction { label: "Export O_DS",  shortcut: "",             action: MenuActionKind::ExportOds },
-    MenuAction { label: "Export ASC_II",shortcut: "",             action: MenuActionKind::ExportAscii },
-    MenuAction { label: "Export Al_l",  shortcut: "",             action: MenuActionKind::ExportAll },
-];
+/// The application menu bar as a nested tree (matches the ratatui reference:
+/// File, Edit, Insert, Format, Sheet, Help). Every backend builds its native
+/// menu from this single definition, so the menus can never drift.
+/// Labels are plain text (no toolkit mnemonic markers); each backend applies
+/// its own accelerator conventions when building its native menu.
+pub fn menu_bar() -> Vec<MenuAction> {
+    menu_items! {
+    "File" => [
+        "Open file"    => Open ("O"),
+        "Save as"      => SaveAs ("A"),
+        "Export"       => ("T") [
+            "TSV"         => ExportTsv ("T"),
+            "CSV"         => ExportCsv ("C"),
+            "ASCII table" => ExportAscii ("A"),
+            "Export all"  => ExportAll ("L"),
+            "ODS"         => ExportOds ("D"),
+        ],
+        "Width"        => ("C") [
+            "Default width" => SetMaxColWidth ("D"),
+            "Column width"  => SetColWidth ("C"),
+        ],
+        "Sort view"    => SortView ("S"),
+        "Persist sort" => SaveSort ("P"),
+        "Exit"         => Quit ("X"),
+        "Replay"       => Replay ("R"),
+    ],
+    "Edit" => [
+        "Cut"         => Cut ("X"),
+        "Copy"        => Copy ("C"),
+        "Paste"       => Paste ("P"),
+        "Find"        => Find ("F"),
+        "Replace"     => Replace ("R"),
+        "Duplicate"   => Duplicate ("D"),
+        "Extrapolate" => Extrapolate ("E"),
+    ],
+    "Insert" => [
+        "Rows"          => InsertRows ("R"),
+        "Mitosis (Row)" => InsertMitosisRow ("M"),
+        "Mitosis (Col)" => InsertMitosisCol ("O"),
+        "Cols"          => InsertCols ("C"),
+        "Special Char"  => InsertSpecialChars ("S"),
+        "Date"          => InsertDate (";"),
+        "Time"          => InsertTime (":"),
+        "Hyperlink"     => InsertHyperlink ("H"),
+    ],
+    "Format" => [
+        "Scope"  => ("S") [
+            "All"        => FormatApplyAll ("A"),
+            "Full col"   => FormatApplyFullColumn ("F"),
+            "Data"       => FormatApplyData ("D"),
+            "Special"    => FormatApplySpecial ("S"),
+            "Cell"       => FormatApplyCell ("C"),
+            "Selection"  => FormatApplySelection ("L"),
+        ],
+        "Number" => ("N") [
+            "Decimal (generic)" => FormatDecimalGeneric ("D"),
+            "Currency ($)"      => FormatCurrency ("$"),
+            "Rational"          => FormatRational ("R"),
+            "Fixed 0"           => FormatFixed0 ("0"),
+            "Fixed 1"           => FormatFixed1 ("1"),
+            "Fixed 2"           => FormatFixed2 ("2"),
+            "Fixed n"           => FormatFixedCustom ("N"),
+        ],
+        "Align"  => ("A") [
+            "Left"    => FormatAlignLeft ("L"),
+            "Center"  => FormatAlignCenter ("C"),
+            "Right"   => FormatAlignRight ("R"),
+            "Default" => FormatAlignDefault ("D"),
+        ],
+        "Reset"  => FormatReset ("R"),
+    ],
+    "Sheet" => [
+        "Prev sheet"    => SheetPrev ("["),
+        "Next sheet"    => SheetNext ("]"),
+        "New sheet"     => NewSheet ("N"),
+        "Rename sheet"  => RenameSheet ("R"),
+        "Copy sheet"    => CopySheet ("C"),
+        "Move sheet"    => MoveSheet ("M"),
+        "Go"            => GoToCell ("G"),
+        "Balance books" => BalanceBooks ("B"),
+    ],
+    "Help" => [
+        "About"     => About ("A"),
+        "Row ops"   => HelpRows ("R"),
+        "Col ops"   => HelpCols ("C"),
+        "Full help" => HelpFull ("H"),
+    ],
+} }
 
-pub const EDIT_MENU: &[MenuAction] = &[
-    MenuAction { label: "_Undo",         shortcut: "Ctrl+Z", action: MenuActionKind::Undo },
-    MenuAction { label: "_Redo",         shortcut: "Ctrl+Y", action: MenuActionKind::Redo },
-    MenuAction { label: "_Cut",          shortcut: "Ctrl+X", action: MenuActionKind::Cut },
-    MenuAction { label: "C_opy",         shortcut: "Ctrl+C", action: MenuActionKind::Copy },
-    MenuAction { label: "_Paste",        shortcut: "Ctrl+V", action: MenuActionKind::Paste },
-    MenuAction { label: "_Delete",       shortcut: "Del",    action: MenuActionKind::DeleteCell },
-    MenuAction { label: "_Select All",   shortcut: "Ctrl+A", action: MenuActionKind::SelectAll },
-    MenuAction { label: "_Find",         shortcut: "Ctrl+F", action: MenuActionKind::Find },
-    MenuAction { label: "R_eplace",      shortcut: "Ctrl+H", action: MenuActionKind::Replace },
-];
-
-pub const VIEW_MENU: &[MenuAction] = &[
-    MenuAction { label: "_Toggle Headers", shortcut: "", action: MenuActionKind::ToggleHeaders },
-    MenuAction { label: "Toggle _Margins", shortcut: "", action: MenuActionKind::ToggleMargins },
-];
-
-pub const SHEET_MENU: &[MenuAction] = &[
-    MenuAction { label: "_New Sheet",   shortcut: "", action: MenuActionKind::NewSheet },
-    MenuAction { label: "_Rename Sheet",shortcut: "", action: MenuActionKind::RenameSheet },
-    MenuAction { label: "_Delete Sheet",shortcut: "", action: MenuActionKind::DeleteSheet },
-];
-
-pub const INSERT_MENU: &[MenuAction] = &[
-    MenuAction { label: "_Rows",          shortcut: "", action: MenuActionKind::InsertRows },
-    MenuAction { label: "_Mitosis (Row)", shortcut: "", action: MenuActionKind::InsertMitosisRow },
-    MenuAction { label: "Mi_tosis (Col)", shortcut: "", action: MenuActionKind::InsertMitosisCol },
-    MenuAction { label: "_Cols",          shortcut: "", action: MenuActionKind::InsertCols },
-    MenuAction { label: "_Special Char",  shortcut: "", action: MenuActionKind::InsertSpecialChars },
-    MenuAction { label: "_Date",          shortcut: "", action: MenuActionKind::InsertDate },
-    MenuAction { label: "_Time",          shortcut: "", action: MenuActionKind::InsertTime },
-    MenuAction { label: "_Hyperlink",     shortcut: "", action: MenuActionKind::InsertHyperlink },
-];
-
-pub const FORMAT_MENU: &[MenuAction] = &[
-    MenuAction { label: "Scope: _All",        shortcut: "", action: MenuActionKind::FormatApplyAll },
-    MenuAction { label: "Scope: _Full Col",   shortcut: "", action: MenuActionKind::FormatApplyFullColumn },
-    MenuAction { label: "Scope: _Data",       shortcut: "", action: MenuActionKind::FormatApplyData },
-    MenuAction { label: "Scope: _Special",    shortcut: "", action: MenuActionKind::FormatApplySpecial },
-    MenuAction { label: "Scope: Ce_ll",       shortcut: "", action: MenuActionKind::FormatApplyCell },
-    MenuAction { label: "Scope: _Selection",  shortcut: "", action: MenuActionKind::FormatApplySelection },
-    MenuAction { label: "Decimal (_generic)", shortcut: "", action: MenuActionKind::FormatDecimalGeneric },
-    MenuAction { label: "C_urrency ($)",      shortcut: "", action: MenuActionKind::FormatCurrency },
-    MenuAction { label: "Rat_ional",          shortcut: "", action: MenuActionKind::FormatRational },
-    MenuAction { label: "F_ixed 0",           shortcut: "", action: MenuActionKind::FormatFixed0 },
-    MenuAction { label: "Fi_xed 1",           shortcut: "", action: MenuActionKind::FormatFixed1 },
-    MenuAction { label: "Fixed _2",           shortcut: "", action: MenuActionKind::FormatFixed2 },
-    MenuAction { label: "Fixed _n",           shortcut: "", action: MenuActionKind::FormatFixedCustom },
-    MenuAction { label: "Align _Left",        shortcut: "", action: MenuActionKind::FormatAlignLeft },
-    MenuAction { label: "Align _Center",      shortcut: "", action: MenuActionKind::FormatAlignCenter },
-    MenuAction { label: "Align _Right",       shortcut: "", action: MenuActionKind::FormatAlignRight },
-    MenuAction { label: "Align D_efault",     shortcut: "", action: MenuActionKind::FormatAlignDefault },
-    MenuAction { label: "Rese_t",             shortcut: "", action: MenuActionKind::FormatReset },
-];
-
-pub const DATA_MENU: &[MenuAction] = &[
-    MenuAction { label: "Sort _Ascending",  shortcut: "", action: MenuActionKind::SortAsc },
-    MenuAction { label: "Sort _Descending", shortcut: "", action: MenuActionKind::SortDesc },
-    MenuAction { label: "_Balance Books",   shortcut: "", action: MenuActionKind::BalanceBooks },
-];
-
-pub const HELP_MENU: &[MenuAction] = &[
-    MenuAction { label: "_Keybindings", shortcut: "F1", action: MenuActionKind::HelpKeybinds },
-    MenuAction { label: "_About",       shortcut: "",   action: MenuActionKind::About },
-];
-
-fn actions_to_defs(items: &[MenuAction]) -> Vec<MenuItemDef> {
+fn defs_to_leaked(items: &[MenuAction]) -> &'static [MenuItemDef] {
     items.iter().map(|a| MenuItemDef {
         label: a.label,
         action: action_kind_to_name(a.action),
-        submenu: None,
-    }).collect()
+        submenu: a.submenu.as_deref().map(defs_to_leaked),
+    }).collect::<Vec<_>>().leak()
 }
 
 /// All submenus as SubmenuDef slices — used by rswidgets::App::build_menu_model().
+/// Built from the shared [`menu_bar`] tree so the GTK menus can never drift
+/// from the ratatui reference.
 pub fn all_submenus() -> Vec<SubmenuDef> {
     // Deliberately leak Vec backing buffers so the returned slices live forever.
-    vec![
-        SubmenuDef { label: "File",   prefix: "app", items: actions_to_defs(FILE_MENU).leak() },
-        SubmenuDef { label: "Edit",   prefix: "app", items: actions_to_defs(EDIT_MENU).leak() },
-        SubmenuDef { label: "View",   prefix: "app", items: actions_to_defs(VIEW_MENU).leak() },
-        SubmenuDef { label: "Insert", prefix: "app", items: actions_to_defs(INSERT_MENU).leak() },
-        SubmenuDef { label: "Format", prefix: "app", items: actions_to_defs(FORMAT_MENU).leak() },
-        SubmenuDef { label: "Sheet",  prefix: "app", items: actions_to_defs(SHEET_MENU).leak() },
-        SubmenuDef { label: "Data",   prefix: "app", items: actions_to_defs(DATA_MENU).leak() },
-        SubmenuDef { label: "Tools",  prefix: "app", items: actions_to_defs(TOOLS_MENU).leak() },
-        SubmenuDef { label: "Help",   prefix: "app", items: actions_to_defs(HELP_MENU).leak() },
-    ]
+    menu_bar().iter().map(|root| SubmenuDef {
+        label: root.label,
+        prefix: "app",
+        items: defs_to_leaked(root.submenu.as_deref().unwrap_or(&[])),
+    }).collect()
 }
 
 /// Menu bar display text for backends that render a static text bar (pancurses).
+/// Derived from the shared [`menu_bar`] tree so it never drifts; spacing
+/// matches the ratatui menu bar (bracketed first item, three-space separators).
 pub fn menu_bar_text() -> String {
-    let defs = all_submenus();
-    let mut s = String::new();
-    for (i, sm) in defs.iter().enumerate() {
-        if i > 0 { s.push_str("   "); }
-        if i == 0 {
-            s.push('[');
-            s.push_str(sm.label);
-            s.push(']');
-        } else {
-            s.push_str(sm.label);
-        }
+    let bar = menu_bar();
+    let mut s = String::from(" [");
+    s.push_str(bar[0].label);
+    s.push(']');
+    for root in &bar[1..] {
+        s.push_str("   ");
+        s.push_str(root.label);
     }
     s
+}
+
+/// Build a pancurses `Menu` model from a `&[MenuAction]` tree (the pancurses
+/// backend's converter for the shared [`menu_bar`] definition).
+#[cfg(feature = "pancurses")]
+pub fn build_menu_model(menu: &rswidgets::backends_pancurses_adapter::Menu, items: &[MenuAction]) {
+    for item in items {
+        if let Some(sub) = item.submenu.as_deref() {
+            let sub_menu = rswidgets::backends_pancurses_adapter::create_menu().expect("create submenu");
+            build_menu_model(&sub_menu, sub);
+            if item.shortcut.is_empty() {
+                menu.append_submenu(item.label, &sub_menu);
+            } else {
+                menu.append_submenu_with_shortcut(item.label, item.shortcut, &sub_menu);
+            }
+        } else if item.shortcut.is_empty() {
+            menu.append(item.label, action_kind_to_name(item.action));
+        } else {
+            menu.append_with_shortcut(item.label, action_kind_to_name(item.action), item.shortcut);
+        }
+    }
+}
+
+/// Build a backend-agnostic (`common`) menu tree from a `&[MenuAction]` tree
+/// (the GTK backend's converter for the shared [`menu_bar`] definition).
+pub fn build_common_menu(
+    rxapp: &rswidgets::App,
+    items: &[MenuAction],
+    prefix: &str,
+) -> Result<rswidgets::common::Menu, Box<dyn std::error::Error>> {
+    let mut menu = rxapp.new_menu()?;
+    for item in items {
+        if let Some(sub) = item.submenu.as_deref() {
+            let sub_menu = build_common_menu(rxapp, sub, prefix)?;
+            menu.append_submenu(item.label, &sub_menu);
+        } else {
+            let name = action_kind_to_name(item.action);
+            menu.append(item.label, &format!("{}.{}", prefix, name));
+        }
+    }
+    Ok(menu)
 }

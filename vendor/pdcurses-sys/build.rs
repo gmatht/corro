@@ -17,6 +17,14 @@ fn is_rust9x_target() -> bool {
 }
 
 fn main() {
+    // Non-Windows targets never link pdcurses (the pancurses crate uses
+    // ncurses there; nothing in this workspace references pdcurses_sys
+    // outside `cfg(windows)`). Emit no artifacts so `--features pancurses`
+    // stays buildable on Linux, where the tmux render-parity tests run.
+    // (The `links = "pdcurses"` key still reserves the native lib name.)
+    if std::env::var("CARGO_CFG_TARGET_OS").map(|os| os != "windows").unwrap_or(false) {
+        return;
+    }
     let mut build = cc::Build::new();
     build
         .file("src/PDCurses/pdcurses/addch.c") //Common PDCurses files

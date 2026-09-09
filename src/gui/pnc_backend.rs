@@ -1,16 +1,18 @@
-use crate::grid::{CellAddr, ColumnAddr, GridBox, SheetCursor, HEADER_ROWS, MARGIN_COLS};
-use crate::ops::{Op, WorkbookOp};
+use crate::grid::{CellAddr, ColumnAddr, SheetCursor, HEADER_ROWS, MARGIN_COLS};
 use crate::ui_core;
 use std::collections::HashMap;
 use rswidgets::backends_pancurses_adapter::*;
-use rswidgets::core::terminal_size;
+
 
 use unicode_width::UnicodeWidthStr;
 
+use super::actions::{apply_format, commit_cell, dispatch_menu_action, main_addr_label, menu_action_needs_prompt, run_prompt_action, sort_sheet, MenuDispatch};
+use super::viewport::Viewport;
 use super::compute;
 use super::render::{self, CellSink};
 
-/// Pancurses adapter: wraps a Spreadsheet ref as a CellSink for the generic fill_cells.
+/// Pancurses adapter: wraps a `Spreadsheet` ref as a `CellSink` for the
+/// backend-agnostic `render::fill_cells`.
 struct SpreadsheetSink<'a> {
     ss: &'a Spreadsheet,
 }
@@ -36,30 +38,308 @@ impl CellSink for SpreadsheetSink<'_> {
     }
 }
 
-/// Populate the spreadsheet widget with cell data for the given viewport.
-#[allow(clippy::too_many_arguments)]
-fn fill_cells(
-    spreadsheet: &Spreadsheet,
-    display_rows: &[usize],
-    col_ixs: &[usize],
-    col_widths: &HashMap<usize, usize>,
-    g: &GridBox,
-    hr: usize, mr: usize, mc: usize, lm: usize,
-    data_width: usize,
-    display_cursor_row: usize, display_cursor_col: usize,
-    row_agg_func: &[Option<crate::ops::AggFunc>],
-) {
-    let mut sink = SpreadsheetSink::new(spreadsheet);
-    render::fill_cells(
-        &mut sink, display_rows, col_ixs, col_widths, g,
-        hr, mr, mc, lm, data_width,
-        display_cursor_row, display_cursor_col, row_agg_func,
-    );
+
+
+/// Show a modal info dialog (About / Help) in the pancurses UI.  The backend
+/// draws it via SGR on top of the spreadsheet output (ncurses widgets get
+/// overwritten by the spreadsheet's direct SGR writes).  Without this, Help ->
+/// About just set a status string and no dialog ever appeared.
+fn show_info_dialog(title: &str, text: &str) {
+    rswidgets::backends::pancurses::show_dialog(title, text);
 }
 
-pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Error>> {
+/// Borrow the host [`App`](super::App) behind a raw UI-thread pointer.
+/// Centralised here so the raw dereference happens in exactly one place and
+/// call sites stay `unsafe`-free.
+///
+/// # Contract (not machine-checked)
+/// The `'a` lifetime is intentionally free: the pointer is trusted, so the
+/// compiler cannot prevent two live borrows — only discipline can. Callers
+/// must observe two rules (see `GuiState::app_mut` for the full rationale):
+/// 1. **LIFO nesting only** — never use an outer borrow after an inner one
+///    was taken.
+/// 2. **No cross-frame borrows** — each closure below binds its borrow
+///    locally and drops it before returning, so every borrow's dynamic
+///    extent lies within a single sequential dispatch.
+/// The pointer itself cannot dangle: the caller holds the `App` across the
+/// blocking event loop.
+#[allow(clippy::needless_lifetimes)]
+fn app_from_raw<'a>(app_ptr: *mut super::App) -> &'a mut super::App {
+    unsafe { &mut *app_ptr }
+}
+
+/// Re-run the full viewport computation and re-fill the spreadsheet widget's
+/// cells from the workbook.  Menu actions and prompt submissions mutate the
+/// workbook (Insert Date, Cut/Paste, New sheet, Open file, ...) but, unlike a
+/// cursor move, nothing re-filled the widget's own cell buffers — so the grid
+/// kept showing the stale values until the next key press (e.g. Insert Date
+/// only appeared after arrowing away).  Every mutation entry point calls this
+/// so the grid reflects the change immediately.
+fn refresh_viewport_after_action(
+    app: &mut super::App,
+    ss: &Spreadsheet,
+    sid: usize,
+    display_rows: &std::rc::Rc<std::cell::RefCell<Vec<usize>>>,
+    data_rows: usize,
+    data_cols: usize,
+    data_width: usize,
+    hr: usize,
+) {
+    let cursor = app.core.cursor;
+    let vp = Viewport::recompute(app, cursor, data_rows, data_cols, data_width, hr, MARGIN_COLS);
+    let rec = app.core.workbook.active_sheet().clone();
+    spreadsheet_set_border_title(sid, &vp.border_title(app.core.ops_applied));
+    spreadsheet_set_row_labels(sid, vp.row_labels.clone());
+    spreadsheet_set_column_layout(sid, vp.column_layout.clone());
+    *display_rows.borrow_mut() = vp.display_rows.clone();
+    spreadsheet_set_grid_config(sid, MARGIN_COLS as u32, vp.mc as u32);
+    // Sync the tab bar (New/Copy/Rename/Move sheet change the workbook's sheet
+    // list; without this the tab bar stays stale after a menu action).
+    if app.core.workbook.sheet_count() > 1 {
+        let titles: Vec<String> = app.core.workbook.sheets.iter()
+            .map(|s| s.title.clone())
+            .collect();
+        let active = app.core.workbook.active_sheet;
+        ss.set_tab_data(&titles, active);
+    } else {
+        ss.set_tab_data(&[], 0);
+    }
+    vp.refill(&mut SpreadsheetSink::new(ss), &rec.grid, hr, MARGIN_COLS, data_width, cursor.row, cursor.col);
+    // The cursor cell is rendered from the raw (unformatted) value, matching
+    // the cursor-move callback's post-refill raw-cell update.  Also sync the
+    // WIDGET cursor to the (possibly moved) app cursor so the formula bar
+    // address follows — mitosis moves the cursor onto the duplicate row/col.
+    if let Some(new_display_ri) = vp.display_rows.iter().position(|&r| r == cursor.row) {
+        ss.set_cursor(new_display_ri as u32, cursor.col as u32);
+        let cursor_addr = crate::addr::sheet_cursor_to_addr(
+            crate::addr::LogicalRow(cursor.row),
+            crate::addr::GlobalCol(cursor.col),
+            crate::addr::MainRows(vp.mr),
+            crate::addr::MainCols(vp.mc),
+        );
+        let raw = rec.grid.get(&cursor_addr).unwrap_or_default();
+        ss.set_raw_cell(new_display_ri as u32, cursor.col as u32, &raw);
+    }
+}
+
+/// The About-dialog body text, sourced from the ratatui reference
+/// (`crate::ui::App::about_page_body`) so the pancurses dialog renders the SAME
+/// content as the ratatui backend (render parity).
+fn about_body() -> String {
+    crate::ui_core::about_page_body()
+}
+
+/// The Full-help dialog body text, sourced from the ratatui reference
+/// (`crate::ui::App::help_page_body`) so the pancurses dialog renders the SAME
+/// content as the ratatui backend (render parity).
+fn help_body() -> String {
+    crate::ui_core::help_page_body()
+}
+
+/// Append `bytes` to `path` (create if needed) via raw CreateFileA — std::fs
+/// is broken on Win9x (CreateFileW is an unimplemented stub, OS error 120).
+#[cfg(windows)]
+fn append_marker_raw(path: &str, bytes: &[u8]) {
+    unsafe {
+        use std::os::raw::c_void;
+        unsafe extern "system" {
+            fn CreateFileA(
+                name: *const u8,
+                access: u32,
+                share: u32,
+                sa: *mut c_void,
+                disp: u32,
+                flags: u32,
+                tmpl: *mut c_void,
+            ) -> *mut c_void;
+            fn WriteFile(h: *mut c_void, buf: *const u8, len: u32, written: *mut u32, ov: *mut c_void) -> i32;
+            fn CloseHandle(h: *mut c_void) -> i32;
+        }
+        let mut pathz = path.as_bytes().to_vec();
+        pathz.push(0);
+        let h = CreateFileA(
+            pathz.as_ptr(),
+            0x4000_0000, // GENERIC_WRITE
+            1,           // FILE_SHARE_READ
+            std::ptr::null_mut(),
+            4,           // OPEN_ALWAYS
+            0x80,        // FILE_ATTRIBUTE_NORMAL
+            std::ptr::null_mut(),
+        );
+        if h.is_null() || h as isize == -1 {
+            return;
+        }
+        let mut written = 0u32;
+        WriteFile(h, bytes.as_ptr(), bytes.len() as u32, &mut written, std::ptr::null_mut());
+        CloseHandle(h);
+    }
+}
+
+/// Non-Windows append: plain std::fs (the CreateFileW-stub issue is Win9x-only).
+#[cfg(not(windows))]
+fn append_marker_raw(path: &str, bytes: &[u8]) {
+    use std::io::Write as _;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = f.write_all(bytes);
+    }
+}
+
+pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Error>> {    // Win9x: environment variables do not propagate to Win32 processes (neither
+    // DOS-box `set` nor AUTOEXEC.BAT), so fall back to fixed diagnostic paths
+    // when built for the rust9x-msvc (Win95) target.
+    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+    let trace_fallback = {
+        rswidgets::backends::pancurses::set_input_trace_file("c:\\corro.keys");
+        true
+    };
+    #[cfg(not(all(target_family = "rust9x", target_env = "msvc")))]
+    let trace_fallback = false;
+    let _ = trace_fallback;
+
+    let _ = std::env::var("INPUT_TRACE_FILE").inspect(|v| {
+        eprintln!("[corro] input trace file: {v}");
+    });
+
+    // TEMPORARY Win95 diagnosis: run the probe95 input sequence (open CONIN$,
+    // SetConsoleMode, poll GetNumberOfConsoleInputEvents + ReadConsoleInputA)
+    // BEFORE pancurses init, to A/B against the post-init state.
+    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+    unsafe fn input_probe_pre() {
+        use std::os::raw::c_void;
+        unsafe extern "system" {
+            fn CreateFileA(
+                name: *const u8, access: u32, share: u32, sa: *mut c_void,
+                disp: u32, flags: u32, tmpl: *mut c_void) -> *mut c_void;
+            fn SetConsoleMode(h: *mut c_void, mode: u32) -> i32;
+            fn GetNumberOfConsoleInputEvents(h: *mut c_void, n: *mut u32) -> i32;
+            fn ReadConsoleInputA(h: *mut c_void, rec: *mut c_void, len: u32, read: *mut u32) -> i32;
+            fn CloseHandle(h: *mut c_void) -> i32;
+            fn Sleep(ms: u32);
+        }
+        let h = CreateFileA(
+            b"CONIN$\0".as_ptr(), 0xC000_0000, 3, std::ptr::null_mut(),
+            3, 0x80, std::ptr::null_mut());
+        let mut out = String::new();
+        if h.is_null() || h as isize == -1 {
+            out.push_str("open=fail\n");
+        } else {
+            let m = SetConsoleMode(h, 0x18);
+            out.push_str(&format!("open=ok mode0x18={m}\n"));
+            for _ in 0..20 {
+                let mut n = 0u32;
+                GetNumberOfConsoleInputEvents(h, &mut n);
+                if n > 0 {
+                    let mut buf = [0u32; 5];
+                    let mut r = 0u32;
+                    let ok = ReadConsoleInputA(h, buf.as_mut_ptr() as *mut c_void, 1, &mut r);
+                    let et = buf[0];
+                    out.push_str(&format!("ev ok={ok} et={et}\n"));
+                } else {
+                    out.push_str(&format!("n={n}\n"));
+                    Sleep(150);
+                }
+            }
+            CloseHandle(h);
+        }
+        append_marker_raw("c:\\corro.inq", out.as_bytes());
+    }
+    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+    unsafe { input_probe_pre() };
+
+    /// TEMPORARY Win95 diagnosis: after pancurses init + first frame, poll the
+    /// console input queue and log whether events arrive.
+    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+    unsafe fn input_probe_post() {
+        use std::os::raw::c_void;
+        unsafe extern "system" {
+            fn CreateFileA(
+                name: *const u8, access: u32, share: u32, sa: *mut c_void,
+                disp: u32, flags: u32, tmpl: *mut c_void) -> *mut c_void;
+            fn SetConsoleMode(h: *mut c_void, mode: u32) -> i32;
+            fn GetNumberOfConsoleInputEvents(h: *mut c_void, n: *mut u32) -> i32;
+            fn ReadConsoleInputA(h: *mut c_void, rec: *mut c_void, len: u32, read: *mut u32) -> i32;
+            fn CloseHandle(h: *mut c_void) -> i32;
+            fn Sleep(ms: u32);
+        }
+        let h = CreateFileA(
+            b"CONIN$\0".as_ptr(), 0xC000_0000, 3, std::ptr::null_mut(),
+            3, 0x80, std::ptr::null_mut());
+        let mut out = String::new();
+        if h.is_null() || h as isize == -1 {
+            out.push_str("post open=fail\n");
+        } else {
+            let m = SetConsoleMode(h, 0x18);
+            out.push_str(&format!("post open=ok mode0x18={m}\n"));
+            for _ in 0..10 {
+                let mut n = 0u32;
+                GetNumberOfConsoleInputEvents(h, &mut n);
+                if n > 0 {
+                    let mut buf = [0u32; 5];
+                    let mut r = 0u32;
+                    let ok = ReadConsoleInputA(h, buf.as_mut_ptr() as *mut c_void, 1, &mut r);
+                    let et = buf[0];
+                    out.push_str(&format!("post ev ok={ok} et={et}\n"));
+                } else {
+                    out.push_str(&format!("post n={n}\n"));
+                    Sleep(150);
+                }
+            }
+            CloseHandle(h);
+        }
+        append_marker_raw("c:\\corro.inq", out.as_bytes());
+    }
     let _backend = rswidgets::backends::pancurses::init()
         .map_err(|e| format!("pancurses init failed: {e}"))?;
+
+    // Test-harness idle marker: the toolkit exposes a generic after-redraw
+    // callback; corro wires it to append to the CORRO_IDLE_MARKER file so a
+    // test can detect when a frame is fully flushed (instead of sleeping).
+    // Win95 DOS boxes cannot type `_` reliably (keyboard-layout mismatch), so
+    // the underscore-free alias CORROIDLEMARKER is also accepted.
+    let idle_path = match std::env::var("CORRO_IDLE_MARKER")
+        .or_else(|_| std::env::var("CORROIDLEMARKER"))
+    {
+        Ok(p) => Some(p),
+        Err(_) if cfg!(all(target_family = "rust9x", target_env = "msvc")) => {
+            // Win9x: env vars unavailable; fixed diagnostic path.
+            Some("c:\\corro.idle".to_string())
+        }
+        Err(_) => None,
+    };
+    if let Some(path) = idle_path {
+        eprintln!("[corro] idle marker file: {path}");
+        // TEMPORARY Win95 diagnosis: on the FIRST after-redraw (post-init, post
+        // first frame), poll the input queue and log whether events arrive.
+        #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+        {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static FIRST: AtomicBool = AtomicBool::new(true);
+            rswidgets::backends::pancurses::set_after_redraw_callback(Box::new(move || {
+                if FIRST.swap(false, Ordering::SeqCst) {
+                    unsafe { input_probe_post() };
+                }
+                append_marker_raw(&path, b"idle\n");
+            }));
+        }
+        #[cfg(not(all(target_family = "rust9x", target_env = "msvc")))]
+        rswidgets::backends::pancurses::set_after_redraw_callback(Box::new(move || {
+            append_marker_raw(&path, b"idle\n");
+        }));
+    }
+
+    // Alt+letter shortcuts matching the ratatui reference: Alt+O/T/W/A/X open
+    // specific File items/submenus.  The toolkit's generic alt-key callback
+    // lets the app decide; the backend itself knows nothing about corro's menus.
+    rswidgets::backends::pancurses::set_alt_key_callback(Box::new(|ch: char| {
+        match ch.to_ascii_lowercase() {
+            'o' => { rswidgets::backends::pancurses::open_menu(0, vec![], 0); true } // File -> Open file
+            't' => { rswidgets::backends::pancurses::open_menu(0, vec![2], 0); true } // File -> Export
+            'w' => { rswidgets::backends::pancurses::open_menu(0, vec![3], 0); true } // File -> Width
+            'a' => { rswidgets::backends::pancurses::open_menu(0, vec![2], 2); true } // File -> Export -> ASCII table
+            'x' => { rswidgets::backends::pancurses::open_menu(0, vec![3], 1); true } // File -> Width -> Column width
+            _ => false, // let the backend fall back to the root-menu prefix match
+        }
+    }));
 
     let win = create_window()?;
     win.set_title("corro");
@@ -76,14 +356,29 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         let env_rows: Option<usize> = std::env::var("CORRO_TERM_ROWS").ok().and_then(|s| s.parse().ok());
         if let (Some(c), Some(r)) = (env_cols, env_rows) {
             (c, r)
-        } else if let Some((cols, rows)) = terminal_size() {
-            (cols, rows)
         } else {
-            let cols: usize = std::env::var("COLUMNS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(80);
-            (cols, 50usize)
+            #[cfg(unix)]
+            {
+                let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+                if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) } == 0 && ws.ws_col > 0
+                {
+                    (ws.ws_col as usize, ws.ws_row as usize)
+                } else {
+                    let cols: usize = std::env::var("COLUMNS")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(80);
+                    (cols, 50usize)
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let cols: usize = std::env::var("COLUMNS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(80);
+                (cols, 50usize)
+            }
         }
     };
     let data_width = term_cols
@@ -169,7 +464,7 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     spreadsheet.set_row_labels(row_labels);
 
     // ── Cell data for ALL visible rows and columns ────────────────────
-    fill_cells(&spreadsheet, &display_rows, &col_ixs, &col_widths,
+    render::fill_cells(&mut SpreadsheetSink::new(&spreadsheet), &display_rows, &col_ixs, &col_widths,
         g, hr, mr, mc, lm, data_width,
         display_cursor_row, display_cursor_col, &row_agg_func);
 
@@ -241,8 +536,21 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         format!("corro  {}r × {}c  ops {}", mr, mc, total_ops);
     spreadsheet.set_border_title(&border_title);
 
-    // Menu — built from the shared menu definitions so it never drifts
-    spreadsheet.set_menu_text(&format!(" {}", super::menu::menu_bar_text()));
+    // Menu bar text (rendered) + the MenuBar *widget* so Alt+key navigation
+    // (Alt+F opens File, etc.) works — matching the GTK path which creates a
+    // MenuBar via build_menu(). Without the widget, menu_bar_id is None and
+    // Alt+key does nothing in the pancurses backend.
+    spreadsheet.set_menu_text(" [File]   Edit    Insert    Format    Sheet    Help");
+    // Build the menu bar from the shared, backend-agnostic menu model.  The
+    // same Menu type is used by every rswidgets backend, so the menu
+    // definitions in crate::gui::menu are not tied to the pancurses backend.
+    let menubar_model = rswidgets::backends_pancurses_adapter::create_menu()?;
+    for root in crate::gui::menu::menu_bar() {
+        let sub = rswidgets::backends_pancurses_adapter::create_menu()?;
+        crate::gui::menu::build_menu_model(&sub, root.submenu.as_deref().unwrap_or(&[]));
+        menubar_model.append_submenu(root.label, &sub);
+    }
+    let _menubar = rswidgets::backends_pancurses_adapter::create_menubar(&menubar_model, std::ptr::null_mut())?;
 
     // Formula bar trailing: show app status text (matches ratatui's
     // mode_prompt_widget which appends "   ·  {status}" after the cell value).
@@ -261,10 +569,120 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // keys scrolls the visible columns/rows and the grid extent grows as needed.
     let display_rows_for_cb = std::rc::Rc::new(std::cell::RefCell::new(display_rows.clone()));
     let display_rows_for_ce = display_rows_for_cb.clone();
+    // Clones captured by the go-to (Ctrl+G) callback, taken here BEFORE the
+    // cursor-move / commit-edit closures move the originals below.
+    let dr_for_goto_cb = display_rows_for_cb.clone();
+    let dr_for_goto_ce = display_rows_for_ce.clone();
     let mut col_ixs_cb = col_ixs.clone();
     let sheet_cb = spreadsheet.clone();
     let sid = spreadsheet.id();
     let app_ptr: *mut super::App = app;
+    // One borrow flag per callback chain (all start cleared): each chain's
+    // AppBorrow guard is independent, so sequential dispatch never trips
+    // another chain's flag. See [`AppBorrow`](super::AppBorrow).
+
+    // Wire menu item activation: when a menu item is chosen in the pancurses UI,
+    // dispatch its action here.  "quit" is handled by the backend itself
+    // (sets running=false); everything else performs the corresponding op on the
+    // App or records status so the user sees the action fired.  Previously the
+    // pancurses Enter handler just closed the menu and did nothing.
+    let menu_ss = spreadsheet.clone();
+    let display_rows_menu = display_rows_for_cb.clone();
+    // Persist the pending format target across the Scope/Number/Align picks,
+    // mirroring the ratatui menu (scope is chosen first, then the format).
+    let pending_scope: std::rc::Rc<std::cell::RefCell<u8>> = std::rc::Rc::new(std::cell::RefCell::new(0));
+    // Simple session clipboard for Copy/Cut/Paste.
+    let clipboard: std::rc::Rc<std::cell::RefCell<String>> = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+    // Clone for the Ctrl+C handler (the menu callback below moves `clipboard`).
+    let ctrlc_clip = clipboard.clone();
+    rswidgets::backends::pancurses::set_menu_action_callback(Box::new(move |name: String| {
+        let app = app_from_raw(app_ptr);
+        if let Some(label) = menu_action_needs_prompt(&name) {
+            rswidgets::backends::pancurses::set_prompt(label, &name);
+            return;
+        }
+        let result = dispatch_menu_action(
+            app,
+            &name,
+            &mut *pending_scope.borrow_mut(),
+            &mut *clipboard.borrow_mut(),
+        );
+        let mut apply_status = |s: &str| {
+            if !s.is_empty() {
+                app.core.status = s.to_string();
+                menu_ss.set_formula_bar_trailing(&format!("   ·  {}", s));
+            }
+        };
+        match result {
+            MenuDispatch::Status(s) => apply_status(&s),
+            MenuDispatch::Prompt(label, action) => {
+                rswidgets::backends::pancurses::set_prompt(label, action);
+            }
+            MenuDispatch::About { status } => {
+                show_info_dialog(" About ", &about_body());
+                apply_status(&status);
+            }
+            MenuDispatch::HelpFull { status } => {
+                show_info_dialog(" Help ", &help_body());
+                apply_status(&status);
+            }
+            MenuDispatch::HelpKeybinds { status } => {
+                show_info_dialog(
+                    "Keybindings",
+                    "F2 edit\narrows move\nEnter commit\nCtrl+G go-to\nCtrl+Q quit",
+                );
+                apply_status(&status);
+            }
+        }
+        // The action may have mutated the workbook (Insert Date, Cut/Paste,
+        // New/Rename sheet, sort, ...).  Re-fill the widget's cells from the
+        // workbook so the grid reflects the change immediately instead of
+        // staying stale until the next cursor move.
+        refresh_viewport_after_action(
+            app, &menu_ss, sid, &display_rows_menu,
+            data_rows, data_cols, data_width, HEADER_ROWS,
+        );
+    }));
+
+    // Ctrl+C copies the cursor cell (standard terminal copy; it does NOT quit).
+    // The value goes to the in-app clipboard (for Paste) and, via OSC 52, to the
+    // terminal's system clipboard so it can be pasted elsewhere.
+    let ctrlc_ss = spreadsheet.clone();
+    rswidgets::backends::pancurses::add_key_callback('\x03', Box::new(move || {
+        let app = app_from_raw(app_ptr);
+        let hr = HEADER_ROWS;
+        let lm = MARGIN_COLS;
+        let main_row = app.core.cursor.row.saturating_sub(hr) as u32;
+        let main_col = app.core.cursor.col.saturating_sub(lm) as u32;
+        let addr = CellAddr::Main { row: main_row, col: main_col };
+        let val = app.core.workbook.active_sheet().grid.get(&addr).unwrap_or_default();
+        if !val.is_empty() {
+            *ctrlc_clip.borrow_mut() = val.clone();
+            rswidgets::backends::pancurses::set_clipboard_text(&val);
+            app.core.status = format!("Copied {} ({})", main_addr_label(main_row, main_col), val);
+            ctrlc_ss.set_formula_bar_trailing(&format!("   ·  Copied {}", main_addr_label(main_row, main_col)));
+        } else {
+            app.core.status = format!("Nothing to copy at {}", main_addr_label(main_row, main_col));
+        }
+    }));
+
+    // Prompt callback: perform the real file operation for path/name actions
+    // (Open/Save As/Export) submitted via the TUI text prompt.
+    let prompt_ss = spreadsheet.clone();
+    let sid_prompt = sid;
+    let display_rows_prompt = display_rows_for_cb.clone();
+    rswidgets::backends::pancurses::set_prompt_callback(Box::new(move |action: String, text: String| {
+        let app = app_from_raw(app_ptr);
+        run_prompt_action(app, &action, &text);
+        prompt_ss.set_formula_bar_trailing(&format!("   ·  {}", app.core.status));
+        // A prompt action can replace the whole workbook (Open) or write cells
+        // (Save As records state) — re-fill the widget from the workbook so the
+        // grid reflects it immediately.
+        refresh_viewport_after_action(
+            app, &prompt_ss, sid_prompt, &display_rows_prompt,
+            data_rows, data_cols, data_width, HEADER_ROWS,
+        );
+    }));
     let hr_cb = hr;
     let hr_ce = hr;
     let mr_cb = mr;
@@ -275,8 +693,7 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     let mut prev_cursor_col = cursor.col;
     let mut prev_cursor_row = cursor.row;
     add_cursor_move_callback(move |_display_row, _display_col| {
-        // SAFETY: app is &mut App alive for the entire event loop
-        let app = unsafe { &mut *app_ptr };
+        let app = app_from_raw(app_ptr);
 
         // Sync formula bar trailing with app status (ratatui shows status in formula bar)
         if !app.core.status.is_empty() {
@@ -336,72 +753,21 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
 
         if need_viewport_recompute {
             let cursor = app.core.cursor;
-            // Determine viewport and fit columns BEFORE cloning so the
-            // resulting width overrides are reflected in the snapshot.
-            let (new_display_rows, new_mr, new_mc, new_ixs) = {
-                let rec = app.core.workbook.active_sheet().clone();
-                let (new_display_rows, _) =
-                    crate::ui_core::visible_row_indices(&rec, cursor, data_rows_cb, 0);
-                let new_mr = rec.grid.main_rows();
-                let new_mc = rec.grid.main_cols();
-                let (mut new_ixs, _) =
-                    crate::ui_core::visible_col_indices(&rec, cursor, data_cols_cb, 0);
-                // Trim columns to fit (matching ratatui: no proportional refit).
-                {
-                    let sht = app.core.workbook.active_sheet_mut();
-                    crate::ui_core::trim_visible_cols_to_width(
-                        &mut sht.grid, &mut new_ixs, cursor.col, data_width_cb,
-                    );
-                }
-                (new_display_rows, new_mr, new_mc, new_ixs)
-            };
+            let vp = Viewport::recompute(app, cursor, data_rows_cb, data_cols_cb, data_width_cb, hr_cb, MARGIN_COLS);
             // Re-read the sheet after width adjustments.
             let rec = app.core.workbook.active_sheet().clone();
-            // Update border title when grid grew (matching the non-recompute path)
-            let boundary_title = format!(
-                "corro  {}r × {}c  ops {}",
-                new_mr, new_mc, app.core.ops_applied
-            );
-            spreadsheet_set_border_title(sid, &boundary_title);
-            let new_labels: Vec<(u32, String)> = new_display_rows.iter()
-                .enumerate()
-                .map(|(idx, &r)| {
-                    let label = crate::addr::ui_row_label(r, new_mr);
-                    (idx as u32, label)
-                })
-                .collect();
-            spreadsheet_set_row_labels(sid, new_labels);
-            // Update column layout with fitted widths
-            {
-                let g = &rec.grid;
-                let new_layout: Vec<(u32, u32, String)> = new_ixs
-                    .iter()
-                    .map(|&c| {
-                        let w = g.col_width(c).max(1);
-                        let label = crate::addr::ui_column_fragment(c, new_mc);
-                        (c as u32, w as u32, label)
-                    })
-                    .collect();
-                spreadsheet_set_column_layout(sid, new_layout);
-                col_ixs_cb = new_ixs.clone();
-                spreadsheet_set_grid_config(sid, MARGIN_COLS as u32, new_mc as u32);
-            }
-            // Repopulate all visible cells for the new viewport
-            let new_col_widths: HashMap<usize, usize> = col_ixs_cb.iter()
-                .map(|&c| (c, rec.grid.col_width(c).max(1)))
-                .collect();
-            let new_row_agg = compute::compute_row_agg_func(&rec.grid, &new_display_rows, hr_cb, new_mr);
-            fill_cells(
-                &sheet_cb, &new_display_rows, &col_ixs_cb, &new_col_widths,
-                &rec.grid, hr_cb, new_mr, new_mc, MARGIN_COLS, data_width_cb,
-                cursor.row, cursor.col, &new_row_agg,
-            );
-            if let Some(new_display_ri) = new_display_rows.iter().position(|&r| r == cursor.row) {
+            spreadsheet_set_border_title(sid, &vp.border_title(app.core.ops_applied));
+            spreadsheet_set_row_labels(sid, vp.row_labels.clone());
+            spreadsheet_set_column_layout(sid, vp.column_layout.clone());
+            col_ixs_cb = vp.col_ixs.clone();
+            spreadsheet_set_grid_config(sid, MARGIN_COLS as u32, vp.mc as u32);
+            vp.refill(&mut SpreadsheetSink::new(&sheet_cb), &rec.grid, hr_cb, MARGIN_COLS, data_width_cb, cursor.row, cursor.col);
+            if let Some(new_display_ri) = vp.display_rows.iter().position(|&r| r == cursor.row) {
                 let cursor_addr = crate::addr::sheet_cursor_to_addr(
                     crate::addr::LogicalRow(cursor.row),
                     crate::addr::GlobalCol(cursor.col),
-                    crate::addr::MainRows(new_mr),
-                    crate::addr::MainCols(new_mc),
+                    crate::addr::MainRows(vp.mr),
+                    crate::addr::MainCols(vp.mc),
                 );
                 if let Some(raw_val) = rec.grid.get(&cursor_addr) {
                     sheet_cb.set_raw_cell(new_display_ri as u32, cursor.col as u32, &raw_val);
@@ -410,7 +776,7 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                 }
                 sheet_cb.set_cursor(new_display_ri as u32, cursor.col as u32);
             }
-            *display_rows_for_cb.borrow_mut() = new_display_rows;
+            *display_rows_for_cb.borrow_mut() = vp.display_rows.clone();
             prev_cursor_row = app.core.cursor.row;
             prev_cursor_col = app.core.cursor.col;
             return;
@@ -454,119 +820,44 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
             // row-growth condition at line ~753 already fired.
             let cur_mr = sheet.grid.main_rows();
             if logical_row >= hr_cb + cur_mr {
-                sheet.grid.grow_main_row_at_bottom();
+                // Grow the grid so the cursor row becomes a main row (matching
+                // ratatui's move_cursor_one_row_vertical, which extends the grid
+                // when the cursor moves down past the last main row).  Growing by
+                // one is not enough when the cursor jumps several rows at once.
+                let need = logical_row.saturating_sub(hr_cb) + 1;
+                if sheet.grid.main_rows() < need {
+                    sheet.grid.set_main_size(need, sheet.grid.main_cols());
+                }
             }
             sheet.grid.ensure_extent_for_cursor(logical_row, _display_col as usize);
             if sheet.grid.main_rows() != prev_mr || sheet.grid.main_cols() != prev_mc {
-                // Grid grew — update border title and row labels
-                let mr = sheet.grid.main_rows();
-                let mc = sheet.grid.main_cols();
-                let boundary_title = format!(
-                    "corro  {}r × {}c  ops {}",
-                    mr, mc, app.core.ops_applied
-                );
-                spreadsheet_set_border_title(sid, &boundary_title);
-                let new_labels: Vec<(u32, String)> = display_rows_for_cb.borrow().iter()
-                    .enumerate()
-                    .map(|(idx, &r)| {
-                        let label = crate::addr::ui_row_label(r, mr);
-                        (idx as u32, label)
-                    })
-                    .collect();
-                spreadsheet_set_row_labels(sid, new_labels);
-                // Also update column layout when main columns grew
-                let rec = app.core.workbook.active_sheet().clone();
+                // Grid grew — recompute visible columns and repaint (shared).
                 let cursor = app.core.cursor;
-                let (mut new_ixs, _) =
-                    crate::ui_core::visible_col_indices(&rec, cursor, data_cols_cb, 0);
-                // Trim columns to fit (matching ratatui: no proportional refit).
-                {
-                    let sht = app.core.workbook.active_sheet_mut();
-                    crate::ui_core::trim_visible_cols_to_width(
-                        &mut sht.grid, &mut new_ixs, cursor.col, data_width_cb,
-                    );
-                }
+                let vp = Viewport::recompute_columns(app, &display_rows_for_cb.borrow(), cursor, data_cols_cb, data_width_cb, hr_cb, MARGIN_COLS);
                 let rec = app.core.workbook.active_sheet().clone();
-                let g = &rec.grid;
-                let mc = g.main_cols();
-                let new_layout: Vec<(u32, u32, String)> = new_ixs
-                    .iter()
-                    .map(|&c| {
-                        let w = g.col_width(c).max(1);
-                        let label = crate::addr::ui_column_fragment(c, mc);
-                        (c as u32, w as u32, label)
-                    })
-                    .collect();
-                spreadsheet_set_column_layout(sid, new_layout);
-                col_ixs_cb = new_ixs;
-                // Keep the widget's margin_cols and main_cols in sync
-                spreadsheet_set_grid_config(sid, lm as u32, mc as u32);
-                // Repopulate cells with updated column layout after growth
-                let dr: Vec<usize> = display_rows_for_cb.borrow().clone();
-                let new_col_widths: HashMap<usize, usize> = col_ixs_cb.iter()
-                    .map(|&c| (c, g.col_width(c).max(1)))
-                    .collect();
-                let new_row_agg = compute::compute_row_agg_func(g, &dr, hr_cb, mr);
-                fill_cells(
-                    &sheet_cb, &dr, &col_ixs_cb, &new_col_widths,
-                    g, hr_cb, mr, mc, MARGIN_COLS, data_width_cb,
-                    cursor.row, cursor.col, &new_row_agg,
-                );
+                spreadsheet_set_border_title(sid, &vp.border_title(app.core.ops_applied));
+                spreadsheet_set_row_labels(sid, vp.row_labels.clone());
+                spreadsheet_set_column_layout(sid, vp.column_layout.clone());
+                col_ixs_cb = vp.col_ixs.clone();
+                spreadsheet_set_grid_config(sid, lm as u32, vp.mc as u32);
+                vp.refill(&mut SpreadsheetSink::new(&sheet_cb), &rec.grid, hr_cb, MARGIN_COLS, data_width_cb, cursor.row, cursor.col);
             } else if !col_ixs_cb.contains(&(_display_col as usize)) {
                 // Update column viewport when cursor column moves outside the
                 // currently visible range (matching ratatui's per-frame recompute).
-                let rec = app.core.workbook.active_sheet().clone();
                 let cursor = app.core.cursor;
-                let (mut new_ixs, _) =
-                    crate::ui_core::visible_col_indices(&rec, cursor, data_cols_cb, 0);
-                // Trim columns to fit (matching ratatui: no proportional refit).
-                {
-                    let sht = app.core.workbook.active_sheet_mut();
-                    crate::ui_core::trim_visible_cols_to_width(
-                        &mut sht.grid, &mut new_ixs, cursor.col, data_width_cb,
-                    );
-                }
+                let vp = Viewport::recompute_columns(app, &display_rows_for_cb.borrow(), cursor, data_cols_cb, data_width_cb, hr_cb, MARGIN_COLS);
                 let rec = app.core.workbook.active_sheet().clone();
-                let g = &rec.grid;
-                let mc = g.main_cols();
-                let new_layout: Vec<(u32, u32, String)> = new_ixs
-                    .iter()
-                    .map(|&c| {
-                        let w = g.col_width(c).max(1);
-                        let label = crate::addr::ui_column_fragment(c, mc);
-                        (c as u32, w as u32, label)
-                    })
-                    .collect();
-                spreadsheet_set_column_layout(sid, new_layout);
-                col_ixs_cb = new_ixs;
-                // Repopulate cells with updated column viewport
-                let dr: Vec<usize> = display_rows_for_cb.borrow().clone();
-                let new_col_widths: HashMap<usize, usize> = col_ixs_cb.iter()
-                    .map(|&c| (c, g.col_width(c).max(1)))
-                    .collect();
-                let new_row_agg = compute::compute_row_agg_func(g, &dr, hr_cb, mc);
-                fill_cells(
-                    &sheet_cb, &dr, &col_ixs_cb, &new_col_widths,
-                    g, hr_cb, g.main_rows(), mc, MARGIN_COLS, data_width_cb,
-                    cursor.row, cursor.col, &new_row_agg,
-                );
+                spreadsheet_set_column_layout(sid, vp.column_layout.clone());
+                col_ixs_cb = vp.col_ixs.clone();
+                vp.refill(&mut SpreadsheetSink::new(&sheet_cb), &rec.grid, hr_cb, MARGIN_COLS, data_width_cb, cursor.row, cursor.col);
             } else {
                 // Cursor moved within the current viewport — refresh cells to ensure
                 // formatted display values are used (commits overwrite cells with raw values).
-                let rec = app.core.workbook.active_sheet().clone();
-                let g = &rec.grid;
-                let mc = g.main_cols();
                 let cursor = app.core.cursor;
                 let dr: Vec<usize> = display_rows_for_cb.borrow().clone();
-                let new_col_widths: HashMap<usize, usize> = col_ixs_cb.iter()
-                    .map(|&c| (c, g.col_width(c).max(1)))
-                    .collect();
-                let new_row_agg = compute::compute_row_agg_func(g, &dr, hr_cb, g.main_rows());
-                fill_cells(
-                    &sheet_cb, &dr, &col_ixs_cb, &new_col_widths,
-                    g, hr_cb, g.main_rows(), mc, MARGIN_COLS, data_width_cb,
-                    cursor.row, cursor.col, &new_row_agg,
-                );
+                let rec = app.core.workbook.active_sheet().clone();
+                let vp = Viewport::snapshot(app, &dr, &col_ixs_cb, hr_cb, MARGIN_COLS);
+                vp.refill(&mut SpreadsheetSink::new(&sheet_cb), &rec.grid, hr_cb, MARGIN_COLS, data_width_cb, cursor.row, cursor.col);
             }
         }
     });
@@ -578,26 +869,19 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     let commit_sheet = spreadsheet.clone();
     let app_ptr_ce = app_ptr;
     add_commit_edit_callback(move |display_row, col, value| {
-        let app = unsafe { &mut *app_ptr_ce };
+        let app = app_from_raw(app_ptr_ce);
         let dr = display_rows_for_ce.borrow();
         let logical_row = dr.get(display_row as usize).copied().unwrap_or(0);
         let main_row = logical_row.saturating_sub(hr_ce);
         let main_col = col.saturating_sub(lm_ce as u32);
         let addr = CellAddr::Main { row: main_row as u32, col: main_col as u32 };
-        let sheet_id = app.core.workbook.sheet_id(app.core.workbook.active_sheet);
-        let op = Op::SetCell { addr, value };
-        let wbo = WorkbookOp::SheetOp { sheet_id, op };
-        if let Some(ref p) = app.core.path.clone() {
-            let mut active_sheet = sheet_id;
-            let _ = crate::io::commit_workbook_op(
-                p,
-                &mut app.core.offset,
-                &mut app.core.workbook,
-                &mut active_sheet,
-                &wbo,
-            );
-            app.core.ops_applied = app.core.ops_applied.saturating_add(1);
-        }
+        crate::debug_log::log(&format!(
+            "COMMIT_CB display_row={} col={} logical_row={} hr_ce={} lm_ce={} main_row={} main_col={} addr={:?} value={:?} app_cursor_row={} app_cursor_col={}",
+            display_row, col, logical_row, hr_ce, lm_ce, main_row, main_col, addr, value, app.core.cursor.row, app.core.cursor.col
+        ));
+        // Commit the edited value to the workbook via the shared helper
+        // (logs to the live .corro file when one is open, else applies in-memory).
+        commit_cell(app, addr, value);
         // Re-align the committed cell's display text (spreadsheet_commit_edit
         // stored the raw value, but we need the aligned version).
         let rec = app.core.workbook.active_sheet().clone();
@@ -620,6 +904,59 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
             };
             commit_sheet.set_cell(display_row, col, &aligned);
         }
+    });
+
+    // ── Go-to (Ctrl+G) callback ───────────────────────────────────────────
+    // The ratatui reference jump target for Ctrl+G is A1000. This callback
+    // recomputes the visible viewport around that cell, repopulates the
+    // widget, and positions the widget cursor there so the formula bar shows
+    // the target address (e.g. `A1000`).
+    let goto_sheet = spreadsheet.clone();
+    let app_ptr_goto = app_ptr;
+    let hr_goto = hr;
+    let lm_goto = MARGIN_COLS;
+    let sid_goto = sid;
+    add_goto_callback(move || {
+        let app = app_from_raw(app_ptr_goto);
+        let cursor = crate::grid::SheetCursor {
+            row: crate::grid::HEADER_ROWS + 999,
+            col: lm_goto,
+        };
+        // Ensure the jump target (A1000) actually exists in the grid so it is
+        // treated as a main row (label "1000") rather than spilling into a
+        // footer row. This mirrors ratatui's Go-To, which extends the grid to
+        // the jump target; without it, on a small workbook the far cursor is
+        // clamped to a footer label (e.g. `_996`) instead of `A1000`.
+        {
+            let sht = app.core.workbook.active_sheet_mut();
+            let target_main_row = cursor.row - crate::grid::HEADER_ROWS + 1; // = 1000
+            if sht.grid.main_rows() < target_main_row {
+                sht.grid.set_main_size(target_main_row, sht.grid.main_cols());
+            }
+        }
+        // Recompute the viewport around the target cell (shared controller).
+        let vp = Viewport::recompute(app, cursor, data_rows_cb, data_cols_cb, data_width_cb, hr_goto, MARGIN_COLS);
+        let rec = app.core.workbook.active_sheet().clone();
+        let target_logical = crate::grid::HEADER_ROWS + 999;
+        let display_ri = vp.display_rows
+            .iter()
+            .position(|&r| r == target_logical)
+            .unwrap_or(0);
+        app.core.cursor = cursor;
+        spreadsheet_set_border_title(sid_goto, &vp.border_title(app.core.ops_applied));
+        spreadsheet_set_row_labels(sid_goto, vp.row_labels.clone());
+        spreadsheet_set_column_layout(sid_goto, vp.column_layout.clone());
+        spreadsheet_set_grid_config(sid_goto, lm_goto as u32, vp.mc as u32);
+        vp.refill(&mut SpreadsheetSink::new(&goto_sheet), &rec.grid, hr_goto, MARGIN_COLS, data_width_cb, cursor.row, cursor.col);
+        // Position the widget cursor on the target cell (A1000).
+        goto_sheet.set_cursor(display_ri as u32, lm_goto as u32);
+        let target_val = rec
+            .grid
+            .get(&CellAddr::Main { row: 999, col: 0 })
+            .unwrap_or_default();
+        goto_sheet.set_raw_cell(display_ri as u32, lm_goto as u32, &target_val);
+        *dr_for_goto_cb.borrow_mut() = vp.display_rows.clone();
+        *dr_for_goto_ce.borrow_mut() = vp.display_rows.clone();
     });
 
     _backend.run().map_err(|e| format!("pancurses error: {e}"))?;

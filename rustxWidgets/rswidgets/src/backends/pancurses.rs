@@ -285,6 +285,10 @@ mod pancurses_backend {
         }
     }
 
+    // Win9x/Windows-only: drives the PDCurses win32 buffer through the sys
+    // crate (64-bit chtype ABI). Never used on other platforms, where the
+    // SGR stream always goes to ANSI stdout (see `emit_sgr`).
+    #[cfg(windows)]
     fn emit_sgr_via_curses(s: &str) {
         let bytes = s.as_bytes();
         let mut i = 0usize;
@@ -393,6 +397,13 @@ mod pancurses_backend {
         unsafe {
             pdcurses::refresh();
         }
+    }
+
+    #[cfg(not(windows))]
+    fn emit_sgr_via_curses(_s: &str) {
+        // Unreachable: `sgr_stream_is_ansi_unusable()` is always false off
+        // Windows, so `emit_sgr` never routes here. Present only so the
+        // call in `emit_sgr` compiles on every platform.
     }
 
     pub type Callback = Box<dyn FnMut()>;

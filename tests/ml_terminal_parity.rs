@@ -80,12 +80,39 @@ fn wait_marker(path: &std::path::Path, target: usize) {
 
 
 
+/// Copy an in-repo `docs/tests/*.corro` fixture to a unique temp file.
+/// The pancurses backend writes cell commits through to the open file, so
+/// tests must never open a checked-in fixture in place (editing tests once
+/// appended their keystrokes to the repo file itself). Absolute paths
+/// (already-temp copies shared with the ratatui side) pass through as-is.
+fn fixture_temp_copy(rel: &str) -> String {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let src = manifest.join(rel);
+    let dst = std::env::temp_dir().join(format!(
+        "corro-tmux-{}-{}.corro",
+        std::process::id(),
+        COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    ));
+    std::fs::copy(&src, &dst).expect("copy fixture to temp");
+    dst.to_string_lossy().to_string()
+}
+
 /// Run pancurses in tmux, send keys, capture pane output.
 fn run_in_tmux(args: &str, keys: &[&str], wait_ms: u64) -> String {
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let session = format!("corro-{}", id);
     let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
-    tmux::new_session(&session, &format!("{} {}; sleep 2", bin, args));
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut rewritten: Vec<String> = Vec::new();
+    for tok in args.split_whitespace() {
+        if tok.ends_with(".corro") && !tok.starts_with('/') && manifest.join(tok).is_file() {
+            rewritten.push(fixture_temp_copy(tok));
+        } else {
+            rewritten.push(tok.to_string());
+        }
+    }
+    let cmd_args = rewritten.join(" ");
+    tmux::new_session(&session, &format!("{} {}; sleep 2", bin, cmd_args));
     std::thread::sleep(Duration::from_millis(wait_ms));
     for key in keys {
         tmux::send_keys(&session, key);
@@ -244,7 +271,8 @@ fn left_arrow_does_not_jump_viewport() {
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let session = format!("corro-{}", id);
     let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
-    tmux::new_session(&session, &format!("{} --pancurses docs/tests/overflow.corro; sleep 2", bin));
+    let fixture = menu_fixture();
+    tmux::new_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
     std::thread::sleep(Duration::from_millis(1200));
 
     // Verify app started

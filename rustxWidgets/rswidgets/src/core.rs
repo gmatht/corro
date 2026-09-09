@@ -78,8 +78,176 @@ pub mod key {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Shared backend-agnostic UI model (mirrors wxWidgets concepts).
+// These types live in the core so every backend renders/navigates the same
+// model; application code builds one menu/event/action model and hands it to
+// any backend. Never put app-specific menu text or indices here.
+// ---------------------------------------------------------------------------
+
+/// Layout alignment for a sizer child (mirrors wxSizerFlags alignment).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Align {
+    #[default]
+    Default,
+    Left,
+    Center,
+    Right,
+    Top,
+    Bottom,
+}
+
+/// Layout flags for a sizer child (mirrors wxSizerFlags).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SizerFlags {
+    pub expand: bool,
+    pub align: Align,
+}
+
+/// A sizer child: a widget id with weight, border, and flags.
+#[derive(Clone, Debug)]
+pub struct SizerChild {
+    pub widget: usize,
+    pub weight: i32,
+    pub border: i32,
+    pub flags: SizerFlags,
+}
+
+/// A layout sizer (mirrors wxSizer): arranges its children. `Box` lays out
+/// children in a row/column with weights; `Grid`/`FlexGrid` arrange them in a
+/// fixed or flexible grid.
+#[derive(Clone, Debug)]
+pub enum Sizer {
+    Box { horizontal: bool, spacing: i32, children: Vec<SizerChild> },
+    Grid { cols: usize, rows: usize, children: Vec<SizerChild> },
+    FlexGrid { cols: usize, rows: usize, children: Vec<SizerChild> },
+}
+
+/// Message box kind (mirrors wxMessageBox style).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MessageBoxKind {
+    Info,
+    Warning,
+    Error,
+    Question,
+}
+
+/// Result of dismissing a message box (mirrors wxMessageBox return values).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MessageBoxResult {
+    Ok,
+    Cancel,
+    Yes,
+    No,
+}
+
+/// A UI event dispatched through the widget tree. Callbacks that return
+/// `CallbackResult::Skip` let the event propagate to the parent widget
+/// (mirrors wxEvent).
+#[derive(Clone, Debug)]
+pub enum Event {
+    /// Generic activation (button click, menu item, …).
+    Activate,
+    /// Pointer click at widget-local coordinates.
+    Click { x: u32, y: u32 },
+    /// Key press (backend key code).
+    Key { code: u32 },
+    /// Menu item activation by action name.
+    Menu { action: String },
+}
+
+/// Result of an event callback: `Handled` stops propagation, `Skip` lets the
+/// event bubble to the parent widget (mirrors wxEvent::Skip).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CallbackResult {
+    Handled,
+    Skip,
+}
+
+/// A named, stateful action: enable/disable and checked state shared across
+/// menu items, toolbars, and keybindings (mirrors wxAction). Menu items
+/// reference actions by name; the toolkit keeps a registry so one action's
+/// state is reflected everywhere it appears.
+#[derive(Clone, Debug, Default)]
+pub struct Action {
+    pub name: String,
+    pub enabled: bool,
+    pub checked: bool,
+}
+
+/// A menu item in a backend-agnostic menu model. Backends render and navigate
+/// this model with their own widgets; the model itself is shared so an
+/// application can build one menu and hand it to any backend.
+///
+/// Item kinds mirror wxWidgets: plain actions, check items (boolean state),
+/// radio items (one-of-a-group), separators, and submenus. `shortcut` is the
+/// accelerator text (e.g. "Ctrl+O") for backends that can wire real
+/// keybindings.
+#[derive(Clone, Debug)]
+pub enum MenuItem {
+    Action { label: String, action: String, shortcut: Option<String> },
+    Check { label: String, action: String, checked: bool },
+    Radio { label: String, action: String, group: u32 },
+    Separator,
+    Submenu { label: String, items: Vec<MenuItem>, shortcut: Option<String> },
+}
+
+/// A data grid (mirrors wxGrid): cells, cursor, viewport, editing state,
+/// column layout, and row labels. Backends render it with their own widgets;
+/// the `Spreadsheet` widget builds its chrome (formula bar, status, tabs) on
+/// top of a `Grid`. (Deliberately `core::Grid`, not re-exported at the crate
+/// root, so `crate::Grid` keeps referring to the active backend's widget.)
+#[derive(Clone, Debug)]
+pub struct Grid {
+    pub cells: Rc<RefCell<HashMap<(u32, u32), String>>>,
+    pub raw_cells: Rc<RefCell<HashMap<(u32, u32), String>>>,
+    pub cell_styles: Rc<RefCell<HashMap<(u32, u32), u8>>>,
+    pub total_rows: u32,
+    pub total_cols: u32,
+    pub top_row: u32,
+    pub left_col: u32,
+    pub cursor_row: u32,
+    pub cursor_col: u32,
+    pub editing: bool,
+    pub edit_buf: String,
+    pub edit_pos: usize,
+    pub col_width: u32,
+    pub margin_cols: u32,
+    pub main_cols: u32,
+    pub anchor: Option<(u32, u32)>,
+    pub header_row_count: u32,
+    pub main_row_count: u32,
+    pub column_layout: Vec<(u32, u32, String)>,
+    pub row_labels: Vec<(u32, String)>,
+}
+
+impl Grid {
+    /// The value displayed in a cell (committed value, falling back to the
+    /// in-progress edit buffer when editing that cell).
+    pub fn display_value(&self, row: u32, col: u32) -> String {
+        if self.editing && row == self.cursor_row && col == self.cursor_col {
+            self.edit_buf.clone()
+        } else {
+            self.cells.borrow().get(&(row, col)).cloned().unwrap_or_default()
+        }
+    }
+
+    /// Commit the in-progress edit into the cell (no-op when not editing).
+    pub fn commit_edit(&mut self) {
+        if self.editing {
+            let val = self.edit_buf.clone();
+            let r = self.cursor_row;
+            let c = self.cursor_col;
+            self.cells.borrow_mut().insert((r, c), val.clone());
+            self.raw_cells.borrow_mut().insert((r, c), val);
+            self.editing = false;
+            self.edit_buf.clear();
+            self.edit_pos = 0;
+        }
+    }
+}
+
 use std::cell::RefCell;
-#[cfg(windows)]
 use std::collections::HashMap;
 use std::os::raw::c_void;
 use std::rc::Rc;
@@ -840,6 +1008,11 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
             let inner = crate::backends_nwg_adapter::create_window(&self.parent_cell)?;
             Ok(crate::common::Window { inner })
         }
+        #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
+        {
+            let inner = crate::backends_pancurses_adapter::create_window()?;
+            Ok(crate::common::Window { inner })
+        }
         #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
         {
             let inner = crate::backends_wasm_adapter::create_window()?;
@@ -868,6 +1041,11 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
             let inner = crate::backends_nwg_adapter::create_box(nwg_orient, spacing, parent)?;
             Ok(crate::common::WidgetBox { inner })
         }
+        #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
+        {
+            let inner = crate::backends_pancurses_adapter::create_box(orientation, spacing)?;
+            Ok(crate::common::WidgetBox { inner })
+        }
         #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
         {
             let inner = crate::backends_wasm_adapter::create_box(orientation, spacing)?;
@@ -887,6 +1065,11 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
             let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
             let inner = crate::backends_nwg_adapter::create_label(parent)?;
             inner.set_text(text);
+            Ok(crate::common::Label { inner })
+        }
+        #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
+        {
+            let inner = crate::backends_pancurses_adapter::create_label(text)?;
             Ok(crate::common::Label { inner })
         }
         #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
@@ -909,6 +1092,11 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
             let inner = crate::backends_nwg_adapter::create_entry(parent)?;
             Ok(crate::common::Entry { inner })
         }
+        #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
+        {
+            let inner = crate::backends_pancurses_adapter::create_entry()?;
+            Ok(crate::common::Entry { inner })
+        }
         #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
         {
             let inner = crate::backends_wasm_adapter::create_entry()?;
@@ -927,6 +1115,11 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
         {
             let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
             let inner = crate::backends_nwg_adapter::create_canvas(parent)?;
+            Ok(crate::common::Canvas { inner })
+        }
+        #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
+        {
+            let inner = crate::backends_pancurses_adapter::create_canvas()?;
             Ok(crate::common::Canvas { inner })
         }
         #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
@@ -1046,6 +1239,11 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
         #[cfg(all(windows, not(feature = "zork")))]
         {
             let inner = crate::backends_nwg_adapter::create_dialog(&self.parent_cell)?;
+            Ok(crate::common::Dialog { inner })
+        }
+        #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
+        {
+            let inner = crate::backends_pancurses_adapter::create_dialog()?;
             Ok(crate::common::Dialog { inner })
         }
         #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]

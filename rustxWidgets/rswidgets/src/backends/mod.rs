@@ -21,7 +21,10 @@ pub trait BackendApp {
 
 #[cfg(all(feature = "gtk4-rs", target_os = "linux", not(feature = "zork")))]
 pub mod gtk4_rs;
-#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "pancurses"), not(feature = "zork")))]
+// The module itself is always available when its feature is on (combined
+// builds need gtk + pancurses side by side); only the `init` re-export
+// below is priority-gated so `pancurses::init` wins as the fallback.
+#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
 pub mod gtk;
 
 #[cfg(all(feature = "gtk4-rs", target_os = "linux", not(feature = "zork"), not(feature = "gtk")))]
