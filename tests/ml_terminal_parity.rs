@@ -652,7 +652,7 @@ fn menu_item_activation_smoke() {
     activate_menu_item(2, 0, "Rows", "Inserted row", false);
     activate_menu_item(5, 0, "About", "About", false);
     activate_menu_item(3, 3, "Reset", "Format reset", false);
-    activate_menu_item(0, 4, "Sort view", "Sorted", false);
+    activate_menu_item(1, 0, "Cut", "Cut A1", false);
     activate_menu_item(4, 2, "New sheet", "New sheet created", false);
     // Quit must actually terminate the app.
     activate_menu_item(0, 6, "Exit", "", true);

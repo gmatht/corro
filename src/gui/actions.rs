@@ -147,6 +147,8 @@ pub fn menu_action_needs_prompt(name: &str) -> Option<&'static str> {
         "delete_sheet" => "Delete sheet named",
         "insert_special_chars" => "Insert special char",
         "insert_hyperlink" => "Insert hyperlink",
+        "sort_view" => "sort cols [A,B,C]",
+        "persist_sort" => "sort cols [A,B,C] (save)",
         _ => return None,
     })
 }
@@ -328,7 +330,7 @@ pub fn dispatch_menu_action(
                 MenuDispatch::Status(format!("Pasted at {}", main_addr_label(main_row, main_col)))
             }
         }
-        "sort_asc" | "sort_desc" | "sort_view" => {
+        "sort_asc" | "sort_desc" => {
             let asc = name != "sort_desc";
             let n = sort_sheet(app, main_col as usize, asc);
             MenuDispatch::Status(if n > 0 {
@@ -337,7 +339,6 @@ pub fn dispatch_menu_action(
                 "Nothing to sort".into()
             })
         }
-        "persist_sort" => MenuDispatch::Status("Persist sort: not available in the pancurses build".into()),
         "replay" => MenuDispatch::Status("Replay: not available in the pancurses build".into()),
         "extrapolate" => MenuDispatch::Status("Extrapolate: not available in the pancurses build".into()),
         "duplicate" => {
@@ -475,6 +476,73 @@ pub fn run_prompt_action(app: &mut App, action: &str, text: &str) {
             } else {
                 app.core.status = "Column width: enter a number".into();
             }
+        }
+        "sort_view" => {
+            // Parse "A,B,C" (optional "!" prefix = descending) into view-sort
+            // cols, matching the ratatui SortView prompt exactly.
+            let cols: Vec<crate::grid::SortSpec> = path
+                .split(',')
+                .filter_map(|s| {
+                    let s = s.trim();
+                    if s.is_empty() {
+                        None
+                    } else {
+                        let (desc, raw) = if let Some(rest) = s.strip_prefix('!') {
+                            (true, rest)
+                        } else {
+                            (false, s)
+                        };
+                        crate::addr::parse_excel_column(raw).map(|c| crate::grid::SortSpec {
+                            col: MARGIN_COLS + c as usize,
+                            desc,
+                        })
+                    }
+                })
+                .collect();
+            app.core.workbook.active_sheet_mut().grid.set_view_sort_cols(cols);
+            app.core.status = "View sort updated".into();
+        }
+        "persist_sort" => {
+            // Same parse as sort_view, but persist the sort (commit a
+            // SetViewSortCols op to the live file when one is open) and
+            // record it in the persisted-sort cache — matching ratatui's
+            // SortView with persist=true ("View sort saved").
+            let cols: Vec<crate::grid::SortSpec> = path
+                .split(',')
+                .filter_map(|s| {
+                    let s = s.trim();
+                    if s.is_empty() {
+                        None
+                    } else {
+                        let (desc, raw) = if let Some(rest) = s.strip_prefix('!') {
+                            (true, rest)
+                        } else {
+                            (false, s)
+                        };
+                        crate::addr::parse_excel_column(raw).map(|c| crate::grid::SortSpec {
+                            col: MARGIN_COLS + c as usize,
+                            desc,
+                        })
+                    }
+                })
+                .collect();
+            let sheet_id = app.core.workbook.sheet_id(app.core.workbook.active_sheet);
+            app.core.workbook.active_sheet_mut().grid.set_view_sort_cols(cols.clone());
+            if !cols.is_empty() {
+                app.core.persisted_view_sort_cols.insert(sheet_id, cols.clone());
+            } else {
+                app.core.persisted_view_sort_cols.remove(&sheet_id);
+            }
+            if let Some(ref p) = app.core.path.clone() {
+                let mut active_sheet = sheet_id;
+                let wbo = WorkbookOp::SheetOp {
+                    sheet_id,
+                    op: Op::SetViewSortCols { cols },
+                };
+                let _ = crate::io::commit_workbook_op(p, &mut app.core.offset, &mut app.core.workbook, &mut active_sheet, &wbo);
+                app.core.ops_applied = app.core.ops_applied.saturating_add(1);
+            }
+            app.core.status = "View sort saved".into();
         }
         "go_to_cell" => {
             if !path.is_empty() {

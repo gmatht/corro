@@ -654,7 +654,7 @@ fn menu_item_activation_smoke() {
     activate_menu_item(2, 0, "Rows", "Inserted row", false);
     activate_menu_item(5, 0, "About", "About", false);
     activate_menu_item(3, 3, "Reset", "Format reset", false);
-    activate_menu_item(0, 4, "Sort view", "Sorted", false);
+    activate_menu_item(1, 0, "Cut", "Cut A1", false);
     activate_menu_item(4, 2, "New sheet", "New sheet created", false);
     // Quit must actually terminate the app.
     activate_menu_item(0, 6, "Exit", "", true);
@@ -1316,6 +1316,42 @@ fn tab_bar_parity_after_new_sheet() {
     // content — titles, order and inter-tab spacing are the parity surface.
     assert_eq!(pnc_tab.trim_end(), rat_tab.trim_end(),
         "tab bar diverges after New sheet\npancurses: |{pnc_tab}|\nratatui:   |{rat_tab}|");
+}
+
+/// Sort view opens a `sort cols [A,B,C]:` prompt (matching ratatui) and
+/// applying it sorts the view and reports "View sort updated". Regression:
+/// it used to immediately sort with a different status.
+#[test]
+fn sort_view_prompt_sorts_and_reports() {
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let session = format!("corro-sort-{}-{}", std::process::id(), id);
+    let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
+    let fixture = menu_fixture();
+    tmux::new_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
+    wait_for_text(&session, "[File]");
+    send_settled(&session, "M-f");
+    wait_for_text(&session, "┌File");
+    for _ in 0..4 { send_settled(&session, "Down"); } // Sort view (idx 4)
+    send_settled(&session, "Enter"); // opens the prompt
+    wait_for_text(&session, "sort cols [A,B,C]");
+    for ch in "A".chars() {
+        tmux::send_keys(&session, &ch.to_string());
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    tmux::send_keys(&session, "Enter"); // submit
+    // Poll for the status (the sort applies and reports).
+    let mut pane = String::new();
+    for _ in 0..40 {
+        pane = tmux::capture_pane(&session);
+        if pane.contains("View sort updated") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    tmux::kill_session(&session);
+    assert!(pane.contains("View sort updated"),
+        "Sort view should apply and report 'View sort updated'\n--- pane ---\n{}", safe_slice(&pane, 1200));
 }
 
 
