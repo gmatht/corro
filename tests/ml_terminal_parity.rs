@@ -80,6 +80,29 @@ fn send_settled(session: &str, key: &str) {
     }
 }
 
+/// Start a pancurses session and wait for the app to render its menu bar,
+/// retrying on slow startup (many parallel tmux sessions contend for the
+/// shared server; a session can take >15s to start under load).
+fn start_session(session: &str, command: &str) {
+    for _ in 0..3 {
+        tmux::new_session(session, command);
+        let mut ok = false;
+        for _ in 0..100 {
+            if tmux::capture_pane(session).contains("[File]") {
+                ok = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        if ok {
+            return;
+        }
+        tmux::kill_session(session);
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    panic!("failed to start session {session}");
+}
+
 /// Slice `s` to at most `n` chars, never splitting a UTF-8 codepoint
 /// (the pancurses pane contains multi-byte box-drawing characters).
 fn safe_slice(s: &str, n: usize) -> &str {
@@ -242,8 +265,7 @@ fn ctrl_c_copies_instead_of_quitting() {
     let session = format!("corro-ctrlc-{}", id);
     let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
     let fixture = menu_fixture();
-    tmux::new_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
-    std::thread::sleep(Duration::from_millis(1200));
+    start_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
     tmux::send_keys(&session, "C-c");
     std::thread::sleep(Duration::from_millis(400));
     let pane = tmux::capture_pane(&session);
@@ -299,8 +321,7 @@ fn left_arrow_does_not_jump_viewport() {
     let session = format!("corro-{}", id);
     let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
     let fixture = menu_fixture();
-    tmux::new_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
-    std::thread::sleep(Duration::from_millis(1200));
+    start_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
 
     // Verify app started
     let pane0 = tmux::capture_pane(&session);
@@ -472,8 +493,7 @@ fn walk_menu_items(sm: usize, labels: &[&str]) -> String {
     let session = format!("corro-walk-{}", id);
     let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
     let fixture = menu_fixture();
-    tmux::new_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
-    std::thread::sleep(Duration::from_millis(1200));
+    start_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
     open_root_menu(&session, sm);
     std::thread::sleep(Duration::from_millis(300));
     for (i, &label) in labels.iter().enumerate() {
@@ -553,8 +573,7 @@ fn activate_menu_item(sm: usize, idx: usize, label: &str, expected: &str, quit: 
     let session = format!("corro-act-{}", id);
     let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
     let fixture = menu_fixture();
-    tmux::new_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
-    std::thread::sleep(Duration::from_millis(1200));
+    start_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
     open_root_menu(&session, sm);
     for _ in 0..idx {
         tmux::send_keys(&session, "Down");
@@ -645,8 +664,7 @@ fn menu_file_parity_with_ratatui() {
     let session = format!("corro-parity-{}", id);
     let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
     let fixture = menu_fixture();
-    tmux::new_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
-    std::thread::sleep(Duration::from_millis(1200));
+    start_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
     tmux::send_keys(&session, "Escape");
     std::thread::sleep(Duration::from_millis(120));
     tmux::send_keys(&session, "f");
@@ -692,8 +710,7 @@ fn menu_export_tsv_writes_file() {
     let fixture = menu_fixture();
     let export_path = std::env::temp_dir().join(format!("corro-export-{}.tsv", std::process::id()));
     let _ = std::fs::remove_file(&export_path);
-    tmux::new_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
-    std::thread::sleep(Duration::from_millis(1200));
+    start_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
     tmux::send_keys(&session, "Escape");
     std::thread::sleep(Duration::from_millis(120));
     tmux::send_keys(&session, "f");
@@ -747,8 +764,7 @@ fn menu_open_loads_file() {
     let session = format!("corro-act-{}", id);
     let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
     let fixture = menu_fixture();
-    tmux::new_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
-    std::thread::sleep(Duration::from_millis(1200));
+    start_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
     tmux::send_keys(&session, "Escape");
     std::thread::sleep(Duration::from_millis(120));
     tmux::send_keys(&session, "f");
@@ -780,8 +796,7 @@ fn activate_menu_item_prompt(sm: usize, idx: usize, label: &str, input: &str, ex
     let session = format!("corro-act-{}", id);
     let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
     let fixture = menu_fixture();
-    tmux::new_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
-    std::thread::sleep(Duration::from_millis(1200));
+    start_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
     open_root_menu(&session, sm);
     for _ in 0..idx {
         tmux::send_keys(&session, "Down");
@@ -851,8 +866,7 @@ fn help_about_shows_dialog() {
     let session = format!("corro-{}", id);
     let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
     let fixture = menu_fixture();
-    tmux::new_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
-    std::thread::sleep(Duration::from_millis(1500));
+    start_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
     // Open Help menu with Alt+H (Right-navigation from File would enter the
     // Format->Scope submenu, since the first Format item is a submenu).
     tmux::send_keys(&session, "Escape");
@@ -913,8 +927,7 @@ fn help_full_shows_dialog() {
     let session = format!("corro-{}", id);
     let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
     let fixture = menu_fixture();
-    tmux::new_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
-    std::thread::sleep(Duration::from_millis(1500));
+    start_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
     tmux::send_keys(&session, "Escape");
     std::thread::sleep(Duration::from_millis(120));
     tmux::send_keys(&session, "h"); // Alt+H opens Help
@@ -992,8 +1005,7 @@ fn help_about_parity_with_ratatui() {
     let session = format!("corro-parity-{}", id);
     let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
     let fixture = menu_fixture();
-    tmux::new_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
-    std::thread::sleep(Duration::from_millis(1500));
+    start_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
     tmux::send_keys(&session, "Escape");
     std::thread::sleep(Duration::from_millis(120));
     tmux::send_keys(&session, "h");
@@ -1040,8 +1052,7 @@ fn help_full_parity_with_ratatui() {
     let session = format!("corro-parity-{}", id);
     let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
     let fixture = menu_fixture();
-    tmux::new_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
-    std::thread::sleep(Duration::from_millis(1500));
+    start_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
     tmux::send_keys(&session, "Escape");
     std::thread::sleep(Duration::from_millis(120));
     tmux::send_keys(&session, "h");
@@ -1075,8 +1086,7 @@ fn menu_insert_date_shows_cell_immediately() {
     let session = format!("corro-date-{}-{}", std::process::id(), id);
     let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
     let fixture = menu_fixture();
-    tmux::new_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
-    wait_for_text(&session, "[File]");
+    start_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
     // Insert menu (Alt+I), Date is item index 5.
     send_settled(&session, "M-i");
     wait_for_text(&session, "┌Insert");
@@ -1123,8 +1133,7 @@ fn menu_mitosis_row_copies_row_values() {
     let session = format!("corro-mit-r-{}", id);
     let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
     let fixture = menu_fixture();
-    tmux::new_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
-    std::thread::sleep(Duration::from_millis(1200));
+    start_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
     // Cursor starts at A1 ("Hello World!").  Insert menu (Alt+I);
     // Mitosis (Row) is item index 1.
     tmux::send_keys(&session, "Escape");
@@ -1176,8 +1185,7 @@ fn menu_mitosis_col_copies_col_values() {
     let session = format!("corro-mit-c-{}", id);
     let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
     let fixture = menu_fixture();
-    tmux::new_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
-    std::thread::sleep(Duration::from_millis(1200));
+    start_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
     // Cursor starts at A1 ("Hello World!").  Insert menu (Alt+I), then the
     // item's SHORTCUT letter 'o' (the user's exact key sequence Alt+I > O) —
     // this must fire the item, not fall through into the grid as a cell edit.
@@ -1213,8 +1221,7 @@ fn menu_popup_has_border() {
     let session = format!("corro-{}", id);
     let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
     let fixture = menu_fixture();
-    tmux::new_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
-    std::thread::sleep(Duration::from_millis(1500));
+    start_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
     tmux::send_keys(&session, "Escape");
     std::thread::sleep(Duration::from_millis(120));
     tmux::send_keys(&session, "f");
@@ -1243,8 +1250,7 @@ fn overwrite_text_is_consistent_and_matches_disk() {
     let fid = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let fixture = std::env::temp_dir().join(format!("corro-ow-{}-{}.corro", std::process::id(), fid));
     std::fs::write(&fixture, "CORRO_LOG 1\n").unwrap();
-    tmux::new_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture.to_string_lossy()));
-    std::thread::sleep(Duration::from_millis(1500));
+    start_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture.to_string_lossy()));
     // AAA, Enter
     for ch in "AAA".chars() {
         tmux::send_keys(&session, &ch.to_string());
@@ -1298,8 +1304,7 @@ fn edit_text_no_file_persists() {
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let session = format!("corro-{}", id);
     let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
-    tmux::new_session(&session, &format!("{} --pancurses; sleep 2", bin));
-    std::thread::sleep(Duration::from_millis(1500));
+    start_session(&session, &format!("{} --pancurses; sleep 2", bin));
     for ch in "AAA".chars() {
         tmux::send_keys(&session, &ch.to_string());
         std::thread::sleep(Duration::from_millis(40));
@@ -1332,8 +1337,7 @@ fn edit_text_multiple_cells_persists() {
     let fid = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let fixture = std::env::temp_dir().join(format!("corro-multi-{}-{}.corro", std::process::id(), fid));
     std::fs::write(&fixture, "CORRO_LOG 1\n").unwrap();
-    tmux::new_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture.to_string_lossy()));
-    std::thread::sleep(Duration::from_millis(1200));
+    start_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture.to_string_lossy()));
     for ch in "AAA".chars() {
         tmux::send_keys(&session, &ch.to_string());
         std::thread::sleep(Duration::from_millis(40));
@@ -1372,8 +1376,7 @@ fn edit_text_then_move_persists() {
     let session = format!("corro-{}", id);
     let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
     let fixture = menu_fixture();
-    tmux::new_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
-    std::thread::sleep(Duration::from_millis(1200));
+    start_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
     for ch in "ZZZTEST".chars() {
         tmux::send_keys(&session, &ch.to_string());
         std::thread::sleep(Duration::from_millis(30));
