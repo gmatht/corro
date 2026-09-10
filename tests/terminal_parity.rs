@@ -1785,6 +1785,35 @@ fn full_screen_shared_session_walk_char_exact() {
     let _ = std::fs::remove_file(&marker);
 }
 
+/// Home/End/PageUp/PageDown must be consumed by the pancurses backend and move
+/// the cursor, NOT leak their CSI escape sequences into the formula bar as
+/// literal text (regression; ratatui handles these keys).
+#[test]
+fn nav_keys_home_end_page_move_not_leak() {
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let session = format!("corro-nav-{}-{}", std::process::id(), id);
+    let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
+    let fixture = menu_fixture();
+    start_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
+    // The raw escape sequences that appeared as literal text before the fix:
+    //   End -> ^[[4~ , Home -> ^[[1~ , PageDown -> ^[[6~ , PageUp -> ^[[5~
+    let leak: &[&str] = &["~", "\x1b[", "^["]; // tilde suffix + CSI introducer
+    for k in ["End", "Home", "PageDown", "PageUp"] {
+        tmux::send_keys(&session, k);
+        capture_settled(&session, 30);
+        let fbar = tmux::capture_pane(&session).lines().nth(1).unwrap_or("").to_string();
+        for l in leak {
+            assert!(!fbar.contains(l),
+                "after {k}: escape sequence {l:?} leaked into the formula bar (should move the cursor)\n--- bar ---\n{fbar}");
+        }
+    }
+    // End/Home should move the column; PageDown should move the row from A1.
+    let fbar = tmux::capture_pane(&session).lines().nth(1).unwrap_or("").to_string();
+    assert!(!fbar.starts_with("A1"),
+        "navigation keys should move the cursor off the start cell\n--- bar ---\n{fbar}");
+    tmux::kill_session(&session);
+}
+
 #[test]
 fn pseudorandom_walk_matches_ratatui() {
     use crossterm::event::KeyCode;

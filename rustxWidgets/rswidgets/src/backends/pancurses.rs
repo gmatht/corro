@@ -828,6 +828,10 @@ mod pancurses_backend {
                 const KDOWN: c_int = 258;
                 const KLEFT: c_int = 260;
                 const KRIGHT: c_int = 261;
+                const KHOME: c_int = 262; // ncurses KEY_HOME (\x1b[H or \x1b[1~)
+                const KPPAGE: c_int = 339; // ncurses KEY_PPAGE (\x1b[5~)
+                const KNPAGE: c_int = 338; // ncurses KEY_NPAGE (\x1b[6~)
+                const KEND: c_int = 360;   // ncurses KEY_END (\x1b[F or \x1b[4~)
                 for (seq, code) in [
                     (&b"\x1b[A\x00"[..], KUP),
                     (&b"\x1b[B\x00"[..], KDOWN),
@@ -837,6 +841,15 @@ mod pancurses_backend {
                     (&b"\x1b[1;2B\x00"[..], KDOWN),
                     (&b"\x1b[1;2D\x00"[..], KLEFT),
                     (&b"\x1b[1;2C\x00"[..], KRIGHT),
+                    // Home/End/PageUp/PageDown. Without these the CSI tilde
+                    // sequences leak into the formula bar as literal text
+                    // while ratatui handles the keys.
+                    (&b"\x1b[H\x00"[..], KHOME),
+                    (&b"\x1b[1~\x00"[..], KHOME),
+                    (&b"\x1b[F\x00"[..], KEND),
+                    (&b"\x1b[4~\x00"[..], KEND),
+                    (&b"\x1b[5~\x00"[..], KPPAGE),
+                    (&b"\x1b[6~\x00"[..], KNPAGE),
                 ] {
                     unsafe { define_key(seq.as_ptr() as *const c_char, code); }
                 }
