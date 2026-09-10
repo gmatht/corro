@@ -165,7 +165,7 @@ fn get_char_for_key(key_event: &KeyEventRecord) -> Option<char> {
         GetKeyboardLayout(foreground_thread)
     };
 
-    let ret = unsafe {
+    let ret = {
         // (Win95 patch, vendored) ToUnicodeEx is missing from USER32 on Windows
         // 95 (it is a Win2000+ API); a static import would make the Win95
         // loader reject the whole exe with "linked to missing export

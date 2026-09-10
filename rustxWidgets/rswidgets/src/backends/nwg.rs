@@ -7,6 +7,7 @@ mod nwg_backend {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     pub struct NwgApp {
+        #[allow(dead_code)]
         pub(crate) current_parent: Rc<RefCell<Option<*mut c_void>>>,
     }
 

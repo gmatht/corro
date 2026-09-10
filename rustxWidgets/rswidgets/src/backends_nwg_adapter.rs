@@ -376,6 +376,9 @@ mod nwg_adapter {
         pub fn set_margin_top(&self, _px: i32) {}
         pub fn set_halign(&self, _align: i32) {}
         pub fn set_valign(&self, _align: i32) {}
+        pub fn raw_handle(&self) -> *mut c_void {
+            self.0.handle.hwnd().unwrap_or(std::ptr::null_mut()) as *mut c_void
+        }
     }
 
     impl AsRef<*mut c_void> for Label {
@@ -721,7 +724,7 @@ mod nwg_adapter {
             self.pos_x.set(px);
             if let Some(hwnd) = self.inner.handle.hwnd() {
                 unsafe {
-                    let result = winapi::um::winuser::SetWindowPos(
+                    let _ = winapi::um::winuser::SetWindowPos(
                         hwnd as _, std::ptr::null_mut(), px, self.pos_y.get(), 0, 0,
                         winapi::um::winuser::SWP_NOZORDER | winapi::um::winuser::SWP_NOSIZE | winapi::um::winuser::SWP_SHOWWINDOW,
                     );
@@ -733,7 +736,7 @@ mod nwg_adapter {
             self.pos_y.set(px);
             if let Some(hwnd) = self.inner.handle.hwnd() {
                 unsafe {
-                    let result = winapi::um::winuser::SetWindowPos(
+                    let _ = winapi::um::winuser::SetWindowPos(
                         hwnd as _, std::ptr::null_mut(), self.pos_x.get(), px, 0, 0,
                         winapi::um::winuser::SWP_NOZORDER | winapi::um::winuser::SWP_NOSIZE | winapi::um::winuser::SWP_SHOWWINDOW,
                     );
@@ -1451,7 +1454,7 @@ mod nwg_adapter {
                     &nwg::ControlHandle::Hwnd(raw_hwnd), cid,
                     move |_h, msg, _w, l| {
                         if msg != winapi::um::winuser::WM_LBUTTONDOWN { return None; }
-                        unsafe {
+                        {
                             let x = (l & 0xFFFF) as i16 as f64;
                             let y = ((l >> 16) & 0xFFFF) as i16 as f64;
                             if let Some(ref mut f) = *cc.borrow_mut() {
@@ -1640,15 +1643,16 @@ mod nwg_adapter {
                 let view_h = rect.bottom - rect.top;
                 let vrange = if child_h > view_h { (child_h - view_h) as usize } else { 0usize };
                 let hrange = if child_w > view_w { (child_w - view_w) as usize } else { 0usize };
-                if let Ok(mut sb) = self.vscroll.try_borrow_mut() {
+                if let Ok(sb) = self.vscroll.try_borrow_mut() {
                     sb.set_range(0..vrange.max(1));
                 }
-                if let Ok(mut sb) = self.hscroll.try_borrow_mut() {
+                if let Ok(sb) = self.hscroll.try_borrow_mut() {
                     sb.set_range(0..hrange.max(1));
                 }
             }
         }
 
+#[allow(dead_code)]
         fn on_scroll(&self) {
             let (child_w, child_h) = *self.child_size.borrow();
             if child_w == 0 && child_h == 0 { return; }
@@ -2000,6 +2004,7 @@ mod nwg_adapter {
     }
 
     /// Count leaf items in the menu tree (sequential numbering).
+#[allow(dead_code)]
     fn count_leaves(items: &[crate::backends::nwg::MenuItemData]) -> u32 {
         let mut n = 0;
         for i in items {

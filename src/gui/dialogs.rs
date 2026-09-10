@@ -3,8 +3,8 @@ use crate::ops::WorkbookState;
 use crate::gui::app_alias::App;
 use std::path::PathBuf;
 
-#[allow(dead_code)] // only used by the gui feature
-fn log_dialog_action(_action: &str, _detail: &str) {
+#[allow(dead_code, unused_variables)] // only used by the gui feature
+fn log_dialog_action(action: &str, detail: &str) {
     #[cfg(feature = "gui")]
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true).append(true)

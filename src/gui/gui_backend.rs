@@ -21,6 +21,7 @@ const KEYLOG_PATH: &str = "/tmp/corro_keylog.txt";
 
 fn key_name(keyval: u32) -> String {
     if keyval == 0 { return "MENU".into(); }
+    #[allow(unreachable_patterns)] // ALT_L/ALT_R are the same value on Windows
     match normalize(keyval) {
         RETURN    => "RETURN".into(),
         ESCAPE    => "ESCAPE".into(),
@@ -37,8 +38,7 @@ fn key_name(keyval: u32) -> String {
         PAGE_DOWN => "PAGE_DOWN".into(),
         F1        => "F1".into(),
         F2        => "F2".into(),
-        ALT_L     => "ALT_L".into(),
-        ALT_R     => "ALT_R".into(),
+        ALT_L | ALT_R => "ALT".into(),
         k if (32..=126).contains(&k) => format!("'{}'", char::from_u32(k).unwrap_or('?')),
         k => format!("0x{k:X}"),
     }
