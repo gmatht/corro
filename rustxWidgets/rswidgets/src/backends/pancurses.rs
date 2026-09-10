@@ -2266,8 +2266,11 @@ mod pancurses_backend {
                                 if is_spreadsheet_focused(state, fid) {
                                     spreadsheet_commit_edit(state, fid);
                                     if let Some(n) = state.node_mut(fid) {
-                                        if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let cursor_col = &mut grid.cursor_col;
-                                            *cursor_col = 0;
+                                        if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind {
+                                            let row = grid.cursor_row;
+                                            if let Some((leftmost, _)) = spreadsheet_row_nonblank_extremes(grid, row) {
+                                                grid.cursor_col = leftmost as u32;
+                                            }
                                         }
                                     }
                                     spreadsheet_scroll_to_cursor(state, fid);
@@ -2281,8 +2284,11 @@ mod pancurses_backend {
                                 if is_spreadsheet_focused(state, fid) {
                                     spreadsheet_commit_edit(state, fid);
                                     if let Some(n) = state.node_mut(fid) {
-                                        if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let cursor_col = &mut grid.cursor_col; let total_cols = grid.total_cols;
-                                            *cursor_col = total_cols - 1;
+                                        if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind {
+                                            let row = grid.cursor_row;
+                                            if let Some((_, rightmost)) = spreadsheet_row_nonblank_extremes(grid, row) {
+                                                grid.cursor_col = rightmost as u32;
+                                            }
                                         }
                                     }
                                     spreadsheet_scroll_to_cursor(state, fid);
@@ -4472,9 +4478,30 @@ mod pancurses_backend {
         });
     }
 
+    /// Leftmost/rightmost non-blank column in `row` (widget coordinate space),
+    /// matching ratatui's row_nonblank_horizontal_extremes. None when the row
+    /// has no non-blank cells.
+    fn spreadsheet_row_nonblank_extremes(grid: &crate::core::Grid, row: u32) -> Option<(usize, usize)> {
+        let cells = grid.cells.borrow();
+        let mut first: Option<usize> = None;
+        let mut last: Option<usize> = None;
+        for (&(r, c), v) in cells.iter() {
+            if r == row && !v.trim().is_empty() {
+                let c = c as usize;
+                if first.is_none() {
+                    first = Some(c);
+                }
+                last = Some(c);
+            }
+        }
+        match (first, last) {
+            (Some(a), Some(b)) => Some((a, b)),
+            _ => None,
+        }
+    }
+
     pub fn spreadsheet_get_cell(id: usize, r: u32, c: u32) -> Option<String> {
-        with_state(|s| {
-            s.node(id).and_then(|n| {
+        with_state(|s| {            s.node(id).and_then(|n| {
                 if let PcWidgetKind::Spreadsheet { grid, .. } = &n.kind { let cells = &grid.cells;
                     cells.borrow().get(&(r, c)).cloned()
                 } else {
