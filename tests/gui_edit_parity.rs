@@ -1,9 +1,12 @@
-//! Live GUI parity for type-first editing: Right,Right,A,Enter.
+//! Live GUI parity for type-first editing.
 //!
-//! The ratatui reference commits exactly "A" to C1 and leaves the cursor on
-//! C2. This test drives the real GTK GUI and asserts on the committed
-//! `.corro` file (no pixel matching, no fixed sleeps for the verdict — the
-//! file is polled with a deadline).
+//! The ratatui reference is the oracle: on a fresh 1x1 sheet Right,Right
+//! leaves the main area (trailing-blank growth stops at 2x2), so A,Enter
+//! commits to the RIGHT-MARGIN cell (`SET ]A1 A`), and Down x3 / Down x40
+//! land in the footer (`SET A_2 Z` / `SET A_39 Q`) for the same reason.
+//! These tests drive the real GTK GUI and assert on the committed `.corro`
+//! file (no pixel matching, no fixed sleeps for the verdict — the file is
+//! polled with a deadline).
 //!
 //! Requires: Linux, an X server, xdotool. Run with:
 //!   xvfb-run -a cargo test --features gtk --test gui_edit_parity
@@ -83,11 +86,15 @@ fn spawn_gui(path: &PathBuf) -> Child {
         .expect("spawn corro --gui")
 }
 
-/// Right,Right,A,Enter must commit exactly "A" to C1 (cursor was on A1).
-/// Regression: the GUI backend dropped both arrows (cursor never grew past
-/// A1 — move just clamped) and doubled the typed char, committing "AA" to A1.
+/// Right,Right,A,Enter must commit exactly "A" to the right-margin cell
+/// ]A1 (the two Rights leave the 1x1-start main area: trailing-blank growth
+/// stops, so the cursor sits in the margin — exactly what the ratatui
+/// reference commits: `SET ]A1 A`).
+/// Regression: the GUI backend built CellAddr::Main unconditionally, so the
+/// margin edit misrouted into an out-of-range main cell (accidentally
+/// growing the grid and serializing as `SET C1 A`).
 #[test]
-fn gui_right_right_a_enter_commits_c1_single_a() {
+fn gui_right_right_a_enter_commits_margin_bracket_a1() {
     // Tolerate poisoning: a failed sibling must not mask this test's verdict.
     let _guard = GUI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     assert!(
@@ -114,8 +121,8 @@ fn gui_right_right_a_enter_commits_c1_single_a() {
     let _ = child.wait();
 
     assert!(
-        lines.iter().any(|l| l == "SET C1 A"),
-        "expected exactly `SET C1 A`, got lines: {lines:?}"
+        lines.iter().any(|l| l == "SET ]A1 A"),
+        "expected exactly `SET ]A1 A` (margin commit, matching ratatui), got lines: {lines:?}"
     );
     assert!(
         !lines.iter().any(|l| l.starts_with("SET A1")),
@@ -124,6 +131,114 @@ fn gui_right_right_a_enter_commits_c1_single_a() {
     assert!(
         !lines.iter().any(|l| l.contains("AA")),
         "typed char must not double, got: {lines:?}"
+    );
+}
+
+/// Up,Left,A,Enter must commit exactly "A" to the margin-header corner
+/// cell `[A~1` (Up reaches the header band, Left steps into the left margin
+/// — exactly what the ratatui reference commits: `SET [A~1 A`).
+/// Regression: the GUI cursor clamped into the main area (Up/Left from A1
+/// were no-ops) and commits built CellAddr::Main unconditionally, so the
+/// sequence committed `SET A1 A` instead.
+#[test]
+fn gui_up_left_a_enter_commits_margin_header_corner() {
+    // Tolerate poisoning: a failed sibling must not mask this test's verdict.
+    let _guard = GUI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    assert!(
+        std::env::var("DISPLAY").is_ok(),
+        "requires X server (run under xvfb-run -a)"
+    );
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let path = std::env::temp_dir().join(format!("corro-gui-seq1-{}-{}.corro", std::process::id(), id));
+    let _ = std::fs::remove_file(&path);
+
+    let mut child = spawn_gui(&path);
+    let wid = find_corro_window(child.id(), Instant::now() + Duration::from_secs(25));
+    xdotool(&["windowactivate", "--sync", &wid]);
+    std::thread::sleep(Duration::from_millis(400));
+    xdotool(&["key", "--window", &wid, "Up"]);
+    std::thread::sleep(Duration::from_millis(300));
+    xdotool(&["key", "--window", &wid, "Left"]);
+    std::thread::sleep(Duration::from_millis(300));
+    xdotool(&["type", "--window", &wid, "A"]);
+    std::thread::sleep(Duration::from_millis(500));
+    xdotool(&["key", "--window", &wid, "Return"]);
+    let lines = wait_file_lines(&path, Instant::now() + Duration::from_secs(10));
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(
+        lines.iter().any(|l| l == "SET [A~1 A"),
+        "expected exactly `SET [A~1 A` (margin-header commit, matching ratatui), got lines: {lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|l| l == "SET A1 A"),
+        "must not commit to main A1 (Up/Left must leave the main area), got: {lines:?}"
+    );
+}
+
+/// Delete on a margin-header cell must clear THAT cell (empty SET op for
+/// `[A~1`), not the clamped main cell. Regression: handle_delete built
+/// CellAddr::Main unconditionally, so deleting a header/margin cell wiped
+/// an unrelated main cell instead.
+#[test]
+fn gui_delete_clears_margin_header_cell() {
+    let _guard = GUI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    assert!(
+        std::env::var("DISPLAY").is_ok(),
+        "requires X server (run under xvfb-run -a)"
+    );
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let path = std::env::temp_dir().join(format!("corro-gui-delhdr-{}-{}.corro", std::process::id(), id));
+    let _ = std::fs::remove_file(&path);
+
+    let mut child = spawn_gui(&path);
+    let wid = find_corro_window(child.id(), Instant::now() + Duration::from_secs(25));
+    xdotool(&["windowactivate", "--sync", &wid]);
+    std::thread::sleep(Duration::from_millis(400));
+    // Commit "A" to the margin-header corner, then delete it.
+    for key in ["Up", "Left"] {
+        xdotool(&["key", "--window", &wid, key]);
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    xdotool(&["type", "--window", &wid, "A"]);
+    std::thread::sleep(Duration::from_millis(500));
+    xdotool(&["key", "--window", &wid, "Return"]);
+    // Wait for the commit, then delete and wait for the clear op.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        if content.lines().any(|l| l == "SET [A~1 A") { break; }
+        if Instant::now() > deadline { panic!("no header commit in {}", path.display()); }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // Move back up onto the header cell (Enter moved down) and delete.
+    xdotool(&["key", "--window", &wid, "Up"]);
+    std::thread::sleep(Duration::from_millis(300));
+    xdotool(&["key", "--window", &wid, "Delete"]);
+    let lines = {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let content = std::fs::read_to_string(&path).unwrap_or_default();
+            let have: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+            // The commit plus the clear op: two ops for `[A~1`.
+            if have.iter().filter(|l| l.starts_with("SET [A~1")).count() >= 2 { break have; }
+            if Instant::now() > deadline {
+                panic!("no clear op after Delete, got: {have:?}");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    let _ = child.kill();
+    let _ = child.wait();
+    let last = lines.last().cloned().unwrap_or_default();
+    assert!(
+        last.starts_with("SET [A~1") && !last.ends_with(" A"),
+        "Delete must clear the header cell (empty op for `[A~1`), got lines: {lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|l| l.starts_with("SET A1")),
+        "Delete must not touch main A1, got: {lines:?}"
     );
 }
 
@@ -249,7 +364,9 @@ fn analyze_selection(png: &PathBuf, y_cut: i32) -> SelCensus {
 /// Plain arrows must move WITHOUT painting a selection band (the anchor
 /// collapses). Regression: the anchor stuck at startup, so Down x3 painted
 /// a full-width band over rows 1-4 (~4700 tint px); now expect ~0.
-/// Movement itself is proven by typing Z + Enter afterwards (file = A4).
+/// Movement itself is proven by typing Z + Enter afterwards: on the fresh
+/// 1x1 sheet Down x3 lands in the footer (growth stops at 2 rows), so the
+/// file holds `SET A_2 Z` — exactly the ratatui reference.
 #[test]
 fn gui_plain_arrows_paint_no_selection_band() {
     let _guard = GUI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -293,8 +410,8 @@ fn gui_plain_arrows_paint_no_selection_band() {
     let _ = child.kill();
     let _ = child.wait();
     assert!(
-        lines.iter().any(|l| l == "SET A4 Z"),
-        "expected commit at A4 after Down x3, got: {lines:?}"
+        lines.iter().any(|l| l == "SET A_2 Z"),
+        "expected footer commit `SET A_2 Z` after Down x3 (matching ratatui), got: {lines:?}"
     );
 }
 
@@ -343,7 +460,9 @@ fn gui_shift_right_extends_rect_not_band() {
 
 /// Cursor must stay visible: after Down x40 (past the ~30 visible rows)
 /// the selected cell's blue border must render on screen, and typing + Enter
-/// must commit at the arrived address (A41), proving the viewport followed.
+/// must commit at the arrived address (`SET A_39 Q`: on the fresh 1x1 sheet
+/// the Downs land in the footer — exactly the ratatui reference), proving
+/// the viewport followed.
 #[test]
 fn gui_deep_move_keeps_cursor_visible() {
     let _guard = GUI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -374,8 +493,9 @@ fn gui_deep_move_keeps_cursor_visible() {
     let _ = std::fs::remove_file(&script);
     let nums: Vec<i32> = String::from_utf8_lossy(&out.stdout).trim().split_whitespace().map(|s| s.parse().unwrap_or(-99)).collect();
     let (fill, blue) = (nums[0], nums[1]);
-    // Prove arrival at A41 via commit (guards a vacuous pass where no keys
-    // landed: unmoved cursor would commit at A1 instead).
+    // Prove arrival deep down via commit (guards a vacuous pass where no
+    // keys landed: unmoved cursor would commit at A1 instead). The footer
+    // address matches the ratatui reference for Down x40 on a fresh sheet.
     xdotool(&["type", "--window", &wid, "Q"]);
     std::thread::sleep(Duration::from_millis(500));
     xdotool(&["key", "--window", &wid, "Return"]);
@@ -387,8 +507,8 @@ fn gui_deep_move_keeps_cursor_visible() {
         "cursor cell must render after Down x40 (fill px={fill}, border px={blue}) — viewport did not follow"
     );
     assert!(
-        lines.iter().any(|l| l == "SET A41 Q"),
-        "expected commit at A41 after Down x40, got: {lines:?}"
+        lines.iter().any(|l| l == "SET A_39 Q"),
+        "expected footer commit `SET A_39 Q` after Down x40 (matching ratatui), got: {lines:?}"
     );
 }
 
@@ -472,8 +592,12 @@ fn gui_scrollbar_trough_click_moves_down() {
     let lines = wait_file_lines(&path, Instant::now() + Duration::from_secs(10));
     let _ = child.kill();
     let _ = child.wait();
+    // The trough pages down past the 2-row main area into the footer, so
+    // the commit serializes with the footer prefix (`SET A_11 W`); accept
+    // both main (`A<num>`) and footer (`A_<num>`) forms and assert the row.
     let committed_row: Option<u32> = lines.iter().find_map(|l| {
-        let rest = l.strip_prefix("SET A")?;
+        let rest = l.strip_prefix("SET A").or_else(|| l.strip_prefix("SET A_"))?;
+        let rest = rest.strip_prefix('_').unwrap_or(rest);
         let num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
         num.parse().ok()
     });

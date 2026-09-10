@@ -473,24 +473,29 @@ fn render_grid(dc: &mut dyn DrawContext, state: &GuiState, w: i32, h: i32) {
         dc.fill_rect(0.0, h as f64 - 20.0, w as f64, 20.0, 0.9, 0.9, 0.9, 1.0);
     }
 
-    // Diagnostic: read first data cell from grid + sink
-    let first_row = hr;
-    let first_col = lm;
-    let main_row = first_row.saturating_sub(hr);
-    let main_col = first_col.saturating_sub(lm);
-    let addr = crate::grid::CellAddr::Main { row: main_row as u32, col: main_col as u32 };
-    let cell_val = app.core.workbook.active_sheet().grid.get(&addr).unwrap_or_default();
-    let is_editing = if state.editing.get() { "EDIT" } else { "NORM" };
-    let eb = state.edit_buf.borrow().clone();
-    let buf_display = if eb.is_empty() { "(empty)" } else { &eb };
-    let sink_key_col = MARGIN_COLS as u32;
-    let sink_first = sink_snapshot.get(&(0u32, sink_key_col)).cloned().unwrap_or_default();
-    let cur = (state.last_row.get(), state.last_col.get());
-    let lk = state.last_key.get();
-    let kc = state.key_counter.get();
-    dc.draw_text(100.0, h as f64 - 140.0, &format!("Grid(0,0)='{cell_val}' Sink(0,{sink_key_col})='{sink_first}' Cur=({},{})", cur.0, cur.1), "monospace", 12.0, 0.0, 0.5, 0.0, 1.0);
-    dc.draw_text(100.0, h as f64 - 120.0, &format!("lastKey=0x{lk:04x} cnt={kc}", ), "monospace", 12.0, 1.0, 0.0, 0.0, 1.0);
-    dc.draw_text(100.0, h as f64 - 100.0, &format!("Mode:{is_editing} Buf:'{buf_display}'"), "monospace", 14.0, 0.5, 0.0, 0.5, 1.0);
+    // Diagnostic overlay (cell/sink/cursor/key state) painted over the grid.
+    // Opt-in via CORRO_DEBUG_OVERLAY (any value): off by default so normal
+    // runs render a clean sheet. Previously this always drew, obscuring cells
+    // and breaking pixel-level assertions about grid content.
+    if std::env::var_os("CORRO_DEBUG_OVERLAY").is_some() {
+        let first_row = hr;
+        let first_col = lm;
+        let main_row = first_row.saturating_sub(hr);
+        let main_col = first_col.saturating_sub(lm);
+        let addr = crate::grid::CellAddr::Main { row: main_row as u32, col: main_col as u32 };
+        let cell_val = app.core.workbook.active_sheet().grid.get(&addr).unwrap_or_default();
+        let is_editing = if state.editing.get() { "EDIT" } else { "NORM" };
+        let eb = state.edit_buf.borrow().clone();
+        let buf_display = if eb.is_empty() { "(empty)" } else { &eb };
+        let sink_key_col = MARGIN_COLS as u32;
+        let sink_first = sink_snapshot.get(&(0u32, sink_key_col)).cloned().unwrap_or_default();
+        let cur = (state.last_row.get(), state.last_col.get());
+        let lk = state.last_key.get();
+        let kc = state.key_counter.get();
+        dc.draw_text(100.0, h as f64 - 140.0, &format!("Grid(0,0)='{cell_val}' Sink(0,{sink_key_col})='{sink_first}' Cur=({},{})", cur.0, cur.1), "monospace", 12.0, 0.0, 0.5, 0.0, 1.0);
+        dc.draw_text(100.0, h as f64 - 120.0, &format!("lastKey=0x{lk:04x} cnt={kc}", ), "monospace", 12.0, 1.0, 0.0, 0.0, 1.0);
+        dc.draw_text(100.0, h as f64 - 100.0, &format!("Mode:{is_editing} Buf:'{buf_display}'"), "monospace", 14.0, 0.5, 0.0, 0.5, 1.0);
+    }
 }
 
 fn sheet_rec_col_width(sheet: &crate::ops::SheetState, col: usize) -> usize {
@@ -594,7 +599,9 @@ fn handle_key(keyval: u32, state_rc: &Rc<GuiState>, mods: u32) -> bool {
         }
         UP => {
             log_key_action(keyval, "move_cursor_up", &format!("cell={}", format_cell(state)));
-            if state.last_row.get() > HEADER_ROWS {
+            // Plain Up walks into the header band (matching ratatui);
+            // move_cursor itself floors at row 0.
+            if state.last_row.get() > 0 {
                 if mods & MOD_SHIFT != 0 {
                     extend_selection(state, -1, 0);
                 } else {
@@ -732,7 +739,8 @@ fn handle_edit_key(key: u32, state: &GuiState) -> bool {
         UP => {
             log_key_action(key, "commit_edit_up", &format!("cell={} mode=edit", format_cell(state)));
             commit_edit(state);
-            if state.last_row.get() > HEADER_ROWS {
+            // Commit-then-Up walks the header band too (matching ratatui).
+            if state.last_row.get() > 0 {
                 state.last_row.set(state.last_row.get() - 1);
                 update_state_cursor(state, state.last_row.get(), state.last_col.get());
             }
@@ -822,9 +830,16 @@ fn commit_edit(state: &GuiState) {
         let app = state.app_mut();
         let row = state.last_row.get();
         let col = state.last_col.get();
-        let main_row = row.saturating_sub(HEADER_ROWS);
-        let main_col = col.saturating_sub(MARGIN_COLS);
-        let addr = CellAddr::Main { row: main_row as u32, col: main_col as u32 };
+        // Resolve the TRUE cell address (header/margin/footer included),
+        // matching ratatui's commit_edit_buffer which commits to the edit
+        // target address. Building CellAddr::Main unconditionally misroutes
+        // header/margin/footer edits into main cells.
+        let addr = crate::addr::sheet_cursor_to_addr(
+            crate::addr::LogicalRow(row),
+            crate::addr::GlobalCol(col),
+            crate::addr::MainRows(app.core.workbook.active_sheet().grid.main_rows()),
+            crate::addr::MainCols(app.core.workbook.active_sheet().grid.main_cols()),
+        );
         app.core.workbook.active_sheet_mut().grid.set(&addr, val.clone());
         let sheet_id = app.core.workbook.sheet_id(app.core.workbook.active_sheet);
         let op = Op::SetCell { addr, value: val };
@@ -858,8 +873,15 @@ fn handle_delete(state: &GuiState) {
     let app = state.app_mut();
     let row = state.last_row.get();
     let col = state.last_col.get();
-    let main_row = row.saturating_sub(HEADER_ROWS);
-    let main_col = col.saturating_sub(MARGIN_COLS);
+    // Resolve the TRUE cell address (header/margin/footer included),
+    // matching ratatui: clearing a margin/header cell must clear that cell,
+    // not the clamped main cell.
+    let addr_of = |app: &mut super::App, r: usize, c: usize| crate::addr::sheet_cursor_to_addr(
+        crate::addr::LogicalRow(r),
+        crate::addr::GlobalCol(c),
+        crate::addr::MainRows(app.core.workbook.active_sheet().grid.main_rows()),
+        crate::addr::MainCols(app.core.workbook.active_sheet().grid.main_cols()),
+    );
     if let Some(anchor) = app.core.anchor {
         let r1 = anchor.row.min(row);
         let r2 = anchor.row.max(row);
@@ -870,14 +892,12 @@ fn handle_delete(state: &GuiState) {
         if ro > 1 || co > 1 {
             for r in r1..=r2 {
                 for c in c1..=c2 {
-                    let main_r = r.saturating_sub(HEADER_ROWS);
-                    let main_c = c.saturating_sub(MARGIN_COLS);
-                    let addr = CellAddr::Main { row: main_r as u32, col: main_c as u32 };
+                    let addr = addr_of(app, r, c);
                     app.core.workbook.active_sheet_mut().grid.set(&addr, String::new());
                 }
             }
             let sheet_id = app.core.workbook.sheet_id(app.core.workbook.active_sheet);
-            let addr = CellAddr::Main { row: main_row as u32, col: main_col as u32 };
+            let addr = addr_of(app, row, col);
             let op = Op::SetCell { addr, value: String::new() };
             let wbo = WorkbookOp::SheetOp { sheet_id, op };
             if let Some(ref p) = app.core.path.clone() {
@@ -899,7 +919,7 @@ fn handle_delete(state: &GuiState) {
             return;
         }
     }
-    let addr = CellAddr::Main { row: main_row as u32, col: main_col as u32 };
+    let addr = addr_of(app, row, col);
     app.core.workbook.active_sheet_mut().grid.set(&addr, String::new());
     let sheet_id = app.core.workbook.sheet_id(app.core.workbook.active_sheet);
     let op = Op::SetCell { addr, value: String::new() };
@@ -995,7 +1015,10 @@ fn move_cursor(state: &GuiState, dr: isize, dc: isize) {
         }
         col = col.saturating_add(1);
     } else if dc < 0 {
-        col = col.saturating_sub(1).max(lm);
+        // Plain Left walks into the left margin (floor 0), matching
+        // ratatui's move_cursor_one_col_horizontal (Shift+Left is the one
+        // that stays in main — see extend_selection).
+        col = col.saturating_sub(1);
     } else if dr > 0 {
         // Grow the grid when stepping down off the last main row
         // (matching ratatui's move_cursor_one_row_vertical).
@@ -1009,7 +1032,10 @@ fn move_cursor(state: &GuiState, dr: isize, dc: isize) {
         }
         row = row.saturating_add(1);
     } else if dr < 0 {
-        row = row.saturating_sub(1).max(hr);
+        // Plain Up walks into the header band (floor 0), matching ratatui's
+        // move_cursor_one_row_vertical (Shift+Up is the one that stays in
+        // main — see extend_selection).
+        row = row.saturating_sub(1);
     }
     // Clamp into the grid extent and ensure it (matching ratatui).
     {
@@ -1112,8 +1138,6 @@ fn scroll_to_cursor(state: &GuiState, vertical: bool, value: f64) {
 
 fn update_formula_bar(state: &GuiState, row: usize, col: usize) {
     let app = state.app_ref();
-    let main_row = row.saturating_sub(HEADER_ROWS);
-    let main_col = col.saturating_sub(MARGIN_COLS);
     let addr_str = crate::addr::sheet_cursor_to_addr(
         crate::addr::LogicalRow(row),
         crate::addr::GlobalCol(col),
@@ -1121,7 +1145,14 @@ fn update_formula_bar(state: &GuiState, row: usize, col: usize) {
         crate::addr::MainCols(app.core.workbook.active_sheet().grid.main_cols()),
     );
     state.addr_label.set_text(&addr_str.to_string());
-    let addr = crate::grid::CellAddr::Main { row: main_row as u32, col: main_col as u32 };
+    // Look up the entry value at the TRUE address (a header/margin cursor
+    // shows that cell's value, not the clamped main cell's).
+    let addr = crate::addr::sheet_cursor_to_addr(
+        crate::addr::LogicalRow(row),
+        crate::addr::GlobalCol(col),
+        crate::addr::MainRows(app.core.workbook.active_sheet().grid.main_rows()),
+        crate::addr::MainCols(app.core.workbook.active_sheet().grid.main_cols()),
+    );
     let val = app.core.workbook.active_sheet().grid.get(&addr).unwrap_or_default();
     state.formula_entry.set_text(&val);
     state.status_label.set_text(&app.core.status);

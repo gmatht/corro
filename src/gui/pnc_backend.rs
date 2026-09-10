@@ -690,9 +690,7 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         );
     }));
     let hr_cb = hr;
-    let hr_ce = hr;
     let mr_cb = mr;
-    let lm_ce = lm;
     let data_rows_cb = data_rows;
     let data_cols_cb = data_cols;
     let data_width_cb = data_width;
@@ -886,12 +884,22 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         let app = app_from_raw(app_ptr_ce);
         let dr = display_rows_for_ce.borrow();
         let logical_row = dr.get(display_row as usize).copied().unwrap_or(0);
-        let main_row = logical_row.saturating_sub(hr_ce);
-        let main_col = col.saturating_sub(lm_ce as u32);
-        let addr = CellAddr::Main { row: main_row as u32, col: main_col as u32 };
+        // Resolve the TRUE cell address (header/margin/footer included),
+        // matching ratatui's commit_edit_buffer which commits to the edit
+        // target address. Building CellAddr::Main unconditionally misroutes
+        // header/margin/footer edits into main cells (saturating_sub clamps
+        // a header row to main row 0, i.e. A1).
+        let rec0 = app.core.workbook.active_sheet().clone();
+        let g0 = &rec0.grid;
+        let addr = crate::addr::sheet_cursor_to_addr(
+            crate::addr::LogicalRow(logical_row),
+            crate::addr::GlobalCol(col as usize),
+            crate::addr::MainRows(g0.main_rows()),
+            crate::addr::MainCols(g0.main_cols()),
+        );
         crate::debug_log::log(&format!(
-            "COMMIT_CB display_row={} col={} logical_row={} hr_ce={} lm_ce={} main_row={} main_col={} addr={:?} value={:?} app_cursor_row={} app_cursor_col={}",
-            display_row, col, logical_row, hr_ce, lm_ce, main_row, main_col, addr, value, app.core.cursor.row, app.core.cursor.col
+            "COMMIT_CB display_row={} col={} logical_row={} addr={:?} value={:?} app_cursor_row={} app_cursor_col={}",
+            display_row, col, logical_row, addr, value, app.core.cursor.row, app.core.cursor.col
         ));
         // Commit the edited value to the workbook via the shared helper
         // (logs to the live .corro file when one is open, else applies in-memory).
@@ -900,9 +908,7 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         // stored the raw value, but we need the aligned version).
         let rec = app.core.workbook.active_sheet().clone();
         let g = &rec.grid;
-        if let Some(effective) = logical_row.checked_sub(hr_ce).and_then(|mr| {
-            g.get(&CellAddr::Main { row: mr as u32, col: main_col as u32 })
-        }) {
+        if let Some(effective) = g.get(&addr) {
             let formatted = crate::ui_core::format_cell_display(g, &addr, effective);
             let fw = formatted.width();
             let cw = g.col_width(col as usize).max(1);

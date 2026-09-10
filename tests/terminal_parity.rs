@@ -398,8 +398,13 @@ fn type_first_right_right_a_enter_parity() {
         safe_slice(&pane, 1500));
 }
 
-/// Type-first edit with no file: Right,Right,A,Enter must persist "A" and
-/// show C2 in the formula bar (covers the no-file commit branch).
+/// Type-first edit with no file: Right,Right,A,Enter. On the default grid
+/// the two Rights leave the main area (right margin ]A1), so the edit
+/// commits to the MARGIN cell and the cursor lands on ]A2 — exactly what the
+/// ratatui reference does (verified via bench_handle_key: formula `]A2`).
+/// (An older revision of this test expected C2, which enshrined a bug where
+/// margin edits were misrouted into out-of-range main cells, accidentally
+/// growing the grid.) Covers the no-file commit branch.
 #[test]
 fn type_first_right_right_a_enter_no_file() {
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -420,18 +425,19 @@ fn type_first_right_right_a_enter_no_file() {
     }
     tmux::kill_session(&session);
     let formula = pane.lines().nth(1).unwrap_or("");
-    assert!(formula.contains("C2"),
-        "no-file formula bar should show C2 after Right,Right,A,Enter\n{formula:?}\n--- pane ---\n{}",
+    assert!(formula.contains("]A2"),
+        "no-file formula bar should show ]A2 after Right,Right,A,Enter (margin edit, matching ratatui)\n{formula:?}\n--- pane ---\n{}",
         safe_slice(&pane, 1500));
-    // Data row 1 carries no labels, so an 'A' in its line can only be the
-    // committed cell value (unlike header/menu lines full of 'A's).
+    // The committed value must persist visibly in the right-margin cell of
+    // data row 1 (third │-field trims to exactly "A"). Main cells stay empty.
     let row1 = pane.lines().find(|l| {
         let mut parts = l.split('│');
         let _left = parts.next();
         parts.next().map(|f| f.trim() == "1").unwrap_or(false)
     }).unwrap_or("");
-    assert!(row1.contains('A'),
-        "typed A should persist in row 1 with no file\n{row1:?}\n--- pane ---\n{}",
+    let margin_cell = row1.split('│').nth(3).unwrap_or("");
+    assert!(margin_cell.trim() == "A",
+        "typed A should persist in row 1's margin cell with no file\n{row1:?}\n--- pane ---\n{}",
         safe_slice(&pane, 1500));
 }
 
@@ -2017,3 +2023,236 @@ fn pseudorandom_walk_matches_ratatui() {
 
 
 
+
+// ── Type-first edit parity: arrows-in-edit + header edits ───────────────
+// Reference = ratatui (bench_handle_key + TestBackend render + file tail).
+// The pancurses side drives tmux with settled keys and asserts the same
+// observable state (formula bar, grid content, committed file ops).
+
+/// Unique empty .corro fixture (log header only): the test's commits are the
+/// only SET ops, so file tails assert commit targets exactly. Absolute,
+/// unique-per-call paths (parallel tests must never share a writable file).
+fn empty_fixture(prefix: &str) -> String {
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let dst = std::env::temp_dir().join(format!(
+        "corro-empty-{}-{}-{}.corro", prefix, std::process::id(), id
+    ));
+    std::fs::write(&dst, "CORRO_LOG 1\n").expect("write empty fixture");
+    dst.to_string_lossy().to_string()
+}
+
+/// Last `n` SET ops from a .corro file (commit-target assertions).
+fn file_set_tail(path: &str, n: usize) -> Vec<String> {
+    let content = std::fs::read_to_string(path).unwrap_or_default();
+    let sets: Vec<String> = content
+        .lines()
+        .filter(|l| l.starts_with("SET "))
+        .map(|l| l.to_string())
+        .collect();
+    sets.into_iter().rev().take(n).rev().collect()
+}
+
+/// Drive a pancurses session with settled keys; returns the formula-bar line.
+/// The fixture path stays owned by the caller for file assertions.
+/// After the sequence, waits (deadline) for a commit op in the file so the
+/// final capture reflects the drained commit — not a mid-transition frame.
+fn drive_pnc(fixture: &str, keys: &[&str]) -> String {
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    // Unique across processes too (parallel `cargo test` runs share one tmux
+    // server; a bare counter restarts at 0 per process and would collide with
+    // leaked sessions from other runs).
+    let session = format!("corro-tf-{}-{id}", std::process::id());
+    let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
+    start_session(&session, &format!("{bin} --pancurses {fixture}; sleep 2"));
+    for key in keys {
+        send_settled(&session, key);
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let has_set = std::fs::read_to_string(fixture)
+            .map(|s| s.lines().any(|l| l.starts_with("SET ")))
+            .unwrap_or(false);
+        if has_set || std::time::Instant::now() > deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // The file proves the commit drained, but the frame showing post-commit
+    // state may lag a redraw behind: settle for two identical captures so we
+    // never assert on a mid-transition frame (e.g. still showing the edit
+    // buffer after the commit already landed in the file).
+    let pane = capture_settled(&session, 100);
+    tmux::kill_session(&session);
+    let bar = pane.lines().nth(1).unwrap_or("").to_string();
+    // Stash the full pane for grid-content assertions via a side file is
+    // overkill; callers re-derive from a second run only if needed. Instead
+    // return "formula\npane" packed: formula is line 0, rest follows.
+    format!("{bar}\n{pane}")
+}
+
+/// Drive the ratatui reference headlessly on a private copy of `fixture`;
+/// returns (formula-bar line, full render, file path) for assertions.
+fn drive_ratatui(
+    fixture: &str,
+    codes: &[crossterm::event::KeyCode],
+) -> (String, String, String) {
+    use crossterm::event::KeyModifiers;
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let tmp = std::env::temp_dir().join(format!(
+        "corro-rt-tf-{}-{}.corro",
+        std::process::id(),
+        id
+    ));
+    std::fs::copy(fixture, &tmp).expect("copy ratatui fixture");
+    let tmps = tmp.to_string_lossy().to_string();
+    let mut app = corro::ui::App::new(Some(tmp));
+    app.load_initial().unwrap();
+    for &code in codes {
+        let ev = crossterm::event::KeyEvent::new(code, KeyModifiers::NONE);
+        app.bench_handle_key(ev).ok();
+    }
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal.draw(|f| app.bench_draw(f)).unwrap();
+    let buffer = terminal.backend().buffer();
+    let render: String = (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let bar = render.lines().nth(1).unwrap_or("").to_string();
+    (bar, render, tmps)
+}
+
+/// Type A, arrow Right (commit + move while editing), type AAA, Enter.
+/// Expected everywhere: A1="A", B1="AAA", cursor B2.
+#[test]
+fn type_first_a_right_aaa_enter_parity() {
+    use crossterm::event::KeyCode;
+    let keys = ["A", "Right", "A", "A", "A", "Enter"];
+    let codes = [
+        KeyCode::Char('A'),
+        KeyCode::Right,
+        KeyCode::Char('A'),
+        KeyCode::Char('A'),
+        KeyCode::Char('A'),
+        KeyCode::Enter,
+    ];
+
+    // ── ratatui reference ──
+    let fix_rt = empty_fixture("rt-right");
+    let (rt_bar, rt_render, rt_path) = drive_ratatui(&fix_rt, &codes);
+    assert!(rt_bar.contains("B2"), "ratatui formula should show B2\n{rt_bar:?}");
+    assert!(rt_render.contains("AAA"), "ratatui grid should show AAA");
+    assert_eq!(
+        file_set_tail(&rt_path, 2),
+        vec!["SET A1 A".to_string(), "SET B1 AAA".to_string()],
+        "ratatui must commit A@A1 then AAA@B1"
+    );
+
+    // ── pancurses must match ──
+    let fix_pnc = empty_fixture("pnc-right");
+    let packed = drive_pnc(&fix_pnc, &keys);
+    let mut lines = packed.lines();
+    let pnc_bar = lines.next().unwrap_or("");
+    let pnc_pane: String = lines.collect::<Vec<_>>().join("\n");
+    assert!(pnc_bar.contains("B2"), "pancurses formula should show B2\n{pnc_bar:?}");
+    assert!(pnc_pane.contains("AAA"), "pancurses grid should show AAA");
+    assert_eq!(
+        file_set_tail(&fix_pnc, 2),
+        vec!["SET A1 A".to_string(), "SET B1 AAA".to_string()],
+        "pancurses must commit A@A1 then AAA@B1"
+    );
+}
+
+/// Type A, arrow Down (commit + move while editing), type AAA, Enter.
+/// Expected everywhere: A1="A", A2="AAA", cursor A3.
+#[test]
+fn type_first_a_down_aaa_enter_parity() {
+    use crossterm::event::KeyCode;
+    let keys = ["A", "Down", "A", "A", "A", "Enter"];
+    let codes = [
+        KeyCode::Char('A'),
+        KeyCode::Down,
+        KeyCode::Char('A'),
+        KeyCode::Char('A'),
+        KeyCode::Char('A'),
+        KeyCode::Enter,
+    ];
+
+    // ── ratatui reference ──
+    let fix_rt = empty_fixture("rt-down");
+    let (rt_bar, rt_render, rt_path) = drive_ratatui(&fix_rt, &codes);
+    assert!(rt_bar.contains("A3"), "ratatui formula should show A3\n{rt_bar:?}");
+    assert!(rt_render.contains("AAA"), "ratatui grid should show AAA");
+    assert_eq!(
+        file_set_tail(&rt_path, 2),
+        vec!["SET A1 A".to_string(), "SET A2 AAA".to_string()],
+        "ratatui must commit A@A1 then AAA@A2"
+    );
+
+    // ── pancurses must match ──
+    let fix_pnc = empty_fixture("pnc-down");
+    let packed = drive_pnc(&fix_pnc, &keys);
+    let mut lines = packed.lines();
+    let pnc_bar = lines.next().unwrap_or("");
+    let pnc_pane: String = lines.collect::<Vec<_>>().join("\n");
+    assert!(pnc_bar.contains("A3"), "pancurses formula should show A3\n{pnc_bar:?}");
+    assert!(pnc_pane.contains("AAA"), "pancurses grid should show AAA");
+    assert_eq!(
+        file_set_tail(&fix_pnc, 2),
+        vec!["SET A1 A".to_string(), "SET A2 AAA".to_string()],
+        "pancurses must commit A@A1 then AAA@A2"
+    );
+}
+
+/// Up, Left, type A, Enter: the edit happens in the header zone, so the
+/// commit must target the header address ([A~1) and the cursor moves down
+/// to A1. Regression: pancurses built CellAddr::Main unconditionally, so a
+/// header edit silently landed in main A1.
+#[test]
+fn type_first_up_left_a_enter_header_parity() {
+    use crossterm::event::KeyCode;
+    let keys = ["Up", "Left", "A", "Enter"];
+    let codes = [KeyCode::Up, KeyCode::Left, KeyCode::Char('A'), KeyCode::Enter];
+
+    // ── ratatui reference ──
+    let fix_rt = empty_fixture("rt-hdr");
+    let (rt_bar, rt_render, rt_path) = drive_ratatui(&fix_rt, &codes);
+    assert!(rt_bar.contains("A1"), "ratatui formula should show A1\n{rt_bar:?}");
+    assert_eq!(
+        file_set_tail(&rt_path, 1),
+        vec!["SET [A~1 A".to_string()],
+        "ratatui must commit A to the header address [A~1"
+    );
+    let rt_hdr = rt_render.lines().find(|l| match l.find("~1 ") {
+        Some(pos) => l[pos..].contains('A'),
+        None => false,
+    });
+    assert!(rt_hdr.is_some(), "ratatui grid header ~1 should show the committed A");
+
+    // ── pancurses must match ──
+    let fix_pnc = empty_fixture("pnc-hdr");
+    let packed = drive_pnc(&fix_pnc, &keys);
+    let mut lines = packed.lines();
+    let pnc_bar = lines.next().unwrap_or("");
+    let pnc_pane: String = lines.collect::<Vec<_>>().join("\n");
+    assert!(pnc_bar.contains("A1"), "pancurses formula should show A1\n{pnc_bar:?}");
+    assert_eq!(
+        file_set_tail(&fix_pnc, 1),
+        vec!["SET [A~1 A".to_string()],
+        "pancurses must commit A to the header address [A~1, not main A1"
+    );
+    let pnc_hdr = pnc_pane.lines().find(|l| match l.find("~1 ") {
+        Some(pos) => l[pos..].contains('A'),
+        None => false,
+    });
+    assert!(
+        pnc_hdr.is_some(),
+        "pancurses grid header ~1 should show the committed A\n--- pane ---\n{}",
+        safe_slice(&pnc_pane, 1500)
+    );
+}
