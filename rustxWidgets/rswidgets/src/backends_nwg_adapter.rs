@@ -188,12 +188,22 @@ mod nwg_adapter {
                             return Some(0); // consumed, do not forward
                         }
                     }
-                    // Forward keyboard messages to the correct child.
-                    // The window-level raw handler consumes all key events
-                    // to prevent DefWindowProc from activating the menu bar
-                    // on WM_SYSKEYDOWN(Alt).  We manually post the message
-                    // to the focused child (or a suitable descendant if no
-                    // child has focus).
+                    // Alt+letter (WM_SYSKEYDOWN): let DefWindowProc activate the
+                    // native menu bar so the user can keyboard-navigate the menu
+                    // (Alt+letter to open, arrows to move, Enter to activate,
+                    // Esc to close). The native menu is modal, so it handles the
+                    // navigation keys itself; item activation fires WM_MENUCOMMAND
+                    // which dispatches the action. Previously we consumed every
+                    // key to stop the menu from stealing focus, which made the
+                    // menu mouse-only.
+                    if msg == winapi::um::winuser::WM_SYSKEYDOWN {
+                        return None;
+                    }
+                    // Forward other keyboard messages to the correct child.
+                    // The window-level raw handler consumes non-Alt key events
+                    // (returning Some(0) below) so they are not processed twice;
+                    // we manually post the message to the focused child (or a
+                    // suitable descendant if no child has focus).
                     unsafe {
                         let focused = winapi::um::winuser::GetFocus();
                         if focused != std::ptr::null_mut() && focused != parent_hwnd {
@@ -995,6 +1005,7 @@ mod nwg_adapter {
         pub(crate) response_cb: Rc<RefCell<Option<Box<dyn FnMut(i32)>>>>,
         pub(crate) _handler: Rc<nwg::EventHandler>,
         layout_cb: Rc<RefCell<Vec<Box<dyn FnMut(i32, i32)>>>>,
+        esc_handlers: Rc<RefCell<Vec<nwg::RawEventHandler>>>,
     }
 
     impl Clone for Dialog {
@@ -1005,6 +1016,7 @@ mod nwg_adapter {
                 response_cb: self.response_cb.clone(),
                 _handler: self._handler.clone(),
                 layout_cb: self.layout_cb.clone(),
+                esc_handlers: self.esc_handlers.clone(),
             }
         }
     }
@@ -1028,6 +1040,16 @@ mod nwg_adapter {
             self.inner.set_visible(true);
             let hwnd = self.inner.handle.hwnd().unwrap_or(std::ptr::null_mut());
             if hwnd != std::ptr::null_mut() {
+                // Parity with GtkDialog (which natively emits a cancel response
+                // on Escape): dismiss the dialog on Escape and fire the response
+                // callback with 0 (the Cancel convention used by corro's prompt
+                // dialogs). Keyboard focus is usually on a child (button/entry),
+                // so bind on the dialog and every descendant. Bound once; the
+                // RawEventHandlers are kept alive in esc_handlers. All call sites
+                // append content before present(), so the subtree is complete.
+                if self.esc_handlers.borrow().is_empty() {
+                    self.bind_esc_dismiss(hwnd);
+                }
                 unsafe {
                     winapi::um::winuser::SetForegroundWindow(hwnd as _);
                     let mut rect: winapi::shared::windef::RECT = std::mem::zeroed();
@@ -1077,6 +1099,47 @@ mod nwg_adapter {
         pub fn connect_response<F: FnMut(i32) + 'static>(&self, f: F) -> Result<u64, Error> {
             *self.response_cb.borrow_mut() = Some(Box::new(f));
             Ok(0)
+        }
+        /// Bind an Escape-to-dismiss raw handler on the dialog window and all
+        /// of its current descendants (see present()).
+        fn bind_esc_dismiss(&self, dlg_hwnd: winapi::shared::windef::HWND) {
+            // Collect dialog + recursive descendants.
+            fn collect(hwnd: winapi::shared::windef::HWND, out: &mut Vec<winapi::shared::windef::HWND>) {
+                out.push(hwnd);
+                unsafe {
+                    let mut child = winapi::um::winuser::GetWindow(hwnd, winapi::um::winuser::GW_CHILD);
+                    while child != std::ptr::null_mut() {
+                        collect(child, out);
+                        child = winapi::um::winuser::GetWindow(child, winapi::um::winuser::GW_HWNDNEXT);
+                    }
+                }
+            }
+            let mut hwnds = Vec::new();
+            collect(dlg_hwnd as _, &mut hwnds);
+            static ESC_ID: AtomicUsize = AtomicUsize::new(0xD0000000);
+            for child in hwnds {
+                let cb = self.response_cb.clone();
+                let id = ESC_ID.fetch_add(1, Ordering::SeqCst);
+                if let Ok(h) = nwg::bind_raw_event_handler(
+                    &nwg::ControlHandle::Hwnd(child), id,
+                    move |_h, msg, w, _l| {
+                        if (msg == winapi::um::winuser::WM_KEYDOWN
+                            || msg == winapi::um::winuser::WM_SYSKEYDOWN)
+                            && w == winapi::um::winuser::VK_ESCAPE as usize
+                        {
+                            if let Some(ref mut f) = *cb.borrow_mut() { f(0); }
+                            unsafe {
+                                winapi::um::winuser::ShowWindow(dlg_hwnd as _,
+                                    winapi::um::winuser::SW_HIDE);
+                            }
+                            return Some(0);
+                        }
+                        None
+                    },
+                ) {
+                    self.esc_handlers.borrow_mut().push(h);
+                }
+            }
         }
         pub fn close(&self) {
             if let Some(hwnd) = self.inner.handle.hwnd() {
@@ -1139,7 +1202,7 @@ mod nwg_adapter {
             ).map_err(|e| Error::Backend(format!("{}", e)))?;
         }
 
-        Ok(Dialog { inner: Rc::new(inner), buttons: Rc::new(RefCell::new(Vec::new())), response_cb, _handler: Rc::new(handler), layout_cb })
+        Ok(Dialog { inner: Rc::new(inner), buttons: Rc::new(RefCell::new(Vec::new())), response_cb, _handler: Rc::new(handler), layout_cb, esc_handlers: Rc::new(RefCell::new(Vec::new())) })
     }
 
     pub fn create_dialog_button(

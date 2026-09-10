@@ -49,6 +49,7 @@ pub fn show_about_dialog() {
                     dialog.add_button("Close", -7);
                     dialog.connect_response(move |_| {}).ok();
                     dialog.present();
+                    let _ = Box::into_raw(Box::new(dialog));
                     return;
                 }
             }
