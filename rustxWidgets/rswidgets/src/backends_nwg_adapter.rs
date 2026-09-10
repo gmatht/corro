@@ -378,7 +378,26 @@ mod nwg_adapter {
     pub struct Label(pub(crate) Rc<nwg::Label>);
 
     impl Label {
-        pub fn set_text(&self, text: &str) { self.0.set_text(text); }
+        pub fn set_text(&self, text: &str) {
+            self.0.set_text(text);
+            // Nudge the parent to re-run its layout (if it has a WM_SIZE
+            // layout handler, i.e. a BoxWidget): label width is measured
+            // from text at layout time, so a text change must re-layout
+            // to keep the label fitted (parity with GTK auto-sizing).
+            // Harmless when the parent has no such handler.
+            if let Some(hwnd) = self.0.handle.hwnd() {
+                unsafe {
+                    let parent = winapi::um::winuser::GetParent(hwnd as _);
+                    if !parent.is_null() {
+                        let mut rect: winapi::shared::windef::RECT = std::mem::zeroed();
+                        winapi::um::winuser::GetClientRect(parent, &mut rect);
+                        let l = (((rect.bottom & 0xFFFF) << 16) | (rect.right & 0xFFFF)) as isize;
+                        winapi::um::winuser::PostMessageW(parent,
+                            winapi::um::winuser::WM_SIZE, 0, l as _);
+                    }
+                }
+            }
+        }
         pub fn get_text(&self) -> Option<String> { Some(self.0.text()) }
         pub fn set_visible(&self, visible: bool) { self.0.set_visible(visible); }
         pub fn set_markup(&self, markup: &str) { self.0.set_text(markup); }
@@ -521,6 +540,19 @@ mod nwg_adapter {
                         crate::backends::nwg::Orientation::Horizontal => 60,
                         crate::backends::nwg::Orientation::Vertical => 28,
                     };
+                    // Labels (STATIC controls) are fitted to their text
+                    // (parity with GTK auto-sizing); NWG gives them a wide
+                    // default that would otherwise leave gaps in the row.
+                    // Other controls keep their current window size.
+                    let fitted = match self.orientation {
+                        crate::backends::nwg::Orientation::Horizontal =>
+                            static_text_width(children[i] as _),
+                        crate::backends::nwg::Orientation::Vertical => None,
+                    };
+                    if let Some(w) = fitted {
+                        desired_sizes.push(w);
+                        continue;
+                    }
                     unsafe {
                         let mut rect: winapi::shared::windef::RECT = std::mem::zeroed();
                         if winapi::um::winuser::GetWindowRect(children[i] as _, &mut rect) != 0 {
@@ -573,6 +605,38 @@ mod nwg_adapter {
         }
         pub fn set_vexpand(&self, _expand: bool) {}
         pub fn set_hexpand(&self, _expand: bool) {}
+    }
+
+    /// Measure a STATIC (label) control's text width in pixels, for
+    /// shrink-to-fit layout (parity with GTK label auto-sizing).
+    /// Returns None for non-label controls or on any measurement failure
+    /// (callers fall back to the window rect / hardcoded size).
+    fn static_text_width(hwnd: winapi::shared::windef::HWND) -> Option<i32> {
+        unsafe {
+            let mut cls: [u16; 256] = [0; 256];
+            let n = winapi::um::winuser::GetClassNameW(hwnd, cls.as_mut_ptr(), 256);
+            if n <= 0 { return None; }
+            if !String::from_utf16_lossy(&cls[..n as usize]).eq_ignore_ascii_case("Static") {
+                return None;
+            }
+            let tlen = winapi::um::winuser::GetWindowTextLengthW(hwnd);
+            let mut buf: Vec<u16> = vec![0; (tlen + 1) as usize];
+            winapi::um::winuser::GetWindowTextW(hwnd, buf.as_mut_ptr(), tlen + 1);
+            let hdc = winapi::um::winuser::GetDC(hwnd);
+            if hdc.is_null() { return None; }
+            let hfont = winapi::um::winuser::SendMessageW(hwnd, winapi::um::winuser::WM_GETFONT, 0, 0);
+            let old = if hfont != 0 {
+                winapi::um::wingdi::SelectObject(hdc, hfont as _)
+            } else {
+                std::ptr::null_mut()
+            };
+            let mut sz: winapi::shared::windef::SIZE = std::mem::zeroed();
+            let ok = winapi::um::wingdi::GetTextExtentPoint32W(hdc, buf.as_ptr(), tlen, &mut sz);
+            if !old.is_null() { winapi::um::wingdi::SelectObject(hdc, old); }
+            winapi::um::winuser::ReleaseDC(hwnd, hdc);
+            if ok == 0 { return None; }
+            Some(sz.cx + 8) // small horizontal padding
+        }
     }
 
     pub fn create_box(orientation: crate::backends::nwg::Orientation, spacing: i32, parent: *mut c_void) -> Result<BoxWidget, Error> {
