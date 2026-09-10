@@ -18,6 +18,9 @@ use super::render::{self, CellSink};
 use rswidgets::core::key::{normalize, RETURN, ESCAPE, BACKSPACE, DELETE, LEFT, UP, RIGHT, DOWN, TAB, HOME, END, PAGE_UP, PAGE_DOWN, F1, F2, ALT_L, ALT_R};
 
 const KEYLOG_PATH: &str = "/tmp/corro_keylog.txt";
+/// Modifier bit for Shift in key-event state masks. Shared by GDK
+/// (GDK_SHIFT_MASK) and the nwg adapter (Win32 shift bit).
+const MOD_SHIFT: u32 = 0x1;
 
 fn key_name(keyval: u32) -> String {
     if keyval == 0 { return "MENU".into(); }
@@ -281,15 +284,16 @@ fn render_to(
     let cells = sink.cells.borrow();
     let styles = sink.styles.borrow();
 
+    // Selection rectangle (anchor..cursor, rows AND columns), computed once.
+    // Plain navigation collapses the anchor, so no band is painted then —
+    // only explicit selections (Shift+arrows, select-all) highlight.
+    let sel_rect: Option<(usize, usize, usize, usize)> = selection_anchor.map(|(ar, ac)| {
+        let (r1, r2) = if ar <= cursor_row { (ar, cursor_row) } else { (cursor_row, ar) };
+        let (c1, c2) = if ac <= cursor_col { (ac, cursor_col) } else { (cursor_col, ac) };
+        (r1, r2, c1, c2)
+    });
     for (ri, &logical_row) in display_rows.iter().enumerate().take(MAX_RENDER_ROWS) {
         let ry = HEADER_H + ri as f64 * ROW_H;
-        let is_sel_row = selection_anchor.map_or(false, |(ar, ac)| {
-            let r1 = ar.min(cursor_row);
-            let r2 = ar.max(cursor_row);
-            let _c1 = ac.min(cursor_col);
-            let _c2 = ac.max(cursor_col);
-            logical_row >= r1 && logical_row <= r2
-        });
 
         for (ci, &c) in col_ixs.iter().enumerate().take(MAX_RENDER_COLS) {
             let cw = *col_widths.get(&c).unwrap_or(&8) as f64 * CHAR_W;
@@ -300,10 +304,13 @@ fn render_to(
             let style_key = (ri as u32, c as u32);
             let style = styles.get(&style_key).copied().unwrap_or(CellDisplayStyle::Default);
             let is_current = logical_row == cursor_row && c == cursor_col;
+            let in_selection = sel_rect.map_or(false, |(r1, r2, c1, c2)| {
+                logical_row >= r1 && logical_row <= r2 && c >= c1 && c <= c2
+            });
 
             let bg = if is_current {
                 if is_editing { (1.0, 1.0, 0.8, 1.0) } else { (0.8, 0.9, 1.0, 1.0) }
-            } else if is_sel_row && selection_anchor.is_some() {
+            } else if in_selection {
                 (0.9, 0.95, 1.0, 1.0)
             } else {
                 (1.0, 1.0, 1.0, 1.0)
@@ -373,9 +380,11 @@ fn cols_to_fill_px(app: &super::App, cursor: SheetCursor, avail_px: i32) -> usiz
     }
 }
 
-/// How many rows are needed to cover a canvas `h` pixels tall.
+/// How many rows are needed to cover a canvas `h` pixels tall. Reserves the
+/// 20px in-canvas status strip (drawn over the bottom) so the last row —
+/// often the cursor — stays fully visible instead of sliding underneath it.
 fn rows_to_fill_px(h: i32) -> usize {
-    (((h as f64 - HEADER_H) / ROW_H + 1.0).max(1.0)) as usize
+    (((h as f64 - HEADER_H - 20.0) / ROW_H + 1.0).max(1.0)) as usize
 }
 
 fn render_grid(dc: &mut dyn DrawContext, state: &GuiState, w: i32, h: i32) {
@@ -407,6 +416,9 @@ fn render_grid(dc: &mut dyn DrawContext, state: &GuiState, w: i32, h: i32) {
         dc.fill_rect(0.0, ry, ROW_LABEL_W, ROW_H, 0.9, 0.9, 0.9, 1.0);
         dc.draw_text(ROW_LABEL_W - tw - 4.0, ry + 2.0, &label, "monospace", FONT_SIZE, 0.3, 0.3, 0.3, 1.0);
     }
+
+    // Selection rectangle (anchor..cursor, rows AND columns). None while
+    // navigating plainly — only explicit selections highlight.
 
     // Column headers
     for (ci, &c) in col_ixs.iter().enumerate().take(MAX_RENDER_COLS) {
@@ -483,7 +495,7 @@ fn sheet_rec_col_width(sheet: &crate::ops::SheetState, col: usize) -> usize {
 // Keyboard handling
 // ---------------------------------------------------------------------------
 
-fn handle_key(keyval: u32, state_rc: &Rc<GuiState>) -> bool {
+fn handle_key(keyval: u32, state_rc: &Rc<GuiState>, mods: u32) -> bool {
     let state: &GuiState = &**state_rc;
     state.last_key.set(keyval);
     let app = state.app_mut();
@@ -551,33 +563,47 @@ fn handle_key(keyval: u32, state_rc: &Rc<GuiState>) -> bool {
         }
         ESCAPE => {
             log_key_action(keyval, "cancel_nav", "");
-            app.core.anchor = Some(SheetCursor {
-                row: state.last_row.get(),
-                col: state.last_col.get(),
-            });
+            // Collapse any selection (plain navigation state).
+            app.core.anchor = None;
             state.canvas.queue_redraw();
             true
         }
         LEFT => {
             log_key_action(keyval, "move_cursor_left", &format!("cell={}", format_cell(state)));
-            move_cursor(state, 0, -1);
+            if mods & MOD_SHIFT != 0 {
+                extend_selection(state, 0, -1);
+            } else {
+                move_cursor(state, 0, -1);
+            }
             true
         }
         RIGHT => {
             log_key_action(keyval, "move_cursor_right", &format!("cell={}", format_cell(state)));
-            move_cursor(state, 0, 1);
+            if mods & MOD_SHIFT != 0 {
+                extend_selection(state, 0, 1);
+            } else {
+                move_cursor(state, 0, 1);
+            }
             true
         }
         UP => {
             log_key_action(keyval, "move_cursor_up", &format!("cell={}", format_cell(state)));
             if state.last_row.get() > HEADER_ROWS {
-                move_cursor(state, -1, 0);
+                if mods & MOD_SHIFT != 0 {
+                    extend_selection(state, -1, 0);
+                } else {
+                    move_cursor(state, -1, 0);
+                }
             }
             true
         }
         DOWN => {
             log_key_action(keyval, "move_cursor_down", &format!("cell={}", format_cell(state)));
-            move_cursor(state, 1, 0);
+            if mods & MOD_SHIFT != 0 {
+                extend_selection(state, 1, 0);
+            } else {
+                move_cursor(state, 1, 0);
+            }
             true
         }
         HOME => {
@@ -861,6 +887,8 @@ fn handle_delete(state: &GuiState) {
             }
             app.core.status = "Cleared selection".into();
             recompute_viewport(state);
+            // Clearing consumes the selection.
+            app.core.anchor = None;
             state.canvas.queue_redraw();
             return;
         }
@@ -882,6 +910,8 @@ fn handle_delete(state: &GuiState) {
         }
     }
     recompute_viewport(state);
+    // Clearing consumes the selection (nothing remains selected).
+    state.app_mut().core.anchor = None;
     state.canvas.queue_redraw();
 }
 
@@ -992,10 +1022,35 @@ fn update_state_cursor(state: &GuiState, row: usize, col: usize) {
     state.last_row.set(row);
     state.last_col.set(col);
     let app = state.app_mut();
+    // Plain navigation collapses any selection (matching ratatui, where the
+    // anchor exists only transiently). Without this the anchor sticks and
+    // every move paints a phantom band over all rows above the cursor.
+    // (extend_selection saves and restores the anchor around moves.)
+    app.core.anchor = None;
     app.core.cursor.row = row;
     app.core.cursor.col = col;
     update_formula_bar(state, row, col);
     state.canvas.queue_redraw();
+}
+
+/// Extend the selection (Shift+arrows, matching ratatui): anchor at the
+/// pre-move cursor if unset, then move (with grid growth). Refuses to leave
+/// the main area, like the reference. move_cursor collapses the anchor, so
+/// any previous selection is saved and restored around the move.
+fn extend_selection(state: &GuiState, dr: isize, dc: isize) {
+    let (row, col) = (state.last_row.get(), state.last_col.get());
+    if dc < 0 && col <= MARGIN_COLS {
+        return;
+    }
+    if dr < 0 && row <= HEADER_ROWS {
+        return;
+    }
+    if dr == 0 && dc == 0 {
+        return;
+    }
+    let prev = state.app_ref().core.anchor;
+    move_cursor(state, dr, dc);
+    state.app_mut().core.anchor = prev.or(Some(SheetCursor { row, col }));
 }
 
 fn update_formula_bar(state: &GuiState, row: usize, col: usize) {
@@ -1047,9 +1102,8 @@ fn handle_click(x: f64, y: f64, state_rc: &Rc<GuiState>) {
                 state.last_col.set(c);
                 app.core.cursor.row = logical_row;
                 app.core.cursor.col = c;
-                if app.core.anchor.is_none() {
-                    app.core.anchor = Some(SheetCursor { row: logical_row, col: c });
-                }
+                // Plain click collapses any selection (fresh single-cell focus).
+                app.core.anchor = None;
                 update_formula_bar(state, logical_row, c);
                 start_edit(state);
                 state.canvas.queue_redraw();
@@ -1447,7 +1501,9 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     let cursor_col = lm;
     corro_app.core.cursor.row = cursor_row;
     corro_app.core.cursor.col = cursor_col;
-    corro_app.core.anchor = Some(SheetCursor { row: hr, col: lm });
+    // No selection at rest (matching ratatui, where the anchor only exists
+    // transiently for shift-extend/select-all/format-selection).
+    corro_app.core.anchor = None;
 
     let data_rows = 30usize;
     let data_cols = 12usize;
@@ -1509,7 +1565,11 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // Keyboard: canvas.on_key, win.on_event_key, etc.
     let shared_key = shared.clone();
     canvas.on_key(Box::new(move |keyval: u32| -> bool {
-        handle_key(keyval, &shared_key)
+        // Canvas callbacks carry no modifier state on any backend
+        // (common::Canvas::on_key drops it), so Shift+arrows from a
+        // canvas-focused keypress move plainly; entry/window paths below
+        // carry Shift (bit 0x1, GDK_SHIFT_MASK / Win32-shift bit).
+        handle_key(keyval, &shared_key, 0)
     }));
 
     // Click
@@ -1530,7 +1590,7 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // that path.  On NWG this is a no-op (connect_activate returns Ok(0)).
     let shared_act = shared.clone();
     formula_entry.connect_activate(Box::new(move |_entry: *mut std::os::raw::c_void| {
-        handle_key(0xFF0D, &shared_act);
+        handle_key(0xFF0D, &shared_act, 0);
     }))?;
 
     // Window-level event interception: fallback for keys that escape the
@@ -1688,7 +1748,7 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                     }
                 }
             }
-    let hk = handle_key(keyval, &state_w);
+    let hk = handle_key(keyval, &state_w, state);
     append_keylog(&format!("handle_key={hk}\n"));
     if hk {
         // Same-event double-fire guard: on setups where the entry observes
@@ -1745,7 +1805,10 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
             match k {
                 RETURN | ESCAPE | TAB | LEFT | RIGHT | UP | DOWN | HOME | END | PAGE_UP | PAGE_DOWN
                 | BACKSPACE | DELETE => {
-                    handle_key(keyval, &shared_k);
+                    // `state` carries the modifier mask (bit 0x1 = Shift on
+                    // both GDK and the nwg adapter); Shift+arrows extend the
+                    // selection via handle_key.
+                    handle_key(keyval, &shared_k, state);
                     true
                 }
                 _ if (32..=126).contains(&k) => {
@@ -1772,7 +1835,7 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                     if (state & (0x4 | 0x8)) != 0 {
                         return false;
                     }
-                    handle_key(keyval, &shared_k);
+                    handle_key(keyval, &shared_k, state);
                     // NOTE: do NOT set entry_processed_key here. That flag is
                     // strictly window-arms / entry-clears for the SAME event
                     // (double-fire setups). If the entry set it after handling

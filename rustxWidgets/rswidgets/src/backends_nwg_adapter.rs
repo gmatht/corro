@@ -160,8 +160,8 @@ mod nwg_adapter {
 
             // Bind raw WM_KEYDOWN/WM_SYSKEYDOWN handler for on_event_key.
             // The state parameter is a GDK-compatible modifier mask:
-            //   bit 3 = Alt (MOD1_MASK)
-            // Alt is detected from WM_SYSKEYDOWN.
+            //   bit 0 = Shift, bit 3 = Alt (MOD1_MASK)
+            // Alt is detected from WM_SYSKEYDOWN; Shift via GetKeyState.
             // If the callback returns 0 (not consumed), the message is forwarded
             // to the focused child window via PostMessage so the canvas or entry
             // raw handlers can process it.  After forwarding, we consume the
@@ -183,6 +183,15 @@ mod nwg_adapter {
                         let mut state: u32 = 0;
                         if msg == winapi::um::winuser::WM_SYSKEYDOWN {
                             state |= 8; // GDK_MOD1_MASK (Alt)
+                        }
+                        // Win32 key messages carry no Shift state; query it
+                        // directly so Shift+arrows (selection extend) work.
+                        // (Control/Alt handling is unchanged.)
+                        unsafe {
+                            const VK_SHIFT: i32 = 0x10;
+                            if winapi::um::winuser::GetKeyState(VK_SHIFT) as u16 & 0x8000 != 0 {
+                                state |= 1; // GDK_SHIFT_MASK
+                            }
                         }
                         if f(w as u32, state) != 0 {
                             return Some(0); // consumed, do not forward
@@ -703,7 +712,7 @@ mod nwg_adapter {
         focus_out_cb: Rc<RefCell<Option<Box<dyn FnMut(*mut c_void) -> i32>>>>,
         _focus_in_handler: Option<nwg::RawEventHandler>,
         _focus_out_handler: Option<nwg::RawEventHandler>,
-        key_cb: Rc<RefCell<Option<Box<dyn FnMut(u32) -> bool>>>>,
+        key_cb: Rc<RefCell<Option<Box<dyn FnMut(u32, u32) -> bool>>>>,
         _key_handler: Option<nwg::RawEventHandler>,
         pub(crate) pos_x: std::cell::Cell<i32>,
         pub(crate) pos_y: std::cell::Cell<i32>,
@@ -787,8 +796,8 @@ mod nwg_adapter {
                 }
             }
         }
-        pub fn on_key(&self, f: Box<dyn FnMut(u32) -> bool>) {
-            *self.key_cb.borrow_mut() = Some(f);
+        pub fn on_key(&self, mut f: Box<dyn FnMut(u32) -> bool>) {
+            *self.key_cb.borrow_mut() = Some(Box::new(move |k: u32, _s: u32| -> bool { f(k) }));
         }
         pub fn set_hexpand(&self, _expand: bool) {}
         pub fn set_vexpand(&self, _expand: bool) {}
@@ -821,8 +830,7 @@ mod nwg_adapter {
         pub fn set_halign(&self, _align: i32) {}
         pub fn set_valign(&self, _align: i32) {}
         pub fn on_key_raw(&self, cb: Box<dyn FnMut(u32, u32) -> bool>) {
-            let mut cb = cb;
-            *self.key_cb.borrow_mut() = Some(Box::new(move |k: u32| -> bool { cb(k, 0) }));
+            *self.key_cb.borrow_mut() = Some(cb);
         }
         pub fn connect_activate(&self, _f: impl FnMut(*mut c_void) + 'static) -> Result<u64, Error> { Ok(0) }
         pub fn connect_focus_in_event(&self, f: impl FnMut(*mut c_void) -> i32 + 'static) -> Result<u64, Error> {
@@ -852,7 +860,7 @@ mod nwg_adapter {
             .map_err(|e| Error::Backend(format!("{}", e)))?;
         let focus_in_cb: Rc<RefCell<Option<Box<dyn FnMut(*mut c_void) -> i32>>>> = Rc::new(RefCell::new(None));
         let focus_out_cb: Rc<RefCell<Option<Box<dyn FnMut(*mut c_void) -> i32>>>> = Rc::new(RefCell::new(None));
-        let key_cb: Rc<RefCell<Option<Box<dyn FnMut(u32) -> bool>>>> = Rc::new(RefCell::new(None));
+        let key_cb: Rc<RefCell<Option<Box<dyn FnMut(u32, u32) -> bool>>>> = Rc::new(RefCell::new(None));
         let hwnd = inner.handle.hwnd().unwrap_or(std::ptr::null_mut());
         if hwnd != std::ptr::null_mut() {
             unsafe {
@@ -931,7 +939,16 @@ mod nwg_adapter {
                     }
                     if msg == winapi::um::winuser::WM_KEYDOWN || msg == winapi::um::winuser::WM_SYSKEYDOWN {
                         if let Some(ref mut f) = *kc.borrow_mut() {
-                            if f(w as u32) {
+                            // Modifier mask (GDK-compatible): Shift only — the
+                            // app needs it for Shift+arrows (selection extend).
+                            let mut mods: u32 = 0;
+                            unsafe {
+                                const VK_SHIFT: i32 = 0x10;
+                                if winapi::um::winuser::GetKeyState(VK_SHIFT) as u16 & 0x8000 != 0 {
+                                    mods |= 1;
+                                }
+                            }
+                            if f(w as u32, mods) {
                                 // Printable VKs reliably produce exactly one
                                 // WM_CHAR, as does Backspace (0x08); arrows etc.
                                 // produce none.
