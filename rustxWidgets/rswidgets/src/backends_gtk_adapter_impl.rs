@@ -175,6 +175,17 @@ mod gtk_adapter {
                             let _ = gtk_dynamic_loader::widget_connect_signal_bool(
                                 &l.clone(), win_ptr, "event",
                                 Box::new(move |ev: *mut c_void| -> i32 {
+                                    // The unfiltered "event" signal also delivers key
+                                    // RELEASES, which carry the same keyval/state as
+                                    // presses and are indistinguishable downstream —
+                                    // heuristics there eat genuine repeats. Drop
+                                    // everything but GDK_KEY_PRESS (8) at the source.
+                                    // If the symbol is missing, fail open (old behavior).
+                                    if let Some(get_ty) = l.symbols.gdk_event_get_event_type {
+                                        if get_ty(ev) != 8 {
+                                            return 0;
+                                        }
+                                    }
                                     let mut keyval: u32 = 0;
                                     if let Some(get_kv) = l.symbols.gdk_event_get_keyval {
                                         if get_kv(ev, &mut keyval) == 0 {

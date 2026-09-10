@@ -194,17 +194,19 @@ struct GuiState {
     key_counter: Cell<u64>,
     entry_processed_key: Cell<bool>,
     last_alt_keyval: Cell<u32>,
-    // Key event dedup: prevents press+release doubling on GTK3 (widget "event" signal)
-    // and GTK4 (where `key-pressed` can fire for release events on some versions).
-    // The same keyval arriving within DEDUP_NS is treated as a duplicate (release).
-    // Press+release dedup: tracks the last canonical (lowercased) printable
-    // keyval and a consecutive counter.  Every even occurrence of the same
-    // canonical key is treated as a release (skipped).  This works because
-    // xdotool sends exactly one press+one release per character; key repeat
-    // (which generates multiple press events) does not occur in the test
-    // environment.  The window handler processes all keys in CAPTURE phase,
-    // so this dedup applies regardless of which widget has focus.
+    // Tracks whether the entry widget's key handler has ever fired. Gates the
+    // entry_processed_key protocol below: that flag is only meaningful when
+    // both the window and the entry can observe the same event (double-fire
+    // setups). On streams where the entry never fires, setting the flag would
+    // poison the next keypress (it would wrongly skip handle_key).
+    entry_seen: Cell<bool>,
+    // Press/release dedup trackers. GTK4-only (feature = "gtk4"): only there
+    // can release events arrive as same-keyval callbacks. Everywhere else
+    // (GTK3 presses-only, nwg WM_KEYDOWN-only, wasm keydown-only) every key
+    // event is a genuine press and deduping would swallow genuine repeats.
+    #[cfg(feature = "gtk4")]
     last_dedup_key: Cell<u32>,
+    #[cfg(feature = "gtk4")]
     dedup_count: Cell<u32>,
     // Prevents the RETURN safety net (line ~1375) from re-entering edit mode
     // on the release event of a RETURN press that already committed an edit.
@@ -214,13 +216,14 @@ struct GuiState {
     // normal RETURN press that committed an edit and re-displayed the
     // new cell's value in the formula entry.
     return_pressed: Cell<bool>,
-    // General press/release dedup for navigation keys.  GTK4's
-    // EventControllerKey::key-pressed fires for both GDK_KEY_PRESS and
+    // Press/release dedup bookkeeping. GTK4-only (see entry_seen above):
+    // EventControllerKey::key-pressed can fire for both GDK_KEY_PRESS and
     // GDK_KEY_RELEASE on some versions/display servers.  When the same
     // canonical keyval arrives twice consecutively, the second event is
     // a release and should be skipped.  Set at each return point where
     // a key was actually processed; cleared on skip so the next different
     // key is not affected.
+    #[cfg(feature = "gtk4")]
     last_keyval_dedup: Cell<u32>,
 }
 
@@ -596,11 +599,16 @@ fn handle_key(keyval: u32, state_rc: &Rc<GuiState>) -> bool {
         }
         _ if (32..=126).contains(&key) => {
             let ch = char::from_u32(key).unwrap_or('?');
-            // Prime the dedup tracker so the upcoming release event is skipped
-            // by handle_edit_key (the release arrives after editing is established).
-            let dk = ch.to_ascii_lowercase() as u32;
-            state.last_dedup_key.set(dk);
-            state.dedup_count.set(1);
+            // Prime the press/release tracker so a following release event is
+            // skipped by handle_edit_key. GTK4-only: only there can releases
+            // arrive as same-keyval callbacks; elsewhere priming would cause
+            // handle_edit_key to skip the next identical char.
+            #[cfg(feature = "gtk4")]
+            {
+                let dk = ch.to_ascii_lowercase() as u32;
+                state.last_dedup_key.set(dk);
+                state.dedup_count.set(1);
+            }
             log_key_action(keyval, "start_edit_with", &format!("char={ch} cell={}", format_cell(state)));
             start_edit_with(state, ch);
             true
@@ -635,12 +643,14 @@ fn handle_edit_key(key: u32, state: &GuiState) -> bool {
         BACKSPACE => {
             log_key_action(key, "edit_backspace", &format!("cell={} mode=edit", format_cell(state)));
             state.edit_buf.borrow_mut().pop();
+            sync_entry_to_buf(state);
             state.canvas.queue_redraw();
             true
         }
         DELETE => {
             log_key_action(key, "edit_clear", &format!("cell={} mode=edit", format_cell(state)));
             state.edit_buf.borrow_mut().clear();
+            sync_entry_to_buf(state);
             state.canvas.queue_redraw();
             true
         }
@@ -678,25 +688,29 @@ fn handle_edit_key(key: u32, state: &GuiState) -> bool {
             true
         }
         _ if (32..=126).contains(&key) => {
-            // Press+release dedup: on the GTK3 path (and some GTK4 versions) the
-            // `key-pressed` signal fires for both GDK_KEY_PRESS and GDK_KEY_RELEASE.
-            // We skip every even occurrence of the same canonical (lowercased) key
-            // because xdotool generates exactly one press + one release per character.
-            let dedup_key = char::from_u32(key).map(|c| c.to_ascii_lowercase() as u32).unwrap_or(key);
-            if dedup_key == state.last_dedup_key.get() {
-                let cnt = state.dedup_count.get() + 1;
-                state.dedup_count.set(cnt);
-                // Skip every even occurrence (the release event)
-                if cnt % 2 == 0 {
-                    return true;
+            // Press/release dedup. GTK4-only (see GuiState): elsewhere every
+            // key event is a genuine press (releases are filtered at the
+            // source or never hooked), so deduping would swallow genuine
+            // repeats ("HELLO" -> "HELO").
+            #[cfg(feature = "gtk4")]
+            {
+                let dedup_key = char::from_u32(key).map(|c| c.to_ascii_lowercase() as u32).unwrap_or(key);
+                if dedup_key == state.last_dedup_key.get() {
+                    let cnt = state.dedup_count.get() + 1;
+                    state.dedup_count.set(cnt);
+                    // Skip every even occurrence (the release event)
+                    if cnt % 2 == 0 {
+                        return true;
+                    }
+                } else {
+                    state.last_dedup_key.set(dedup_key);
+                    state.dedup_count.set(1);
                 }
-            } else {
-                state.last_dedup_key.set(dedup_key);
-                state.dedup_count.set(1);
             }
             let ch = char::from_u32(key).unwrap_or('?');
             log_key_action(key, "edit_insert", &format!("char={ch} cell={} mode=edit", format_cell(state)));
             state.edit_buf.borrow_mut().push(ch);
+            sync_entry_to_buf(state);
             state.canvas.queue_redraw();
             true
         }
@@ -719,31 +733,27 @@ fn start_edit(state: &GuiState) {
 fn start_edit_with(state: &GuiState, ch: char) {
     let already_editing = state.editing.get();
     state.editing.set(true);
-    let s = ch.to_string();
-    if state.edit_buf.borrow().is_empty() {
-        state.edit_buf.borrow_mut().push_str(&s);
-    } else {
-        let mut buf = state.edit_buf.borrow_mut();
-        buf.push_str(&s);
-    }
+    state.edit_buf.borrow_mut().push(ch);
+    // Keep the widget identical to edit_buf (see sync_entry_to_buf): the
+    // widget text is what the user sees, edit_buf is what gets committed.
+    sync_entry_to_buf(state);
     if !already_editing {
-        // Set the entry text to the typed character so it is visible in the
-        // formula bar.  Using set_text(&s) instead of set_text("") ensures
-        // the entry displays the first character (important when the window
-        // CAPTURE-phase controller handles the key and stops propagation,
-        // preventing the entry's default handler from inserting the char).
-        //
-        // set_text() triggers connect_changed -> on_formula_entry_changed,
-        // which would overwrite edit_buf with the entry text.  The starts_with
-        // guard in on_formula_entry_changed accepts this because the entry
-        // text ("4") is a forward extension of current edit_buf (""), and
-        // after restoring the saved value the result is identical.
-        let saved = state.edit_buf.borrow().clone();
-        state.formula_entry.set_text(&s);
-        *state.edit_buf.borrow_mut() = saved;
         state.formula_entry.grab_focus();
     }
     state.canvas.queue_redraw();
+}
+
+/// Keep the formula entry widget text identical to edit_buf (the commit
+/// source of truth). Without this the two diverge: the native widget inserts
+/// typed chars itself on top of handle_key's push (doubling, "AA"), and it
+/// never sees Backspace/Delete (handle_key consumes those), leaving stale
+/// text on screen. Syncing here covers every key path (window + entry, all
+/// GUI backends); on_formula_entry_changed accepts identical text as a no-op.
+fn sync_entry_to_buf(state: &GuiState) {
+    let buf = state.edit_buf.borrow().clone();
+    if state.formula_entry.get_text().as_deref() != Some(buf.as_str()) {
+        state.formula_entry.set_text(&buf);
+    }
 }
 
 fn commit_edit(state: &GuiState) {
@@ -905,14 +915,51 @@ fn row_nonblank_extremes(state: &GuiState, row: usize) -> Option<(usize, usize)>
 }
 
 fn move_cursor(state: &GuiState, dr: isize, dc: isize) {
-    let row = state.last_row.get();
-    let col = state.last_col.get();
-    let app = state.app_mut();
-    let mr = app.core.workbook.active_sheet().grid.main_rows();
-    let mc = app.core.workbook.active_sheet().grid.main_cols() + MARGIN_COLS;
-    let new_row = (row as isize + dr).max(HEADER_ROWS as isize).min((HEADER_ROWS + mr).max(HEADER_ROWS) as isize) as usize;
-    let new_col = (col as isize + dc).max(MARGIN_COLS as isize).min(mc as isize - 1).max(MARGIN_COLS as isize) as usize;
-    update_state_cursor(state, new_row, new_col);
+    let hr = HEADER_ROWS;
+    let lm = MARGIN_COLS;
+    let (mut row, mut col) = (state.last_row.get(), state.last_col.get());
+    if dc > 0 {
+        // Grow the grid when stepping right off the last main column with
+        // few trailing blanks (matching ratatui's move_cursor_one_col_horizontal).
+        // Clamping here instead strands the cursor (Right does nothing) and
+        // even walks it backwards when the clamp bound sits below the cursor.
+        let mc = state.app_ref().core.workbook.active_sheet().grid.main_cols();
+        if col == lm + mc.saturating_sub(1) {
+            let app = state.app_mut();
+            let sheet = app.core.workbook.active_sheet_mut();
+            if compute::trailing_blank_main_cols(&sheet.grid) < ui_core::NAV_BLANK_COLS {
+                sheet.grid.grow_main_col_at_right();
+            }
+        }
+        col = col.saturating_add(1);
+    } else if dc < 0 {
+        col = col.saturating_sub(1).max(lm);
+    } else if dr > 0 {
+        // Grow the grid when stepping down off the last main row
+        // (matching ratatui's move_cursor_one_row_vertical).
+        let mr = state.app_ref().core.workbook.active_sheet().grid.main_rows();
+        if row == hr + mr.saturating_sub(1) {
+            let app = state.app_mut();
+            let sheet = app.core.workbook.active_sheet_mut();
+            if compute::trailing_blank_main_rows(&sheet.grid) < ui_core::NAV_BLANK_ROWS {
+                sheet.grid.grow_main_row_at_bottom();
+            }
+        }
+        row = row.saturating_add(1);
+    } else if dr < 0 {
+        row = row.saturating_sub(1).max(hr);
+    }
+    // Clamp into the grid extent and ensure it (matching ratatui).
+    {
+        let app = state.app_mut();
+        let grid = &mut app.core.workbook.active_sheet_mut().grid;
+        let mut cursor = SheetCursor { row, col };
+        cursor.clamp(grid);
+        grid.ensure_extent_for_cursor(cursor.row, cursor.col);
+        row = cursor.row;
+        col = cursor.col;
+    }
+    update_state_cursor(state, row, col);
 }
 
 fn update_state_cursor(state: &GuiState, row: usize, col: usize) {
@@ -1418,9 +1465,13 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         key_counter: Cell::new(0),
         entry_processed_key: Cell::new(false),
         last_alt_keyval: Cell::new(0),
+        entry_seen: Cell::new(false),
+        #[cfg(feature = "gtk4")]
         last_dedup_key: Cell::new(0),
+        #[cfg(feature = "gtk4")]
         dedup_count: Cell::new(0),
         return_pressed: Cell::new(false),
+        #[cfg(feature = "gtk4")]
         last_keyval_dedup: Cell::new(0),
     });
 
@@ -1494,12 +1545,11 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
             let alt_held = (state & 0x8) != 0;
             let ctrl_held = (state & 0x4) != 0;
 
-            // General press/release dedup: EventControllerKey::key-pressed fires for
-            // both GDK_KEY_PRESS and GDK_KEY_RELEASE on some GTK4 versions/display
-            // servers (e.g., WSLg XWayland).  When the same canonical keyval arrives
-            // twice consecutively, the second event is a release and should be skipped.
-            // This catches navigation keys (Down, Escape, etc.) and other non-printable
-            // keys that are not covered by entry_processed_key or return_pressed.
+            // General press/release dedup. GTK4-only (see GuiState): elsewhere
+            // every key event is genuine (releases are filtered at the source
+            // or never hooked), so skipping repeats would drop real input
+            // (e.g. Right,Right).
+            #[cfg(feature = "gtk4")]
             if nk != 0 && nk == s.last_keyval_dedup.get() {
                 s.last_keyval_dedup.set(0);
                 append_keylog(&format!("dedup: skipping keyval={nk} release\n"));
@@ -1615,11 +1665,18 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     let hk = handle_key(keyval, &state_w);
     append_keylog(&format!("handle_key={hk}\n"));
     if hk {
-        // Mark printable chars as entry-processed so the entry CAPTURE
-        // controller (which fires after window CAPTURE on some GTK
-        // versions despite GDK_EVENT_STOP) skips its duplicate handle_key
-        // call.  This prevents window+entry character doubling.
-        if (32..=126).contains(&nk) {
+        // Same-event double-fire guard: on setups where the entry observes
+        // the same event after the window, it clears this flag and skips its
+        // duplicate handle_key call (prevents window+entry doubling).
+        // Only arm it once the entry has proven it can observe events
+        // (entry_seen); otherwise — streams where the entry never fires —
+        // the flag would linger and wrongly skip the NEXT keypress (every
+        // second typed char silently lost). Never armed on Windows: the
+        // window never observes entry-focused keys there, so the flag could
+        // never be cleared same-event. Always armed on GTK4 (legacy).
+        if (32..=126).contains(&nk)
+            && (cfg!(feature = "gtk4") || (!cfg!(windows) && s.entry_seen.get()))
+        {
             s.entry_processed_key.set(true);
         }
         if nk == RETURN {
@@ -1629,11 +1686,13 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                 s.formula_entry.get_text().unwrap_or_default(),
                 *s.edit_buf.borrow()));
         }
-        // Set dedup keyval so the release event (same keyval arriving next)
-        // is caught by the guard at line 1327 and skipped.
+        // GTK4-only release bookkeeping (see GuiState); elsewhere the field
+        // does not exist.
+        #[cfg(feature = "gtk4")]
         s.last_keyval_dedup.set(nk);
         1 
     } else {
+        #[cfg(feature = "gtk4")]
         s.last_keyval_dedup.set(0);
         0 
     }
@@ -1652,9 +1711,14 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         let shared_k_cnt = shared.clone();
         formula_entry.on_key_raw(Box::new(move |keyval: u32, state: u32| -> bool {
             shared_k_cnt.last_key.set(keyval);
+            // Capability witness for the entry_processed_key protocol (see the
+            // window handler): once this has fired, both layers can observe
+            // the same event, so the window arms the same-event guard.
+            shared_k_cnt.entry_seen.set(true);
             let k = normalize(keyval);
             match k {
-                RETURN | ESCAPE | TAB | LEFT | RIGHT | UP | DOWN | HOME | END | PAGE_UP | PAGE_DOWN => {
+                RETURN | ESCAPE | TAB | LEFT | RIGHT | UP | DOWN | HOME | END | PAGE_UP | PAGE_DOWN
+                | BACKSPACE | DELETE => {
                     handle_key(keyval, &shared_k);
                     true
                 }
@@ -1670,14 +1734,11 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                         return false;
                     }
                     // Process the key to update edit_buf (via handle_key →
-                    // handle_edit_key or start_edit_with), then let the event
-                    // propagate so the entry's default handler inserts the
-                    // character and fires "changed" → on_formula_entry_changed.
-                    // The starts_with guard in on_formula_entry_changed prevents
-                    // the (already-correct) edit_buf from being overwritten by
-                    // stale entry text in the mixed-flow scenario (first char
-                    // via window handler, subsequent chars via entry handler
-                    // after grab_focus).
+                    // handle_edit_key or start_edit_with), which also syncs the
+                    // widget text to edit_buf (sync_entry_to_buf), then consume
+                    // the event so the native widget does NOT insert the char
+                    // a second time (doubling, "AA") — the widget already
+                    // shows exactly what will be committed.
                     //
                     // For keys with Ctrl (0x4) or Alt (0x8) modifiers, do NOT
                     // claim the key so the event bubbles to the window BUBBLE
@@ -1686,8 +1747,14 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                         return false;
                     }
                     handle_key(keyval, &shared_k);
-                    shared_k.entry_processed_key.set(true);
-                    false
+                    // NOTE: do NOT set entry_processed_key here. That flag is
+                    // strictly window-arms / entry-clears for the SAME event
+                    // (double-fire setups). If the entry set it after handling
+                    // a key, the window would skip a LATER genuine key thinking
+                    // the entry already handled it — silently dropping every
+                    // second char on streams where the window never observes
+                    // entry keys.
+                    true
                 }
                 _ => false,
             }

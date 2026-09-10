@@ -900,6 +900,18 @@ mod nwg_adapter {
 
         let _key_handler = if hwnd != std::ptr::null_mut() {
             let kc = key_cb.clone();
+            // When a WM_KEYDOWN is consumed by key_cb (the app handled the
+            // key itself and synced the widget text), the message loop's
+            // TranslateMessage still posts a WM_CHAR for it, and the edit
+            // control's default handler would insert the char a second time
+            // ("AA" for a single keypress). Remember the consumed key and
+            // swallow its WM_CHAR (same idea as the Enter/Escape suppression
+            // below). Only printable VKs set the flag — they reliably produce
+            // exactly one WM_CHAR; arrows etc. produce none.
+            let suppress_char: std::rc::Rc<std::cell::Cell<bool>> =
+                std::rc::Rc::new(std::cell::Cell::new(false));
+            let suppress_set = suppress_char.clone();
+            let suppress_get = suppress_char.clone();
             static ENTRY_KEY_ID: AtomicUsize = AtomicUsize::new(0x60000000);
             let id = ENTRY_KEY_ID.fetch_add(1, Ordering::SeqCst);
             nwg::bind_raw_event_handler(
@@ -911,11 +923,24 @@ mod nwg_adapter {
                         if c == 0x0D || c == 0x1B {
                             return Some(0);
                         }
+                        if suppress_get.get() {
+                            suppress_get.set(false);
+                            return Some(0);
+                        }
                         return None;
                     }
                     if msg == winapi::um::winuser::WM_KEYDOWN || msg == winapi::um::winuser::WM_SYSKEYDOWN {
                         if let Some(ref mut f) = *kc.borrow_mut() {
-                            if f(w as u32) { return Some(0); }
+                            if f(w as u32) {
+                                // Printable VKs reliably produce exactly one
+                                // WM_CHAR, as does Backspace (0x08); arrows etc.
+                                // produce none.
+                                let vk = w & 0xFF;
+                                if vk == 0x08 || (32..=126).contains(&vk) {
+                                    suppress_set.set(true);
+                                }
+                                return Some(0);
+                            }
                         }
                     }
                     None

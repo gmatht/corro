@@ -345,6 +345,96 @@ fn left_arrow_does_not_jump_viewport() {
 
 /// Move to C3, enter "Hello World!", and verify both backends show the
 /// correct cell address and content (structural match, not exact char).
+///
+/// Type-first edit parity: Right,Right,A,Enter (no Enter-before-type) must
+/// commit exactly "A" to C1 and leave the cursor on C2 in BOTH backends.
+/// The address comes from the formula-bar line; the value comes from the
+/// row-1 grid line (the committed cell must show A after "Hello World!").
+/// Regression: the GUI backend dropped both arrows (move clamped instead of
+/// growing the grid, committing to A1) and doubled the char ("AA").
+#[test]
+fn type_first_right_right_a_enter_parity() {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let seq = [KeyCode::Right, KeyCode::Right, KeyCode::Char('A'), KeyCode::Enter];
+
+    // ── ratatui reference ──
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs/tests/overflow.corro");
+    let tmp = std::env::temp_dir().join(format!(
+        "corro-rt-tf-{}-{}.corro", std::process::id(),
+        COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)));
+    std::fs::copy(&src, &tmp).expect("copy ratatui fixture");
+    let mut app = corro::ui::App::new(Some(tmp));
+    app.load_initial().unwrap();
+    for code in seq {
+        let ev = crossterm::event::KeyEvent::new(code, KeyModifiers::NONE);
+        app.bench_handle_key(ev).ok();
+    }
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal.draw(|f| app.bench_draw(f)).unwrap();
+    let buf = terminal.backend().buffer();
+    let rt: String = (0..buf.area.height).map(|y| {
+        (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>()
+    }).collect::<Vec<_>>().join("\n");
+    let rt_formula = rt.lines().nth(1).unwrap_or("");
+    assert!(rt_formula.contains("C2"),
+        "ratatui formula bar should show C2 after Right,Right,A,Enter\n{rt_formula:?}");
+    let rt_row1 = rt.lines().find(|l| l.contains("Hello World!")).unwrap_or("");
+    let hello_pos = rt_row1.find("Hello World!").unwrap_or(usize::MAX);
+    assert!(rt_row1[hello_pos..].contains('A'),
+        "ratatui row 1 should show committed A after Hello World!\n{rt_row1:?}");
+
+    // ── pancurses must show the SAME address and value ──
+    let pane = run_in_tmux("--pancurses docs/tests/overflow.corro",
+        &["Right", "Right", "A", "Enter"], 2000);
+    let pnc_formula = pane.lines().nth(1).unwrap_or("");
+    assert!(pnc_formula.contains("C2"),
+        "pancurses formula bar should show C2 after Right,Right,A,Enter\n{pnc_formula:?}\n--- pane ---\n{}",
+        safe_slice(&pane, 1500));
+    let pnc_row1 = pane.lines().find(|l| l.contains("Hello World!")).unwrap_or("");
+    let pnc_pos = pnc_row1.find("Hello World!").unwrap_or(usize::MAX);
+    assert!(pnc_row1[pnc_pos..].contains('A'),
+        "pancurses row 1 should show committed A after Hello World!\n{pnc_row1:?}\n--- pane ---\n{}",
+        safe_slice(&pane, 1500));
+}
+
+/// Type-first edit with no file: Right,Right,A,Enter must persist "A" and
+/// show C2 in the formula bar (covers the no-file commit branch).
+#[test]
+fn type_first_right_right_a_enter_no_file() {
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let session = format!("corro-tf-{id}");
+    let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
+    start_session(&session, &format!("{bin} --pancurses; sleep 2"));
+    for key in ["Right", "Right", "A", "Enter"] {
+        send_settled(&session, key);
+    }
+    let mut pane = tmux::capture_pane(&session);
+    let mut tries = 0;
+    while (!pane.lines().nth(1).map(|l| l.contains("C2")).unwrap_or(false)
+        || pane.find('A').is_none()) && tries < 10
+    {
+        std::thread::sleep(Duration::from_millis(200));
+        pane = tmux::capture_pane(&session);
+        tries += 1;
+    }
+    tmux::kill_session(&session);
+    let formula = pane.lines().nth(1).unwrap_or("");
+    assert!(formula.contains("C2"),
+        "no-file formula bar should show C2 after Right,Right,A,Enter\n{formula:?}\n--- pane ---\n{}",
+        safe_slice(&pane, 1500));
+    // Data row 1 carries no labels, so an 'A' in its line can only be the
+    // committed cell value (unlike header/menu lines full of 'A's).
+    let row1 = pane.lines().find(|l| {
+        let mut parts = l.split('│');
+        let _left = parts.next();
+        parts.next().map(|f| f.trim() == "1").unwrap_or(false)
+    }).unwrap_or("");
+    assert!(row1.contains('A'),
+        "typed A should persist in row 1 with no file\n{row1:?}\n--- pane ---\n{}",
+        safe_slice(&pane, 1500));
+}
+
 #[test]
 fn edit_c3_hello_world_full_screen_match() {
     use crossterm::event::KeyCode;
