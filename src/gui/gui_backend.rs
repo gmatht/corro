@@ -553,14 +553,20 @@ fn handle_key(keyval: u32, state_rc: &Rc<GuiState>) -> bool {
         }
         HOME => {
             log_key_action(keyval, "move_cursor_home", &format!("cell={}", format_cell(state)));
-            state.last_col.set(MARGIN_COLS);
-            update_state_cursor(state, state.last_row.get(), MARGIN_COLS);
+            // Jump to the leftmost non-blank cell in the row (matching ratatui).
+            if let Some((leftmost, _)) = row_nonblank_extremes(state, state.last_row.get()) {
+                state.last_col.set(leftmost);
+                update_state_cursor(state, state.last_row.get(), leftmost);
+            }
             true
         }
         END => {
             log_key_action(keyval, "move_cursor_end", &format!("cell={}", format_cell(state)));
-            state.last_col.set(state.last_col.get() + 10);
-            update_state_cursor(state, state.last_row.get(), state.last_col.get());
+            // Jump to the rightmost non-blank cell in the row (matching ratatui).
+            if let Some((_, rightmost)) = row_nonblank_extremes(state, state.last_row.get()) {
+                state.last_col.set(rightmost);
+                update_state_cursor(state, state.last_row.get(), rightmost);
+            }
             true
         }
         PAGE_UP => {
@@ -863,6 +869,38 @@ fn recompute_viewport(state: &GuiState) {
             cursor_col
         };
         update_state_cursor(state, new_row, new_col);
+    }
+}
+
+/// Leftmost/rightmost non-blank global column in `row` (global row space),
+/// matching ratatui's row_nonblank_horizontal_extremes. None when the row has
+/// no non-blank cells.
+fn row_nonblank_extremes(state: &GuiState, row: usize) -> Option<(usize, usize)> {
+    let app = state.app_ref();
+    let grid = &app.core.workbook.active_sheet().grid;
+    let main_cols = grid.main_cols();
+    let mut first: Option<usize> = None;
+    let mut last: Option<usize> = None;
+    for (addr, val) in grid.iter_nonempty() {
+        if val.trim().is_empty() {
+            continue;
+        }
+        let (r, c) = match addr {
+            CellAddr::Main { row: r, col: c } => (HEADER_ROWS + r as usize, MARGIN_COLS + c as usize),
+            CellAddr::Left { row: r, .. } => (HEADER_ROWS + r as usize, 0),
+            CellAddr::Right { row: r, .. } => (HEADER_ROWS + r as usize, MARGIN_COLS + main_cols),
+            CellAddr::Header { row: r, .. } | CellAddr::Footer { row: r, .. } => (r as usize, 0),
+        };
+        if r == row {
+            if first.is_none() {
+                first = Some(c);
+            }
+            last = Some(c);
+        }
+    }
+    match (first, last) {
+        (Some(a), Some(b)) => Some((a, b)),
+        _ => None,
     }
 }
 

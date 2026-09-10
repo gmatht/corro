@@ -86,7 +86,7 @@ macro_rules! common_types_mod {
             pub fn set_title(&self, title: &str) { self.inner.set_title(title); }
             pub fn set_default_size(&self, w: i32, h: i32) { self.inner.set_default_size(w, h); }
             pub fn present(&self) { self.inner.present(); }
-            pub fn insert_action_group(&self, name: &str, group_ptr: *mut std::os::raw::c_void) { self.inner.insert_action_group(name, group_ptr); }
+            pub fn insert_action_group(&self, name: &str, group_ptr: *mut std::os::raw::c_void) { #[allow(unused_unsafe)] unsafe { self.inner.insert_action_group(name, group_ptr); } }
             pub fn hwnd(&self) -> *mut std::os::raw::c_void { self.inner.hwnd() }
             pub fn set_child_box(&self, bx: &WidgetBox) { self.inner.set_child_box(&bx.inner); }
         }
