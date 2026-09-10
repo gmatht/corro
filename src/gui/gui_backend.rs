@@ -352,6 +352,32 @@ fn render_to(
     }
 }
 
+/// How many columns are needed so the fitted column widths cover `avail_px`
+/// pixels (matching render_grid's width accumulation). The GUI canvas can be
+/// any size, so the count is derived from the live canvas width every frame
+/// (like ratatui sizes from the terminal each frame) instead of a hardcoded
+/// constant — otherwise the sheet stops early and leaves a huge blank area.
+fn cols_to_fill_px(app: &super::App, cursor: SheetCursor, avail_px: i32) -> usize {
+    let sheet = app.core.workbook.active_sheet();
+    let mut dim = 1usize;
+    loop {
+        let (cols, _) = ui_core::visible_col_indices(sheet, cursor, dim, 0);
+        let used: f64 = cols
+            .iter()
+            .map(|&c| sheet_rec_col_width(sheet, c) as f64 * CHAR_W)
+            .sum();
+        if used >= avail_px as f64 || dim >= 2048 || cols.len() < dim {
+            return dim.max(1);
+        }
+        dim += 8;
+    }
+}
+
+/// How many rows are needed to cover a canvas `h` pixels tall.
+fn rows_to_fill_px(h: i32) -> usize {
+    (((h as f64 - HEADER_H) / ROW_H + 1.0).max(1.0)) as usize
+}
+
 fn render_grid(dc: &mut dyn DrawContext, state: &GuiState, w: i32, h: i32) {
     dc.clear(0.94, 0.94, 0.94, 1.0);
     dc.clip(0.0, 0.0, w as f64, h as f64);
@@ -1763,8 +1789,11 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
 
 // Assemble layout
     vbox.append(&formula_bar);
-    vbox.append(&canvas);
+    // NOTE (GTK3): expand must be set BEFORE append — pack_start freezes the
+    // expand/fill params at append time, so setting vexpand after appending
+    // has no effect and the canvas would never grow vertically.
     vbox.set_child_vexpand(&canvas, true);
+    vbox.append(&canvas);
     vbox.append(&status_label);
 
     // Register the draw callback BEFORE present() so the extensive event
@@ -1785,6 +1814,19 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     canvas.set_draw_callback(Box::new(move |dc: &mut dyn DrawContext, w: i32, h: i32| {
         eprintln!("DRAW_CALLBACK called: w={} h={}", w, h);
         let _ = std::fs::write("/tmp/dim.txt", format!("{} {}\n", w, h));
+        // Size the viewport from the live canvas every frame (cheap: a few
+        // visible_col_indices passes) so the sheet always fills the canvas
+        // after menus/chrome, at any window size. Hardcoded counts leave a
+        // huge blank area whenever the canvas outgrows them.
+        {
+            let app = shared_draw.app_ref();
+            shared_draw.data_cols.set(cols_to_fill_px(
+                app,
+                app.core.cursor,
+                (w as f64 - ROW_LABEL_W).max(0.0) as i32,
+            ));
+            shared_draw.data_rows.set(rows_to_fill_px(h));
+        }
         render_grid(dc, &shared_draw, w, h);
         // Test marker: 8x8 square of 0xFEEDBE at top-left, drawn AFTER render_grid
         // so it appears on top of the grid background and is visible in screenshots.
