@@ -13,6 +13,7 @@
 [package]
 name = "pdcurses-sys"
 version = "0.7.1"
+edition = "2021"
 authors = ["Ilkka Halila <ilkka@hali.la>"]
 build = "build.rs"
 links = "pdcurses"

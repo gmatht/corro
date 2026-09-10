@@ -26,9 +26,9 @@ pub mod style {
 pub type CursorMoveCb = Box<dyn FnMut(u32, u32)>;
 pub type CommitEditCb = Box<dyn FnMut(u32, u32, String)>;
 
-/// Global (backend-wide) callback registry, used by the free
-/// `add_cursor_move_callback` / `add_commit_edit_callback` entry points so a
-/// host app can observe navigation/edits without holding a Spreadsheet handle.
+// Global (backend-wide) callback registry, used by the free
+// `add_cursor_move_callback` / `add_commit_edit_callback` entry points so a
+// host app can observe navigation/edits without holding a Spreadsheet handle.
 thread_local! {
     static GLOBAL_CURSOR_MOVE: RefCell<Vec<CursorMoveCb>> = RefCell::new(Vec::new());
     static GLOBAL_COMMIT_EDIT: RefCell<Vec<CommitEditCb>> = RefCell::new(Vec::new());

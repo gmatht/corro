@@ -38,6 +38,7 @@ mod tmux {
 
     /// Same as capture_pane but keeps ANSI/OSC escape sequences (-e), so tests
     /// can assert on raw output such as the OSC 52 clipboard sequence.
+    #[allow(dead_code)]
     pub fn capture_pane_esc(session: &str) -> String {
         let output = Command::new("tmux")
             .args(["capture-pane", "-t", session, "-p", "-S", "-200", "-e"])

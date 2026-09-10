@@ -18,7 +18,7 @@ use crate::formula::{
     cell_effective_display, effective_numeric, is_formula,
 };
 use crate::grid::{
-    CellAddr, CellFormat, ColumnAddr, FormatScope, GridBox as Grid, MainRange, MarginIndex, NumberFormat,
+    CellAddr, CellFormat, ColumnAddr, FormatScope, GridBox as Grid, MainRange, NumberFormat,
     SheetCursor, SortSpec, TextAlign, FOOTER_ROWS, HEADER_ROWS, MARGIN_COLS, DEFAULT_MAX_COL_WIDTH,
 };
 use crate::io::{
@@ -26,7 +26,7 @@ use crate::io::{
     IoError, LogWatcher, PartialReplay,
 };
 use crate::ops::{
-    AggFunc, AggregateDef, LinkedSource, Op, SheetState, WorkbookState,
+    AggregateDef, LinkedSource, Op, SheetState, WorkbookState,
 };
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -13043,17 +13043,6 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
         }
     }
 
-    fn start_export_mode(&mut self, extension: &str) -> Mode {
-        self.export_preview_scroll = 0;
-        self.start_export_mode_with_saved_path(extension)
-    }
-
-    fn start_export_mode_with_saved_path(&mut self, extension: &str) -> Mode {
-        Mode::ExportTsv {
-            buffer: self.start_input_mode(self.suggested_export_save_path(extension)),
-        }
-    }
-
     fn make_input_line(&self, prefix: String, buffer: &str) -> Paragraph<'static> {
         Paragraph::new(input_line(
             prefix,
@@ -13281,6 +13270,7 @@ mod drive_feature_tests {
             press(app, KeyCode::Right, KeyModifiers::empty());
         }
     }
+#[allow(dead_code)]
     fn esc(app: &mut App) {
         press(app, KeyCode::Esc, KeyModifiers::empty());
     }
@@ -13955,6 +13945,8 @@ mod drive_feature_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::grid::MarginIndex;
+    use crate::ops::AggFunc;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::path::PathBuf;
 
@@ -17260,10 +17252,6 @@ mod tests {
     fn long_text_does_not_make_column_stupidly_wide() {
         // Typing very long text in a cell (which triggers auto_fit_column via
         // Grid::set) must not make the column wider than max_col_width.
-        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        use ratatui::backend::TestBackend;
-        use ratatui::Terminal;
-
         let mut app = App::new(None);
         app.state.grid.set_main_size(1, 2);
         app.cursor = SheetCursor {
@@ -18621,7 +18609,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn two_right_arrows_enter_right_margin() {
         let mut app = App::new(None);
         app.state.grid.set_main_size(1, 1);
@@ -18650,6 +18637,7 @@ mod tests {
         );
     }
 
+#[allow(dead_code)]
     fn zerosum_right_from_a_in_edit_mode_moves_to_b() {
         let fixture = docs_test_path("zerosum.corro");
         if !fixture.exists() {
@@ -21473,6 +21461,7 @@ mod tests {
             .any(|y| (0..buffer.area.width).any(|x| buffer[(x, y)].symbol() == "│"))
     }
 
+#[allow(dead_code)]
     fn normalize_frame(s: &str) -> String {
         s.lines()
             .map(|line| line.trim_end())
@@ -22540,7 +22529,6 @@ fn unsaved_header_and_op_committed_on_first_edit() {
 fn ensure_unsaved_file_uses_default_dir_not_cwd() {
     use tempfile::tempdir;
     use std::env;
-    use std::fs;
 
     // Ensure no test override is set so the App picks the real default dir.
     let prev_test_dir = env::var_os("CORRO_UNSAVED_TEST_DIR");

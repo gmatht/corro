@@ -13,9 +13,13 @@ macro_rules! platform_module {
         pub type PlatformSimpleAction = SimpleAction;
         pub type PlatformMenuBar = MenuBar;
         pub type PlatformDialog = Dialog;
+        #[allow(dead_code)] // not referenced by common_types_mod! on every backend
         pub type PlatformDropDown = DropDown;
+        #[allow(dead_code)]
         pub type PlatformCheckButton = CheckButton;
+        #[allow(dead_code)]
         pub type PlatformRadioButton = RadioButton;
+        #[allow(dead_code)]
         pub type PlatformTextView = TextView;
     };
 }
@@ -58,7 +62,6 @@ mod platform {
 macro_rules! common_types_mod {
     () => {
         use super::platform::*;
-        use crate::core::Widget;
 
         #[derive(Clone)]
         pub struct Window { pub inner: PlatformWindow }
@@ -83,7 +86,7 @@ macro_rules! common_types_mod {
             pub fn set_title(&self, title: &str) { self.inner.set_title(title); }
             pub fn set_default_size(&self, w: i32, h: i32) { self.inner.set_default_size(w, h); }
             pub fn present(&self) { self.inner.present(); }
-            pub fn insert_action_group(&self, name: &str, group_ptr: *mut std::os::raw::c_void) { unsafe { self.inner.insert_action_group(name, group_ptr); } }
+            pub fn insert_action_group(&self, name: &str, group_ptr: *mut std::os::raw::c_void) { self.inner.insert_action_group(name, group_ptr); }
             pub fn hwnd(&self) -> *mut std::os::raw::c_void { self.inner.hwnd() }
             pub fn set_child_box(&self, bx: &WidgetBox) { self.inner.set_child_box(&bx.inner); }
         }

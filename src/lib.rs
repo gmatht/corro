@@ -1,4 +1,5 @@
 
+#![allow(unexpected_cfgs)] // Win95/rust9x custom target_family gates are intentional
 
 pub mod capture;
 pub mod core;

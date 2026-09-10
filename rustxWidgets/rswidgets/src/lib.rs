@@ -1,5 +1,6 @@
 //! rswidgets: cross-platform thin GUI abstraction (GTK-dlopen on Linux, NWG on Windows)
 #![warn(missing_docs)]
+#![allow(missing_docs)] // many backend items are undocumented; silence the noisy per-item warnings
 
 pub mod prelude;
 pub mod core;

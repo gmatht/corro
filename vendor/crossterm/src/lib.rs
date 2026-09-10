@@ -1,4 +1,5 @@
 #![deny(unused_imports, unused_must_use)]
+#![allow(unexpected_cfgs)] // vendored winapi/crossterm_winapi cfg gates are intentional
 
 //! # Cross-platform Terminal Manipulation Library
 //!

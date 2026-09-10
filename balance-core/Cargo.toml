@@ -5,11 +5,3 @@ edition = "2021"
 
 [dependencies]
 
-
-[profile.release]
-opt-level = 2
-lto = "fat" 
-codegen-units = 1
-panic = "abort"
-strip = true
-

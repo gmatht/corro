@@ -149,7 +149,7 @@ fn build(
     data_cols: usize,
     data_width: usize,
     hr: usize,
-    lm: usize,
+    _lm: usize,
 ) -> Viewport {
     let (mut col_ixs, _) =
         ui_core::visible_col_indices(&app.core.workbook.active_sheet(), cursor, data_cols, 0);

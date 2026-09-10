@@ -1325,7 +1325,7 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     win.set_title(&format!("corro {}", env!("CARGO_PKG_VERSION")));
     win.set_default_size(1200, 800);
 
-    let mut vbox = rxapp.new_box(Orientation::Vertical, 0)?;
+    let vbox = rxapp.new_box(Orientation::Vertical, 0)?;
 
     // Fit column widths to rendered content
     corro_app.fit_main_columns_to_max_width();
@@ -1342,7 +1342,7 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     let data_cols = 12usize;
 
     // Formula bar
-    let mut formula_bar = rxapp.new_box(Orientation::Horizontal, 2)?;
+    let formula_bar = rxapp.new_box(Orientation::Horizontal, 2)?;
     let addr_label = rxapp.new_label("A1")?;
     let f_label = rxapp.new_label("  fx  ")?;
     let formula_entry = rxapp.new_entry()?;

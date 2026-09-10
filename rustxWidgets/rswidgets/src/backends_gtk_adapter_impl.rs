@@ -99,7 +99,7 @@ mod gtk_adapter {
                 }
             }
         }
-        pub fn on_event_key(&self, mut cb: Box<dyn FnMut(u32, u32) -> i32>) {
+        pub fn on_event_key(&self, cb: Box<dyn FnMut(u32, u32) -> i32>) {
             if let Some(loader) = crate::backends::gtk::loader() {
                 let win_ptr = *self.0.as_ref();
                 if !win_ptr.is_null() {

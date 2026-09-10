@@ -6,7 +6,7 @@ use rswidgets::backends_pancurses_adapter::*;
 
 use unicode_width::UnicodeWidthStr;
 
-use super::actions::{apply_format, commit_cell, dispatch_menu_action, main_addr_label, menu_action_needs_prompt, run_prompt_action, sort_sheet, MenuDispatch};
+use super::actions::{commit_cell, dispatch_menu_action, main_addr_label, menu_action_needs_prompt, run_prompt_action, MenuDispatch};
 use super::viewport::Viewport;
 use super::compute;
 use super::render::{self, CellSink};

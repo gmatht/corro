@@ -1,5 +1,6 @@
 #[cfg(feature = "pancurses")]
 mod pancurses_backend {
+    #![allow(unexpected_cfgs)] // Win95/rust9x custom target_family gates are intentional
     use pancurses::*;
     use std::cell::RefCell;
     use std::collections::HashMap;
@@ -8,12 +9,17 @@ mod pancurses_backend {
     use std::io::Write;
 
     // ── SGR escape sequences matching ratatui output ──────────────
-    const SGR_FG_BLACK: &str = "\x1b[38;5;0m";
+    #[allow(dead_code)] // Win9x-only SGR emitter (unused on Linux)
     const SGR_FG_CYAN: &str = "\x1b[38;5;6m";
+    #[allow(dead_code)] // Win9x-only SGR emitter (unused on Linux)
     const SGR_FG_YELLOW: &str = "\x1b[38;5;3m";
+    #[allow(dead_code)] // Win9x-only SGR emitter (unused on Linux)
     const SGR_FG_DARK_GRAY: &str = "\x1b[38;5;8m";
+    #[allow(dead_code)] // Win9x-only SGR emitter (unused on Linux)
     const SGR_BG_CYAN: &str = "\x1b[48;5;6m";
+    #[allow(dead_code)] // Win9x-only SGR emitter (unused on Linux)
     const SGR_BG_YELLOW: &str = "\x1b[48;5;3m";
+    #[allow(dead_code)] // Win9x-only SGR emitter (unused on Linux)
     const SGR_BG_DARK_GRAY: &str = "\x1b[48;5;8m";
     const SGR_BOLD: &str = "\x1b[1m";
     const SGR_UNDERLINE: &str = "\x1b[4m";
@@ -58,7 +64,7 @@ mod pancurses_backend {
     pub fn set_input_trace_file(path: &str) {
         unsafe {
             let b = path.as_bytes();
-            let n = b.len().min(INPUT_TRACE_PATH.len());
+            let n = b.len().min(256); // INPUT_TRACE_PATH is [u8; 256]
             INPUT_TRACE_PATH[..n].copy_from_slice(&b[..n]);
         }
         INPUT_TRACE_PATH_LEN.store(path.as_bytes().len().min(256), std::sync::atomic::Ordering::Relaxed);
@@ -184,10 +190,14 @@ mod pancurses_backend {
     // Fixed table, const-initialized (no thread_local/LazyCell machinery —
     // fragile on Win9x). All callers run on the single curses/UI thread.
     // Slot 0 unused; slots 1..=63 map (fg, bg) → PDCurses pair index.
+#[allow(dead_code)] // Win9x-only SGR emitter (unused on Linux)
     static mut SGR_PAIR_FG: [i16; 64] = [-1; 64];
+#[allow(dead_code)] // Win9x-only SGR emitter (unused on Linux)
     static mut SGR_PAIR_BG: [i16; 64] = [-1; 64];
+#[allow(dead_code)] // Win9x-only SGR emitter (unused on Linux)
     static SGR_PAIR_NEXT: std::sync::atomic::AtomicI16 = std::sync::atomic::AtomicI16::new(1);
 
+#[allow(dead_code)] // Win9x-only SGR emitter (unused on Linux)
     fn sgr_pair(fg: i16, bg: i16) -> chtype {
         if !has_colors() {
             return 0;
@@ -209,6 +219,7 @@ mod pancurses_backend {
         COLOR_PAIR(p as chtype)
     }
 
+#[allow(dead_code)] // Win9x-only SGR emitter (unused on Linux)
     fn sgr_current_attr(fg: i16, bg: i16, bold: bool, uline: bool, dim: bool) -> chtype {
         let mut a: chtype = 0;
         if bold {
@@ -238,6 +249,7 @@ mod pancurses_backend {
         a
     }
 
+#[allow(dead_code)] // Win9x-only SGR emitter (unused on Linux)
     fn sgr_apply(params: &str, fg: &mut i16, bg: &mut i16, bold: &mut bool, uline: &mut bool, dim: &mut bool) {
         if params.is_empty() {
             *fg = -1;
@@ -630,9 +642,9 @@ mod pancurses_backend {
     /// selection; enable only when the app has widgets that need pointer input.
     pub fn set_mouse_enabled(enabled: bool) {
         if enabled {
-            unsafe { mousemask(ALL_MOUSE_EVENTS, None); }
+            mousemask(ALL_MOUSE_EVENTS, None);
         } else {
-            unsafe { mousemask(0, None); }
+            mousemask(0, None);
         }
     }
 
@@ -4506,7 +4518,7 @@ mod pancurses_backend {
     pub fn spreadsheet_set_menu_text(spreadsheet_id: usize, text: &str) {
         with_state(|s| {
             if let Some(n) = s.node_mut(spreadsheet_id) {
-                if let PcWidgetKind::Spreadsheet { ref mut grid, ref mut menu_text, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut menu_text, .. } = n.kind {
                     *menu_text = text.to_string();
                 }
             }
@@ -4516,7 +4528,7 @@ mod pancurses_backend {
     pub fn spreadsheet_set_border_title(spreadsheet_id: usize, text: &str) {
         with_state(|s| {
             if let Some(n) = s.node_mut(spreadsheet_id) {
-                if let PcWidgetKind::Spreadsheet { ref mut grid, ref mut border_title, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut border_title, .. } = n.kind {
                     *border_title = text.to_string();
                 }
             }
@@ -4526,7 +4538,7 @@ mod pancurses_backend {
     pub fn spreadsheet_set_status_text(spreadsheet_id: usize, text: &str) {
         with_state(|s| {
             if let Some(n) = s.node_mut(spreadsheet_id) {
-                if let PcWidgetKind::Spreadsheet { ref mut grid, ref mut status_text, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut status_text, .. } = n.kind {
                     *status_text = text.to_string();
                 }
             }
@@ -4536,7 +4548,7 @@ mod pancurses_backend {
     pub fn spreadsheet_set_formula_bar_trailing(spreadsheet_id: usize, text: &str) {
         with_state(|s| {
             if let Some(n) = s.node_mut(spreadsheet_id) {
-                if let PcWidgetKind::Spreadsheet { ref mut grid, ref mut formula_bar_trailing, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut formula_bar_trailing, .. } = n.kind {
                     *formula_bar_trailing = text.to_string();
                 }
             }
@@ -4546,7 +4558,7 @@ mod pancurses_backend {
     pub fn spreadsheet_set_tab_data(spreadsheet_id: usize, titles: &[String], active: usize) {
         with_state(|s| {
             if let Some(n) = s.node_mut(spreadsheet_id) {
-                if let PcWidgetKind::Spreadsheet { ref mut grid, ref mut tab_titles, ref mut tab_active, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut tab_titles, ref mut tab_active, .. } = n.kind {
                     *tab_titles = titles.to_vec();
                     *tab_active = active;
                 }
@@ -4557,7 +4569,7 @@ mod pancurses_backend {
     pub fn spreadsheet_set_grid_config(spreadsheet_id: usize, margin_c: u32, main_c: u32) {
         with_state(|s| {
             if let Some(n) = s.node_mut(spreadsheet_id) {
-                if let PcWidgetKind::Spreadsheet { ref mut grid, ref mut menu_text, .. } = n.kind { let margin_cols = &mut grid.margin_cols; let main_cols = &mut grid.main_cols;
+                if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let margin_cols = &mut grid.margin_cols; let main_cols = &mut grid.main_cols;
                     *margin_cols = margin_c;
                     *main_cols = main_c;
                 }
@@ -4568,7 +4580,7 @@ mod pancurses_backend {
     pub fn spreadsheet_set_row_counts(spreadsheet_id: usize, header_rows: u32, main_rows: u32) {
         with_state(|s| {
             if let Some(n) = s.node_mut(spreadsheet_id) {
-                if let PcWidgetKind::Spreadsheet { ref mut grid, ref mut border_title, .. } = n.kind { let header_row_count = &mut grid.header_row_count; let main_row_count = &mut grid.main_row_count;
+                if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let header_row_count = &mut grid.header_row_count; let main_row_count = &mut grid.main_row_count;
                     *header_row_count = header_rows;
                     *main_row_count = main_rows;
                 }
@@ -4607,7 +4619,7 @@ mod pancurses_backend {
     pub fn spreadsheet_set_cursor(id: usize, row: u32, col: u32) {
         with_state(|s| {
             if let Some(n) = s.node_mut(id) {
-                if let PcWidgetKind::Spreadsheet { ref mut grid, ref mut status_text, .. } = n.kind { let cursor_row = &mut grid.cursor_row; let cursor_col = &mut grid.cursor_col;
+                if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let cursor_row = &mut grid.cursor_row; let cursor_col = &mut grid.cursor_col;
                     *cursor_row = row;
                     *cursor_col = col;
                 }
@@ -4618,7 +4630,7 @@ mod pancurses_backend {
     pub fn spreadsheet_set_edit_state(id: usize, is_editing: bool, buf: &str, pos: usize) {
         with_state(|s| {
             if let Some(n) = s.node_mut(id) {
-                if let PcWidgetKind::Spreadsheet { ref mut grid, ref mut formula_bar_trailing, .. } = n.kind { let editing = &mut grid.editing; let edit_buf = &mut grid.edit_buf; let edit_pos = &mut grid.edit_pos;
+                if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let editing = &mut grid.editing; let edit_buf = &mut grid.edit_buf; let edit_pos = &mut grid.edit_pos;
                     *editing = is_editing;
                     *edit_buf = buf.to_string();
                     *edit_pos = pos;
@@ -4647,7 +4659,7 @@ mod pancurses_backend {
                 None => return None,
             };
             if let Some(n) = s.node_mut(spreadsheet_id) {
-                if let PcWidgetKind::Spreadsheet { ref mut grid, ref mut tab_titles, ref mut tab_active, .. } = n.kind { let cells = &grid.cells;
+                if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let cells = &grid.cells;
                     cells.borrow_mut().insert((cursor_row, cursor_col), text.clone());
                 }
             }
@@ -4665,7 +4677,7 @@ mod pancurses_backend {
     pub fn spreadsheet_set_formula_bar(spreadsheet_id: usize, address_label_id: usize, entry_id: usize) {
         with_state(|s| {
             if let Some(n) = s.node_mut(spreadsheet_id) {
-                if let PcWidgetKind::Spreadsheet { ref mut grid, ref mut formula_bar_address_id, ref mut formula_bar_entry_id, .. } = n.kind {
+                if let PcWidgetKind::Spreadsheet { ref mut formula_bar_address_id, ref mut formula_bar_entry_id, .. } = n.kind {
                     *formula_bar_address_id = Some(address_label_id);
                     *formula_bar_entry_id = Some(entry_id);
                 }

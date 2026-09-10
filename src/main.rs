@@ -1,4 +1,5 @@
 //! corro — append-only collaborative spreadsheet TUI.
+#![allow(unexpected_cfgs)] // Win95/rust9x custom target_family gates are intentional
 
 // Win95 (rust9x targets): std::rt initialization hangs inside KERNEL32 on
 // Windows 95 (DBCS conversion loop). With `no_main`, the VC6 CRT startup

@@ -62,6 +62,7 @@ impl Filter for EventFilter {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // constructed only on some platforms
 pub(crate) struct InternalEventFilter;
 
 impl Filter for InternalEventFilter {

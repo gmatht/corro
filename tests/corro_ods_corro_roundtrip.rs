@@ -174,7 +174,7 @@ fn debug_subtotal_b11_inspect() {
     };
     let (_m, c0, _c1, dr) = delimited_export_matrix(g0, &opts);
     eprintln!("export col_start={c0} data_rows[0]={:?}", dr.first());
-    let mc = g0.main_cols();
+    let _mc = g0.main_cols();
     let h703 = CellAddr::Header {
         row: (HEADER_ROWS - 1) as u32,
         col: ColumnAddr::Main(703),

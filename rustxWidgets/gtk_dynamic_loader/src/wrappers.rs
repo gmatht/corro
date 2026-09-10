@@ -256,7 +256,7 @@ impl Window {
                         // schedules an idle handler that calls snapshot() on
                         // the widget tree, which invokes our draw function.
                         if let Some(qd) = loader.symbols.gtk_widget_queue_draw {
-                            unsafe { qd(self.inner); }
+                            qd(self.inner);
                         }
                         // Phase 3: all blocking iterations for the queued
                         // redraw to be processed (allocation idle, frame
@@ -275,12 +275,12 @@ impl Window {
                             loader.symbols.gtk_widget_get_frame_clock,
                             loader.symbols.gdk_frame_clock_request_phase,
                         ) {
-                            let clock = unsafe { get_fc(self.inner) };
+                            let clock = get_fc(self.inner);
                             if !clock.is_null() {
                                 // GDK_FRAME_CLOCK_PHASE_PAINT = 16 triggers
                                 // the snapshot/paint cycle which calls the
                                 // DrawingArea draw function.
-                                unsafe { request_phase(clock, 16); }
+                                request_phase(clock, 16);
                                 // All blocking iterations to let the frame
                                 // clock process the requested phase.  On
                                 // virtual displays only blocking iterations
@@ -298,9 +298,9 @@ impl Window {
                             loader.symbols.gtk_widget_get_display,
                             loader.symbols.gdk_display_sync,
                         ) {
-                            let display = unsafe { get_disp(self.inner) };
+                            let display = get_disp(self.inner);
                             if !display.is_null() {
-                                unsafe { disp_sync(display); }
+                                disp_sync(display);
                             }
                         }
                     }
@@ -2649,7 +2649,6 @@ impl MenuBar {
 
     /// Diagnostic: check which action names exist in the given GActionMap.
     pub fn debug_check_actions(&self, group_ptr: *mut c_void, out_path: &str) {
-        use std::io::Write;
         let symbols = &self.loader.symbols;
         let lookup = match symbols.g_action_map_lookup_action {
             Some(f) => f,
@@ -2669,7 +2668,6 @@ impl MenuBar {
 
     /// Diagnostic: check if submenu links exist for all root GMenu items.
     pub fn debug_check_submenu_links(model_ptr: *mut c_void, loader: &crate::loader::Loader, out_path: &str) {
-        use std::io::Write;
         let symbols = &loader.symbols;
         let get_n_items = match symbols.g_menu_model_get_n_items {
             Some(f) => f,

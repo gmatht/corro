@@ -18,9 +18,6 @@ crossterm = { path = "vendor/crossterm" }
 pdcurses-sys = { path = "vendor/pdcurses-sys" }
 pancurses = { path = "vendor/pancurses" }
 
-[toolchain]
-channel = "nightly"
-
 [package]
 name = "corro"
 version = "0.6.0"
@@ -160,3 +157,4 @@ opt-level = "z"
 
 [profile.tiny.package.compact_str]
 opt-level = "z"
+
