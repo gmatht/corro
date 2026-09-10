@@ -1757,7 +1757,7 @@ mod nwg_adapter {
         vscroll: Rc<RefCell<nwg::ScrollBar>>,
         hscroll: Rc<RefCell<nwg::ScrollBar>>,
         _handlers: Rc<Vec<nwg::RawEventHandler>>,
-        child_size: Rc<RefCell<(i32, i32)>>,
+        on_scroll_cb: Rc<RefCell<Option<Box<dyn FnMut(bool, f64)>>>>,
     }
 
     impl Clone for ScrolledWindow {
@@ -1769,7 +1769,7 @@ mod nwg_adapter {
                 vscroll: self.vscroll.clone(),
                 hscroll: self.hscroll.clone(),
                 _handlers: self._handlers.clone(),
-                child_size: self.child_size.clone(),
+                on_scroll_cb: self.on_scroll_cb.clone(),
             }
         }
     }
@@ -1787,70 +1787,52 @@ mod nwg_adapter {
                 );
             }
             *self.child.borrow_mut() = Some(ptr);
-            // Get child size for scroll range
+            // Size the child to the frame's client area on the next WM_SIZE.
+            // (Scroll ranges are driven by the host via scroll_to; the child
+            // always fills the viewport and nothing pans.)
             unsafe {
                 let mut rect: winapi::shared::windef::RECT = std::mem::zeroed();
-                winapi::um::winuser::GetWindowRect(ptr as _, &mut rect);
-                *self.child_size.borrow_mut() = (rect.right - rect.left, rect.bottom - rect.top);
+                winapi::um::winuser::GetClientRect(self.hwnd as _, &mut rect);
+                let fw = rect.right - rect.left;
+                let fh = rect.bottom - rect.top;
+                if fw > 0 && fh > 0 {
+                    winapi::um::winuser::SetWindowPos(
+                        ptr as _, std::ptr::null_mut(),
+                        0, 0, (fw - 20).max(0), (fh - 20).max(0),
+                        winapi::um::winuser::SWP_NOZORDER | winapi::um::winuser::SWP_SHOWWINDOW,
+                    );
+                }
             }
-            self.update_scroll_range();
         }
 
         pub fn set_policy(&self, _h: u32, _v: u32) {
             // NWG: always show both scrollbars
         }
 
+        /// Drive both scrollbars from item indices (shared cursor-centric
+        /// model with the GTK backend): value = cursor index, upper = domain
+        /// size, page = visible count (page sizes the thumb where supported).
+        pub fn scroll_to(&self, hval: f64, hupper: f64, _hpage: f64, vval: f64, vupper: f64, _vpage: f64) {
+            if let Ok(sb) = self.hscroll.try_borrow() {
+                sb.set_range(0..(hupper.max(1.0) as usize));
+                sb.set_pos((hval.max(0.0) as usize).min(hupper.max(1.0) as usize));
+            }
+            if let Ok(sb) = self.vscroll.try_borrow() {
+                sb.set_range(0..(vupper.max(1.0) as usize));
+                sb.set_pos((vval.max(0.0) as usize).min(vupper.max(1.0) as usize));
+            }
+        }
+
+        /// Notify on user scrollbar interaction: `cb(vertical, pos)`.
+        /// Fires for thumb drags and trough clicks. The host moves its cursor
+        /// (the canvas keeps filling the viewport; nothing pans).
+        pub fn on_scroll(&self, cb: Box<dyn FnMut(bool, f64)>) {
+            *self.on_scroll_cb.borrow_mut() = Some(cb);
+        }
+
         pub fn set_vexpand(&self, _v: bool) {}
         pub fn set_hexpand(&self, _h: bool) {}
 
-        fn update_scroll_range(&self) {
-            let (child_w, child_h) = *self.child_size.borrow();
-            unsafe {
-                let mut rect: winapi::shared::windef::RECT = std::mem::zeroed();
-                winapi::um::winuser::GetClientRect(self.hwnd as _, &mut rect);
-                let view_w = rect.right - rect.left;
-                let view_h = rect.bottom - rect.top;
-                let vrange = if child_h > view_h { (child_h - view_h) as usize } else { 0usize };
-                let hrange = if child_w > view_w { (child_w - view_w) as usize } else { 0usize };
-                if let Ok(sb) = self.vscroll.try_borrow_mut() {
-                    sb.set_range(0..vrange.max(1));
-                }
-                if let Ok(sb) = self.hscroll.try_borrow_mut() {
-                    sb.set_range(0..hrange.max(1));
-                }
-            }
-        }
-
-#[allow(dead_code)]
-        fn on_scroll(&self) {
-            let (child_w, child_h) = *self.child_size.borrow();
-            if child_w == 0 && child_h == 0 { return; }
-            let child_hwnd = match *self.child.borrow() {
-                Some(h) => h,
-                None => return,
-            };
-            let vpos = if let Ok(sb) = self.vscroll.try_borrow() { sb.pos() } else { return };
-            let hpos = if let Ok(sb) = self.hscroll.try_borrow() { sb.pos() } else { return };
-            unsafe {
-                let mut rect: winapi::shared::windef::RECT = std::mem::zeroed();
-                winapi::um::winuser::GetClientRect(self.hwnd as _, &mut rect);
-                let view_w = rect.right - rect.left;
-                let view_h = rect.bottom - rect.top;
-                let max_v = (child_h - view_h).max(0);
-                let max_h = (child_w - view_w).max(0);
-                let v_range = if let Ok(sb) = self.vscroll.try_borrow() { sb.range().end } else { 1 };
-                let h_range = if let Ok(sb) = self.hscroll.try_borrow() { sb.range().end } else { 1 };
-                let scroll_y = if v_range > 0 { -(vpos as i32 * max_v / v_range as i32) } else { 0 };
-                let scroll_x = if h_range > 0 { -(hpos as i32 * max_h / h_range as i32) } else { 0 };
-                winapi::um::winuser::SetWindowPos(
-                    child_hwnd as _,
-                    std::ptr::null_mut(),
-                    scroll_x, scroll_y,
-                    0, 0,
-                    winapi::um::winuser::SWP_NOZORDER | winapi::um::winuser::SWP_NOSIZE | winapi::um::winuser::SWP_SHOWWINDOW,
-                );
-            }
-        }
     }
 
     impl AsRef<*mut c_void> for ScrolledWindow {
@@ -1893,15 +1875,8 @@ mod nwg_adapter {
         let vscroll = Rc::new(RefCell::new(vscroll));
         let hscroll = Rc::new(RefCell::new(hscroll));
         let child: Rc<RefCell<Option<*mut c_void>>> = Rc::new(RefCell::new(None));
-        let child_size: Rc<RefCell<(i32, i32)>> = Rc::new(RefCell::new((0, 0)));
-
-        // Position scrollbars at right/bottom edges
-        let v_hwnd = if let Ok(sb) = vscroll.try_borrow() {
-            sb.handle.hwnd().unwrap_or(std::ptr::null_mut())
-        } else { std::ptr::null_mut() };
-        let h_hwnd = if let Ok(sb) = hscroll.try_borrow() {
-            sb.handle.hwnd().unwrap_or(std::ptr::null_mut())
-        } else { std::ptr::null_mut() };
+        let on_scroll_cb: Rc<RefCell<Option<Box<dyn FnMut(bool, f64)>>>> =
+            Rc::new(RefCell::new(None));
 
         let mut handlers: Vec<nwg::RawEventHandler> = Vec::new();
 
@@ -1909,7 +1884,7 @@ mod nwg_adapter {
         if hwnd != std::ptr::null_mut() {
             let vscroll_sz = vscroll.clone();
             let hscroll_sz = hscroll.clone();
-            let child_sz = child_size.clone();
+            let child_sz_child = child.clone();
             let c_hwnd = hwnd;
             static SIZE_ID: AtomicUsize = AtomicUsize::new(0x80000000);
             let sid = SIZE_ID.fetch_add(1, Ordering::SeqCst);
@@ -1942,86 +1917,68 @@ mod nwg_adapter {
                                 );
                             }
                         }
-                        // Update scroll range based on child size
-                        let (cw, ch) = *child_sz.borrow();
-                        let view_w = w;
-                        let view_h = h;
-                        let vrange = if ch > view_h { (ch - view_h) as usize } else { 0usize };
-                        let hrange = if cw > view_w { (cw - view_w) as usize } else { 0usize };
-                        if let Ok(sb) = vscroll_sz.try_borrow_mut() {
-                            sb.set_range(0..vrange.max(1));
-                        }
-                        if let Ok(sb) = hscroll_sz.try_borrow_mut() {
-                            sb.set_range(0..hrange.max(1));
+                        // The child always fills the viewport (ranges are driven
+                        // by the host via scroll_to; nothing pans).
+                        if let Some(child_ptr) = *child_sz_child.borrow() {
+                            winapi::um::winuser::SetWindowPos(
+                                child_ptr as _, std::ptr::null_mut(),
+                                0, 0, (w - scroll_w).max(0), (h - scroll_h).max(0),
+                                winapi::um::winuser::SWP_NOZORDER | winapi::um::winuser::SWP_SHOWWINDOW,
+                            );
                         }
                     }
                     None
                 },
             ).ok() { handlers.push(h); }
 
-            // VScroll raw handler
-            let vscroll_sc = vscroll.clone();
-            let child_sc = child.clone();
-            let c_hwnd_sc = hwnd;
-            let child_sz_sc = child_size.clone();
-            static VSCROLL_ID: AtomicUsize = AtomicUsize::new(0x90000000);
-            let vsid = VSCROLL_ID.fetch_add(1, Ordering::SeqCst);
+            // Scroll messages from the scrollbar children arrive at the frame
+            // (their parent), not at the scrollbars themselves. Compute the new
+            // thumb position from the request and report it; the host moves its
+            // cursor (the child keeps filling the viewport; nothing pans).
+            // SB_LINEUP/DOWN = 0/1, SB_PAGEUP/DOWN = 2/3, SB_THUMBPOSITION = 4,
+            // SB_THUMBTRACK = 5, SB_TOP/BOTTOM = 6/7, SB_ENDSCROLL = 8.
+            let vscroll_msg = vscroll.clone();
+            let hscroll_msg = hscroll.clone();
+            let scroll_cb = on_scroll_cb.clone();
+            static SCROLL_MSG_ID: AtomicUsize = AtomicUsize::new(0x90000000);
+            let smid = SCROLL_MSG_ID.fetch_add(1, Ordering::SeqCst);
             if let Some(h) = nwg::bind_raw_event_handler(
-                &nwg::ControlHandle::Hwnd(v_hwnd as _), vsid,
-                move |_h, msg, _w, _l| {
-                    if msg != winapi::um::winuser::WM_VSCROLL { return None; }
-                    let (cw, ch) = *child_sz_sc.borrow();
-                    if cw == 0 && ch == 0 { return Some(0); }
-                    let child_hwnd = match *child_sc.borrow() { Some(h) => h, None => return Some(0) };
-                    let pos = if let Ok(sb) = vscroll_sc.try_borrow() { sb.pos() } else { return Some(0) };
-                    unsafe {
-                        let mut rect: winapi::shared::windef::RECT = std::mem::zeroed();
-                        winapi::um::winuser::GetClientRect(c_hwnd_sc as _, &mut rect);
-                        let view_h = rect.bottom - rect.top;
-                        let max_v = (ch - view_h).max(0);
-                        let range = if let Ok(sb) = vscroll_sc.try_borrow() { sb.range().end.max(1) } else { 1 };
-                        let scroll_y = -(pos as i32 * max_v / range as i32);
-                        winapi::um::winuser::SetWindowPos(
-                            child_hwnd as _, std::ptr::null_mut(),
-                            0, scroll_y, 0, 0,
-                            winapi::um::winuser::SWP_NOZORDER | winapi::um::winuser::SWP_NOSIZE | winapi::um::winuser::SWP_SHOWWINDOW,
-                        );
+                &nwg::ControlHandle::Hwnd(hwnd as _), smid,
+                move |_h, msg, w, _l| {
+                    let vertical = if msg == winapi::um::winuser::WM_VSCROLL {
+                        true
+                    } else if msg == winapi::um::winuser::WM_HSCROLL {
+                        false
+                    } else {
+                        return None;
+                    };
+                    let sb = if vertical { &vscroll_msg } else { &hscroll_msg };
+                    let Ok(sb) = sb.try_borrow() else { return Some(0); };
+                    let req = (w & 0xFFFF) as u32;
+                    if req == 8 {
+                        return Some(0); // SB_ENDSCROLL: nothing to do
+                    }
+                    let cur = sb.pos();
+                    let end = sb.range().end.max(1);
+                    let track = ((w >> 16) & 0xFFFF) as usize;
+                    let new_pos = match req {
+                        4 | 5 => track.min(end), // thumb position/track
+                        0 => cur.saturating_sub(1), // line up/left
+                        1 => (cur + 1).min(end), // line down/right
+                        2 => cur.saturating_sub(10), // page up/left
+                        3 => (cur + 10).min(end), // page down/right
+                        6 => 0,  // top/left end
+                        7 => end, // bottom/right end
+                        _ => cur,
+                    };
+                    sb.set_pos(new_pos);
+                    if let Some(ref mut f) = *scroll_cb.borrow_mut() {
+                        f(vertical, new_pos as f64);
                     }
                     Some(0)
                 },
             ).ok() { handlers.push(h); }
 
-            // HScroll raw handler
-            let hscroll_sc = hscroll.clone();
-            let child_sc2 = child.clone();
-            let c_hwnd_sc2 = hwnd;
-            let child_sz_sc2 = child_size.clone();
-            static HSCROLL_ID: AtomicUsize = AtomicUsize::new(0xA0000000);
-            let hsid = HSCROLL_ID.fetch_add(1, Ordering::SeqCst);
-            if let Some(h) = nwg::bind_raw_event_handler(
-                &nwg::ControlHandle::Hwnd(h_hwnd as _), hsid,
-                move |_h, msg, _w, _l| {
-                    if msg != winapi::um::winuser::WM_HSCROLL { return None; }
-                    let (cw, ch) = *child_sz_sc2.borrow();
-                    if cw == 0 && ch == 0 { return Some(0); }
-                    let child_hwnd = match *child_sc2.borrow() { Some(h) => h, None => return Some(0) };
-                    let pos = if let Ok(sb) = hscroll_sc.try_borrow() { sb.pos() } else { return Some(0) };
-                    unsafe {
-                        let mut rect: winapi::shared::windef::RECT = std::mem::zeroed();
-                        winapi::um::winuser::GetClientRect(c_hwnd_sc2 as _, &mut rect);
-                        let view_w = rect.right - rect.left;
-                        let max_h = (cw - view_w).max(0);
-                        let range = if let Ok(sb) = hscroll_sc.try_borrow() { sb.range().end.max(1) } else { 1 };
-                        let scroll_x = -(pos as i32 * max_h / range as i32);
-                        winapi::um::winuser::SetWindowPos(
-                            child_hwnd as _, std::ptr::null_mut(),
-                            scroll_x, 0, 0, 0,
-                            winapi::um::winuser::SWP_NOZORDER | winapi::um::winuser::SWP_NOSIZE | winapi::um::winuser::SWP_SHOWWINDOW,
-                        );
-                    }
-                    Some(0)
-                },
-            ).ok() { handlers.push(h); }
         }
 
         Ok(ScrolledWindow {
@@ -2031,7 +1988,7 @@ mod nwg_adapter {
             vscroll,
             hscroll,
             _handlers: Rc::new(handlers),
-            child_size,
+            on_scroll_cb,
         })
     }
 

@@ -693,6 +693,7 @@ mod pancurses_adapter {
 
     // -- ScrolledWindow --
 
+    #[derive(Clone)]
     pub struct ScrolledWindow {
         pub(crate) id: usize,
     }

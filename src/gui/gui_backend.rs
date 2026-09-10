@@ -203,6 +203,12 @@ struct GuiState {
     // setups). On streams where the entry never fires, setting the flag would
     // poison the next keypress (it would wrongly skip handle_key).
     entry_seen: Cell<bool>,
+    // Scrollbar sync: native scrollbars around the sheet (thumb tracks the
+    // cursor; dragging/clicking moves the cursor, so the selection is always
+    // visible). Guard against reentrancy between programmatic sets and the
+    // value-changed notification.
+    scrolled: rswidgets::common::ScrolledWindow,
+    syncing_scroll: Cell<bool>,
     // Press/release dedup trackers. GTK4-only (feature = "gtk4"): only there
     // can release events arrive as same-keyval callbacks. Everywhere else
     // (GTK3 presses-only, nwg WM_KEYDOWN-only, wasm keydown-only) every key
@@ -1053,6 +1059,57 @@ fn extend_selection(state: &GuiState, dr: isize, dc: isize) {
     state.app_mut().core.anchor = prev.or(Some(SheetCursor { row, col }));
 }
 
+/// Scrollbar domain (upper bounds) for (rows, cols): content plus the
+/// visible page plus footer padding, so upper > page always holds (a
+/// degenerate upper <= page disables the bar). The native bars need a finite
+/// domain; the sheet's margin/header bands are astronomically large.
+fn scroll_domain(state: &GuiState) -> (usize, usize) {
+    let app = state.app_ref();
+    let grid = &app.core.workbook.active_sheet().grid;
+    let ru = grid.main_rows() + state.data_rows.get().max(1) + 10;
+    let cu = grid.main_cols() + state.data_cols.get().max(1) + 10;
+    (ru.max(2), cu.max(2))
+}
+
+/// Push cursor position and domain into the native scrollbars (thumb tracks
+/// the selection). Guarded against reentrancy with the value-changed
+/// notification below. Domain and page satisfy upper > page so the bars
+/// stay live: upper covers content plus a viewport plus footer padding.
+fn sync_scrollbars(state: &GuiState) {
+    if state.syncing_scroll.get() {
+        return;
+    }
+    state.syncing_scroll.set(true);
+    let (ru, cu) = scroll_domain(state);
+    let vv = state.last_row.get().saturating_sub(HEADER_ROWS).min(ru.saturating_sub(1));
+    let hv = state.last_col.get().saturating_sub(MARGIN_COLS).min(cu.saturating_sub(1));
+    state.scrolled.scroll_to(
+        hv as f64, cu as f64, state.data_cols.get().max(1) as f64,
+        vv as f64, ru as f64, state.data_rows.get().max(1) as f64,
+    );
+    state.syncing_scroll.set(false);
+}
+
+/// Scrollbar interaction moves the cursor (selection) to the thumb-indicated
+/// cell, clamped into the domain (no grid growth from scrollbars). The
+/// per-frame viewport recompute then keeps it visible. Plain navigation, so
+/// any selection collapses via update_state_cursor.
+fn scroll_to_cursor(state: &GuiState, vertical: bool, value: f64) {
+    if state.syncing_scroll.get() {
+        return;
+    }
+    let (ru, cu) = scroll_domain(state);
+    if vertical {
+        let row = (HEADER_ROWS as f64 + value).max(HEADER_ROWS as f64) as usize;
+        let row = row.min(HEADER_ROWS + ru.saturating_sub(1));
+        update_state_cursor(state, row, state.last_col.get());
+    } else {
+        let col = (MARGIN_COLS as f64 + value).max(MARGIN_COLS as f64) as usize;
+        let col = col.min(MARGIN_COLS + cu.saturating_sub(1));
+        update_state_cursor(state, state.last_row.get(), col);
+    }
+}
+
 fn update_formula_bar(state: &GuiState, row: usize, col: usize) {
     let app = state.app_ref();
     let main_row = row.saturating_sub(HEADER_ROWS);
@@ -1519,12 +1576,19 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     formula_bar.append(&formula_entry);
     formula_bar.set_child_hexpand(&formula_entry, true);
 
-    // Canvas
+    // Canvas inside native scrollbars: the thumb tracks the cursor and
+    // scrollbar interaction moves the cursor (selection), so the selected
+    // cell is always visible. Expand flags go on BEFORE append (GTK3 freezes
+    // pack params at append time). Policy 0 = always show (GtkPolicyType).
     let canvas = rxapp.new_canvas()?;
-    canvas.set_size_request(800, 600);
+    canvas.set_size_request(1, 1);
     // Ensure the canvas can receive keyboard focus (needed after commit_edit
     // to return focus — GtkDrawingArea does not accept focus by default).
     canvas.set_can_focus(true);
+    let scrolled = rxapp.new_scrolled_window()?;
+    scrolled.set_policy(0, 0);
+    scrolled.set_child(&canvas);
+    scrolled.set_vexpand(true);
 
     // Status label
     let status_label = rxapp.new_label("Ready")?;
@@ -1555,7 +1619,19 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         return_pressed: Cell::new(false),
         #[cfg(feature = "gtk4")]
         last_keyval_dedup: Cell::new(0),
+        scrolled: scrolled.clone(),
+        syncing_scroll: Cell::new(false),
     });
+
+    // Scrollbar interaction moves the cursor (selection); the per-frame
+    // viewport recompute then keeps it visible. Reentrancy-safe: syncs
+    // from sync_scrollbars (below) set the guard.
+    {
+        let shared_scroll = shared.clone();
+        scrolled.on_scroll(Box::new(move |vertical: bool, value: f64| {
+            scroll_to_cursor(&shared_scroll, vertical, value);
+        }));
+    }
 
     // Build menu
     let menubar = build_menu(&rxapp, &win, &shared)?;
@@ -1854,9 +1930,13 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     vbox.append(&formula_bar);
     // NOTE (GTK3): expand must be set BEFORE append — pack_start freezes the
     // expand/fill params at append time, so setting vexpand after appending
-    // has no effect and the canvas would never grow vertically.
-    vbox.set_child_vexpand(&canvas, true);
-    vbox.append(&canvas);
+    // has no effect and the scrolled sheet would never grow vertically.
+    scrolled.set_vexpand(true);
+    vbox.set_child_vexpand(&scrolled, true);
+    vbox.append(&scrolled);
+    // The nwg manual box layout looks the child up by handle, so it needs
+    // the flag set AFTER append as well (a no-op repeat everywhere else).
+    vbox.set_child_vexpand(&scrolled, true);
     vbox.append(&status_label);
 
     // Register the draw callback BEFORE present() so the extensive event
@@ -1889,6 +1969,9 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                 (w as f64 - ROW_LABEL_W).max(0.0) as i32,
             ));
             shared_draw.data_rows.set(rows_to_fill_px(h));
+            // Keep the scrollbar thumb on the cursor (ranges track grid
+            // growth here too).
+            sync_scrollbars(&shared_draw);
         }
         render_grid(dc, &shared_draw, w, h);
         // Test marker: 8x8 square of 0xFEEDBE at top-left, drawn AFTER render_grid

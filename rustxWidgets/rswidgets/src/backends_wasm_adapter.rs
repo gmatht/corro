@@ -1634,6 +1634,7 @@ impl SimpleAction {
     // -----------------------------------------------------------------------
     // ScrolledWindow
     // -----------------------------------------------------------------------
+    #[derive(Clone)]
     pub struct ScrolledWindow {
         elem: HtmlDivElement,
     }

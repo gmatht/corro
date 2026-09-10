@@ -1033,6 +1033,84 @@ mod gtk_adapter {
         pub fn set_policy(&self, hscroll: u32, vscroll: u32) {
             self.0.set_policy(hscroll, vscroll);
         }
+        /// Configure both scrollbar adjustments atomically:
+        /// (value, upper, page) with lower 0 and step 1. Lower/upper define
+        /// the scroll domain, page the thumb size, value the position.
+        /// Backend-agnostic scrollbar model shared with the nwg backend:
+        /// value tracks an item index (row/col), not pixels.
+        pub fn scroll_to(&self, hval: f64, hupper: f64, hpage: f64, vval: f64, vupper: f64, vpage: f64) {
+            if let Some(loader) = crate::backends::gtk::loader() {
+                let symbols = &loader.symbols;
+                let (Some(get_h), Some(get_v), Some(configure)) = (
+                    symbols.gtk_scrolled_window_get_hadjustment,
+                    symbols.gtk_scrolled_window_get_vadjustment,
+                    symbols.gtk_adjustment_configure,
+                ) else { return; };
+                unsafe {
+                    let sw = *self.0.as_ref();
+                    if sw.is_null() {
+                        return;
+                    }
+                    let hadj = get_h(sw);
+                    let vadj = get_v(sw);
+                    if !hadj.is_null() {
+                        configure(hadj, hval, 0.0, hupper.max(1.0), 1.0, hpage.max(1.0), hpage.max(1.0));
+                    }
+                    if !vadj.is_null() {
+                        configure(vadj, vval, 0.0, vupper.max(1.0), 1.0, vpage.max(1.0), vpage.max(1.0));
+                    }
+                }
+            }
+        }
+        /// Notify on user scrollbar interaction: `cb(vertical, value)`.
+        /// Fires for thumb drags and trough clicks (both route through the
+        /// adjustment's value-changed signal).
+        /// Notify on user scrollbar interaction: `cb(vertical, value)`.
+        /// Fires for thumb drags and trough clicks (both route through the
+        /// adjustment's value-changed signal). One shared callback serves
+        /// both adjustments; connect_signal frees it via destroy notify.
+        pub fn on_scroll(&self, cb: Box<dyn FnMut(bool, f64)>) {
+            if let Some(loader) = crate::backends::gtk::loader() {
+                let symbols = &loader.symbols;
+                let (Some(get_h), Some(get_v), Some(get_val)) = (
+                    symbols.gtk_scrolled_window_get_hadjustment,
+                    symbols.gtk_scrolled_window_get_vadjustment,
+                    symbols.gtk_adjustment_get_value,
+                ) else { return; };
+                let sw = *self.0.as_ref();
+                if sw.is_null() { return; }
+                let shared: std::rc::Rc<std::cell::RefCell<Box<dyn FnMut(bool, f64)>>> =
+                    std::rc::Rc::new(std::cell::RefCell::new(cb));
+                unsafe {
+                    let hadj = get_h(sw);
+                    if !hadj.is_null() {
+                        let sc = shared.clone();
+                        let _ = gtk_dynamic_loader::connect_signal(
+                            symbols, hadj, "value-changed",
+                            Box::new(move || {
+                                if let Ok(mut f) = sc.try_borrow_mut() {
+                                    f(false, get_val(hadj));
+                                }
+                            }),
+                            0,
+                        );
+                    }
+                    let vadj = get_v(sw);
+                    if !vadj.is_null() {
+                        let sc = shared.clone();
+                        let _ = gtk_dynamic_loader::connect_signal(
+                            symbols, vadj, "value-changed",
+                            Box::new(move || {
+                                if let Ok(mut f) = sc.try_borrow_mut() {
+                                    f(true, get_val(vadj));
+                                }
+                            }),
+                            0,
+                        );
+                    }
+                }
+            }
+        }
         pub fn set_hexpand(&self, expand: bool) { self.0.set_hexpand(expand); }
         pub fn set_vexpand(&self, expand: bool) { self.0.set_vexpand(expand); }
         pub fn set_size_request(&self, w: i32, h: i32) { self.0.set_size_request(w, h); }
@@ -1215,6 +1293,7 @@ mod gtk_adapter {
     }
 
 }
+
 
 #[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
 pub use gtk_adapter::*;

@@ -599,6 +599,29 @@ mod android_adapter {
     }
 }
 
+    // Stub: present so the shared common::ScrolledWindow type resolves on
+    // android (gui code using scrollbars never runs there).
+    #[repr(transparent)]
+    #[derive(Clone, Copy)]
+    pub struct ScrolledWindow(pub *mut c_void);
+
+    impl AsRef<*mut c_void> for ScrolledWindow {
+        fn as_ref(&self) -> &*mut c_void {
+            &self.0
+        }
+    }
+
+    impl Widget for ScrolledWindow {
+        fn raw_handle(&self) -> *mut c_void {
+            self.0
+        }
+    }
+
+    pub fn create_scrolled_window() -> Result<ScrolledWindow, Error> {
+        Ok(ScrolledWindow(std::ptr::null_mut()))
+    }
+}
+
 #[cfg(target_os = "android")]
 pub use android_adapter::*;
 

@@ -1017,6 +1017,13 @@ impl ScrolledWindow {
         let inner = unsafe { ctor(std::ptr::null_mut(), std::ptr::null_mut()) };
         if inner.is_null() { return Err(Error::Other("gtk_scrolled_window_new returned null".into())); }
         unsafe { take_ownership(&symbols, &loader.version, inner); }
+        // Classic (non-overlay) scrollbars: overlay indicators fade out and
+        // reserve no space, which breaks trough-click tests and hides the
+        // bars exactly when the sheet needs them. A spreadsheet wants
+        // always-visible chrome.
+        if let Some(set_overlay) = symbols.gtk_scrolled_window_set_overlay_scrolling {
+            unsafe { set_overlay(inner, 0); }
+        }
         Ok(ScrolledWindow { inner, loader, _not_send: PhantomData })
     }
 

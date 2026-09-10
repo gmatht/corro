@@ -391,3 +391,94 @@ fn gui_deep_move_keeps_cursor_visible() {
         "expected commit at A41 after Down x40, got: {lines:?}"
     );
 }
+
+/// Scrollbar presence: a vertical scrollbar trough must run along the right
+/// edge of the grid band (uniform non-white column where grid content would
+/// otherwise reach the edge). Regression guard: canvases without scrollbars
+/// (or with dead ones) show grid/border pixels there instead.
+#[test]
+fn gui_vertical_scrollbar_present() {
+    let _guard = GUI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    assert!(std::env::var("DISPLAY").is_ok(), "requires X server (run under xvfb-run -a)");
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let path = std::env::temp_dir().join(format!("corro-gui-sbpres-{}-{}.corro", std::process::id(), id));
+    let _ = std::fs::remove_file(&path);
+
+    let mut child = spawn_gui(&path);
+    let wid = find_corro_window(child.id(), Instant::now() + Duration::from_secs(25));
+    xdotool(&["windowactivate", "--sync", &wid]);
+    std::thread::sleep(Duration::from_millis(800));
+    let png = screenshot(&wid, "sbpres");
+    let script = std::env::temp_dir().join(format!(
+        "corro-sbpres-an-{}.py",
+        COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    ));
+    // Right-edge column over the grid band: a scrollbar trough is one uniform
+    // non-white gray; grid content reaching the edge is mostly white with
+    // border/text pixels mixed in.
+    std::fs::write(&script, "import sys\nfrom PIL import Image\nfrom collections import Counter\nimg = Image.open(sys.argv[1]).convert('RGB')\nW,H = img.size\npx = img.load()\ncol = [px[W-10, y] for y in range(150, H-150, 2)]\nmc = Counter(col).most_common(1)[0]\nprint(f'{mc[0][0]} {mc[0][1]} {mc[0][2]} {mc[1]} {len(col)}')\n").expect("write analyzer");
+    let out = Command::new("python3").arg(&script).arg(&png).output().expect("python3");
+    let _ = std::fs::remove_file(&script);
+    let _ = child.kill();
+    let _ = child.wait();
+    let p: Vec<i32> = String::from_utf8_lossy(&out.stdout).trim().split_whitespace().map(|s| s.parse().unwrap_or(-99)).collect();
+    assert_eq!(p.len(), 5, "bad analyzer output");
+    let (r, g, b, count, total) = (p[0], p[1], p[2], p[3], p[4]);
+    let uniform_frac = count as f64 / total as f64;
+    let is_white = r > 250 && g > 250 && b > 250;
+    assert!(
+        !is_white && uniform_frac > 0.85,
+        "expected scrollbar trough (uniform non-white) at right edge, got rgb=({r},{g},{b}) frac={uniform_frac:.2}"
+    );
+}
+
+/// Scrollbar function: clicking the trough below the thumb must move the
+/// selection down (formula row advances), proving the bars drive the sheet.
+#[test]
+fn gui_scrollbar_trough_click_moves_down() {
+    let _guard = GUI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    assert!(std::env::var("DISPLAY").is_ok(), "requires X server (run under xvfb-run -a)");
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let path = std::env::temp_dir().join(format!("corro-gui-sbclick-{}-{}.corro", std::process::id(), id));
+    let _ = std::fs::remove_file(&path);
+
+    let mut child = spawn_gui(&path);
+    let wid = find_corro_window(child.id(), Instant::now() + Duration::from_secs(25));
+    // Window screen geometry (no WM under Xvfb: client origin == window origin).
+    let geo = xdotool(&["getwindowgeometry", "--shell", &wid]);
+    let mut wx = 0i32;
+    let mut wy = 0i32;
+    let mut ww = 0i32;
+    let mut wh = 0i32;
+    for line in geo.lines() {
+        if let Some(v) = line.strip_prefix("X=") { wx = v.trim().parse().unwrap_or(0); }
+        if let Some(v) = line.strip_prefix("Y=") { wy = v.trim().parse().unwrap_or(0); }
+        if let Some(v) = line.strip_prefix("WIDTH=") { ww = v.trim().parse().unwrap_or(0); }
+        if let Some(v) = line.strip_prefix("HEIGHT=") { wh = v.trim().parse().unwrap_or(0); }
+    }
+    assert!(ww > 100 && wh > 100, "bad geometry {ww}x{wh}");
+    xdotool(&["windowactivate", "--sync", &wid]);
+    std::thread::sleep(Duration::from_millis(400));
+    // Click the vertical trough well below the top (thumb sits at top while
+    // the cursor is on row 1): trough click pages the selection down.
+    xdotool(&["mousemove", "--sync", &(wx + ww - 10).to_string(), &(wy + wh * 3 / 4).to_string()]);
+    xdotool(&["click", "1"]);
+    std::thread::sleep(Duration::from_millis(800));
+    // Prove the selection moved down via commit (guards clicks that land on
+    // nothing: an unmoved cursor would commit at A1).
+    xdotool(&["type", "--window", &wid, "W"]);
+    std::thread::sleep(Duration::from_millis(500));
+    xdotool(&["key", "--window", &wid, "Return"]);
+    let lines = wait_file_lines(&path, Instant::now() + Duration::from_secs(10));
+    let _ = child.kill();
+    let _ = child.wait();
+    let committed_row: Option<u32> = lines.iter().find_map(|l| {
+        let rest = l.strip_prefix("SET A")?;
+        let num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        num.parse().ok()
+    });
+    assert!(
+        committed_row.map_or(false, |r| r > 5),
+        "trough click must move selection down several rows, got lines: {lines:?}"
+    );
+}

@@ -661,6 +661,7 @@ impl Overlay {
     pub fn set_size_request(&self, _w: i32, _h: i32) {}
 }
 
+#[derive(Clone)]
 pub struct ScrolledWindow {
     pub(crate) id: usize,
 }

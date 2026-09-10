@@ -1129,6 +1129,34 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
         }
     }
 
+    /// Create a scrollable container for the sheet canvas (native scrollbar
+    /// chrome around the grid on GUI backends; inert elsewhere).
+    pub fn new_scrolled_window(&self) -> Result<crate::common::ScrolledWindow, Error> {
+        #[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
+        {
+            let inner = crate::backends_gtk_adapter::create_scrolled_window()?;
+            return Ok(crate::common::ScrolledWindow { inner });
+        }
+        #[cfg(all(windows, not(feature = "zork")))]
+        {
+            let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
+            let inner = crate::backends_nwg_adapter::create_scrolled_window(parent)?;
+            return Ok(crate::common::ScrolledWindow { inner });
+        }
+        #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
+        {
+            let inner = crate::backends_wasm_adapter::create_scrolled_window()?;
+            return Ok(crate::common::ScrolledWindow { inner });
+        }
+        #[cfg(all(target_os = "android", not(feature = "zork")))]
+        {
+            let inner = crate::backends_android_adapter::create_scrolled_window()?;
+            return Ok(crate::common::ScrolledWindow { inner });
+        }
+        #[allow(unreachable_code)]
+        Err(Error::Backend("scrolled windows not supported on this backend".into()))
+    }
+
     /// Create a new Menu data model.
     pub fn new_menu(&self) -> Result<crate::common::Menu, Error> {
         #[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]

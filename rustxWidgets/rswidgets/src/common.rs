@@ -3,7 +3,7 @@
 // Platform-specific type re-exports using cfg
 macro_rules! platform_module {
     ($backend:path, $Orientation:ident) => {
-        pub use $backend::{Window, BoxWidget, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, DropDown, CheckButton, RadioButton, TextView, Orientation as $Orientation};
+        pub use $backend::{Window, BoxWidget, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, DropDown, CheckButton, RadioButton, TextView, ScrolledWindow, Orientation as $Orientation};
         pub type PlatformWindow = Window;
         pub type PlatformWidgetBox = BoxWidget;
         pub type PlatformLabel = Label;
@@ -13,6 +13,7 @@ macro_rules! platform_module {
         pub type PlatformSimpleAction = SimpleAction;
         pub type PlatformMenuBar = MenuBar;
         pub type PlatformDialog = Dialog;
+        pub type PlatformScrolledWindow = ScrolledWindow;
         #[allow(dead_code)] // not referenced by common_types_mod! on every backend
         pub type PlatformDropDown = DropDown;
         #[allow(dead_code)]
@@ -81,6 +82,8 @@ macro_rules! common_types_mod {
         pub struct MenuBar { pub inner: PlatformMenuBar }
         #[derive(Clone)]
         pub struct Dialog { pub inner: PlatformDialog }
+        #[derive(Clone)]
+        pub struct ScrolledWindow { pub inner: PlatformScrolledWindow }
 
         impl Window {
             pub fn set_title(&self, title: &str) { self.inner.set_title(title); }
@@ -215,6 +218,9 @@ macro_rules! common_types_mod {
         impl AsRef<*mut std::os::raw::c_void> for Dialog {
             fn as_ref(&self) -> &*mut std::os::raw::c_void { self.inner.as_ref() }
         }
+        impl AsRef<*mut std::os::raw::c_void> for ScrolledWindow {
+            fn as_ref(&self) -> &*mut std::os::raw::c_void { self.inner.as_ref() }
+        }
     }
 }
 
@@ -227,6 +233,15 @@ mod common_types {
             self.inner.on_key(Box::new(move |k: u32, _s: u32| -> bool { cb(k) }));
         }
     }
+    impl ScrolledWindow {
+        pub fn set_child(&self, child: &impl AsRef<*mut std::os::raw::c_void>) { self.inner.set_child(child); }
+        pub fn set_policy(&self, hscroll: u32, vscroll: u32) { self.inner.set_policy(hscroll, vscroll); }
+        pub fn set_vexpand(&self, expand: bool) { self.inner.set_vexpand(expand); }
+        pub fn scroll_to(&self, hval: f64, hupper: f64, hpage: f64, vval: f64, vupper: f64, vpage: f64) {
+            self.inner.scroll_to(hval, hupper, hpage, vval, vupper, vpage);
+        }
+        pub fn on_scroll(&self, cb: Box<dyn FnMut(bool, f64)>) { self.inner.on_scroll(cb); }
+    }
 }
 
 #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs")))]
@@ -236,6 +251,15 @@ mod common_types {
         pub fn on_key(&self, mut cb: Box<dyn FnMut(u32) -> bool>) {
             self.inner.on_key(Box::new(move |k: u32, _s: u32| -> bool { cb(k) }));
         }
+    }
+    impl ScrolledWindow {
+        pub fn set_child(&self, child: &impl AsRef<*mut std::os::raw::c_void>) { self.inner.set_child(child); }
+        pub fn set_policy(&self, hscroll: u32, vscroll: u32) { self.inner.set_policy(hscroll, vscroll); }
+        pub fn set_vexpand(&self, expand: bool) { self.inner.set_vexpand(expand); }
+        pub fn scroll_to(&self, hval: f64, hupper: f64, hpage: f64, vval: f64, vupper: f64, vpage: f64) {
+            self.inner.scroll_to(hval, hupper, hpage, vval, vupper, vpage);
+        }
+        pub fn on_scroll(&self, cb: Box<dyn FnMut(bool, f64)>) { self.inner.on_scroll(cb); }
     }
 }
 
@@ -248,6 +272,15 @@ mod common_types {
     impl Entry {
         pub fn on_key(&self, f: Box<dyn FnMut(u32) -> bool>) { self.inner.on_key(f); }
     }
+    impl ScrolledWindow {
+        pub fn set_child(&self, child: &impl AsRef<*mut std::os::raw::c_void>) { self.inner.set_child(child); }
+        pub fn set_policy(&self, hscroll: u32, vscroll: u32) { self.inner.set_policy(hscroll, vscroll); }
+        pub fn set_vexpand(&self, expand: bool) { self.inner.set_vexpand(expand); }
+        pub fn scroll_to(&self, hval: f64, hupper: f64, hpage: f64, vval: f64, vupper: f64, vpage: f64) {
+            self.inner.scroll_to(hval, hupper, hpage, vval, vupper, vpage);
+        }
+        pub fn on_scroll(&self, cb: Box<dyn FnMut(bool, f64)>) { self.inner.on_scroll(cb); }
+    }
 }
 
 #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
@@ -259,34 +292,54 @@ mod common_types {
     impl Canvas {
         pub fn on_key(&self, cb: Box<dyn FnMut(u32) -> bool>) { self.inner.on_key(cb); }
     }
+    // Wasm has no native scrollbar need here (the web view scrolls natively);
+    // these exist so gui code compiles unchanged.
+    impl ScrolledWindow {
+        pub fn set_child(&self, _child: &impl AsRef<*mut std::os::raw::c_void>) {}
+        pub fn set_policy(&self, _hscroll: u32, _vscroll: u32) {}
+        pub fn set_vexpand(&self, _expand: bool) {}
+        pub fn set_vexpand(&self, _expand: bool) {}
+        pub fn scroll_to(&self, _hval: f64, _hupper: f64, _hpage: f64, _vval: f64, _vupper: f64, _vpage: f64) {}
+        pub fn on_scroll(&self, _cb: Box<dyn FnMut(bool, f64)>) {}
+    }
 }
 
 #[cfg(all(target_os = "android", not(feature = "zork")))]
-mod common_types { common_types_mod!(); }
+mod common_types {
+    common_types_mod!();
+    impl ScrolledWindow {
+        pub fn set_child(&self, _child: &impl AsRef<*mut std::os::raw::c_void>) {}
+        pub fn set_policy(&self, _hscroll: u32, _vscroll: u32) {}
+        pub fn set_vexpand(&self, _expand: bool) {}
+        pub fn set_vexpand(&self, _expand: bool) {}
+        pub fn scroll_to(&self, _hval: f64, _hupper: f64, _hpage: f64, _vval: f64, _vupper: f64, _vpage: f64) {}
+        pub fn on_scroll(&self, _cb: Box<dyn FnMut(bool, f64)>) {}
+    }
+}
 
 #[cfg(feature = "zork")]
 mod common_types { common_types_mod!(); }
 
 #[cfg(all(feature = "gtk4-rs", target_os = "linux", not(feature = "zork")))]
-pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog};
+pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, ScrolledWindow};
 
 #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs")))]
-pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog};
+pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, ScrolledWindow};
 
 #[cfg(all(windows, not(feature = "zork")))]
-pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog};
+pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, ScrolledWindow};
 
 #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
-pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog};
+pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, ScrolledWindow};
 
 #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
-pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog};
+pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, ScrolledWindow};
 
 #[cfg(all(target_os = "android", not(feature = "zork")))]
-pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog};
+pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, ScrolledWindow};
 
 #[cfg(feature = "zork")]
-pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog};
+pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, ScrolledWindow};
 
 // Re-export Orientation from the active platform backend
 #[cfg(all(feature = "gtk4-rs", target_os = "linux", not(feature = "zork")))]

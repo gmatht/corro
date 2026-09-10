@@ -385,6 +385,12 @@ impl TextView {
 #[derive(Clone)]
 pub struct ScrolledWindow(pub gtk4::ScrolledWindow);
 impl ScrolledWindow {
+    // Scrollbar driving is not wired on GTK4 (native overlay scrolling
+    // applies); no-ops so shared gui code compiles unchanged.
+    pub fn scroll_to(&self, _hval: f64, _hupper: f64, _hpage: f64, _vval: f64, _vupper: f64, _vpage: f64) {}
+    pub fn on_scroll(&self, _cb: Box<dyn FnMut(bool, f64)>) {}
+}
+impl ScrolledWindow {
     pub fn new() -> Self { ensure_dlopen(); ScrolledWindow(gtk4::ScrolledWindow::new()) }
     pub fn set_child(&self, c: &impl AsRef<*mut std::ffi::c_void>) { self.0.set_child(Some(unsafe { &*(c.as_ref() as *const *mut _ as *const gtk4::Widget) })); }
     pub fn set_policy(&self, _h: u32, _v: u32) {}
