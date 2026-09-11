@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use super::actions::run_prompt_action;
-use super::actions::{dispatch_menu_action, MenuDispatch};
+use super::actions::{dispatch_menu_action, menu_action_needs_prompt, MenuDispatch};
 use super::extrapolate;
 
 use crate::grid::{CellAddr, SheetCursor, HEADER_ROWS, MARGIN_COLS};
@@ -1422,16 +1422,9 @@ fn handle_menu_action(name: &str, state: &Rc<GuiState>) {
             }
         }
         "save" => {
-            if let Some(ref p) = app.core.path.clone() {
-                let snapshot = crate::ops::WorkbookSnapshot::from_workbook(&app.core.workbook);
-                match crate::io::save_workbook(p, &snapshot) {
-                    Ok(()) => app.core.status = "Saved".into(),
-                    Err(e) => app.core.status = format!("Save error: {e}"),
-                }
-            } else if let Some(path) = dialogs::file_save_dialog() {
-                // No path yet: fall back to Save As (same as pancurses).
-                run_prompt_action(app, "save_as", &path.display().to_string());
-            }
+            // Shared save logic: saves directly with no dialog when a path
+            // exists, otherwise prompts Save As (same as pancurses).
+            delegate_shared_action(name, state);
         }
         "save_as" => {
             if let Some(path) = dialogs::file_save_dialog() {
@@ -1446,19 +1439,6 @@ fn handle_menu_action(name: &str, state: &Rc<GuiState>) {
         "quit" => {
             eprintln!("DEBUG handle_menu_action: quit activated");
             save_before_quit(state);
-        }
-        "find" | "replace" | "balance_books" | "rename_sheet" => {
-            // Shared search/mutate logic (same as pancurses/ratatui); the
-            // dialog only supplies the input. Previously these set a
-            // status string without doing anything.
-            let st = state.clone();
-            let action = name.to_string();
-            dialogs::find_dialog(move |result| {
-                if let Some(text) = result {
-                    run_prompt_action(st.app_mut(), &action, &text);
-                    refresh_after_dialog(&st);
-                }
-            });
         }
         "sort_asc" => {
             let wb = crate::ops::WorkbookState::default();
@@ -1503,16 +1483,6 @@ fn handle_menu_action(name: &str, state: &Rc<GuiState>) {
             // Shared selection/chrome/sheet logic (same as pancurses/ratatui).
             delegate_shared_action(name, state);
         }
-        "delete_sheet" => {
-            // Shared logic needs the sheet name: prompt, then delegate.
-            let st = state.clone();
-            dialogs::find_dialog(move |result| {
-                if let Some(text) = result {
-                    run_prompt_action(st.app_mut(), "delete_sheet", &text);
-                    refresh_after_dialog(&st);
-                }
-            });
-        }
         "export_tsv" | "export_csv" | "export_ods" | "export_ascii" | "export_all" => {
             // Shared export logic writes the file (same as pancurses/ratatui);
             // the save dialog only supplies the destination path.
@@ -1529,8 +1499,11 @@ fn handle_menu_action(name: &str, state: &Rc<GuiState>) {
             // arrive as Edit{value} and preset the edit buffer for Enter.
             delegate_shared_action(name, state);
         }
-        "insert_special_chars" | "insert_hyperlink" | "sort_view" | "persist_sort" => {
-            // Shared logic needs prompt input: ask, then delegate.
+        _ if menu_action_needs_prompt(name).is_some() => {
+            // Every other prompt-gated action funnels through the shared
+            // prompt logic; the dialog only supplies the input. Routing by
+            // the shared gate (not a hardcoded list) means a newly-added
+            // prompt action can never silently fall to the stub below.
             let st = state.clone();
             let action = name.to_string();
             dialogs::find_dialog(move |result| {
@@ -1560,16 +1533,6 @@ fn handle_menu_action(name: &str, state: &Rc<GuiState>) {
             // Shared workbook logic (same as pancurses/ratatui).
             delegate_shared_action(name, state);
         }
-        "set_max_col_width" | "set_col_width" => {
-            let st = state.clone();
-            let action = name.to_string();
-            dialogs::find_dialog(move |result| {
-                if let Some(text) = result {
-                    run_prompt_action(st.app_mut(), &action, &text);
-                    refresh_after_dialog(&st);
-                }
-            });
-        }
         "extrapolate" => {
             // Enter interactive extrapolate modal (mirrors ratatui).
             extrapolate::enter(state.app_mut());
@@ -1579,24 +1542,6 @@ fn handle_menu_action(name: &str, state: &Rc<GuiState>) {
             // reach the grid (the menu action left focus on the menu bar).
             state.canvas.grab_focus();
             state.canvas.queue_redraw();
-        }
-        "copy_sheet" => {
-            let st = state.clone();
-            dialogs::find_dialog(move |result| {
-                if let Some(text) = result {
-                    run_prompt_action(st.app_mut(), "copy_sheet", &text);
-                    refresh_after_dialog(&st);
-                }
-            });
-        }
-        "go_to_cell" => {
-            let st = state.clone();
-            dialogs::find_dialog(move |result| {
-                if let Some(text) = result {
-                    run_prompt_action(st.app_mut(), "go_to_cell", &text);
-                    refresh_after_dialog(&st);
-                }
-            });
         }
         "help_rows" => {
             app.core.status = "Row ops: select full rows, then move to target row".into();

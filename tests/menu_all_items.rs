@@ -169,9 +169,12 @@ fn every_menu_item_is_handled() {
     let mut pending_scope = 0u8;
     let mut clipboard = String::new();
 
-    // Names that the backend handles before/without the dispatcher (the pancurses
-    // backend sets running=false for "quit"; these have no dispatch work to do).
-    let backend_special: HashSet<&'static str> = ["quit"].into_iter().collect();
+    // Names that the backend handles before/without the dispatcher: "quit"
+    // (the pancurses backend sets running=false) and "extrapolate" (both GUI
+    // backends enter the interactive modal before dispatch runs, so the
+    // dispatcher has deliberately no arm for it). These have no dispatch work
+    // to do.
+    let backend_special: HashSet<&'static str> = ["quit", "extrapolate"].into_iter().collect();
 
     let leaves = all_leaves();
     let mut failures = Vec::new();
@@ -541,4 +544,63 @@ fn gui_routing_covers_every_menu_item() {
         !uncovered.is_empty(),
         "shared-dispatch remainder is empty; the classification above is vacuous"
     );
+}
+
+/// The ratatui reference menu tables and the shared `gui::menu::menu_bar()`
+/// tree must enumerate the same items with the same shortcut letters, or the
+/// backends' menus have drifted (same labels, same mnemonics everywhere).
+/// Multiset comparison: catches items missing, duplicated, renamed, or
+/// re-shortcutted on either side. Submenu containers count too (Export,
+/// Width, Scope, Number, Align exist as navigable entries in both).
+#[cfg(feature = "ratatui")]
+#[test]
+fn ratatui_and_gui_menus_enumerate_the_same_items() {
+    let mut reference: Vec<(String, char)> = corro::ui::all_menu_shortcuts()
+        .into_iter()
+        .map(|(sc, label)| (label.to_string(), sc))
+        .collect();
+    // All tree nodes with shortcuts: leaves plus submenu containers (which
+    // carry a shortcut in the shared tree, e.g. Export (T)).
+    fn walk_all(items: &[MenuAction], out: &mut Vec<(String, String)>) {
+        for it in items {
+            out.push((it.label.to_string(), it.shortcut.to_string()));
+            if let Some(sub) = it.submenu.as_deref() {
+                walk_all(sub, out);
+            }
+        }
+    }
+    // Skip the six roots (File/Edit/... carry no shortcut in either model).
+    let mut nodes: Vec<(String, String)> = Vec::new();
+    for root in menu_bar() {
+        if let Some(sub) = root.submenu.as_deref() {
+            walk_all(sub, &mut nodes);
+        }
+    }
+    let mut tree: Vec<(String, char)> = nodes
+        .iter()
+        .map(|(label, sc)| {
+            let mut chars = sc.chars();
+            let (first, second) = (chars.next(), chars.next());
+            assert!(
+                first.is_some() && second.is_none(),
+                "menu item '{label}' must carry exactly one shortcut letter, got {sc:?}"
+            );
+            (label.clone(), first.unwrap())
+        })
+        .collect();
+    reference.sort_unstable();
+    tree.sort_unstable();
+    assert_eq!(
+        reference.len(),
+        tree.len(),
+        "menu item counts diverged (ratatui {}, gui tree {})",
+        reference.len(),
+        tree.len()
+    );
+    for (r, t) in reference.iter().zip(tree.iter()) {
+        assert_eq!(
+            r, t,
+            "menu mismatch: ratatui has {r:?} where the shared tree has {t:?}"
+        );
+    }
 }

@@ -24,6 +24,19 @@ use crate::ops::{AggFunc, AggregateDef, SheetState};
 pub use crate::addr::ui_column_fragment as col_header_label;
 pub use crate::addr::ui_row_label as sheet_row_label;
 
+/// Today's date as `YYYY-MM-DD` in local time: the Insert > Date preset.
+/// Shared by the ratatui reference and the GUI dispatch so every backend
+/// presets (and tests assert) byte-identical values.
+pub fn today_string() -> String {
+    chrono::Local::now().format("%Y-%m-%d").to_string()
+}
+
+/// Current clock time as `HH:MM:SS` in local time: the Insert > Time preset.
+/// Shared like [`today_string`].
+pub fn clock_string() -> String {
+    chrono::Local::now().format("%H:%M:%S").to_string()
+}
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------

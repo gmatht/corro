@@ -822,6 +822,22 @@ const HELP_MENU_ITEMS: [MenuItem; 4] = [
 // ── Viewport helpers (main_row_window, main_col_window, footer_nonblank_end, etc.)
 // provided by crate::ui_core — imported via `use crate::ui_core::*`.
 
+/// All (shortcut, label) pairs across every menu section, in section order.
+/// Used by cross-backend parity tests to lock the ratatui menu definition to
+/// the shared `gui::menu::menu_bar()` tree: both must enumerate the same
+/// items or the menus have drifted (same labels, same shortcut letters).
+pub fn all_menu_shortcuts() -> Vec<(char, &'static str)> {
+    use MenuSection::*;
+    [
+        Edit, File, Format, FormatScope, FormatNumber, FormatAlign, Sheet, Insert,
+        Export, Width, Help,
+    ]
+    .iter()
+    .flat_map(|s| menu_items(*s))
+    .map(|it| (it.shortcut, it.label))
+    .collect()
+}
+
 fn menu_items(section: MenuSection) -> &'static [MenuItem] {
     match section {
         MenuSection::Edit => &EDIT_MENU_ITEMS,
@@ -1345,7 +1361,7 @@ impl App {
                 self.mode.clone()
             }
             MenuAction::InsertDate => self.start_edit_mode(
-                chrono::Local::now().format("%Y-%m-%d").to_string(),
+                crate::ui_core::today_string(),
                 None,
                 None,
                 false,
@@ -1353,7 +1369,7 @@ impl App {
                 None,
             ),
             MenuAction::InsertTime => self.start_edit_mode(
-                chrono::Local::now().format("%H:%M:%S").to_string(),
+                crate::ui_core::clock_string(),
                 None,
                 None,
                 false,
@@ -10676,17 +10692,17 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
             if let KeyCode::Char(ch) = key.code {
                 match ch {
                     ';' if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                        let buffer = chrono::Local::now().format("%H:%M:%S").to_string();
+                        let buffer = crate::ui_core::clock_string();
                         self.mode = self.start_edit_mode(buffer, None, None, false, false, None);
                         return Ok(false);
                     }
                     ':' => {
-                        let buffer = chrono::Local::now().format("%H:%M:%S").to_string();
+                        let buffer = crate::ui_core::clock_string();
                         self.mode = self.start_edit_mode(buffer, None, None, false, false, None);
                         return Ok(false);
                     }
                     ';' => {
-                        let buffer = chrono::Local::now().format("%Y-%m-%d").to_string();
+                        let buffer = crate::ui_core::today_string();
                         self.mode = self.start_edit_mode(buffer, None, None, false, true, None);
                         return Ok(false);
                     }

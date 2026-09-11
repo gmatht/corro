@@ -10,7 +10,6 @@
 use crate::grid::{CellAddr, CellFormat, NumberFormat, SheetCursor, TextAlign, HEADER_ROWS, MARGIN_COLS};
 use crate::ops::{Op, SheetState, WorkbookOp};
 use crate::gui::App;
-use chrono;
 
 /// Set a main cell value in the grid and log it to the live `.corro` file (if any).
 pub fn commit_cell(app: &mut App, addr: CellAddr, value: String) {
@@ -54,6 +53,42 @@ pub fn main_addr_label(row: u32, col: u32) -> String {
         c = c / 26 - 1;
     }
     format!("{}{}", name, row + 1)
+}
+
+/// Format-scope menu actions as data: (action name, scope id, status text).
+/// One table instead of six near-identical match arms.
+const FORMAT_SCOPES: &[(&str, u8, &str)] = &[
+    ("format_apply_all", 1, "Format scope: All"),
+    ("format_apply_full_column", 2, "Format scope: Full column"),
+    ("format_apply_data", 3, "Format scope: Data"),
+    ("format_apply_special", 4, "Format scope: Special"),
+    ("format_apply_cell", 0, "Format scope: Cell"),
+    ("format_apply_selection", 5, "Format scope: Selection"),
+];
+
+fn format_scope(name: &str) -> Option<(u8, &'static str)> {
+    FORMAT_SCOPES.iter().find(|(n, _, _)| *n == name).map(|(_, s, t)| (*s, *t))
+}
+
+/// Format-value menu actions as data: (action name, format, status text).
+/// One table instead of eleven near-identical match arms.
+const FORMAT_VALUES: &[(&str, CellFormat, &str)] = &[
+    ("format_decimal_generic", CellFormat { number: Some(NumberFormat::DecimalGeneric), align: None }, "Format: Decimal (generic)"),
+    ("format_currency", CellFormat { number: Some(NumberFormat::Currency { decimals: 2 }), align: None }, "Format: Currency ($)"),
+    ("format_rational", CellFormat { number: Some(NumberFormat::Rational), align: None }, "Format: Rational"),
+    ("format_fixed_0", CellFormat { number: Some(NumberFormat::Fixed { decimals: 0 }), align: None }, "Format: Fixed 0"),
+    ("format_fixed_1", CellFormat { number: Some(NumberFormat::Fixed { decimals: 1 }), align: None }, "Format: Fixed 1"),
+    ("format_fixed_2", CellFormat { number: Some(NumberFormat::Fixed { decimals: 2 }), align: None }, "Format: Fixed 2"),
+    ("format_fixed_custom", CellFormat { number: Some(NumberFormat::Fixed { decimals: 2 }), align: None }, "Format: Fixed n"),
+    ("format_align_left", CellFormat { number: None, align: Some(TextAlign::Left) }, "Format: Align Left"),
+    ("format_align_center", CellFormat { number: None, align: Some(TextAlign::Center) }, "Format: Align Center"),
+    ("format_align_right", CellFormat { number: None, align: Some(TextAlign::Right) }, "Format: Align Right"),
+    ("format_align_default", CellFormat { number: None, align: Some(TextAlign::Default) }, "Format: Align Default"),
+    ("format_reset", CellFormat { number: None, align: None }, "Format reset"),
+];
+
+fn format_value(name: &str) -> Option<(CellFormat, &'static str)> {
+    FORMAT_VALUES.iter().find(|(n, _, _)| *n == name).map(|(_, f, t)| (*f, *t))
 }
 
 /// Apply `fmt` to a format target scope (0=Cell,1=All,2=Full column,3=Data,4=Special,5=Selection).
@@ -321,13 +356,13 @@ pub fn dispatch_menu_action(
             // Enter edit mode with the date as the in-progress buffer,
             // matching ratatui's InsertDate (start_edit_mode). The user
             // presses Enter to commit.
-            let d = chrono::Local::now().format("%Y-%m-%d").to_string();
+            let d = crate::ui_core::today_string();
             MenuDispatch::Edit { value: d }
         }
         "insert_time" => {
             // Enter edit mode with the time as the in-progress buffer,
             // matching ratatui's InsertTime.
-            let t = chrono::Local::now().format("%H:%M:%S").to_string();
+            let t = crate::ui_core::clock_string();
             MenuDispatch::Edit { value: t }
         }
         "delete_cell" | "delete" => {
@@ -422,26 +457,12 @@ pub fn dispatch_menu_action(
                 MenuDispatch::Status("Replay: no file loaded".into())
             }
         }
-        "extrapolate" => {
-            // Extrapolate the cursor cell's value one step down (matching
-            // ratatui's Extrapolate on a single-cell seed).
-            let val = app.core.workbook.active_sheet().grid.get(&addr).unwrap_or_default();
-            if val.is_empty() {
-                MenuDispatch::Status("Select cells with a pattern, then Extrapolate".into())
-            } else {
-                let seed = vec![val];
-                let main_cols = app.core.workbook.active_sheet().grid.main_cols();
-                if let Some(filled) = crate::extrapolate::infer_fill_value(
-                    &seed, 1, crate::extrapolate::FillDirection::Down, main_cols,
-                ) {
-                    let below = CellAddr::Main { row: main_row + 1, col: main_col };
-                    commit_cell(app, below, filled);
-                    MenuDispatch::Status("Extrapolated selection".into())
-                } else {
-                    MenuDispatch::Status("Select cells with a pattern, then Extrapolate".into())
-                }
-            }
-        }
+        // NOTE: no "extrapolate" arm here on purpose. Both GUI backends
+        // enter the interactive extrapolate modal before dispatch runs
+        // (pancurses intercepts it in the menu callback, GTK has its own
+        // modal arm), so a one-shot arm would be dead code — and a wrong one
+        // (it would overwrite the cell below the cursor). The modal commits
+        // through extrapolate_cells, shared with the ratatui reference.
         "duplicate" => {
             // Duplicate the cursor row (matching ratatui's Duplicate mode
             // Enter on a single cell, which inserts a mitosis row).
@@ -495,24 +516,14 @@ pub fn dispatch_menu_action(
         "help_rows" => MenuDispatch::Status("Row ops: v·select full rows, then r·move to target row".into()),
         "help_cols" => MenuDispatch::Status("Col ops: v·select full columns, then c·move to target column".into()),
         "help_full" => MenuDispatch::HelpFull { status: "Help: Full help".into() },
-        "format_apply_all" => { *pending_scope = 1; MenuDispatch::Status("Format scope: All".into()) }
-        "format_apply_full_column" => { *pending_scope = 2; MenuDispatch::Status("Format scope: Full column".into()) }
-        "format_apply_data" => { *pending_scope = 3; MenuDispatch::Status("Format scope: Data".into()) }
-        "format_apply_special" => { *pending_scope = 4; MenuDispatch::Status("Format scope: Special".into()) }
-        "format_apply_cell" => { *pending_scope = 0; MenuDispatch::Status("Format scope: Cell".into()) }
-        "format_apply_selection" => { *pending_scope = 5; MenuDispatch::Status("Format scope: Selection".into()) }
-        "format_decimal_generic" => { apply_format(app, *pending_scope, main_row, main_col, CellFormat { number: Some(NumberFormat::DecimalGeneric), align: None }); MenuDispatch::Status("Format: Decimal (generic)".into()) }
-        "format_currency" => { apply_format(app, *pending_scope, main_row, main_col, CellFormat { number: Some(NumberFormat::Currency { decimals: 2 }), align: None }); MenuDispatch::Status("Format: Currency ($)".into()) }
-        "format_rational" => { apply_format(app, *pending_scope, main_row, main_col, CellFormat { number: Some(NumberFormat::Rational), align: None }); MenuDispatch::Status("Format: Rational".into()) }
-        "format_fixed_0" => { apply_format(app, *pending_scope, main_row, main_col, CellFormat { number: Some(NumberFormat::Fixed { decimals: 0 }), align: None }); MenuDispatch::Status("Format: Fixed 0".into()) }
-        "format_fixed_1" => { apply_format(app, *pending_scope, main_row, main_col, CellFormat { number: Some(NumberFormat::Fixed { decimals: 1 }), align: None }); MenuDispatch::Status("Format: Fixed 1".into()) }
-        "format_fixed_2" => { apply_format(app, *pending_scope, main_row, main_col, CellFormat { number: Some(NumberFormat::Fixed { decimals: 2 }), align: None }); MenuDispatch::Status("Format: Fixed 2".into()) }
-        "format_fixed_custom" => { apply_format(app, *pending_scope, main_row, main_col, CellFormat { number: Some(NumberFormat::Fixed { decimals: 2 }), align: None }); MenuDispatch::Status("Format: Fixed n".into()) }
-        "format_align_left" => { apply_format(app, *pending_scope, main_row, main_col, CellFormat { number: None, align: Some(TextAlign::Left) }); MenuDispatch::Status("Format: Align Left".into()) }
-        "format_align_center" => { apply_format(app, *pending_scope, main_row, main_col, CellFormat { number: None, align: Some(TextAlign::Center) }); MenuDispatch::Status("Format: Align Center".into()) }
-        "format_align_right" => { apply_format(app, *pending_scope, main_row, main_col, CellFormat { number: None, align: Some(TextAlign::Right) }); MenuDispatch::Status("Format: Align Right".into()) }
-        "format_align_default" => { apply_format(app, *pending_scope, main_row, main_col, CellFormat { number: None, align: Some(TextAlign::Default) }); MenuDispatch::Status("Format: Align Default".into()) }
-        "format_reset" => { apply_format(app, *pending_scope, main_row, main_col, CellFormat { number: None, align: None }); MenuDispatch::Status("Format reset".into()) }
+        _ if let Some((scope, status)) = format_scope(name) => {
+            *pending_scope = scope;
+            MenuDispatch::Status(status.into())
+        }
+        _ if let Some((fmt, status)) = format_value(name) => {
+            apply_format(app, *pending_scope, main_row, main_col, fmt);
+            MenuDispatch::Status(status.into())
+        }
         "about" => MenuDispatch::About { status: "About".into() },
         "help_keybinds" => MenuDispatch::HelpKeybinds { status: "Help".into() },
         "toggle_headers" | "toggle_margins" => MenuDispatch::Status(format!("Toggle: {name} (fixed chrome in this build)")),

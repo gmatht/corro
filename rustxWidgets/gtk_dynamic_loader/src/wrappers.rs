@@ -2171,6 +2171,16 @@ impl Clone for SimpleAction {
 /// GTK4: uses GtkPopoverMenuBar from GMenuModel.
 /// GTK3: builds GtkMenuBar from the Rust-side Menu item list.
 /// Implements AsRef<*mut c_void> so it can be packed into a Box.
+/// Extract the '_' mnemonic marker from a menu label ("Save _as" -> 'A').
+/// Returns None when the label carries no marker. All mnemonic search sites
+/// share this so the rule lives in exactly one place.
+fn mnemonic_of(label: &str) -> Option<char> {
+    label
+        .chars()
+        .skip_while(|&c| c != '_')
+        .nth(1)
+        .map(|c| c.to_ascii_uppercase())
+}
 pub struct MenuBar {
     inner: *mut c_void,
     loader: Arc<Loader>,
@@ -2286,6 +2296,7 @@ impl MenuBar {
         }
     }
 
+
     /// Activate the submenu whose mnemonic label matches `keyval`.
     /// Returns true if a matching button was found and activated.
     pub fn activate_submenu_by_mnemonic(&self, keyval: u32) -> bool {
@@ -2353,11 +2364,7 @@ impl MenuBar {
             action_group: *mut c_void) -> bool
         {
             for sub_item in items {
-                if let Some(m) = sub_item.label.chars()
-                    .skip_while(|&c| c != '_')
-                    .nth(1)
-                    .map(|c| c.to_ascii_uppercase())
-                {
+                if let Some(m) = mnemonic_of(&sub_item.label) {
                     if m == key_upper && !sub_item.detailed_action.is_empty() {
                         let action_name = sub_item.detailed_action
                             .rsplit('.')
@@ -2483,11 +2490,7 @@ impl MenuBar {
             action_group: *mut c_void) -> Option<String>
         {
             for sub_item in items {
-                if let Some(m) = sub_item.label.chars()
-                    .skip_while(|&c| c != '_')
-                    .nth(1)
-                    .map(|c| c.to_ascii_uppercase())
-                {
+                if let Some(m) = mnemonic_of(&sub_item.label) {
                     if m == key_upper && !sub_item.detailed_action.is_empty() {
                         let action_name = sub_item.detailed_action
                             .rsplit('.')
@@ -2583,9 +2586,9 @@ impl MenuBar {
             let key_upper = char::from_u32(keyval)
                 .map(|c| c.to_ascii_uppercase()).unwrap_or('\0');
             for (i, item) in self.model_items.iter().enumerate() {
-                // Look for _<char> mnemonic; if no '_' found, use first char as mnemonic.
-                let m = item.label.chars()
-                    .skip_while(|&c| c != '_').nth(1)
+                // Explicit '_' marker wins; otherwise first char (top-level
+                // items carry no shortcut, so "_File"-style first letters).
+                let m = mnemonic_of(&item.label)
                     .or_else(|| item.label.chars().next())
                     .map(|c| c.to_ascii_uppercase());
                 if let Some(m) = m {
