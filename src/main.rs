@@ -84,6 +84,29 @@ fn cli_args() -> impl Iterator<Item = String> {
     win95_args().into_iter().skip(1)
 }
 
+/// Default UI implied by the program name (busybox-style argv[0] dispatch):
+/// invoked as `pcorro*` prefers the pancurses UI, as `gcorro*` the GUI.
+/// Returns None when the name requests nothing or the requested backend is
+/// not compiled in (callers fall back to [`determine_default_ui`]); explicit
+/// `--gui`/`--ratatui`/`--pancurses` flags always win over this default.
+fn argv0_ui(program: &str) -> Option<UiKind> {
+    let base = program.rsplit(|c| c == '/' || c == '\\').next().unwrap_or(program);
+    let base = base
+        .strip_suffix(".exe")
+        .or_else(|| base.strip_suffix(".EXE"))
+        .unwrap_or(base);
+    let lower = base.to_ascii_lowercase();
+    #[cfg(feature = "pancurses")]
+    if lower.starts_with("pcorro") {
+        return Some(UiKind::Pancurses);
+    }
+    #[cfg(feature = "gui")]
+    if lower.starts_with("gcorro") {
+        return Some(UiKind::Gui);
+    }
+    None
+}
+
 #[cfg(not(all(target_family = "rust9x", target_env = "msvc")))]
 fn cli_args() -> impl Iterator<Item = String> {
     std::env::args().skip(1)
@@ -137,7 +160,18 @@ fn parse_args() -> Result<Args, String> {
     let mut show_help = false;
     let mut show_version = false;
     let debug_no_number = false;
-    let mut ui = determine_default_ui();
+    let mut ui = {
+        // argv[0] dispatch comes first so explicit flags below can override
+        // it; a non-matching or uncompiled name falls back to the default.
+        #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+        let argv0 = win95_args().into_iter().next();
+        #[cfg(not(all(target_family = "rust9x", target_env = "msvc")))]
+        let argv0 = std::env::args().next();
+        argv0
+            .as_deref()
+            .and_then(argv0_ui)
+            .unwrap_or_else(determine_default_ui)
+    };
     let mut capture_html = None;
     let mut convert_ansi = None;
     let mut positional = Vec::new();
@@ -581,6 +615,10 @@ fn cli_help_text() -> String {
     { ui_opts.push_str("  --gui                    Use GTK native GUI\n"); }
     #[cfg(feature = "pancurses")]
     { ui_opts.push_str("  --pancurses              Use pancurses terminal UI\n"); }
+    #[cfg(feature = "pancurses")]
+    { ui_opts.push_str("  (invoked as pcorro* defaults to pancurses)\n"); }
+    #[cfg(feature = "gui")]
+    { ui_opts.push_str("  (invoked as gcorro* defaults to the GUI)\n"); }
     format!(
         "corro {}\n\
 \n\
@@ -725,7 +763,13 @@ mod tests {
         S: Into<std::ffi::OsString> + Clone,
     {
         let mut it = iter.into_iter();
-        let _program = it.next();
+        let program = it.next();
+        let mut ui = program
+            .clone()
+            .map(|p| p.into().to_string_lossy().into_owned())
+            .as_deref()
+            .and_then(super::argv0_ui)
+            .unwrap_or_else(super::determine_default_ui);
         let mut revision = None;
         let mut export = None;
         let mut movie = false;
@@ -734,7 +778,6 @@ mod tests {
         let mut movie_menu_hold_ms = 1200u64;
         let mut show_help = false;
         let mut show_version = false;
-        let mut ui = super::determine_default_ui();
         let mut positional = Vec::new();
         let mut rest = it.peekable();
 
@@ -863,6 +906,70 @@ mod tests {
         assert!(matches!(
             parse_args_from(["corro", "--gui"]).ui,
             super::UiKind::Gui
+        ));
+    }
+
+    #[test]
+    fn argv0_selects_default_backend() {
+        // Busybox-style dispatch: the program name selects the default UI.
+        // Explicit flags still win (covered by the next test).
+        #[cfg(feature = "pancurses")]
+        assert!(matches!(
+            parse_args_from(["pcorro"]).ui,
+            super::UiKind::Pancurses
+        ));
+        #[cfg(feature = "gui")]
+        assert!(matches!(
+            parse_args_from(["gcorro"]).ui,
+            super::UiKind::Gui
+        ));
+        // Prefix, path, .exe suffix, and case variants all dispatch.
+        #[cfg(feature = "pancurses")]
+        assert!(matches!(
+            parse_args_from(["/usr/local/bin/pcorro-debug"]).ui,
+            super::UiKind::Pancurses
+        ));
+        #[cfg(feature = "gui")]
+        assert!(matches!(
+            parse_args_from(["C:\\tools\\GCORRO.EXE"]).ui,
+            super::UiKind::Gui
+        ));
+        // Unrelated names fall back to the normal default.
+        #[cfg(all(not(target_arch = "wasm32"), feature = "ratatui"))]
+        assert!(matches!(
+            parse_args_from(["corro"]).ui,
+            super::UiKind::Ratatui
+        ));
+        // An argv[0]-requested backend that is not compiled in falls back
+        // to the normal default instead of erroring.
+        #[cfg(all(
+            not(target_arch = "wasm32"),
+            feature = "ratatui",
+            not(feature = "pancurses")
+        ))]
+        assert!(matches!(
+            parse_args_from(["pcorro"]).ui,
+            super::UiKind::Ratatui
+        ));
+    }
+
+    #[test]
+    fn explicit_ui_flags_override_argv0() {
+        // An explicit flag always beats the program-name default.
+        #[cfg(all(feature = "gui", feature = "ratatui"))]
+        assert!(matches!(
+            parse_args_from(["pcorro", "--gui"]).ui,
+            super::UiKind::Gui
+        ));
+        #[cfg(all(feature = "pancurses", feature = "ratatui"))]
+        assert!(matches!(
+            parse_args_from(["gcorro", "--pancurses"]).ui,
+            super::UiKind::Pancurses
+        ));
+        #[cfg(all(feature = "ratatui", feature = "gui"))]
+        assert!(matches!(
+            parse_args_from(["gcorro", "--ratatui"]).ui,
+            super::UiKind::Ratatui
         ));
     }
 
