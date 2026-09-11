@@ -413,12 +413,13 @@ fn cols_to_fill_px(app: &super::App, cursor: SheetCursor, avail_px: i32) -> usiz
     // The grid is exhausted exactly when every column is returned (column
     // indices live in [0, total), so len >= total means full coverage).
     let total = MARGIN_COLS + sheet.grid.main_cols() + MARGIN_COLS;
+    let mc = sheet.grid.main_cols();
     let mut dim = 1usize;
     loop {
         let (cols, _) = ui_core::visible_col_indices(sheet, cursor, dim, 0);
         let used: f64 = cols
             .iter()
-            .map(|&c| sheet_rec_col_width(sheet, c) as f64 * CHAR_W)
+            .map(|&c| display_col_width(sheet, c, mc) as f64 * CHAR_W)
             .sum();
         // Exit when covered, capped, or exhausted. Never exit on
         // `cols.len() < dim`: visible_col_indices may legitimately return
@@ -455,7 +456,9 @@ fn paint_row_headers(
         let label = crate::addr::ui_row_label(logical_row, mr);
         let (_, _, tw, _) = dc.text_extents_styled(&label, "monospace", FONT_SIZE, 0, 1);
         dc.fill_rect(0.0, ry, ROW_LABEL_W, ROW_H, 0.9, 0.9, 0.9, 1.0);
-        dc.draw_text_styled(ROW_LABEL_W - tw - 4.0, ry + 2.0, &label, "monospace", FONT_SIZE, 0.3, 0.3, 0.3, 1.0, 0, 1);
+        // Row numbers sit 6px off the gutter's right gridline so glyphs
+        // never touch it.
+        dc.draw_text_styled(ROW_LABEL_W - tw - 6.0, ry + 2.0, &label, "monospace", FONT_SIZE, 0.3, 0.3, 0.3, 1.0, 0, 1);
         // Padlock at the gutter's left edge (short labels only): the label
         // is right-aligned, so the left side always has room.
         if wants_padlock(&label) {
@@ -492,11 +495,18 @@ fn paint_col_headers(
         let col_name = crate::addr::ui_column_fragment(c, mc);
         dc.fill_rect(cx, 0.0, cw, HEADER_H, 0.9, 0.9, 0.9, 1.0);
         let (_, _, tw, _) = dc.text_extents_styled(&col_name, "monospace", FONT_SIZE, 0, 1);
-        let tx = cx + (cw - tw) / 2.0;
+        // Label and padlock center as a unit, so the icon fits inside its
+        // own column instead of dangling past the gridline: the column is
+        // one character wider than recorded (see display_col_width)
+        // precisely to hold this group.
+        let lock = wants_padlock(&col_name);
+        let group = tw + if lock { 2.0 + PADLOCK_W } else { 0.0 };
+        let tx = cx + (cw - group) / 2.0;
         dc.draw_text_styled(tx, (HEADER_H - FONT_SIZE * 1.2) / 2.0, &col_name, "monospace", FONT_SIZE, 0.3, 0.3, 0.3, 1.0, 0, 1);
-        // Padlock right after the centered text (may overlay the neighbor
-        // gutter background in narrow columns; it stays fully clickable).
-        if wants_padlock(&col_name) {
+        // Padlock right after the centered text, inside its own column: the
+        // column is one character wider than recorded (see display_col_width)
+        // precisely so this icon fits without spilling over the neighbor.
+        if lock {
             let locked = pinned.contains(&c);
             let (px, py) = (tx + tw + 2.0, (HEADER_H - PADLOCK_H) / 2.0);
             paint_padlock(dc, px, py, locked);
@@ -650,7 +660,7 @@ fn render_grid(dc: &mut dyn DrawContext, state: &GuiState, w: i32, h: i32) {
     let mc = app.core.workbook.active_sheet().grid.main_cols();
 
     let col_widths: HashMap<usize, usize> = col_ixs.iter()
-        .map(|&c| (c, sheet_rec_col_width(&app.core.workbook.active_sheet(), c)))
+        .map(|&c| (c, display_col_width(&app.core.workbook.active_sheet(), c, mc)))
         .collect();
 
     // Row headers (padlock hit rects refresh every frame for click mapping).
@@ -728,6 +738,17 @@ fn render_grid(dc: &mut dyn DrawContext, state: &GuiState, w: i32, h: i32) {
 
 fn sheet_rec_col_width(sheet: &crate::ops::SheetState, col: usize) -> usize {
     sheet.grid.col_width(col).max(1)
+}
+
+/// On-screen width of a column in characters: the recorded width plus one
+/// spare character when the column header carries a padlock, so the icon
+/// fits inside its own column instead of overlapping the neighbor's
+/// gridline. Single source of truth for every width accumulation (render
+/// headers, render cells, click mapping, viewport sizing) — they must all
+/// agree or columns misalign.
+fn display_col_width(sheet: &crate::ops::SheetState, c: usize, mc: usize) -> usize {
+    sheet_rec_col_width(sheet, c)
+        + usize::from(wants_padlock(&crate::addr::ui_column_fragment(c, mc)))
 }
 
 // ---------------------------------------------------------------------------
@@ -1482,9 +1503,10 @@ fn handle_click(x: f64, y: f64, state_rc: &Rc<GuiState>) {
         return;
     }
     let col_ixs: Vec<usize> = displayed_cols(state);
+    let mc = app.core.workbook.active_sheet().grid.main_cols();
     let mut cx = ROW_LABEL_W;
     for &c in &col_ixs {
-        let cw = sheet_rec_col_width(&app.core.workbook.active_sheet(), c) as f64 * CHAR_W;
+        let cw = display_col_width(&app.core.workbook.active_sheet(), c, mc) as f64 * CHAR_W;
         if x >= cx && x < cx + cw {
             let ri = ((y - HEADER_H) / ROW_H) as usize;
             // Same pinned-first display set the renderer uses, or clicks
@@ -2418,6 +2440,17 @@ mod gutter_tests {
         assert_eq!(hits.len(), 2, "short row labels need padlocks, got {hits:?}");
         assert!(hits.iter().all(|h| h.is_row && !h.locked));
         assert_eq!((hits[0].x, hits[0].w), (2.0, PADLOCK_W));
+        // Row numbers sit 6px off the gutter's right gridline (headless
+        // measures "1" at 8px wide: 50 - 8 - 6 = 36), never touching it.
+        let xs: Vec<f64> = dc
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                DrawOp::StyledText { text, x, .. } if text == "1" => Some(*x),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(xs, vec![ROW_LABEL_W - 8.0 - 6.0], "row number x, got {xs:?}");
     }
 
     /// Column gutter labels must paint bold (weight 1), with the column name.
@@ -2683,10 +2716,13 @@ mod fill_tests {
             let cursor = SheetCursor { row: HEADER_ROWS, col: MARGIN_COLS - depth };
             let dim = cols_to_fill_px(&app, cursor, 1220);
             let sheet = app.core.workbook.active_sheet();
+            let mc = sheet.grid.main_cols();
             let (cols, _) = ui_core::visible_col_indices(sheet, cursor, dim, 0);
+            // Same display widths the renderer uses (padlock columns are one
+            // char wider); recomputing with recorded widths would undercount.
             let used_px: usize = cols
                 .iter()
-                .map(|&c| sheet_rec_col_width(sheet, c))
+                .map(|&c| display_col_width(sheet, c, mc))
                 .sum::<usize>()
                 * CHAR_W as usize;
             assert!(
@@ -2697,6 +2733,73 @@ mod fill_tests {
         }
     }
 
+    /// display_col_width spares exactly one extra character for padlock
+    /// columns (short gutter labels) and none otherwise — the +1 the
+    /// renderer relies on so the icon fits inside its own column.
+    #[test]
+    fn display_col_width_spares_a_char_for_padlock_columns() {
+        let app = overflow_app();
+        let sheet = app.core.workbook.active_sheet();
+        let mc = sheet.grid.main_cols();
+        let mut saw_pad = false;
+        let mut saw_plain = false;
+        // Deep margin (long labels) and the A1 neighborhood (short labels).
+        for c in (0..8).chain(MARGIN_COLS - 4..MARGIN_COLS + 8) {
+            let label = crate::addr::ui_column_fragment(c, mc);
+            let extra = display_col_width(sheet, c, mc) - sheet_rec_col_width(sheet, c);
+            assert_eq!(
+                extra,
+                usize::from(wants_padlock(&label)),
+                "col {c} ({label:?}): extra width must match padlock eligibility"
+            );
+            saw_pad |= extra == 1;
+            saw_plain |= extra == 0;
+        }
+        assert!(saw_pad, "expected padlock columns near A1");
+        assert!(saw_plain, "expected plain columns in the deep margin");
+    }
+
+    /// Every padlock painted with production widths must end inside its own
+    /// column (no spill over the neighbor's gridline). Regression: the icon
+    /// hung past narrow margin columns.
+    #[test]
+    fn padlocks_fit_inside_their_widened_columns() {
+        use rswidgets::backends::headless::RecordingDrawContext;
+        use std::collections::BTreeSet;
+        let app = overflow_app();
+        let sheet = app.core.workbook.active_sheet();
+        let mc = sheet.grid.main_cols();
+        let cursor = SheetCursor { row: HEADER_ROWS, col: MARGIN_COLS };
+        let (cols, _) = ui_core::visible_col_indices(sheet, cursor, 12, 0);
+        let widths: HashMap<usize, usize> = cols
+            .iter()
+            .map(|&c| (c, display_col_width(sheet, c, mc)))
+            .collect();
+        let mut dc = RecordingDrawContext::new();
+        let mut hits = Vec::new();
+        paint_col_headers(&mut dc, &cols, &widths, mc, &BTreeSet::new(), &mut hits);
+        assert!(!hits.is_empty(), "expected padlock columns in the A1 view");
+        // Replay the paint's x-accumulation; each padlock's right edge must
+        // not pass its own column's right edge.
+        let mut cx = ROW_LABEL_W;
+        let mut hi = 0usize;
+        for &c in &cols {
+            let cw = *widths.get(&c).unwrap() as f64 * CHAR_W;
+            if wants_padlock(&crate::addr::ui_column_fragment(c, mc)) {
+                let h = &hits[hi];
+                hi += 1;
+                assert!(
+                    h.x + h.w <= cx + cw + 1e-9,
+                    "padlock for col {c} spills past its column: right {} vs edge {}",
+                    h.x + h.w,
+                    cx + cw
+                );
+            }
+            cx += cw;
+        }
+        assert_eq!(hi, hits.len(), "hit/column mapping drifted");
+    }
+
     /// Same guarantee with the cursor on A1 (the pre-existing passing case,
     /// pinned so the fix cannot regress the common path).
     #[test]
@@ -2705,10 +2808,12 @@ mod fill_tests {
         let cursor = SheetCursor { row: HEADER_ROWS, col: MARGIN_COLS };
         let dim = cols_to_fill_px(&app, cursor, 1220);
         let sheet = app.core.workbook.active_sheet();
+        let mc = sheet.grid.main_cols();
         let (cols, _) = ui_core::visible_col_indices(sheet, cursor, dim, 0);
+        // Same display widths the renderer uses (see margin-cursor case).
         let used_px: usize = cols
             .iter()
-            .map(|&c| sheet_rec_col_width(sheet, c))
+            .map(|&c| display_col_width(sheet, c, mc))
             .sum::<usize>()
             * CHAR_W as usize;
         assert!(

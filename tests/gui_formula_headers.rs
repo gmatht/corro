@@ -288,14 +288,19 @@ fn find_slate_leftmost(wid: &str, x0: i32, x1: i32, y0: i32, y1: i32) -> (i32, i
     );
 }
 
-/// OCR all visible grid text (grid band cropped, upscaled).
+/// OCR all visible grid text (grid band cropped, upscaled). Binarize with
+/// gamma-preserving `-colorspace Gray` (NOT `-grayscale Rec709Luminance`,
+/// which linearizes margin gray 191 down to 132, flipping dimmed margins
+/// black and fusing PINME into a black bar). Crop starts below the header
+/// strip so header text/padlocks never join the text block; `+repage`
+/// clears the virtual canvas so later ops register correctly.
 fn ocr_grid_text(wid: &str) -> String {
     let shot = screenshot(wid, "gridtext");
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let crop = std::env::temp_dir().join(format!("corro-fhdr-grid-{id}.png"));
     Command::new("convert")
         .arg(&shot)
-        .args(["-crop", "500x360+50+44", "-resize", "200%", "-grayscale", "Rec709Luminance", "-threshold", "60%"])
+        .args(["-crop", "500x348+50+56", "+repage", "-resize", "200%", "-colorspace", "Gray", "-threshold", "60%"])
         .arg(&crop)
         .status()
         .expect("convert crop");
