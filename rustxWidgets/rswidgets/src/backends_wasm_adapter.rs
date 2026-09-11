@@ -989,6 +989,10 @@ impl SimpleAction {
             *self.response_cb.borrow_mut() = Some(Box::new(f));
             Ok(0)
         }
+
+        pub fn close(&self) {
+            self.elem.close();
+        }
     }
 
     pub fn create_dialog() -> Result<Dialog, Error> {

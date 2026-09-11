@@ -342,6 +342,8 @@ impl Dialog {
     pub fn add_button(&self, _label: &str, _response_id: i32) {}
     pub fn connect_response(&self, _f: impl FnMut(i32) + 'static) -> Result<u64, Error> { Ok(0) }
     pub fn present(&self) {}
+    /// No-op: terminal dialogs are virtual; nothing to dismiss.
+    pub fn close(&self) {}
 }
 
 // -- DropDown --

@@ -97,6 +97,64 @@ pub fn show_keybinds_help() {
 }
 
 
+/// Wire OK/Cancel buttons (response path) and Enter-in-entry (activate path)
+/// to one once-only confirm for a single-entry prompt dialog. Enter commits
+/// exactly like the OK button (ratatui parity: type + Enter commits, Esc
+/// cancels); Esc/cancel yields None. Rc-shared because FnOnce can only move
+/// into one closure.
+#[cfg(feature = "gui")]
+fn wire_prompt_confirm<F: FnOnce(Option<String>) + 'static>(
+    dialog: &rswidgets::common::Dialog,
+    entry_ptr: usize,
+    on_result: F,
+) {
+    use rswidgets::common::Entry as CommonEntry;
+    let shared: std::rc::Rc<std::cell::RefCell<(Option<F>, bool)>> =
+        std::rc::Rc::new(std::cell::RefCell::new((Some(on_result), false)));
+    {
+        let shared = shared.clone();
+        dialog
+            .connect_response(move |response_id| {
+                let mut g = shared.borrow_mut();
+                if g.1 {
+                    return;
+                }
+                g.1 = true;
+                if let Some(f) = g.0.take() {
+                    let entry: &CommonEntry = unsafe { &*(entry_ptr as *const CommonEntry) };
+                    if response_id == 1 {
+                        f(entry.get_text());
+                    } else {
+                        f(None);
+                    }
+                }
+            })
+            .ok();
+    }
+    {
+        // Enter confirms like the OK button (and closes: the response path's
+        // auto-close does not run here, so close explicitly). On backends
+        // whose entry-activate is a no-op stub, Tab/Space/click still work.
+        let shared = shared.clone();
+        let dlg = dialog.clone();
+        let entry_ref: &CommonEntry = unsafe { &*(entry_ptr as *const CommonEntry) };
+        entry_ref
+            .connect_activate(move |_| {
+                let mut g = shared.borrow_mut();
+                if g.1 {
+                    return;
+                }
+                g.1 = true;
+                if let Some(f) = g.0.take() {
+                    let entry: &CommonEntry = unsafe { &*(entry_ptr as *const CommonEntry) };
+                    f(entry.get_text());
+                    dlg.close();
+                }
+            })
+            .ok();
+    }
+}
+
 /// Generic single-entry modal prompt with caller-supplied title, OK button
 /// label, and initial text. Prompt-gated menu actions (rename/copy/delete
 /// sheet, go to cell, column widths, ...) each get correctly labeled chrome
@@ -110,7 +168,6 @@ pub fn prompt_dialog<F: FnOnce(Option<String>) + 'static>(
 ) {
     #[cfg(feature = "gui")]
     {
-        use rswidgets::common::Entry as CommonEntry;
         if let Ok(rxapp) = rswidgets::App::init() {
             if let Ok(dialog) = rxapp.new_dialog() {
                 if let Ok(entry) = rxapp.new_entry() {
@@ -120,22 +177,7 @@ pub fn prompt_dialog<F: FnOnce(Option<String>) + 'static>(
                     dialog.add_button("Cancel", 0);
                     dialog.add_button(ok_label, 1);
                     let entry_ptr = Box::into_raw(Box::new(entry)) as usize;
-                    let mut on_result = Some(on_result);
-                    let callback_called = std::cell::RefCell::new(false);
-                    dialog.connect_response(move |response_id| {
-                        let mut called = callback_called.borrow_mut();
-                        if !*called {
-                            *called = true;
-                            if let Some(f) = on_result.take() {
-                                let entry: &CommonEntry = unsafe { &*(entry_ptr as *const CommonEntry) };
-                                if response_id == 1 {
-                                    f(entry.get_text());
-                                } else {
-                                    f(None);
-                                }
-                            }
-                        }
-                    }).ok();
+                    wire_prompt_confirm(&dialog, entry_ptr, on_result);
                     dialog.present();
                     let _ = Box::into_raw(Box::new(dialog));
                     return;
@@ -149,7 +191,6 @@ pub fn prompt_dialog<F: FnOnce(Option<String>) + 'static>(
 pub fn find_dialog<F: FnOnce(Option<String>) + 'static>(on_result: F) {
     #[cfg(feature = "gui")]
     {
-        use rswidgets::common::Entry as CommonEntry;
         if let Ok(rxapp) = rswidgets::App::init() {
             if let Ok(dialog) = rxapp.new_dialog() {
                 if let Ok(entry) = rxapp.new_entry() {
@@ -158,22 +199,7 @@ pub fn find_dialog<F: FnOnce(Option<String>) + 'static>(on_result: F) {
                     dialog.add_button("Cancel", 0);
                     dialog.add_button("Find", 1);
                     let entry_ptr = Box::into_raw(Box::new(entry)) as usize;
-                    let mut on_result = Some(on_result);
-                    let callback_called = std::cell::RefCell::new(false);
-                    dialog.connect_response(move |response_id| {
-                        let mut called = callback_called.borrow_mut();
-                        if !*called {
-                            *called = true;
-                            if let Some(f) = on_result.take() {
-                                let entry: &CommonEntry = unsafe { &*(entry_ptr as *const CommonEntry) };
-                                if response_id == 1 {
-                                    f(entry.get_text());
-                                } else {
-                                    f(None);
-                                }
-                            }
-                        }
-                    }).ok();
+                    wire_prompt_confirm(&dialog, entry_ptr, on_result);
                     dialog.present();
                     let _ = Box::into_raw(Box::new(dialog));
                     return;
@@ -208,13 +234,19 @@ pub fn replace_dialog<F: FnOnce(Option<(String, String)>) + 'static>(on_result: 
                 dialog.add_button("Replace", 1);
                 let find_ptr = Box::into_raw(Box::new(find_entry)) as usize;
                 let replace_ptr = Box::into_raw(Box::new(replace_entry)) as usize;
-                let mut on_result = Some(on_result);
-                let callback_called = std::cell::RefCell::new(false);
-                dialog.connect_response(move |response_id| {
-                    let mut called = callback_called.borrow_mut();
-                    if !*called {
-                        *called = true;
-                        if let Some(f) = on_result.take() {
+                // Shared once-only confirm: OK button (response path) and
+                // Enter in either entry (activate path, ratatui parity).
+                let shared: std::rc::Rc<std::cell::RefCell<(Option<F>, bool)>> =
+                    std::rc::Rc::new(std::cell::RefCell::new((Some(on_result), false)));
+                {
+                    let shared = shared.clone();
+                    dialog.connect_response(move |response_id| {
+                        let mut g = shared.borrow_mut();
+                        if g.1 {
+                            return;
+                        }
+                        g.1 = true;
+                        if let Some(f) = g.0.take() {
                             let find_entry: &CommonEntry = unsafe { &*(find_ptr as *const CommonEntry) };
                             let replace_entry: &CommonEntry = unsafe { &*(replace_ptr as *const CommonEntry) };
                             if response_id == 1 {
@@ -226,8 +258,37 @@ pub fn replace_dialog<F: FnOnce(Option<(String, String)>) + 'static>(on_result: 
                                 f(None);
                             }
                         }
-                    }
-                }).ok();
+                    }).ok();
+                }
+                {
+                    // Enter in either field confirms like Replace (and
+                    // closes: the response path's auto-close runs only there).
+                    let shared = shared.clone();
+                    let dlg = dialog.clone();
+                    let confirm = move || {
+                        let mut g = shared.borrow_mut();
+                        if g.1 {
+                            return;
+                        }
+                        g.1 = true;
+                        if let Some(f) = g.0.take() {
+                            let find_entry: &CommonEntry = unsafe { &*(find_ptr as *const CommonEntry) };
+                            let replace_entry: &CommonEntry = unsafe { &*(replace_ptr as *const CommonEntry) };
+                            f(Some((
+                                find_entry.get_text().unwrap_or_default(),
+                                replace_entry.get_text().unwrap_or_default(),
+                            )));
+                            dlg.close();
+                        }
+                    };
+                    let confirm = std::rc::Rc::new(confirm);
+                    let c1 = confirm.clone();
+                    let find_ref: &CommonEntry = unsafe { &*(find_ptr as *const CommonEntry) };
+                    find_ref.connect_activate(move |_| c1()).ok();
+                    let c2 = confirm.clone();
+                    let replace_ref: &CommonEntry = unsafe { &*(replace_ptr as *const CommonEntry) };
+                    replace_ref.connect_activate(move |_| c2()).ok();
+                }
                 dialog.present();
                 let _ = Box::into_raw(Box::new(dialog));
                 return;

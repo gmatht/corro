@@ -488,17 +488,12 @@ fn gui_rename_sheet_retitles_active_tab() {
     // Entry arrives focused with the current title selected: typing replaces.
     // Settle for focus (the dialog just mapped; verdicts below stay polled).
     std::thread::sleep(Duration::from_millis(800));
-    // Confirm via Tab/Tab/Space (entry -> Cancel -> Rename): dialog screen
-    // geometry reports (0,0), so coordinate clicks cannot aim at it, but
-    // synthetic keys reach the focused entry fine.
+    // Confirm with Enter (ratatui parity: type + Enter renames, Esc cancels).
+    // Dialog screen geometry reports (0,0), so coordinate clicks cannot aim
+    // at it — keyboard confirmation is also the honest end-to-end proof.
     xdotool(&["type", "--window", &dlg, "Budget"]);
     std::thread::sleep(Duration::from_millis(400));
-    // Tab to the Rename button (entry -> Cancel -> Rename), then Space.
-    // Separate invocations so focus re-asserts on the dialog each time.
-    for key in ["Tab", "Tab", "space"] {
-        xdotool(&["key", "--window", &dlg, key]);
-        std::thread::sleep(Duration::from_millis(300));
-    }
+    xdotool(&["key", "--window", &dlg, "Return"]);
     // The dialog must close (deadline) and the rename must land: tab title,
     // status, and log op.
     let deadline = Instant::now() + Duration::from_secs(10);
