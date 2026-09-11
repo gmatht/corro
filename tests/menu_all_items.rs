@@ -435,3 +435,110 @@ fn leaf_count_is_substantial() {
         assert!(*n >= 1, "menu '{menu}' has no leaf items");
     }
 }
+
+/// The GUI backend (`gui_backend::handle_menu_action`, shared by GTK and nwg)
+/// must route every menu item somewhere real — never a "not yet implemented"
+/// stub. This test pins the routing classification: dialog-native arms keep
+/// native dialogs, dialog-delegated arms feed `run_prompt_action`, and
+/// everything else goes through the shared `dispatch_menu_action` (proven
+/// non-stub by `every_menu_item_is_handled`). If a menu item is added or an
+/// arm changes shape without updating these sets, this fails loudly instead
+/// of shipping another silent no-op like Insert Date was.
+#[test]
+fn gui_routing_covers_every_menu_item() {
+    // gui_backend arms that keep native dialogs/file ops (verified working).
+    const GUI_NATIVE_DIALOG: &[&str] = &["open", "save_as", "about"];
+    // gui_backend arms that open a dialog and feed run_prompt_action.
+    // Must equal EXACTLY the prompt-gated menu leaves (derived check below).
+    const GUI_DIALOG_DELEGATED: &[&str] = &[
+        "find",
+        "replace",
+        "balance_books",
+        "rename_sheet",
+        "export_tsv",
+        "export_csv",
+        "export_ods",
+        "export_ascii",
+        "export_all",
+        "set_col_width",
+        "set_max_col_width",
+        "copy_sheet",
+        "go_to_cell",
+        "insert_special_chars",
+        "insert_hyperlink",
+        "sort_view",
+        "persist_sort",
+        // NOTE: delete_sheet has prompt handling but no menu item (the Sheet
+        // menu offers New/Rename/Copy only), so it is intentionally absent
+        // here; prompt_actions_run_cleanly still covers its handler.
+    ];
+    // gui_backend arms with backend-specific behavior covered elsewhere:
+    // extrapolate (interactive modal), quit (save_before_quit flow).
+    // NOTE: delete_cell has dispatch/handler code but no menu item (Delete is
+    // keyboard-only), so it is intentionally absent here.
+    const GUI_NATIVE_OTHER: &[&str] = &["extrapolate", "quit"];
+
+    let leaves = all_leaves();
+    let leaf_names: HashSet<&str> = leaves.iter().map(|l| l.action).collect();
+
+    // Every classified name must be a real menu leaf (catches typos/renames).
+    for name in GUI_NATIVE_DIALOG
+        .iter()
+        .chain(GUI_DIALOG_DELEGATED.iter())
+        .chain(GUI_NATIVE_OTHER.iter())
+    {
+        assert!(
+            leaf_names.contains(name),
+            "gui routing set mentions '{name}', which is not a menu item (stale?)"
+        );
+    }
+
+    // The dialog-delegated set must be EXACTLY the prompt-gated menu leaves,
+    // except open/save_as which use native file dialogs (still prompt-gated
+    // in the shared layer). Every other prompt-gated leaf must be here, and
+    // nothing here may lack prompt logic.
+    let prompt_leaves: HashSet<&str> = leaves
+        .iter()
+        .filter(|l| menu_action_needs_prompt(l.action).is_some())
+        .map(|l| l.action)
+        .collect();
+    let dialog_set: HashSet<&str> = GUI_DIALOG_DELEGATED.iter().copied().collect();
+    let native_file: HashSet<&str> = ["open", "save_as"].into_iter().collect();
+    let mut covered: HashSet<&str> = dialog_set.clone();
+    covered.extend(native_file.iter().copied());
+    assert_eq!(
+        covered, prompt_leaves,
+        "gui dialog routing diverged from prompt-gated menu leaves"
+    );
+
+    // Everything else must be a shared-dispatch leaf (non-stub, proven by
+    // every_menu_item_is_handled) or one of the classified specials.
+    let mut uncovered: Vec<&str> = leaf_names
+        .iter()
+        .copied()
+        .filter(|n| {
+            !dialog_set.contains(n)
+                && !GUI_NATIVE_DIALOG.contains(n)
+                && !GUI_NATIVE_OTHER.contains(n)
+        })
+        .collect();
+    uncovered.sort_unstable();
+    let mut app = seeded_app(None);
+    let mut pending_scope = 0u8;
+    let mut clipboard = String::new();
+    let mut stubbed = Vec::new();
+    for name in uncovered.iter().copied() {
+        let d = dispatch_menu_action(&mut app, name, &mut pending_scope, &mut clipboard);
+        if matches!(&d, MenuDispatch::Status(s) if s.starts_with("Menu action: ")) {
+            stubbed.push(name);
+        }
+    }
+    assert!(
+        stubbed.is_empty(),
+        "menu items with no GUI behavior (stub fallback): {stubbed:?}"
+    );
+    assert!(
+        !uncovered.is_empty(),
+        "shared-dispatch remainder is empty; the classification above is vacuous"
+    );
+}

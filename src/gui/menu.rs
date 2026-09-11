@@ -439,8 +439,38 @@ pub fn build_menu_model(menu: &rswidgets::backends_pancurses_adapter::Menu, item
     }
 }
 
+/// Build a GTK mnemonic label from a plain label plus the item's documented
+/// shortcut letter (the same letter ratatui/pancurses match on): insert '_'
+/// before the shortcut letter's first case-insensitive occurrence, so GTK
+/// underlines exactly the documented mnemonic (e.g. "Save as"+"A" ->
+/// "Save _as").  Empty shortcut (top-level menus) or a shortcut letter
+/// absent from the label (Width/C, Date/;, Time/;, Currency/$, Prev/[, Next/])
+/// falls back to first-character mnemonic ("_Width").  A shortcut letter
+/// absent from the label can never match on GTK (e.g. Cut/X); some other
+/// item may share the fallback letter (Cut/Copy both underline C) and GTK
+/// cycles those — still reachable, just not by the documented letter.
+pub fn mnemonic_label(label: &str, shortcut: &str) -> String {
+    let target = shortcut.chars().next().map(|c| c.to_ascii_uppercase());
+    if let Some(t) = target {
+        let mut out = String::with_capacity(label.len() + 1);
+        for c in label.chars() {
+            if c.to_ascii_uppercase() == t && !out.contains('_') {
+                out.push('_');
+            }
+            out.push(c);
+        }
+        if out.contains('_') {
+            return out;
+        }
+    }
+    format!("_{label}")
+}
+
 /// Build a backend-agnostic (`common`) menu tree from a `&[MenuAction]` tree
 /// (the GTK backend's converter for the shared [`menu_bar`] definition).
+/// Labels carry GTK underscore mnemonics derived from each item's shortcut
+/// (see [`mnemonic_label`); the loader strips them back out for the GMenu
+/// model so GTK4 popover menus keep showing plain text.
 pub fn build_common_menu(
     rxapp: &rswidgets::App,
     items: &[MenuAction],
@@ -450,10 +480,10 @@ pub fn build_common_menu(
     for item in items {
         if let Some(sub) = item.submenu.as_deref() {
             let sub_menu = build_common_menu(rxapp, sub, prefix)?;
-            menu.append_submenu(item.label, &sub_menu);
+            menu.append_submenu(&mnemonic_label(item.label, item.shortcut), &sub_menu);
         } else {
             let name = action_kind_to_name(item.action);
-            menu.append(item.label, &format!("{}.{}", prefix, name));
+            menu.append(&mnemonic_label(item.label, item.shortcut), &format!("{}.{}", prefix, name));
         }
     }
     Ok(menu)

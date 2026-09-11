@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use super::actions::run_prompt_action;
+use super::actions::{dispatch_menu_action, MenuDispatch};
 use super::extrapolate;
 
 use crate::grid::{CellAddr, SheetCursor, HEADER_ROWS, MARGIN_COLS};
@@ -204,6 +205,12 @@ struct GuiState {
     // setups). On streams where the entry never fires, setting the flag would
     // poison the next keypress (it would wrongly skip handle_key).
     entry_seen: Cell<bool>,
+    // Shared-dispatch state for menu actions: clipboard for cut/copy/paste
+    // and the pending format scope. The pancurses backend passes these as
+    // dispatch arguments; the GUI backend keeps them here so every menu item
+    // behaves identically across backends instead of drifting into stubs.
+    clipboard: RefCell<String>,
+    pending_scope: Cell<u8>,
     // Scrollbar sync: native scrollbars around the sheet (thumb tracks the
     // cursor; dragging/clicking moves the cursor, so the selection is always
     // visible). Guard against reentrancy between programmatic sets and the
@@ -1209,7 +1216,13 @@ fn update_formula_bar(state: &GuiState, row: usize, col: usize) {
         crate::addr::MainCols(app.core.workbook.active_sheet().grid.main_cols()),
     );
     let val = app.core.workbook.active_sheet().grid.get(&addr).unwrap_or_default();
-    state.formula_entry.set_text(&val);
+    // While an edit is in progress the entry widget belongs to the edit
+    // buffer (e.g. an Insert Date/Time preset), not the grid cell: overwriting
+    // it here would wipe the preset (and the entry's change handler could
+    // then eat edit_buf too). Address/status labels always update.
+    if !state.editing.get() {
+        state.formula_entry.set_text(&val);
+    }
     state.status_label.set_text(&app.core.status);
     if state.status_label.raw_handle().is_null() {
         // status label will be updated; no-op
@@ -1273,7 +1286,8 @@ fn build_menu(rxapp: &rswidgets::App, win: &Window, state: &Rc<GuiState>) -> Res
     let mut menubar_model = rxapp.new_menu()?;
     for root in &bar {
         let sub = menu::build_common_menu(rxapp, root.submenu.as_deref().unwrap_or(&[]), "app")?;
-        menubar_model.append_submenu(root.label, &sub);
+        // Top-level items carry no shortcut: first-character mnemonic.
+        menubar_model.append_submenu(&menu::mnemonic_label(root.label, root.shortcut), &sub);
     }
 
     // Register action callbacks with state access (walk the whole tree).
@@ -1312,6 +1326,81 @@ fn build_menu(rxapp: &rswidgets::App, win: &Window, state: &Rc<GuiState>) -> Res
     Ok(menubar)
 }
 
+/// Start editing with a full preset string (used by menu actions such as
+/// Insert > Date/Time, which arrive via MenuDispatch::Edit). Mirrors
+/// start_edit_with but takes &str so multi-char values need no loop.
+fn start_edit_with_text(state: &GuiState, text: &str) {
+    state.editing.set(true);
+    *state.edit_buf.borrow_mut() = text.to_string();
+    // Keep the widget identical to edit_buf (see sync_entry_to_buf).
+    sync_entry_to_buf(state);
+    state.formula_entry.grab_focus();
+    state.canvas.queue_redraw();
+}
+
+/// Refresh viewport, formula bar, and canvas after a menu action mutated the
+/// workbook or cursor outside the normal key path (dialog callbacks, shared
+/// dispatch). Without this the grid shows stale cells after e.g. Find moves
+/// the cursor or Replace edits cells.
+fn refresh_after_dialog(state: &Rc<GuiState>) {
+    recompute_viewport(state);
+    update_formula_bar(state, state.last_row.get(), state.last_col.get());
+    state.canvas.queue_redraw();
+}
+
+/// Route a menu action through the shared `actions::dispatch_menu_action`
+/// implementation (the same code the pancurses backend uses), then apply the
+/// result to GUI state. This is what keeps GUI menu behavior identical to the
+/// other backends instead of drifting into per-backend stubs: any menu item
+/// handled here behaves exactly as it does under pancurses/ratatui.
+fn delegate_shared_action(name: &str, state: &Rc<GuiState>) {
+    let mut scope = state.pending_scope.get();
+    let mut cb = state.clipboard.borrow().clone();
+    let result = dispatch_menu_action(state.app_mut(), name, &mut scope, &mut cb);
+    state.pending_scope.set(scope);
+    *state.clipboard.borrow_mut() = cb;
+    match result {
+        MenuDispatch::Status(s) => {
+            // Empty means "keep current status" (copy/paste/single-sheet nav).
+            if !s.is_empty() {
+                state.app_mut().core.status = s;
+            }
+        }
+        MenuDispatch::Edit { value } => {
+            // Insert > Date/Time: preset the edit buffer; the user commits
+            // with Enter exactly like the other backends.
+            start_edit_with_text(state, &value);
+        }
+        MenuDispatch::Prompt(_label, action) => {
+            // Only "save" (no path yet) reaches here; open a save dialog.
+            if action == "save_as" {
+                if let Some(path) = dialogs::file_save_dialog() {
+                    run_prompt_action(state.app_mut(), action, &path.display().to_string());
+                }
+            }
+        }
+        MenuDispatch::About { status } => {
+            state.app_mut().core.status = status;
+            dialogs::show_about_dialog();
+        }
+        MenuDispatch::HelpFull { .. } => {
+            dialogs::show_keybinds_help();
+        }
+        MenuDispatch::HelpKeybinds { .. } => {
+            dialogs::show_keybinds_help();
+        }
+    }
+    // Shared ops may move the cursor (select_all, mitosis, go_to); sync the
+    // widget cursor cells before redrawing so the formula bar follows.
+    let (cr, cc) = {
+        let app = state.app_ref();
+        (app.core.cursor.row, app.core.cursor.col)
+    };
+    state.last_row.set(cr);
+    state.last_col.set(cc);
+    refresh_after_dialog(state);
+}
+
 fn handle_menu_action(name: &str, state: &Rc<GuiState>) {
     let app = state.app_mut();
     log_ui_action("menu_action", name);
@@ -1339,6 +1428,9 @@ fn handle_menu_action(name: &str, state: &Rc<GuiState>) {
                     Ok(()) => app.core.status = "Saved".into(),
                     Err(e) => app.core.status = format!("Save error: {e}"),
                 }
+            } else if let Some(path) = dialogs::file_save_dialog() {
+                // No path yet: fall back to Save As (same as pancurses).
+                run_prompt_action(app, "save_as", &path.display().to_string());
             }
         }
         "save_as" => {
@@ -1355,23 +1447,16 @@ fn handle_menu_action(name: &str, state: &Rc<GuiState>) {
             eprintln!("DEBUG handle_menu_action: quit activated");
             save_before_quit(state);
         }
-        "find" => {
-            // Borrow at fire time (not at arm time): the dialog responds
-            // long after this arm returns, so holding the outer borrow
-            // across frames would alias with later borrows. Cloning the
-            // `Rc` keeps each borrow's dynamic extent inside one dispatch.
+        "find" | "replace" | "balance_books" | "rename_sheet" => {
+            // Shared search/mutate logic (same as pancurses/ratatui); the
+            // dialog only supplies the input. Previously these set a
+            // status string without doing anything.
             let st = state.clone();
+            let action = name.to_string();
             dialogs::find_dialog(move |result| {
                 if let Some(text) = result {
-                    st.app_mut().core.status = format!("Find: {text}");
-                }
-            });
-        }
-        "replace" => {
-            let st = state.clone();
-            dialogs::replace_dialog(move |result| {
-                if let Some((find, replace)) = result {
-                    st.app_mut().core.status = format!("Replace: '{find}' with '{replace}'");
+                    run_prompt_action(st.app_mut(), &action, &text);
+                    refresh_after_dialog(&st);
                 }
             });
         }
@@ -1393,14 +1478,6 @@ fn handle_menu_action(name: &str, state: &Rc<GuiState>) {
                 }
             });
         }
-        "balance_books" => {
-            let st = state.clone();
-            dialogs::balance_dialog(move |result| {
-                if let Some(col) = result {
-                    st.app_mut().core.status = format!("Balance col: {col}");
-                }
-            });
-        }
         "about" => {
             use std::sync::atomic::{AtomicUsize, Ordering};
             static ABOUT_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -1415,113 +1492,62 @@ fn handle_menu_action(name: &str, state: &Rc<GuiState>) {
             let _ = std::fs::write("/tmp/corro_kb_count.txt", format!("help_keybinds called: {n}\n"));
             dialogs::show_keybinds_help();
         }
-        "rename_sheet" => {
-            let st = state.clone();
-            dialogs::find_dialog(move |result| {
-                if let Some(name) = result {
-                    st.app_mut().core.status = format!("Rename sheet to: {name}");
-                }
-            });
-        }
-        "undo" => {
-            app.core.status = "Undo not yet implemented".into();
-            state.canvas.queue_redraw();
-        }
-        "redo" => {
-            app.core.status = "Redo not yet implemented".into();
-            state.canvas.queue_redraw();
-        }
-        "cut" => {
-            app.core.status = "Cut not yet implemented".into();
-        }
-        "copy" => {
-            app.core.status = "Copy not yet implemented".into();
-        }
-        "paste" => {
-            app.core.status = "Paste not yet implemented".into();
+        "undo" | "redo" | "cut" | "copy" | "paste" => {
+            // Shared clipboard/history logic (same as pancurses/ratatui).
+            delegate_shared_action(name, state);
         }
         "delete_cell" => {
             handle_delete(state);
         }
-        "select_all" => {
-            app.core.status = "Select All".into();
-            app.core.anchor = None;
-            state.canvas.queue_redraw();
-        }
-        "toggle_headers" => {
-            app.core.status = "Toggle headers not yet implemented".into();
-        }
-        "toggle_margins" => {
-            app.core.status = "Toggle margins not yet implemented".into();
-        }
-        "new_sheet" => {
-            app.core.status = "New sheet not yet implemented".into();
+        "select_all" | "toggle_headers" | "toggle_margins" | "new_sheet" => {
+            // Shared selection/chrome/sheet logic (same as pancurses/ratatui).
+            delegate_shared_action(name, state);
         }
         "delete_sheet" => {
-            app.core.status = "Delete sheet not yet implemented".into();
+            // Shared logic needs the sheet name: prompt, then delegate.
+            let st = state.clone();
+            dialogs::find_dialog(move |result| {
+                if let Some(text) = result {
+                    run_prompt_action(st.app_mut(), "delete_sheet", &text);
+                    refresh_after_dialog(&st);
+                }
+            });
         }
-        "export_tsv" => {
+        "export_tsv" | "export_csv" | "export_ods" | "export_ascii" | "export_all" => {
+            // Shared export logic writes the file (same as pancurses/ratatui);
+            // the save dialog only supplies the destination path.
+            let st = state.clone();
+            let action = name.to_string();
             if let Some(path) = dialogs::file_save_dialog() {
-                app.core.status = format!("Exporting TSV to {}", path.display());
+                run_prompt_action(st.app_mut(), &action, &path.display().to_string());
+                refresh_after_dialog(&st);
             }
         }
-        "export_csv" => {
-            if let Some(path) = dialogs::file_save_dialog() {
-                app.core.status = format!("Exporting CSV to {}", path.display());
-            }
+        "insert_rows" | "insert_mitosis_row" | "insert_mitosis_col" | "insert_cols"
+        | "insert_date" | "insert_time" => {
+            // Shared insert logic (same as pancurses/ratatui). Date/Time
+            // arrive as Edit{value} and preset the edit buffer for Enter.
+            delegate_shared_action(name, state);
         }
-        "export_ods" => {
-            if let Some(path) = dialogs::file_save_dialog() {
-                app.core.status = format!("Exporting ODS to {}", path.display());
-            }
-        }
-        "export_ascii" => {
-            if let Some(path) = dialogs::file_save_dialog() {
-                app.core.status = format!("Exporting ASCII to {}", path.display());
-            }
-        }
-        "export_all" => {
-            app.core.status = "Export All".into();
-            state.canvas.queue_redraw();
-        }
-        "insert_rows" => {
-            app.core.status = "Insert rows not yet implemented".into();
-        }
-        "insert_mitosis_row" => {
-            app.core.status = "Insert mitosis row not yet implemented".into();
-        }
-        "insert_mitosis_col" => {
-            app.core.status = "Insert mitosis col not yet implemented".into();
-        }
-        "insert_cols" => {
-            app.core.status = "Insert cols not yet implemented".into();
-        }
-        "insert_special_chars" => {
-            app.core.status = "Insert special chars not yet implemented".into();
-        }
-        "insert_date" => {
-            app.core.status = "Insert date not yet implemented".into();
-        }
-        "insert_time" => {
-            app.core.status = "Insert time not yet implemented".into();
-        }
-        "insert_hyperlink" => {
-            app.core.status = "Insert hyperlink not yet implemented".into();
+        "insert_special_chars" | "insert_hyperlink" | "sort_view" | "persist_sort" => {
+            // Shared logic needs prompt input: ask, then delegate.
+            let st = state.clone();
+            let action = name.to_string();
+            dialogs::find_dialog(move |result| {
+                if let Some(text) = result {
+                    run_prompt_action(st.app_mut(), &action, &text);
+                    refresh_after_dialog(&st);
+                }
+            });
         }
         "format_apply_all" | "format_apply_full_column" | "format_apply_data"
-        | "format_apply_special" | "format_apply_cell" | "format_apply_selection" => {
-            app.core.status = format!("Format scope: {name}");
-        }
-        "format_decimal_generic" | "format_currency" | "format_rational"
-        | "format_fixed_0" | "format_fixed_1" | "format_fixed_2" | "format_fixed_custom" => {
-            app.core.status = format!("Format number: {name}");
-        }
-        "format_align_left" | "format_align_center" | "format_align_right"
-        | "format_align_default" => {
-            app.core.status = format!("Format align: {name}");
-        }
-        "format_reset" => {
-            app.core.status = "Format reset".into();
+        | "format_apply_special" | "format_apply_cell" | "format_apply_selection"
+        | "format_decimal_generic" | "format_currency" | "format_rational"
+        | "format_fixed_0" | "format_fixed_1" | "format_fixed_2" | "format_fixed_custom"
+        | "format_align_left" | "format_align_center" | "format_align_right"
+        | "format_align_default" | "format_reset" => {
+            // Shared format logic with the pending scope (same as pancurses).
+            delegate_shared_action(name, state);
         }
         // Ratatui-parity menu actions without dedicated GTK widgets yet.
         // Each arm records an honest status (never a silent no-op) so menu
@@ -1530,15 +1556,9 @@ fn handle_menu_action(name: &str, state: &Rc<GuiState>) {
         "submenu" => {
             app.core.status = "Menu action: submenu placeholder (never dispatched)".into();
         }
-        "sort_view" => {
-            app.core.status = "Sorted".into();
-            state.canvas.queue_redraw();
-        }
-        "persist_sort" => {
-            app.core.status = "Persist sort: not wired in the GTK backend yet".into();
-        }
-        "replay" => {
-            app.core.status = "Replay: not wired in the GTK backend yet".into();
+        "replay" | "duplicate" | "sheet_prev" | "sheet_next" | "move_sheet" => {
+            // Shared workbook logic (same as pancurses/ratatui).
+            delegate_shared_action(name, state);
         }
         "set_max_col_width" | "set_col_width" => {
             let st = state.clone();
@@ -1546,11 +1566,9 @@ fn handle_menu_action(name: &str, state: &Rc<GuiState>) {
             dialogs::find_dialog(move |result| {
                 if let Some(text) = result {
                     run_prompt_action(st.app_mut(), &action, &text);
+                    refresh_after_dialog(&st);
                 }
             });
-        }
-        "duplicate" => {
-            app.core.status = "Duplicate: not wired in the GTK backend yet".into();
         }
         "extrapolate" => {
             // Enter interactive extrapolate modal (mirrors ratatui).
@@ -1562,25 +1580,21 @@ fn handle_menu_action(name: &str, state: &Rc<GuiState>) {
             state.canvas.grab_focus();
             state.canvas.queue_redraw();
         }
-        "sheet_prev" | "sheet_next" => {
-            app.core.status = format!("Menu action: {name} (sheet navigation not wired in GTK yet)");
-        }
         "copy_sheet" => {
             let st = state.clone();
             dialogs::find_dialog(move |result| {
                 if let Some(text) = result {
                     run_prompt_action(st.app_mut(), "copy_sheet", &text);
+                    refresh_after_dialog(&st);
                 }
             });
-        }
-        "move_sheet" => {
-            app.core.status = "Move sheet: not wired in the GTK backend yet".into();
         }
         "go_to_cell" => {
             let st = state.clone();
             dialogs::find_dialog(move |result| {
                 if let Some(text) = result {
                     run_prompt_action(st.app_mut(), "go_to_cell", &text);
+                    refresh_after_dialog(&st);
                 }
             });
         }
@@ -1597,7 +1611,16 @@ fn handle_menu_action(name: &str, state: &Rc<GuiState>) {
             app.core.status = format!("Menu action: {name}");
         }
     }
-    update_formula_bar(state, state.last_row.get(), state.last_col.get());
+    // Refresh the formula bar — unless an Edit{value} action just preset an
+    // edit buffer (Insert Date/Time). update_formula_bar copies the grid cell
+    // into the entry widget, which would wipe the preset (and the entry's
+    // change handler could then eat edit_buf too). The status label still
+    // needs the new status text.
+    if state.editing.get() {
+        state.status_label.set_text(&state.app_ref().core.status);
+    } else {
+        update_formula_bar(state, state.last_row.get(), state.last_col.get());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1705,6 +1728,8 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         entry_processed_key: Cell::new(false),
         last_alt_keyval: Cell::new(0),
         entry_seen: Cell::new(false),
+        clipboard: RefCell::new(String::new()),
+        pending_scope: Cell::new(0),
         #[cfg(feature = "gtk4")]
         last_dedup_key: Cell::new(0),
         #[cfg(feature = "gtk4")]

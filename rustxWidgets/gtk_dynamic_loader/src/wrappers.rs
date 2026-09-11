@@ -2052,8 +2052,13 @@ impl Menu {
 
     pub fn append(&mut self, label: &str, detailed_action: &str) {
         guard_widget!(self, "Menu", "append");
+        // GMenu labels carry no mnemonic markup: strip the underscores the
+        // app layer baked in for the GTK3 widget build below, so GTK4 popover
+        // menus keep showing plain text (no menu label legitimately contains
+        // an underscore).
+        let plain_label = label.replace('_', "");
         if let Some(append) = self.loader.symbols.g_menu_append {
-            let l = CString::new(label).unwrap();
+            let l = CString::new(plain_label).unwrap();
             let a = CString::new(detailed_action).unwrap();
             unsafe { append(self.inner, l.as_ptr(), a.as_ptr()); }
         }
@@ -2066,8 +2071,9 @@ impl Menu {
 
     pub fn append_submenu(&mut self, label: &str, submenu: &Menu) {
         guard_widget!(self, "Menu", "append_submenu");
+        let plain_label = label.replace('_', "");
         if let Some(append_sub) = self.loader.symbols.g_menu_append_submenu {
-            let l = CString::new(label).unwrap();
+            let l = CString::new(plain_label).unwrap();
             unsafe { append_sub(self.inner, l.as_ptr(), submenu.inner); }
         } else {
             self.append(label, "");
@@ -2209,14 +2215,14 @@ impl MenuBar {
             take_ownership(&symbols, &loader.version, inner);
             let mut mnemonic_index = HashMap::new();
             for (i, item) in model.items.iter().enumerate() {
+                // Strip app-layer '_' mnemonic markers before indexing: this
+                // keeps the GTK4 lookup byte-identical to the pre-marker
+                // behavior (first character of the plain label).  GTK4 menu
+                // handling itself is intentionally untouched.
                 // label is "_File" → skip '_' → mnemonic is first remaining char 'F'
                 // If no '_' is found, fall back to the first character of the label.
-                let m = item.label.chars()
-                    .skip_while(|&c| c != '_')
-                    .skip(1)  // skip the '_' itself
-                    .next()   // take the mnemonic character
-                    .or_else(|| item.label.chars().next())
-                    .map(|c| c.to_ascii_uppercase());
+                let plain = item.label.replace('_', "");
+                let m = plain.chars().next().map(|c| c.to_ascii_uppercase());
                 if let Some(m) = m {
                     mnemonic_index.entry(m).or_insert(i);
                 }
@@ -2248,17 +2254,15 @@ impl MenuBar {
         action_group: *mut c_void,
     ) {
         for item in items {
-            // First-character mnemonics: prefix '_' so GTK registers a real
-            // mnemonic for every item (e.g. "File" -> "_File") and Alt+letter
-            // opens/navigates menus natively.  With gtk_menu_item_new_with_mnemonic
-            // the underscore is consumed as the marker, so the displayed text is
-            // unchanged (underline appears only while Alt is held, per theme).
-            // The plain label is kept for the non-mnemonic constructor fallback
-            // so a missing mnemonic symbol can never leak a literal underscore.
-            let mnemonic_label = format!("_{}", item.label);
+            // Labels arrive pre-baked with '_' mnemonics from the app layer
+            // (menu::mnemonic_label); gtk_menu_item_new_with_mnemonic consumes
+            // the marker so displayed text is unchanged.  The plain label is
+            // kept for the non-mnemonic constructor fallback so a missing
+            // mnemonic symbol can never leak a literal underscore.
+            let plain_label = item.label.replace('_', "");
             let new_item = symbols.gtk_menu_item_new_with_mnemonic
-                .and_then(|f| CString::new(mnemonic_label).ok().map(|c_label| unsafe { f(c_label.as_ptr()) }))
-                .or_else(|| match CString::new(item.label.as_str()) {
+                .and_then(|f| CString::new(item.label.as_str()).ok().map(|c_label| unsafe { f(c_label.as_ptr()) }))
+                .or_else(|| match CString::new(plain_label.as_str()) {
                     Ok(c_label) => symbols.gtk_menu_item_new_with_label.map(|f| unsafe { f(c_label.as_ptr()) }),
                     Err(_) => None,
                 });

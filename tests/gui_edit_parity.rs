@@ -693,3 +693,261 @@ fn gui_scrollbar_trough_click_moves_down() {
         "trough click must move selection down several rows, got lines: {lines:?}"
     );
 }
+
+/// Click at a fraction down the currently-open menu popup (found as the
+/// non-main window of this pid). Synthetic key events cannot drive GTK's
+/// grab-based menu navigation, but synthetic button presses reach the popup
+/// directly, so clicking a menu row is the reliable activation path.
+fn click_popup_fraction(pid: u32, wid: &str, frac: f64) {
+    let pid = pid.to_string();
+    let mut popup = String::new();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let out = xdotool(&["search", "--pid", &pid]);
+        for id in out.split_whitespace() {
+            if id == wid {
+                continue;
+            }
+            let geo = xdotool(&["getwindowgeometry", "--shell", id]);
+            let wide = geo.lines().any(|l| {
+                l.strip_prefix("WIDTH=")
+                    .and_then(|v| v.trim().parse::<i32>().ok())
+                    .map(|w| w > 40)
+                    .unwrap_or(false)
+            });
+            if wide {
+                popup = id.to_string();
+                break;
+            }
+        }
+        if !popup.is_empty() {
+            break;
+        }
+        if Instant::now() > deadline {
+            panic!("timed out waiting for menu popup to click");
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    let geo = xdotool(&["getwindowgeometry", "--shell", &popup]);
+    let (mut px, mut py, mut ph) = (0, 0, 0);
+    for l in geo.lines() {
+        if let Some(v) = l.strip_prefix("X=") {
+            px = v.trim().parse().unwrap_or(0);
+        }
+        if let Some(v) = l.strip_prefix("Y=") {
+            py = v.trim().parse().unwrap_or(0);
+        }
+        if let Some(v) = l.strip_prefix("HEIGHT=") {
+            ph = v.trim().parse().unwrap_or(0);
+        }
+    }
+    assert!(ph > 60, "popup height implausible ({ph})");
+    // Settle so the popup is mapped and input-ready (a click in the same
+    // instant as appearance can land before GTK finishes mapping it).
+    std::thread::sleep(Duration::from_millis(500));
+    xdotool(&[
+        "mousemove",
+        &format!("{}", px + 50),
+        &format!("{}", py + (ph as f64 * frac) as i32),
+        "click",
+        "1",
+    ]);
+}
+
+/// Poll a `.corro` file with a deadline until `pred` holds of its lines.
+fn wait_file_pred(
+    path: &PathBuf,
+    deadline: Instant,
+    what: &str,
+    pred: impl Fn(&[String]) -> bool,
+) -> Vec<String> {
+    loop {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            let lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+            if pred(&lines) {
+                return lines;
+            }
+        }
+        if Instant::now() > deadline {
+            panic!(
+                "timed out waiting for {what} in {}\ncontent: {:?}",
+                path.display(),
+                std::fs::read_to_string(path).unwrap_or_default()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn date_today() -> String {
+    String::from_utf8_lossy(
+        &Command::new("date")
+            .arg("+%F")
+            .output()
+            .expect("date +%F")
+            .stdout,
+    )
+    .trim()
+    .to_string()
+}
+
+/// Insert > Date must preset today's date and commit it on Enter (GTK live).
+/// Regression: the GTK backend answered "Insert date not yet implemented"
+/// and committed nothing; the shared dispatch this now delegates to presets
+/// the edit buffer exactly like pancurses/ratatui.
+#[test]
+fn gui_insert_date_commits_today() {
+    let _guard = GUI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    assert!(
+        std::env::var("DISPLAY").is_ok(),
+        "requires X server (run under xvfb-run -a)"
+    );
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let path = std::env::temp_dir().join(format!("corro-gui-insdate-{}-{}.corro", std::process::id(), id));
+    let _ = std::fs::remove_file(&path);
+    std::fs::write(&path, "CORRO_LOG 1\n").expect("write fixture");
+
+    let mut child = spawn_gui(&path);
+    let wid = find_corro_window(child.id(), Instant::now() + Duration::from_secs(25));
+    xdotool(&["windowactivate", "--sync", &wid]);
+    std::thread::sleep(Duration::from_millis(400));
+    // Insert menu (Alt+I), Date is the 'D' mnemonic item.
+    xdotool(&["key", "--window", &wid, "alt+i"]);
+    std::thread::sleep(Duration::from_millis(500));
+    xdotool(&["key", "--window", &wid, "d"]);
+    std::thread::sleep(Duration::from_millis(500));
+    // Commit the preset date.
+    xdotool(&["key", "--window", &wid, "Return"]);
+    let today = date_today();
+    let expected = format!("SET A1 {today}");
+    let lines = wait_file_pred(&path, Instant::now() + Duration::from_secs(10), "date commit", |ls| {
+        ls.iter().any(|l| l == &expected)
+    });
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(
+        lines.iter().any(|l| l == &expected),
+        "Insert Date should commit `SET A1 {today}`, got: {lines:?}"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Insert > Time must preset the clock time and commit it on Enter (GTK live).
+/// Same Edit-preset mechanism as Date; the committed HH:MM:SS must be within
+/// two minutes of now (guards second-boundary flakes without fixed sleeps).
+#[test]
+fn gui_insert_time_commits_time() {
+    let _guard = GUI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    assert!(
+        std::env::var("DISPLAY").is_ok(),
+        "requires X server (run under xvfb-run -a)"
+    );
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let path = std::env::temp_dir().join(format!("corro-gui-instime-{}-{}.corro", std::process::id(), id));
+    let _ = std::fs::remove_file(&path);
+    std::fs::write(&path, "CORRO_LOG 1\n").expect("write fixture");
+
+    let mut child = spawn_gui(&path);
+    let wid = find_corro_window(child.id(), Instant::now() + Duration::from_secs(25));
+    xdotool(&["windowactivate", "--sync", &wid]);
+    std::thread::sleep(Duration::from_millis(400));
+    // Insert menu (Alt+I), Time is the 'T' mnemonic item.
+    xdotool(&["key", "--window", &wid, "alt+i"]);
+    std::thread::sleep(Duration::from_millis(500));
+    xdotool(&["key", "--window", &wid, "t"]);
+    std::thread::sleep(Duration::from_millis(500));
+    xdotool(&["key", "--window", &wid, "Return"]);
+    let lines = wait_file_pred(&path, Instant::now() + Duration::from_secs(10), "time commit", |ls| {
+        ls.iter().any(|l| {
+            l.strip_prefix("SET A1 ")
+                .map(|v| {
+                    v.len() == 8
+                        && v.as_bytes()[2] == b':'
+                        && v.as_bytes()[5] == b':'
+                        && v[..2].parse::<u32>().is_ok()
+                })
+                .unwrap_or(false)
+        })
+    });
+    let _ = child.kill();
+    let _ = child.wait();
+    let committed: String = lines
+        .iter()
+        .find_map(|l| l.strip_prefix("SET A1 "))
+        .unwrap_or_default()
+        .to_string();
+    // Within two minutes of now (robust to second ticks, no fixed sleeps).
+    // Compare in local wall-clock: the app formats Local time, and `date`
+    // without -u agrees with it (epoch seconds would be UTC-shifted).
+    let now_out = Command::new("date").arg("+%H %M %S").output().expect("date");
+    let now_hms = String::from_utf8_lossy(&now_out.stdout);
+    let now_parts: Vec<i64> = now_hms
+        .split_whitespace()
+        .map(|p| p.parse().unwrap_or(-1))
+        .collect();
+    assert_eq!(now_parts.len(), 3, "could not read local time");
+    let now_secs = now_parts[0] * 3600 + now_parts[1] * 60 + now_parts[2];
+    let parts: Vec<i64> = committed.split(':').map(|p| p.parse().unwrap_or(-1)).collect();
+    assert_eq!(parts.len(), 3, "committed time should be HH:MM:SS, got {committed:?}");
+    let got_secs = parts[0] * 3600 + parts[1] * 60 + parts[2];
+    assert!(
+        (now_secs - got_secs).abs() <= 120,
+        "committed time {committed:?} is not within two minutes of now"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Edit > Cut then Edit > Paste round-trips the cell value through the menu
+/// (GTK live). Regression: the GTK backend answered "Cut/Paste not yet
+/// implemented". This also exercises the GUI clipboard plumbing behind the
+/// shared dispatch: paste must restore exactly what cut took.
+#[test]
+fn gui_cut_paste_roundtrip_via_menu() {
+    let _guard = GUI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    assert!(
+        std::env::var("DISPLAY").is_ok(),
+        "requires X server (run under xvfb-run -a)"
+    );
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let path = std::env::temp_dir().join(format!("corro-gui-cutpaste-{}-{}.corro", std::process::id(), id));
+    let _ = std::fs::remove_file(&path);
+    std::fs::write(&path, "CORRO_LOG 1\n").expect("write fixture");
+
+    let mut child = spawn_gui(&path);
+    let wid = find_corro_window(child.id(), Instant::now() + Duration::from_secs(25));
+    xdotool(&["windowactivate", "--sync", &wid]);
+    std::thread::sleep(Duration::from_millis(400));
+    // Seed A1 with "A" (Enter commits and moves down to A2).
+    xdotool(&["type", "--window", &wid, "A"]);
+    std::thread::sleep(Duration::from_millis(400));
+    xdotool(&["key", "--window", &wid, "Return"]);
+    wait_file_pred(&path, Instant::now() + Duration::from_secs(10), "seed commit", |ls| {
+        ls.iter().any(|l| l == "SET A1 A")
+    });
+    // Move back up to A1 (Enter advanced to A2); Cut/Paste target A1.
+    xdotool(&["key", "--window", &wid, "Up"]);
+    std::thread::sleep(Duration::from_millis(300));
+    // Edit menu (Alt+E), Cut is row 1 of 7. Cut has no keyboard mnemonic
+    // (its documented shortcut X appears nowhere in "Cut"), so activate by
+    // click like the menu-key tests: clears A1.
+    xdotool(&["key", "--window", &wid, "alt+e"]);
+    std::thread::sleep(Duration::from_millis(500));
+    click_popup_fraction(child.id(), &wid, 0.5 / 7.0);
+    wait_file_pred(&path, Instant::now() + Duration::from_secs(10), "cut clear", |ls| {
+        ls.iter().any(|l| l.starts_with("SET A1") && l != "SET A1 A")
+    });
+    // Edit menu, Paste is row 3 of 7: restores "A" from the menu clipboard.
+    xdotool(&["key", "--window", &wid, "alt+e"]);
+    std::thread::sleep(Duration::from_millis(500));
+    click_popup_fraction(child.id(), &wid, 2.5 / 7.0);
+    let lines = wait_file_pred(&path, Instant::now() + Duration::from_secs(10), "paste restore", |ls| {
+        ls.iter().filter(|l| *l == "SET A1 A").count() >= 2
+    });
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(
+        lines.iter().filter(|l| *l == "SET A1 A").count() >= 2,
+        "paste should restore a second `SET A1 A` after cut cleared it, got: {lines:?}"
+    );
+    let _ = std::fs::remove_file(&path);
+}
