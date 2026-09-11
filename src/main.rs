@@ -51,20 +51,29 @@ fn cli_option_suggestion(arg: &str) -> Option<&'static str> {
     }
 }
 
-#[cfg(any(target_arch = "wasm32", feature = "gui"))]
+#[cfg(target_arch = "wasm32")]
 fn determine_default_ui() -> UiKind { UiKind::Gui }
 
+// Terminal-first: a compiled-in terminal UI is always the default; the GUI
+// is opt-in via an explicit --gui flag (see --help text). Without this,
+// `cargo run --features gui` would pop a GUI window even though the user
+// never asked for one.
+#[cfg(all(not(target_arch = "wasm32"), feature = "ratatui"))]
+fn determine_default_ui() -> UiKind { UiKind::Ratatui }
+
 #[cfg(all(
-    not(any(target_arch = "wasm32", feature = "gui")),
+    not(target_arch = "wasm32"),
+    not(feature = "ratatui"),
     feature = "pancurses"
 ))]
 fn determine_default_ui() -> UiKind { UiKind::Pancurses }
 
 #[cfg(all(
-    not(any(target_arch = "wasm32", feature = "gui")),
+    not(target_arch = "wasm32"),
+    not(feature = "ratatui"),
     not(feature = "pancurses")
 ))]
-fn determine_default_ui() -> UiKind { UiKind::Ratatui }
+fn determine_default_ui() -> UiKind { UiKind::Gui }
 
 // Win95-safe command line: `GetCommandLineW` is a no-op stub on Windows 95
 // (returns NULL), so `std::env::args()` cannot be used there. Read the ANSI
@@ -725,6 +734,7 @@ mod tests {
         let mut movie_menu_hold_ms = 1200u64;
         let mut show_help = false;
         let mut show_version = false;
+        let mut ui = super::determine_default_ui();
         let mut positional = Vec::new();
         let mut rest = it.peekable();
 
@@ -756,6 +766,18 @@ mod tests {
                 }
                 "--movie" => {
                     movie = true;
+                }
+                "--ratatui" => {
+                    #[cfg(feature = "ratatui")]
+                    { ui = super::UiKind::Ratatui; }
+                }
+                "--gui" => {
+                    #[cfg(feature = "gui")]
+                    { ui = super::UiKind::Gui; }
+                }
+                "--pancurses" => {
+                    #[cfg(feature = "pancurses")]
+                    { ui = super::UiKind::Pancurses; }
                 }
                 "--movie-typing-cps" => {
                     let next = rest.next().expect("movie typing cps");
@@ -790,10 +812,58 @@ mod tests {
             show_help,
             show_version,
             debug_no_number: false,
-            ui: super::determine_default_ui(),
+            ui,
             capture_html: None,
             convert_ansi: None,
         }
+    }
+
+    #[test]
+    fn default_ui_is_terminal_unless_requested() {
+        // No UI flag: the default must be a terminal UI whenever one is
+        // compiled in — the GUI is opt-in via --gui (matches --help text).
+        // Regression: with the `gui` feature enabled the default used to be
+        // Gui, so `cargo run --features gui` popped a window unasked.
+        let args = parse_args_from(["corro"]);
+        #[cfg(all(not(target_arch = "wasm32"), feature = "ratatui"))]
+        assert!(
+            matches!(args.ui, super::UiKind::Ratatui),
+            "default UI should be ratatui when compiled in"
+        );
+        #[cfg(all(
+            not(target_arch = "wasm32"),
+            not(feature = "ratatui"),
+            feature = "pancurses"
+        ))]
+        assert!(
+            matches!(args.ui, super::UiKind::Pancurses),
+            "default UI should be pancurses when it is the only terminal UI"
+        );
+        #[cfg(target_arch = "wasm32")]
+        assert!(
+            matches!(args.ui, super::UiKind::Gui),
+            "wasm default UI should be gui"
+        );
+    }
+
+    #[test]
+    fn explicit_ui_flags_select_backends() {
+        // Explicit flags always win over the default, per compiled backend.
+        #[cfg(feature = "ratatui")]
+        assert!(matches!(
+            parse_args_from(["corro", "--ratatui"]).ui,
+            super::UiKind::Ratatui
+        ));
+        #[cfg(feature = "pancurses")]
+        assert!(matches!(
+            parse_args_from(["corro", "--pancurses"]).ui,
+            super::UiKind::Pancurses
+        ));
+        #[cfg(feature = "gui")]
+        assert!(matches!(
+            parse_args_from(["corro", "--gui"]).ui,
+            super::UiKind::Gui
+        ));
     }
 
     #[test]
