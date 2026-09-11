@@ -381,15 +381,22 @@ fn render_to(
 fn cols_to_fill_px(app: &super::App, cursor: SheetCursor, avail_px: i32) -> usize {
     let sheet = app.core.workbook.active_sheet();
     let mut dim = 1usize;
+    let mut prev_len = 0usize;
     loop {
         let (cols, _) = ui_core::visible_col_indices(sheet, cursor, dim, 0);
         let used: f64 = cols
             .iter()
             .map(|&c| sheet_rec_col_width(sheet, c) as f64 * CHAR_W)
             .sum();
-        if used >= avail_px as f64 || dim >= 2048 || cols.len() < dim {
+        // Exit when covered, capped, or STALLED (the returned set stops
+        // growing: the grid is exhausted). Never exit on `cols.len() < dim`:
+        // visible_col_indices may legitimately return fewer than dim (e.g.
+        // dim-1 with a left-margin cursor), and bailing there strands the
+        // sheet narrow with a huge blank area.
+        if used >= avail_px as f64 || dim >= 2048 || cols.len() <= prev_len {
             return dim.max(1);
         }
+        prev_len = cols.len();
         dim += 8;
     }
 }
@@ -2134,4 +2141,63 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // pointer is available for quit_main_loop before any user interaction.
     rxapp.run()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod fill_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn overflow_app() -> crate::gui::App {
+        let mut dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        dir.push("docs/tests/overflow.corro");
+        let mut app = crate::gui::App::new_with_paths(vec![dir]);
+        app.load_initial().unwrap();
+        app
+    }
+
+    /// cols_to_fill_px must size the viewport to cover the available width
+    /// even when the cursor sits in the left margin. Regression: with a
+    /// margin cursor, visible_col_indices returns dim-1 columns, so the
+    /// `cols.len() < dim` exit fired after two iterations (data_cols=9) and
+    /// the sheet stopped ~460px into a 1280px window, leaving a huge blank.
+    #[test]
+    fn cols_to_fill_px_covers_viewport_with_margin_cursor() {
+        let app = overflow_app();
+        let cursor = SheetCursor { row: HEADER_ROWS, col: MARGIN_COLS - 3 };
+        let dim = cols_to_fill_px(&app, cursor, 1220);
+        let sheet = app.core.workbook.active_sheet();
+        let (cols, _) = ui_core::visible_col_indices(sheet, cursor, dim, 0);
+        let used_px: usize = cols
+            .iter()
+            .map(|&c| sheet_rec_col_width(sheet, c))
+            .sum::<usize>()
+            * CHAR_W as usize;
+        assert!(
+            used_px >= 1220,
+            "viewport must cover 1220px with margin cursor (dim={dim}, cols={}, used~{used_px})",
+            cols.len()
+        );
+    }
+
+    /// Same guarantee with the cursor on A1 (the pre-existing passing case,
+    /// pinned so the fix cannot regress the common path).
+    #[test]
+    fn cols_to_fill_px_covers_viewport_on_main_cursor() {
+        let app = overflow_app();
+        let cursor = SheetCursor { row: HEADER_ROWS, col: MARGIN_COLS };
+        let dim = cols_to_fill_px(&app, cursor, 1220);
+        let sheet = app.core.workbook.active_sheet();
+        let (cols, _) = ui_core::visible_col_indices(sheet, cursor, dim, 0);
+        let used_px: usize = cols
+            .iter()
+            .map(|&c| sheet_rec_col_width(sheet, c))
+            .sum::<usize>()
+            * CHAR_W as usize;
+        assert!(
+            used_px >= 1220,
+            "viewport must cover 1220px on A1 (dim={dim}, cols={}, used~{used_px})",
+            cols.len()
+        );
+    }
 }

@@ -23,6 +23,10 @@ use std::time::{Duration, Instant};
 
 static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Serialize the live-GUI tests in this binary: parallel windows steal focus
+/// and blank each other's screenshots (same pattern as gui_edit_parity.rs).
+static GUI_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn xdotool(args: &[&str]) -> String {
     String::from_utf8_lossy(
         &Command::new("xdotool").args(args).output().expect("xdotool failed").stdout,
@@ -114,15 +118,87 @@ fn analyze(png: &PathBuf) -> Fill {
     Fill { marker_x: p[0], marker_y: p[1], right_gap: p[2], bottom_gap: p[3] }
 }
 
-fn spawn_gui(path: &PathBuf) -> Child {
+// Non-panicking analyzer for settle loops: None while the window hasn't
+// rendered yet (blank first frames under Xvfb are normal).
+fn try_analyze(png: &PathBuf) -> Option<Fill> {
+    let script = std::env::temp_dir().join(format!(
+        "corro-fill-try-{}.py",
+        COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    ));
+    std::fs::write(&script, ANALYZER).expect("write analyzer");
+    let out = Command::new("python3")
+        .arg(&script)
+        .arg(png)
+        .output()
+        .expect("python3 analyzer");
+    let _ = std::fs::remove_file(&script);
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if text == "NO_MARKER" {
+        return None;
+    }
+    let p: Vec<i32> = text.split_whitespace().map(|s| s.parse().expect("ints")).collect();
+    if p.len() != 4 {
+        return None;
+    }
+    Some(Fill { marker_x: p[0], marker_y: p[1], right_gap: p[2], bottom_gap: p[3] })
+}
+
+/// Screenshot until the canvas marker renders (deadline), then settle until
+/// two captures 400ms apart agree — so neither a blank first frame nor a
+/// mid-move tear can produce the verdict.
+fn capture_settled(wid: &str, tag: &str) -> Fill {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut prev: Option<Fill> = None;
+    loop {
+        if Instant::now() > deadline {
+            panic!("timed out waiting for rendered canvas in settled capture");
+        }
+        let shot = screenshot(wid, tag);
+        let cur = try_analyze(&shot);
+        let _ = std::fs::remove_file(&shot);
+        match (prev.take(), cur) {
+            (Some(p), Some(c))
+                if p.marker_x == c.marker_x && p.marker_y == c.marker_y =>
+            {
+                return c
+            }
+            (_, c) => {
+                prev = c;
+                std::thread::sleep(Duration::from_millis(400));
+            }
+        }
+    }
+}
+
+/// Child process handle that kills (and reaps) the app on drop, including
+/// on test panic. Without this, a panicking test leaks its window, which
+/// steals X focus and blanks/keys later tests (cascading flakes).
+struct KillOnDrop(Child);
+impl std::ops::Deref for KillOnDrop {
+    type Target = Child;
+    fn deref(&self) -> &Child { &self.0 }
+}
+impl std::ops::DerefMut for KillOnDrop {
+    fn deref_mut(&mut self) -> &mut Child { &mut self.0 }
+}
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn spawn_gui(path: &PathBuf) -> KillOnDrop {
     let bin = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/corro");
-    Command::new(&bin)
-        .arg("--gui")
-        .arg(path)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn corro --gui")
+    KillOnDrop(
+        Command::new(&bin)
+            .arg("--gui")
+            .arg(path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn corro --gui"),
+    )
 }
 
 fn find_window(child_pid: u32) -> String {
@@ -216,7 +292,6 @@ fn assert_fills(wid: &str, tag: &str, w: i32, h: i32) {
 
 #[test]
 fn gui_sheet_fills_window_after_chrome() {
-    static GUI_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _guard = GUI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     assert!(
         std::env::var("DISPLAY").is_ok(),
@@ -242,6 +317,126 @@ fn gui_sheet_fills_window_after_chrome() {
     // Large window (fits a 1280x1024 Xvfb screen): catches a viewport that
     // never expands — proves live expansion, not a fixed size.
     assert_fills(&wid, "large", 1280, 1000);
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_file(&path);
+}
+
+
+/// Poll a `.corro` file with a deadline until one line satisfies `pred`.
+fn wait_file_pred(
+    path: &std::path::PathBuf,
+    what: &str,
+    pred: impl Fn(&str) -> bool,
+) -> Vec<String> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            let lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+            if lines.iter().any(|l| pred(l)) {
+                return lines;
+            }
+        }
+        if Instant::now() > deadline {
+            panic!(
+                "timed out waiting for {what} in {}\ncontent: {:?}",
+                path.display(),
+                std::fs::read_to_string(path).unwrap_or_default()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Type Q + Enter and assert the commit lands in a margin cell (`SET [`):
+/// proves the Left keys actually reached the margin (guards a vacuous pass
+/// where lost keys leave the cursor on A1 and the fill trivially holds).
+fn assert_margin_commit(wid: &str, path: &std::path::PathBuf) {
+    xdotool(&["key", "--window", wid, "q"]);
+    std::thread::sleep(Duration::from_millis(300));
+    xdotool(&["key", "--window", wid, "Return"]);
+    let lines = wait_file_pred(path, "margin-zone commit", |l| l.starts_with("SET ["));
+    assert!(
+        lines.iter().any(|l| l.starts_with("SET [")),
+        "typed Q should commit into the margin zone after Left, got: {lines:?}"
+    );
+}
+
+/// After Left-arrowing into the left margin, the sheet must still reach the
+/// After Left-arrowing into the left margin, the sheet must still reach the
+/// right window edge — no huge blank area.
+///
+/// Regression: with the cursor in the left margin, `visible_col_indices`
+/// returns dim-1 columns, so `cols_to_fill_px`'s `cols.len() < dim` exit
+/// fired after two iterations (data_cols=9) and the grid stopped ~460px
+/// into a 1280px window. Populated sheet (overflow.corro exercises margin
+/// columns plus footer rows).
+#[test]
+fn gui_left_arrow_fills_window() {
+    let _guard = GUI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    assert!(
+        std::env::var("DISPLAY").is_ok(),
+        "requires X server (run under xvfb-run -a)"
+    );
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let path = std::env::temp_dir().join(format!("corro-fill-left-{}-{}.corro", std::process::id(), id));
+    std::fs::copy(
+        format!("{}/docs/tests/overflow.corro", env!("CARGO_MANIFEST_DIR")),
+        &path,
+    )
+    .expect("copy overflow fixture");
+
+    let mut child = spawn_gui(&path);
+    let wid = find_window(child.id());
+    xdotool(&["windowsize", &wid, "1200", "800"]);
+    std::thread::sleep(Duration::from_millis(400));
+    // Walk three columns into the left margin (cursor was on A1).
+    for _ in 0..3 {
+        xdotool(&["key", "--window", &wid, "Left"]);
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    let f = capture_settled(&wid, "left");
+    assert!(
+        f.right_gap <= 60,
+        "grid must still reach the right edge after Left into the margin (right_gap={})",
+        f.right_gap
+    );
+    // Rows are unchanged by a horizontal move (covered by
+    // gui_sheet_fills_window_after_chrome); the regression is horizontal.
+    assert_margin_commit(&wid, &path);
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Same as above on a tiny (1x1, empty) sheet: margin columns always exist,
+/// so even the smallest grid must fill the window after Left.
+#[test]
+fn gui_left_arrow_fills_window_empty() {
+    let _guard = GUI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    assert!(
+        std::env::var("DISPLAY").is_ok(),
+        "requires X server (run under xvfb-run -a)"
+    );
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let path = std::env::temp_dir().join(format!("corro-fill-left-empty-{}-{}.corro", std::process::id(), id));
+    std::fs::write(&path, "CORRO_LOG 1\n").expect("write empty fixture");
+
+    let mut child = spawn_gui(&path);
+    let wid = find_window(child.id());
+    xdotool(&["windowsize", &wid, "1200", "800"]);
+    std::thread::sleep(Duration::from_millis(400));
+    for _ in 0..3 {
+        xdotool(&["key", "--window", &wid, "Left"]);
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    let f = capture_settled(&wid, "leftempty");
+    assert!(
+        f.right_gap <= 60,
+        "empty grid must still reach the right edge after Left into the margin (right_gap={})",
+        f.right_gap
+    );
+    assert_margin_commit(&wid, &path);
     let _ = child.kill();
     let _ = child.wait();
     let _ = std::fs::remove_file(&path);

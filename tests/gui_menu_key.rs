@@ -57,15 +57,35 @@ fn find_corro_window(child_pid: u32, deadline: Instant) -> String {
     }
 }
 
-fn spawn_gui(path: &PathBuf) -> Child {
+/// Child process handle that kills (and reaps) the app on drop, including
+/// on test panic. Without this, a panicking test leaks its window, which
+/// steals X focus and blanks/keys later tests (cascading flakes).
+struct KillOnDrop(Child);
+impl std::ops::Deref for KillOnDrop {
+    type Target = Child;
+    fn deref(&self) -> &Child { &self.0 }
+}
+impl std::ops::DerefMut for KillOnDrop {
+    fn deref_mut(&mut self) -> &mut Child { &mut self.0 }
+}
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn spawn_gui(path: &PathBuf) -> KillOnDrop {
     let bin = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/corro");
-    Command::new(&bin)
-        .arg("--gui")
-        .arg(path)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn corro --gui")
+    KillOnDrop(
+        Command::new(&bin)
+            .arg("--gui")
+            .arg(path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn corro --gui"),
+    )
 }
 
 /// Windows of `pid` excluding the main window and tiny/input-only ones:
