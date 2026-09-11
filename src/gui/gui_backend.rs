@@ -1731,13 +1731,20 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     let menubar_cb = menubar.clone();
     vbox.append(&menubar);
 
-    // Keyboard: canvas.on_key, win.on_event_key, etc.
+    // Keyboard: canvas.on_key_raw, win.on_event_key, etc.
     let shared_key = shared.clone();
-    canvas.on_key(Box::new(move |keyval: u32| -> bool {
-        // Canvas callbacks carry no modifier state on any backend
-        // (common::Canvas::on_key drops it), so Shift+arrows from a
-        // canvas-focused keypress move plainly; entry/window paths below
-        // carry Shift (bit 0x1, GDK_SHIFT_MASK / Win32-shift bit).
+    canvas.on_key_raw(Box::new(move |keyval: u32, state: u32| -> bool {
+        // Alt+letter is reserved for menu mnemonics (handled natively by GTK
+        // after propagation): never start a grid edit from it.  Without this
+        // guard a canvas-focused Alt+F would type 'f' into the grid, since
+        // this path (unlike entry/window) otherwise drops modifier state.
+        if (state & 0x8) != 0 {
+            return false;
+        }
+        // Modifier state arrives here (unlike common::Canvas::on_key, which
+        // drops it), but only Alt is inspected: Shift+arrows from a
+        // canvas-focused keypress still move plainly; entry/window paths
+        // below carry Shift (bit 0x1, GDK_SHIFT_MASK / Win32-shift bit).
         handle_key(keyval, &shared_key, 0)
     }));
 
@@ -1818,18 +1825,17 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                 return 1;
             }
 
-            // ALT+letter: open menu via handle_menu_key.  This tries GTK's
-            // activate_submenu_by_mnemonic first, then falls back to the
-            // Rust-side model scan via keyboard_menu_active.  The fallback
-            // works even when GTK's popover system is blocked by the
-            // CAPTURE-phase controller.
+            // ALT+letter: let GTK open the submenu natively via the underscore
+            // mnemonics baked into the GTK3 menu labels (build_gtk3).  Do NOT
+            // engage the Rust-side handle_menu_key fallback here: it consumes
+            // the key and only sets internal flags without displaying any
+            // popup, so the user sees nothing happen.  Native handling owns the
+            // whole interaction (open, navigate, dismiss); returning 0
+            // propagates the event to the toplevel default handler which
+            // activates the mnemonic.  (GTK4's adapter ignores Alt+letter and
+            // already propagated, so this is a no-op there.)
             if alt_held && (32..=126).contains(&keyval) {
-                let ok = menubar_cb.handle_menu_key(keyval, state);
-                append_keylog(&format!("Alt+letter keyval={keyval} handle_menu_key={ok}\n"));
-                if ok {
-                    s.last_alt_keyval.set(keyval);
-                    return 1;
-                }
+                append_keylog(&format!("Alt+letter keyval={keyval} propagating to GTK mnemonics\n"));
                 return 0;
             }
 

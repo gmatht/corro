@@ -2248,16 +2248,20 @@ impl MenuBar {
         action_group: *mut c_void,
     ) {
         for item in items {
-            let c_label = match CString::new(item.label.as_str()) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            // Use gtk_menu_item_new_with_mnemonic so underscores are
-            // interpreted as mnemonics (e.g. _File shows as File with
-            // underlined F).  Fall back to the label variant.
+            // First-character mnemonics: prefix '_' so GTK registers a real
+            // mnemonic for every item (e.g. "File" -> "_File") and Alt+letter
+            // opens/navigates menus natively.  With gtk_menu_item_new_with_mnemonic
+            // the underscore is consumed as the marker, so the displayed text is
+            // unchanged (underline appears only while Alt is held, per theme).
+            // The plain label is kept for the non-mnemonic constructor fallback
+            // so a missing mnemonic symbol can never leak a literal underscore.
+            let mnemonic_label = format!("_{}", item.label);
             let new_item = symbols.gtk_menu_item_new_with_mnemonic
-                .map(|f| unsafe { f(c_label.as_ptr()) })
-                .or_else(|| symbols.gtk_menu_item_new_with_label.map(|f| unsafe { f(c_label.as_ptr()) }));
+                .and_then(|f| CString::new(mnemonic_label).ok().map(|c_label| unsafe { f(c_label.as_ptr()) }))
+                .or_else(|| match CString::new(item.label.as_str()) {
+                    Ok(c_label) => symbols.gtk_menu_item_new_with_label.map(|f| unsafe { f(c_label.as_ptr()) }),
+                    Err(_) => None,
+                });
             if let Some(gtk_item) = new_item {
                 if let Some(ref submenu) = item.submenu {
                     // Submenu item: create GtkMenu and recurse
