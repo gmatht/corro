@@ -308,6 +308,10 @@ mod nwg_backend {
             move |evt, _data, _handle| {
                 if let nwg::Event::OnButtonClick = evt {
                     if let Some(ref mut f) = *cb2.borrow_mut() { f(rid); }
+                    // Dismiss like the Escape path: confirming must close.
+                    unsafe {
+                        winapi::um::winuser::ShowWindow(parent as _, winapi::um::winuser::SW_HIDE);
+                    }
                 }
             },
         );

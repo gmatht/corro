@@ -97,6 +97,55 @@ pub fn show_keybinds_help() {
 }
 
 
+/// Generic single-entry modal prompt with caller-supplied title, OK button
+/// label, and initial text. Prompt-gated menu actions (rename/copy/delete
+/// sheet, go to cell, column widths, ...) each get correctly labeled chrome
+/// through this — never a recycled "Find" dialog (which is what Rename
+/// Sheet showed before this existed).
+pub fn prompt_dialog<F: FnOnce(Option<String>) + 'static>(
+    title: &str,
+    ok_label: &str,
+    initial: &str,
+    on_result: F,
+) {
+    #[cfg(feature = "gui")]
+    {
+        use rswidgets::common::Entry as CommonEntry;
+        if let Ok(rxapp) = rswidgets::App::init() {
+            if let Ok(dialog) = rxapp.new_dialog() {
+                if let Ok(entry) = rxapp.new_entry() {
+                    dialog.set_title(title);
+                    entry.set_text(initial);
+                    dialog.append_content_area(&entry);
+                    dialog.add_button("Cancel", 0);
+                    dialog.add_button(ok_label, 1);
+                    let entry_ptr = Box::into_raw(Box::new(entry)) as usize;
+                    let mut on_result = Some(on_result);
+                    let callback_called = std::cell::RefCell::new(false);
+                    dialog.connect_response(move |response_id| {
+                        let mut called = callback_called.borrow_mut();
+                        if !*called {
+                            *called = true;
+                            if let Some(f) = on_result.take() {
+                                let entry: &CommonEntry = unsafe { &*(entry_ptr as *const CommonEntry) };
+                                if response_id == 1 {
+                                    f(entry.get_text());
+                                } else {
+                                    f(None);
+                                }
+                            }
+                        }
+                    }).ok();
+                    dialog.present();
+                    let _ = Box::into_raw(Box::new(dialog));
+                    return;
+                }
+            }
+        }
+    }
+    on_result(None);
+}
+
 pub fn find_dialog<F: FnOnce(Option<String>) + 'static>(on_result: F) {
     #[cfg(feature = "gui")]
     {

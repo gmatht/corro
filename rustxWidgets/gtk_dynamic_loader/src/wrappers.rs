@@ -2853,8 +2853,19 @@ impl Dialog {
 
     pub fn connect_response<F: FnMut(i32) + 'static>(&self, mut f: F) -> Result<u64, Error> {
         guard_widget_or!(self, "Dialog", "connect_response", Err(Error::Other("dialog dropped".into())));
+        // GtkDialog does not auto-dismiss on response (that was the
+        // deprecated gtk_dialog_run): close here so one-shot prompt dialogs
+        // (find/replace/rename/...) actually dismiss. Without this,
+        // confirming a dialog applies the action but leaves the dialog open.
+        let inner = self.inner;
+        let loader = self.loader.clone();
         let boxed: Box<Box<dyn FnMut(*mut c_void, i32)>> = Box::new(Box::new(move |_dialog, response_id| {
             f(response_id);
+            if let Some(window_close) = loader.symbols.gtk_window_close {
+                unsafe { window_close(inner); }
+            } else if let Some(widget_destroy) = loader.symbols.gtk_widget_destroy {
+                unsafe { widget_destroy(inner); }
+            }
         }));
         let raw = Box::into_raw(boxed) as *mut c_void;
         let sig_name = CString::new("response").unwrap();

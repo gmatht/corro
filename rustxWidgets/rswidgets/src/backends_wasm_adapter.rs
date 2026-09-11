@@ -959,10 +959,13 @@ impl SimpleAction {
             let btn: HtmlButtonElement = create_element("button").dyn_into().unwrap();
             btn.set_text_content(Some(text));
             let cb = self.response_cb.clone();
+            let elem = self.elem.clone();
             let closure = Closure::<dyn FnMut(MouseEvent)>::new(move |_: MouseEvent| {
                 if let Some(ref mut f) = *cb.borrow_mut() {
                     f(response_id);
                 }
+                // Dismiss like every other backend: confirming must close.
+                elem.close();
             });
             btn.add_event_listener_with_callback("click", closure.as_ref().unchecked_ref())
                 .ok();

@@ -1829,6 +1829,29 @@ fn delegate_shared_action(name: &str, state: &Rc<GuiState>) {
     refresh_after_dialog(state);
 }
 
+/// Dialog chrome (window title, OK button label, initial entry text) for a
+/// prompt-gated menu action. Pure so unit tests pin every action's labels:
+/// a mislabeled dialog (Rename Sheet showing "Find") fails here instead of
+/// reaching users. The initial text pre-fills the entry for edit-in-place
+/// actions (rename); everything else starts empty.
+fn prompt_chrome(action: &str, current_sheet_title: &str) -> (String, String, String) {
+    match action {
+        "rename_sheet" => ("Rename sheet".into(), "Rename".into(), current_sheet_title.into()),
+        "copy_sheet" => ("Copy sheet".into(), "Copy".into(), String::new()),
+        "delete_sheet" => ("Delete sheet".into(), "Delete".into(), String::new()),
+        "go_to_cell" => ("Go to cell".into(), "Go".into(), String::new()),
+        "set_col_width" => ("Column width".into(), "Set".into(), String::new()),
+        "set_max_col_width" => ("Default width".into(), "Set".into(), String::new()),
+        "find" => ("Find".into(), "Find".into(), String::new()),
+        "insert_special_chars" => ("Insert special char".into(), "Insert".into(), String::new()),
+        "insert_hyperlink" => ("Insert hyperlink".into(), "Insert".into(), String::new()),
+        "sort_view" => ("Sort view".into(), "Sort".into(), String::new()),
+        "persist_sort" => ("Persist sort".into(), "Sort".into(), String::new()),
+        "balance_books" => ("Balance books".into(), "Balance".into(), String::new()),
+        _ => ("Prompt".into(), "OK".into(), String::new()),
+    }
+}
+
 fn handle_menu_action(name: &str, state: &Rc<GuiState>) {
     let app = state.app_mut();
     log_ui_action("menu_action", name);
@@ -1927,19 +1950,38 @@ fn handle_menu_action(name: &str, state: &Rc<GuiState>) {
             // arrive as Edit{value} and preset the edit buffer for Enter.
             delegate_shared_action(name, state);
         }
+
         _ if menu_action_needs_prompt(name).is_some() => {
             // Every other prompt-gated action funnels through the shared
             // prompt logic; the dialog only supplies the input. Routing by
             // the shared gate (not a hardcoded list) means a newly-added
             // prompt action can never silently fall to the stub below.
+            // Replace has two fields, so it gets its dedicated dialog (a
+            // single Find box could never supply "find|replacement");
+            // everything else gets a correctly labeled single-entry prompt
+            // (never a recycled "Find" dialog — see prompt_chrome).
             let st = state.clone();
             let action = name.to_string();
-            dialogs::find_dialog(move |result| {
-                if let Some(text) = result {
-                    run_prompt_action(st.app_mut(), &action, &text);
-                    refresh_after_dialog(&st);
-                }
-            });
+            if action == "replace" {
+                dialogs::replace_dialog(move |result| {
+                    if let Some((find, repl)) = result {
+                        run_prompt_action(st.app_mut(), &action, &format!("{find}|{repl}"));
+                        refresh_after_dialog(&st);
+                    }
+                });
+            } else {
+                let (title, ok, initial) = {
+                    let app = st.app_ref();
+                    let wb = &app.core.workbook;
+                    prompt_chrome(&action, wb.sheet_title(wb.active_sheet))
+                };
+                dialogs::prompt_dialog(&title, &ok, &initial, move |result| {
+                    if let Some(text) = result {
+                        run_prompt_action(st.app_mut(), &action, &text);
+                        refresh_after_dialog(&st);
+                    }
+                });
+            }
         }
         "format_apply_all" | "format_apply_full_column" | "format_apply_data"
         | "format_apply_special" | "format_apply_cell" | "format_apply_selection"
@@ -2758,6 +2800,58 @@ mod gutter_tests {
                 && c == (0.45, 0.45, 0.45, 1.0)),
             "unlocked padlock needs an outlined lighter body, got {strokes:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod prompt_tests {
+    use super::*;
+
+    /// Regression for "Rename Sheet opens Find": every prompt-gated action
+    /// gets its own correctly labeled dialog chrome — titles and buttons
+    /// pinned here, not eyeballed in screenshots.
+    #[test]
+    fn prompt_chrome_labels_every_action() {
+        let cases: &[(&str, &str, &str)] = &[
+            ("rename_sheet", "Rename sheet", "Rename"),
+            ("copy_sheet", "Copy sheet", "Copy"),
+            ("delete_sheet", "Delete sheet", "Delete"),
+            ("go_to_cell", "Go to cell", "Go"),
+            ("set_col_width", "Column width", "Set"),
+            ("set_max_col_width", "Default width", "Set"),
+            ("find", "Find", "Find"),
+            ("insert_special_chars", "Insert special char", "Insert"),
+            ("insert_hyperlink", "Insert hyperlink", "Insert"),
+            ("sort_view", "Sort view", "Sort"),
+            ("persist_sort", "Persist sort", "Sort"),
+            ("balance_books", "Balance books", "Balance"),
+        ];
+        for (action, title, ok) in cases {
+            let (t, o, initial) = prompt_chrome(action, "Sheet2");
+            assert_eq!(&t, title, "dialog title for {action}");
+            assert_eq!(&o, ok, "dialog button for {action}");
+            if *action != "find" {
+                assert_ne!(&t, "Find", "{action} must not recycle the Find dialog");
+            }
+            let _ = initial;
+        }
+    }
+
+    /// Rename pre-fills the entry with the current title (edit-in-place);
+    /// creation-style prompts start empty so stale text can never leak in.
+    #[test]
+    fn prompt_chrome_initial_text() {
+        assert_eq!(
+            prompt_chrome("rename_sheet", "Budget"),
+            ("Rename sheet".into(), "Rename".into(), "Budget".into())
+        );
+        for action in ["copy_sheet", "delete_sheet", "go_to_cell", "find"] {
+            assert_eq!(
+                prompt_chrome(action, "Budget").2,
+                String::new(),
+                "{action} must start with an empty entry"
+            );
+        }
     }
 }
 

@@ -418,3 +418,126 @@ fn gui_tab_click_switches_active_sheet() {
 fn y1_in_first_tab(yellow_x0: i32, divs: &[i32]) -> bool {
     yellow_x0 >= 0 && yellow_x0 < divs[0]
 }
+
+/// Window id of the dialog titled `title` (deadline): None on timeout.
+/// Dialog titles come from prompt_chrome — a mislabeled dialog (Rename
+/// showing "Find") fails the title assertion instead of reaching users.
+fn wait_dialog_title(pid: u32, title: &str, deadline: Instant) -> Option<String> {
+    loop {
+        for id in xdotool(&["search", "--pid", &pid.to_string()]).split_whitespace() {
+            if xdotool(&["getwindowname", id]).trim() == title {
+                return Some(id.to_string());
+            }
+        }
+        if Instant::now() > deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+
+/// Sheet > Rename sheet renames the active sheet end to end. Regression:
+/// Rename opened a dialog titled "Find" (the prompt funnel recycled
+/// find_dialog for every prompt action). The title assertion pins the fix;
+/// the tab re-title, status, and log op prove the rename itself.
+#[test]
+fn gui_rename_sheet_retitles_active_tab() {
+    let _guard = GUI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    assert!(
+        std::env::var("DISPLAY").is_ok(),
+        "requires X server (run under xvfb-run -a)"
+    );
+    let path = fresh_fixture("renametab", "CORRO_LOG 1\n$2:NEW_SHEET Sheet2\n");
+    let mut child = spawn_gui(&path);
+    let pid = child.id();
+    let wid = find_corro_window(pid, Instant::now() + Duration::from_secs(25));
+    xdotool(&["windowactivate", "--sync", &wid]);
+    std::thread::sleep(Duration::from_millis(400));
+    xdotool(&["key", "--window", &wid, "alt+s"]);
+    let found = wait_popup(pid, &wid, Instant::now() + Duration::from_secs(8));
+    let popup = found[0].clone();
+    let geo = xdotool(&["getwindowgeometry", "--shell", &popup]);
+    let (mut px, mut py, mut pw, mut ph): (i32, i32, i32, i32) = (0, 0, 0, 0);
+    for l in geo.lines() {
+        if let Some(v) = l.strip_prefix("X=") {
+            px = v.trim().parse().unwrap_or(0);
+        }
+        if let Some(v) = l.strip_prefix("Y=") {
+            py = v.trim().parse().unwrap_or(0);
+        }
+        if let Some(v) = l.strip_prefix("WIDTH=") {
+            pw = v.trim().parse().unwrap_or(0);
+        }
+        if let Some(v) = l.strip_prefix("HEIGHT=") {
+            ph = v.trim().parse().unwrap_or(0);
+        }
+    }
+    assert!(ph > 60, "Sheet popup height implausible ({ph})");
+    // Rename is 4th of 8 items (~0.44 down).
+    xdotool(&[
+        "mousemove",
+        &format!("{}", px + pw / 2),
+        &format!("{}", py + (ph as f64 * 0.44) as i32),
+        "click",
+        "1",
+    ]);
+    // The dialog must be titled "Rename sheet" — not "Find".
+    let dlg = wait_dialog_title(pid, "Rename sheet", Instant::now() + Duration::from_secs(10))
+        .expect("Rename sheet must open a dialog titled 'Rename sheet'");
+    // Entry arrives focused with the current title selected: typing replaces.
+    // Settle for focus (the dialog just mapped; verdicts below stay polled).
+    std::thread::sleep(Duration::from_millis(800));
+    // Confirm via Tab/Tab/Space (entry -> Cancel -> Rename): dialog screen
+    // geometry reports (0,0), so coordinate clicks cannot aim at it, but
+    // synthetic keys reach the focused entry fine.
+    xdotool(&["type", "--window", &dlg, "Budget"]);
+    std::thread::sleep(Duration::from_millis(400));
+    // Tab to the Rename button (entry -> Cancel -> Rename), then Space.
+    // Separate invocations so focus re-asserts on the dialog each time.
+    for key in ["Tab", "Tab", "space"] {
+        xdotool(&["key", "--window", &dlg, key]);
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    // The dialog must close (deadline) and the rename must land: tab title,
+    // status, and log op.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if wait_dialog_title(pid, "Rename sheet", Instant::now()) .is_none() {
+            break;
+        }
+        if Instant::now() > deadline {
+            panic!("Rename dialog never closed after confirming");
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    let log = std::fs::read_to_string(&path).unwrap_or_default();
+    assert!(
+        log.contains("RENAME_SHEET") && log.contains("Budget"),
+        "rename must log RENAME_SHEET Budget (log: {log:?})"
+    );
+    let shot = screenshot(&wid, "renamedtab");
+    let (_, ny0, _, ndivs, nstripy) = strip_metrics(&shot);
+    assert!(
+        ndivs.len() >= 2 && ny0 < ndivs[0],
+        "renamed tab stays first and active (yellow {ny0}, dividers {ndivs:?})"
+    );
+    // Poll for the re-titled text (the strip repaints asynchronously after
+    // the dialog closes); the content assertion below is the verdict.
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let text = loop {
+        let shot = screenshot(&wid, "renamedtabtext");
+        let text = ocr_region(&shot, 0, nstripy - 20, 700, 44, "6");
+        let _ = std::fs::remove_file(&shot);
+        if text.contains("Budget") || Instant::now() > deadline {
+            break text;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    };
+    assert!(
+        text.contains("Budget"),
+        "first tab must read Budget after rename, OCR got: {text:?}"
+    );
+    let _ = child.kill();
+    let _ = std::fs::remove_file(&path);
+}
