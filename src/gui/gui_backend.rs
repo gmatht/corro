@@ -211,6 +211,14 @@ struct GuiState {
     // behaves identically across backends instead of drifting into stubs.
     clipboard: RefCell<String>,
     pending_scope: Cell<u8>,
+    // Row/column pins (padlock feature): logical rows / global cols pinned
+    // visible while scrolling. Session-only (not persisted); cleared lazily
+    // when the active sheet changes (see pinned_sets). Hit rects painted
+    // last frame, used for click toggling.
+    pinned_rows: RefCell<std::collections::BTreeSet<usize>>,
+    pinned_cols: RefCell<std::collections::BTreeSet<usize>>,
+    pinned_sheet: Cell<u32>,
+    padlocks: RefCell<Vec<GutterPadlock>>,
     // Scrollbar sync: native scrollbars around the sheet (thumb tracks the
     // cursor; dragging/clicking moves the cursor, so the selection is always
     // visible). Guard against reentrancy between programmatic sets and the
@@ -281,14 +289,32 @@ impl GuiState {
 // Rendering
 // ---------------------------------------------------------------------------
 
+/// True for data cells outside the main body: left/right margin columns,
+/// header rows, footer rows. Margin zones render dimmer than body content.
+fn is_margin_cell(
+    logical_row: usize,
+    global_col: usize,
+    hr: usize,
+    mr: usize,
+    lm: usize,
+    mc: usize,
+) -> bool {
+    !(logical_row >= hr
+        && logical_row < hr + mr
+        && global_col >= lm
+        && global_col < lm + mc)
+}
+
 fn render_to(
     sink: &GuiCanvasSink,
     dc: &mut dyn DrawContext,
     col_ixs: &[usize],
     col_widths: &HashMap<usize, usize>,
     display_rows: &[usize],
-    _mr: usize,
-    _mc: usize,
+    hr: usize,
+    mr: usize,
+    mc: usize,
+    lm: usize,
     cursor_row: usize,
     cursor_col: usize,
     is_editing: bool,
@@ -326,6 +352,10 @@ fn render_to(
                 if is_editing { (1.0, 1.0, 0.8, 1.0) } else { (0.8, 0.9, 1.0, 1.0) }
             } else if in_selection {
                 (0.9, 0.95, 1.0, 1.0)
+            } else if is_margin_cell(logical_row, c, hr, mr, lm, mc) {
+                // Margin-zone data cells render at 75% background brightness
+                // so margins read as subordinate to body content.
+                (0.75, 0.75, 0.75, 1.0)
             } else {
                 (1.0, 1.0, 1.0, 1.0)
             };
@@ -409,6 +439,201 @@ fn rows_to_fill_px(h: i32) -> usize {
     (((h as f64 - HEADER_H - 20.0) / ROW_H + 1.0).max(1.0)) as usize
 }
 
+/// Paint the row-label gutter. Labels render bold (weight 1), matching the
+/// ratatui reference (which bolds the active row and footer rows) and plain
+/// spreadsheet convention. Pure apart from the draw calls, so unit tests
+/// drive it headlessly with the recording context.
+fn paint_row_headers(
+    dc: &mut dyn DrawContext,
+    display_rows: &[usize],
+    mr: usize,
+    pinned: &std::collections::BTreeSet<usize>,
+    out_padlocks: &mut Vec<GutterPadlock>,
+) {
+    for (ri, &logical_row) in display_rows.iter().enumerate().take(MAX_RENDER_ROWS) {
+        let ry = HEADER_H + ri as f64 * ROW_H;
+        let label = crate::addr::ui_row_label(logical_row, mr);
+        let (_, _, tw, _) = dc.text_extents_styled(&label, "monospace", FONT_SIZE, 0, 1);
+        dc.fill_rect(0.0, ry, ROW_LABEL_W, ROW_H, 0.9, 0.9, 0.9, 1.0);
+        dc.draw_text_styled(ROW_LABEL_W - tw - 4.0, ry + 2.0, &label, "monospace", FONT_SIZE, 0.3, 0.3, 0.3, 1.0, 0, 1);
+        // Padlock at the gutter's left edge (short labels only): the label
+        // is right-aligned, so the left side always has room.
+        if wants_padlock(&label) {
+            let locked = pinned.contains(&logical_row);
+            let (px, py) = (2.0, ry + (ROW_H - PADLOCK_H) / 2.0);
+            paint_padlock(dc, px, py, locked);
+            out_padlocks.push(GutterPadlock {
+                x: px,
+                y: py,
+                w: PADLOCK_W,
+                h: PADLOCK_H,
+                is_row: true,
+                index: logical_row,
+                locked,
+            });
+        }
+    }
+}
+
+/// Paint the column-label header strip. Labels render bold (weight 1),
+/// matching the ratatui reference (all column headers bold). See
+/// [`paint_row_headers`] for testability notes.
+fn paint_col_headers(
+    dc: &mut dyn DrawContext,
+    col_ixs: &[usize],
+    col_widths: &HashMap<usize, usize>,
+    mc: usize,
+    pinned: &std::collections::BTreeSet<usize>,
+    out_padlocks: &mut Vec<GutterPadlock>,
+) {
+    for (ci, &c) in col_ixs.iter().enumerate().take(MAX_RENDER_COLS) {
+        let cw = *col_widths.get(&c).unwrap_or(&8) as f64 * CHAR_W;
+        let cx = ROW_LABEL_W + col_ixs.iter().take(ci).map(|&pc| *col_widths.get(&pc).unwrap_or(&8) as f64 * CHAR_W).sum::<f64>();
+        let col_name = crate::addr::ui_column_fragment(c, mc);
+        dc.fill_rect(cx, 0.0, cw, HEADER_H, 0.9, 0.9, 0.9, 1.0);
+        let (_, _, tw, _) = dc.text_extents_styled(&col_name, "monospace", FONT_SIZE, 0, 1);
+        let tx = cx + (cw - tw) / 2.0;
+        dc.draw_text_styled(tx, (HEADER_H - FONT_SIZE * 1.2) / 2.0, &col_name, "monospace", FONT_SIZE, 0.3, 0.3, 0.3, 1.0, 0, 1);
+        // Padlock right after the centered text (may overlay the neighbor
+        // gutter background in narrow columns; it stays fully clickable).
+        if wants_padlock(&col_name) {
+            let locked = pinned.contains(&c);
+            let (px, py) = (tx + tw + 2.0, (HEADER_H - PADLOCK_H) / 2.0);
+            paint_padlock(dc, px, py, locked);
+            out_padlocks.push(GutterPadlock {
+                x: px,
+                y: py,
+                w: PADLOCK_W,
+                h: PADLOCK_H,
+                is_row: false,
+                index: c,
+                locked,
+            });
+        }
+    }
+}
+
+/// Padlock affordance geometry (device px): small enough for 20px rows and
+/// the 24px header strip, big enough to click and to read at a glance.
+const PADLOCK_W: f64 = 10.0;
+const PADLOCK_H: f64 = 12.0;
+/// Unlocked padlock slate (115): distinct from header gray (77), grid lines
+/// (204), backgrounds (191/229/255) and cursor/selection blues.
+const PADLOCK_OPEN: (f64, f64, f64) = (0.45, 0.45, 0.45);
+/// Locked padlock slate (51): darker than any chrome gray.
+const PADLOCK_SHUT: (f64, f64, f64) = (0.2, 0.2, 0.2);
+
+/// A painted padlock hit target from the last frame: gutter position plus
+/// which logical row (is_row) or global column it pins.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct GutterPadlock {
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    is_row: bool,
+    index: usize,
+    locked: bool,
+}
+
+/// Padlock eligibility: gutter labels with short text only (dual-character
+/// or less, non-empty) get the affordance — the auto-generated margin
+/// labels (`1`, `_1`, `[A`, `AA`, ...) rather than long content.
+fn wants_padlock(label: &str) -> bool {
+    !label.is_empty() && label.chars().count() <= 2
+}
+
+/// Toggle a pin in a set; returns true when the index ends up pinned.
+fn toggle_pin_in(set: &mut std::collections::BTreeSet<usize>, idx: usize) -> bool {
+    if set.contains(&idx) {
+        set.remove(&idx);
+        false
+    } else {
+        set.insert(idx);
+        true
+    }
+}
+
+/// Merge pinned rows/cols ahead of the normal display window (frozen at the
+/// top/left, like frozen panes). `pinned` must be ascending (BTreeSet order
+/// qualifies). Entries already in `display` are not duplicated.
+fn union_pinned(display: &[usize], pinned: &[usize]) -> Vec<usize> {
+    let mut out: Vec<usize> = pinned.to_vec();
+    out.extend(display.iter().filter(|r| !pinned.contains(r)).copied());
+    out
+}
+
+/// Paint the padlock icon at (ox, oy): body rect plus a three-bar shackle.
+/// The right shackle bar connects to the body when locked and floats with a
+/// gap when unlocked. Vector rects only (no font/emoji dependency), so both
+/// backends and screenshots render it identically.
+fn paint_padlock(dc: &mut dyn DrawContext, ox: f64, oy: f64, locked: bool) {
+    let (r, g, b) = if locked { PADLOCK_SHUT } else { PADLOCK_OPEN };
+    if locked {
+        dc.fill_rect(ox + 1.0, oy + 6.0, 8.0, 5.0, r, g, b, 1.0);
+    } else {
+        dc.stroke_rect(ox + 1.0, oy + 6.0, 8.0, 5.0, r, g, b, 1.0, 1.0);
+    }
+    dc.fill_rect(ox + 2.0, oy + 1.0, 2.0, 6.0, r, g, b, 1.0);
+    dc.fill_rect(ox + 2.0, oy + 1.0, 6.0, 2.0, r, g, b, 1.0);
+    if locked {
+        dc.fill_rect(ox + 6.0, oy + 1.0, 2.0, 6.0, r, g, b, 1.0);
+    } else {
+        dc.fill_rect(ox + 6.0, oy + 2.0, 2.0, 3.0, r, g, b, 1.0);
+    }
+}
+
+/// Current pin sets, clearing them lazily when the active sheet changed
+/// (pins are per-sheet session state, never persisted to the log).
+fn pinned_sets(state: &GuiState) -> (Vec<usize>, Vec<usize>) {
+    let sid = {
+        let app = state.app_ref();
+        app.core.workbook.sheet_id(app.core.workbook.active_sheet)
+    };
+    if state.pinned_sheet.get() != sid {
+        state.pinned_rows.borrow_mut().clear();
+        state.pinned_cols.borrow_mut().clear();
+        state.pinned_sheet.set(sid);
+    }
+    let rows: Vec<usize> = state.pinned_rows.borrow().iter().copied().collect();
+    let cols: Vec<usize> = state.pinned_cols.borrow().iter().copied().collect();
+    (rows, cols)
+}
+
+/// Display rows with pins merged in (frozen first), for rendering and click
+/// mapping alike — both must agree or clicks land on the wrong cells.
+fn displayed_rows(state: &GuiState) -> Vec<usize> {
+    let (display, _) = {
+        let app = state.app_ref();
+        let sheet = app.core.workbook.active_sheet();
+        ui_core::visible_row_indices(sheet, app.core.cursor, state.data_rows.get(), 0)
+    };
+    let (pinned, _) = pinned_sets(state);
+    union_pinned(&display, &pinned)
+}
+
+/// Display columns with pins merged in (frozen first). See [`displayed_rows`].
+fn displayed_cols(state: &GuiState) -> Vec<usize> {
+    let (col_ixs, _) = {
+        let app = state.app_ref();
+        let sheet = app.core.workbook.active_sheet();
+        ui_core::visible_col_indices(sheet, app.core.cursor, state.data_cols.get(), 0)
+    };
+    let (_, pinned) = pinned_sets(state);
+    union_pinned(&col_ixs, &pinned)
+}
+
+/// Toggle the pin hit-tested from the last frame's padlocks; returns true
+/// when the row/column ends up pinned.
+fn toggle_pin(state: &GuiState, is_row: bool, idx: usize) -> bool {
+    let _ = pinned_sets(state);
+    if is_row {
+        toggle_pin_in(&mut state.pinned_rows.borrow_mut(), idx)
+    } else {
+        toggle_pin_in(&mut state.pinned_cols.borrow_mut(), idx)
+    }
+}
+
 fn render_grid(dc: &mut dyn DrawContext, state: &GuiState, w: i32, h: i32) {
     dc.clear(0.94, 0.94, 0.94, 1.0);
     dc.clip(0.0, 0.0, w as f64, h as f64);
@@ -419,42 +644,29 @@ fn render_grid(dc: &mut dyn DrawContext, state: &GuiState, w: i32, h: i32) {
     let cursor_row = state.last_row.get();
     let cursor_col = state.last_col.get();
 
-    let display_rows: Vec<usize> = {
-        let sheet = app.core.workbook.active_sheet();
-        ui_core::visible_row_indices(sheet, app.core.cursor, state.data_rows.get(), 0).0
-    };
-    let col_ixs: Vec<usize> = {
-        let sheet = app.core.workbook.active_sheet();
-        ui_core::visible_col_indices(sheet, app.core.cursor, state.data_cols.get(), 0).0
-    };
+    let display_rows: Vec<usize> = displayed_rows(state);
+    let col_ixs: Vec<usize> = displayed_cols(state);
     let mr = app.core.workbook.active_sheet().grid.main_rows();
     let mc = app.core.workbook.active_sheet().grid.main_cols();
 
-    // Row headers
-    for (ri, &logical_row) in display_rows.iter().enumerate().take(MAX_RENDER_ROWS) {
-        let ry = HEADER_H + ri as f64 * ROW_H;
-        let label = crate::addr::ui_row_label(logical_row, mr);
-        let (_, _, tw, _) = dc.text_extents(&label, "monospace", FONT_SIZE);
-        dc.fill_rect(0.0, ry, ROW_LABEL_W, ROW_H, 0.9, 0.9, 0.9, 1.0);
-        dc.draw_text(ROW_LABEL_W - tw - 4.0, ry + 2.0, &label, "monospace", FONT_SIZE, 0.3, 0.3, 0.3, 1.0);
-    }
+    let col_widths: HashMap<usize, usize> = col_ixs.iter()
+        .map(|&c| (c, sheet_rec_col_width(&app.core.workbook.active_sheet(), c)))
+        .collect();
+
+    // Row headers (padlock hit rects refresh every frame for click mapping).
+    let pinned_rows: std::collections::BTreeSet<usize> =
+        state.pinned_rows.borrow().iter().copied().collect();
+    let pinned_cols: std::collections::BTreeSet<usize> =
+        state.pinned_cols.borrow().iter().copied().collect();
+    let mut padlocks: Vec<GutterPadlock> = Vec::new();
+    paint_row_headers(dc, &display_rows, mr, &pinned_rows, &mut padlocks);
 
     // Selection rectangle (anchor..cursor, rows AND columns). None while
     // navigating plainly — only explicit selections highlight.
 
     // Column headers
-    for (ci, &c) in col_ixs.iter().enumerate().take(MAX_RENDER_COLS) {
-        let cw = sheet_rec_col_width(&app.core.workbook.active_sheet(), c) as f64 * CHAR_W;
-        let cx = ROW_LABEL_W + col_ixs.iter().take(ci).map(|&pc| sheet_rec_col_width(&app.core.workbook.active_sheet(), pc) as f64 * CHAR_W).sum::<f64>();
-        let col_name = crate::addr::ui_column_fragment(c, mc);
-        dc.fill_rect(cx, 0.0, cw, HEADER_H, 0.9, 0.9, 0.9, 1.0);
-        let (_, _, tw, _) = dc.text_extents(&col_name, "monospace", FONT_SIZE);
-        dc.draw_text(cx + (cw - tw) / 2.0, (HEADER_H - FONT_SIZE * 1.2) / 2.0, &col_name, "monospace", FONT_SIZE, 0.3, 0.3, 0.3, 1.0);
-    }
-
-    let col_widths: HashMap<usize, usize> = col_ixs.iter()
-        .map(|&c| (c, sheet_rec_col_width(&app.core.workbook.active_sheet(), c)))
-        .collect();
+    paint_col_headers(dc, &col_ixs, &col_widths, mc, &pinned_cols, &mut padlocks);
+    *state.padlocks.borrow_mut() = padlocks;
 
     let row_agg_func = compute::compute_row_agg_func(
         &app.core.workbook.active_sheet().grid,
@@ -476,7 +688,7 @@ fn render_grid(dc: &mut dyn DrawContext, state: &GuiState, w: i32, h: i32) {
         sink_snapshot = sink.cells.borrow().clone();
         render_to(
             &sink, dc, &col_ixs, &col_widths, &display_rows,
-            mr, mc,
+            hr, mr, mc, lm,
             cursor_row, cursor_col,
             state.editing.get(),
             &state.edit_buf.borrow(),
@@ -1251,23 +1463,33 @@ fn update_formula_bar(state: &GuiState, row: usize, col: usize) {
 
 fn handle_click(x: f64, y: f64, state_rc: &Rc<GuiState>) {
     let state: &GuiState = &**state_rc;
+    // Padlock hits first: padlocks live in the gutter chrome that plain
+    // clicks ignore, and toggling a pin must not move the cursor, collapse
+    // the selection, or start editing.
+    let hit = state
+        .padlocks
+        .borrow()
+        .iter()
+        .find(|h| x >= h.x && x < h.x + h.w && y >= h.y && y < h.y + h.h)
+        .copied();
+    if let Some(hit) = hit {
+        toggle_pin(state, hit.is_row, hit.index);
+        state.canvas.queue_redraw();
+        return;
+    }
     let app = state.app_mut();
     if x < ROW_LABEL_W || y < HEADER_H {
         return;
     }
-    let col_ixs: Vec<usize> = {
-        let sheet = app.core.workbook.active_sheet();
-        ui_core::visible_col_indices(sheet, app.core.cursor, state.data_cols.get(), 0).0
-    };
+    let col_ixs: Vec<usize> = displayed_cols(state);
     let mut cx = ROW_LABEL_W;
     for &c in &col_ixs {
         let cw = sheet_rec_col_width(&app.core.workbook.active_sheet(), c) as f64 * CHAR_W;
         if x >= cx && x < cx + cw {
             let ri = ((y - HEADER_H) / ROW_H) as usize;
-            let display_rows: Vec<usize> = {
-                let sheet = app.core.workbook.active_sheet();
-                ui_core::visible_row_indices(sheet, app.core.cursor, state.data_rows.get(), 0).0
-            };
+            // Same pinned-first display set the renderer uses, or clicks
+            // land on the wrong rows once pins are active.
+            let display_rows: Vec<usize> = displayed_rows(state);
             if ri < display_rows.len() {
                 let logical_row = display_rows[ri];
                 state.last_row.set(logical_row);
@@ -1691,6 +1913,10 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         entry_seen: Cell::new(false),
         clipboard: RefCell::new(String::new()),
         pending_scope: Cell::new(0),
+        pinned_rows: RefCell::new(std::collections::BTreeSet::new()),
+        pinned_cols: RefCell::new(std::collections::BTreeSet::new()),
+        pinned_sheet: Cell::new(u32::MAX),
+        padlocks: RefCell::new(Vec::new()),
         #[cfg(feature = "gtk4")]
         last_dedup_key: Cell::new(0),
         #[cfg(feature = "gtk4")]
@@ -2153,6 +2379,232 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
 }
 
 #[cfg(test)]
+mod gutter_tests {
+    use super::*;
+    use rswidgets::backends::headless::{DrawOp, RecordingDrawContext};
+    use std::collections::HashMap;
+
+    fn styled_texts(dc: &RecordingDrawContext) -> Vec<(String, i32, (f64, f64, f64, f64))> {
+        dc.ops
+            .iter()
+            .filter_map(|op| match op {
+                DrawOp::StyledText { text, weight, rgba, .. } => {
+                    Some((text.clone(), *weight, *rgba))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Row gutter labels must paint bold (weight 1), with the row's label.
+    /// Short labels (<=2 chars) additionally record a padlock hit rect.
+    #[test]
+    fn row_headers_paint_bold() {
+        use std::collections::BTreeSet;
+        let mut dc = RecordingDrawContext::new();
+        // Logical rows: main row 0 then footer rows (mr=1).
+        let mut hits = Vec::new();
+        paint_row_headers(&mut dc, &[HEADER_ROWS, HEADER_ROWS + 1], 1, &BTreeSet::new(), &mut hits);
+        let texts = styled_texts(&dc);
+        assert_eq!(texts.len(), 2, "one label per row, got {texts:?}");
+        assert_eq!(texts[0].0, "1", "main row label text, got {:?}", texts[0].0);
+        for (text, weight, _) in &texts {
+            assert_eq!(
+                *weight, 1,
+                "gutter label {text:?} must be bold (weight 1), got weight {weight}"
+            );
+        }
+        // Both labels ("1", "_1") are short: two padlock hits recorded.
+        assert_eq!(hits.len(), 2, "short row labels need padlocks, got {hits:?}");
+        assert!(hits.iter().all(|h| h.is_row && !h.locked));
+        assert_eq!((hits[0].x, hits[0].w), (2.0, PADLOCK_W));
+    }
+
+    /// Column gutter labels must paint bold (weight 1), with the column name.
+    #[test]
+    fn col_headers_paint_bold() {
+        use std::collections::BTreeSet;
+        let mut dc = RecordingDrawContext::new();
+        // Margin col, main col A (mc=1).
+        let col_ixs = vec![MARGIN_COLS - 1, MARGIN_COLS];
+        let col_widths: HashMap<usize, usize> =
+            col_ixs.iter().map(|&c| (c, 8)).collect();
+        let mut hits = Vec::new();
+        paint_col_headers(&mut dc, &col_ixs, &col_widths, 1, &BTreeSet::new(), &mut hits);
+        let texts = styled_texts(&dc);
+        assert_eq!(texts.len(), 2, "one label per column, got {texts:?}");
+        assert_eq!(texts[1].0, "A", "main column label text, got {:?}", texts[1].0);
+        for (text, weight, _) in &texts {
+            assert_eq!(
+                *weight, 1,
+                "gutter label {text:?} must be bold (weight 1), got weight {weight}"
+            );
+        }
+        // "[A" and "A" are short: two padlock hits recorded.
+        assert_eq!(hits.len(), 2, "short col labels need padlocks, got {hits:?}");
+        assert!(hits.iter().all(|h| !h.is_row && !h.locked));
+    }
+
+    /// Padlock eligibility: short (dual-character or less), non-empty gutter
+    /// labels get the affordance; longer content does not.
+    #[test]
+    fn padlock_eligibility_rule() {
+        assert!(!wants_padlock(""));
+        assert!(wants_padlock("A"));
+        assert!(wants_padlock("1"));
+        assert!(wants_padlock("AB"));
+        assert!(wants_padlock("[A"));
+        assert!(wants_padlock("]B"));
+        assert!(wants_padlock("~1"));
+        assert!(wants_padlock("_1"));
+        assert!(wants_padlock("10"));
+        assert!(!wants_padlock("ABC"));
+        assert!(!wants_padlock("_12"));
+        assert!(!wants_padlock("Hello"));
+    }
+
+    /// Pinned rows/cols merge ahead of the display window (frozen first);
+    /// entries already displayed are not duplicated.
+    #[test]
+    fn pinned_union_freezes_first() {
+        assert_eq!(union_pinned(&[10, 11, 12], &[]), vec![10, 11, 12]);
+        assert_eq!(union_pinned(&[10, 11, 12], &[1]), vec![1, 10, 11, 12]);
+        assert_eq!(union_pinned(&[10, 11, 12], &[11]), vec![11, 10, 12]);
+        assert_eq!(union_pinned(&[], &[3]), vec![3]);
+    }
+
+    /// Pin toggle flips membership and reports the end state.
+    #[test]
+    fn pin_toggle_flips() {
+        use std::collections::BTreeSet;
+        let mut set = BTreeSet::new();
+        assert!(toggle_pin_in(&mut set, 7));
+        assert!(set.contains(&7));
+        assert!(!toggle_pin_in(&mut set, 7));
+        assert!(!set.contains(&7));
+    }
+
+    /// Locked padlocks paint filled bodies in the dark slate; unlocked paint
+    /// outlines in the lighter slate. Exact op assertions (geometry + color).
+    #[test]
+    fn padlock_paint_states_differ() {
+        // Locked: filled body + connected shackle, all dark slate.
+        let mut locked_dc = RecordingDrawContext::new();
+        paint_padlock(&mut locked_dc, 0.0, 0.0, true);
+        let fills: Vec<_> = locked_dc
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                DrawOp::FillRect { x, y, w, h, rgba } => Some((*x, *y, *w, *h, *rgba)),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            fills.iter().any(|&(x, y, w, h, c)| (x, y, w, h) == (1.0, 6.0, 8.0, 5.0)
+                && c == (0.2, 0.2, 0.2, 1.0)),
+            "locked padlock needs a filled dark body, got {fills:?}"
+        );
+        // Unlocked: stroked (outline) body in lighter slate, never filled.
+        let mut open_dc = RecordingDrawContext::new();
+        paint_padlock(&mut open_dc, 0.0, 0.0, false);
+        let open_fills: Vec<_> = open_dc
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                DrawOp::FillRect { x, y, w, h, rgba } => Some((*x, *y, *w, *h, *rgba)),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !open_fills.iter().any(|&(x, y, w, h, _)| (x, y, w, h) == (1.0, 6.0, 8.0, 5.0)),
+            "unlocked padlock body must be outline-only, got fills {open_fills:?}"
+        );
+        let strokes: Vec<_> = open_dc
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                DrawOp::StrokeRect { x, y, w, h, rgba, .. } => Some((*x, *y, *w, *h, *rgba)),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            strokes.iter().any(|&(x, y, w, h, c)| (x, y, w, h) == (1.0, 6.0, 8.0, 5.0)
+                && c == (0.45, 0.45, 0.45, 1.0)),
+            "unlocked padlock needs an outlined lighter body, got {strokes:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod brightness_tests {
+    use super::*;
+    use rswidgets::backends::headless::RecordingDrawContext;
+    use std::collections::HashMap;
+
+    fn two_by_two_grid() -> GridBox {
+        crate::grid::Grid::new(2, 2).into()
+    }
+
+    /// Margin-zone data cells must render at 75% background brightness
+    /// (0.75 gray) while main cells stay white. Regression: every data cell
+    /// painted white, so margins were indistinguishable from body content.
+    #[test]
+    fn margin_cells_render_dimmer_than_main_cells() {
+        let grid = two_by_two_grid();
+        let hr = HEADER_ROWS;
+        let lm = MARGIN_COLS;
+        // One main row, two columns: left-margin col then main col A.
+        let display_rows = vec![hr];
+        let col_ixs = vec![lm - 1, lm];
+        let col_widths: HashMap<usize, usize> =
+            col_ixs.iter().map(|&c| (c, sheet_rec_col_width_for_test(&grid, c))).collect();
+        let row_agg = compute::compute_row_agg_func(&grid, &display_rows, hr, 2);
+        let mut sink = GuiCanvasSink::new();
+        render::fill_cells(
+            &mut sink, &display_rows, &col_ixs, &col_widths, &grid,
+            hr, 2, 2, lm, col_ixs.len(), hr, lm, &row_agg,
+        );
+        let mut dc = RecordingDrawContext::new();
+        // Cursor parked off the displayed row so neither sample cell takes
+        // the cursor highlight (which would mask the base backgrounds).
+        render_to(
+            &sink, &mut dc, &col_ixs, &col_widths, &display_rows,
+            hr, 2, 2, lm, hr + 1, lm, false, "", None,
+        );
+        // Cell background rects in the grid band, left to right.
+        let mut bgs: Vec<((f64, f64), (f64, f64, f64, f64))> = dc
+            .fill_rects()
+            .into_iter()
+            .filter(|r| r.y >= HEADER_H - 0.5 && r.y < HEADER_H + ROW_H)
+            .map(|r| ((r.x, r.w), r.rgba))
+            .collect();
+        bgs.sort_by(|a, b| a.0 .0.partial_cmp(&b.0 .0).unwrap());
+        assert!(
+            bgs.len() >= 2,
+            "expected margin + main background rects, got {bgs:?}"
+        );
+        let margin_bg = bgs[0].1;
+        let main_bg = bgs[1].1;
+        assert!(
+            (margin_bg.0 - 0.75).abs() < 0.01
+                && (margin_bg.1 - 0.75).abs() < 0.01
+                && (margin_bg.2 - 0.75).abs() < 0.01,
+            "margin cell background must be 75% brightness, got {margin_bg:?}"
+        );
+        assert_eq!(
+            main_bg,
+            (1.0, 1.0, 1.0, 1.0),
+            "main cell background must stay white, got {main_bg:?}"
+        );
+    }
+
+    /// Test-only width lookup mirroring sheet_rec_col_width without an App.
+    fn sheet_rec_col_width_for_test(grid: &GridBox, col: usize) -> usize {
+        grid.col_width(col).max(1)
+    }
+}
+
+#[cfg(test)]
 mod formula_tests {
     use super::*;
 
@@ -2206,6 +2658,7 @@ mod formula_tests {
     }
 }
 
+#[cfg(test)]
 mod fill_tests {
     use super::*;
     use std::path::PathBuf;

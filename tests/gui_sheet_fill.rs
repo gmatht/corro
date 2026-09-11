@@ -46,6 +46,9 @@ W, H = img.size
 px = img.load()
 MARK = (254, 237, 190)
 WHITE = (255, 255, 255)
+MARGIN = (191, 191, 191)
+def is_grid(px):
+    return px == WHITE or px == MARGIN
 # Canvas origin: bbox of the marker the canvas draws at (0,0).
 mx0, my0, mx1, my1 = W, H, -1, -1
 for y in range(0, H, 2):
@@ -67,23 +70,24 @@ for y in range(ey0, ey1 + 1):
         if px[x, y] == MARK:
             bx0 = min(bx0, x); by0 = min(by0, y)
             bx1 = max(bx1, x); by1 = max(by1, y)
-# Right extent: rightmost white cell interior in the grid band.
-# (Cell interiors are ~28px runs; text antialiasing never spans that far.)
+# Right extent: rightmost grid-cell interior in the grid band (white body
+# or dimmed-margin gray; cell interiors are ~28px runs, text antialiasing
+# never spans that far, and chrome grays differ from both).
 right = -1
 for y in range(by1 + 10, H - 30, 4):
-    # scan from the right; stop at first white
+    # scan from the right; stop at first grid cell
     for x in range(W - 1, bx0, -1):
-        if px[x, y] == WHITE:
+        if is_grid(px[x, y]):
             if x > right: right = x
             break
-# Bottom extent: bottommost white pixel anywhere below the marker.
-# (Window chrome below the grid — status label — is gray + dark text,
-# never pure white, so white always means grid.)
+# Bottom extent: bottommost grid-cell pixel anywhere below the marker.
+# (Window chrome below the grid — status label — is neither white nor
+# margin gray, so grid colors always mean grid.)
 bottom = -1
 for y in range(H - 1, by1, -1):
     found = False
     for x in range(bx0, W, 3):
-        if px[x, y] == WHITE:
+        if is_grid(px[x, y]):
             bottom = y
             found = True
             break

@@ -106,8 +106,7 @@ fn screenshot(wid: &str, tag: &str) -> PathBuf {
         .arg(&png)
         .status()
         .expect("convert xwd->png");
-    let _ = std::fs::remove_file(&xwd);
-    png
+    let _ = std::fs::remove_file(&xwd);    png
 }
 
 /// OCR the formula-bar address label (top-left, left of `fx`). Crops just
@@ -155,6 +154,198 @@ fn wait_addr_label(wid: &str, tag: &str, expected: &str) {
         }
         std::thread::sleep(Duration::from_millis(300));
     }
+}
+
+/// Centroid of the TOPMOST unlocked-padlock slate cluster in a screen rect:
+/// the click target for that padlock. Scans top-down and averages only the
+/// first icon's band (padlocks are ~12px tall with gaps between rows), so
+/// the result is one padlock, not the centroid of all of them. Panics
+/// (loudly, not silently) when no padlock pixels exist there.
+fn find_slate_centroid(wid: &str, x0: i32, x1: i32, y0: i32, y1: i32) -> (i32, i32) {
+    // Settle poll: a fresh app may not have rendered padlocks on the first
+    // screenshots; verdicts stay pixel-based, only the wait is timed.
+    for _ in 0..16 {
+    let shot = screenshot(wid, "slatefind");
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let script = std::env::temp_dir().join(format!("corro-fhdr-slate-{id}.py"));
+    std::fs::write(
+        &script,
+        "import sys\nfrom PIL import Image\nimg = Image.open(sys.argv[1]).convert('RGB')\npx = img.load()\nSLATE=(115,115,115)\nx0,x1,y0,y1 = map(int, sys.argv[2:6])\nysorted=sorted(y for y in range(y0,y1) for x in range(x0,x1) if px[x,y]==SLATE)\ny0top=ysorted[0] if ysorted else y1\nxs=[x for y in range(y0top,min(y0top+16,y1)) for x in range(x0,x1) if px[x,y]==SLATE]\nys=[y for y in range(y0top,min(y0top+16,y1)) for x in range(x0,x1) if px[x,y]==SLATE]\nprint(f'{len(xs)} {sum(xs)//max(1,len(xs))} {sum(ys)//max(1,len(ys))}')\n",
+    )
+    .expect("write analyzer");
+    let out = Command::new("python3")
+        .arg(&script)
+        .arg(&shot)
+        .args([&x0.to_string(), &x1.to_string(), &y0.to_string(), &y1.to_string()])
+        .output()
+        .expect("python3 analyzer");
+    let _ = std::fs::remove_file(&script);
+    let _ = std::fs::remove_file(&shot);
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let p: Vec<i32> = text.split_whitespace().map(|s| s.parse().unwrap_or(-99)).collect();
+    if p.len() == 3 && p[0] > 5 {
+        return (p[1], p[2]);
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    }
+    panic!(
+        "no padlock pixels in rect ({x0},{y0})-({x1},{y1}) after settle poll; padlock missing where test expects one"
+    );
+}
+
+/// Centroid of the single LOCKED-padlock dark cluster in a screen rect:
+/// the click target for unpinning. After scrolling with a pin engaged, the
+/// pinned row's padlock is the only locked one on screen, so it is
+/// unambiguous; unlocked-slate search would find nothing (pinned icon is
+/// dark, scrolled rows have long labels without padlocks). Settle-polls
+/// like the slate finders, panics loudly after the deadline.
+fn find_locked_centroid(wid: &str, x0: i32, x1: i32, y0: i32, y1: i32) -> (i32, i32) {
+    for _ in 0..16 {
+    let shot = screenshot(wid, "lockedfind");
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let script = std::env::temp_dir().join(format!("corro-fhdr-lockedfind-{id}.py"));
+    std::fs::write(
+        &script,
+        "import sys\nfrom PIL import Image\nimg = Image.open(sys.argv[1]).convert('RGB')\npx = img.load()\nDARK=(51,51,51)\nx0,x1,y0,y1 = map(int, sys.argv[2:6])\nxs=[x for y in range(y0,y1) for x in range(x0,x1) if px[x,y]==DARK]\nys=[y for y in range(y0,y1) for x in range(x0,x1) if px[x,y]==DARK]\nprint(f'{len(xs)} {sum(xs)//max(1,len(xs))} {sum(ys)//max(1,len(ys))}')\n",
+    )
+    .expect("write analyzer");
+    let out = Command::new("python3")
+        .arg(&script)
+        .arg(&shot)
+        .args([&x0.to_string(), &x1.to_string(), &y0.to_string(), &y1.to_string()])
+        .output()
+        .expect("python3 analyzer");
+    let _ = std::fs::remove_file(&script);
+    let _ = std::fs::remove_file(&shot);
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let p: Vec<i32> = text.split_whitespace().map(|s| s.parse().unwrap_or(-99)).collect();
+    if p.len() == 3 && p[0] > 5 {
+        return (p[1], p[2]);
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    }
+    panic!(
+        "no locked padlock in rect ({x0},{y0})-({x1},{y1}) after settle poll; pin did not engage?"
+    );
+}
+
+/// True when dark-slate (locked padlock, 51,51,51) pixels appear near a
+/// point: proves a click actually toggled a padlock to locked (as opposed
+/// to clicking empty chrome, which changes nothing).
+fn has_locked_pixel_near(wid: &str, x: i32, y: i32) -> bool {
+    let shot = screenshot(wid, "lockednear");
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let script = std::env::temp_dir().join(format!("corro-fhdr-locked-{id}.py"));
+    std::fs::write(
+        &script,
+        "import sys\nfrom PIL import Image\nimg = Image.open(sys.argv[1]).convert('RGB')\npx = img.load()\nDARK=(51,51,51)\nx,y = map(int, sys.argv[2:4])\nprint(sum(1 for yy in range(max(0,y-10), y+11) for xx in range(max(0,x-10), x+11) if px[xx,yy]==DARK))\n",
+    )
+    .expect("write analyzer");
+    let out = Command::new("python3")
+        .arg(&script)
+        .arg(&shot)
+        .args([&x.to_string(), &y.to_string()])
+        .output()
+        .expect("python3 analyzer");
+    let _ = std::fs::remove_file(&script);
+    let _ = std::fs::remove_file(&shot);
+    String::from_utf8_lossy(&out.stdout).trim().parse().unwrap_or(0) > 3
+}
+
+/// Centroid of the LEFTMOST unlocked-padlock slate cluster in a screen
+/// rect: the click target for that padlock in a horizontal strip (column
+/// headers all share one y-band, so topmost-averaging would merge every
+/// padlock; leftmost isolates the first column's). Panics loudly when no
+/// padlock pixels exist there.
+fn find_slate_leftmost(wid: &str, x0: i32, x1: i32, y0: i32, y1: i32) -> (i32, i32) {
+    // Settle poll, like find_slate_centroid above.
+    for _ in 0..16 {
+    let shot = screenshot(wid, "slateleft");
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let script = std::env::temp_dir().join(format!("corro-fhdr-slateL-{id}.py"));
+    std::fs::write(
+        &script,
+        "import sys\nfrom PIL import Image\nimg = Image.open(sys.argv[1]).convert('RGB')\npx = img.load()\nSLATE=(115,115,115)\nx0,x1,y0,y1 = map(int, sys.argv[2:6])\nxsl=sorted(x for y in range(y0,y1) for x in range(x0,x1) if px[x,y]==SLATE)\nx0l=xsl[0] if xsl else x1\nxs=[x for y in range(y0,y1) for x in range(x0l,min(x0l+14,x1)) if px[x,y]==SLATE]\nys=[y for y in range(y0,y1) for x in range(x0l,min(x0l+14,x1)) if px[x,y]==SLATE]\nprint(f'{len(xs)} {sum(xs)//max(1,len(xs))} {sum(ys)//max(1,len(ys))}')\n",
+    )
+    .expect("write analyzer");
+    let out = Command::new("python3")
+        .arg(&script)
+        .arg(&shot)
+        .args([&x0.to_string(), &x1.to_string(), &y0.to_string(), &y1.to_string()])
+        .output()
+        .expect("python3 analyzer");
+    let _ = std::fs::remove_file(&script);
+    let _ = std::fs::remove_file(&shot);
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let p: Vec<i32> = text.split_whitespace().map(|s| s.parse().unwrap_or(-99)).collect();
+    if p.len() == 3 && p[0] > 5 {
+        return (p[1], p[2]);
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    }
+    panic!(
+        "no padlock pixels in rect ({x0},{y0})-({x1},{y1}) after settle poll; padlock missing where test expects one"
+    );
+}
+
+/// OCR all visible grid text (grid band cropped, upscaled).
+fn ocr_grid_text(wid: &str) -> String {
+    let shot = screenshot(wid, "gridtext");
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let crop = std::env::temp_dir().join(format!("corro-fhdr-grid-{id}.png"));
+    Command::new("convert")
+        .arg(&shot)
+        .args(["-crop", "500x360+50+44", "-resize", "200%", "-grayscale", "Rec709Luminance", "-threshold", "60%"])
+        .arg(&crop)
+        .status()
+        .expect("convert crop");
+    let _ = std::fs::remove_file(&shot);
+    let out = Command::new("tesseract")
+        .arg(&crop)
+        .arg("stdout")
+        .args(["--psm", "6"])
+        .output()
+        .expect("tesseract");
+    let _ = std::fs::remove_file(&crop);
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+/// Grid OCR with a settle poll: screenshots can catch a partial redraw
+/// (empty text) right after a key burst; poll for non-empty text with a
+/// deadline, then let the content assertions (not timing) deliver the
+/// verdict.
+fn ocr_grid_text_settled(wid: &str) -> String {
+    let mut last = String::new();
+    for _ in 0..10 {
+        last = ocr_grid_text(wid);
+        if !last.trim().is_empty() {
+            return last;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    last
+}
+
+/// OCR the column-header strip (top band, upscaled).
+fn ocr_header_strip(wid: &str) -> String {
+    let shot = screenshot(wid, "headstrip");
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let crop = std::env::temp_dir().join(format!("corro-fhdr-strip-{id}.png"));
+    Command::new("convert")
+        .arg(&shot)
+        .args(["-crop", "760x24+0+48", "-resize", "300%"])
+        .arg(&crop)
+        .status()
+        .expect("convert crop");
+    let _ = std::fs::remove_file(&shot);
+    let out = Command::new("tesseract")
+        .arg(&crop)
+        .arg("stdout")
+        .args(["--psm", "6"])
+        .output()
+        .expect("tesseract");
+    let _ = std::fs::remove_file(&crop);
+    String::from_utf8_lossy(&out.stdout).to_string()
 }
 
 fn fresh_fixture(tag: &str) -> PathBuf {
@@ -249,6 +440,253 @@ fn gui_formula_bar_shows_header_name() {
         "test bug: expected a header label, got {expected:?}"
     );
     wait_addr_label(&wid, "header", &expected);
+    let _ = child.kill();
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Margin-zone data cells must render at 75% background brightness (exact
+/// 191 gray) while the body stays white. Measures whole-grid-band fractions
+/// on the populated overflow fixture: margins dominate the area, so gray
+/// must be substantial but not total (which would mean dimming leaked into
+/// main cells).
+#[test]
+fn gui_margin_cells_dimmer_than_body() {
+    let _guard = GUI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    assert!(
+        std::env::var("DISPLAY").is_ok(),
+        "requires X server (run under xvfb-run -a)"
+    );
+    let path = fresh_fixture("dim");
+    std::fs::write(&path, "CORRO_LOG 1\nSET A1 Hello World!\nSET A2 x\n").expect("seed fixture");
+    let mut child = spawn_gui(&path);
+    let wid = find_corro_window(child.id(), Instant::now() + Duration::from_secs(25));
+    xdotool(&["windowactivate", "--sync", &wid]);
+    std::thread::sleep(Duration::from_millis(800));
+    let shot = screenshot(&wid, "dim");
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let script = std::env::temp_dir().join(format!("corro-fhdr-dim-{id}.py"));
+    std::fs::write(
+        &script,
+        "import sys\nfrom PIL import Image\nimg = Image.open(sys.argv[1]).convert('RGB')\nW,H = img.size\npx = img.load()\nGRAY=(191,191,191)\nWHITE=(255,255,255)\n# whole grid band below the 24px header strip\ntot=gray=white=0\nfor y in range(30, 750, 3):\n    row=px\n    for x in range(50, 1150, 3):\n        tot+=1\n        if px[x,y]==GRAY: gray+=1\n        elif px[x,y]==WHITE: white+=1\nprint(f'{gray} {white} {tot}')\n",
+    )
+    .expect("write analyzer");
+    let out = Command::new("python3")
+        .arg(&script)
+        .arg(&shot)
+        .output()
+        .expect("python3 analyzer");
+    let _ = std::fs::remove_file(&script);
+    let _ = std::fs::remove_file(&shot);
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let p: Vec<i32> = text.split_whitespace().map(|s| s.parse().unwrap_or(-99)).collect();
+    assert_eq!(p.len(), 3, "bad analyzer output: {text:?}");
+    let (gray, tot) = (p[0] as f64, p[2].max(1) as f64);
+    assert!(
+        gray / tot > 0.3,
+        "margin zones should render mostly 75%-gray (gray fraction {}/{tot}); margins render full-white",
+        p[0]
+    );
+    assert!(
+        gray / tot < 0.95,
+        "main cells must stay white (gray fraction {}/{tot}); dimming leaked into body content",
+        p[0]
+    );
+    let _ = child.kill();
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Body gutter headers render their labels in place (column strip on top,
+/// row gutter at left). Boldness itself is pinned deterministically by the
+/// `gutter_tests` unit tests (RecordingDrawContext asserts weight == 1 on
+/// every gutter label op); pixel-ink comparison cannot prove boldness live
+/// because grid glyphs render larger than gutter glyphs at this scale.
+/// This test proves the gutter paint path executes end-to-end in the live
+/// app: if header painting regresses (wrong strip, missing labels), it fails.
+#[test]
+fn gui_body_headers_render_labels() {
+    let _guard = GUI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    assert!(
+        std::env::var("DISPLAY").is_ok(),
+        "requires X server (run under xvfb-run -a)"
+    );
+    let path = fresh_fixture("headers");
+    let mut child = spawn_gui(&path);
+    let wid = find_corro_window(child.id(), Instant::now() + Duration::from_secs(25));
+    xdotool(&["windowactivate", "--sync", &wid]);
+    std::thread::sleep(Duration::from_millis(800));
+    let text = ocr_header_strip(&wid);
+    let _ = child.kill();
+    let _ = std::fs::remove_file(&path);
+    assert!(
+        text.contains('A'),
+        "column-header strip should show the A label, OCR got: {text:?}"
+    );
+    assert!(
+        text.contains("[A") || text.contains("]A"),
+        "column-header strip should show a margin label, OCR got: {text:?}"
+    );
+}
+
+/// Short gutter headers carry padlock affordances: exact slate pixels must
+/// appear in BOTH the row-label gutter and the column-header strip.
+/// Unlocked padlocks paint slate-gray (115,115,115); nothing else in the UI
+/// uses that color. Pre-fix: zero such pixels anywhere.
+#[test]
+fn gui_short_headers_show_padlocks() {
+    let _guard = GUI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    assert!(
+        std::env::var("DISPLAY").is_ok(),
+        "requires X server (run under xvfb-run -a)"
+    );
+    let path = fresh_fixture("locks");
+    let mut child = spawn_gui(&path);
+    let wid = find_corro_window(child.id(), Instant::now() + Duration::from_secs(25));
+    xdotool(&["windowactivate", "--sync", &wid]);
+    std::thread::sleep(Duration::from_millis(800));
+    let shot = screenshot(&wid, "locks");
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let script = std::env::temp_dir().join(format!("corro-fhdr-lock-{id}.py"));
+    std::fs::write(
+        &script,
+        "import sys\nfrom PIL import Image\nimg = Image.open(sys.argv[1]).convert('RGB')\nW,H = img.size\npx = img.load()\nSLATE=(115,115,115)\n# row-label gutter (x<50), grid band\nrow = sum(1 for y in range(70, 780) for x in range(0, 50) if px[x,y]==SLATE)\n# column-header strip (below menu+formula chrome, y 48..72), full width\ncol = sum(1 for y in range(48, 72, 1) for x in range(0, W, 2) if px[x,y]==SLATE)\nprint(f'{row} {col}')\n",
+    )
+    .expect("write analyzer");
+    let out = Command::new("python3")
+        .arg(&script)
+        .arg(&shot)
+        .output()
+        .expect("python3 analyzer");
+    let _ = std::fs::remove_file(&script);
+    let _ = std::fs::remove_file(&shot);
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let p: Vec<i32> = text.split_whitespace().map(|s| s.parse().unwrap_or(-99)).collect();
+    assert_eq!(p.len(), 2, "bad analyzer output: {text:?}");
+    let _ = child.kill();
+    let _ = std::fs::remove_file(&path);
+    assert!(
+        p[0] > 100,
+        "row gutter should show unlocked-padlock pixels (found {}); short headers lack padlocks",
+        p[0]
+    );
+    assert!(
+        p[1] > 100,
+        "column header strip should show unlocked-padlock pixels (found {}); short headers lack padlocks",
+        p[1]
+    );
+}
+
+/// Clicking a row padlock pins the row: after scrolling far down, the pinned
+/// row's content stays rendered while unpinned rows scroll away. Clicking
+/// again unpins (row scrolls away normally). GONEBYE proves the viewport
+/// really moved (guards a vacuous pass where scrolling never happened).
+#[test]
+fn gui_padlock_click_pins_row_visible() {
+    let _guard = GUI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    assert!(
+        std::env::var("DISPLAY").is_ok(),
+        "requires X server (run under xvfb-run -a)"
+    );
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let path =
+        std::env::temp_dir().join(format!("corro-fhdr-pin-{}-{}.corro", std::process::id(), id));
+    let _ = std::fs::remove_file(&path);
+    std::fs::write(&path, "CORRO_LOG 1\nSET A1 PINME\nSET A5 GONEBYE\n").expect("write fixture");
+    let mut child = spawn_gui(&path);
+    let wid = find_corro_window(child.id(), Instant::now() + Duration::from_secs(25));
+    xdotool(&["windowactivate", "--sync", &wid]);
+    std::thread::sleep(Duration::from_millis(800));
+    // Topmost padlock in the row gutter = display row 0 (fresh app starts
+    // at A1). Clicking pins that row.
+    let pad = find_slate_centroid(&wid, 0, 50, 70, 780);
+    xdotool(&["mousemove", "--window", &wid, &pad.0.to_string(), &pad.1.to_string(), "click", "1"]);
+    std::thread::sleep(Duration::from_millis(600));
+    for _ in 0..50 {
+        xdotool(&["key", "--window", &wid, "Down"]);
+        std::thread::sleep(Duration::from_millis(120));
+    }
+    std::thread::sleep(Duration::from_millis(800));
+    let grid = ocr_grid_text_settled(&wid);
+    assert!(
+        grid.contains("PINME"),
+        "pinned row 1 must stay visible after scrolling (grid text: {grid:?})"
+    );
+    assert!(
+        !grid.contains("GONEBYE"),
+        "unpinned row 5 must scroll away (viewport never moved? grid text: {grid:?})"
+    );
+    // Click the LOCKED padlock to unlock (the only dark icon on screen;
+    // unlocked-slate search would find nothing now). The pinned row renders
+    // first, so it sits at the gutter top in either chrome variant.
+    let pad2 = find_locked_centroid(&wid, 0, 50, 40, 130);
+    xdotool(&["mousemove", "--window", &wid, &pad2.0.to_string(), &pad2.1.to_string(), "click", "1"]);
+    std::thread::sleep(Duration::from_millis(600));
+    std::thread::sleep(Duration::from_millis(800));
+    let grid2 = ocr_grid_text_settled(&wid);
+    assert!(
+        !grid2.contains("PINME"),
+        "unpinned row 1 must scroll away like any other row (grid text: {grid2:?})"
+    );
+    let _ = child.kill();
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Clicking a column-header padlock pins the column: after scrolling far
+/// left, the pinned column's locked padlock stays frozen at the same screen
+/// spot while the formula bar proves the cursor moved on. Clicking again
+/// unpins (the lock disappears). Pixel-exact padlock checks, not OCR words:
+/// padlock glyphs contaminate header OCR with f/g misreads.
+#[test]
+fn gui_padlock_click_pins_column_visible() {
+    let _guard = GUI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    assert!(
+        std::env::var("DISPLAY").is_ok(),
+        "requires X server (run under xvfb-run -a)"
+    );
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let path =
+        std::env::temp_dir().join(format!("corro-fhdr-pincol-{}-{}.corro", std::process::id(), id));
+    let _ = std::fs::remove_file(&path);
+    std::fs::write(&path, "CORRO_LOG 1\nSET A1 PINME\n").expect("write fixture");
+    let mut child = spawn_gui(&path);
+    let wid = find_corro_window(child.id(), Instant::now() + Duration::from_secs(25));
+    xdotool(&["windowactivate", "--sync", &wid]);
+    std::thread::sleep(Duration::from_millis(800));
+    // Leftmost padlock in the header strip = first visible column's padlock.
+    let pad = find_slate_leftmost(&wid, 0, 760, 40, 76);
+    let formula0 = ocr_addr_label(&screenshot(&wid, "pincol0"));
+    xdotool(&["mousemove", "--window", &wid, &pad.0.to_string(), &pad.1.to_string(), "click", "1"]);
+    std::thread::sleep(Duration::from_millis(600));
+    // The click must have toggled that padlock to locked (dark slate at the
+    // click site); otherwise we clicked empty chrome and nothing is pinned.
+    assert!(
+        has_locked_pixel_near(&wid, pad.0, pad.1),
+        "clicked padlock should render locked after click"
+    );
+    for _ in 0..40 {
+        xdotool(&["key", "--window", &wid, "Left"]);
+        std::thread::sleep(Duration::from_millis(120));
+    }
+    std::thread::sleep(Duration::from_millis(800));
+    let formula1 = ocr_addr_label(&screenshot(&wid, "pincol1"));
+    assert!(
+        formula0 != formula1,
+        "cursor must actually move for the scroll proof (formula {formula0:?} vs {formula1:?})"
+    );
+    // Pixel-exact frozen check (no OCR words: padlock glyphs contaminate
+    // header OCR with f/g misreads): the locked padlock must still sit at
+    // the same screen spot after scrolling — the pinned column never left.
+    assert!(
+        has_locked_pixel_near(&wid, pad.0, pad.1),
+        "pinned column's locked padlock must stay frozen at ({},{}) after scrolling", pad.0, pad.1
+    );
+    // Click again to unlock (same spot: the frozen column renders first);
+    // the locked padlock must disappear from the strip entirely.
+    xdotool(&["mousemove", "--window", &wid, &pad.0.to_string(), &pad.1.to_string(), "click", "1"]);
+    std::thread::sleep(Duration::from_millis(800));
+    assert!(
+        !has_locked_pixel_near(&wid, pad.0, pad.1),
+        "unpinned column must release its lock (dark padlock still at ({},{}))", pad.0, pad.1
+    );
     let _ = child.kill();
     let _ = std::fs::remove_file(&path);
 }
