@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use super::actions::run_prompt_action;
+use super::extrapolate;
 
 use crate::grid::{CellAddr, SheetCursor, HEADER_ROWS, MARGIN_COLS};
 use crate::ops::{Op, WorkbookOp};
@@ -506,6 +507,50 @@ fn sheet_rec_col_width(sheet: &crate::ops::SheetState, col: usize) -> usize {
 // Keyboard handling
 // ---------------------------------------------------------------------------
 
+/// Handle a key while the interactive extrapolate modal is active. Mirrors the
+/// ratatui reference `Mode::Extrapolate`: arrows/navigation extend the selection
+/// (the anchor stays put), Enter commits, Esc cancels. The modal state lives in
+/// `extrapolate.rs` and is shared by all GUI backends.
+fn handle_extrapolate_key(key: u32, state: &GuiState) -> bool {
+    match key {
+        ESCAPE => {
+            log_key_action(state.last_key.get(), "extrapolate_cancel", "");
+            super::extrapolate::cancel(state.app_mut());
+            update_state_cursor(state, state.last_row.get(), state.last_col.get());
+            state.canvas.queue_redraw();
+            true
+        }
+        RETURN => {
+            log_key_action(state.last_key.get(), "extrapolate_commit", &format!("cell={}", format_cell(state)));
+            super::extrapolate::commit(state.app_mut());
+            update_state_cursor(state, state.last_row.get(), state.last_col.get());
+            state.canvas.queue_redraw();
+            true
+        }
+        LEFT | RIGHT | UP | DOWN => {
+            let (dr, dc) = match key {
+                LEFT => (0, -1),
+                RIGHT => (0, 1),
+                UP => (-1, 0),
+                _ => (1, 0),
+            };
+            // Preserve the anchor so the selection extends (move_cursor clears it).
+            let anchor = state.app_ref().core.anchor;
+            if anchor.is_none() {
+                state.app_mut().core.anchor = Some(state.app_ref().core.cursor);
+            }
+            move_cursor(state, dr, dc);
+            if let Some(a) = anchor {
+                state.app_mut().core.anchor = Some(a);
+            }
+            super::extrapolate::refresh_preview(state.app_mut());
+            state.canvas.queue_redraw();
+            true
+        }
+        _ => false,
+    }
+}
+
 fn handle_key(keyval: u32, state_rc: &Rc<GuiState>, mods: u32) -> bool {
     let state: &GuiState = &**state_rc;
     state.last_key.set(keyval);
@@ -528,6 +573,13 @@ fn handle_key(keyval: u32, state_rc: &Rc<GuiState>, mods: u32) -> bool {
 
     if state.editing.get() {
         return handle_edit_key(key, state);
+    }
+
+    // Interactive extrapolate modal (mirrors ratatui's Mode::Extrapolate):
+    // arrows extend the selection (anchor stays put), Enter commits, Esc
+    // cancels. Intercepted here before normal cursor/enter handling.
+    if state.app_ref().extrapolate.is_some() {
+        return handle_extrapolate_key(key, state);
     }
 
     match key {
@@ -1501,7 +1553,14 @@ fn handle_menu_action(name: &str, state: &Rc<GuiState>) {
             app.core.status = "Duplicate: not wired in the GTK backend yet".into();
         }
         "extrapolate" => {
-            app.core.status = "Extrapolate: not wired in the GTK backend yet".into();
+            // Enter interactive extrapolate modal (mirrors ratatui).
+            extrapolate::enter(state.app_mut());
+            extrapolate::refresh_preview(state.app_mut());
+            update_state_cursor(state, state.last_row.get(), state.last_col.get());
+            // Return keyboard focus to the canvas so subsequent arrow/Enter keys
+            // reach the grid (the menu action left focus on the menu bar).
+            state.canvas.grab_focus();
+            state.canvas.queue_redraw();
         }
         "sheet_prev" | "sheet_next" => {
             app.core.status = format!("Menu action: {name} (sheet navigation not wired in GTK yet)");

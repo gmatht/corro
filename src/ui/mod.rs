@@ -3691,137 +3691,14 @@ impl App {
             Mode::Extrapolate { seed_anchor, seed_cursor } => (*seed_anchor, *seed_cursor),
             _ => return None,
         };
-        let seed_r0 = seed_anchor.row.min(seed_cursor.row);
-        let seed_r1 = seed_anchor.row.max(seed_cursor.row);
-        let seed_c0 = seed_anchor.col.min(seed_cursor.col);
-        let seed_c1 = seed_anchor.col.max(seed_cursor.col);
-
-        let seed_main_r0 = (seed_r0 - HEADER_ROWS) as u32;
-        let seed_main_r1 = (seed_r1 - HEADER_ROWS) as u32;
-        let seed_main_c0 = (seed_c0 - MARGIN_COLS) as u32;
-        let seed_main_c1 = (seed_c1 - MARGIN_COLS) as u32;
-
-        let mut cells = Vec::new();
-        let mut filled: HashSet<(u32, u32)> = HashSet::new();
-        let main_cols = self.state.grid.main_cols() as u32;
-        let main_rows = self.state.grid.main_rows() as u32;
-
-        // ── Row-wise (horizontal) extrapolation ──
-        // Only rows within the saved seed range contribute seeds.
-        for &r in &rows {
-            if r < HEADER_ROWS {
-                continue;
-            }
-            if r < seed_r0 || r > seed_r1 {
-                continue;
-            }
-            let main_row = (r - HEADER_ROWS) as u32;
-            if main_row >= main_rows {
-                continue;
-            }
-            // Collect seeds from cells within the seed column range.
-            let mut seed = Vec::new();
-            for mc in seed_main_c0..=seed_main_c1 {
-                if mc >= main_cols {
-                    break;
-                }
-                let addr = CellAddr::Main { row: main_row, col: mc };
-                if let Some(v) = self.state.grid.get(&addr) {
-                    if !v.is_empty() {
-                        seed.push(v.to_string());
-                    }
-                }
-            }
-            let last_col = seed_main_c1.min(main_cols.saturating_sub(1));
-            if !seed.is_empty() {
-                for &c in &cols {
-                    if c < MARGIN_COLS {
-                        continue;
-                    }
-                    let main_col = (c - MARGIN_COLS) as u32;
-                    if main_col >= main_cols {
-                        continue;
-                    }
-                    // Skip columns inside the seed column range.
-                    if main_col >= seed_main_c0 && main_col <= seed_main_c1 {
-                        continue;
-                    }
-                    let addr = CellAddr::Main { row: main_row, col: main_col };
-                    if filled.contains(&(main_row, main_col)) {
-                        continue;
-                    }
-                    let offset = main_col as i32 - last_col as i32;
-                    if let Some(value) = crate::extrapolate::infer_fill_value(
-                        &seed,
-                        offset,
-                        crate::extrapolate::FillDirection::Right,
-                        main_cols as usize,
-                    ) {
-                        filled.insert((main_row, main_col));
-                        cells.push((addr, value));
-                    }
-                }
-            }
-        }
-
-        // ── Column-wise (vertical) extrapolation ──
-        // Only columns within the saved seed range contribute seeds.
-        for &c in &cols {
-            if c < MARGIN_COLS {
-                continue;
-            }
-            if c < seed_c0 || c > seed_c1 {
-                continue;
-            }
-            let main_col = (c - MARGIN_COLS) as u32;
-            if main_col >= main_cols {
-                continue;
-            }
-            // Collect seeds from cells within the seed row range.
-            let mut seed = Vec::new();
-            for mr in seed_main_r0..=seed_main_r1 {
-                if mr >= main_rows {
-                    break;
-                }
-                let addr = CellAddr::Main { row: mr, col: main_col };
-                if let Some(v) = self.state.grid.get(&addr) {
-                    if !v.is_empty() {
-                        seed.push(v.to_string());
-                    }
-                }
-            }
-            let last_row = seed_main_r1.min(main_rows.saturating_sub(1));
-            if !seed.is_empty() {
-                for &r in &rows {
-                    if r < HEADER_ROWS {
-                        continue;
-                    }
-                    let main_row = (r - HEADER_ROWS) as u32;
-                    if main_row >= main_rows {
-                        continue;
-                    }
-                    // Skip rows inside the seed row range.
-                    if main_row >= seed_main_r0 && main_row <= seed_main_r1 {
-                        continue;
-                    }
-                    let addr = CellAddr::Main { row: main_row, col: main_col };
-                    if filled.contains(&(main_row, main_col)) {
-                        continue;
-                    }
-                    let offset = main_row as i32 - last_row as i32;
-                    if let Some(value) = crate::extrapolate::infer_fill_value(
-                        &seed,
-                        offset,
-                        crate::extrapolate::FillDirection::Down,
-                        main_cols as usize,
-                    ) {
-                        filled.insert((main_row, main_col));
-                        cells.push((addr, value));
-                    }
-                }
-            }
-        }
-
+        // Shared fill computation (also used by the pancurses modal flow).
+        let cells = crate::extrapolate::extrapolate_cells(
+            &self.state.grid,
+            seed_anchor,
+            seed_cursor,
+            &rows,
+            &cols,
+        );
         if cells.is_empty() {
             None
         } else {
@@ -11554,6 +11431,11 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
             },
             Mode::Extrapolate { .. } => match key.code {
                 KeyCode::Enter => {
+                    // handle_key mem::replace'd the mode out (self.mode reads
+                    // Normal here); restore it so extrapolate_selection can
+                    // read the saved seed range. Without this the seed match
+                    // always falls through and modal Enter can never commit.
+                    self.mode = mode.clone();
                     if let Some(op) = self.extrapolate_selection() {
                         let _ = self.apply_single_op(op);
                         self.status = "Extrapolated selection".into();

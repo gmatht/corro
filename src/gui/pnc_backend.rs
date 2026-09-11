@@ -7,6 +7,7 @@ use rswidgets::backends_pancurses_adapter::*;
 use unicode_width::UnicodeWidthStr;
 
 use super::actions::{commit_cell, dispatch_menu_action, main_addr_label, menu_action_needs_prompt, run_prompt_action, MenuDispatch};
+use super::extrapolate;
 use super::viewport::Viewport;
 use super::compute;
 use super::render::{self, CellSink};
@@ -601,6 +602,21 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
             rswidgets::backends::pancurses::set_prompt(label, &name);
             return;
         }
+        if name == "extrapolate" {
+            // Enter interactive extrapolate modal (mirrors ratatui): arrows
+            // extend the selection, Enter commits, Esc cancels. The keyboard
+            // hook (installed below) drives commit/cancel. Ensure the widget
+            // is out of edit mode so Enter routes to the extrapolate commit.
+            let app = app_from_raw(app_ptr);
+            menu_ss.set_editing(false, "", 0);
+            extrapolate::enter(app);
+            extrapolate::refresh_preview(app);
+            refresh_viewport_after_action(
+                app, &menu_ss, sid, &display_rows_menu,
+                data_rows, data_cols, data_width, HEADER_ROWS,
+            );
+            return;
+        }
         let result = dispatch_menu_action(
             app,
             &name,
@@ -649,6 +665,38 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
             data_rows, data_cols, data_width, HEADER_ROWS,
         );
     }));
+
+    // Interactive extrapolate keyboard hook: while extrapolate mode is active,
+    // Enter commits and Escape cancels; everything else (including arrows, which
+    // the widget moves and the cursor-move callback re-previews) passes through.
+    let extrap_ss = spreadsheet.clone();
+    let sid_extrap = sid;
+    let display_rows_extrap = display_rows_for_cb.clone();
+    rswidgets::backends::pancurses::set_key_input_hook(Some(Box::new(move |key: &Option<rswidgets::backends::pancurses::KeyInput>| {
+        let app = app_from_raw(app_ptr);
+        if app.extrapolate.is_none() {
+            return false;
+        }
+        match key {
+            Some(rswidgets::backends::pancurses::KeyInput::Enter) => {
+                extrapolate::commit(app);
+                refresh_viewport_after_action(
+                    app, &extrap_ss, sid_extrap, &display_rows_extrap,
+                    data_rows, data_cols, data_width, HEADER_ROWS,
+                );
+                true
+            }
+            Some(rswidgets::backends::pancurses::KeyInput::Escape) => {
+                extrapolate::cancel(app);
+                refresh_viewport_after_action(
+                    app, &extrap_ss, sid_extrap, &display_rows_extrap,
+                    data_rows, data_cols, data_width, HEADER_ROWS,
+                );
+                true
+            }
+            _ => false,
+        }
+    })));
 
     // Ctrl+C copies the cursor cell (standard terminal copy; it does NOT quit).
     // The value goes to the in-app clipboard (for Paste) and, via OSC 52, to the
@@ -699,6 +747,18 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     add_cursor_move_callback(move |_display_row, _display_col| {
         let app = app_from_raw(app_ptr);
 
+        // Sync the widget's selection anchor into the app (Shift+arrow sets it
+        // in the widget; the app needs it for extrapolate/selection logic).
+        // The anchor's display row maps to a logical row via display_rows.
+        if let Some((adr, acol)) = rswidgets::backends::pancurses::spreadsheet_get_anchor(sid) {
+            let alr = display_rows_for_cb.borrow().get(adr as usize).copied()
+                .unwrap_or(adr as usize + 1);
+            app.core.anchor = Some(SheetCursor { row: alr, col: acol as usize });
+        } else if app.extrapolate.is_none() {
+            // Plain navigation collapses any selection (matching ratatui, where
+            // the anchor exists only transiently / during Shift+arrow).
+            app.core.anchor = None;
+        }
         // Sync formula bar trailing with app status (ratatui shows status in formula bar)
         if !app.core.status.is_empty() {
             sheet_cb.set_formula_bar_trailing(&format!("   ·  {}", app.core.status));
@@ -870,6 +930,21 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                 // panics with "RefCell already borrowed" (observed).
                 spreadsheet_set_border_title(sid, &vp.border_title(app.core.ops_applied));
                 vp.refill(&mut SpreadsheetSink::new(&sheet_cb), &rec.grid, hr_cb, MARGIN_COLS, data_width_cb, cursor.row, cursor.col);
+            }
+            // Render the extrapolate preview into the widget (display-only; not
+            // committed). Cells are keyed by (display_row, global_col).
+            if app.extrapolate.is_some() {
+                let cells = extrapolate::preview_cells(app);
+                let dr = display_rows_for_cb.borrow().clone();
+                for (addr, text) in cells.iter() {
+                    if let CellAddr::Main { row, col } = addr {
+                        let lr = HEADER_ROWS + *row as usize;
+                        if let Some(di) = dr.iter().position(|&r| r == lr) {
+                            let gc = MARGIN_COLS + *col as usize;
+                            spreadsheet_set_cell(sid, di as u32, gc as u32, text);
+                        }
+                    }
+                }
             }
         }
     });

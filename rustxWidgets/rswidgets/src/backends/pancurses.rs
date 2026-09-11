@@ -576,6 +576,8 @@ mod pancurses_backend {
         /// tree without its own timer thread (e.g. flush a chat transcript into
         /// a TextView before every refresh). Cleared automatically on quit.
         static FRAME_HOOK: RefCell<Option<Box<dyn FnMut()>>> = RefCell::new(None);
+        /// Generic pre-dispatch key hook (see set_key_input_hook).
+        static KEY_INPUT_HOOK: RefCell<Option<Box<dyn FnMut(&Option<KeyInput>) -> bool>>> = RefCell::new(None);
         /// Commit-edit callbacks captured while inside a `with_state` call are stashed
         /// here and fired *outside* any `with_state` borrow (in the main loop) on the
         /// next iteration. The callbacks themselves call `with_state`-using adapter
@@ -608,6 +610,45 @@ mod pancurses_backend {
     /// UI thread, so it may mutate widgets directly.
     pub fn set_frame_hook(hook: Option<Box<dyn FnMut()>>) {
         FRAME_HOOK.with(|h| *h.borrow_mut() = hook);
+    }
+
+    /// Install (or clear with `None`) a generic pre-dispatch key hook. It is
+    /// invoked for every decoded key before the backend handles it; returning
+    /// `true` consumes the key (the default handling is skipped). The host
+    /// application decides which keys to intercept for its own modal state —
+    /// the toolkit itself never interprets the hook's purpose.
+    pub fn set_key_input_hook(hook: Option<Box<dyn FnMut(&Option<KeyInput>) -> bool>>) {
+        KEY_INPUT_HOOK.with(|h| *h.borrow_mut() = hook);
+    }
+
+    /// A decoded, toolkit-neutral representation of a key press handed to the
+    /// generic pre-dispatch key hook (`set_key_input_hook`). The host decides
+    /// what each key means for its own modal state; the toolkit never does.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum KeyInput {
+        Enter,
+        Escape,
+        ArrowUp,
+        ArrowDown,
+        ArrowLeft,
+        ArrowRight,
+        Char(char),
+        Other,
+    }
+
+    /// Map a raw pancurses `Input` to the generic [`KeyInput`] vocabulary.
+    fn convert_key_input(input: &Option<Input>) -> Option<KeyInput> {
+        match input {
+            Some(Input::Character('\n')) | Some(Input::Character('\r')) => Some(KeyInput::Enter),
+            Some(Input::Character('\x1b')) => Some(KeyInput::Escape),
+            Some(Input::KeyUp) => Some(KeyInput::ArrowUp),
+            Some(Input::KeyDown) => Some(KeyInput::ArrowDown),
+            Some(Input::KeyLeft) => Some(KeyInput::ArrowLeft),
+            Some(Input::KeyRight) => Some(KeyInput::ArrowRight),
+            Some(Input::Character(c)) => Some(KeyInput::Char(*c)),
+            Some(_) => Some(KeyInput::Other),
+            None => None,
+        }
     }
 
     /// Generic after-redraw callback: invoked once per redraw, after all SGR
@@ -1201,6 +1242,18 @@ mod pancurses_backend {
                     trace_input_line(&input);
                 }
 
+                // Generic pre-dispatch key hook: if the host consumes the key
+                // (returns true), skip the default handling below entirely.
+                let consumed = KEY_INPUT_HOOK.with(|h| {
+                    h.borrow_mut().as_mut().map_or(false, |cb| {
+                        let key = convert_key_input(&input);
+                        cb(&key)
+                    })
+                });
+                if consumed {
+                    continue;
+                }
+
                 // Host frame hook: lets a host app mirror external state into the
                 // widget tree on the main thread (e.g. flush a transcript into a
                 // TextView). Runs every loop iteration; cleared on quit.
@@ -1560,7 +1613,7 @@ mod pancurses_backend {
                                                                     let n = state.node(fid).unwrap();
                                                                     spreadsheet_is_editing(&n.kind)
                                                                 };
-                                                                spreadsheet_prepare_move(state, fid, false);
+                                                                spreadsheet_prepare_move(state, fid, true);
                                                                 spreadsheet_commit_edit(state, fid);
                                                                 let needs_sentinel = {
                                                                     if let Some(n) = state.node_mut(fid) {
@@ -4523,6 +4576,18 @@ mod pancurses_backend {
                 }
             }
         }
+    }
+
+    pub fn spreadsheet_get_anchor(fid: usize) -> Option<(u32, u32)> {
+        with_state(|s| {
+            s.node(fid).and_then(|n| {
+                if let PcWidgetKind::Spreadsheet { grid, .. } = &n.kind {
+                    grid.anchor
+                } else {
+                    None
+                }
+            })
+        })
     }
 
     pub fn spreadsheet_clear_anchor(fid: usize) {

@@ -13,6 +13,7 @@ pub mod viewport;
 pub mod compute;
 pub mod dialogs;
 pub mod edit;
+pub mod extrapolate;
 pub mod keymap;
 pub mod menu;
 pub mod render;
@@ -35,6 +36,8 @@ pub struct App {
     rev_limit: Option<usize>,
     rev_browse: bool,
     backend: Option<Backend>,
+    /// Interactive extrapolate modal state (shared by all GUI backends).
+    pub extrapolate: Option<extrapolate::ExtrapolateModal>,
 }
 
 impl App {
@@ -72,6 +75,7 @@ impl App {
             rev_limit: None,
             rev_browse: false,
             backend: None,
+            extrapolate: None,
         }
     }
 
