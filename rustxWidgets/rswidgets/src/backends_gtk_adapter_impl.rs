@@ -1008,6 +1008,10 @@ mod gtk_adapter {
         pub fn set_can_focus(&self, can: bool) {
             self.drawing_area.set_can_focus(can);
         }
+
+        pub fn set_visible(&self, visible: bool) {
+            self.drawing_area.set_visible(visible);
+        }
     }
 
     pub fn create_canvas() -> Result<Canvas, Error> {

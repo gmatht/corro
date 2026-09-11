@@ -1471,6 +1471,14 @@ impl SimpleAction {
             self.elem.set_height(h as u32);
         }
 
+        pub fn set_visible(&self, v: bool) {
+            if v {
+                set_css(self.elem.as_ref(), "display", "");
+            } else {
+                set_css(self.elem.as_ref(), "display", "none");
+            }
+        }
+
         pub fn on_click(&self, cb: Box<dyn FnMut(f64, f64)>) {
             *self.click_cb.borrow_mut() = Some(cb);
             let cb2 = self.click_cb.clone();

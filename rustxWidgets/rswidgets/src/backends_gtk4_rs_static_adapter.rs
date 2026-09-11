@@ -215,7 +215,8 @@ impl Canvas {
     }
     pub fn set_draw_callback(&self, cb: Box<dyn FnMut(&mut dyn DrawContext, i32, i32)>) { *self.1.borrow_mut() = Some(cb); }
     pub fn queue_redraw(&self) { self.0.queue_draw(); }
-    pub fn set_size_request(&self, w: i32, h: i32) { self.0.set_size_request(w, h); }
+        pub fn set_size_request(&self, w: i32, h: i32) { self.0.set_size_request(w, h); }
+        pub fn set_visible(&self, v: bool) { self.0.set_visible(v); }
     pub fn set_content_size(&self, _w: i32, _h: i32) {}
     pub fn grab_focus(&self) { self.0.grab_focus(); }
     pub fn set_can_focus(&self, c: bool) { self.0.set_focusable(c); }

@@ -141,6 +141,7 @@ macro_rules! common_types_mod {
             pub fn queue_redraw(&self) { self.inner.queue_redraw(); }
             pub fn set_size_request(&self, w: i32, h: i32) { self.inner.set_size_request(w, h); }
             pub fn on_click(&self, cb: Box<dyn FnMut(f64, f64)>) { self.inner.on_click(cb); }
+            pub fn set_visible(&self, v: bool) { self.inner.set_visible(v); }
             pub fn set_content_size(&self, w: i32, h: i32) { self.inner.set_content_size(w, h); }
             pub fn grab_focus(&self) { self.inner.grab_focus(); }
             pub fn set_can_focus(&self, can: bool) { self.inner.set_can_focus(can); }

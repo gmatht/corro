@@ -540,6 +540,16 @@ mod nwg_adapter {
             };
             let mut desired_sizes: Vec<i32> = Vec::with_capacity(n);
             for i in 0..n {
+                // Hidden children take no space (e.g. the sheet tab strip
+                // with a single sheet): hiding alone would otherwise leave
+                // a blank gap in the layout.
+                let hidden = unsafe {
+                    winapi::um::winuser::IsWindowVisible(children[i] as _) == 0
+                };
+                if hidden {
+                    desired_sizes.push(0);
+                    continue;
+                }
                 let is_expand = match self.orientation {
                     crate::backends::nwg::Orientation::Horizontal => hex[i],
                     crate::backends::nwg::Orientation::Vertical => vex[i],
@@ -1470,6 +1480,17 @@ mod nwg_adapter {
                         self.hwnd as _,
                         std::ptr::null_mut(), 0, 0, w, h,
                         winapi::um::winuser::SWP_NOZORDER | winapi::um::winuser::SWP_NOMOVE | winapi::um::winuser::SWP_SHOWWINDOW,
+                    );
+                }
+            }
+        }
+
+        pub fn set_visible(&self, visible: bool) {
+            if !self.hwnd.is_null() {
+                unsafe {
+                    winapi::um::winuser::ShowWindow(
+                        self.hwnd as _,
+                        if visible { winapi::um::winuser::SW_SHOW } else { winapi::um::winuser::SW_HIDE },
                     );
                 }
             }

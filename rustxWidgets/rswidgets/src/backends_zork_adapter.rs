@@ -617,6 +617,8 @@ impl Canvas {
     pub fn queue_redraw(&self) {}
     pub fn set_draw_callback(&self, _cb: Box<dyn FnMut(&mut dyn crate::core::DrawContext, i32, i32)>) {}
     pub fn on_click(&self, _cb: Box<dyn FnMut(f64, f64)>) {}
+    /// No-op: terminal canvases are virtual; visibility is meaningless.
+    pub fn set_visible(&self, _v: bool) {}
     pub fn on_key(&self, _cb: Box<dyn FnMut(u32) -> bool>) {}
     pub fn on_key_raw(&self, _cb: Box<dyn FnMut(u32, u32) -> bool>) {}
     pub fn grab_focus(&self) {}

@@ -960,6 +960,12 @@ impl DrawingArea {
             unsafe { f(self.inner, if can { 1 } else { 0 }); }
         }
     }
+    pub fn set_visible(&self, visible: bool) {
+        guard_widget!(self, "DrawingArea", "set_visible");
+        if let Some(f) = self.loader.symbols.gtk_widget_set_visible {
+            unsafe { f(self.inner, if visible { 1 } else { 0 }); }
+        }
+    }
     pub fn grab_focus(&self) {
         guard_widget!(self, "DrawingArea", "grab_focus");
         if let Some(f) = self.loader.symbols.gtk_widget_grab_focus {

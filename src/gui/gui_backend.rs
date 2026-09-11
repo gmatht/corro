@@ -219,6 +219,12 @@ struct GuiState {
     pinned_cols: RefCell<std::collections::BTreeSet<usize>>,
     pinned_sheet: Cell<u32>,
     padlocks: RefCell<Vec<GutterPadlock>>,
+    // Sheet tab bar (below the grid): one tab per sheet, visible only when
+    // the workbook has 2+ sheets. Hit rects painted last frame, used for
+    // click-to-switch. Cached visibility avoids redundant set_visible calls.
+    tabbar: Canvas,
+    tab_hits: RefCell<Vec<TabHit>>,
+    tabbar_visible: Cell<bool>,
     // Scrollbar sync: native scrollbars around the sheet (thumb tracks the
     // cursor; dragging/clicking moves the cursor, so the selection is always
     // visible). Guard against reentrancy between programmatic sets and the
@@ -641,6 +647,165 @@ fn toggle_pin(state: &GuiState, is_row: bool, idx: usize) -> bool {
         toggle_pin_in(&mut state.pinned_rows.borrow_mut(), idx)
     } else {
         toggle_pin_in(&mut state.pinned_cols.borrow_mut(), idx)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sheet tab bar
+// ---------------------------------------------------------------------------
+
+/// Height of the sheet tab strip (device px): matches the 24px column-header
+/// strip so the chrome reads as one family.
+const TAB_H: f64 = 24.0;
+/// Active tab fill: the terminal reference paints the active sheet tab
+/// black-on-yellow bold (ratatui `draw_visual`); the GUI uses a softer
+/// yellow that stays distinct from its blue selection/cursor language.
+const TAB_ACTIVE_BG: (f64, f64, f64) = (1.0, 1.0, 0.6);
+/// Inactive tab fill: same gray as the row/column gutters.
+const TAB_IDLE_BG: (f64, f64, f64) = (0.9, 0.9, 0.9);
+/// Tab divider lines.
+const TAB_DIV: (f64, f64, f64) = (0.55, 0.55, 0.55);
+/// Horizontal padding inside each tab and gap between tabs (device px).
+const TAB_PAD_X: f64 = 10.0;
+const TAB_GAP: f64 = 6.0;
+
+/// A painted sheet tab from the last frame: strip position plus which sheet
+/// index a click switches to.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TabHit {
+    x0: f64,
+    x1: f64,
+    index: usize,
+}
+
+/// Lay out sheet tabs left to right from x=2: each tab pads its measured
+/// title by TAB_PAD_X on both sides, TAB_GAP separates tabs. The active tab
+/// measures bold (weight 1), like it paints. Pure apart from measuring, so
+/// unit tests drive it with a stub measure closure.
+fn tab_layout(
+    titles: &[String],
+    active: usize,
+    measure: &dyn Fn(&str, i32) -> f64,
+) -> Vec<TabHit> {
+    let mut hits = Vec::with_capacity(titles.len());
+    let mut x = 2.0;
+    for (index, title) in titles.iter().enumerate() {
+        let weight = if index == active { 1 } else { 0 };
+        let tw = measure(title, weight);
+        let x0 = x;
+        let x1 = x0 + TAB_PAD_X + tw + TAB_PAD_X;
+        hits.push(TabHit { x0, x1, index });
+        x = x1 + TAB_GAP;
+    }
+    hits
+}
+
+/// Show the tab strip iff the workbook has 2+ sheets, then repaint it.
+/// Called from refresh_after_dialog (every menu/keyboard action) — never
+/// driven from the draw callback alone, because a hidden widget never
+/// draws and could never re-show itself.
+fn sync_tabbar(state: &Rc<GuiState>) {
+    let show = state.app_ref().core.workbook.sheet_count() >= 2;
+    if show != state.tabbar_visible.get() {
+        state.tabbar.set_visible(show);
+        state.tabbar_visible.set(show);
+    }
+    state.tabbar.queue_redraw();
+}
+
+/// Paint the sheet tab strip: one tab per sheet title, the active sheet
+/// bold on yellow (mirroring the terminal's black-on-yellow active tab).
+/// Reads live workbook state every frame, so created/renamed/deleted/copied
+/// sheets repaint with only a tabbar redraw (see refresh_after_dialog).
+/// When below 2 sheets the bar hides itself on every draw unconditionally:
+/// present() runs gtk_widget_show_all inside a seconds-long event pump,
+/// resurrecting setup-hidden widgets while screenshots and input are already
+/// live — a change-guarded hide would never fire (cache already says hidden).
+/// Once hidden GTK stops drawing, so the unconditional hide costs nothing
+/// steady-state.
+fn render_tabbar(dc: &mut dyn DrawContext, state: &GuiState, w: i32, h: i32) {
+    let (titles, active) = {
+        let app = state.app_ref();
+        let wb = &app.core.workbook;
+        let titles: Vec<String> =
+            (0..wb.sheet_count()).map(|i| wb.sheet_title(i).to_string()).collect();
+        (titles, wb.active_sheet)
+    };
+    let show = titles.len() >= 2;
+    if !show {
+        // Unconditional (see doc comment): heals show_all resurrection.
+        state.tabbar.set_visible(false);
+        state.tabbar_visible.set(false);
+        state.tab_hits.borrow_mut().clear();
+        return;
+    }
+    if !state.tabbar_visible.get() {
+        // Normally sync_tabbar already showed it; heal any drift.
+        state.tabbar.set_visible(true);
+        state.tabbar_visible.set(true);
+    }
+    dc.clear(0.94, 0.94, 0.94, 1.0);
+    dc.clip(0.0, 0.0, w as f64, h as f64);
+    let hits = {
+        let measure = |t: &str, weight: i32| {
+            dc.text_extents_styled(t, "monospace", FONT_SIZE, 0, weight).2
+        };
+        tab_layout(&titles, active, &measure)
+    };
+    for hit in &hits {
+        let is_active = hit.index == active;
+        let (r, g, b) = if is_active { TAB_ACTIVE_BG } else { TAB_IDLE_BG };
+        dc.fill_rect(hit.x0, 2.0, hit.x1 - hit.x0, TAB_H - 4.0, r, g, b, 1.0);
+        // Divider at the tab's right edge (also the click target's edge).
+        dc.fill_rect(hit.x1, 2.0, 1.0, TAB_H - 4.0, TAB_DIV.0, TAB_DIV.1, TAB_DIV.2, 1.0);
+        let (tr, tg, tb) = if is_active { (0.0, 0.0, 0.0) } else { (0.3, 0.3, 0.3) };
+        let weight = if is_active { 1 } else { 0 };
+        dc.draw_text_styled(
+            hit.x0 + TAB_PAD_X,
+            (TAB_H - FONT_SIZE * 1.2) / 2.0,
+            &titles[hit.index],
+            "monospace",
+            FONT_SIZE,
+            tr,
+            tg,
+            tb,
+            1.0,
+            0,
+            weight,
+        );
+    }
+    *state.tab_hits.borrow_mut() = hits;
+}
+
+/// Switch to the tabbed sheet (mirrors sheet_prev/sheet_next arrival:
+/// cursor parks at A1, status names the sheet). No-op for the active tab
+/// or an out-of-range index.
+fn switch_to_sheet(state_rc: &Rc<GuiState>, index: usize) {
+    let state: &GuiState = &**state_rc;
+    let app = state.app_mut();
+    let n = app.core.workbook.sheet_count();
+    if index >= n || index == app.core.workbook.active_sheet {
+        return;
+    }
+    app.core.workbook.active_sheet = index;
+    app.core.view_sheet_id = app.core.workbook.sheet_id(index);
+    app.core.cursor = SheetCursor { row: HEADER_ROWS, col: MARGIN_COLS };
+    app.core.anchor = None;
+    app.core.status = format!("Sheet {} of {}", index + 1, n);
+    state.last_row.set(HEADER_ROWS);
+    state.last_col.set(MARGIN_COLS);
+    update_formula_bar(state, HEADER_ROWS, MARGIN_COLS);
+    state.canvas.queue_redraw();
+    state.tabbar.queue_redraw();
+}
+
+/// Click on the tab strip: a tab hit switches sheets; anything else is
+/// ignored and must never move the grid cursor.
+fn handle_tab_click(x: f64, state_rc: &Rc<GuiState>) {
+    let state: &GuiState = &**state_rc;
+    let hit = state.tab_hits.borrow().iter().find(|h| x >= h.x0 && x < h.x1).copied();
+    if let Some(hit) = hit {
+        switch_to_sheet(state_rc, hit.index);
     }
 }
 
@@ -1606,6 +1771,9 @@ fn refresh_after_dialog(state: &Rc<GuiState>) {
     recompute_viewport(state);
     update_formula_bar(state, state.last_row.get(), state.last_col.get());
     state.canvas.queue_redraw();
+    // Created/renamed/deleted/copied sheets change tab titles or the bar's
+    // visibility — sync and repaint the strip with every refresh.
+    sync_tabbar(state);
 }
 
 /// Route a menu action through the shared `actions::dispatch_menu_action`
@@ -1914,6 +2082,14 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // Status label
     let status_label = rxapp.new_label("Ready")?;
 
+    // Sheet tab strip (below the grid): one tab per sheet once the workbook
+    // has 2+ sheets. Hidden until then — the first New sheet creates the
+    // bar, later sheets just append tabs. Fixed strip height; a vertical box
+    // stretches children across the full width on every backend.
+    let tabbar = rxapp.new_canvas()?;
+    tabbar.set_size_request(1, TAB_H as i32);
+    tabbar.set_visible(false);
+
     let shared = Rc::new(GuiState {
         app: corro_app as *mut super::App,
         rxapp: rxapp.clone(),
@@ -1939,6 +2115,9 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         pinned_cols: RefCell::new(std::collections::BTreeSet::new()),
         pinned_sheet: Cell::new(u32::MAX),
         padlocks: RefCell::new(Vec::new()),
+        tabbar: tabbar.clone(),
+        tab_hits: RefCell::new(Vec::new()),
+        tabbar_visible: Cell::new(false),
         #[cfg(feature = "gtk4")]
         last_dedup_key: Cell::new(0),
         #[cfg(feature = "gtk4")]
@@ -1985,6 +2164,17 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // Click
     let shared_click = shared.clone();
     canvas.on_click(Box::new(move |x: f64, y: f64| { handle_click(x, y, &shared_click); }));
+
+    // Sheet tabs: paint the strip and switch sheets on click. Registered
+    // before present() like the grid canvas so the first frame draws tabs.
+    let shared_tabdraw = shared.clone();
+    tabbar.set_draw_callback(Box::new(move |dc: &mut dyn DrawContext, w: i32, h: i32| {
+        render_tabbar(dc, &shared_tabdraw, w, h);
+    }));
+    let shared_tabclick = shared.clone();
+    tabbar.on_click(Box::new(move |x: f64, _y: f64| {
+        handle_tab_click(x, &shared_tabclick);
+    }));
 
     // Formula entry change
     let shared_entry = shared.clone();
@@ -2270,6 +2460,9 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // The nwg manual box layout looks the child up by handle, so it needs
     // the flag set AFTER append as well (a no-op repeat everywhere else).
     vbox.set_child_vexpand(&scrolled, true);
+    // Sheet tabs sit below the grid (above the status line), like the
+    // terminal reference rendering tabs in its bottom row.
+    vbox.append(&tabbar);
     vbox.append(&status_label);
 
     // Register the draw callback BEFORE present() so the extensive event
@@ -2565,6 +2758,50 @@ mod gutter_tests {
                 && c == (0.45, 0.45, 0.45, 1.0)),
             "unlocked padlock needs an outlined lighter body, got {strokes:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod tab_tests {
+    use super::*;
+
+    /// Tabs lay out left to right from x=2, padded by TAB_PAD_X on both
+    /// sides with TAB_GAP between. "Sheet1" at the stub 8px/char measures
+    /// 48px, so tab 1 spans 2..70 and tab 2 starts at 76.
+    #[test]
+    fn tab_layout_pads_and_gaps_tabs() {
+        let titles = vec!["Sheet1".to_string(), "Sheet2".to_string()];
+        let hits = tab_layout(&titles, 1, &|t: &str, _w: i32| t.chars().count() as f64 * 8.0);
+        assert_eq!(hits.len(), 2, "one hit per sheet, got {hits:?}");
+        assert_eq!((hits[0].x0, hits[0].x1), (2.0, 70.0));
+        assert_eq!(hits[0].index, 0);
+        assert_eq!((hits[1].x0, hits[1].x1), (76.0, 144.0));
+        assert_eq!(hits[1].index, 1);
+    }
+
+    /// No titles, no hits (single-sheet workbooks hide the bar anyway).
+    #[test]
+    fn tab_layout_empty_without_titles() {
+        assert!(tab_layout(&[], 0, &|_: &str, _: i32| 0.0).is_empty());
+        assert!(tab_layout(&["Only".to_string()], 0, &|_: &str, _: i32| 0.0).len() == 1);
+    }
+
+    /// The active tab measures bold (weight 1): the measure closure must
+    /// observe weight 1 exactly for the active index and 0 elsewhere, or
+    /// bold titles would misalign their hit rects.
+    #[test]
+    fn tab_layout_measures_active_bold() {
+        let titles = vec!["A".to_string(), "B".to_string(), "C".to_string()];
+        let seen = std::cell::RefCell::new(Vec::new());
+        let hits = tab_layout(&titles, 2, &|t: &str, w: i32| {
+            seen.borrow_mut().push((t.to_string(), w));
+            10.0
+        });
+        assert_eq!(seen.borrow().clone(), vec![("A".into(), 0), ("B".into(), 0), ("C".into(), 1)]);
+        assert_eq!(hits.len(), 3);
+        // Each tab is 10 + 10 + 10 = 30 wide with 6px gaps: tab 0 spans
+        // 2..32, tab 1 spans 38..68, tab 2 spans 74..104.
+        assert_eq!((hits[2].x0, hits[2].x1), (74.0, 104.0));
     }
 }
 
