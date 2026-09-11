@@ -242,6 +242,93 @@ fn gui_delete_clears_margin_header_cell() {
     );
 }
 
+/// A,Right,Right,C,Enter must commit "A" to A1 then "C" to C1: the first
+/// Right grows the grid on the just-committed content (trailing < 2) and
+/// the second grows again, exactly like the ratatui reference
+/// (`SET A1 A`, `SET C1 C`).
+/// Regression: commit-then-Right moved with a direct +1 that skipped the
+/// growth check, so the second Right escaped into the margin and committed
+/// `SET ]B1 C` instead of growing to C1.
+#[test]
+fn gui_a_right_right_c_enter_grows_to_c1() {
+    let _guard = GUI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    assert!(
+        std::env::var("DISPLAY").is_ok(),
+        "requires X server (run under xvfb-run -a)"
+    );
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let path = std::env::temp_dir().join(format!("corro-gui-growr-{}-{}.corro", std::process::id(), id));
+    let _ = std::fs::remove_file(&path);
+    std::fs::write(&path, "CORRO_LOG 1\n").expect("write fixture");
+
+    let mut child = spawn_gui(&path);
+    let wid = find_corro_window(child.id(), Instant::now() + Duration::from_secs(25));
+    xdotool(&["windowactivate", "--sync", &wid]);
+    std::thread::sleep(Duration::from_millis(400));
+    for key in ["A", "Right", "Right", "C", "Return"] {
+        xdotool(&["key", "--window", &wid, key]);
+        std::thread::sleep(Duration::from_millis(400));
+    }
+    let lines = wait_file_lines(&path, Instant::now() + Duration::from_secs(10));
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(
+        lines.iter().any(|l| l == "SET A1 A"),
+        "expected `SET A1 A`, got lines: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l == "SET C1 C"),
+        "expected `SET C1 C` (grid must grow on commit-then-Right, matching ratatui), got lines: {lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|l| l.contains("]")),
+        "must not escape into the margin, got: {lines:?}"
+    );
+}
+
+/// A,Down,Down,C,Enter must commit "A" to A1 then "C" to A3: commit-then-
+/// Down grows like plain Down (ratatui reference: `SET A1 A`, `SET A3 C`).
+/// Regression: same skipped-growth bug as the Right variant (committed to
+/// the footer instead of growing to A3).
+#[test]
+fn gui_a_down_down_c_enter_grows_to_a3() {
+    let _guard = GUI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    assert!(
+        std::env::var("DISPLAY").is_ok(),
+        "requires X server (run under xvfb-run -a)"
+    );
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let path = std::env::temp_dir().join(format!("corro-gui-growd-{}-{}.corro", std::process::id(), id));
+    let _ = std::fs::remove_file(&path);
+    std::fs::write(&path, "CORRO_LOG 1\n").expect("write fixture");
+
+    let mut child = spawn_gui(&path);
+    let wid = find_corro_window(child.id(), Instant::now() + Duration::from_secs(25));
+    xdotool(&["windowactivate", "--sync", &wid]);
+    std::thread::sleep(Duration::from_millis(400));
+    for key in ["A", "Down", "Down", "C", "Return"] {
+        xdotool(&["key", "--window", &wid, key]);
+        std::thread::sleep(Duration::from_millis(400));
+    }
+    let lines = wait_file_lines(&path, Instant::now() + Duration::from_secs(10));
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(
+        lines.iter().any(|l| l == "SET A1 A"),
+        "expected `SET A1 A`, got lines: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l == "SET A3 C"),
+        "expected `SET A3 C` (grid must grow on commit-then-Down, matching ratatui), got lines: {lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|l| l.starts_with("SET A_")),
+        "must not escape into the footer, got: {lines:?}"
+    );
+}
+
 /// Type HELLO, Backspace, Enter in A1: repeated chars must all land (no
 /// press/release-dedup drops) and Backspace must pop exactly once.
 /// Regression: the GUI backend lost the second L and double-popped,

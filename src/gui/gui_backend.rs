@@ -732,8 +732,11 @@ fn handle_edit_key(key: u32, state: &GuiState) -> bool {
         RIGHT => {
             log_key_action(key, "commit_edit_right", &format!("cell={} mode=edit", format_cell(state)));
             commit_edit(state);
-            state.last_col.set(state.last_col.get() + 1);
-            update_state_cursor(state, state.last_row.get(), state.last_col.get());
+            // Route through move_cursor (not a direct +1) so the grid grows
+            // at the boundary exactly like plain Right does — matching
+            // ratatui, where commit-then-Right grows on the just-committed
+            // content (e.g. A,Right,Right reaches C1, not the margin).
+            move_cursor(state, 0, 1);
             true
         }
         UP => {
@@ -749,8 +752,8 @@ fn handle_edit_key(key: u32, state: &GuiState) -> bool {
         DOWN => {
             log_key_action(key, "commit_edit_down", &format!("cell={} mode=edit", format_cell(state)));
             commit_edit(state);
-            state.last_row.set(state.last_row.get() + 1);
-            update_state_cursor(state, state.last_row.get(), state.last_col.get());
+            // Same growth routing as RIGHT above (ratatui grows here too).
+            move_cursor(state, 1, 0);
             true
         }
         _ if (32..=126).contains(&key) => {
