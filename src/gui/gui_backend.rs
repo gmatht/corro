@@ -9,7 +9,7 @@ use super::actions::run_prompt_action;
 use super::actions::{dispatch_menu_action, menu_action_needs_prompt, MenuDispatch};
 use super::extrapolate;
 
-use crate::grid::{CellAddr, SheetCursor, HEADER_ROWS, MARGIN_COLS};
+use crate::grid::{CellAddr, GridBox, SheetCursor, HEADER_ROWS, MARGIN_COLS};
 use crate::ops::{Op, WorkbookOp};
 use crate::ui_core;
 
@@ -1206,15 +1206,23 @@ fn scroll_to_cursor(state: &GuiState, vertical: bool, value: f64) {
     }
 }
 
-fn update_formula_bar(state: &GuiState, row: usize, col: usize) {
-    let app = state.app_ref();
-    let addr_str = crate::addr::sheet_cursor_to_addr(
+/// User-facing address text for the formula bar (left of `fx`), matching the
+/// ratatui reference (`addr_label`/`cell_ref_text`): `A1`, `[A1`, `A~1`, ...
+/// Never `CellAddr`'s internal rendering (`(0, 0)`, `<701>(0)`, ...).
+fn formula_addr_label(row: usize, col: usize, grid: &GridBox) -> String {
+    let addr = crate::addr::sheet_cursor_to_addr(
         crate::addr::LogicalRow(row),
         crate::addr::GlobalCol(col),
-        crate::addr::MainRows(app.core.workbook.active_sheet().grid.main_rows()),
-        crate::addr::MainCols(app.core.workbook.active_sheet().grid.main_cols()),
+        crate::addr::MainRows(grid.main_rows()),
+        crate::addr::MainCols(grid.main_cols()),
     );
-    state.addr_label.set_text(&addr_str.to_string());
+    crate::addr::cell_ref_text(&addr, grid.main_cols())
+}
+
+fn update_formula_bar(state: &GuiState, row: usize, col: usize) {
+    let app = state.app_ref();
+    let grid = &app.core.workbook.active_sheet().grid;
+    state.addr_label.set_text(&formula_addr_label(row, col, grid));
     // Look up the entry value at the TRUE address (a header/margin cursor
     // shows that cell's value, not the clamped main cell's).
     let addr = crate::addr::sheet_cursor_to_addr(
@@ -2145,6 +2153,59 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
 }
 
 #[cfg(test)]
+mod formula_tests {
+    use super::*;
+
+    fn empty_grid() -> GridBox {
+        crate::grid::Grid::new(1, 1).into()
+    }
+
+    /// The formula-bar address label must render user-facing cell names for
+    /// every zone (matching ratatui's addr_label/cell_ref_text), never
+    /// CellAddr's internal rendering (`(0, 0)`, `<701>(0)`, ...).
+    #[test]
+    fn addr_label_main_cell() {
+        let grid = empty_grid();
+        assert_eq!(formula_addr_label(HEADER_ROWS, MARGIN_COLS, &grid), "A1");
+    }
+
+    #[test]
+    fn addr_label_left_margin() {
+        let grid = empty_grid();
+        assert_eq!(
+            formula_addr_label(HEADER_ROWS, MARGIN_COLS - 1, &grid),
+            "[A1"
+        );
+    }
+
+    #[test]
+    fn addr_label_right_margin() {
+        let grid = empty_grid();
+        assert_eq!(
+            formula_addr_label(HEADER_ROWS, MARGIN_COLS + 1, &grid),
+            "]A1"
+        );
+    }
+
+    #[test]
+    fn addr_label_header_row() {
+        let grid = empty_grid();
+        assert_eq!(
+            formula_addr_label(HEADER_ROWS - 1, MARGIN_COLS, &grid),
+            "A~1"
+        );
+    }
+
+    #[test]
+    fn addr_label_footer_row() {
+        let grid = empty_grid();
+        assert_eq!(
+            formula_addr_label(HEADER_ROWS + 1, MARGIN_COLS, &grid),
+            "A_1"
+        );
+    }
+}
+
 mod fill_tests {
     use super::*;
     use std::path::PathBuf;
