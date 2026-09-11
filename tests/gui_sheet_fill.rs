@@ -362,7 +362,28 @@ fn assert_margin_commit(wid: &str, path: &std::path::PathBuf) {
     );
 }
 
-/// After Left-arrowing into the left margin, the sheet must still reach the
+/// Walk Left one step at a time from A1 (depths 1..=10 into the margin),
+/// asserting after EVERY step that the sheet still reaches the right window
+/// edge. A single end-state assertion would miss depths where the viewport
+/// strands narrow; the loop pins the whole margin band. Finishes with a
+/// margin-zone commit proving the keys really landed in the margin
+/// (non-vacuous: lost keys would leave the cursor on A1).
+fn left_arrow_sweep(wid: &str, path: &std::path::PathBuf, tag: &str) {
+    for depth in 1..=10 {
+        xdotool(&["key", "--window", wid, "Left"]);
+        std::thread::sleep(Duration::from_millis(300));
+        let f = capture_settled(wid, tag);
+        assert!(
+            f.right_gap <= 60,
+            "grid must still reach the right edge after {depth} Left(s) into the margin (right_gap={})",
+            f.right_gap
+        );
+    }
+    // Rows are unchanged by horizontal moves (covered by
+    // gui_sheet_fills_window_after_chrome); the regression is horizontal.
+    assert_margin_commit(wid, path);
+}
+
 /// After Left-arrowing into the left margin, the sheet must still reach the
 /// right window edge — no huge blank area.
 ///
@@ -390,20 +411,8 @@ fn gui_left_arrow_fills_window() {
     let wid = find_window(child.id());
     xdotool(&["windowsize", &wid, "1200", "800"]);
     std::thread::sleep(Duration::from_millis(400));
-    // Walk three columns into the left margin (cursor was on A1).
-    for _ in 0..3 {
-        xdotool(&["key", "--window", &wid, "Left"]);
-        std::thread::sleep(Duration::from_millis(300));
-    }
-    let f = capture_settled(&wid, "left");
-    assert!(
-        f.right_gap <= 60,
-        "grid must still reach the right edge after Left into the margin (right_gap={})",
-        f.right_gap
-    );
-    // Rows are unchanged by a horizontal move (covered by
-    // gui_sheet_fills_window_after_chrome); the regression is horizontal.
-    assert_margin_commit(&wid, &path);
+    // Cursor starts on A1; sweep 1..=10 columns into the left margin.
+    left_arrow_sweep(&wid, &path, "left");
     let _ = child.kill();
     let _ = child.wait();
     let _ = std::fs::remove_file(&path);
@@ -426,17 +435,7 @@ fn gui_left_arrow_fills_window_empty() {
     let wid = find_window(child.id());
     xdotool(&["windowsize", &wid, "1200", "800"]);
     std::thread::sleep(Duration::from_millis(400));
-    for _ in 0..3 {
-        xdotool(&["key", "--window", &wid, "Left"]);
-        std::thread::sleep(Duration::from_millis(300));
-    }
-    let f = capture_settled(&wid, "leftempty");
-    assert!(
-        f.right_gap <= 60,
-        "empty grid must still reach the right edge after Left into the margin (right_gap={})",
-        f.right_gap
-    );
-    assert_margin_commit(&wid, &path);
+    left_arrow_sweep(&wid, &path, "leftempty");
     let _ = child.kill();
     let _ = child.wait();
     let _ = std::fs::remove_file(&path);

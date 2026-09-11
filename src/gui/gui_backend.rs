@@ -380,23 +380,24 @@ fn render_to(
 /// constant — otherwise the sheet stops early and leaves a huge blank area.
 fn cols_to_fill_px(app: &super::App, cursor: SheetCursor, avail_px: i32) -> usize {
     let sheet = app.core.workbook.active_sheet();
+    // The grid is exhausted exactly when every column is returned (column
+    // indices live in [0, total), so len >= total means full coverage).
+    let total = MARGIN_COLS + sheet.grid.main_cols() + MARGIN_COLS;
     let mut dim = 1usize;
-    let mut prev_len = 0usize;
     loop {
         let (cols, _) = ui_core::visible_col_indices(sheet, cursor, dim, 0);
         let used: f64 = cols
             .iter()
             .map(|&c| sheet_rec_col_width(sheet, c) as f64 * CHAR_W)
             .sum();
-        // Exit when covered, capped, or STALLED (the returned set stops
-        // growing: the grid is exhausted). Never exit on `cols.len() < dim`:
-        // visible_col_indices may legitimately return fewer than dim (e.g.
-        // dim-1 with a left-margin cursor), and bailing there strands the
-        // sheet narrow with a huge blank area.
-        if used >= avail_px as f64 || dim >= 2048 || cols.len() <= prev_len {
+        // Exit when covered, capped, or exhausted. Never exit on
+        // `cols.len() < dim`: visible_col_indices may legitimately return
+        // fewer than dim (e.g. dim-1 with a left-margin cursor, or equal
+        // consecutive counts that still grow later), and bailing there
+        // strands the sheet narrow with a huge blank area.
+        if used >= avail_px as f64 || dim >= 2048 || cols.len() >= total {
             return dim.max(1);
         }
-        prev_len = cols.len();
         dim += 8;
     }
 }
@@ -2157,27 +2158,29 @@ mod fill_tests {
     }
 
     /// cols_to_fill_px must size the viewport to cover the available width
-    /// even when the cursor sits in the left margin. Regression: with a
+    /// at EVERY margin depth 1..=10, not just one spot. Regression: with a
     /// margin cursor, visible_col_indices returns dim-1 columns, so the
     /// `cols.len() < dim` exit fired after two iterations (data_cols=9) and
     /// the sheet stopped ~460px into a 1280px window, leaving a huge blank.
     #[test]
     fn cols_to_fill_px_covers_viewport_with_margin_cursor() {
         let app = overflow_app();
-        let cursor = SheetCursor { row: HEADER_ROWS, col: MARGIN_COLS - 3 };
-        let dim = cols_to_fill_px(&app, cursor, 1220);
-        let sheet = app.core.workbook.active_sheet();
-        let (cols, _) = ui_core::visible_col_indices(sheet, cursor, dim, 0);
-        let used_px: usize = cols
-            .iter()
-            .map(|&c| sheet_rec_col_width(sheet, c))
-            .sum::<usize>()
-            * CHAR_W as usize;
-        assert!(
-            used_px >= 1220,
-            "viewport must cover 1220px with margin cursor (dim={dim}, cols={}, used~{used_px})",
-            cols.len()
-        );
+        for depth in 1..=10usize {
+            let cursor = SheetCursor { row: HEADER_ROWS, col: MARGIN_COLS - depth };
+            let dim = cols_to_fill_px(&app, cursor, 1220);
+            let sheet = app.core.workbook.active_sheet();
+            let (cols, _) = ui_core::visible_col_indices(sheet, cursor, dim, 0);
+            let used_px: usize = cols
+                .iter()
+                .map(|&c| sheet_rec_col_width(sheet, c))
+                .sum::<usize>()
+                * CHAR_W as usize;
+            assert!(
+                used_px >= 1220,
+                "viewport must cover 1220px at margin depth {depth} (dim={dim}, cols={}, used~{used_px})",
+                cols.len()
+            );
+        }
     }
 
     /// Same guarantee with the cursor on A1 (the pre-existing passing case,
