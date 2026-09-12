@@ -1,6 +1,22 @@
 use std::ffi::CString;
 use std::os::raw::c_void;
 
+/// Log a panic caught at the GTK FFI boundary (where unwinding into C
+/// would abort the process with no message). Returns so callers can supply
+/// a safe default and keep the app alive.
+fn log_trampoline_panic(what: &str, err: Box<dyn std::any::Any + Send>) {
+    let msg = if let Some(s) = err.downcast_ref::<&str>() {
+        s.to_string()
+    } else if let Some(s) = err.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    };
+    let line = format!("corro: panic in GTK callback ({what}): {msg}\n");
+    let _ = std::fs::write("/tmp/corro-panic.log", &line);
+    eprintln!("{line}");
+}
+
 // Trampoline and destroy notify for clicked handler
 // We'll define a small C-ABI trampoline that converts user_data pointer into a Box<dyn FnMut()>
 
@@ -11,8 +27,13 @@ pub extern "C" fn gtk_compat_trampoline_2(_instance: *mut c_void, user_data: *mu
         if user_data.is_null() { return; }
         let inner_ptr = user_data as *mut Box<dyn FnMut()>;
         if inner_ptr.is_null() { return; }
-        let closure_ref: &mut dyn FnMut() = &mut **inner_ptr;
-        closure_ref();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let closure_ref: &mut dyn FnMut() = &mut **inner_ptr;
+            closure_ref();
+        }));
+        if let Err(err) = r {
+            log_trampoline_panic("trampoline_2", err);
+        }
     }
 }
 
@@ -23,8 +44,17 @@ pub extern "C" fn gtk_compat_trampoline_focus(_instance: *mut c_void, user_data:
         if user_data.is_null() { return 0; }
         let inner_ptr = user_data as *mut Box<dyn FnMut(*mut c_void) -> i32>;
         if inner_ptr.is_null() { return 0; }
-        let closure_ref: &mut dyn FnMut(*mut c_void) -> i32 = &mut **inner_ptr;
-        closure_ref(std::ptr::null_mut())
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let closure_ref: &mut dyn FnMut(*mut c_void) -> i32 = &mut **inner_ptr;
+            closure_ref(std::ptr::null_mut())
+        }));
+        match r {
+            Ok(v) => v,
+            Err(err) => {
+                log_trampoline_panic("trampoline_focus", err);
+                0
+            }
+        }
     }
 }
 
@@ -41,8 +71,13 @@ pub extern "C" fn gtk_compat_trampoline_3(_instance: *mut c_void, _param: *mut c
         if user_data.is_null() { return; }
         let inner_ptr = user_data as *mut Box<dyn FnMut()>;
         if inner_ptr.is_null() { return; }
-        let closure_ref: &mut dyn FnMut() = &mut **inner_ptr;
-        closure_ref();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let closure_ref: &mut dyn FnMut() = &mut **inner_ptr;
+            closure_ref();
+        }));
+        if let Err(err) = r {
+            log_trampoline_panic("trampoline_3", err);
+        }
     }
 }
 
@@ -65,8 +100,13 @@ pub extern "C" fn gtk_compat_trampoline_param(_instance: *mut c_void, param: *mu
         if user_data.is_null() { return; }
         let inner_ptr = user_data as *mut Box<dyn FnMut(*mut c_void)>;
         if inner_ptr.is_null() { return; }
-        let closure_ref: &mut dyn FnMut(*mut c_void) = &mut **inner_ptr;
-        closure_ref(param);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let closure_ref: &mut dyn FnMut(*mut c_void) = &mut **inner_ptr;
+            closure_ref(param);
+        }));
+        if let Err(err) = r {
+            log_trampoline_panic("trampoline_param", err);
+        }
     }
 }
 
@@ -86,8 +126,17 @@ pub extern "C" fn gtk_compat_trampoline_bool(_instance: *mut c_void, param: *mut
         if user_data.is_null() { return 0; }
         let inner_ptr = user_data as *mut Box<dyn FnMut(*mut c_void) -> i32>;
         if inner_ptr.is_null() { return 0; }
-        let closure_ref: &mut dyn FnMut(*mut c_void) -> i32 = &mut **inner_ptr;
-        closure_ref(param)
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let closure_ref: &mut dyn FnMut(*mut c_void) -> i32 = &mut **inner_ptr;
+            closure_ref(param)
+        }));
+        match r {
+            Ok(v) => v,
+            Err(err) => {
+                log_trampoline_panic("trampoline_bool", err);
+                0
+            }
+        }
     }
 }
 
