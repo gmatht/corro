@@ -184,6 +184,7 @@ fn save_before_quit(state: &GuiState) {
 struct GuiState {
     app: *mut super::App,
     rxapp: rswidgets::App,
+    window: Window,
     canvas: Canvas,
     formula_entry: Entry,
     addr_label: Label,
@@ -799,8 +800,10 @@ fn switch_to_sheet(state_rc: &Rc<GuiState>, index: usize) {
     app.core.status = format!("Sheet {} of {}", index + 1, n);
     state.last_row.set(HEADER_ROWS);
     state.last_col.set(MARGIN_COLS);
-    // A fresh sheet still gets its clickable trailing blank.
+    // A fresh sheet still gets its clickable trailing blank (pointer-like
+    // arrival — a switch lands the cursor without keyboard stepping).
     ensure_trailing_blank_data(state);
+    grow_blank_past_cursor(state);
     update_formula_bar(state, HEADER_ROWS, MARGIN_COLS);
     state.canvas.queue_redraw();
     state.tabbar.queue_redraw();
@@ -1551,34 +1554,56 @@ fn grow_for_trailing_blank(
 }
 
 /// Keep one blank body row below (and one blank body column right of) the
-/// last non-blank one, counting the cursor's row/column as non-blank. This
-/// is what lets the mouse select a fresh data row/column: without it the
-/// cells beyond the content are margins, so clicking can never start new
-/// data. Keyboard navigation maintains two content-counted blanks
-/// (NAV_BLANK_ROWS/COLS) on step-off; this maintains one cursor-counted
-/// blank so it is visible even before any keyboard navigation (e.g. right
-/// at load). Growth is ephemeral like keyboard growth (never logged).
+/// last non-blank one (content-counted only). This is what lets the mouse
+/// select a fresh data row/column at load: without it the cells beyond the
+/// content are margins, so clicking can never start new data. Growth is
+/// ephemeral like keyboard growth (never logged).
 ///
 /// Intentional GUI-only divergence from ratatui (which shows no trailing
 /// blank at load): the terminal has no mouse, so it needs no clickable
 /// blank row. Keyboard behavior is unchanged and still matches ratatui.
+///
+/// NB: deliberately NOT cursor-counted. Counting the cursor as non-blank
+/// here treadmills keyboard navigation: every arrow step onto the trailing
+/// blank grows a fresh one ahead, so the cursor never leaves main (never
+/// reaching margins/footers, breaking ratatui parity). Pointer arrivals
+/// (clicks, scrollbar drags, sheet switches) grow explicitly via
+/// grow_blank_past_cursor below; keyboard growth stays with the classic
+/// NAV_BLANK step-off logic in move_cursor.
 fn ensure_trailing_blank_data(state: &GuiState) {
+    let app = state.app_mut();
+    let sheet = app.core.workbook.active_sheet_mut();
+    let grid = &mut sheet.grid;
+    let mr = grid.main_rows();
+    let mc = grid.main_cols();
+    // Content-counted only (see doc comment): the cursor must not count
+    // here (treadmill — every keyboard step onto the blank would grow a
+    // fresh one ahead and the cursor could never leave main). Pointer
+    // arrivals grow explicitly via grow_blank_past_cursor.
+    if grow_for_trailing_blank(mr, compute::trailing_blank_main_rows(grid), None) {
+        grid.grow_main_row_at_bottom();
+    }
+    if grow_for_trailing_blank(mc, compute::trailing_blank_main_cols(grid), None) {
+        grid.grow_main_col_at_right();
+    }
+}
+
+/// Open one blank body row/column beyond the cursor when it sits exactly
+/// on the last body row/column. Pointer arrivals only (clicks, scrollbar
+/// drags, sheet switches — see ensure_trailing_blank_data for why keyboard
+/// moves must not call this). Growth is ephemeral (never logged).
+fn grow_blank_past_cursor(state: &GuiState) {
     let app = state.app_mut();
     let cursor = app.core.cursor;
     let sheet = app.core.workbook.active_sheet_mut();
     let grid = &mut sheet.grid;
-    let hr = HEADER_ROWS;
-    let lm = MARGIN_COLS;
+    let (hr, lm) = (HEADER_ROWS, MARGIN_COLS);
     let mr = grid.main_rows();
-    let mc = grid.main_cols();
-    let cursor_row =
-        (cursor.row >= hr && cursor.row < hr + mr).then_some(cursor.row - hr);
-    let cursor_col =
-        (cursor.col >= lm && cursor.col < lm + mc).then_some(cursor.col - lm);
-    if grow_for_trailing_blank(mr, compute::trailing_blank_main_rows(grid), cursor_row) {
+    if mr > 0 && cursor.row >= hr && cursor.row - hr + 1 == mr {
         grid.grow_main_row_at_bottom();
     }
-    if grow_for_trailing_blank(mc, compute::trailing_blank_main_cols(grid), cursor_col) {
+    let mc = grid.main_cols();
+    if mc > 0 && cursor.col >= lm && cursor.col - lm + 1 == mc {
         grid.grow_main_col_at_right();
     }
 }
@@ -1598,6 +1623,12 @@ fn update_state_cursor(state: &GuiState, row: usize, col: usize) {
     ensure_trailing_blank_data(state);
     update_formula_bar(state, row, col);
     state.canvas.queue_redraw();
+    // Window-level cascade: a canvas-only queue_draw may not trigger the
+    // toplevel's frame clock (same reason setup calls win.queue_redraw()),
+    // leaving pure cursor moves invisible — the state advances but the grid
+    // keeps showing the old highlight. Marking the window dirty every move
+    // keeps the view honest on every backend.
+    state.window.queue_redraw();
 }
 
 /// Extend the selection (Shift+arrows, matching ratatui): anchor at the
@@ -1659,15 +1690,44 @@ fn scroll_to_cursor(state: &GuiState, vertical: bool, value: f64) {
     if state.syncing_scroll.get() {
         return;
     }
+    // The thumb domain only expresses the main body: sync floors margin
+    // cursors to 0 (and clamps right-margin ones), so any later
+    // re-emission of the adjustment would drag such a cursor back into
+    // the body (e.g. a stale horizontal 0 resetting [A1 to A1, or a
+    // vertical 0 resetting A~1 to A1). The thumb cannot address chrome
+    // cells, so scrollbar input is ignored while the cursor sits in
+    // chrome; the per-frame viewport recompute still keeps it visible.
+    // (Footer rows are expressible — row-hr needs no floor — so they
+    // stay live here.)
+    if vertical {
+        if state.last_row.get() < HEADER_ROWS {
+            return;
+        }
+    } else {
+        let lm = MARGIN_COLS;
+        let mc = state
+            .app_ref()
+            .core
+            .workbook
+            .active_sheet()
+            .grid
+            .main_cols();
+        let c = state.last_col.get();
+        if c < lm || c >= lm + mc {
+            return;
+        }
+    }
     let (ru, cu) = scroll_domain(state);
     if vertical {
         let row = (HEADER_ROWS as f64 + value).max(HEADER_ROWS as f64) as usize;
         let row = row.min(HEADER_ROWS + ru.saturating_sub(1));
         update_state_cursor(state, row, state.last_col.get());
+        grow_blank_past_cursor(state);
     } else {
         let col = (MARGIN_COLS as f64 + value).max(MARGIN_COLS as f64) as usize;
         let col = col.min(MARGIN_COLS + cu.saturating_sub(1));
         update_state_cursor(state, state.last_row.get(), col);
+        grow_blank_past_cursor(state);
     }
 }
 
@@ -1752,8 +1812,10 @@ fn handle_click(x: f64, y: f64, state_rc: &Rc<GuiState>) {
                 app.core.cursor.col = c;
                 // Plain click collapses any selection (fresh single-cell focus).
                 app.core.anchor = None;
-                // Clicking the trailing blank opens one more beyond it.
+                // Clicking the trailing blank opens one more beyond it
+                // (pointer arrival — see grow_blank_past_cursor).
                 ensure_trailing_blank_data(state);
+                grow_blank_past_cursor(state);
                 update_formula_bar(state, logical_row, c);
                 start_edit(state);
                 state.canvas.queue_redraw();
@@ -2207,6 +2269,7 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     let shared = Rc::new(GuiState {
         app: corro_app as *mut super::App,
         rxapp: rxapp.clone(),
+        window: win.clone(),
         canvas: canvas.clone(),
         formula_entry: formula_entry.clone(),
         addr_label: addr_label.clone(),
@@ -2271,11 +2334,25 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         if (state & 0x8) != 0 {
             return false;
         }
+        // Same-event duplicate guard (mirrors the entry handler): the window
+        // handler fires first and arms entry_processed_key; without this
+        // check a canvas-focused keypress moves twice (Left from A1 lands
+        // two columns deep instead of [A1). Arm after handling for the
+        // reverse order (canvas first, window second); the window's own
+        // guard below consumes it.
+        if shared_key.entry_processed_key.get() {
+            shared_key.entry_processed_key.set(false);
+            return false;
+        }
         // Modifier state arrives here (unlike common::Canvas::on_key, which
         // drops it), but only Alt is inspected: Shift+arrows from a
         // canvas-focused keypress still move plainly; entry/window paths
         // below carry Shift (bit 0x1, GDK_SHIFT_MASK / Win32-shift bit).
-        handle_key(keyval, &shared_key, 0)
+        let r = handle_key(keyval, &shared_key, 0);
+        if !cfg!(windows) && shared_key.entry_seen.get() {
+            shared_key.entry_processed_key.set(true);
+        }
+        r
     }));
 
     // Click
@@ -2387,7 +2464,16 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
             // handler would call handle_key again, doubling the character
             // in edit_buf ("4422" instead of "42").  This is the fix
             // described in Attempt 195 of the idea log.
-            if (32..=126).contains(&nk) && s.entry_processed_key.get() {
+            // Skip keys the entry/canvas already handled first (same-event
+            // flag): printables (native insertion continues below) and pure
+            // movement keys (native caret nudge is harmless). RETURN/ESCAPE/
+            // TAB/BACKSPACE/DELETE keep their dedicated flows below.
+            let skip_dup = (32..=126).contains(&nk)
+                || matches!(
+                    nk,
+                    LEFT | RIGHT | UP | DOWN | HOME | END | PAGE_UP | PAGE_DOWN
+                );
+            if skip_dup && s.entry_processed_key.get() {
                 s.entry_processed_key.set(false);
                 return 0;
             }
@@ -2551,6 +2637,12 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                     // both GDK and the nwg adapter); Shift+arrows extend the
                     // selection via handle_key.
                     handle_key(keyval, &shared_k, state);
+                    // Arm for the reverse order (entry first, window second);
+                    // the window's guard above consumes it. Unreachable when
+                    // the window fired first (skipped above).
+                    if !cfg!(windows) && shared_k.entry_seen.get() {
+                        shared_k.entry_processed_key.set(true);
+                    }
                     true
                 }
                 _ if (32..=126).contains(&k) => {

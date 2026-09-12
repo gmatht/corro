@@ -402,25 +402,66 @@ fn navigate_to_column_k_via_ratatui() {
         &ratatui[..ratatui.len().min(3000)]);
 }
 
-/// Arrow left from A1 should enter the left margin column (show [A label).
-/// Arrow up from A1 should enter the header row (show ~1 label).
+/// Arrow left from A1 must enter the left margin column (formula shows [A1).
+/// (An earlier version of this test also passed when the cursor never moved
+/// at all — `contains("[")` matches the `[File]` menu and `contains("A1")`
+/// matches the stale address — so it could not catch a stuck cursor.)
 #[test]
 fn arrow_left_from_a1_enters_margin() {
     let pane = run_in_tmux("--pancurses docs/tests/overflow.corro", &["Left"], 1000);
-    // After Left from A1, cursor should show left margin label (like [A or similar)
-    assert!(pane.contains("[A") || pane.contains("[") || pane.contains("A1"),
-        "Left from A1 should show margin or remain at A1\n---\n{}\n---",
+    assert!(pane.contains("[A1"),
+        "Left from A1 must show [A1 in the formula bar\n---\n{}\n---",
         safe_slice(&pane, 2000));
 }
 
-/// Arrow up from A1 should enter the header row.
+/// Arrow up from A1 must enter the header row (formula shows A~1).
+/// (Same vacuous-assertion history as `arrow_left_from_a1_enters_margin`:
+/// `contains("~") || contains("A1")` passed with a stuck cursor.)
 #[test]
 fn arrow_up_from_a1_enters_header() {
     let pane = run_in_tmux("--pancurses docs/tests/overflow.corro", &["Up"], 1000);
-    // After Up from A1, cursor should show header label (like ~1)
-    assert!(pane.contains("~") || pane.contains("A1"),
-        "Up from A1 should show header row label or remain at A1\n---\n{}\n---",
+    assert!(pane.contains("A~1"),
+        "Up from A1 must show A~1 in the formula bar\n---\n{}\n---",
         safe_slice(&pane, 2000));
+}
+
+/// New document, press Left: the pancurses formula bar must display the
+/// margin cell, and the highlight color run must move left with the cursor.
+#[test]
+fn new_doc_left_updates_formula_bar_and_selection() {
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let doc = std::env::temp_dir().join(format!(
+        "corro-ml-newdoc-{}-{}.corro",
+        std::process::id(),
+        id
+    ));
+    std::fs::write(&doc, "CORRO_LOG 1\n").expect("write new-doc fixture");
+    let session = format!("corro-ml-{}", id);
+    let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
+    tmux::new_session(
+        &session,
+        &format!("{} --pancurses {}; sleep 2", bin, doc.to_string_lossy()),
+    );
+    std::thread::sleep(Duration::from_millis(1200));
+    let before = tmux::capture_pane(&session);
+    assert!(before.contains("[File]"), "app should show menu bar");
+    let esc0 = tmux::capture_pane_esc(&session);
+    tmux::send_keys(&session, "Left");
+    std::thread::sleep(Duration::from_millis(500));
+    let after = tmux::capture_pane(&session);
+    let esc1 = tmux::capture_pane_esc(&session);
+    tmux::kill_session(&session);
+    assert!(after.contains("[A1"),
+        "formula bar must show [A1 after Left on a new doc\n---\n{}\n---",
+        safe_slice(&after, 2000));
+    let pos = |s: &str| s.find("\x1b[48;5;8m");
+    let (p0, p1) = (pos(&esc0), pos(&esc1));
+    assert!(p0.is_some() && p1.is_some(), "cursor color run must render in both captures");
+    assert!(
+        p1.unwrap() < p0.unwrap(),
+        "highlight must move left after Left ({:?} -> {:?})",
+        p0, p1
+    );
 }
 
 /// Navigate to a cell via repeated arrow keys, enter "Hello World!", and verify

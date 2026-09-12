@@ -434,68 +434,147 @@ fn label_zone_diff(a: &std::path::PathBuf, b: &std::path::PathBuf) -> i32 {
     String::from_utf8_lossy(&out.stdout).trim().parse().unwrap_or(-99)
 }
 
-#[test]
-fn gui_formula_bar_shows_margin_name() {
-    let _guard = GUI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+/// Dark-pixel (ink) count of the formula address zone (x0..64,y14..42).
+/// `"A1"` renders two glyphs, `"[A1"` three: the ink count must grow when
+/// the bar switches to the margin address (a repaint alone could redraw
+/// identical text — growth proves the displayed address changed).
+fn label_zone_ink(shot: &std::path::PathBuf) -> i32 {
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let script = std::env::temp_dir().join(format!("corro-fhdr-labelink-{id}.py"));
+    std::fs::write(
+        &script,
+        "import sys\nfrom PIL import Image\nimg = Image.open(sys.argv[1]).convert('RGB')\npx = img.load()\nn = sum(1 for y in range(14, 42) for x in range(0, 64) if px[x,y][0] < 110 and px[x,y][1] < 110 and px[x,y][2] < 110)\nprint(n)\n",
+    )
+    .expect("write analyzer");
+    let out = Command::new("python3")
+        .arg(&script)
+        .arg(shot)
+        .output()
+        .expect("python3 analyzer");
+    let _ = std::fs::remove_file(&script);
+    String::from_utf8_lossy(&out.stdout).trim().parse().unwrap_or(-99)
+}
+
+/// Spawn the app on a new (empty) document and activate its window.
+/// Returns the child guard, window id, and fixture path.
+/// Callers must hold GUI_LOCK for the whole test (this helper does not).
+fn start_new_doc_app(tag: &str) -> (KillOnDrop, String, PathBuf) {
     assert!(
         std::env::var("DISPLAY").is_ok(),
         "requires X server (run under xvfb-run -a)"
     );
-    let path = fresh_fixture("margin");
-    let mut child = spawn_gui(&path);
+    let path = fresh_fixture(tag);
+    let child = spawn_gui(&path);
     let wid = find_corro_window(child.id(), Instant::now() + Duration::from_secs(25));
     xdotool(&["windowactivate", "--sync", &wid]);
     std::thread::sleep(Duration::from_millis(500));
+    (child, wid, path)
+}
+
+#[test]
+fn gui_new_doc_left_updates_formula_bar() {
+    // New document, press Left: the formula bar must display the margin
+    // cell. Pixel proof (repaint + ink growth for the added bracket),
+    // because short-label OCR confuses 1/L and drops brackets, reading
+    // both A1 and [A1 as "AL".
+    let _guard = GUI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut child, wid, path) = start_new_doc_app("formulamargin");
+    let before_shot = screenshot(&wid, "fbar0");
+    let ink_before = label_zone_ink(&before_shot);
+    assert!(ink_before > 10, "address label must render ink (got {ink_before})");
+    xdotool(&["key", "--window", &wid, "Left"]);
+    // Gate on the highlight moving (the bar follows the cursor): poll for
+    // any bbox change, then prove the bar's displayed text changed too.
+    let deadline = Instant::now() + Duration::from_secs(12);
+    let after_shot = loop {
+        let shot = screenshot(&wid, "fbarmove");
+        let bb = cursor_bbox(&shot);
+        let moved = bb.map(|b| (b.0, b.1)) != cursor_bbox(&before_shot).map(|b| (b.0, b.1));
+        if moved && bb.is_some() {
+            break shot;
+        }
+        let _ = std::fs::remove_file(&shot);
+        if Instant::now() > deadline {
+            panic!("cursor highlight never moved after Left");
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    };
+    let repainted = label_zone_diff(&before_shot, &after_shot);
+    assert!(
+        repainted > 30,
+        "formula bar must repaint for the margin address (diff px: {repainted})"
+    );
+    // The new label must carry more ink ("[A1" gains a bracket over "A1").
+    // Poll for a stable grown reading: a screenshot can catch a torn frame
+    // mid-repaint under load, but the settled label persists.
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let ink_after = loop {
+        let shot = screenshot(&wid, "fbarink");
+        let ink = label_zone_ink(&shot);
+        let _ = std::fs::remove_file(&shot);
+        if ink as f64 > ink_before as f64 * 1.1 {
+            break ink;
+        }
+        if Instant::now() > deadline {
+            break ink;
+        }
+        std::thread::sleep(Duration::from_millis(400));
+    };
+    assert!(
+        ink_after as f64 > ink_before as f64 * 1.1,
+        "formula bar must show a longer address ([A1 gains a bracket): ink {ink_before} -> {ink_after}"
+    );
+    let _ = std::fs::remove_file(&before_shot);
+    let _ = std::fs::remove_file(&after_shot);
+    let _ = child.kill();
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn gui_new_doc_left_moves_blue_selection() {
+    // New document, press Left: the blue highlight itself must move from
+    // A1 into margin column [A (left edge at the gutter's right edge,
+    // x=50=ROW_LABEL_W, fill inset ~2px hence 50..=58; same row). A
+    // double-move would land a full column further right (empty-fixture
+    // margins are ~28px wide); no move would still overlap `before`.
+    let _guard = GUI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut child, wid, path) = start_new_doc_app("bluemargin");
     // Cursor bbox before the key (A1): the gutter ends at x=50, so the
     // margin column [A starts there; col A starts a column-width right.
-    let before_shot = screenshot(&wid, "margin0");
+    let before_shot = screenshot(&wid, "blue0");
     let before = cursor_bbox(&before_shot)
         .expect("cursor highlight must be visible before Left");
+    let _ = std::fs::remove_file(&before_shot);
     xdotool(&["key", "--window", &wid, "Left"]);
     // Poll for the highlight to move (deadline, not sleep): event delivery
-    // through the present-pump is timing-dependent, and key OCR confuses
-    // 1/L and drops brackets, so pixel position (not text) is the verdict.
+    // through the present-pump is timing-dependent, so pixel position (not
+    // text) is the verdict.
     let deadline = Instant::now() + Duration::from_secs(12);
-    let (after, after_shot) = loop {
-        let shot = screenshot(&wid, "marginmove");
+    let after = loop {
+        let shot = screenshot(&wid, "bluemove");
         if let Some(b) = cursor_bbox(&shot) {
             if (b.0 - before.0).abs() > 5 || (b.1 - before.1).abs() > 5 {
-                break (b, shot);
+                let _ = std::fs::remove_file(&shot);
+                break b;
             }
         }
         let _ = std::fs::remove_file(&shot);
         if Instant::now() > deadline {
             panic!(
-                "cursor highlight never moved after Left (stayed {before:?})"
+                "blue selection never moved after Left (stayed {before:?})"
             );
         }
         std::thread::sleep(Duration::from_millis(300));
     };
-    // Exactly one column left, same row: the highlight's left edge sits at
-    // the gutter's right edge (x=50, ROW_LABEL_W) inside the first data
-    // column [A — the cursor fill insets ~2px, hence 50..=58. A double-move
-    // would land a full column further right (empty-fixture margins default
-    // to ~28px wide), and no move would still overlap `before` (excluded by
-    // the poll above). Exact-substring OCR cannot prove this (it reads 1
-    // as L and drops brackets, confusing A1 with [A1), so pixels do.
     assert!(
         (50..=58).contains(&after.0),
-        "Left from A1 must land the highlight in margin column [A (x0 in 50..=58, got {after:?}, was {before:?})"
+        "Left from A1 must land the blue selection in margin column [A (x0 in 50..=58, got {after:?}, was {before:?})"
     );
     assert!(
         (after.1 - before.1).abs() <= 6,
         "Left must not change rows (y0 {} vs {})",
         after.1,
         before.1
-    );
-    // The formula bar must repaint for the new address (a margin label
-    // adds a bracket and shifts every glyph).
-    let repainted = label_zone_diff(&before_shot, &after_shot);
-    let _ = std::fs::remove_file(&before_shot);
-    let _ = std::fs::remove_file(&after_shot);
-    assert!(
-        repainted > 30,
-        "formula bar must repaint for the margin address (diff px: {repainted})"
     );
     let _ = child.kill();
     let _ = std::fs::remove_file(&path);

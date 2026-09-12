@@ -45,6 +45,7 @@ mod android_adapter {
         }
 
         pub fn present(&self) {}
+        pub fn queue_redraw(&self) {}
     }
 
     #[repr(transparent)]

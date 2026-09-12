@@ -230,6 +230,55 @@ fn render_via_ratatui(rel_path: &str) -> String {
     render_via_ratatui_with_keys(rel_path, &[])
 }
 
+/// Fresh empty document (a "new document": log header only, no cells),
+/// as an isolated temp path (see `render_via_ratatui_with_keys` for why the
+/// path must be unique per call).
+fn new_doc_fixture() -> PathBuf {
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let dst = std::env::temp_dir().join(format!(
+        "corro-newdoc-{}-{}.corro",
+        std::process::id(),
+        id
+    ));
+    std::fs::write(&dst, "CORRO_LOG 1\n").expect("write new-doc fixture");
+    dst
+}
+
+/// Drive a fresh empty document in-process (ratatui App): send keys, redraw,
+/// and return the rendered text, the cursor (the state the blue highlight
+/// renders from), and the screen coords of DarkGray-background cells (the
+/// highlight itself: the cursor column renders `bg(DarkGray)` in the cursor
+/// row, even under spill text). Grid rows only (y >= 4): chrome above the
+/// grid must not pollute the highlight census.
+fn drive_new_doc(
+    keys: &[crossterm::event::KeyCode],
+) -> (String, corro::grid::SheetCursor, Vec<(u16, u16)>) {
+    let tmp = new_doc_fixture();
+    let mut app = corro::ui::App::new(Some(tmp));
+    app.load_initial().unwrap();
+    for &code in keys {
+        ratatui_send(&mut app, code, crossterm::event::KeyModifiers::NONE);
+    }
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal.draw(|f| app.bench_draw(f)).unwrap();
+    let buffer = terminal.backend().buffer();
+    let mut rows = Vec::new();
+    let mut dark = Vec::new();
+    for y in 0..buffer.area.height {
+        let mut row = String::new();
+        for x in 0..buffer.area.width {
+            let cell = &buffer[(x, y)];
+            row.push_str(cell.symbol());
+            if cell.bg == ratatui::style::Color::DarkGray && y >= 4 {
+                dark.push((x, y));
+            }
+        }
+        rows.push(row);
+    }
+    (rows.join("\n"), app.cursor, dark)
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[test]
@@ -480,25 +529,106 @@ fn navigate_to_column_k_via_ratatui() {
         &ratatui[..ratatui.len().min(3000)]);
 }
 
-/// Arrow left from A1 should enter the left margin column (show [A label).
-/// Arrow up from A1 should enter the header row (show ~1 label).
+/// Arrow left from A1 must enter the left margin column (formula shows [A1).
+/// (An earlier version of this test also passed when the cursor never moved
+/// at all — `contains("[")` matches the `[File]` menu and `contains("A1")`
+/// matches the stale address — so it could not catch a stuck cursor.)
 #[test]
 fn arrow_left_from_a1_enters_margin() {
     let pane = run_in_tmux("--pancurses docs/tests/overflow.corro", &["Left"], 1000);
-    // After Left from A1, cursor should show left margin label (like [A or similar)
-    assert!(pane.contains("[A") || pane.contains("[") || pane.contains("A1"),
-        "Left from A1 should show margin or remain at A1\n---\n{}\n---",
+    assert!(pane.contains("[A1"),
+        "Left from A1 must show [A1 in the formula bar\n---\n{}\n---",
         safe_slice(&pane, 2000));
 }
 
-/// Arrow up from A1 should enter the header row.
+/// Arrow up from A1 must enter the header row (formula shows A~1).
+/// (Same vacuous-assertion history as `arrow_left_from_a1_enters_margin`:
+/// `contains("~") || contains("A1")` passed with a stuck cursor.)
 #[test]
 fn arrow_up_from_a1_enters_header() {
     let pane = run_in_tmux("--pancurses docs/tests/overflow.corro", &["Up"], 1000);
-    // After Up from A1, cursor should show header label (like ~1)
-    assert!(pane.contains("~") || pane.contains("A1"),
-        "Up from A1 should show header row label or remain at A1\n---\n{}\n---",
+    assert!(pane.contains("A~1"),
+        "Up from A1 must show A~1 in the formula bar\n---\n{}\n---",
         safe_slice(&pane, 2000));
+}
+
+/// New document, press Left: the formula bar must display the margin cell.
+/// Covers ratatui (in-process, deterministic) and pancurses (live tmux).
+#[test]
+fn new_doc_left_updates_formula_bar() {
+    use crossterm::event::KeyCode;
+    let (render, cursor, _) = drive_new_doc(&[KeyCode::Left]);
+    assert!(render.contains("[A1"),
+        "ratatui formula bar must show [A1 after Left on a new doc\n{render}");
+    assert_eq!(
+        (cursor.row, cursor.col),
+        (corro::grid::HEADER_ROWS, corro::grid::MARGIN_COLS - 1),
+        "cursor state must be the [A margin cell"
+    );
+    let doc = new_doc_fixture();
+    let pane = run_in_tmux(
+        &format!("--pancurses {}", doc.to_string_lossy()),
+        &["Left"],
+        1000,
+    );
+    assert!(pane.contains("[A1"),
+        "pancurses formula bar must show [A1 after Left on a new doc\n---\n{}\n---",
+        safe_slice(&pane, 2000));
+}
+
+/// New document, press Left: the highlight itself must move to the margin.
+/// (The formula bar could theoretically update while the highlight stays
+/// put, or vice versa — this pins the rendered selection, not just the
+/// address text or the cursor state.)
+#[test]
+fn new_doc_left_moves_selection() {
+    use crossterm::event::KeyCode;
+    let (_, _, dark_before) = drive_new_doc(&[]);
+    let (render, cursor, dark_after) = drive_new_doc(&[KeyCode::Left]);
+    assert!(!dark_before.is_empty(), "cursor highlight must render on a new doc");
+    assert!(!dark_after.is_empty(), "cursor highlight must render after Left");
+    assert_eq!(
+        (cursor.row, cursor.col),
+        (corro::grid::HEADER_ROWS, corro::grid::MARGIN_COLS - 1),
+        "cursor state must be the [A margin cell (render:\n{render})"
+    );
+    // Every highlight cell sits on one screen row (the cursor row); after
+    // Left that row is unchanged but the whole run moved one column left.
+    let rows_before: std::collections::HashSet<u16> =
+        dark_before.iter().map(|&(_, y)| y).collect();
+    let rows_after: std::collections::HashSet<u16> =
+        dark_after.iter().map(|&(_, y)| y).collect();
+    assert_eq!(rows_before, rows_after, "Left must not change the highlight row");
+    let min_before = dark_before.iter().map(|&(x, _)| x).min().unwrap();
+    let max_after = dark_after.iter().map(|&(x, _)| x).max().unwrap();
+    assert!(
+        max_after < min_before,
+        "highlight must move left after Left (before x>={min_before}, after x<={max_after})"
+    );
+    // Pancurses, live: the cursor color run (SGR bg) moves left with the
+    // cursor and returns when stepping back — causal proof, not coincidence.
+    let doc = new_doc_fixture();
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let session = format!("corro-sel-{}", id);
+    let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
+    tmux::new_session(
+        &session,
+        &format!("{} --pancurses {}; sleep 2", bin, doc.to_string_lossy()),
+    );
+    std::thread::sleep(Duration::from_millis(1200));
+    let esc0 = tmux::capture_pane_esc(&session);
+    tmux::send_keys(&session, "Left");
+    std::thread::sleep(Duration::from_millis(500));
+    let esc1 = tmux::capture_pane_esc(&session);
+    tmux::kill_session(&session);
+    let pos = |s: &str| s.find("\x1b[48;5;8m");
+    let (p0, p1) = (pos(&esc0), pos(&esc1));
+    assert!(p0.is_some() && p1.is_some(), "cursor color run must render in both captures");
+    assert!(
+        p1.unwrap() < p0.unwrap(),
+        "pancurses highlight must move left after Left ({:?} -> {:?})",
+        p0, p1
+    );
 }
 
 /// Navigate to a cell via repeated arrow keys, enter "Hello World!", and verify
