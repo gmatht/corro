@@ -204,6 +204,11 @@ struct GuiState {
     // both the window and the entry can observe the same event (double-fire
     // setups). On streams where the entry never fires, setting the flag would
     // poison the next keypress (it would wrongly skip handle_key).
+    // Starts true: the formula entry grabs focus at setup, so it observes
+    // from the first keypress — and the very first keypress needs the guard
+    // (a single Left from A1 must land [A1, not two columns deep). Never
+    // armed on Windows (gate below): the window never observes entry-focused
+    // keys there, so the flag could never be cleared same-event.
     entry_seen: Cell<bool>,
     // Shared-dispatch state for menu actions: clipboard for cut/copy/paste
     // and the pending format scope. The pancurses backend passes these as
@@ -2217,7 +2222,7 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         key_counter: Cell::new(0),
         entry_processed_key: Cell::new(false),
         last_alt_keyval: Cell::new(0),
-        entry_seen: Cell::new(false),
+        entry_seen: Cell::new(true),
         clipboard: RefCell::new(String::new()),
         pending_scope: Cell::new(0),
         pinned_rows: RefCell::new(std::collections::BTreeSet::new()),
@@ -2427,6 +2432,9 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                 return 1;
             }
 
+            // Navigation/edit keys are also observed by the entry's own
+            // handler, which skips when this handler arms entry_processed_key
+            // below — see the arming comment for the full protocol.
             // Safety net for RETURN: if editing is false but the formula entry
             // has text or edit_buf has content (e.g., from CAPTURE-phase key
             // processing on GTK where the entry widget never received the key),
@@ -2471,7 +2479,20 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         // second typed char silently lost). Never armed on Windows: the
         // window never observes entry-focused keys there, so the flag could
         // never be cleared same-event. Always armed on GTK4 (legacy).
-        if (32..=126).contains(&nk)
+        // Armed for every key the entry also observes (printables plus the
+        // navigation/edit keys in its explicit arm): without the
+        // non-printable half, one arrow press moves twice whenever
+        // GDK_EVENT_STOP fails to propagate (Left from A1 lands two columns
+        // deep instead of [A1).
+        // Gated on entry_seen AND live focus: arming when the entry cannot
+        // observe would linger uncleared and wrongly skip a later genuine
+        // keypress there.
+        let entry_also_observes = (32..=126).contains(&nk)
+            || matches!(
+                nk,
+                RETURN | ESCAPE | TAB | LEFT | RIGHT | UP | DOWN | HOME | END | PAGE_UP | PAGE_DOWN | BACKSPACE | DELETE
+            );
+        if entry_also_observes
             && (cfg!(feature = "gtk4") || (!cfg!(windows) && s.entry_seen.get()))
         {
             s.entry_processed_key.set(true);
@@ -2516,6 +2537,16 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
             match k {
                 RETURN | ESCAPE | TAB | LEFT | RIGHT | UP | DOWN | HOME | END | PAGE_UP | PAGE_DOWN
                 | BACKSPACE | DELETE => {
+                    // Same-event duplicate guard (mirrors the printable arm
+                    // below): the window handler fires first and arms
+                    // entry_processed_key; without this check a second
+                    // handle_key call moves twice (Left from A1 lands two
+                    // columns deep instead of [A1) whenever GDK_EVENT_STOP
+                    // fails to propagate between the layers.
+                    if shared_k.entry_processed_key.get() {
+                        shared_k.entry_processed_key.set(false);
+                        return false;
+                    }
                     // `state` carries the modifier mask (bit 0x1 = Shift on
                     // both GDK and the nwg adapter); Shift+arrows extend the
                     // selection via handle_key.

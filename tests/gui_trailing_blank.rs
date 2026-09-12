@@ -112,55 +112,46 @@ fn screenshot(wid: &str, tag: &str) -> PathBuf {
     png
 }
 
-/// OCR the formula-bar address label (top-left, left of `fx`).
-fn ocr_addr_label(png: &PathBuf) -> String {
+/// Cursor centroid of the blue cursor fill (204,230,255), or None when
+/// invisible. Pixel ground truth for the highlight position (short-label
+/// OCR confuses 1/L/3 and drops brackets, so A1 vs A3 vs [A1 are
+/// indistinguishable as text).
+fn cursor_xy(shot: &PathBuf) -> Option<(i32, i32)> {
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let crop = std::env::temp_dir().join(format!("corro-blank-crop-{id}.png"));
-    Command::new("convert")
-        .arg(png)
-        .args(["-crop", "48x34+0+20", "-resize", "300%"])
-        .arg(&crop)
-        .status()
-        .expect("convert crop");
-    let out = Command::new("tesseract")
-        .arg(&crop)
-        .arg("stdout")
-        .args(["--psm", "7", "-c", "tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ[]()~,0123456789_ "])
+    let script = std::env::temp_dir().join(format!("corro-blank-curxy-{id}.py"));
+    std::fs::write(
+        &script,
+        "import sys\nfrom PIL import Image\nimg = Image.open(sys.argv[1]).convert('RGB')\nW,H = img.size\npx = img.load()\nC=(204,230,255)\nxs=[x for y in range(60,500) for x in range(0,W) if px[x,y]==C]\nys=[y for y in range(60,500) for x in range(0,W) if px[x,y]==C]\nprint(f'{len(xs)} {(sum(xs)//len(xs)) if xs else -1} {(sum(ys)//len(ys)) if ys else -1}')\n",
+    )
+    .expect("write analyzer");
+    let out = Command::new("python3")
+        .arg(&script)
+        .arg(shot)
         .output()
-        .expect("tesseract");
-    let _ = std::fs::remove_file(&crop);
-    String::from_utf8_lossy(&out.stdout)
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect()
-}
-
-/// Poll OCR of the address label until it reads `expected` (deadline, not
-/// sleep, delivers the verdict).
-fn wait_addr_label(wid: &str, expected: &str, deadline: Instant) -> String {
-    loop {
-        let shot = screenshot(wid, "blankaddr");
-        let text = ocr_addr_label(&shot);
-        let _ = std::fs::remove_file(&shot);
-        if text == expected || Instant::now() > deadline {
-            return text;
-        }
-        std::thread::sleep(Duration::from_millis(300));
+        .expect("python3 analyzer");
+    let _ = std::fs::remove_file(&script);
+    let _ = std::fs::remove_file(shot);
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let p: Vec<i32> = text.split_whitespace().map(|s| s.parse().unwrap_or(-99)).collect();
+    assert_eq!(p.len(), 3, "bad analyzer output: {text:?}");
+    if p[0] < 50 {
+        return None;
     }
+    Some((p[1], p[2]))
 }
 
 /// Body census of a screenshot: white (255,255,255) runs of 10+ px in the
-/// row band `y0..y1` (one per body column), and the number of body rows
-/// down column `x` (white region height / 20px rows). Body cells paint
-/// white (plus dark text); footer/right margins paint solid 191 gray, so
-/// the white region's bottom edge (8 consecutive all-gray rows) marks the
-/// last body row. Prints `colruns bodyrows`.
+/// row band `y0..y1` (one per body column), the number of body rows down
+/// column `x` (white region height / 20px rows), and the center x of the
+/// first white run (the leftmost body column, for aiming clicks).
+/// Body cells paint white (plus dark text); footer/right margins paint
+/// solid 191 gray. Prints `colruns bodyrows firstcx`.
 fn band_census(shot: &PathBuf, y0: i32, y1: i32, x: i32) -> (i32, i32, i32) {
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let script = std::env::temp_dir().join(format!("corro-blank-census-{id}.py"));
     std::fs::write(
         &script,
-        "import sys\nfrom PIL import Image\nimg = Image.open(sys.argv[1]).convert('RGB')\nW,H = img.size\npx = img.load()\ny0,y1,x = map(int, sys.argv[2:5])\nWHITE=(255,255,255)\n# white runs in the row band (each body column contributes one)\nruns=0\nrun=0\nrunstart=0\nfirstcx=-1\nfor xx in range(50, min(700, W)):\n    colwhite = sum(1 for yy in range(y0, y1, 3) if px[xx,yy]==WHITE)\n    if colwhite * 3 >= (y1 - y0) - 4:\n        if run == 0:\n            runstart = xx\n        run += 1\n    else:\n        if run >= 10:\n            runs += 1\n            if firstcx < 0:\n                firstcx = (runstart + xx) // 2\n        run = 0\nif run >= 10:\n    runs += 1\n    if firstcx < 0:\n        firstcx = (runstart + min(700, W)) // 2\n# body rows: white-region height down column x (grid top onward)\ndef isgray(c):\n    r,g,b = c\n    return 150 <= r <= 235 and 150 <= g <= 235 and 150 <= b <= 235\n# grid top: first gutter ink (row numbers live only in grid rows; the\n# header-strip corner above them is blank). Glyphs start a couple px below\n# the row edge; rounding absorbs that. Robust across chrome variants.\ndef hasink(c):\n    return max(c) < 130\ntop = next((yy for yy in range(48, 220) if any(hasink(px[xx,yy]) for xx in range(30, 48))), 72)\nbottom = top\ngrayrun = 0\nfor yy in range(top, min(600, H)):\n    if all(isgray(px[xx,yy]) for xx in range(x-4, x+5)):\n        grayrun += 1\n        if grayrun >= 8:\n            bottom = yy - 7\n            break\n    else:\n        grayrun = 0\n        bottom = yy\nprint(f'{runs} {round((bottom - top) / 20)} {firstcx}')\n",
+        "import sys\nfrom PIL import Image\nimg = Image.open(sys.argv[1]).convert('RGB')\nW,H = img.size\npx = img.load()\ny0,y1,x = map(int, sys.argv[2:5])\nWHITE=(255,255,255)\n# white runs in the row band (each body column contributes one)\nruns=0\nrun=0\nrunstart=0\nfirstcx=-1\nfor xx in range(50, min(700, W)):\n    colwhite = sum(1 for yy in range(y0, y1, 3) if px[xx,yy]==WHITE)\n    if colwhite * 3 >= (y1 - y0) - 4:\n        if run == 0:\n            runstart = xx\n        run += 1\n    else:\n        if run >= 10:\n            runs += 1\n            if firstcx < 0:\n                firstcx = (runstart + xx) // 2\n        run = 0\nif run >= 10:\n    runs += 1\n    if firstcx < 0:\n        firstcx = (runstart + min(700, W)) // 2\n# grid top: first gutter ink (row numbers live only in grid rows; the\n# header-strip corner above them is blank). Glyphs start a couple px below\n# the row edge; rounding absorbs that. Robust across chrome variants.\ndef hasink(c):\n    return max(c) < 130\ntop = next((yy for yy in range(48, 220) if any(hasink(px[xx,yy]) for xx in range(30, 48))), 72)\n# body rows: white-region height down column x (grid top onward)\ndef isgray(c):\n    r,g,b = c\n    return 150 <= r <= 235 and 150 <= g <= 235 and 150 <= b <= 235\nbottom = top\ngrayrun = 0\nfor yy in range(top, min(600, H)):\n    if all(isgray(px[xx,yy]) for xx in range(x-4, x+5)):\n        grayrun += 1\n        if grayrun >= 8:\n            bottom = yy - 7\n            break\n    else:\n        grayrun = 0\n        bottom = yy\nprint(f'{runs} {round((bottom - top) / 20)} {firstcx}')\n",
     )
     .expect("write analyzer");
     let out = Command::new("python3")
@@ -248,10 +239,28 @@ fn gui_click_blank_row_selects_data_cell() {
         "first body column must be right of the gutter (x: {firstcx})"
     );
     xdotool(&["mousemove", "--window", &wid, &firstcx.to_string(), "122", "click", "1"]);
-    let addr = wait_addr_label(&wid, "A3", Instant::now() + Duration::from_secs(10));
-    assert_eq!(
-        addr, "A3",
-        "clicking blank row 3 must select data cell A3 (formula: {addr:?})"
+    // The click starts edit mode (yellow overlay, no blue fill): cancel it
+    // so the plain cursor highlight returns for position proof.
+    std::thread::sleep(Duration::from_millis(500));
+    xdotool(&["key", "--window", &wid, "Escape"]);
+    // Poll for the highlight to land in row 3 (its band center y=122):
+    // centroid x must stay in column A (near firstcx) and y in the row.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let (cx, cy) = loop {
+        let shot = screenshot(&wid, "clickcur");
+        if let Some((cx, cy)) = cursor_xy(&shot) {
+            if (cx - firstcx).abs() < 20 && (108..=136).contains(&cy) {
+                break (cx, cy);
+            }
+        }
+        if Instant::now() > deadline {
+            panic!("cursor highlight never landed on A3 after click");
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    };
+    assert!(
+        (cx - firstcx).abs() < 20 && (108..=136).contains(&cy),
+        "clicking blank row 3 must select data cell A3 (centroid {cx},{cy} vs col {firstcx})"
     );
     // Cursor on row 3 counts as non-blank: row 4 opens beyond it.
     let shot = screenshot(&wid, "bodybands2");

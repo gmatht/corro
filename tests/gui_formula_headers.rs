@@ -383,9 +383,57 @@ fn gui_formula_bar_shows_cell_name() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// Address label must show the margin name after Left (cursor in `[A`
-/// column). Expected text is computed with the same `cell_ref_text` the
-/// ratatui reference uses, on a 1x1 empty grid.
+/// Left from A1 must highlight margin column [A and repaint the formula
+/// bar for the margin address. Pixel ground truth (cursor bbox + label
+/// repaint), because OCR of short labels confuses 1/L and drops brackets.
+/// Cursor bounding box of the blue cursor fill (204,230,255) in the grid
+/// band: (x0, y0, x1, y1), or None when no fill is visible. Pixel ground
+/// truth for where the highlight sits (OCR of short labels confuses
+/// 1/L and drops brackets, so text reads cannot distinguish A1 from [A1).
+fn cursor_bbox(shot: &std::path::PathBuf) -> Option<(i32, i32, i32, i32)> {
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let script = std::env::temp_dir().join(format!("corro-fhdr-curbox-{id}.py"));
+    std::fs::write(
+        &script,
+        "import sys\nfrom PIL import Image\nimg = Image.open(sys.argv[1]).convert('RGB')\nW,H = img.size\npx = img.load()\nC=(204,230,255)\nxs=[x for y in range(60,500) for x in range(0,W) if px[x,y]==C]\nys=[y for y in range(60,500) for x in range(0,W) if px[x,y]==C]\nprint(f'{len(xs)} {(min(xs) if xs else -1)} {(min(ys) if ys else -1)} {(max(xs) if xs else -1)} {(max(ys) if ys else -1)}')\n",
+    )
+    .expect("write analyzer");
+    let out = Command::new("python3")
+        .arg(&script)
+        .arg(shot)
+        .output()
+        .expect("python3 analyzer");
+    let _ = std::fs::remove_file(&script);
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let p: Vec<i32> = text.split_whitespace().map(|s| s.parse().unwrap_or(-99)).collect();
+    assert_eq!(p.len(), 5, "bad analyzer output: {text:?}");
+    if p[0] < 50 {
+        return None;
+    }
+    Some((p[1], p[2], p[3], p[4]))
+}
+
+/// Dark-pixel count difference of the formula address zone (x0..52,y14..42)
+/// between two screenshots: proves the label repainted (a margin address
+/// adds a bracket and shifts glyphs, tens of pixels).
+fn label_zone_diff(a: &std::path::PathBuf, b: &std::path::PathBuf) -> i32 {
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let script = std::env::temp_dir().join(format!("corro-fhdr-labeld-{id}.py"));
+    std::fs::write(
+        &script,
+        "import sys\nfrom PIL import Image\nA = Image.open(sys.argv[1]).convert('RGB')\nB = Image.open(sys.argv[2]).convert('RGB')\npa, pb = A.load(), B.load()\ndef dark(p):\n    r,g,b = p\n    return r < 110 and g < 110 and b < 110\nn = sum(1 for y in range(14, 42) for x in range(0, 52) if dark(pa[x,y]) != dark(pb[x,y]))\nprint(n)\n",
+    )
+    .expect("write analyzer");
+    let out = Command::new("python3")
+        .arg(&script)
+        .arg(a)
+        .arg(b)
+        .output()
+        .expect("python3 analyzer");
+    let _ = std::fs::remove_file(&script);
+    String::from_utf8_lossy(&out.stdout).trim().parse().unwrap_or(-99)
+}
+
 #[test]
 fn gui_formula_bar_shows_margin_name() {
     let _guard = GUI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -398,21 +446,57 @@ fn gui_formula_bar_shows_margin_name() {
     let wid = find_corro_window(child.id(), Instant::now() + Duration::from_secs(25));
     xdotool(&["windowactivate", "--sync", &wid]);
     std::thread::sleep(Duration::from_millis(500));
+    // Cursor bbox before the key (A1): the gutter ends at x=50, so the
+    // margin column [A starts there; col A starts a column-width right.
+    let before_shot = screenshot(&wid, "margin0");
+    let before = cursor_bbox(&before_shot)
+        .expect("cursor highlight must be visible before Left");
     xdotool(&["key", "--window", &wid, "Left"]);
-    let expected = corro::addr::cell_ref_text(
-        &corro::addr::sheet_cursor_to_addr(
-            corro::addr::LogicalRow(corro::grid::HEADER_ROWS),
-            corro::addr::GlobalCol(corro::grid::MARGIN_COLS - 1),
-            corro::addr::MainRows(1),
-            corro::addr::MainCols(1),
-        ),
-        1,
+    // Poll for the highlight to move (deadline, not sleep): event delivery
+    // through the present-pump is timing-dependent, and key OCR confuses
+    // 1/L and drops brackets, so pixel position (not text) is the verdict.
+    let deadline = Instant::now() + Duration::from_secs(12);
+    let (after, after_shot) = loop {
+        let shot = screenshot(&wid, "marginmove");
+        if let Some(b) = cursor_bbox(&shot) {
+            if (b.0 - before.0).abs() > 5 || (b.1 - before.1).abs() > 5 {
+                break (b, shot);
+            }
+        }
+        let _ = std::fs::remove_file(&shot);
+        if Instant::now() > deadline {
+            panic!(
+                "cursor highlight never moved after Left (stayed {before:?})"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    };
+    // Exactly one column left, same row: the highlight's left edge sits at
+    // the gutter's right edge (x=50, ROW_LABEL_W) inside the first data
+    // column [A — the cursor fill insets ~2px, hence 50..=58. A double-move
+    // would land a full column further right (empty-fixture margins default
+    // to ~28px wide), and no move would still overlap `before` (excluded by
+    // the poll above). Exact-substring OCR cannot prove this (it reads 1
+    // as L and drops brackets, confusing A1 with [A1), so pixels do.
+    assert!(
+        (50..=58).contains(&after.0),
+        "Left from A1 must land the highlight in margin column [A (x0 in 50..=58, got {after:?}, was {before:?})"
     );
     assert!(
-        expected.starts_with('['),
-        "test bug: expected a margin label, got {expected:?}"
+        (after.1 - before.1).abs() <= 6,
+        "Left must not change rows (y0 {} vs {})",
+        after.1,
+        before.1
     );
-    wait_addr_label(&wid, "margin", &expected);
+    // The formula bar must repaint for the new address (a margin label
+    // adds a bracket and shifts every glyph).
+    let repainted = label_zone_diff(&before_shot, &after_shot);
+    let _ = std::fs::remove_file(&before_shot);
+    let _ = std::fs::remove_file(&after_shot);
+    assert!(
+        repainted > 30,
+        "formula bar must repaint for the margin address (diff px: {repainted})"
+    );
     let _ = child.kill();
     let _ = std::fs::remove_file(&path);
 }
