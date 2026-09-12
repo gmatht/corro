@@ -470,8 +470,168 @@ fn hthumb(shot: &PathBuf) -> (i32, i32, i32) {
     (p[0], p[1], p[2])
 }
 
-/// Left edge (x0) of the blue cursor fill in the grid band, or None.
-/// Margin highlight sits left of x=80; A1 spans 87..120.
+/// Vertical-thumb census of a screenshot: (count, min_y, max_y) of
+/// dark-slate thumb pixels in the v-scrollbar column (x = W-8, y 40..H-40
+/// of the 1200x800 window). Matches normal and pressed thumb shades;
+/// trough (206) and text do not match.
+fn vthumb(shot: &PathBuf) -> (i32, i32, i32) {
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let script = std::env::temp_dir().join(format!("corro-fill-vthumb-{id}.py"));
+    std::fs::write(
+        &script,
+        "import sys\nfrom PIL import Image\nimg = Image.open(sys.argv[1]).convert('RGB')\nW,H = img.size\npx = img.load()\nys=[y for y in range(40,H-40) for x in [W-8] if 75<=px[x,y][0]<=155 and abs(px[x,y][0]-px[x,y][1])<14 and abs(px[x,y][1]-px[x,y][2])<14]\nprint(f'{len(ys)} {(min(ys) if ys else -1)} {(max(ys) if ys else -1)}')\n",
+    )
+    .expect("write analyzer");
+    let out = Command::new("python3")
+        .arg(&script)
+        .arg(shot)
+        .output()
+        .expect("python3 analyzer");
+    let _ = std::fs::remove_file(&script);
+    let _ = std::fs::remove_file(shot);
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let p: Vec<i32> = text.split_whitespace().map(|s| s.parse().unwrap_or(-99)).collect();
+    assert_eq!(p.len(), 3, "bad analyzer output: {text:?}");
+    (p[0], p[1], p[2])
+}
+
+/// Cursor centroid of the blue cursor fill (204,230,255), or None when
+/// invisible. Proves frames are live (redraws present cursor moves).
+fn vcursor_xy(shot: &PathBuf) -> Option<(i32, i32)> {
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let script = std::env::temp_dir().join(format!("corro-fill-vcurxy-{id}.py"));
+    std::fs::write(
+        &script,
+        "import sys\nfrom PIL import Image\nimg = Image.open(sys.argv[1]).convert('RGB')\nW,H = img.size\npx = img.load()\nC=(204,230,255)\nxs=[x for y in range(60,500) for x in range(0,W) if px[x,y]==C]\nys=[y for y in range(60,500) for x in range(0,W) if px[x,y]==C]\nprint(f'{len(xs)} {(sum(xs)//len(xs)) if xs else -1} {(sum(ys)//len(ys)) if ys else -1}')\n",
+    )
+    .expect("write analyzer");
+    let out = Command::new("python3")
+        .arg(&script)
+        .arg(shot)
+        .output()
+        .expect("python3 analyzer");
+    let _ = std::fs::remove_file(&script);
+    let _ = std::fs::remove_file(shot);
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let p: Vec<i32> = text.split_whitespace().map(|s| s.parse().unwrap_or(-99)).collect();
+    assert_eq!(p.len(), 3, "bad analyzer output: {text:?}");
+    if p[0] < 50 {
+        return None;
+    }
+    Some((p[1], p[2]))
+}
+
+/// In-viewport arrows must not move the vertical thumb: it tracks the
+/// viewport (like Excel), not the cursor. Regression: cursor-tracking
+/// slid the thumb on every step although the view never scrolled.
+/// (The cursor-centroid gate guards a vacuous pass on frozen frames:
+/// the highlight must demonstrably reach row 3 while the thumb sits.)
+#[test]
+fn gui_viewport_thumb_static_on_inviewport_arrows() {
+    let _guard = GUI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    assert!(
+        std::env::var("DISPLAY").is_ok(),
+        "requires X server (run under xvfb-run -a)"
+    );
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let path = std::env::temp_dir().join(format!("corro-fill-vpstatic-{}-{}.corro", std::process::id(), id));
+    std::fs::write(&path, "CORRO_LOG 1\nSET A1 a\nSET A2 b\nSET A3 c\nSET A4 d\nSET A5 e\nSET A6 f\n")
+        .expect("write fixture");
+    let mut child = spawn_gui(&path);
+    let wid = find_window(child.id());
+    xdotool(&["windowsize", &wid, "1200", "800"]);
+    xdotool(&["windowactivate", "--sync", &wid]);
+    std::thread::sleep(Duration::from_millis(800));
+    let shot = screenshot(&wid, "vpstatic0");
+    let (n0, min0, max0) = vthumb(&shot);
+    assert!(n0 > 100, "v-thumb must render (px: {n0})");
+    xdotool(&["key", "--window", &wid, "Down"]);
+    std::thread::sleep(Duration::from_millis(300));
+    xdotool(&["key", "--window", &wid, "Down"]);
+    // Gate: highlight reaches row 3 (centroid y 108..136), proving live
+    // frames and delivered keys — a frozen frame would trivially agree.
+    let deadline = Instant::now() + Duration::from_secs(12);
+    loop {
+        let shot = screenshot(&wid, "vpstaticcur");
+        if let Some((_, cy)) = vcursor_xy(&shot) {
+            if (108..=136).contains(&cy) {
+                break;
+            }
+        }
+        if Instant::now() > deadline {
+            panic!("cursor highlight never reached row 3 after Down x2");
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    // Settle: two reads 500ms apart must agree (no mid-repaint tear).
+    let shot = screenshot(&wid, "vpstatic1");
+    let t1 = vthumb(&shot);
+    std::thread::sleep(Duration::from_millis(500));
+    let shot = screenshot(&wid, "vpstatic2");
+    let t2 = vthumb(&shot);
+    assert_eq!(t1, t2, "thumb reads must settle (live frames, no tear): {t1:?} vs {t2:?}");
+    assert_eq!(
+        (t1.1, t1.2), (min0, max0),
+        "thumb must not move on in-viewport arrows (viewport static): {min0}..{max0} -> {:?}",
+        (t1.1, t1.2)
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Scrolling the viewport must move the vertical thumb with it (it tracks
+/// the viewport origin). Companion to the static test: the thumb is live,
+/// not nailed on.
+#[test]
+fn gui_viewport_thumb_follows_scrolled_viewport() {
+    let _guard = GUI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    assert!(
+        std::env::var("DISPLAY").is_ok(),
+        "requires X server (run under xvfb-run -a)"
+    );
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let path = std::env::temp_dir().join(format!("corro-fill-vpfollow-{}-{}.corro", std::process::id(), id));
+    std::fs::write(&path, "CORRO_LOG 1\nSET A1 a\nSET A2 b\nSET A3 c\nSET A4 d\nSET A5 e\nSET A6 f\n")
+        .expect("write fixture");
+    let mut child = spawn_gui(&path);
+    let wid = find_window(child.id());
+    xdotool(&["windowsize", &wid, "1200", "800"]);
+    xdotool(&["windowactivate", "--sync", &wid]);
+    std::thread::sleep(Duration::from_millis(800));
+    let shot = screenshot(&wid, "vpfollow0");
+    let (n0, min0, _) = vthumb(&shot);
+    assert!(n0 > 100, "v-thumb must render (px: {n0})");
+    for _ in 0..42 {
+        xdotool(&["key", "--window", &wid, "Down"]);
+        std::thread::sleep(Duration::from_millis(120));
+    }
+    // Poll for the thumb to ride down with the viewport (frames lag keys
+    // under load; deadline, not sleep).
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let (n1, min1, max1) = loop {
+        let shot = screenshot(&wid, "vpfollow");
+        let t = vthumb(&shot);
+        if t.1 - min0 > 30 {
+            break t;
+        }
+        if Instant::now() > deadline {
+            panic!("thumb never followed the scrolled viewport (top {min0} -> {})", t.1);
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    assert!(
+        (n1 - n0).abs() < n0 / 3,
+        "thumb size must stay plausible while following (px {n0} -> {n1})"
+    );
+    assert!(
+        max1 < 740,
+        "thumb must track the viewport origin, not slam to the bottom (bottom {max1})"
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_file(&path);
+}
 fn cursor_x0(shot: &PathBuf) -> Option<i32> {
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let script = std::env::temp_dir().join(format!("corro-fill-curx-{id}.py"));

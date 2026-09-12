@@ -232,8 +232,8 @@ struct GuiState {
     tab_hits: RefCell<Vec<TabHit>>,
     tabbar_visible: Cell<bool>,
     // Scrollbar sync: native scrollbars around the sheet (thumb tracks the
-    // cursor; dragging/clicking moves the cursor, so the selection is always
-    // visible). Guard against reentrancy between programmatic sets and the
+    // viewport; dragging/clicking moves the cursor, which pulls the
+    // viewport along, so the selection stays visible). Guard against reentrancy between programmatic sets and the
     // value-changed notification.
     scrolled: rswidgets::common::ScrolledWindow,
     syncing_scroll: Cell<bool>,
@@ -650,6 +650,29 @@ fn displayed_cols(state: &GuiState) -> Vec<usize> {
     };
     let (_, pinned) = pinned_sets(state);
     union_pinned(&col_ixs, &pinned)
+}
+
+/// First viewport (non-pinned) row/col of the current display: what the
+/// scrollbar thumbs track. The thumb follows the viewport (like Excel),
+/// not the cursor — in-viewport arrow steps leave it alone; it moves only
+/// when the viewport itself scrolls. Pinned rows/cols render frozen first
+/// and must not nail the thumb, so they are skipped (the fallback is the
+/// body origin when everything displayed is pinned).
+fn viewport_origin(state: &GuiState) -> (usize, usize) {
+    let (pinned_rows, pinned_cols) = pinned_sets(state);
+    let rows = displayed_rows(state);
+    let cols = displayed_cols(state);
+    let r = rows
+        .iter()
+        .copied()
+        .find(|r| !pinned_rows.contains(r))
+        .unwrap_or(HEADER_ROWS);
+    let c = cols
+        .iter()
+        .copied()
+        .find(|c| !pinned_cols.contains(c))
+        .unwrap_or(MARGIN_COLS);
+    (r, c)
 }
 
 /// Toggle the pin hit-tested from the last frame's padlocks; returns true
@@ -1670,17 +1693,20 @@ fn scroll_domain(state: &GuiState) -> (usize, usize) {
     (ru.max(2), cu.max(2))
 }
 
-/// Push cursor position and domain into the native scrollbars (thumb tracks
-/// the selection). Guarded against reentrancy with the value-changed
-/// notification below. Domain and page satisfy upper > page so the bars
-/// stay live: upper covers content plus a viewport plus footer padding.
+/// Push viewport position and domain into the native scrollbars (thumb
+/// tracks the viewport, like Excel — not the cursor, so in-viewport arrow
+/// steps leave it alone and it moves only when the viewport scrolls).
+/// Guarded against reentrancy with the value-changed notification below.
+/// Domain and page satisfy upper > page so the bars stay live: upper
+/// covers content plus a viewport plus footer padding.
 fn sync_scrollbars(state: &GuiState) {
     if state.syncing_scroll.get() {
         return;
     }
     let (ru, cu) = scroll_domain(state);
-    let vv = state.last_row.get().saturating_sub(HEADER_ROWS).min(ru.saturating_sub(1));
-    let hv = state.last_col.get().saturating_sub(MARGIN_COLS).min(cu.saturating_sub(1));
+    let (orow, ocol) = viewport_origin(state);
+    let vv = orow.saturating_sub(HEADER_ROWS).min(ru.saturating_sub(1));
+    let hv = ocol.saturating_sub(MARGIN_COLS).min(cu.saturating_sub(1));
     let page_h = state.data_cols.get().max(1) as f64;
     let page_v = state.data_rows.get().max(1) as f64;
     let want = (hv as f64, cu as f64, page_h, vv as f64, ru as f64, page_v);
@@ -1708,13 +1734,11 @@ fn scroll_to_cursor(state: &GuiState, vertical: bool, value: f64) {
     if state.syncing_scroll.get() {
         return;
     }
-    // The thumb domain only expresses the main body: sync floors margin
-    // cursors to 0 (and clamps right-margin ones), so any later
-    // re-emission of the adjustment would drag such a cursor back into
-    // the body (e.g. a stale horizontal 0 resetting [A1 to A1, or a
-    // vertical 0 resetting A~1 to A1). The thumb cannot address chrome
-    // cells, so scrollbar input is ignored while the cursor sits in
-    // chrome; the per-frame viewport recompute still keeps it visible.
+    // The thumb addresses the body viewport only, so scrollbar input is
+    // ignored while the cursor sits in chrome (margins/headers): a stale
+    // re-emission would otherwise drag such a cursor back into the body
+    // (e.g. horizontal 0 resetting [A1 to A1, or vertical 0 resetting A~1
+    // to A1). The per-frame viewport recompute still keeps it visible.
     // (Footer rows are expressible — row-hr needs no floor — so they
     // stay live here.)
     if vertical {
@@ -2259,7 +2283,7 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     formula_bar.append(&formula_entry);
     formula_bar.set_child_hexpand(&formula_entry, true);
 
-    // Canvas inside native scrollbars: the thumb tracks the cursor and
+    // Canvas inside native scrollbars: the thumb tracks the viewport and
     // scrollbar interaction moves the cursor (selection), so the selected
     // cell is always visible. Expand flags go on BEFORE append (GTK3 freezes
     // pack params at append time). Policy 0 = always show (GtkPolicyType).
@@ -2749,7 +2773,7 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                 (w as f64 - ROW_LABEL_W).max(0.0) as i32,
             ));
             shared_draw.data_rows.set(rows_to_fill_px(h));
-            // Keep the scrollbar thumb on the cursor (ranges track grid
+            // Keep the scrollbar thumb on the viewport (ranges track grid
             // growth here too).
             sync_scrollbars(&shared_draw);
         }
