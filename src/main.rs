@@ -371,6 +371,17 @@ fn main() {
 }
 
 fn corro_main() {
+    // Log every panic to a file as well as stderr: release profiles use
+    // panic="abort" (silent death, no message), and GUI launches often
+    // detach stderr, so an undebuggable abort is otherwise all you get.
+    // /tmp/corro-panic.log then names the panic site (e.g. which key
+    // sequence tripped it) instead of leaving only "Aborted (core dumped)".
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let msg = format!("corro panic: {info}\n{}", std::backtrace::Backtrace::force_capture());
+        let _ = std::fs::write("/tmp/corro-panic.log", &msg);
+        default_hook(info);
+    }));
     let (res, exit_message) = try_main();
     if let Some(msg) = exit_message {
         // Print to both stderr and stdout and flush so the message is
