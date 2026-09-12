@@ -2256,3 +2256,52 @@ fn type_first_up_left_a_enter_header_parity() {
         safe_slice(&pnc_pane, 1500)
     );
 }
+
+/// Type "2i", Left, Left: arrow keys move the in-edit caret (no commit until
+/// the caret hits the buffer edge), so the edit stays open on A1 with an
+/// empty commit log on both backends. Guards the reported GUI abort sequence
+/// at the shared-logic level: any backend that crashes, commits early, or
+/// moves the cursor on these keys fails here instead of in production.
+#[test]
+fn type_first_2i_left_left_parity() {
+    use crossterm::event::KeyCode;
+    let keys = ["2", "i", "Left", "Left"];
+    let codes = [
+        KeyCode::Char('2'),
+        KeyCode::Char('i'),
+        KeyCode::Left,
+        KeyCode::Left,
+    ];
+
+    // ── ratatui reference ──
+    let fix_rt = empty_fixture("rt-2ill");
+    let (rt_bar, rt_render, rt_path) = drive_ratatui(&fix_rt, &codes);
+    assert!(rt_bar.contains("A1"), "ratatui formula should show A1\n{rt_bar:?}");
+    assert!(
+        rt_render.contains("2i"),
+        "ratatui grid should still show the uncommitted edit buffer 2i"
+    );
+    assert!(
+        file_set_tail(&rt_path, 1).is_empty(),
+        "ratatui must not commit on caret moves (tail: {:?})",
+        file_set_tail(&rt_path, 1)
+    );
+
+    // ── pancurses must match ──
+    let fix_pnc = empty_fixture("pnc-2ill");
+    let packed = drive_pnc(&fix_pnc, &keys);
+    let mut lines = packed.lines();
+    let pnc_bar = lines.next().unwrap_or("");
+    let pnc_pane: String = lines.collect::<Vec<_>>().join("\n");
+    assert!(pnc_bar.contains("A1"), "pancurses formula should show A1\n{pnc_bar:?}");
+    assert!(
+        pnc_pane.contains("2i"),
+        "pancurses grid should still show the uncommitted edit buffer 2i\n--- pane ---\n{}",
+        safe_slice(&pnc_pane, 1500)
+    );
+    assert!(
+        file_set_tail(&fix_pnc, 1).is_empty(),
+        "pancurses must not commit on caret moves (tail: {:?})",
+        file_set_tail(&fix_pnc, 1)
+    );
+}
