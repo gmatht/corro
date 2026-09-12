@@ -2305,3 +2305,36 @@ fn type_first_2i_left_left_parity() {
         file_set_tail(&fix_pnc, 1)
     );
 }
+
+/// Left from A1 moves the highlight into the left margin ([A1): the formula
+/// bar must display the margin address on both backends, with no commit.
+/// Guards navigation-into-margin parity (a move that lands nowhere, drops
+/// the cursor, or spuriously commits fails here instead of in production).
+#[test]
+fn type_first_left_from_a1_shows_margin_parity() {
+    use crossterm::event::KeyCode;
+    let keys = ["Left"];
+    let codes = [KeyCode::Left];
+
+    // ── ratatui reference ──
+    let fix_rt = empty_fixture("rt-left");
+    let (rt_bar, _rt_render, rt_path) = drive_ratatui(&fix_rt, &codes);
+    assert!(rt_bar.contains("[A1"), "ratatui formula should show [A1\n{rt_bar:?}");
+    assert!(
+        file_set_tail(&rt_path, 1).is_empty(),
+        "ratatui must not commit on a plain move (tail: {:?})",
+        file_set_tail(&rt_path, 1)
+    );
+
+    // ── pancurses must match ──
+    let fix_pnc = empty_fixture("pnc-left");
+    let packed = drive_pnc(&fix_pnc, &keys);
+    let mut lines = packed.lines();
+    let pnc_bar = lines.next().unwrap_or("");
+    assert!(pnc_bar.contains("[A1"), "pancurses formula should show [A1\n{pnc_bar:?}");
+    assert!(
+        file_set_tail(&fix_pnc, 1).is_empty(),
+        "pancurses must not commit on a plain move (tail: {:?})",
+        file_set_tail(&fix_pnc, 1)
+    );
+}
