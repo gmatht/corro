@@ -237,6 +237,13 @@ struct GuiState {
     // value-changed notification.
     scrolled: rswidgets::common::ScrolledWindow,
     syncing_scroll: Cell<bool>,
+    // Last pushed scrollbar state (hval, hupper, hpage, vval, vupper, vpage).
+    // sync_scrollbars only configures an adjustment when its desired state
+    // differs — re-pushing identical values every draw is not just waste:
+    // each configure revalidates the range (async value-changed echoes),
+    // and a push mid-drag snaps a user-moved thumb back to the stale
+    // cursor-implied position. -1 forces the first push.
+    sb_push: Cell<(f64, f64, f64, f64, f64, f64)>,
     // Press/release dedup trackers. GTK4-only (feature = "gtk4"): only there
     // can release events arrive as same-keyval callbacks. Everywhere else
     // (GTK3 presses-only, nwg WM_KEYDOWN-only, wasm keydown-only) every key
@@ -1671,14 +1678,25 @@ fn sync_scrollbars(state: &GuiState) {
     if state.syncing_scroll.get() {
         return;
     }
-    state.syncing_scroll.set(true);
     let (ru, cu) = scroll_domain(state);
     let vv = state.last_row.get().saturating_sub(HEADER_ROWS).min(ru.saturating_sub(1));
     let hv = state.last_col.get().saturating_sub(MARGIN_COLS).min(cu.saturating_sub(1));
+    let page_h = state.data_cols.get().max(1) as f64;
+    let page_v = state.data_rows.get().max(1) as f64;
+    let want = (hv as f64, cu as f64, page_h, vv as f64, ru as f64, page_v);
+    // Push only on genuine change: re-configuring identical values every
+    // draw revalidates the ranges (spurious async value-changed echoes)
+    // and a push landing mid-drag snaps the thumb back to the stale
+    // position. (Exact ints as f64 — equality is exact.)
+    if want == state.sb_push.get() {
+        return;
+    }
+    state.syncing_scroll.set(true);
     state.scrolled.scroll_to(
-        hv as f64, cu as f64, state.data_cols.get().max(1) as f64,
-        vv as f64, ru as f64, state.data_rows.get().max(1) as f64,
+        hv as f64, cu as f64, page_h,
+        vv as f64, ru as f64, page_v,
     );
+    state.sb_push.set(want);
     state.syncing_scroll.set(false);
 }
 
@@ -2304,6 +2322,7 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         last_keyval_dedup: Cell::new(0),
         scrolled: scrolled.clone(),
         syncing_scroll: Cell::new(false),
+        sb_push: Cell::new((-1.0, -1.0, -1.0, -1.0, -1.0, -1.0)),
     });
 
     // A fresh load still opens with a clickable trailing blank data row/col.

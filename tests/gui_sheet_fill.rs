@@ -444,3 +444,129 @@ fn gui_left_arrow_fills_window_empty() {
     let _ = child.wait();
     let _ = std::fs::remove_file(&path);
 }
+
+/// Horizontal-thumb census of a screenshot: (count, min_x, max_x) of
+/// dark-slate thumb pixels in the h-scrollbar band (y 770..782, 1200x800
+/// window). Matches the normal (126,129,130) and pressed (86,91,92)
+/// thumb shades; trough (206) and text (<100) do not match.
+fn hthumb(shot: &PathBuf) -> (i32, i32, i32) {
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let script = std::env::temp_dir().join(format!("corro-fill-thumb-{id}.py"));
+    std::fs::write(
+        &script,
+        "import sys\nfrom PIL import Image\nimg = Image.open(sys.argv[1]).convert('RGB')\nW,H = img.size\npx = img.load()\nxs=[x for y in range(770,782) for x in range(0,W) if 75<=px[x,y][0]<=155 and abs(px[x,y][0]-px[x,y][1])<14 and abs(px[x,y][1]-px[x,y][2])<14]\nprint(f'{len(xs)} {(min(xs) if xs else -1)} {(max(xs) if xs else -1)}')\n",
+    )
+    .expect("write analyzer");
+    let out = Command::new("python3")
+        .arg(&script)
+        .arg(shot)
+        .output()
+        .expect("python3 analyzer");
+    let _ = std::fs::remove_file(&script);
+    let _ = std::fs::remove_file(shot);
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let p: Vec<i32> = text.split_whitespace().map(|s| s.parse().unwrap_or(-99)).collect();
+    assert_eq!(p.len(), 3, "bad analyzer output: {text:?}");
+    (p[0], p[1], p[2])
+}
+
+/// Left edge (x0) of the blue cursor fill in the grid band, or None.
+/// Margin highlight sits left of x=80; A1 spans 87..120.
+fn cursor_x0(shot: &PathBuf) -> Option<i32> {
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let script = std::env::temp_dir().join(format!("corro-fill-curx-{id}.py"));
+    std::fs::write(
+        &script,
+        "import sys\nfrom PIL import Image\nimg = Image.open(sys.argv[1]).convert('RGB')\nW,H = img.size\npx = img.load()\nxs=[x for y in range(60,200) for x in range(0,W) if px[x,y]==(204,230,255)]\nprint(f'{len(xs)} {(min(xs) if xs else -1)}')\n",
+    )
+    .expect("write analyzer");
+    let out = Command::new("python3")
+        .arg(&script)
+        .arg(shot)
+        .output()
+        .expect("python3 analyzer");
+    let _ = std::fs::remove_file(&script);
+    let _ = std::fs::remove_file(shot);
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let p: Vec<i32> = text.split_whitespace().map(|s| s.parse().unwrap_or(-99)).collect();
+    assert_eq!(p.len(), 2, "bad analyzer output: {text:?}");
+    if p[0] < 50 {
+        return None;
+    }
+    Some(p[1])
+}
+
+/// Dragging the horizontal thumb while the cursor sits in the left margin
+/// must neither snap the thumb back nor move the selection: the thumb has
+/// nothing new to show (sync pushes only on genuine change), and the
+/// margin address is outside the thumb's expressible domain.
+/// Regression: every draw re-pushed hv=0, so post-mouseup draws snapped a
+/// dragged thumb back to the left edge.
+#[test]
+fn gui_margin_drag_thumb_does_not_snap_back() {
+    let _guard = GUI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    assert!(
+        std::env::var("DISPLAY").is_ok(),
+        "requires X server (run under xvfb-run -a)"
+    );
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let path = std::env::temp_dir().join(format!("corro-fill-drag-{}-{}.corro", std::process::id(), id));
+    std::fs::write(&path, "CORRO_LOG 1\n").expect("write empty fixture");
+    let mut child = spawn_gui(&path);
+    let wid = find_window(child.id());
+    xdotool(&["windowsize", &wid, "1200", "800"]);
+    xdotool(&["windowactivate", "--sync", &wid]);
+    std::thread::sleep(Duration::from_millis(500));
+    // Into the margin (delivery gate: poll for the highlight to leave A1).
+    xdotool(&["key", "--window", &wid, "Left"]);
+    let deadline = Instant::now() + Duration::from_secs(12);
+    loop {
+        let shot = screenshot(&wid, "dragcur");
+        if let Some(x0) = cursor_x0(&shot) {
+            if x0 < 80 {
+                break;
+            }
+        }
+        if Instant::now() > deadline {
+            panic!("cursor highlight never reached the margin after Left");
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    // Thumb before: must render (thousands of px on an empty doc).
+    let shot = screenshot(&wid, "dragbefore");
+    let (n0, min0, max0) = hthumb(&shot);
+    assert!(n0 > 1000, "h-thumb must render (px: {n0})");
+    let cx0 = (min0 + max0) / 2;
+    // Drag +150px and release away (un-hover restores normal colors).
+    xdotool(&["mousemove", "--window", &wid, &cx0.to_string(), "776", "mousedown", "1"]);
+    std::thread::sleep(Duration::from_millis(400));
+    xdotool(&["mousemove", "--window", &wid, &(cx0 + 150).to_string(), "776"]);
+    std::thread::sleep(Duration::from_millis(400));
+    xdotool(&["mouseup", "1", "mousemove", "--window", &wid, "300", "300"]);
+    std::thread::sleep(Duration::from_millis(1000));
+    let shot = screenshot(&wid, "dragafter");
+    let (n1, min1, max1) = hthumb(&shot);
+    let cx1 = (min1 + max1) / 2;
+    assert!(
+        (n1 - n0).abs() < n0 / 7,
+        "drag must not resize the thumb (px {n0} -> {n1})"
+    );
+    assert!(
+        cx1 - cx0 > 60,
+        "thumb must follow the drag, not snap back (center {cx0} -> {cx1})"
+    );
+    assert!(
+        min1 > 50,
+        "thumb must not snap back to the left edge (min x {min1})"
+    );
+    // Selection still in the margin (drag must not move it: {x} vs A1 87+).
+    let shot = screenshot(&wid, "dragcur2");
+    let x0 = cursor_x0(&shot).expect("cursor highlight must still render");
+    assert!(
+        x0 < 80,
+        "margin selection must survive the thumb drag (cursor x0 {x0})"
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_file(&path);
+}
