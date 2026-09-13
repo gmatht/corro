@@ -803,6 +803,138 @@ fn gui_padlock_click_pins_row_visible() {
 /// spot while the formula bar proves the cursor moved on. Clicking again
 /// unpins (the lock disappears). Pixel-exact padlock checks, not OCR words:
 /// padlock glyphs contaminate header OCR with f/g misreads.
+/// Ring reached by keys (not clicks) commits as data: build trailing blanks
+/// with clicks (pointer growth chains), step onto the ring with the keyboard
+/// (no NAV growth fires while 2+ blanks stand past content), then commit.
+/// Must file exactly `SET E1 Q` — pre-fix the ring addressed as margin
+/// (`SET ]A1 Q`). The single Right carries the usual autorepeat caveat.
+#[test]
+fn gui_ring_key_step_commits_data() {
+    let _guard = GUI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    assert!(
+        std::env::var("DISPLAY").is_ok(),
+        "requires X server (run under xvfb-run -a)"
+    );
+    let path = fresh_fixture("ringkeystep");
+    std::fs::write(&path, "CORRO_LOG 1\nSET A1 x\n").expect("seed fixture");
+    let mut child = spawn_gui(&path);
+    let wid = find_corro_window(child.id(), Instant::now() + Duration::from_secs(25));
+    xdotool(&["windowactivate", "--sync", &wid]);
+    std::thread::sleep(Duration::from_millis(500));
+    // Chain clicks rightward to open blanks (each click on the last column
+    // grows one more): B1, then C1.
+    for x in [130, 165] {
+        xdotool(&["mousemove", "--window", &wid, &x.to_string(), "82", "click", "1"]);
+        std::thread::sleep(Duration::from_millis(600));
+        xdotool(&["key", "--window", &wid, "Escape"]);
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    // Step right twice onto the ring (D1 main, then E1 ring — no NAV growth
+    // with 2+ blanks standing).
+    xdotool(&["key", "--window", &wid, "Right"]);
+    std::thread::sleep(Duration::from_millis(400));
+    xdotool(&["key", "--window", &wid, "Right"]);
+    // Gate: highlight reaches the E1 column zone (x0 > 200).
+    let deadline = Instant::now() + Duration::from_secs(12);
+    loop {
+        let shot = screenshot(&wid, "ringkeycur");
+        let far_enough = cursor_bbox(&shot).map(|b| b.0 > 200).unwrap_or(false);
+        let _ = std::fs::remove_file(&shot);
+        if far_enough {
+            break;
+        }
+        if Instant::now() > deadline {
+            panic!("cursor highlight never reached the ring column");
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    xdotool(&["key", "--window", &wid, "Q"]);
+    std::thread::sleep(Duration::from_millis(500));
+    xdotool(&["key", "--window", &wid, "Return"]);
+    let lines = wait_file_lines(&path, Instant::now() + Duration::from_secs(10));
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(
+        lines.iter().any(|l| l == "SET E1 Q"),
+        "ring reached by keys must file as data E1 (lines: {lines:?})"
+    );
+    assert!(
+        !lines.iter().any(|l| l == "SET ]A1 Q"),
+        "ring reached by keys must never file as margin ]A1 (lines: {lines:?})"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Poll the fixture file until a SET line lands (commit proof), or panic.
+fn wait_file_lines(path: &PathBuf, deadline: Instant) -> Vec<String> {
+    loop {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            let lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+            if lines.iter().any(|l| l.starts_with("SET ")) {
+                return lines;
+            }
+        }
+        if Instant::now() > deadline {
+            panic!(
+                "timed out waiting for commit in {}\ncontent: {:?}",
+                path.display(),
+                std::fs::read_to_string(path).unwrap_or_default()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// True margins stay margins: clicking the right-margin column files a
+/// `SET ]..` commit (never data), and the formula bar shows the longer
+/// margin label. Guards over-correction of the ring-as-data change.
+#[test]
+fn gui_true_margin_stays_margin() {
+    let _guard = GUI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut child, wid, path) = start_new_doc_app("truemargin");
+    let before_shot = screenshot(&wid, "truemargin0");
+    let ink_before = label_zone_ink(&before_shot);
+    let _ = std::fs::remove_file(&before_shot);
+    // Click deep into the right-margin area (past the ring column).
+    xdotool(&["mousemove", "--window", &wid, "300", "82", "click", "1"]);
+    std::thread::sleep(Duration::from_millis(700));
+    xdotool(&["key", "--window", &wid, "Escape"]);
+    std::thread::sleep(Duration::from_millis(300));
+    // Formula bar shows a longer (3-glyph) margin label.
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let ink_after = loop {
+        let shot = screenshot(&wid, "truemarginink");
+        let ink = label_zone_ink(&shot);
+        let _ = std::fs::remove_file(&shot);
+        if ink as f64 > ink_before as f64 * 1.1 {
+            break ink;
+        }
+        if Instant::now() > deadline {
+            break ink;
+        }
+        std::thread::sleep(Duration::from_millis(400));
+    };
+    assert!(
+        ink_after as f64 > ink_before as f64 * 1.1,
+        "true margin must show a longer label than A1 (ink {ink_before} -> {ink_after})"
+    );
+    // ...and commits as margin (any ]X1), never as data.
+    xdotool(&["key", "--window", &wid, "W"]);
+    std::thread::sleep(Duration::from_millis(500));
+    xdotool(&["key", "--window", &wid, "Return"]);
+    let lines = wait_file_lines(&path, Instant::now() + Duration::from_secs(10));
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(
+        lines.iter().any(|l| l.starts_with("SET ]")),
+        "true-margin click must file a margin commit (lines: {lines:?})"
+    );
+    assert!(
+        !lines.iter().any(|l| l.starts_with("SET B") || l.starts_with("SET C")),
+        "true-margin click must not misroute into data (lines: {lines:?})"
+    );
+    let _ = std::fs::remove_file(&path);
+}
 #[test]
 fn gui_padlock_click_pins_column_visible() {
     let _guard = GUI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
