@@ -990,3 +990,36 @@ fn gui_padlock_click_pins_column_visible() {
     let _ = child.kill();
     let _ = std::fs::remove_file(&path);
 }
+
+/// True footers past the ring keep footer addressing: Down x3 on an empty
+/// sheet lands the first true footer row (ring row hr+1 is data A2 now) and
+/// commits exactly `SET A_2 Q` — never data A3, never A1. Pins the footer
+/// scheme intact beyond the ring (the ring consumed the old _1 slot).
+#[test]
+fn gui_footer_commit_past_ring() {
+    let _guard = GUI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut child, wid, path) = start_new_doc_app("footerpast");
+    for _ in 0..3 {
+        xdotool(&["key", "--window", &wid, "Down"]);
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    xdotool(&["key", "--window", &wid, "Q"]);
+    std::thread::sleep(Duration::from_millis(500));
+    xdotool(&["key", "--window", &wid, "Return"]);
+    let lines = wait_file_lines(&path, Instant::now() + Duration::from_secs(10));
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(
+        lines.iter().any(|l| l == "SET A_2 Q"),
+        "first true footer must file as A_2 (lines: {lines:?})"
+    );
+    assert!(
+        !lines.iter().any(|l| l == "SET A3 Q"),
+        "true footer must not misroute into data A3 (lines: {lines:?})"
+    );
+    assert!(
+        !lines.iter().any(|l| l == "SET A1 Q"),
+        "keys must have moved (lines: {lines:?})"
+    );
+    let _ = std::fs::remove_file(&path);
+}
