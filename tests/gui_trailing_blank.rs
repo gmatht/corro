@@ -199,8 +199,8 @@ fn gui_blank_row_and_col_render_as_body() {
     let shot = screenshot(&wid, "bodybands");
     let (colruns, _, firstcx) = band_census(&shot, 114, 130, 80);
     assert_eq!(
-        colruns, 4,
-        "row 3 must show white body columns A,B,C plus the ring D (runs: {colruns})"
+        colruns, 3,
+        "row 3 must show three white body columns A,B,C (runs: {colruns})"
     );
     assert!(
         firstcx > 50,
@@ -209,8 +209,8 @@ fn gui_blank_row_and_col_render_as_body() {
     let shot = screenshot(&wid, "bodyrows");
     let (_, bodybands, _) = band_census(&shot, 114, 130, firstcx);
     assert_eq!(
-        bodybands, 4,
-        "column A must show body rows 1,2,3 plus the ring row 4 (rows: {bodybands})"
+        bodybands, 3,
+        "column A must show three body rows 1,2,3 (rows: {bodybands})"
     );
     let _ = child.kill();
     let _ = std::fs::remove_file(&path);
@@ -262,12 +262,11 @@ fn gui_click_blank_row_selects_data_cell() {
         (cx - firstcx).abs() < 20 && (108..=136).contains(&cy),
         "clicking blank row 3 must select data cell A3 (centroid {cx},{cy} vs col {firstcx})"
     );
-    // Cursor on row 3 counts as non-blank: row 4 opens beyond it (plus the
-    // ring row 5, all white).
+    // Cursor on row 3 counts as non-blank: row 4 opens beyond it.
     let shot = screenshot(&wid, "bodybands2");
     let (_, bodybands, _) = band_census(&shot, 114, 130, firstcx);
     assert_eq!(
-        bodybands, 5,
+        bodybands, 4,
         "cursor on row 3 must open body row 4 (rows: {bodybands})"
     );
     // The click alone commits nothing.
@@ -307,13 +306,12 @@ fn white_runs(shot: &PathBuf, y0: i32, y1: i32) -> Vec<(i32, i32)> {
         .collect()
 }
 
-/// Empty startup must show the B row and column B as body-white (the
-/// one-past-main ring): row 2 renders at least two white body columns
-/// (A and B), and column B is white across rows 1-2. The main extent
-/// stays 1x1 (footer addressing untouched) — whiteness comes from the
-/// ring, not growth. Regression: fresh sheets rendered all-gray past A1.
+/// Empty startup renders the first margin row/col (_1/]A) margin-gray like
+/// the rest of the margin: row 2 shows no white body runs past the gutter,
+/// and column B is gray across rows 1-2. The main extent stays 1x1 and the
+/// labels/storage stay margin-correct (same as ratatui).
 #[test]
-fn gui_empty_startup_shows_blank_b_row_and_col() {
+fn gui_empty_startup_first_margin_renders_gray() {
     let _guard = GUI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     assert!(
         std::env::var("DISPLAY").is_ok(),
@@ -330,16 +328,16 @@ fn gui_empty_startup_shows_blank_b_row_and_col() {
     let runs_b = white_runs(&screenshot(&wid, "ringb"), 94, 110);
     assert_eq!(runs_a, runs_b, "row-2 census must settle: {runs_a:?} vs {runs_b:?}");
     assert!(
-        runs_b.len() >= 2,
-        "row 2 (B row) must render body-white columns A and B on empty startup (runs: {runs_b:?})"
+        runs_b.is_empty(),
+        "row 2 (first margin _1) must render margin-gray, no white runs (runs: {runs_b:?})"
     );
-    // Column B white across rows 1-2: white fraction of the strip.
+    // Column B gray across rows 1-2: gray fraction of the strip.
     let shot = screenshot(&wid, "ringcol");
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let script = std::env::temp_dir().join(format!("corro-blank-colfrac-{id}.py"));
     std::fs::write(
         &script,
-        "import sys\nfrom PIL import Image\nimg = Image.open(sys.argv[1]).convert('RGB')\npx = img.load()\nWHITE=(255,255,255)\nn = sum(1 for y in range(72, 112) for x in range(115, 155) if px[x,y]==WHITE)\nprint(n)\n",
+        "import sys\nfrom PIL import Image\nimg = Image.open(sys.argv[1]).convert('RGB')\npx = img.load()\nGRAY=(191,191,191)\nn = sum(1 for y in range(72, 112) for x in range(115, 155) if px[x,y]==GRAY)\nprint(n)\n",
     )
     .expect("write analyzer");
     let out = Command::new("python3")
@@ -352,16 +350,16 @@ fn gui_empty_startup_shows_blank_b_row_and_col() {
     let n: i32 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap_or(-99);
     assert!(
         n > 800,
-        "column B must render body-white across rows 1-2 on empty startup (white px: {n})"
+        "column B (first margin ]A) must render margin-gray across rows 1-2 (gray px: {n})"
     );
     let _ = child.kill();
     let _ = std::fs::remove_file(&path);
 }
 
-/// Clicking the ring (B row on an empty sheet) files margin: the first
-/// margin row addresses (and saves) as footer, same as ratatui — file must
-/// hold exactly `SET A_1 Z` (and no A1 commit — a main misroute would land
-/// in A1).
+/// Clicking the first margin row (B row on an empty sheet, gray like the
+/// rest of the margin) files margin: it addresses (and saves) as footer,
+/// same as ratatui — file must hold exactly `SET A_1 Z` (and no A1 commit
+/// — a main misroute would land in A1).
 #[test]
 fn gui_ring_click_files_margin() {
     let _guard = GUI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -374,15 +372,9 @@ fn gui_ring_click_files_margin() {
     let wid = find_corro_window(child.id(), Instant::now() + Duration::from_secs(25));
     xdotool(&["windowactivate", "--sync", &wid]);
     std::thread::sleep(Duration::from_millis(800));
-    // Aim column A in the ring row 2: first white run's center (the
-    // second run is the ring column, which addresses as right margin).
-    let runs = white_runs(&screenshot(&wid, "ringaim"), 94, 110);
-    assert!(
-        !runs.is_empty(),
-        "body columns must render for aiming (runs: {runs:?})"
-    );
-    let (rs, re) = runs[0];
-    let aimx = (rs + re) / 2;
+    // Aim column A in the ring row 2 (fixed x: col A spans ~87-120 on an
+    // empty sheet; the ring renders gray now, so no white-run aiming).
+    let aimx = 100;
     xdotool(&["mousemove", "--window", &wid, &aimx.to_string(), "102", "click", "1"]);
     std::thread::sleep(Duration::from_millis(700));
     xdotool(&["key", "--window", &wid, "Z"]);

@@ -324,24 +324,6 @@ fn is_margin_cell(
         && global_col < lm + mc)
 }
 
-/// The one-past-main ring (row hr+mr across body cols, col lm+mc across
-/// body rows, plus their corner): the clickable trailing blank. It renders
-/// body-white (not margin gray) so the data area visibly includes it on
-/// startup (B row / column B on an empty sheet), WITHOUT extending main
-/// extent — footer addressing and ratatui parity depend on main staying
-/// put until the blank is actually entered (click promotion grows it then).
-fn is_trailing_blank_cell(
-    logical_row: usize,
-    global_col: usize,
-    hr: usize,
-    mr: usize,
-    lm: usize,
-    mc: usize,
-) -> bool {
-    (logical_row == hr + mr && global_col >= lm && global_col <= lm + mc)
-        || (global_col == lm + mc && logical_row >= hr && logical_row <= hr + mr)
-}
-
 fn render_to(
     sink: &GuiCanvasSink,
     dc: &mut dyn DrawContext,
@@ -389,13 +371,11 @@ fn render_to(
                 if is_editing { (1.0, 1.0, 0.8, 1.0) } else { (0.8, 0.9, 1.0, 1.0) }
             } else if in_selection {
                 (0.9, 0.95, 1.0, 1.0)
-            } else if is_trailing_blank_cell(logical_row, c, hr, mr, lm, mc) {
-                // Clickable trailing blank: body-white so the data area
-                // reads as data (see is_trailing_blank_cell).
-                (1.0, 1.0, 1.0, 1.0)
             } else if is_margin_cell(logical_row, c, hr, mr, lm, mc) {
-                // Margin-zone data cells render at 75% background brightness
-                // so margins read as subordinate to body content.
+                // Margin-zone cells render at 75% background brightness
+                // so margins read as subordinate to body content —
+                // including the first margin row/col (_1/]A), same gray
+                // as the rest of the margin.
                 (0.75, 0.75, 0.75, 1.0)
             } else {
                 (1.0, 1.0, 1.0, 1.0)
@@ -853,8 +833,7 @@ fn switch_to_sheet(state_rc: &Rc<GuiState>, index: usize) {
     state.last_col.set(MARGIN_COLS);
     // A fresh sheet still gets its clickable trailing blank. No pointer
     // growth here: landing on the last cell of a 1x1 sheet must not grow
-    // (that would shift footer addressing and break ratatui parity) — the
-    // ring renders white regardless (see is_trailing_blank_cell).
+    // (that would shift footer addressing and break ratatui parity).
     maintain_extent(state, false);
     update_formula_bar(state, HEADER_ROWS, MARGIN_COLS);
     state.canvas.queue_redraw();
@@ -3375,14 +3354,6 @@ mod formula_tests {
         assert_eq!(crate::addr::ui_row_label(HEADER_ROWS + 2, 1), "_2");
         assert_eq!(crate::addr::ui_column_fragment(MARGIN_COLS + 1, 1), "]A");
         assert_eq!(crate::addr::ui_column_fragment(MARGIN_COLS + 2, 1), "]B");
-        // Ring predicate itself (body intersections only, not margins).
-        let (hr, lm) = (HEADER_ROWS, MARGIN_COLS);
-        assert!(is_trailing_blank_cell(hr + 1, lm, hr, 1, lm, 1));
-        assert!(is_trailing_blank_cell(hr, lm + 1, hr, 1, lm, 1));
-        assert!(is_trailing_blank_cell(hr + 1, lm + 1, hr, 1, lm, 1));
-        assert!(!is_trailing_blank_cell(hr + 2, lm, hr, 1, lm, 1));
-        assert!(!is_trailing_blank_cell(hr, lm + 2, hr, 1, lm, 1));
-        assert!(!is_trailing_blank_cell(hr + 1, lm - 1, hr, 1, lm, 1));
     }
 }
 
