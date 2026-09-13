@@ -199,8 +199,8 @@ fn gui_blank_row_and_col_render_as_body() {
     let shot = screenshot(&wid, "bodybands");
     let (colruns, _, firstcx) = band_census(&shot, 114, 130, 80);
     assert_eq!(
-        colruns, 3,
-        "row 3 must show three white body columns A,B,C (runs: {colruns})"
+        colruns, 4,
+        "row 3 must show white body columns A,B,C plus the ring D (runs: {colruns})"
     );
     assert!(
         firstcx > 50,
@@ -209,8 +209,8 @@ fn gui_blank_row_and_col_render_as_body() {
     let shot = screenshot(&wid, "bodyrows");
     let (_, bodybands, _) = band_census(&shot, 114, 130, firstcx);
     assert_eq!(
-        bodybands, 3,
-        "column A must show three body rows 1,2,3 (rows: {bodybands})"
+        bodybands, 4,
+        "column A must show body rows 1,2,3 plus the ring row 4 (rows: {bodybands})"
     );
     let _ = child.kill();
     let _ = std::fs::remove_file(&path);
@@ -262,11 +262,12 @@ fn gui_click_blank_row_selects_data_cell() {
         (cx - firstcx).abs() < 20 && (108..=136).contains(&cy),
         "clicking blank row 3 must select data cell A3 (centroid {cx},{cy} vs col {firstcx})"
     );
-    // Cursor on row 3 counts as non-blank: row 4 opens beyond it.
+    // Cursor on row 3 counts as non-blank: row 4 opens beyond it (plus the
+    // ring row 5, all white).
     let shot = screenshot(&wid, "bodybands2");
     let (_, bodybands, _) = band_census(&shot, 114, 130, firstcx);
     assert_eq!(
-        bodybands, 4,
+        bodybands, 5,
         "cursor on row 3 must open body row 4 (rows: {bodybands})"
     );
     // The click alone commits nothing.
@@ -274,6 +275,207 @@ fn gui_click_blank_row_selects_data_cell() {
     assert!(
         !log.contains("SET A3"),
         "clicking must not commit a cell (log: {log:?})"
+    );
+    let _ = child.kill();
+    let _ = std::fs::remove_file(&path);
+}
+
+/// White runs (10px+) in a row band: (count, list of (start, end)).
+/// Pixel census for which columns render as body in that band.
+fn white_runs(shot: &PathBuf, y0: i32, y1: i32) -> Vec<(i32, i32)> {
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let script = std::env::temp_dir().join(format!("corro-blank-runs-{id}.py"));
+    std::fs::write(
+        &script,
+        "import sys\nfrom PIL import Image\nimg = Image.open(sys.argv[1]).convert('RGB')\nW,H = img.size\npx = img.load()\nWHITE=(255,255,255)\nruns=[]\nrun=0\nrs=0\nfor xx in range(50, 700):\n    w = sum(1 for yy in range(int(sys.argv[2]), int(sys.argv[3]), 3) if px[xx,yy]==WHITE)\n    if w * 3 >= (int(sys.argv[3]) - int(sys.argv[2])) - 4:\n        if run == 0:\n            rs = xx\n        run += 1\n    else:\n        if run >= 10:\n            runs.append(f'{rs}-{xx}')\n        run = 0\nprint(' '.join(runs))\n",
+    )
+    .expect("write analyzer");
+    let out = Command::new("python3")
+        .arg(&script)
+        .arg(shot)
+        .args([&y0.to_string(), &y1.to_string()])
+        .output()
+        .expect("python3 analyzer");
+    let _ = std::fs::remove_file(&script);
+    let _ = std::fs::remove_file(shot);
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .filter_map(|s| {
+            let mut it = s.split('-');
+            Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
+        })
+        .collect()
+}
+
+/// Empty startup must show the B row and column B as body-white (the
+/// one-past-main ring): row 2 renders at least two white body columns
+/// (A and B), and column B is white across rows 1-2. The main extent
+/// stays 1x1 (footer addressing untouched) — whiteness comes from the
+/// ring, not growth. Regression: fresh sheets rendered all-gray past A1.
+#[test]
+fn gui_empty_startup_shows_blank_b_row_and_col() {
+    let _guard = GUI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    assert!(
+        std::env::var("DISPLAY").is_ok(),
+        "requires X server (run under xvfb-run -a)"
+    );
+    let path = fresh_fixture("startupring", "CORRO_LOG 1\n");
+    let mut child = spawn_gui(&path);
+    let wid = find_corro_window(child.id(), Instant::now() + Duration::from_secs(25));
+    xdotool(&["windowactivate", "--sync", &wid]);
+    std::thread::sleep(Duration::from_millis(1200));
+    // Settle: two consecutive row-2 censuses must agree (no tear).
+    let runs_a = white_runs(&screenshot(&wid, "ringa"), 94, 110);
+    std::thread::sleep(Duration::from_millis(500));
+    let runs_b = white_runs(&screenshot(&wid, "ringb"), 94, 110);
+    assert_eq!(runs_a, runs_b, "row-2 census must settle: {runs_a:?} vs {runs_b:?}");
+    assert!(
+        runs_b.len() >= 2,
+        "row 2 (B row) must render body-white columns A and B on empty startup (runs: {runs_b:?})"
+    );
+    // Column B white across rows 1-2: white fraction of the strip.
+    let shot = screenshot(&wid, "ringcol");
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let script = std::env::temp_dir().join(format!("corro-blank-colfrac-{id}.py"));
+    std::fs::write(
+        &script,
+        "import sys\nfrom PIL import Image\nimg = Image.open(sys.argv[1]).convert('RGB')\npx = img.load()\nWHITE=(255,255,255)\nn = sum(1 for y in range(72, 112) for x in range(115, 155) if px[x,y]==WHITE)\nprint(n)\n",
+    )
+    .expect("write analyzer");
+    let out = Command::new("python3")
+        .arg(&script)
+        .arg(&shot)
+        .output()
+        .expect("python3 analyzer");
+    let _ = std::fs::remove_file(&script);
+    let _ = std::fs::remove_file(&shot);
+    let n: i32 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap_or(-99);
+    assert!(
+        n > 800,
+        "column B must render body-white across rows 1-2 on empty startup (white px: {n})"
+    );
+    let _ = child.kill();
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Clicking the ring (B row on an empty sheet) promotes it into main and
+/// commits there as data: file must hold exactly `SET B2 Z` (and no A1
+/// commit — a footer/margin misroute would land elsewhere).
+#[test]
+fn gui_ring_click_promotes_b_row_to_data() {
+    let _guard = GUI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    assert!(
+        std::env::var("DISPLAY").is_ok(),
+        "requires X server (run under xvfb-run -a)"
+    );
+    let path = fresh_fixture("ringpromote", "CORRO_LOG 1\n");
+    let mut child = spawn_gui(&path);
+    let wid = find_corro_window(child.id(), Instant::now() + Duration::from_secs(25));
+    xdotool(&["windowactivate", "--sync", &wid]);
+    std::thread::sleep(Duration::from_millis(800));
+    // Aim the ring column B in the ring row 2: second white run's left
+    // half (the run may bleed past the ring into margin pixels; the ring
+    // itself is its left part).
+    let runs = white_runs(&screenshot(&wid, "ringaim"), 94, 110);
+    assert!(
+        runs.len() >= 2,
+        "ring columns must render for aiming (runs: {runs:?})"
+    );
+    let (rs, re) = runs[1];
+    let aimx = rs + (re - rs).min(30) / 2;
+    xdotool(&["mousemove", "--window", &wid, &aimx.to_string(), "102", "click", "1"]);
+    std::thread::sleep(Duration::from_millis(700));
+    xdotool(&["key", "--window", &wid, "Z"]);
+    std::thread::sleep(Duration::from_millis(500));
+    xdotool(&["key", "--window", &wid, "Return"]);
+    std::thread::sleep(Duration::from_millis(1200));
+    let log = std::fs::read_to_string(&path).unwrap_or_default();
+    assert!(
+        log.lines().any(|l| l == "SET B2 Z"),
+        "ring click must promote B row to data (file: {log:?})"
+    );
+    assert!(
+        !log.lines().any(|l| l == "SET A1 Z"),
+        "ring click must not misroute into A1 (file: {log:?})"
+    );
+    let _ = child.kill();
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The sheet shrinks again when blanks are no longer needed: grow deep
+/// with Downs, come back up, and the body extent trims to content+blank
+/// with no file churn (growth/shrink are silent). Regression: abandoned
+/// growth stayed forever (scroll domain ballooned, thumb shrank).
+#[test]
+fn gui_sheet_shrinks_back_after_return() {
+    let _guard = GUI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    assert!(
+        std::env::var("DISPLAY").is_ok(),
+        "requires X server (run under xvfb-run -a)"
+    );
+    let body = "CORRO_LOG 1\nSET A1 a\nSET A2 b\n";
+    let path = fresh_fixture("shrinkback", body);
+    let mut child = spawn_gui(&path);
+    let wid = find_corro_window(child.id(), Instant::now() + Duration::from_secs(25));
+    xdotool(&["windowactivate", "--sync", &wid]);
+    std::thread::sleep(Duration::from_millis(800));
+    // Aim column: first body column center (content-narrow cols shift it).
+    let shot = screenshot(&wid, "shrinkaim");
+    let (_, _, firstcx) = band_census(&shot, 114, 130, 80);
+    assert!(
+        firstcx > 50,
+        "first body column must be right of the gutter (x: {firstcx})"
+    );
+    // Grow: click successive blank rows (pointer growth chains +1 per
+    // click, delivery-reliable unlike autorepeat-prone key holds). Row N
+    // band center y = 82 + (N-1)*20; rows 3..8 take the body to 8+ bands.
+    // Escape after each click so the blue fill (not the edit overlay)
+    // renders for the censuses.
+    for row in 3..=8i32 {
+        let y = 82 + (row - 1) * 20;
+        xdotool(&["mousemove", "--window", &wid, &firstcx.to_string(), &y.to_string(), "click", "1"]);
+        std::thread::sleep(Duration::from_millis(600));
+        xdotool(&["key", "--window", &wid, "Escape"]);
+        std::thread::sleep(Duration::from_millis(400));
+    }
+    let shot = screenshot(&wid, "shrinkgrown");
+    let (_, grown, _) = band_census(&shot, 114, 130, firstcx);
+    assert!(
+        grown >= 7,
+        "click-chained growth must reach 7+ bands (bands: {grown})"
+    );
+    // Return: steer the highlight back to A1 (centroid gate). An overshoot
+    // into the header (duplicate Up) steers back down instead of spiraling.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let shot = screenshot(&wid, "shrinkback");
+        if let Some((cx, cy)) = cursor_xy(&shot) {
+            if (80..=125).contains(&cx) && (70..=95).contains(&cy) {
+                break;
+            }
+            if cy < 70 && (50..=200).contains(&cx) {
+                xdotool(&["key", "--window", &wid, "Down"]);
+                std::thread::sleep(Duration::from_millis(150));
+                continue;
+            }
+        }
+        if Instant::now() > deadline {
+            panic!("cursor highlight never returned to A1 after Ups");
+        }
+        xdotool(&["key", "--window", &wid, "Up"]);
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    std::thread::sleep(Duration::from_millis(800));
+    let shot = screenshot(&wid, "shrinkbands");
+    let (_, bands, _) = band_census(&shot, 114, 130, firstcx);
+    assert!(
+        bands <= 5,
+        "abandoned growth must trim after return (bands {grown} -> {bands})"
+    );
+    let log = std::fs::read_to_string(&path).unwrap_or_default();
+    assert_eq!(
+        log, body,
+        "growth/shrink must stay silent in the file (log: {log:?})"
     );
     let _ = child.kill();
     let _ = std::fs::remove_file(&path);

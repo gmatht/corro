@@ -324,6 +324,24 @@ fn is_margin_cell(
         && global_col < lm + mc)
 }
 
+/// The one-past-main ring (row hr+mr across body cols, col lm+mc across
+/// body rows, plus their corner): the clickable trailing blank. It renders
+/// body-white (not margin gray) so the data area visibly includes it on
+/// startup (B row / column B on an empty sheet), WITHOUT extending main
+/// extent — footer addressing and ratatui parity depend on main staying
+/// put until the blank is actually entered (click promotion grows it then).
+fn is_trailing_blank_cell(
+    logical_row: usize,
+    global_col: usize,
+    hr: usize,
+    mr: usize,
+    lm: usize,
+    mc: usize,
+) -> bool {
+    (logical_row == hr + mr && global_col >= lm && global_col <= lm + mc)
+        || (global_col == lm + mc && logical_row >= hr && logical_row <= hr + mr)
+}
+
 fn render_to(
     sink: &GuiCanvasSink,
     dc: &mut dyn DrawContext,
@@ -371,6 +389,10 @@ fn render_to(
                 if is_editing { (1.0, 1.0, 0.8, 1.0) } else { (0.8, 0.9, 1.0, 1.0) }
             } else if in_selection {
                 (0.9, 0.95, 1.0, 1.0)
+            } else if is_trailing_blank_cell(logical_row, c, hr, mr, lm, mc) {
+                // Clickable trailing blank: body-white so the data area
+                // reads as data (see is_trailing_blank_cell).
+                (1.0, 1.0, 1.0, 1.0)
             } else if is_margin_cell(logical_row, c, hr, mr, lm, mc) {
                 // Margin-zone data cells render at 75% background brightness
                 // so margins read as subordinate to body content.
@@ -830,10 +852,11 @@ fn switch_to_sheet(state_rc: &Rc<GuiState>, index: usize) {
     app.core.status = format!("Sheet {} of {}", index + 1, n);
     state.last_row.set(HEADER_ROWS);
     state.last_col.set(MARGIN_COLS);
-    // A fresh sheet still gets its clickable trailing blank (pointer-like
-    // arrival — a switch lands the cursor without keyboard stepping).
-    ensure_trailing_blank_data(state);
-    grow_blank_past_cursor(state);
+    // A fresh sheet still gets its clickable trailing blank. No pointer
+    // growth here: landing on the last cell of a 1x1 sheet must not grow
+    // (that would shift footer addressing and break ratatui parity) — the
+    // ring renders white regardless (see is_trailing_blank_cell).
+    maintain_extent(state, false);
     update_formula_bar(state, HEADER_ROWS, MARGIN_COLS);
     state.canvas.queue_redraw();
     state.tabbar.queue_redraw();
@@ -1600,28 +1623,70 @@ fn grow_for_trailing_blank(
 /// (clicks, scrollbar drags, sheet switches) grow explicitly via
 /// grow_blank_past_cursor below; keyboard growth stays with the classic
 /// NAV_BLANK step-off logic in move_cursor.
-fn ensure_trailing_blank_data(state: &GuiState) {
+/// Converge the body extent on need: content + one blank, floored by the
+/// cursor and by 1x1. Grows toward the target and silently shrinks
+/// abandoned growth back toward it (via the cursor floor + the grid's
+/// silent shrink_to_content) — this is what lets the sheet shrink again
+/// when blank rows/cols are no longer needed (navigate back up, delete
+/// content). Target per axis = max(content+1, cursor_idx+1, 1); the +1
+/// keeps the clickable trailing blank, the cursor floor keeps the
+/// selection addressable, and 1x1 keeps empty sheets footer-addressable
+/// (ratatui parity: footers count from main end). All silent (no ops) —
+/// file/ratatui parity preserved; only the rendered extent tightens.
+/// Pointer arrivals (clicks, scrollbar drags, sheet switches) add
+/// grow_blank_past_cursor after this when landing on the last row/col.
+/// When `allow_shrink` is false only growth runs (fresh loads/switches must
+/// not second-guess the file's stored extent); navigation and post-delete
+/// refresh pass true so abandoned growth trims back.
+fn maintain_extent(state: &GuiState, allow_shrink: bool) {
     let app = state.app_mut();
+    let cursor = app.core.cursor;
     let sheet = app.core.workbook.active_sheet_mut();
     let grid = &mut sheet.grid;
-    let mr = grid.main_rows();
-    let mc = grid.main_cols();
-    // Content-counted only (see doc comment): the cursor must not count
-    // here (treadmill — every keyboard step onto the blank would grow a
-    // fresh one ahead and the cursor could never leave main). Pointer
-    // arrivals grow explicitly via grow_blank_past_cursor.
-    if grow_for_trailing_blank(mr, compute::trailing_blank_main_rows(grid), None) {
+    let (hr, lm) = (HEADER_ROWS, MARGIN_COLS);
+    // Content blank via the tested one-blank rule (the cursor never counts
+    // here — treadmill). Each iteration re-scans; converges once the blank
+    // exists (empty sheets: tb == extent fails the rule, so no growth).
+    while grow_for_trailing_blank(grid.main_rows(), compute::trailing_blank_main_rows(grid), None) {
         grid.grow_main_row_at_bottom();
     }
-    if grow_for_trailing_blank(mc, compute::trailing_blank_main_cols(grid), None) {
+    while grow_for_trailing_blank(grid.main_cols(), compute::trailing_blank_main_cols(grid), None) {
         grid.grow_main_col_at_right();
     }
+    if !allow_shrink {
+        return;
+    }
+    // Shrink abandoned growth back toward need (see doc comment): recompute
+    // post-growth, then keep max(content+1, cursor floor, 1x1).
+    let (mr, mc) = (grid.main_rows(), grid.main_cols());
+    let tb_r = compute::trailing_blank_main_rows(grid).min(mr);
+    let tb_c = compute::trailing_blank_main_cols(grid).min(mc);
+    let content_r = mr - tb_r;
+    let content_c = mc - tb_c;
+    // Floor: cursor-relative index + 1 while inside the body; the CURRENT
+    // extent while outside (margins/headers/footers). Shrinking under an
+    // out-of-body cursor re-addresses it (its margin/footer label counts
+    // from main end), so the extent is left alone there.
+    let floor_r = if cursor.row >= hr && cursor.row < hr + mr {
+        cursor.row - hr + 1
+    } else {
+        mr
+    };
+    let floor_c = if cursor.col >= lm && cursor.col < lm + mc {
+        cursor.col - lm + 1
+    } else {
+        mc
+    };
+    let target_r = (content_r + 1).max(floor_r).max(1);
+    let target_c = (content_c + 1).max(floor_c).max(1);
+    grid.set_min_extent(target_r as u32, target_c as u32);
+    grid.shrink_to_content();
 }
 
 /// Open one blank body row/column beyond the cursor when it sits exactly
 /// on the last body row/column. Pointer arrivals only (clicks, scrollbar
-/// drags, sheet switches — see ensure_trailing_blank_data for why keyboard
-/// moves must not call this). Growth is ephemeral (never logged).
+/// drags — see maintain_extent for why keyboard moves must not call this).
+/// Growth is ephemeral (never logged).
 fn grow_blank_past_cursor(state: &GuiState) {
     let app = state.app_mut();
     let cursor = app.core.cursor;
@@ -1649,8 +1714,8 @@ fn update_state_cursor(state: &GuiState, row: usize, col: usize) {
     app.core.anchor = None;
     app.core.cursor.row = row;
     app.core.cursor.col = col;
-    // Keep the clickable trailing blank (cursor counts as non-blank).
-    ensure_trailing_blank_data(state);
+    // Converge the extent on need (grows and shrinks; see maintain_extent).
+    maintain_extent(state, true);
     update_formula_bar(state, row, col);
     state.canvas.queue_redraw();
     // Window-level cascade: a canvas-only queue_draw may not trigger the
@@ -1848,6 +1913,28 @@ fn handle_click(x: f64, y: f64, state_rc: &Rc<GuiState>) {
             let display_rows: Vec<usize> = displayed_rows(state);
             if ri < display_rows.len() {
                 let logical_row = display_rows[ri];
+                // Ring promotion: the click landed on the one-past-main
+                // trailing blank (rendered body-white but not yet
+                // main-addressed). Promote it into main first so it
+                // behaves as a data cell (B row / column B on empty
+                // sheets); deeper clicks keep their footer/margin meaning.
+                // Afterwards the cursor sits on the new last row/col, so
+                // the pointer-arrival growth below opens one more past it.
+                let (mr0, mc0) = {
+                    let grid = &app.core.workbook.active_sheet().grid;
+                    (grid.main_rows(), grid.main_cols())
+                };
+                let ring_row = logical_row == HEADER_ROWS + mr0 && c >= MARGIN_COLS && c <= MARGIN_COLS + mc0;
+                let ring_col = c == MARGIN_COLS + mc0 && logical_row >= HEADER_ROWS && logical_row <= HEADER_ROWS + mr0;
+                if ring_row || ring_col {
+                    let sheet = app.core.workbook.active_sheet_mut();
+                    if ring_row {
+                        sheet.grid.grow_main_row_at_bottom();
+                    }
+                    if ring_col {
+                        sheet.grid.grow_main_col_at_right();
+                    }
+                }
                 state.last_row.set(logical_row);
                 state.last_col.set(c);
                 app.core.cursor.row = logical_row;
@@ -1856,7 +1943,7 @@ fn handle_click(x: f64, y: f64, state_rc: &Rc<GuiState>) {
                 app.core.anchor = None;
                 // Clicking the trailing blank opens one more beyond it
                 // (pointer arrival — see grow_blank_past_cursor).
-                ensure_trailing_blank_data(state);
+                maintain_extent(state, false);
                 grow_blank_past_cursor(state);
                 update_formula_bar(state, logical_row, c);
                 start_edit(state);
@@ -1943,8 +2030,8 @@ fn start_edit_with_text(state: &GuiState, text: &str) {
 fn refresh_after_dialog(state: &Rc<GuiState>) {
     recompute_viewport(state);
     // Menu ops can change content (delete/insert) without moving the cursor:
-    // re-assert the clickable trailing blank.
-    ensure_trailing_blank_data(state);
+    // re-converge the extent (trims post-delete bloat, keeps the blank).
+    maintain_extent(state, true);
     update_formula_bar(state, state.last_row.get(), state.last_col.get());
     state.canvas.queue_redraw();
     // Created/renamed/deleted/copied sheets change tab titles or the bar's
@@ -2350,7 +2437,7 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     });
 
     // A fresh load still opens with a clickable trailing blank data row/col.
-    ensure_trailing_blank_data(&shared);
+    maintain_extent(&shared, false);
 
     // Scrollbar interaction moves the cursor (selection); the per-frame
     // viewport recompute then keeps it visible. Reentrancy-safe: syncs

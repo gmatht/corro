@@ -238,6 +238,10 @@ pub trait GridImpl {
     fn set_main_size(&mut self, main_rows: usize, main_cols: usize);
     fn ensure_extent_for_cursor(&mut self, row: usize, col: usize) -> bool;
     fn set_min_extent(&mut self, min_rows: u32, min_cols: u32);
+    /// Silently shrink main extents to the largest stored content (never
+    /// below the min extent floor). In-memory only: no remapping, no ops.
+    /// Returns true if either extent was reduced.
+    fn shrink_to_content(&mut self) -> bool;
     fn grow_main_row_at_bottom(&mut self);
     fn grow_main_col_at_right(&mut self);
     fn move_main_rows(&mut self, from: usize, count: usize, to: usize);
@@ -366,6 +370,10 @@ impl GridBox {
 
     pub fn set_min_extent(&mut self, min_rows: u32, min_cols: u32) {
         self.inner.set_min_extent(min_rows, min_cols)
+    }
+
+    pub fn shrink_to_content(&mut self) -> bool {
+        self.inner.shrink_to_content()
     }
 
     pub fn grow_main_row_at_bottom(&mut self) {
@@ -1574,6 +1582,10 @@ impl GridImpl for Grid {
 
     fn set_min_extent(&mut self, min_rows: u32, min_cols: u32) {
         self.set_min_extent(min_rows, min_cols)
+    }
+
+    fn shrink_to_content(&mut self) -> bool {
+        self.shrink_to_content()
     }
 
     fn grow_main_row_at_bottom(&mut self) {
