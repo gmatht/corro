@@ -1,9 +1,11 @@
 //! Live GUI parity for type-first editing.
 //!
-//! The ratatui reference is the oracle: on a fresh 1x1 sheet Right,Right
-//! leaves the main area (trailing-blank growth stops at 2x2), so A,Enter
-//! commits to the RIGHT-MARGIN cell (`SET ]A1 A`), and Down x3 / Down x40
-//! land in the footer (`SET A_2 Z` / `SET A_39 Q`) for the same reason.
+//! The ratatui reference is the oracle: on a fresh sheet Right,Right
+//! leaves the main area, so A,Enter commits to the RIGHT-MARGIN cell
+//! (`SET ]A1 A`), and Down x3 / Down x40 land in the footer (`SET A_2 Z`
+//! / `SET A_39 Q`) for the same reason. Empty sheets open 2x2 (data row 2
+//! / column B visible at startup); footer indices count from main end in
+//! both UIs, so the footer labels match too.
 //! These tests drive the real GTK GUI and assert on the committed `.corro`
 //! file (no pixel matching, no fixed sleeps for the verdict — the file is
 //! polled with a deadline).
@@ -472,9 +474,9 @@ fn analyze_selection(png: &PathBuf, y_cut: i32) -> SelCensus {
 /// Plain arrows must move WITHOUT painting a selection band (the anchor
 /// collapses). Regression: the anchor stuck at startup, so Down x3 painted
 /// a full-width band over rows 1-4 (~4700 tint px); now expect ~0.
-/// Movement itself is proven by typing Z + Enter afterwards: on the fresh
-/// 1x1 sheet Down x3 lands in the footer (growth stops at 2 rows), so the
-/// file holds `SET A_2 Z` — exactly the ratatui reference.
+/// Movement itself is proven by typing Z + Enter afterwards: Down x3 lands
+/// in the footer, so the file holds `SET A_2 Z` — exactly the ratatui
+/// reference (footer index counts from main end: 3-2=1, label A_2).
 #[test]
 fn gui_plain_arrows_paint_no_selection_band() {
     let _guard = GUI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -568,9 +570,9 @@ fn gui_shift_right_extends_rect_not_band() {
 
 /// Cursor must stay visible: after Down x40 (past the ~30 visible rows)
 /// the selected cell's blue border must render on screen, and typing + Enter
-/// must commit at the arrived address (`SET A_39 Q`: on the fresh 1x1 sheet
-/// the Downs land in the footer — exactly the ratatui reference), proving
-/// the viewport followed.
+/// must commit at the arrived address (`SET A_39 Q`: the Downs land in the
+/// footer — exactly the ratatui reference), proving the viewport
+/// followed.
 #[test]
 fn gui_deep_move_keeps_cursor_visible() {
     let _guard = GUI_LOCK.lock().unwrap_or_else(|e| e.into_inner());

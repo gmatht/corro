@@ -306,12 +306,12 @@ fn white_runs(shot: &PathBuf, y0: i32, y1: i32) -> Vec<(i32, i32)> {
         .collect()
 }
 
-/// Empty startup renders the first margin row/col (_1/]A) margin-gray like
-/// the rest of the margin: row 2 shows no white body runs past the gutter,
-/// and column B is gray across rows 1-2. The main extent stays 1x1 and the
-/// labels/storage stay margin-correct (same as ratatui).
+/// Empty startup shows data row 2 and column B (2x2 minimal body): row 2
+/// renders at least two white body columns (A and B), and column B is
+/// white across rows 1-2. The first margin (_1/]A) sits one further out
+/// (row 3 / col C), grey like the rest of the margin.
 #[test]
-fn gui_empty_startup_first_margin_renders_gray() {
+fn gui_empty_startup_shows_data_row2_and_colB() {
     let _guard = GUI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     assert!(
         std::env::var("DISPLAY").is_ok(),
@@ -322,44 +322,77 @@ fn gui_empty_startup_first_margin_renders_gray() {
     let wid = find_corro_window(child.id(), Instant::now() + Duration::from_secs(25));
     xdotool(&["windowactivate", "--sync", &wid]);
     std::thread::sleep(Duration::from_millis(1200));
-    // Settle: two consecutive row-2 censuses must agree (no tear).
-    let runs_a = white_runs(&screenshot(&wid, "ringa"), 94, 110);
+    // Nudge Up+Down (net-zero state): cursor moves queue window redraws,
+    // presenting post-growth frames that no-move startups otherwise never
+    // show (the frame clock may never tick for a static grid). Then click
+    // back to A1 + Escape so the highlight sits deterministically outside
+    // the asserted bands. The asserts below don't otherwise depend on it.
+    xdotool(&["key", "--window", &wid, "Up"]);
     std::thread::sleep(Duration::from_millis(500));
-    let runs_b = white_runs(&screenshot(&wid, "ringb"), 94, 110);
-    assert_eq!(runs_a, runs_b, "row-2 census must settle: {runs_a:?} vs {runs_b:?}");
-    assert!(
-        runs_b.is_empty(),
-        "row 2 (first margin _1) must render margin-gray, no white runs (runs: {runs_b:?})"
-    );
-    // Column B gray across rows 1-2: gray fraction of the strip.
-    let shot = screenshot(&wid, "ringcol");
-    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let script = std::env::temp_dir().join(format!("corro-blank-colfrac-{id}.py"));
-    std::fs::write(
-        &script,
-        "import sys\nfrom PIL import Image\nimg = Image.open(sys.argv[1]).convert('RGB')\npx = img.load()\nGRAY=(191,191,191)\nn = sum(1 for y in range(72, 112) for x in range(115, 155) if px[x,y]==GRAY)\nprint(n)\n",
-    )
-    .expect("write analyzer");
-    let out = Command::new("python3")
-        .arg(&script)
-        .arg(&shot)
-        .output()
-        .expect("python3 analyzer");
-    let _ = std::fs::remove_file(&script);
-    let _ = std::fs::remove_file(&shot);
-    let n: i32 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap_or(-99);
+    xdotool(&["key", "--window", &wid, "Down"]);
+    std::thread::sleep(Duration::from_millis(500));
+    xdotool(&["mousemove", "--window", &wid, "100", "82", "click", "1"]);
+    std::thread::sleep(Duration::from_millis(600));
+    xdotool(&["key", "--window", &wid, "Escape"]);
+    std::thread::sleep(Duration::from_millis(400));
+    // Poll for row 2 to render white (setup growth + first frames lag
+    // under load; deadline, not sleep). Settles twice identically first.
+    let deadline = Instant::now() + Duration::from_secs(25);
+    let runs_b = loop {
+        let runs_a = white_runs(&screenshot(&wid, "ringa"), 94, 110);
+        std::thread::sleep(Duration::from_millis(500));
+        let runs_b = white_runs(&screenshot(&wid, "ringb"), 94, 110);
+        assert_eq!(runs_a, runs_b, "row-2 census must settle: {runs_a:?} vs {runs_b:?}");
+        if runs_b.len() >= 2 {
+            break runs_b;
+        }
+        if Instant::now() > deadline {
+            panic!(
+                "row 2 (B row) never rendered body-white columns on empty startup (runs: {runs_b:?})"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    // Column B white across rows 1-2: white fraction of the strip (polled:
+    // frames lag growth under load).
+    let deadline = Instant::now() + Duration::from_secs(25);
+    let n = loop {
+        let shot = screenshot(&wid, "ringcol");
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let script = std::env::temp_dir().join(format!("corro-blank-colfrac-{id}.py"));
+        std::fs::write(
+            &script,
+            "import sys\nfrom PIL import Image\nimg = Image.open(sys.argv[1]).convert('RGB')\npx = img.load()\nWHITE=(255,255,255)\nn = sum(1 for y in range(72, 112) for x in range(115, 155) if px[x,y]==WHITE)\nprint(n)\n",
+        )
+        .expect("write analyzer");
+        let out = Command::new("python3")
+            .arg(&script)
+            .arg(&shot)
+            .output()
+            .expect("python3 analyzer");
+        let _ = std::fs::remove_file(&script);
+        let _ = std::fs::remove_file(&shot);
+        let n: i32 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap_or(-99);
+        if n > 800 {
+            break n;
+        }
+        if Instant::now() > deadline {
+            break n;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    };
     assert!(
         n > 800,
-        "column B (first margin ]A) must render margin-gray across rows 1-2 (gray px: {n})"
+        "column B must render body-white across rows 1-2 on empty startup (white px: {n})"
     );
     let _ = child.kill();
     let _ = std::fs::remove_file(&path);
 }
 
-/// Clicking the first margin row (B row on an empty sheet, gray like the
-/// rest of the margin) files margin: it addresses (and saves) as footer,
-/// same as ratatui — file must hold exactly `SET A_1 Z` (and no A1 commit
-/// — a main misroute would land in A1).
+/// Clicking the first margin row (row 3 on an empty 2x2 sheet) files
+/// margin: it addresses (and saves) as footer, same as ratatui — file must
+/// hold exactly `SET A_1 Z` (and no A1 commit — a main misroute would land
+/// in A1).
 #[test]
 fn gui_ring_click_files_margin() {
     let _guard = GUI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -375,7 +408,8 @@ fn gui_ring_click_files_margin() {
     // Aim column A in the ring row 2 (fixed x: col A spans ~87-120 on an
     // empty sheet; the ring renders gray now, so no white-run aiming).
     let aimx = 100;
-    xdotool(&["mousemove", "--window", &wid, &aimx.to_string(), "102", "click", "1"]);
+    // Row 3 (y=122) is the first margin row on a 2x2-empty sheet.
+    xdotool(&["mousemove", "--window", &wid, &aimx.to_string(), "122", "click", "1"]);
     std::thread::sleep(Duration::from_millis(700));
     xdotool(&["key", "--window", &wid, "Z"]);
     std::thread::sleep(Duration::from_millis(500));

@@ -1597,10 +1597,11 @@ fn grow_for_trailing_blank(
 /// grow_blank_past_cursor below; keyboard growth stays with the classic
 /// NAV_BLANK step-off logic in move_cursor.
 /// Converge the body extent on need: content + one blank, floored by the
-/// cursor and by 1x1. Grows toward the target and silently shrinks
-/// abandoned growth back toward it (via the cursor floor + the grid's
-/// silent shrink_to_content) — this is what lets the sheet shrink again
-/// when blank rows/cols are no longer needed (navigate back up, delete
+/// cursor and by a minimal 2x2 body (so startup always shows data row 2
+/// and column B). Grows toward the target and silently shrinks abandoned
+/// growth back toward it (via the cursor floor + the grid's silent
+/// shrink_to_content) — this is what lets the sheet shrink again when
+/// blank rows/cols are no longer needed (navigate back up, delete
 /// content). Target per axis = max(content+1, cursor_idx+1, 1); the +1
 /// keeps the clickable trailing blank, the cursor floor keeps the
 /// selection addressable, and 1x1 keeps empty sheets footer-addressable
@@ -1626,11 +1627,10 @@ fn maintain_extent(state: &GuiState, allow_shrink: bool) {
     while grow_for_trailing_blank(grid.main_cols(), compute::trailing_blank_main_cols(grid), None) {
         grid.grow_main_col_at_right();
     }
-    if !allow_shrink {
-        return;
-    }
-    // Shrink abandoned growth back toward need (see doc comment): recompute
-    // post-growth, then keep max(content+1, cursor floor, 1x1).
+    // Converge on need below (see doc comment): recompute post-growth,
+    // then grow toward target always but shrink only when allowed (fresh
+    // loads/switches must not second-guess stored extents).
+    let (mr, mc) = (grid.main_rows(), grid.main_cols());
     let (mr, mc) = (grid.main_rows(), grid.main_cols());
     let tb_r = compute::trailing_blank_main_rows(grid).min(mr);
     let tb_c = compute::trailing_blank_main_cols(grid).min(mc);
@@ -1650,8 +1650,19 @@ fn maintain_extent(state: &GuiState, allow_shrink: bool) {
     } else {
         mc
     };
-    let target_r = (content_r + 1).max(floor_r).max(1);
-    let target_c = (content_c + 1).max(floor_c).max(1);
+    let target_r = (content_r + 1).max(floor_r).max(2);
+    let target_c = (content_c + 1).max(floor_c).max(2);
+    // Grow toward target (covers the minimal 2x2 body on empty sheets and
+    // any cursor floor above current extent).
+    while grid.main_rows() < target_r {
+        grid.grow_main_row_at_bottom();
+    }
+    while grid.main_cols() < target_c {
+        grid.grow_main_col_at_right();
+    }
+    if !allow_shrink {
+        return;
+    }
     grid.set_min_extent(target_r as u32, target_c as u32);
     grid.shrink_to_content();
 }
@@ -1893,8 +1904,9 @@ fn handle_click(x: f64, y: f64, state_rc: &Rc<GuiState>) {
                 // Plain click collapses any selection (fresh single-cell focus).
                 app.core.anchor = None;
                 // Clicking the trailing blank opens one more beyond it
-                // (pointer arrival — see grow_blank_past_cursor).
-                maintain_extent(state, false);
+                // (pointer arrival — see grow_blank_past_cursor). Shrink
+                // allowed too (mouse users prune like keyboard users).
+                maintain_extent(state, true);
                 grow_blank_past_cursor(state);
                 update_formula_bar(state, logical_row, c);
                 start_edit(state);
