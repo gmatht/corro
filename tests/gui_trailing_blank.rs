@@ -358,11 +358,12 @@ fn gui_empty_startup_shows_blank_b_row_and_col() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// Clicking the ring (B row on an empty sheet) promotes it into main and
-/// commits there as data: file must hold exactly `SET B2 Z` (and no A1
-/// commit — a footer/margin misroute would land elsewhere).
+/// Clicking the ring (B row on an empty sheet) files margin: the first
+/// margin row addresses (and saves) as footer, same as ratatui — file must
+/// hold exactly `SET A_1 Z` (and no A1 commit — a main misroute would land
+/// in A1).
 #[test]
-fn gui_ring_click_promotes_b_row_to_data() {
+fn gui_ring_click_files_margin() {
     let _guard = GUI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     assert!(
         std::env::var("DISPLAY").is_ok(),
@@ -373,16 +374,15 @@ fn gui_ring_click_promotes_b_row_to_data() {
     let wid = find_corro_window(child.id(), Instant::now() + Duration::from_secs(25));
     xdotool(&["windowactivate", "--sync", &wid]);
     std::thread::sleep(Duration::from_millis(800));
-    // Aim the ring column B in the ring row 2: second white run's left
-    // half (the run may bleed past the ring into margin pixels; the ring
-    // itself is its left part).
+    // Aim column A in the ring row 2: first white run's center (the
+    // second run is the ring column, which addresses as right margin).
     let runs = white_runs(&screenshot(&wid, "ringaim"), 94, 110);
     assert!(
-        runs.len() >= 2,
-        "ring columns must render for aiming (runs: {runs:?})"
+        !runs.is_empty(),
+        "body columns must render for aiming (runs: {runs:?})"
     );
-    let (rs, re) = runs[1];
-    let aimx = rs + (re - rs).min(30) / 2;
+    let (rs, re) = runs[0];
+    let aimx = (rs + re) / 2;
     xdotool(&["mousemove", "--window", &wid, &aimx.to_string(), "102", "click", "1"]);
     std::thread::sleep(Duration::from_millis(700));
     xdotool(&["key", "--window", &wid, "Z"]);
@@ -391,8 +391,8 @@ fn gui_ring_click_promotes_b_row_to_data() {
     std::thread::sleep(Duration::from_millis(1200));
     let log = std::fs::read_to_string(&path).unwrap_or_default();
     assert!(
-        log.lines().any(|l| l == "SET B2 Z"),
-        "ring click must promote B row to data (file: {log:?})"
+        log.lines().any(|l| l == "SET A_1 Z"),
+        "ring click must file first-margin-row as footer A_1, same as ratatui (file: {log:?})"
     );
     assert!(
         !log.lines().any(|l| l == "SET A1 Z"),

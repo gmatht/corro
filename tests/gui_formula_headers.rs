@@ -803,13 +803,14 @@ fn gui_padlock_click_pins_row_visible() {
 /// spot while the formula bar proves the cursor moved on. Clicking again
 /// unpins (the lock disappears). Pixel-exact padlock checks, not OCR words:
 /// padlock glyphs contaminate header OCR with f/g misreads.
-/// Ring reached by keys (not clicks) commits as data: build trailing blanks
-/// with clicks (pointer growth chains), step onto the ring with the keyboard
-/// (no NAV growth fires while 2+ blanks stand past content), then commit.
-/// Must file exactly `SET E1 Q` — pre-fix the ring addressed as margin
-/// (`SET ]A1 Q`). The single Right carries the usual autorepeat caveat.
+/// First margin column reached by keys commits as margin: build trailing
+/// blanks with clicks (pointer growth chains), step onto the first margin
+/// column with the keyboard (no NAV growth fires while 2+ blanks stand
+/// past content), then commit. Must file exactly `SET ]A1 Q`, same as
+/// ratatui — never data. The single Right carries the usual autorepeat
+/// caveat.
 #[test]
-fn gui_ring_key_step_commits_data() {
+fn gui_ring_key_step_commits_margin() {
     let _guard = GUI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     assert!(
         std::env::var("DISPLAY").is_ok(),
@@ -855,12 +856,12 @@ fn gui_ring_key_step_commits_data() {
     let _ = child.kill();
     let _ = child.wait();
     assert!(
-        lines.iter().any(|l| l == "SET E1 Q"),
-        "ring reached by keys must file as data E1 (lines: {lines:?})"
+        lines.iter().any(|l| l == "SET ]A1 Q"),
+        "first margin column reached by keys must file as margin ]A1, same as ratatui (lines: {lines:?})"
     );
     assert!(
-        !lines.iter().any(|l| l == "SET ]A1 Q"),
-        "ring reached by keys must never file as margin ]A1 (lines: {lines:?})"
+        !lines.iter().any(|l| l == "SET E1 Q"),
+        "first margin column must never file as data E1 (lines: {lines:?})"
     );
     let _ = std::fs::remove_file(&path);
 }
