@@ -487,6 +487,13 @@ mod nwg_adapter {
     impl BoxWidget {
         pub fn append(&self, child: &impl Appendable) {
             let hwnds = child.collect_hwnds();
+            // A null HWND can never participate in layout (it is filtered
+            // below) — silently dropping it crams the remaining widgets
+            // with no diagnostic. Fail loudly in debug builds instead.
+            debug_assert!(
+                hwnds.iter().all(|&p| !p.is_null()),
+                "BoxWidget::append: child with null HWND cannot be laid out"
+            );
             for &ptr in &hwnds {
                 if !ptr.is_null() && !self.hwnd.is_null() {
                     unsafe {
@@ -505,6 +512,12 @@ mod nwg_adapter {
             let ptr = *child.as_ref();
             let children = self.children.borrow();
             let mut vex = self.child_vexpand.borrow_mut();
+            // Silently missing the child leaves it fixed-size (fx-bar cram
+            // shape): fail loudly in debug builds instead.
+            debug_assert!(
+                children.iter().any(|&c| c == ptr),
+                "BoxWidget::set_child_vexpand: child not found in box"
+            );
             if let Some(idx) = children.iter().position(|&c| c == ptr) {
                 vex[idx] = expand;
             }
@@ -513,6 +526,12 @@ mod nwg_adapter {
             let ptr = *child.as_ref();
             let children = self.children.borrow();
             let mut hex = self.child_hexpand.borrow_mut();
+            // Silently missing the child leaves it fixed-size (fx-bar cram
+            // shape): fail loudly in debug builds instead.
+            debug_assert!(
+                children.iter().any(|&c| c == ptr),
+                "BoxWidget::set_child_hexpand: child not found in box"
+            );
             if let Some(idx) = children.iter().position(|&c| c == ptr) {
                 hex[idx] = expand;
             }
