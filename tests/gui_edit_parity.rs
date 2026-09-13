@@ -1,9 +1,11 @@
 //! Live GUI parity for type-first editing.
 //!
-//! The ratatui reference is the oracle: on a fresh 1x1 sheet Right,Right
-//! leaves the main area (trailing-blank growth stops at 2x2), so A,Enter
-//! commits to the RIGHT-MARGIN cell (`SET ]A1 A`), and Down x3 / Down x40
-//! land in the footer (`SET A_2 Z` / `SET A_39 Q`) for the same reason.
+//! The ratatui reference is the oracle, with one GUI-only exception: the
+//! trailing ring (one past main) renders body-white, so it addresses and
+//! commits as data. On a fresh 1x1 sheet Right,Right lands the ring column
+//! and A,Enter commits `SET C1 A` (ratatui, which has no ring, addresses
+//! the margin: `SET ]A1 A`). Down x3 / Down x40 land in the footer
+//! (`SET A_2 Z` / `SET A_39 Q`) exactly like ratatui.
 //! These tests drive the real GTK GUI and assert on the committed `.corro`
 //! file (no pixel matching, no fixed sleeps for the verdict — the file is
 //! polled with a deadline).
@@ -106,15 +108,17 @@ fn spawn_gui(path: &PathBuf) -> KillOnDrop {
     )
 }
 
-/// Right,Right,A,Enter must commit exactly "A" to the right-margin cell
-/// ]A1 (the two Rights leave the 1x1-start main area: trailing-blank growth
-/// stops, so the cursor sits in the margin — exactly what the ratatui
-/// reference commits: `SET ]A1 A`).
+/// Right,Right,A,Enter must commit exactly "A" to the ring cell C1 (the two
+/// Rights leave the 1x1-start main area onto the one-past-main ring: the
+/// ring renders body-white, so it addresses and commits as data —
+/// `SET C1 A`. This is an intentional GUI-only divergence from ratatui,
+/// which has no ring: there the same keys address the margin (`SET ]A1 A`).
+/// White cells must never carry margin names.
 /// Regression: the GUI backend built CellAddr::Main unconditionally, so the
 /// margin edit misrouted into an out-of-range main cell (accidentally
 /// growing the grid and serializing as `SET C1 A`).
 #[test]
-fn gui_right_right_a_enter_commits_margin_bracket_a1() {
+fn gui_right_right_a_enter_commits_ring_c1() {
     // Tolerate poisoning: a failed sibling must not mask this test's verdict.
     let _guard = GUI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     assert!(
@@ -141,8 +145,8 @@ fn gui_right_right_a_enter_commits_margin_bracket_a1() {
     let _ = child.wait();
 
     assert!(
-        lines.iter().any(|l| l == "SET ]A1 A"),
-        "expected exactly `SET ]A1 A` (margin commit, matching ratatui), got lines: {lines:?}"
+        lines.iter().any(|l| l == "SET C1 A"),
+        "expected exactly `SET C1 A` (ring commits as data; ratatui says `SET ]A1 A`), got lines: {lines:?}"
     );
     assert!(
         !lines.iter().any(|l| l.starts_with("SET A1")),

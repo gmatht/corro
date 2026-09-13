@@ -494,7 +494,7 @@ fn paint_row_headers(
 ) {
     for (ri, &logical_row) in display_rows.iter().enumerate().take(MAX_RENDER_ROWS) {
         let ry = HEADER_H + ri as f64 * ROW_H;
-        let label = crate::addr::ui_row_label(logical_row, mr);
+        let label = gutter_row_label(logical_row, mr);
         let (_, _, tw, _) = dc.text_extents_styled(&label, "monospace", FONT_SIZE, 0, 1);
         dc.fill_rect(0.0, ry, ROW_LABEL_W, ROW_H, 0.9, 0.9, 0.9, 1.0);
         // Row numbers sit 6px off the gutter's right gridline so glyphs
@@ -533,7 +533,7 @@ fn paint_col_headers(
     for (ci, &c) in col_ixs.iter().enumerate().take(MAX_RENDER_COLS) {
         let cw = *col_widths.get(&c).unwrap_or(&8) as f64 * CHAR_W;
         let cx = ROW_LABEL_W + col_ixs.iter().take(ci).map(|&pc| *col_widths.get(&pc).unwrap_or(&8) as f64 * CHAR_W).sum::<f64>();
-        let col_name = crate::addr::ui_column_fragment(c, mc);
+        let col_name = gutter_col_fragment(c, mc);
         dc.fill_rect(cx, 0.0, cw, HEADER_H, 0.9, 0.9, 0.9, 1.0);
         let (_, _, tw, _) = dc.text_extents_styled(&col_name, "monospace", FONT_SIZE, 0, 1);
         // Label and padlock center as a unit, so the icon fits inside its
@@ -614,7 +614,51 @@ fn union_pinned(display: &[usize], pinned: &[usize]) -> Vec<usize> {
     out
 }
 
-/// Paint the padlock icon at (ox, oy): body rect plus a three-bar shackle.
+/// Gutter row label with ring-as-data: the ring row (hr+mr) shows its data
+/// number (mr+1), not the footer `_N` — it renders body-white, so it must
+/// read as body (a white cell labelled `_1` is the bug). Shared
+/// ui_row_label stays untouched (ratatui has no ring; its hr+mr really is
+/// footer there).
+fn gutter_row_label(logical_row: usize, mr: usize) -> String {
+    if logical_row == HEADER_ROWS + mr {
+        format!("{}", mr + 1)
+    } else {
+        crate::addr::ui_row_label(logical_row, mr)
+    }
+}
+
+/// Gutter column fragment with ring-as-data: the ring col (lm+mc) shows
+/// the next data letter, not `]A`. See [`gutter_row_label`].
+fn gutter_col_fragment(global_col: usize, mc: usize) -> String {
+    if global_col == MARGIN_COLS + mc {
+        crate::addr::excel_column_name(mc)
+    } else {
+        crate::addr::ui_column_fragment(global_col, mc)
+    }
+}
+
+/// Formula-bar address with ring-as-data: a cursor on the ring addresses
+/// as the data cell it renders as (Main), not footer/margin. Shared
+/// sheet_cursor_to_addr stays untouched (ratatui addressing).
+fn ring_aware_addr(row: usize, col: usize, mr: usize, mc: usize) -> CellAddr {
+    let hr = HEADER_ROWS;
+    let lm = MARGIN_COLS;
+    let ring_row = row == hr + mr && col >= lm && col <= lm + mc;
+    let ring_col = col == lm + mc && row >= hr && row <= hr + mr;
+    if ring_row || ring_col {
+        CellAddr::Main {
+            row: (row - hr) as u32,
+            col: (col - lm) as u32,
+        }
+    } else {
+        crate::addr::sheet_cursor_to_addr(
+            crate::addr::LogicalRow(row),
+            crate::addr::GlobalCol(col),
+            crate::addr::MainRows(mr),
+            crate::addr::MainCols(mc),
+        )
+    }
+}
 /// The right shackle bar connects to the body when locked and floats with a
 /// gap when unlocked. Vector rects only (no font/emoji dependency), so both
 /// backends and screenshots render it identically.
@@ -1364,16 +1408,16 @@ fn commit_edit(state: &GuiState) {
         // Resolve the TRUE cell address (header/margin/footer included),
         // matching ratatui's commit_edit_buffer which commits to the edit
         // target address. Building CellAddr::Main unconditionally misroutes
-        // header/margin/footer edits into main cells.
-        let addr = crate::addr::sheet_cursor_to_addr(
-            crate::addr::LogicalRow(row),
-            crate::addr::GlobalCol(col),
-            crate::addr::MainRows(app.core.workbook.active_sheet().grid.main_rows()),
-            crate::addr::MainCols(app.core.workbook.active_sheet().grid.main_cols()),
-        );
+        // header/margin/footer edits into main cells. Ring cursors address
+        // as data (they render body-white); grid.set grows main past them.
+        let (mr, mc) = {
+            let grid = &app.core.workbook.active_sheet().grid;
+            (grid.main_rows(), grid.main_cols())
+        };
+        let addr = ring_aware_addr(row, col, mr, mc);
         app.core.workbook.active_sheet_mut().grid.set(&addr, val.clone());
         let sheet_id = app.core.workbook.sheet_id(app.core.workbook.active_sheet);
-        let op = Op::SetCell { addr, value: val };
+        let op = Op::SetCell { addr: addr.clone(), value: val };
         let wbo = WorkbookOp::SheetOp { sheet_id, op };
         if let Some(ref p) = app.core.path.clone() {
             let mut active_sheet = sheet_id;
@@ -1386,14 +1430,7 @@ fn commit_edit(state: &GuiState) {
                 app.core.ops_applied = app.core.ops_applied.saturating_add(1);
             }
         }
-        let main_rows = crate::addr::MainRows(app.core.workbook.active_sheet().grid.main_rows());
-        let main_cols = crate::addr::MainCols(app.core.workbook.active_sheet().grid.main_cols());
-        app.core.status = format!("Set cell {}", crate::addr::sheet_cursor_to_addr(
-            crate::addr::LogicalRow(row),
-            crate::addr::GlobalCol(col),
-            main_rows,
-            main_cols,
-        ));
+        app.core.status = format!("Set cell {}", crate::addr::cell_ref_text(&addr, app.core.workbook.active_sheet().grid.main_cols()));
         recompute_viewport(state);
     }
     state.edit_buf.borrow_mut().clear();
@@ -1407,12 +1444,10 @@ fn handle_delete(state: &GuiState) {
     // Resolve the TRUE cell address (header/margin/footer included),
     // matching ratatui: clearing a margin/header cell must clear that cell,
     // not the clamped main cell.
-    let addr_of = |app: &mut super::App, r: usize, c: usize| crate::addr::sheet_cursor_to_addr(
-        crate::addr::LogicalRow(r),
-        crate::addr::GlobalCol(c),
-        crate::addr::MainRows(app.core.workbook.active_sheet().grid.main_rows()),
-        crate::addr::MainCols(app.core.workbook.active_sheet().grid.main_cols()),
-    );
+    let addr_of = |app: &mut super::App, r: usize, c: usize| {
+        let grid = &app.core.workbook.active_sheet().grid;
+        ring_aware_addr(r, c, grid.main_rows(), grid.main_cols())
+    };
     if let Some(anchor) = app.core.anchor {
         let r1 = anchor.row.min(row);
         let r2 = anchor.row.max(row);
@@ -1842,12 +1877,7 @@ fn scroll_to_cursor(state: &GuiState, vertical: bool, value: f64) {
 /// ratatui reference (`addr_label`/`cell_ref_text`): `A1`, `[A1`, `A~1`, ...
 /// Never `CellAddr`'s internal rendering (`(0, 0)`, `<701>(0)`, ...).
 fn formula_addr_label(row: usize, col: usize, grid: &GridBox) -> String {
-    let addr = crate::addr::sheet_cursor_to_addr(
-        crate::addr::LogicalRow(row),
-        crate::addr::GlobalCol(col),
-        crate::addr::MainRows(grid.main_rows()),
-        crate::addr::MainCols(grid.main_cols()),
-    );
+    let addr = ring_aware_addr(row, col, grid.main_rows(), grid.main_cols());
     crate::addr::cell_ref_text(&addr, grid.main_cols())
 }
 
@@ -1856,13 +1886,9 @@ fn update_formula_bar(state: &GuiState, row: usize, col: usize) {
     let grid = &app.core.workbook.active_sheet().grid;
     state.addr_label.set_text(&formula_addr_label(row, col, grid));
     // Look up the entry value at the TRUE address (a header/margin cursor
-    // shows that cell's value, not the clamped main cell's).
-    let addr = crate::addr::sheet_cursor_to_addr(
-        crate::addr::LogicalRow(row),
-        crate::addr::GlobalCol(col),
-        crate::addr::MainRows(app.core.workbook.active_sheet().grid.main_rows()),
-        crate::addr::MainCols(app.core.workbook.active_sheet().grid.main_cols()),
-    );
+    // shows that cell's value, not the clamped main cell's; ring cursors
+    // address as data).
+    let addr = ring_aware_addr(row, col, grid.main_rows(), grid.main_cols());
     let val = app.core.workbook.active_sheet().grid.get(&addr).unwrap_or_default();
     // While an edit is in progress the entry widget belongs to the edit
     // buffer (e.g. an Insert Date/Time preset), not the grid cell: overwriting
@@ -3351,9 +3377,16 @@ mod formula_tests {
     #[test]
     fn addr_label_right_margin() {
         let grid = empty_grid();
+        // lm+1 is the ring (white trailing blank), so it addresses as
+        // data B1 — never the margin ]A1 (white cells must not carry
+        // margin names). The TRUE right margin starts one past the ring.
         assert_eq!(
             formula_addr_label(HEADER_ROWS, MARGIN_COLS + 1, &grid),
-            "]A1"
+            "B1"
+        );
+        assert_eq!(
+            formula_addr_label(HEADER_ROWS, MARGIN_COLS + 2, &grid),
+            "]B1"
         );
     }
 
@@ -3369,10 +3402,41 @@ mod formula_tests {
     #[test]
     fn addr_label_footer_row() {
         let grid = empty_grid();
+        // hr+1 is the ring (white trailing blank), so it addresses as data
+        // A2 — never footer A_1. The TRUE footer starts one past the ring.
         assert_eq!(
             formula_addr_label(HEADER_ROWS + 1, MARGIN_COLS, &grid),
-            "A_1"
+            "A2"
         );
+        assert_eq!(
+            formula_addr_label(HEADER_ROWS + 2, MARGIN_COLS, &grid),
+            "A_2"
+        );
+    }
+
+    /// Ring addressing: body-white ring cells address as data everywhere
+    /// user-visible (formula, gutters), never footer/margin.
+    #[test]
+    fn ring_addresses_as_data() {
+        let grid = empty_grid(); // 1x1: ring is row hr+1 / col lm+1
+        // Formula bar.
+        assert_eq!(
+            formula_addr_label(HEADER_ROWS + 1, MARGIN_COLS + 1, &grid),
+            "B2"
+        );
+        // Gutter labels (the row/col headers flanking white cells).
+        assert_eq!(gutter_row_label(HEADER_ROWS + 1, 1), "2");
+        assert_eq!(gutter_row_label(HEADER_ROWS + 2, 1), "_2");
+        assert_eq!(gutter_col_fragment(MARGIN_COLS + 1, 1), "B");
+        assert_eq!(gutter_col_fragment(MARGIN_COLS + 2, 1), "]B");
+        // Ring predicate itself (body intersections only, not margins).
+        let (hr, lm) = (HEADER_ROWS, MARGIN_COLS);
+        assert!(is_trailing_blank_cell(hr + 1, lm, hr, 1, lm, 1));
+        assert!(is_trailing_blank_cell(hr, lm + 1, hr, 1, lm, 1));
+        assert!(is_trailing_blank_cell(hr + 1, lm + 1, hr, 1, lm, 1));
+        assert!(!is_trailing_blank_cell(hr + 2, lm, hr, 1, lm, 1));
+        assert!(!is_trailing_blank_cell(hr, lm + 2, hr, 1, lm, 1));
+        assert!(!is_trailing_blank_cell(hr + 1, lm - 1, hr, 1, lm, 1));
     }
 }
 
