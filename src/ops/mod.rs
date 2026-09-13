@@ -28,10 +28,18 @@ pub enum AggFunc {
 /// Margin aggregate directives for the key column / header-band cells.
 ///
 /// Preferred form is `==KEYWORD` (ASCII case-insensitive) so it stays distinct from spreadsheet
-/// formulas like `=MIN(A1)`. Legacy `=TOTAL` (single leading `=`) still maps to sum. Bare `SUM`,
-/// `MIN`, … (no equals) behave as today; bare `TOTAL` is not treated as aggregate.
+/// formulas like `=MIN(A1)`. Legacy `=TOTAL` (single leading `=`) still maps to sum. Bare
+/// `TOTAL` (like bare `SUM`, `MIN`, …) also aggregates. A leading apostrophe
+/// forces literal text instead (Excel escape hatch): `'TOTAL` (or `'==SUM`)
+/// is never an aggregate — display strips one quote and shows plain text.
 pub fn margin_key_agg_func(val: &str) -> Option<AggFunc> {
     let t = val.trim();
+
+    // Leading apostrophe forces literal text: never an aggregate, even for
+    // quoted keywords or quoted controls.
+    if t.starts_with('\'') {
+        return None;
+    }
 
     fn keyword_to_agg(rest: &str) -> Option<AggFunc> {
         match rest.trim().to_ascii_uppercase().as_str() {
@@ -60,7 +68,7 @@ pub fn margin_key_agg_func(val: &str) -> Option<AggFunc> {
         return None;
     }
     match t.to_ascii_uppercase().as_str() {
-        "SUM" => Some(AggFunc::Sum),
+        "SUM" | "TOTAL" => Some(AggFunc::Sum),
         "MEAN" | "AVERAGE" | "AVG" => Some(AggFunc::Mean),
         "MEDIAN" => Some(AggFunc::Median),
         "MIN" | "MINIMUM" => Some(AggFunc::Min),
@@ -2860,7 +2868,7 @@ mod tests {
     }
 
     #[test]
-    fn margin_key_agg_func_accepts_eq_total_not_bare() {
+    fn margin_key_agg_func_accepts_eq_total_and_bare_total() {
         use super::margin_key_agg_func;
         use super::AggFunc;
         assert_eq!(margin_key_agg_func("=TOTAL"), Some(AggFunc::Sum));
@@ -2868,8 +2876,14 @@ mod tests {
         assert_eq!(margin_key_agg_func("==TOTAL"), Some(AggFunc::Sum));
         assert_eq!(margin_key_agg_func("==min"), Some(AggFunc::Min));
         assert_eq!(margin_key_agg_func("=MIN"), None);
-        assert_eq!(margin_key_agg_func("TOTAL"), None);
+        assert_eq!(margin_key_agg_func("TOTAL"), Some(AggFunc::Sum));
+        assert_eq!(margin_key_agg_func("total"), Some(AggFunc::Sum));
         assert_eq!(margin_key_agg_func("SUM"), Some(AggFunc::Sum));
+        // Leading apostrophe forces literal text: never an aggregate,
+        // even for keywords and controls.
+        assert_eq!(margin_key_agg_func("'TOTAL"), None);
+        assert_eq!(margin_key_agg_func("'SUM"), None);
+        assert_eq!(margin_key_agg_func("'==TOTAL"), None);
     }
 
     #[test]

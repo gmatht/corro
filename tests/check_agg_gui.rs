@@ -253,3 +253,50 @@ fn test_full_agg_pipeline() {
         }
     }
 }
+
+/// Bare `TOTAL` in a margin cell aggregates like `==TOTAL` (Sum); quoted
+/// `'TOTAL` stays literal text with no aggregate.
+#[test]
+fn test_bare_total_aggregates_quoted_does_not() {
+    let mut raw = Grid::new(3, 2);
+    raw.set(&CellAddr::Main { row: 0, col: 0 }, "10".into());
+    raw.set(&CellAddr::Main { row: 0, col: 1 }, "20".into());
+    raw.set(&CellAddr::Main { row: 1, col: 0 }, "30".into());
+    raw.set(&CellAddr::Main { row: 1, col: 1 }, "40".into());
+    raw.set(&CellAddr::Main { row: 2, col: 0 }, "5".into());
+    raw.set(&CellAddr::Main { row: 2, col: 1 }, "6".into());
+
+    let gb = GridBox::from(raw);
+    let hr = HEADER_ROWS;
+    let mr = gb.main_rows();
+    let lm = MARGIN_COLS;
+    let display_rows: Vec<usize> = (hr..hr + mr).collect();
+
+    // Bare TOTAL aggregates (Sum), same as ==TOTAL.
+    let mut grid_bare = gb.clone();
+    grid_bare.set(&CellAddr::Left { col: lm - 1, row: 0 }, "TOTAL".into());
+    let funcs = compute::compute_row_agg_func(&grid_bare, &display_rows, hr, mr);
+    assert_eq!(
+        funcs[0],
+        Some(corro::ops::AggFunc::Sum),
+        "bare TOTAL must aggregate as Sum"
+    );
+
+    // Quoted 'TOTAL is literal text: no aggregate fires.
+    let mut grid_quoted = gb.clone();
+    grid_quoted.set(&CellAddr::Left { col: lm - 1, row: 0 }, "'TOTAL".into());
+    let funcs_q = compute::compute_row_agg_func(&grid_quoted, &display_rows, hr, mr);
+    assert!(
+        funcs_q[0].is_none(),
+        "quoted 'TOTAL must not aggregate (got {:?})",
+        funcs_q[0]
+    );
+    // ...and it displays as plain TOTAL (quote stripped).
+    assert_eq!(
+        corro::formula::cell_effective_display(
+            &grid_quoted,
+            &CellAddr::Left { col: lm - 1, row: 0 }
+        ),
+        "TOTAL"
+    );
+}

@@ -1432,6 +1432,17 @@ fn control_formula_label(grid: &Grid, addr: &CellAddr) -> Option<String> {
         {
             return Some("TOTAL".to_string());
         }
+        // Bare TOTAL aggregates like ==TOTAL (Sum); normalize the label.
+        if t.eq_ignore_ascii_case("total") {
+            return Some("TOTAL".to_string());
+        }
+        // Leading apostrophe forces literal text (Excel escape hatch):
+        // display without the quote, never as control/formula — including
+        // quoted controls like '==SUM. (margin cells only; this whole block
+        // is skipped for main cells.)
+        if let Some(lit) = t.strip_prefix('\'') {
+            return Some(lit.to_string());
+        }
     }
     let (_expr, label) = split_labeled_formula(raw)?;
     Some(label.to_string())
@@ -2950,6 +2961,37 @@ mod tests {
         };
         g.set(&addr, "=ToTaL".into());
         assert_eq!(cell_effective_display(&g, &addr), "TOTAL");
+    }
+
+    #[test]
+    fn margin_stored_bare_total_displays_as_total_label() {
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(1, 1));
+        let addr = CellAddr::Header {
+            row: (HEADER_ROWS - 1) as u32,
+            col: ColumnAddr::from_global(MARGIN_COLS + 1, g.main_cols()),
+        };
+        g.set(&addr, "TOTAL".into());
+        assert_eq!(cell_effective_display(&g, &addr), "TOTAL");
+    }
+
+    #[test]
+    fn margin_stored_quoted_total_displays_as_plain_text() {
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(1, 1));
+        let addr = CellAddr::Header {
+            row: (HEADER_ROWS - 1) as u32,
+            col: ColumnAddr::from_global(MARGIN_COLS + 1, g.main_cols()),
+        };
+        // Leading apostrophe forces literal text: the quote is stripped
+        // for display and no aggregate/formula fires.
+        g.set(&addr, "'TOTAL".into());
+        assert_eq!(cell_effective_display(&g, &addr), "TOTAL");
+        assert_eq!(crate::ops::margin_key_agg_func("'TOTAL"), None);
+        assert!(!is_formula("'TOTAL"));
+        // Quoted controls stay literal too.
+        let mut g2 = crate::grid::GridBox::from(crate::grid::Grid::new(1, 1));
+        g2.set(&addr, "'==SUM".into());
+        assert_eq!(cell_effective_display(&g2, &addr), "==SUM");
+        assert_eq!(crate::ops::margin_key_agg_func("'==SUM"), None);
     }
 
     #[test]
