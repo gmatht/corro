@@ -1,0 +1,20 @@
+#!/bin/sh
+# lib.exe shim for the rust9x/Win95 cross build: cc-rs invokes the MSVC
+# librarian ("lib.exe -out:foo.a -nologo objs...") for msvc targets, which
+# does not exist on Linux. Translate to zig ar (GNU archive of COFF
+# objects, which rust-lld reads fine). Put tools/ on PATH when building.
+set -eu
+ZIG=${ZIG:-/snap/bin/zig}
+out=
+objs=
+for a in "$@"; do
+    case "$a" in
+        -out:*) out="${a#-out:}" ;;
+        -nologo|-NOLOGO) ;;
+        -*) echo "lib.exe shim: unknown flag $a" >&2; exit 1 ;;
+        *) objs="$objs $a" ;;
+    esac
+done
+[ -n "$out" ] || { echo "lib.exe shim: no -out: given" >&2; exit 1; }
+# shellcheck disable=SC2086
+exec "$ZIG" ar rcs "$out" $objs
