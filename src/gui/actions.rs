@@ -386,7 +386,7 @@ pub fn dispatch_menu_action(
         "new_sheet" => {
             let id = app.core.workbook.next_sheet_id;
             let title = format!("Sheet{id}");
-            let idx = app.core.workbook.add_sheet(title.clone(), SheetState::new(1, 1));
+            let idx = app.core.workbook.add_sheet(title.clone(), SheetState::new_seeded());
             app.core.workbook.active_sheet = idx;
             app.core.view_sheet_id = id;
             app.core.cursor = SheetCursor { row: HEADER_ROWS, col: MARGIN_COLS };

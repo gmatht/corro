@@ -215,6 +215,43 @@ fn workbook_addr_label(addr: &CellAddr) -> String {
     crate::addr::cell_ref_text(addr, 0)
 }
 
+/// Load a template workbook for new documents (`CORRO_TEMPLATE`): the whole
+/// workbook (all sheets) becomes the fresh document, unsaved. Only `.corro`
+/// logs are accepted; anything else (missing file, bad header, empty
+/// sheets, non-corro extension) is an `Err` and callers fall back to the
+/// built-in seeded blank. Mirrors the normal load path (same replay).
+/// Document-level only: new sheet tabs always get built-in seeds (cloning
+/// a template per tab would duplicate its content onto every tab).
+pub fn load_workbook_template(path: &Path) -> Result<crate::ops::WorkbookState, String> {
+    let ext_ok = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("corro"))
+        .unwrap_or(false);
+    if !ext_ok {
+        return Err(format!(
+            "template must be a .corro file: {}",
+            path.display()
+        ));
+    }
+    let mut workbook = crate::ops::WorkbookState::new();
+    let mut active_sheet = workbook.sheet_id(workbook.active_sheet);
+    let (_offset, replay) =
+        load_workbook_revisions_partial(path, usize::MAX, &mut workbook, &mut active_sheet)
+            .map_err(|e| format!("template load failed: {e}"))?;
+    if let Some(failed) = replay.failed_line {
+        return Err(format!(
+            "template has a bad line {}: {}",
+            failed,
+            replay.error.as_deref().unwrap_or("?")
+        ));
+    }
+    if workbook.sheets.is_empty() {
+        return Err("template has no sheets".to_string());
+    }
+    Ok(workbook)
+}
+
 pub fn load_workbook_snapshot(path: &Path) -> Result<WorkbookSnapshot, IoError> {
     let data = fs::read_to_string(path)?;
     let mut lines = data.lines();
@@ -741,6 +778,51 @@ use crate::grid::{CellAddr, ColumnAddr};
     use tempfile::NamedTempFile;
 
     #[test]
+    #[test]
+    fn template_loads_workbook_content() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "corro-tmpl-ok-{}-{}.corro",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::write(&path, "CORRO_LOG 1\nSET A1 hi\n").unwrap();
+        let wb = load_workbook_template(&path).expect("valid template loads");
+        let _ = std::fs::remove_file(&path);
+        let val = wb.active_sheet().grid.get(&CellAddr::Main { row: 0, col: 0 });
+        assert_eq!(val.as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn template_rejects_missing_bad_and_wrong_extension() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static M: AtomicU64 = AtomicU64::new(0);
+        let missing = std::env::temp_dir().join(format!(
+            "corro-tmpl-missing-{}-{}.corro",
+            std::process::id(),
+            M.fetch_add(1, Ordering::SeqCst)
+        ));
+        let _ = std::fs::remove_file(&missing);
+        assert!(load_workbook_template(&missing).is_err());
+        let bad = std::env::temp_dir().join(format!(
+            "corro-tmpl-bad-{}-{}.corro",
+            std::process::id(),
+            M.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::write(&bad, "CORRO_LOG 1\n!!! not an op !!!\n").unwrap();
+        assert!(load_workbook_template(&bad).is_err());
+        let _ = std::fs::remove_file(&bad);
+        let txt = std::env::temp_dir().join(format!(
+            "corro-tmpl-wrong-{}-{}.txt",
+            std::process::id(),
+            M.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::write(&txt, "CORRO_LOG 1\nSET A1 hi\n").unwrap();
+        assert!(load_workbook_template(&txt).is_err());
+        let _ = std::fs::remove_file(&txt);
+    }
+
     fn commit_workbook_op_roundtrip() {
         let path = NamedTempFile::new().unwrap();
         let mut workbook = WorkbookState::new();

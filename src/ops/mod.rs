@@ -99,6 +99,32 @@ impl SheetState {
         }
     }
 
+    /// Fresh-sheet constructor: a 1x1 body plus the built-in margin TOTAL
+    /// seeds (`[A_1` footer-under-margin and `]A~1` header-beside-margin).
+    /// Used for new documents and new sheet tabs on every backend (never
+    /// for loads, which replay file ops onto `new`). The seeds live in
+    /// margin maps (Footer/Left, Header/Right), so they never pin main
+    /// extents, never appear in body trailing counts, and aggregate via
+    /// the shared margin-key paths. Delete them like any other cells.
+    pub fn new_seeded() -> Self {
+        let mut state = Self::new(1, 1);
+        state.grid.set(
+            &crate::grid::CellAddr::Footer {
+                row: 0,
+                col: crate::grid::ColumnAddr::Left(crate::grid::MARGIN_COLS - 1),
+            },
+            "TOTAL".into(),
+        );
+        state.grid.set(
+            &crate::grid::CellAddr::Header {
+                row: (crate::grid::HEADER_ROWS - 1) as u32,
+                col: crate::grid::ColumnAddr::Right(0),
+            },
+            "TOTAL".into(),
+        );
+        state
+    }
+
     /// Construct a SheetState from an existing GridBox-backed implementation.
     /// This is a convenience for gradually moving to the boxed abstraction.
     pub fn from_grid(grid: crate::grid::Grid) -> Self {
@@ -145,6 +171,22 @@ impl WorkbookState {
                 id: 1,
                 title: "Sheet1".into(),
                 state: SheetState::new(1, 1),
+                linked_source: None,
+            }],
+            active_sheet: 0,
+            next_sheet_id: 2,
+        }
+    }
+
+    /// Fresh-workbook constructor: the initial sheet carries the built-in
+    /// margin TOTAL seeds. Used for new documents on every backend (never
+    /// for loads, which replay file ops onto plain construction).
+    pub fn new_seeded() -> Self {
+        Self {
+            sheets: vec![SheetRecord {
+                id: 1,
+                title: "Sheet1".into(),
+                state: SheetState::new_seeded(),
                 linked_source: None,
             }],
             active_sheet: 0,
@@ -2891,6 +2933,29 @@ mod tests {
         let mut s = SheetState::new(1, 1);
         apply_line("TOTAL", &mut s).unwrap();
         apply_line("SUM", &mut s).unwrap();
+    }
+
+    #[test]
+    fn new_seeded_sheet_has_margin_totals() {
+        use crate::grid::{ColumnAddr, HEADER_ROWS, MARGIN_COLS};
+        let s = SheetState::new_seeded();
+        // [A_1: footer under the nearest-A left margin column.
+        let footer_addr = crate::grid::CellAddr::Footer {
+            row: 0,
+            col: ColumnAddr::Left(MARGIN_COLS - 1),
+        };
+        // ]A~1: header beside the nearest right margin column.
+        let header_addr = crate::grid::CellAddr::Header {
+            row: (HEADER_ROWS - 1) as u32,
+            col: ColumnAddr::Right(0),
+        };
+        assert_eq!(s.grid.get(&footer_addr).as_deref(), Some("TOTAL"));
+        assert_eq!(s.grid.get(&header_addr).as_deref(), Some("TOTAL"));
+        assert_eq!(margin_key_agg_func(&s.grid.get(&footer_addr).unwrap()), Some(AggFunc::Sum));
+        assert_eq!(margin_key_agg_func(&s.grid.get(&header_addr).unwrap()), Some(AggFunc::Sum));
+        // Seeds live outside main: body extent and trailing math untouched.
+        assert_eq!(s.grid.main_rows(), 1);
+        assert_eq!(s.grid.main_cols(), 1);
     }
 
     #[test]

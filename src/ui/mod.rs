@@ -2507,6 +2507,51 @@ impl App {
             env::var("CORRO_AUTO_UNSAVED").map(|v| v != "0").unwrap_or(true)
         };
 
+/// Template path for new documents (`CORRO_TEMPLATE`): a `.corro` file
+/// whose whole workbook becomes the fresh document. Blank/unset means
+/// built-in seeded blank. Pure lookup — loading + fallback live with the
+/// caller so both stay unit-testable without touching process env.
+fn template_path_from_env() -> Option<std::path::PathBuf> {
+    let raw = std::env::var("CORRO_TEMPLATE").ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(std::path::PathBuf::from(trimmed))
+}
+
+/// Fresh-document content: template workbook when CORRO_TEMPLATE
+/// points at a readable .corro file, built-in seeded blank otherwise
+/// (and on any template failure, with a status note).
+fn fresh_document_parts() -> (WorkbookState, SheetState, Option<String>) {
+    match template_path_from_env() {
+        Some(path) => match crate::io::load_workbook_template(&path) {
+            Ok(wb) => {
+                let st = wb.active_sheet().clone();
+                (wb, st, None)
+            }
+            Err(msg) => {
+                let note = format!(
+                    "Template {} failed ({msg}); opened blank instead",
+                    path.display()
+                );
+                (
+                    WorkbookState::new_seeded(),
+                    SheetState::new_seeded(),
+                    Some(note),
+                )
+            }
+        },
+        None => (
+            WorkbookState::new_seeded(),
+            SheetState::new_seeded(),
+            None,
+        ),
+    }
+}
+
+        let (workbook, state, template_note) = fresh_document_parts();
+        let view_sheet_id = workbook.sheet_id(workbook.active_sheet);
         let app = App {
             path,
             capturer: None,
@@ -2516,8 +2561,8 @@ impl App {
             revision_browse: false,
             revision_browse_limit: 1,
             offset: 0,
-            state: SheetState::new(1, 1),
-            workbook: WorkbookState::new(),
+            state,
+            workbook,
             cursor: SheetCursor {
                 row: HEADER_ROWS,
                 col: MARGIN_COLS,
@@ -2525,7 +2570,7 @@ impl App {
             anchor: None,
             mode: Mode::Normal,
             watcher: None,
-            status: String::new(),
+            status: template_note.unwrap_or_default(),
             ops_applied: 0,
             row_scroll: 0,
             col_scroll: 0,
@@ -2546,7 +2591,7 @@ impl App {
             pending_menu_edit: None,
             special_insert_snap: None,
             pending_format_target: None,
-            view_sheet_id: 1,
+            view_sheet_id,
             persisted_view_sort_cols: HashMap::new(),
             edit_target_addr: None,
             edit_range_addrs: None,
@@ -2687,7 +2732,7 @@ impl App {
         self.commit_active_sheet_cache();
         let id = self.workbook.next_sheet_id;
         let log_title = title.clone();
-        self.workbook.add_sheet(title, SheetState::new(1, 1));
+        self.workbook.add_sheet(title, SheetState::new_seeded());
         self.view_sheet_id = id;
         self.sync_active_sheet_cache();
         self.cursor = SheetCursor {
@@ -16142,6 +16187,19 @@ mod tests {
         use ratatui::Terminal;
 
         let mut app = App::new(None);
+        // Fresh Apps now carry built-in margin TOTAL seeds; this test needs
+        // a blank slate (verdicts below unchanged), so clear them.
+        app.state.grid.set(
+            &CellAddr::Footer { row: 0, col: ColumnAddr::Left(MARGIN_COLS - 1) },
+            "".into(),
+        );
+        app.state.grid.set(
+            &CellAddr::Header {
+                row: (HEADER_ROWS - 1) as u32,
+                col: ColumnAddr::Right(0),
+            },
+            "".into(),
+        );
         app.state.grid.set_main_size(1, 4);
         app.state
             .grid
@@ -16624,6 +16682,19 @@ mod tests {
         use ratatui::Terminal;
 
         let mut app = App::new(None);
+        // Fresh Apps now carry built-in margin TOTAL seeds; this test needs
+        // a blank slate (verdicts below unchanged), so clear them.
+        app.state.grid.set(
+            &CellAddr::Footer { row: 0, col: ColumnAddr::Left(MARGIN_COLS - 1) },
+            "".into(),
+        );
+        app.state.grid.set(
+            &CellAddr::Header {
+                row: (HEADER_ROWS - 1) as u32,
+                col: ColumnAddr::Right(0),
+            },
+            "".into(),
+        );
         app.state.grid.set_main_size(3, 2);
 
         // Position cursor at header ~15 (logical row HEADER_ROWS - 15).
@@ -17179,6 +17250,19 @@ mod tests {
         use ratatui::Terminal;
 
         let mut app = App::new(None);
+        // Fresh Apps now carry built-in margin TOTAL seeds; this test needs
+        // a blank slate (verdicts below unchanged), so clear them.
+        app.state.grid.set(
+            &CellAddr::Footer { row: 0, col: ColumnAddr::Left(MARGIN_COLS - 1) },
+            "".into(),
+        );
+        app.state.grid.set(
+            &CellAddr::Header {
+                row: (HEADER_ROWS - 1) as u32,
+                col: ColumnAddr::Right(0),
+            },
+            "".into(),
+        );
         app.state.grid.set_main_size(3, 2);
         app.state
             .grid
