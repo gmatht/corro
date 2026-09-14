@@ -1,11 +1,25 @@
-v0.6.0 Release Artifacts
+v0.7.0 Release Artifacts
 
 | Artifact         | Platform         | Profile  | PGO |
 |------------------|------------------|----------|-----|
 | corro.gz         | Linux x86_64     | release  | yes |
+| corro-no-gui.gz  | Linux x86_64     | release  | no  |
+| gcorro.gz        | Linux x86_64     | release  | no  |
 | corro-tiny.gz    | Linux x86_64     | tiny     | no  |
 | corro-arm.gz     | Linux armv7hf    | release  | no  |
 | corro-aarch64.gz | Linux aarch64    | release  | yes |
 | corro.exe.zip    | Windows x86_64   | release  | no  |
 | corro-x86.exe.zip| Windows x86      | release  | no  |
 | corro-osx.gz     | macOS aarch64    | release  | yes |
+| corro-no-gui-win95.exe.zip | Windows 95 (i586) | win95/pancurses TUI | no |
+| gcorro-win95.exe.zip      | Windows 95 (i586) | win95/nwg GUI       | no |
+
+Notes
+- corro-no-gui.gz is the default-feature terminal build (same binary as
+  corro.gz, kept under both names for continuity); gcorro.gz adds the GTK
+  GUI backend (GTK itself is runtime-dlopen, never linked).
+- The Win95 zips are built locally (rust9x toolchain + VC6 libs + zig are
+  not available on CI runners); see scripts/package-win95-release.sh.
+  Inner names: corro.exe (pancurses TUI) and gcorro.exe (GUI, selected by
+  argv[0] dispatch). unicows.dll is NOT bundled (licensing); the zips
+  carry a README95.txt pointing at Microsoft's unicows redistributable.

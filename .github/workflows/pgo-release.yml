@@ -204,6 +204,84 @@ jobs:
         with:
           files: corro-aarch64.gz
 
+  # ── Linux x86_64 terminal (no GUI): release, old-glibc link ──────────
+  # corro-no-gui.gz is the default-feature TUI build. It is linked through
+  # zig targeting glibc 2.17 (tools/zig-cc-gnu217) so the same asset runs on
+  # old distros incl. CentOS 7: a plain link on the ubuntu-latest runner
+  # would tag symbols up to the runner's glibc and refuse to start there.
+  # No PGO (keeps the job self-contained); see docs/binaries.txt.
+  build-linux-nogui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install zig
+        run: |
+          ZIG_VERSION=0.15.1
+          curl -sL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz
+          tar -xf /tmp/zig.tar.xz -C /tmp
+          echo "/tmp/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+
+      - name: Build (zig-linked for glibc 2.17)
+        run: |
+          export ZIG=zig
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$PWD/tools/zig-cc-gnu217" \
+            cargo build --release
+          BIN=target/release/corro
+          # fail the job if the binary needs anything newer than glibc 2.17
+          if objdump -T "$BIN" | grep -oE "GLIBC_[0-9.]+" | sort -Vu | tail -1 | grep -qE "GLIBC_2\.([3-9][0-9]|[0-9]{3,})"; then
+            echo "error: binary requires glibc newer than 2.17" >&2
+            exit 1
+          fi
+
+      - name: Strip and compress
+        run: |
+          strip target/release/corro
+          7z a -mx=9 -tgzip corro-no-gui.gz target/release/corro
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: corro-no-gui.gz
+
+  # ── Linux x86_64 GUI (GTK backend): release (no PGO) ──────────────────
+  # gcorro.gz is the --features gtk build, renamed so argv[0] dispatch
+  # selects the GUI. GTK itself is never linked (runtime dlopen via
+  # gtk_dynamic_loader), so no system GTK dev packages are needed to build.
+  build-linux-gcorro:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install zig
+        run: |
+          ZIG_VERSION=0.15.1
+          curl -sL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz
+          tar -xf /tmp/zig.tar.xz -C /tmp
+          echo "/tmp/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+
+      - name: Build (zig-linked for glibc 2.17; GTK stays runtime-dlopen)
+        run: |
+          export ZIG=zig
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$PWD/tools/zig-cc-gnu217" \
+            cargo build --release --features gtk
+
+      - name: Strip and compress
+        run: |
+          strip target/release/corro
+          cp target/release/corro gcorro
+          7z a -mx=9 -tgzip gcorro.gz gcorro
+          rm -f gcorro
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: gcorro.gz
+
   # ── Windows x86_64: release (no PGO) ─────────────────────────────────
   build-windows-x64:
     runs-on: windows-latest

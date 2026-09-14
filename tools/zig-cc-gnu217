@@ -1,0 +1,23 @@
+#!/bin/sh
+# zig-cc wrapper: link Rust binaries against old-glibc (CentOS 7 = glibc 2.17)
+# system libraries while compiling on a modern host.
+#
+#   CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=/path/to/zig-cc-gnu217 \
+#       cargo build --target x86_64-unknown-linux-gnu
+#
+# Why: linking a Rust binary on a modern distro tags its undefined symbols
+# with the HOST libc's default symbol versions (e.g. __libc_start_main@2.34,
+# pthread_create@2.34, stat64@2.33), so the binary refuses to start on older
+# systems even though the code itself only needs old ABIs (rustc's prebuilt
+# std caps at GLIBC 2.16, newer entry points are referenced weakly with
+# runtime fallbacks). zig ships libc headers + crt objects for every glibc
+# version, so linking through `zig cc -target x86_64-linux-gnu.2.17` tags
+# everything at <= 2.17 and the binary runs on CentOS 7 (glibc 2.17,
+# kernel 3.10). Verify with:
+#   objdump -T <binary> | grep -oE "GLIBC_[0-9.]+" | sort -Vu | tail -1
+# (must print GLIBC_2.17 or older).
+#
+# This mirrors tools/zig-cc-msvc586 (the Win95 PDCurses C wrapper).
+set -eu
+ZIG=${ZIG:-/snap/bin/zig}
+exec "$ZIG" cc --target=x86_64-linux-gnu.2.17 "$@"

@@ -1,3 +1,17 @@
+0.7.0 Windows 95 support; new release artifacts
+      - Pancurses TUI backend renders and takes input on Windows 95
+        (PDCurses win32 console flavor, ANSI APIs; wait-based input poll;
+        key-code mapping for non-WIDE PDCurses). Ships as
+        corro-no-gui-win95.exe.zip.
+      - Native Windows GUI (nwg) backend builds for Windows 95
+        (/SUBSYSTEM:WINDOWS, WinMain entry). Ships as gcorro-win95.exe.zip.
+      - Busybox-style argv[0] dispatch: gcorro* prefers the GUI,
+        pcorro* the pancurses UI; explicit flags always win.
+      - Linux release artifacts: gcorro.gz (GTK GUI, runtime-dlopen) and
+        corro-no-gui.gz (terminal UI) alongside corro.gz.
+      - Win95 runtime note: rust9x exes need unicows.dll next to the exe
+        (or in C:\WINDOWS\SYSTEM); it is not bundled (see README95).
+
 0.5.0 All features intended for 1.0.0 at least partially work
       - Export functions are still largely work
       - Balance Books function implemented 
