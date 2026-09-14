@@ -13,6 +13,8 @@
 //! Run on Windows with: cargo test --test fx_bar_nwg_cram
 #![cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
 
+use native_windows_gui as nwg;
+
 use std::time::{Duration, Instant};
 
 fn rect_of(hwnd: *mut std::os::raw::c_void) -> Option<(i32, i32, i32, i32)> {
