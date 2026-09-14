@@ -5,7 +5,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Status label
     let status_label = app.create_label("Ready")?;
-    let label = status_label.clone();
 
     // Build simple menu bar items
     let mut file_menu = app.create_menu()?;

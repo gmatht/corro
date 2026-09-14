@@ -27,6 +27,7 @@ use corro::gui::actions::{
     dispatch_menu_action, menu_action_needs_prompt, run_prompt_action, MenuDispatch,
 };
 use corro::gui::menu::{action_kind_to_name, menu_bar, MenuAction, MenuActionKind};
+use corro::gui::special_picker;
 use corro::gui::App;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -86,6 +87,7 @@ fn dispatch_hint(d: &MenuDispatch) -> &'static str {
     match d {
         MenuDispatch::Status(_) => "Status",
         MenuDispatch::Prompt(..) => "Prompt",
+        MenuDispatch::SpecialPicker => "SpecialPicker",
         MenuDispatch::Edit { .. } => "Edit",
         MenuDispatch::About { .. } => "About",
         MenuDispatch::HelpFull { .. } => "HelpFull",
@@ -243,7 +245,8 @@ fn prompt_actions_run_cleanly() {
         ("rename_sheet", "Renamed"),
         ("copy_sheet", "CopyOf"),
         ("delete_sheet", "Renamed"),
-        ("insert_special_chars", "Ω"),
+        // NOTE: insert_special_chars is not free-text: it opens the
+        // 10-choice picker (see special_picker_routing + special_char_parity).
         ("insert_hyperlink", "https://example.com"),
         ("sort_view", "A,"),
         ("persist_sort", "A!"),
@@ -467,7 +470,8 @@ fn gui_routing_covers_every_menu_item() {
         "set_max_col_width",
         "copy_sheet",
         "go_to_cell",
-        "insert_special_chars",
+        // NOTE: insert_special_chars is picker-gated, not prompt-gated
+        // (see special_picker_routing + special_char_parity).
         "insert_hyperlink",
         "sort_view",
         "persist_sort",
@@ -546,6 +550,41 @@ fn gui_routing_covers_every_menu_item() {
     );
 }
 
+/// Insert > Special Char is picker-gated, not prompt-gated: the shared layer
+/// offers no free-text prompt for it, dispatch opens shared picker state,
+/// and the rows/digits/clamp match the ratatui reference. Guards the
+/// classification the old free-text dialog depended on (see
+/// special_char_parity for the end-to-end gesture equivalence).
+#[test]
+fn special_picker_routing() {
+    assert_eq!(
+        menu_action_needs_prompt("insert_special_chars"),
+        None,
+        "insert_special_chars must not be a free-text prompt"
+    );
+    let mut app = seeded_app(None);
+    let mut scope = 0u8;
+    let mut clipboard = String::new();
+    match dispatch_menu_action(&mut app, "insert_special_chars", &mut scope, &mut clipboard) {
+        MenuDispatch::SpecialPicker => {}
+        d => panic!("insert_special_chars must dispatch SpecialPicker, got {}", dispatch_hint(&d)),
+    }
+    assert_eq!(special_picker::index(&app), Some(0), "dispatch opens on the first choice");
+    let rows = special_picker::items();
+    assert_eq!(rows.len(), 10);
+    assert_eq!((rows[0].as_str(), rows[2].as_str(), rows[9].as_str()), ("1: ∞", "3: Ω", "0: θ"));
+    // Down*2 + take commits the 3rd choice; digits map 1:1 with the reference.
+    special_picker::step(&mut app, 1);
+    special_picker::step(&mut app, 1);
+    assert_eq!(special_picker::take(&mut app), Some("Ω".to_string()));
+    assert_eq!(special_picker::index(&app), None, "take closes the picker");
+    special_picker::open(&mut app);
+    special_picker::set(&mut app, 99);
+    assert_eq!(special_picker::take(&mut app), Some("θ".to_string()), "out-of-range clamps to last");
+    assert_eq!(special_picker::index_for_digit('3'), Some(2));
+    assert_eq!(special_picker::index_for_digit('0'), Some(9));
+}
+
 /// The ratatui reference menu tables and the shared `gui::menu::menu_bar()`
 /// tree must enumerate the same items with the same shortcut letters, or the
 /// backends' menus have drifted (same labels, same mnemonics everywhere).
@@ -569,7 +608,9 @@ fn ratatui_and_gui_menus_enumerate_the_same_items() {
             }
         }
     }
-    // Skip the six roots (File/Edit/... carry no shortcut in either model).
+    // Skip the six roots (their shortcuts live outside both models: the
+    // ratatui reference opens sections by letter directly, while only the
+    // Format root carries a tree shortcut (R) for GUI mnemonics).
     let mut nodes: Vec<(String, String)> = Vec::new();
     for root in menu_bar() {
         if let Some(sub) = root.submenu.as_deref() {

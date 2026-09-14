@@ -8,7 +8,10 @@ pub mod common;
 // Shared backend-agnostic model types at the crate root (menu model,
 // events, actions, sizers, message boxes). Backends and apps refer to
 // these as `crate::MenuItem` etc.; never put app-specific content here.
-pub use core::{Action, Align, CallbackResult, Event, MessageBoxKind, MessageBoxResult, MenuItem, Sizer, SizerChild, SizerFlags};
+pub use core::{Action, Align, CallbackResult, Event, LayoutDir, Label, MessageBoxKind, MessageBoxResult, MenuItem, Sizer, SizerChild, SizerFlags};
+// i18n mechanism (deferred labels + translator hook). No translated text lives
+// in this crate; the app owns the catalog.
+pub use core::{locale_is_rtl, set_layout_direction, set_layout_direction_hook, set_translator, tr};
 pub mod spreadsheet;
 pub mod overflow;
 
@@ -17,6 +20,9 @@ pub mod overflow;
 #[cfg(feature = "gtk")]
 pub use gtk_dynamic_loader;
 pub mod lifecycle_stress;
+/// Portable Win32-backend helpers (pure logic + tests, host-independent).
+/// Public so host apps can share the Windows-input predicates.
+pub mod win32_portable;
 pub mod backends;
 #[cfg(all(feature = "gtk4-rs", target_os = "linux", not(feature = "zork")))]
 pub mod backends_gtk_adapter {

@@ -415,10 +415,10 @@ fn screenshot(wid: &str, tag: &str) -> PathBuf {
 }
 
 /// Selection-tint census of a screenshot, via an inline python3+PIL script.
-/// Prints `marker_y sel_total sel_max_x sel_below_cutoff cursor_blue`.
+/// Prints `marker_y sel_total sel_max_x sel_below_cutoff`.
 /// Colors (cairo rounds halves up): selection fill (0.9,0.95,1.0) renders as
 /// (230,243,255); cursor fill (0.8,0.9,1.0) as (204,230,255); the canvas
-/// test marker is (254,237,190); the cursor border core is (0,102,204).
+/// test marker is (254,237,190).
 const SEL_ANALYZER: &str = r#"
 import sys
 from PIL import Image
@@ -431,7 +431,7 @@ SEL = (230, 243, 255)
 BLUE = (0, 102, 204)
 my = [y for y in range(H) for x in range(0, W, 4) if px[x, y] == MARK]
 marker_y = min(my) if my else -1
-sel_total = sel_max_x = sel_below = blue = 0
+sel_total = sel_max_x = sel_below = 0
 for y in range(H):
     for x in range(0, W, 2):
         c = px[x, y]
@@ -439,9 +439,7 @@ for y in range(H):
             sel_total += 1
             if x > sel_max_x: sel_max_x = x
             if y > y_cut: sel_below += 1
-        elif c == BLUE:
-            blue += 1
-print(f"{marker_y} {sel_total} {sel_max_x} {sel_below} {blue}")
+print(f"{marker_y} {sel_total} {sel_max_x} {sel_below}")
 "#;
 
 struct SelCensus {
@@ -449,7 +447,6 @@ struct SelCensus {
     sel_total: i32,
     sel_max_x: i32,
     sel_below: i32,
-    blue: i32,
 }
 
 fn analyze_selection(png: &PathBuf, y_cut: i32) -> SelCensus {
@@ -467,8 +464,8 @@ fn analyze_selection(png: &PathBuf, y_cut: i32) -> SelCensus {
     let _ = std::fs::remove_file(&script);
     let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
     let p: Vec<i32> = text.split_whitespace().map(|s| s.parse().expect("ints")).collect();
-    assert_eq!(p.len(), 5, "bad analyzer output: {text:?}");
-    SelCensus { marker_y: p[0], sel_total: p[1], sel_max_x: p[2], sel_below: p[3], blue: p[4] }
+    assert_eq!(p.len(), 4, "bad analyzer output: {text:?}");
+    SelCensus { marker_y: p[0], sel_total: p[1], sel_max_x: p[2], sel_below: p[3] }
 }
 
 /// Plain arrows must move WITHOUT painting a selection band (the anchor

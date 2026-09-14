@@ -234,9 +234,7 @@ checksum = "fd16c4719339c4530435d38e511904438d07cce7950afa3718a84ac36c10e89e"
 
 [[package]]
 name = "chrono"
-version = "0.4.45"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
+version = "0.4.44"
 dependencies = [
  "iana-time-zone",
  "num-traits",
@@ -1248,7 +1246,6 @@ dependencies = [
 name = "gtk_dynamic_loader"
 version = "0.1.0"
 dependencies = [
- "gtk4 0.12.0-alpha",
  "libc",
  "libloading 0.8.9",
  "thiserror 1.0.69",
@@ -3125,7 +3122,3 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
-
-[[patch.unused]]
-name = "chrono"
-version = "0.4.44"

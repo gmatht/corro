@@ -601,10 +601,8 @@ impl Op {
                 let count_us = *count as usize;
                 let remainder = er.saturating_sub(from_us).saturating_sub(count_us);
                 if remainder > 0 {
-                    let mc = state.grid.main_cols();
                     crate::formula::repair_all_formulas_after_main_row_insert(
                         &mut state.grid,
-                        mc,
                         *from,
                         remainder as u32,
                         None,
@@ -703,21 +701,24 @@ impl Op {
                 if remainder > 0 {
                     crate::formula::repair_all_formulas_after_main_row_insert(
                         &mut state.grid,
-                        mc,
                         dest_row as u32,
                         remainder as u32,
                         None,
                     );
                 }
-                for (addr, value) in copied_cells {
-                    let pasted = if is_formula_text(&value) {
-                        crate::formula::translate_formula_text_by_offset(&value, 1, 0, mc)
-                            .unwrap_or_else(|| value.clone())
-                    } else {
-                        value.clone()
-                    };
-                    state.grid.set(&addr, pasted);
-                }
+                let pasted_cells: Vec<(CellAddr, String)> = copied_cells
+                    .into_iter()
+                    .map(|(addr, value)| {
+                        let pasted = if is_formula_text(&value) {
+                            crate::formula::translate_formula_text_by_offset(&value, 1, 0, mc)
+                                .unwrap_or_else(|| value.clone())
+                        } else {
+                            value.clone()
+                        };
+                        (addr, pasted)
+                    })
+                    .collect();
+                state.grid.set_many(pasted_cells);
                 state.grid.bump_volatile_seed();
             }
             Op::DuplicateRowRange { row_start, row_end } => {
@@ -782,7 +783,6 @@ impl Op {
                 if remainder > 0 {
                     crate::formula::repair_all_formulas_after_main_row_insert(
                         &mut state.grid,
-                        mc,
                         dest as u32,
                         remainder as u32,
                         None,
@@ -790,15 +790,19 @@ impl Op {
                 }
 
                 // Paste copied cells with relative formula translation
-                for (addr, value) in copied_cells {
-                    let pasted = if is_formula_text(&value) {
-                        crate::formula::translate_formula_text_by_offset(&value, count as i32, 0, mc)
-                            .unwrap_or_else(|| value.clone())
-                    } else {
-                        value.clone()
-                    };
-                    state.grid.set(&addr, pasted);
-                }
+                let pasted_cells: Vec<(CellAddr, String)> = copied_cells
+                    .into_iter()
+                    .map(|(addr, value)| {
+                        let pasted = if is_formula_text(&value) {
+                                crate::formula::translate_formula_text_by_offset(&value, count as i32, 0, mc)
+                                    .unwrap_or_else(|| value.clone())
+                        } else {
+                            value.clone()
+                        };
+                        (addr, pasted)
+                    })
+                    .collect();
+                state.grid.set_many(pasted_cells);
                 state.grid.bump_volatile_seed();
             }
             // No-op for Undo here; it's handled in UI layer by applying the
@@ -909,15 +913,19 @@ impl Op {
                         None,
                     );
                 }
-                for (addr, value) in copied_cells {
-                    let pasted = if is_formula_text(&value) {
-                        crate::formula::translate_formula_text_by_offset(&value, 0, 1, mc)
-                            .unwrap_or_else(|| value.clone())
-                    } else {
-                        value.clone()
-                    };
-                    state.grid.set(&addr, pasted);
-                }
+                let pasted_cells: Vec<(CellAddr, String)> = copied_cells
+                    .into_iter()
+                    .map(|(addr, value)| {
+                        let pasted = if is_formula_text(&value) {
+                                crate::formula::translate_formula_text_by_offset(&value, 0, 1, mc)
+                                    .unwrap_or_else(|| value.clone())
+                        } else {
+                            value.clone()
+                        };
+                        (addr, pasted)
+                    })
+                    .collect();
+                state.grid.set_many(pasted_cells);
                 state.grid.bump_volatile_seed();
             }
             Op::DuplicateColRange { col_start, col_end } => {
@@ -1011,15 +1019,19 @@ let start = *col_start as usize;
                 }
 
                 // Paste copied cells with formula translation
-                for (addr, value) in copied_cells {
-                    let pasted = if is_formula_text(&value) {
-                        crate::formula::translate_formula_text_by_offset(&value, 0, count as i32, mc)
-                            .unwrap_or_else(|| value.clone())
-                    } else {
-                        value.clone()
-                    };
-                    state.grid.set(&addr, pasted);
-                }
+                let pasted_cells: Vec<(CellAddr, String)> = copied_cells
+                    .into_iter()
+                    .map(|(addr, value)| {
+                        let pasted = if is_formula_text(&value) {
+                                crate::formula::translate_formula_text_by_offset(&value, 0, count as i32, mc)
+                                    .unwrap_or_else(|| value.clone())
+                        } else {
+                            value.clone()
+                        };
+                        (addr, pasted)
+                    })
+                    .collect();
+                state.grid.set_many(pasted_cells);
                 for (addr, value) in header_footer_cells {
                     state.grid.set(&addr, value);
                 }
@@ -1050,13 +1062,15 @@ let start = *col_start as usize;
                 state.grid.bump_volatile_seed();
             }
             Op::FillRange { cells } => {
-                for (addr, value) in cells {
-                    state.grid.set(addr, value.clone());
-                }
+                // One auto-fit per touched column (ALGORITHMS.md §2.2).
+                let owned: Vec<(CellAddr, String)> =
+                    cells.iter().map(|(a, v)| (a.clone(), v.clone())).collect();
+                state.grid.set_many(owned);
                 state.grid.bump_volatile_seed();
             }
             Op::RelFillRange { range, value } => {
                 let original_main_cols = state.grid.main_cols();
+                state.grid.suspend_auto_fit();
                 for r in range.row_start..range.row_end {
                     for c in range.col_start..range.col_end {
                         let row_delta = r as i32 - range.row_start as i32;
@@ -1066,6 +1080,7 @@ let start = *col_start as usize;
                         state.grid.set(&addr, v);
                     }
                 }
+                state.grid.resume_auto_fit();
                 state.grid.bump_volatile_seed();
             }
             Op::CopyFromTo { source, target } => {
@@ -1091,9 +1106,7 @@ let start = *col_start as usize;
                         cells.push((dst, state.grid.get(&src).unwrap_or_else(|| "".to_string())));
                     }
                 }
-                for (addr, value) in cells {
-                    state.grid.set(&addr, value);
-                }
+                state.grid.set_many(cells);
                 state.grid.bump_volatile_seed();
             }
             Op::SetMaxColWidth { width } => {

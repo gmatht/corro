@@ -1024,3 +1024,47 @@ fn gui_footer_commit_past_ring() {
     );
     let _ = std::fs::remove_file(&path);
 }
+
+/// Fx-bar entry must show everything typed: type a wide string into the
+/// focused formula entry and OCR the bar. A crammed entry (the reported nwg
+/// shape: fixed-small, labels piled left) clips the text; a correctly
+/// expanded entry shows it all. Guards the app-side wiring (append order +
+/// expand flags) shared by every GUI backend.
+#[test]
+fn gui_fx_bar_entry_shows_typed_text() {
+    let _guard = GUI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut child, wid, path) = start_new_doc_app("fxtext");
+    xdotool(&["windowsize", &wid, "1200", "800"]);
+    std::thread::sleep(Duration::from_millis(600));
+    // The formula entry holds keyboard focus from setup: typing lands there.
+    xdotool(&["type", "--window", &wid, "HELLO WORLD"]);
+    std::thread::sleep(Duration::from_millis(800));
+    let shot = screenshot(&wid, "fxtext");
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let crop = std::env::temp_dir().join(format!("corro-fhdr-fxcrop-{id}.png"));
+    let out = Command::new("convert")
+        .arg(&shot)
+        .args(["-crop", "1100x26+50+22", "+repage", "-resize", "300%"])
+        .arg(&crop)
+        .output()
+        .expect("convert crop");
+    assert!(out.status.success(), "convert crop failed");
+    let _ = std::fs::remove_file(&shot);
+    let out = Command::new("tesseract")
+        .arg(&crop)
+        .arg("stdout")
+        .args(["--psm", "7"])
+        .output()
+        .expect("tesseract");
+    let _ = std::fs::remove_file(&crop);
+    let text: String = String::from_utf8_lossy(&out.stdout)
+        .chars()
+        .filter(|c| c.is_ascii_alphabetic())
+        .collect();
+    assert!(
+        text.contains("HELLOWORLD"),
+        "typed text must show fully in the entry (a crammed entry clips it; ocr: {text:?})"
+    );
+    let _ = child.kill();
+    let _ = std::fs::remove_file(&path);
+}

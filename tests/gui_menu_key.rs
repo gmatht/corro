@@ -170,6 +170,22 @@ fn analyze_popup(png: &PathBuf) -> (i32, i32, i32, i32) {
     (p[0], p[1], p[2], p[3])
 }
 
+/// Top-left (x, y) of an X window id.
+fn win_xy(id: &str) -> (i32, i32) {
+    let g = xdotool(&["getwindowgeometry", "--shell", id]);
+    let mut x = -1;
+    let mut y = -1;
+    for l in g.lines() {
+        if let Some(v) = l.strip_prefix("X=") {
+            x = v.trim().parse().unwrap_or(-1);
+        }
+        if let Some(v) = l.strip_prefix("Y=") {
+            y = v.trim().parse().unwrap_or(-1);
+        }
+    }
+    (x, y)
+}
+
 /// Drive Alt+<letter>, assert the submenu popup appears visibly with menu
 /// structure, then activate an item by clicking it (synthetic key events
 /// cannot drive GTK's grab-based menu dismissal/navigation, so activation by
@@ -179,6 +195,11 @@ fn analyze_popup(png: &PathBuf) -> (i32, i32, i32, i32) {
 enum Expect {
     Quit,
     Dialog(String),
+    /// The click must expand a nested submenu: a second popup appears to
+    /// the right of the first. Proves the open menu is real and functional
+    /// for menus whose leaves apply silently (Format▸Reset has no
+    /// quit/dialog aftermath to assert on).
+    NestedOpens,
 }
 
 fn alt_opens_menu(letter: &str, min_text_px: i32, item_frac: f64, expect: Expect) {
@@ -284,6 +305,35 @@ fn alt_opens_menu(letter: &str, min_text_px: i32, item_frac: f64, expect: Expect
         "1",
     ]);
     match expect {
+        Expect::NestedOpens => {
+            // A second popup must appear (deadline, not sleep), positioned
+            // right of its parent: submenu expansion, not a stray window.
+            let deadline = Instant::now() + Duration::from_secs(8);
+            let nested = loop {
+                let found = popup_candidates(pid, &wid);
+                if found.len() >= 2 {
+                    break found;
+                }
+                if Instant::now() > deadline {
+                    let _ = child.kill();
+                    panic!("Alt+{letter} submenu did not expand after item click");
+                }
+                std::thread::sleep(Duration::from_millis(150));
+            };
+            let (px, _) = win_xy(&popup);
+            let extra: Vec<&String> =
+                nested.iter().filter(|id| *id != &popup).collect();
+            assert!(
+                !extra.is_empty(),
+                "Alt+{letter} expansion produced no new popup"
+            );
+            let (nx, _) = win_xy(extra[0]);
+            assert!(
+                nx > px,
+                "Alt+{letter} nested popup at x={nx} is not right of its parent at x={px}"
+            );
+            let _ = child.kill();
+        }
         Expect::Quit => {
             // The app must quit within a deadline (kill would mask it).
             let deadline = Instant::now() + Duration::from_secs(8);
@@ -344,4 +394,13 @@ fn gui_alt_f_opens_file_menu() {
 fn gui_alt_e_opens_edit_menu() {
     // Find is item 4 of 7; its dialog proves activation.
     alt_opens_menu("e", 90, 3.5 / 7.0, Expect::Dialog("Find".into()));
+}
+
+/// Alt+R must open the Format menu visibly (root shortcut R disambiguates
+/// File &F vs Format &F so Alt+F uniquely opens File). Scope is item 1 of
+/// 4; clicking it must expand the nested Scope submenu to the right.
+/// Text threshold scales with item count (4 items vs Edit's 7 at 90px).
+#[test]
+fn gui_alt_r_opens_format_menu() {
+    alt_opens_menu("r", 50, 0.5 / 4.0, Expect::NestedOpens);
 }

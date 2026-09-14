@@ -2,11 +2,12 @@
 //! Main and margin cells use sparse storage for unbounded logical size.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::formula::{parse_numeric_or_date_literal, Number};
+use crate::formula::{is_formula, parse_numeric_or_date_literal, Number};
 
 pub const HEADER_ROWS: usize = 999_999_999;
 pub const FOOTER_ROWS: usize = 999_999_999;
@@ -53,7 +54,7 @@ pub type MarginIndex = usize;
 /// Objective column address that identifies a column independently of current
 /// `main_cols`.  Once constructed, the same variant + index always refers to
 /// the same logical column regardless of grid resizing.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
 pub enum ColumnAddr {
     /// Left‑margin column (`[{letter}` in UI).  Index is 0‑based margin‑relative.
     Left(usize),
@@ -302,6 +303,108 @@ pub trait GridImpl {
     // Iteration
     fn iter_nonempty(&self) -> Box<dyn Iterator<Item = (CellAddr, String)> + '_>;
 
+    /// Borrowed iteration over stored cells (ALGORITHMS.md §1): same visit
+    /// order as `iter_nonempty`, without cloning every value. Hot paths that
+    /// filter (e.g. formula scans) must prefer this.
+    fn for_each_nonempty(&self, f: &mut dyn FnMut(&CellAddr, &str)) {
+        for (addr, val) in self.iter_nonempty() {
+            f(&addr, &val);
+        }
+    }
+
+    /// Occupied-row summary without per-row full scans (ALGORITHMS.md §2.4).
+    /// Default: derived by scanning; `Grid` serves it from its index.
+    fn content_summary(&self) -> GridContentSummary {
+        let mut summary = GridContentSummary::default();
+        let mut all = BTreeSet::new();
+        let mut main_right = BTreeSet::new();
+        self.for_each_nonempty(&mut |addr, _| {
+            match addr {
+                CellAddr::Header { row, .. } => summary.header_rows.push(*row),
+                CellAddr::Footer { row, .. } => summary.footer_rows.push(*row),
+                CellAddr::Main { row, .. } => {
+                    all.insert(*row as usize);
+                    main_right.insert(*row as usize);
+                }
+                CellAddr::Left { row, .. } => {
+                    all.insert(*row as usize);
+                }
+                CellAddr::Right { row, .. } => {
+                    all.insert(*row as usize);
+                    main_right.insert(*row as usize);
+                }
+            }
+        });
+        summary.header_rows.sort_unstable();
+        summary.header_rows.dedup();
+        summary.footer_rows.sort_unstable();
+        summary.footer_rows.dedup();
+        summary.main_rows_all = all.into_iter().collect();
+        summary.main_rows_main_right = main_right.into_iter().collect();
+        summary
+    }
+
+    /// Suspend per-write auto-fit scans; touched columns fit once on resume.
+    /// Default: no-op (immediate fitting). Nesting-safe where implemented.
+    fn suspend_auto_fit(&mut self) {}
+    fn resume_auto_fit(&mut self) {}
+
+    /// Write many cells, fitting each touched column once (ALGORITHMS.md §2.2).
+    /// Default: sequential `set` calls.
+    fn set_many(&mut self, cells: Vec<(CellAddr, String)>) {
+        for (addr, value) in cells {
+            self.set(&addr, value);
+        }
+    }
+
+    /// Stored main-cell count, O(1) where indexed (ALGORITHMS.md §2.6).
+    fn stored_main_count(&self) -> usize {
+        let mut n = 0usize;
+        self.for_each_nonempty(&mut |addr, _| {
+            if matches!(addr, CellAddr::Main { .. }) {
+                n += 1;
+            }
+        });
+        n
+    }
+
+    /// Stored formula-cell count, O(1) where indexed (ALGORITHMS.md §2.5).
+    /// Same predicate `refresh_spills` scans for.
+    fn formula_cell_count(&self) -> usize {
+        let mut n = 0usize;
+        self.for_each_nonempty(&mut |_, raw| {
+            if crate::formula::is_formula(raw) {
+                n += 1;
+            }
+        });
+        n
+    }
+
+    /// Evaluation plan for one main-range scan (ALGORITHMS.md §2.6).
+    /// Default: all coordinates unknown, templates assumed (dense loop).
+    fn main_range_eval_plan(&self, range: &MainRange) -> MainRangeEvalPlan {
+        let mut stored_sorted = Vec::new();
+        self.for_each_nonempty(&mut |addr, _| {
+            if let CellAddr::Main { row, col } = addr {
+                if range.contains(*row, *col) {
+                    stored_sorted.push((*row, *col));
+                }
+            }
+        });
+        for (addr, _) in self.spill_followers() {
+            if let CellAddr::Main { row, col } = addr {
+                if range.contains(row, col) && !stored_sorted.contains(&(row, col)) {
+                    stored_sorted.push((row, col));
+                }
+            }
+        }
+        stored_sorted.sort_unstable();
+        MainRangeEvalPlan {
+            stored_sorted,
+            has_template: !range.is_empty(),
+        }
+    }
+
     // Clone trait-object helper
     fn clone_box(&self) -> Box<dyn GridImpl>;
 }
@@ -535,6 +638,38 @@ impl GridBox {
     pub fn iter_nonempty(&self) -> Box<dyn Iterator<Item = (CellAddr, String)> + '_> {
         self.inner.iter_nonempty()
     }
+
+    pub fn for_each_nonempty(&self, f: &mut dyn FnMut(&CellAddr, &str)) {
+        self.inner.for_each_nonempty(f)
+    }
+
+    pub fn content_summary(&self) -> GridContentSummary {
+        self.inner.content_summary()
+    }
+
+    pub fn suspend_auto_fit(&mut self) {
+        self.inner.suspend_auto_fit()
+    }
+
+    pub fn resume_auto_fit(&mut self) {
+        self.inner.resume_auto_fit()
+    }
+
+    pub fn set_many(&mut self, cells: Vec<(CellAddr, String)>) {
+        self.inner.set_many(cells)
+    }
+
+    pub fn stored_main_count(&self) -> usize {
+        self.inner.stored_main_count()
+    }
+
+    pub fn formula_cell_count(&self) -> usize {
+        self.inner.formula_cell_count()
+    }
+
+    pub fn main_range_eval_plan(&self, range: &MainRange) -> MainRangeEvalPlan {
+        self.inner.main_range_eval_plan(range)
+    }
 }
 
 /// Inclusive-exclusive range in the **main** region (for aggregates).
@@ -589,8 +724,72 @@ pub enum FormatScope {
     Special,
 }
 
-/// Full sheet with sparse storage for each editable region.
+/// Occupancy summary derived from the primary cell maps (see `Grid`).
+/// Rows/cols listed here have at least one stored (non-spill) cell.
+/// Used to answer blank row/col and span queries without full-map scans.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GridContentSummary {
+    /// Sorted header-band row ids with content.
+    pub header_rows: Vec<u32>,
+    /// Sorted main-band row indices with main/left/right content.
+    pub main_rows_all: Vec<usize>,
+    /// Sorted main-band row indices with main/right content (no left-only rows).
+    pub main_rows_main_right: Vec<usize>,
+    /// Sorted footer-band row ids with content.
+    pub footer_rows: Vec<u32>,
+}
+
+/// Precomputed iteration strategy for one main-region range scan
+/// (ALGORITHMS.md §2.6): which stored cells to evaluate, and whether a
+/// dense area loop is required because templates could make stored-empty
+/// cells contribute.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MainRangeEvalPlan {
+    /// Stored main cells plus spill followers in the range, row-major.
+    /// Stored-empty cells outside this list provably contribute nothing:
+    /// they consume no budget, touch no visiting stack, and parse to
+    /// non-numeric — so skipping them preserves evaluation semantics.
+    pub stored_sorted: Vec<(u32, u32)>,
+    /// True if a header/right-margin/left-margin template could make a
+    /// stored-empty cell in the range evaluate to a value. Callers that
+    /// consult templates (aggregates, `SUM`) must use a dense loop then.
+    pub has_template: bool,
+}
+
+impl MainRange {
+    /// Cell count of the range area (saturating; empty ranges give 0).
+    pub fn area(&self) -> u64 {
+        if self.is_empty() {
+            return 0;
+        }
+        (self.row_end as u64 - self.row_start as u64)
+            .saturating_mul(self.col_end as u64 - self.col_start as u64)
+    }
+
+    /// True if `(row, col)` lies in the range.
+    pub fn contains(&self, row: u32, col: u32) -> bool {
+        row >= self.row_start && row < self.row_end && col >= self.col_start && col < self.col_end
+    }
+}
+
+/// Cached view-sort order (`Grid::sorted_main_rows`).
 #[derive(Clone, Debug, PartialEq, Eq)]
+struct SortCache {
+    specs: Vec<SortSpec>,
+    revision: u64,
+    order: Vec<usize>,
+}
+
+/// Full sheet with sparse storage for each editable region.
+///
+/// In addition to the primary cell maps, `Grid` maintains derived,
+/// incrementally updated indexes (see ALGORITHMS.md):
+/// - per-region row/column occupancy counts (`*_row_counts`, `*_col_counts`)
+///   so blank row/col probes are `O(log n)` instead of full-map scans;
+/// - `data_revision` + `sort_cache` so `sorted_main_rows` is computed once
+///   per mutation instead of once per caller per frame.
+/// Spill followers/errors are intentionally *not* counted as content.
+#[derive(Clone, Debug)]
 pub struct Grid {
     /// Main cells; absent key = empty.
     pub main_cells: HashMap<(u32, u32), String>,
@@ -626,7 +825,69 @@ pub struct Grid {
     min_extent_main_rows: u32,
     /// Cursor floor: never shrink extent_main_cols below this (0 = no floor).
     min_extent_main_cols: u32,
+    // --- Derived occupancy index (counts of stored cells; spills excluded) ---
+    main_row_counts: BTreeMap<u32, usize>,
+    main_col_counts: BTreeMap<u32, usize>,
+    left_row_counts: BTreeMap<u32, usize>,
+    left_col_counts: BTreeMap<usize, usize>,
+    right_row_counts: BTreeMap<u32, usize>,
+    right_col_counts: BTreeMap<usize, usize>,
+    header_row_counts: BTreeMap<u32, usize>,
+    header_col_counts: HashMap<ColumnAddr, usize>,
+    footer_row_counts: BTreeMap<u32, usize>,
+    footer_col_counts: HashMap<ColumnAddr, usize>,
+    /// Stored cells holding spreadsheet formulas (`is_formula`), across all
+    /// regions. Lets `refresh_spills` skip its fixpoint passes in O(1) when
+    /// there is nothing to evaluate (ALGORITHMS.md §2.5). Maintained in
+    /// `set`, recounted after bulk drops; moves never change it.
+    formula_cell_count: usize,
+    // --- Per-column content-width index (ALGORITHMS.md §2.2) ---
+    /// Global column → display-width (`chars + 1`) → stored-cell count.
+    /// Lets `auto_fit_column`/`content_width_for_column` read the max in
+    /// `O(log W)` instead of scanning the column in `O(R)`. Maintained
+    /// incrementally in `set`, rebuilt when global-column identities shift
+    /// (main-width resize/grow, column moves) or bulk drops happen.
+    col_content_widths: HashMap<usize, BTreeMap<usize, usize>>,
+    // --- Batched auto-fit deferral ---
+    /// Nesting depth of auto-fit suspension (see `suspend_auto_fit`).
+    auto_fit_suspend: u32,
+    /// Global columns touched while auto-fit is suspended.
+    auto_fit_pending: BTreeSet<usize>,
+    // --- View-sort cache ---
+    /// Bumped on every stored-content/extent/spill mutation.
+    data_revision: u64,
+    sort_cache: RefCell<Option<SortCache>>,
 }
+
+/// Equality is observable sheet state: primary maps, extents, widths,
+/// formats, spills and floors. Derived occupancy, batch-deferral state,
+/// revision counters and sort caches are intentionally excluded.
+impl PartialEq for Grid {
+    fn eq(&self, other: &Self) -> bool {
+        self.main_cells == other.main_cells
+            && self.extent_main_rows == other.extent_main_rows
+            && self.extent_main_cols == other.extent_main_cols
+            && self.left == other.left
+            && self.right == other.right
+            && self.max_col_width == other.max_col_width
+            && self.col_width_overrides == other.col_width_overrides
+            && self.view_sort_cols == other.view_sort_cols
+            && self.col_all_formats == other.col_all_formats
+            && self.col_data_formats == other.col_data_formats
+            && self.col_special_formats == other.col_special_formats
+            && self.cell_formats == other.cell_formats
+            && self.header == other.header
+            && self.footer == other.footer
+            && self.spill_followers == other.spill_followers
+            && self.spill_errors == other.spill_errors
+            && self.volatile_seed == other.volatile_seed
+            && self.spills_dirty == other.spills_dirty
+            && self.min_extent_main_rows == other.min_extent_main_rows
+            && self.min_extent_main_cols == other.min_extent_main_cols
+    }
+}
+
+impl Eq for Grid {}
 
 impl Default for Grid {
     fn default() -> Self {
@@ -657,8 +918,357 @@ impl Grid {
             spills_dirty: true,
             min_extent_main_rows: 0,
             min_extent_main_cols: 0,
+            main_row_counts: BTreeMap::new(),
+            main_col_counts: BTreeMap::new(),
+            left_row_counts: BTreeMap::new(),
+            left_col_counts: BTreeMap::new(),
+            right_row_counts: BTreeMap::new(),
+            right_col_counts: BTreeMap::new(),
+            header_row_counts: BTreeMap::new(),
+            header_col_counts: HashMap::new(),
+            footer_row_counts: BTreeMap::new(),
+            footer_col_counts: HashMap::new(),
+            formula_cell_count: 0,
+            col_content_widths: HashMap::new(),
+            auto_fit_suspend: 0,
+            auto_fit_pending: BTreeSet::new(),
+            data_revision: 0,
+            sort_cache: RefCell::new(None),
         };
         g
+    }
+
+    // ------------------------------------------------------------------
+    // Occupancy index (ALGORITHMS.md §1, §3)
+    // ------------------------------------------------------------------
+
+    fn occ_inc<K: Ord>(map: &mut BTreeMap<K, usize>, key: K) {
+        *map.entry(key).or_insert(0) += 1;
+    }
+
+    fn occ_dec<K: Ord>(map: &mut BTreeMap<K, usize>, key: &K) {
+        if let Some(cnt) = map.get_mut(key) {
+            *cnt -= 1;
+            if *cnt == 0 {
+                map.remove(key);
+            }
+        }
+    }
+
+    fn occ_inc_hash<K: Eq + std::hash::Hash>(map: &mut HashMap<K, usize>, key: K) {
+        *map.entry(key).or_insert(0) += 1;
+    }
+
+    fn occ_dec_hash<K: Eq + std::hash::Hash>(map: &mut HashMap<K, usize>, key: &K) {
+        if let Some(cnt) = map.get_mut(key) {
+            *cnt -= 1;
+            if *cnt == 0 {
+                map.remove(key);
+            }
+        }
+    }
+
+    /// Display width a stored value contributes (`chars + 1`), matching the
+    /// per-cell term in `content_width_for_column`.
+    fn display_width(value: &str) -> usize {
+        value.chars().count() + 1
+    }
+
+    fn width_inc(map: &mut HashMap<usize, BTreeMap<usize, usize>>, col: usize, w: usize) {
+        *map.entry(col).or_default().entry(w).or_insert(0) += 1;
+    }
+
+    fn width_dec(map: &mut HashMap<usize, BTreeMap<usize, usize>>, col: usize, w: usize) {
+        if let Some(buckets) = map.get_mut(&col) {
+            if let Some(cnt) = buckets.get_mut(&w) {
+                *cnt -= 1;
+                if *cnt == 0 {
+                    buckets.remove(&w);
+                }
+            }
+            if buckets.is_empty() {
+                map.remove(&col);
+            }
+        }
+    }
+
+    fn width_replace(
+        map: &mut HashMap<usize, BTreeMap<usize, usize>>,
+        col: usize,
+        old_w: usize,
+        new_w: usize,
+    ) {
+        if old_w != new_w {
+            Self::width_dec(map, col, old_w);
+            Self::width_inc(map, col, new_w);
+        }
+    }
+
+    /// Adjust the formula-cell counter for a write transition (`None` old =
+    /// fresh insert). Counts the same predicate `refresh_spills` scans for.
+    fn note_formula_replace(&mut self, old: Option<&String>, new_is_formula: bool) {
+        let old_is = old.is_some_and(|v| is_formula(v));
+        if old_is != new_is_formula {
+            if new_is_formula {
+                self.formula_cell_count += 1;
+            } else {
+                self.formula_cell_count = self.formula_cell_count.saturating_sub(1);
+            }
+        }
+    }
+
+    /// Recount formula cells from the primary maps. O(n); used after bulk
+    /// drops that bypass `set` (`set_main_size` retains, `clear_cells`).
+    fn recount_formulas(&mut self) {
+        let mut n = 0usize;
+        for val in self.main_cells.values() {
+            n += is_formula(val) as usize;
+        }
+        for val in self.left.values() {
+            n += is_formula(val) as usize;
+        }
+        for val in self.right.values() {
+            n += is_formula(val) as usize;
+        }
+        for val in self.header.values() {
+            n += is_formula(val) as usize;
+        }
+        for val in self.footer.values() {
+            n += is_formula(val) as usize;
+        }
+        self.formula_cell_count = n;
+    }
+
+    /// Rebuild the content-width index from the primary maps with current
+    /// global-column identities. O(n); used where those identities shift.
+    fn rebuild_width_index(&mut self) {
+        self.col_content_widths.clear();
+        let mc = self.extent_main_cols as usize;
+        for (&(_r, col), val) in &self.header {
+            Self::width_inc(
+                &mut self.col_content_widths,
+                col.to_global(mc),
+                Self::display_width(val),
+            );
+        }
+        for (&(_r, col), val) in &self.footer {
+            Self::width_inc(
+                &mut self.col_content_widths,
+                col.to_global(mc),
+                Self::display_width(val),
+            );
+        }
+        for (&(_r, c), val) in &self.main_cells {
+            Self::width_inc(
+                &mut self.col_content_widths,
+                MARGIN_COLS + c as usize,
+                Self::display_width(val),
+            );
+        }
+        for (&(_r, mc_idx), val) in &self.left {
+            Self::width_inc(&mut self.col_content_widths, mc_idx, Self::display_width(val));
+        }
+        for (&(_r, mc_idx), val) in &self.right {
+            Self::width_inc(
+                &mut self.col_content_widths,
+                MARGIN_COLS + mc + mc_idx,
+                Self::display_width(val),
+            );
+        }
+    }
+
+    /// Rebuild the whole occupancy index from the primary maps.
+    /// Used after bulk mutations (resize/move/clear); steady-state writes
+    /// maintain the index incrementally in `set`.
+    fn rebuild_occupancy(&mut self) {
+        self.main_row_counts.clear();
+        self.main_col_counts.clear();
+        self.left_row_counts.clear();
+        self.left_col_counts.clear();
+        self.right_row_counts.clear();
+        self.right_col_counts.clear();
+        self.header_row_counts.clear();
+        self.header_col_counts.clear();
+        self.footer_row_counts.clear();
+        self.footer_col_counts.clear();
+        for &(r, c) in self.main_cells.keys() {
+            Self::occ_inc(&mut self.main_row_counts, r);
+            Self::occ_inc(&mut self.main_col_counts, c);
+        }
+        for &(r, mc) in self.left.keys() {
+            Self::occ_inc(&mut self.left_row_counts, r);
+            Self::occ_inc(&mut self.left_col_counts, mc);
+        }
+        for &(r, mc) in self.right.keys() {
+            Self::occ_inc(&mut self.right_row_counts, r);
+            Self::occ_inc(&mut self.right_col_counts, mc);
+        }
+        for &(r, col) in self.header.keys() {
+            Self::occ_inc(&mut self.header_row_counts, r);
+            Self::occ_inc_hash(&mut self.header_col_counts, col);
+        }
+        for &(r, col) in self.footer.keys() {
+            Self::occ_inc(&mut self.footer_row_counts, r);
+            Self::occ_inc_hash(&mut self.footer_col_counts, col);
+        }
+    }
+
+    /// Number of stored main cells (spills excluded). O(1); used to decide
+    /// between dense and sparse range iteration (ALGORITHMS.md §2.6).
+    pub fn stored_main_count(&self) -> usize {
+        self.main_cells.len()
+    }
+
+    /// Build the evaluation plan for one main-range scan (ALGORITHMS.md §2.6).
+    /// O(n + C + R + S): one key scan plus per-column/per-row template probes
+    /// and one spill-map scan. Callers skip this unless the range area dwarfs
+    /// the stored count (see `stored_main_count`), bounding the overhead.
+    pub fn main_range_eval_plan(&self, range: &MainRange) -> MainRangeEvalPlan {
+        let mut coords: BTreeSet<(u32, u32)> = BTreeSet::new();
+        for &(r, c) in self.main_cells.keys() {
+            if range.contains(r, c) {
+                coords.insert((r, c));
+            }
+        }
+        for addr in self.spill_followers.keys() {
+            if let CellAddr::Main { row, col } = addr {
+                if range.contains(*row, *col) {
+                    coords.insert((*row, *col));
+                }
+            }
+        }
+        let has_template = self.range_has_template(range);
+        MainRangeEvalPlan {
+            stored_sorted: coords.into_iter().collect(),
+            has_template,
+        }
+    }
+
+    /// Could a header/right-margin/left-margin template make a stored-empty
+    /// cell in `range` evaluate to a value? Conservative (may say yes when
+    /// the template expression is inert), never no when it matters.
+    fn range_has_template(&self, range: &MainRange) -> bool {
+        if range.is_empty() {
+            return false;
+        }
+        // Mirrors the three template sources in `templated_formula`:
+        // a column header, its right-margin mirror, and the row's key cell.
+        fn raw_templates(raw: Option<&String>) -> bool {
+            let Some(raw) = raw else {
+                return false;
+            };
+            if crate::ops::margin_key_agg_func(raw).is_some() {
+                return false;
+            }
+            let t = raw.trim_start();
+            t.starts_with('=') && !t.starts_with("==")
+        }
+        let mc = self.extent_main_cols as usize;
+        let header_row = (HEADER_ROWS - 1) as u32;
+        for c in range.col_start..range.col_end {
+            let header_col = ColumnAddr::from_global(MARGIN_COLS + c as usize, mc);
+            if raw_templates(self.header.get(&(header_row, header_col))) {
+                return true;
+            }
+            // Out-of-extent `Main(c)` headers keep absolute globals (same
+            // edge as the occupancy col probe).
+            if ColumnAddr::Main(c) != header_col
+                && raw_templates(self.header.get(&(header_row, ColumnAddr::Main(c))))
+            {
+                return true;
+            }
+            // Right-margin mirror header for this column (see `templated_formula`).
+            if (c as usize) < mc && mc > 0 {
+                let rmi = mc.saturating_sub(1).saturating_sub(c as usize);
+                let mirror = ColumnAddr::from_global(MARGIN_COLS + mc + rmi, mc);
+                if raw_templates(self.header.get(&(header_row, mirror))) {
+                    return true;
+                }
+            }
+        }
+        // Left key-column cells template their row (no agg-key exclusion on
+        // this path: e.g. left `=TOTAL` rewrites per column).
+        for r in range.row_start..range.row_end {
+            if let Some(raw) = self.left.get(&(r, MARGIN_COLS - 1)) {
+                let t = raw.trim_start();
+                if t.starts_with('=') && !t.starts_with("==") {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Snapshot of occupied rows, derived from the occupancy index.
+    /// Same sets that `row_order`-style callers previously built by scanning
+    /// every stored cell per row (ALGORITHMS.md §2.4).
+    pub fn content_summary(&self) -> GridContentSummary {
+        let header_rows: Vec<u32> = self.header_row_counts.keys().copied().collect();
+        let footer_rows: Vec<u32> = self.footer_row_counts.keys().copied().collect();
+        let mut all: BTreeSet<usize> = BTreeSet::new();
+        let mut main_right: BTreeSet<usize> = BTreeSet::new();
+        for &r in self
+            .main_row_counts
+            .keys()
+            .chain(self.left_row_counts.keys())
+            .chain(self.right_row_counts.keys())
+        {
+            all.insert(r as usize);
+        }
+        for &r in self
+            .main_row_counts
+            .keys()
+            .chain(self.right_row_counts.keys())
+        {
+            main_right.insert(r as usize);
+        }
+        GridContentSummary {
+            header_rows,
+            main_rows_all: all.into_iter().collect(),
+            main_rows_main_right: main_right.into_iter().collect(),
+            footer_rows,
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Batched auto-fit deferral (ALGORITHMS.md §2.2)
+    // ------------------------------------------------------------------
+
+    /// Suspend per-write `auto_fit_column` scans; touched columns are fitted
+    /// once when the outermost `resume_auto_fit` runs. Nesting-safe.
+    pub fn suspend_auto_fit(&mut self) {
+        self.auto_fit_suspend = self.auto_fit_suspend.saturating_add(1);
+    }
+
+    pub fn resume_auto_fit(&mut self) {
+        if self.auto_fit_suspend == 0 {
+            return;
+        }
+        self.auto_fit_suspend -= 1;
+        if self.auto_fit_suspend == 0 {
+            for col in std::mem::take(&mut self.auto_fit_pending) {
+                self.auto_fit_column(col);
+            }
+        }
+    }
+
+    /// Record a global-column touch for deferred fitting, or fit immediately.
+    fn note_column_touched(&mut self, global_col: usize) {
+        if self.auto_fit_suspend > 0 {
+            self.auto_fit_pending.insert(global_col);
+        } else {
+            self.auto_fit_column(global_col);
+        }
+    }
+
+    /// Write many cells, fitting each touched column once at the end.
+    /// Same final widths as sequential `set` calls (ALGORITHMS.md §2.2).
+    pub fn set_many(&mut self, cells: Vec<(CellAddr, String)>) {
+        self.suspend_auto_fit();
+        for (addr, value) in cells {
+            self.set(&addr, value);
+        }
+        self.resume_auto_fit();
     }
 
     /// One new main row at the bottom (cursor moving down from the last main row).
@@ -674,6 +1284,8 @@ impl Grid {
         self.remap_main_col_layout_for_resize(old_main_cols, new_main_cols);
         self.remap_formats_for_resize(old_main_cols, new_main_cols);
         self.extent_main_cols = new_main_cols as u32;
+        // Right-margin globals shifted: rebuild content-width buckets.
+        self.rebuild_width_index();
         self.mark_spills_stale();
     }
 
@@ -718,6 +1330,7 @@ impl Grid {
                 self.remap_main_col_layout_for_resize(old_main_cols, new_main_cols);
                 self.remap_formats_for_resize(old_main_cols, new_main_cols);
                 self.extent_main_cols = mc + 1;
+                self.rebuild_width_index();
                 grown = true;
             }
         } else if (hr..hr + self.extent_main_rows as usize).contains(&row) && (0..m).contains(&col)
@@ -742,49 +1355,70 @@ impl Grid {
         grown
     }
 
+    /// O(log n) occupancy probe via the index (ALGORITHMS.md §2.1).
+    /// Spill followers are intentionally not counted as content.
     pub fn logical_row_has_content(&self, r: usize) -> bool {
         let hr = HEADER_ROWS;
         if r < hr {
-            let row = r as u32;
-            return self.header.keys().any(|&(stored_row, _)| stored_row == row);
+            return self.header_row_counts.contains_key(&(r as u32));
         }
         if r < hr + self.extent_main_rows as usize {
-            let mr = r - hr;
-            let mru = mr as u32;
-            return self.main_cells.keys().any(|(row, _)| *row == mru)
-                || self.left.keys().any(|(row, _)| *row == mru)
-                || self.right.keys().any(|(row, _)| *row == mru);
+            let mru = (r - hr) as u32;
+            return self.main_row_counts.contains_key(&mru)
+                || self.left_row_counts.contains_key(&mru)
+                || self.right_row_counts.contains_key(&mru);
         }
-        let fr = r - hr - self.extent_main_rows as usize;
-        let fr = fr as u32;
-        self.footer.keys().any(|&(stored_row, _)| stored_row == fr)
+        let fr = (r - hr - self.extent_main_rows as usize) as u32;
+        self.footer_row_counts.contains_key(&fr)
     }
 
+    /// O(log n) occupancy probe via the index (ALGORITHMS.md §2.1, §3).
+    /// Header/footer columns are keyed by objective `ColumnAddr`, so the
+    /// global column is mapped back with `from_global` (exact inverse of
+    /// the `to_global` scan this replaces).
     pub fn logical_col_has_content(&self, c: usize) -> bool {
         let tc = self.total_cols();
         if c >= tc {
             return false;
         }
-        if self.header.keys().any(|&(_, col)| col.to_global(self.extent_main_cols as usize) == c) {
-            return true;
-        }
+        let mc = self.extent_main_cols as usize;
         let m = MARGIN_COLS;
-        let me = m + self.extent_main_cols as usize;
-        let data_region_has_content = if c < m {
-            self.left.keys().any(|(_, mc)| *mc == c)
+        let me = m + mc;
+        if c < m {
+            if self.left_col_counts.contains_key(&c) {
+                return true;
+            }
         } else if c < me {
-            let mc = (c - m) as u32;
-            self.main_cells.keys().any(|(_, col)| *col == mc)
+            if self.main_col_counts.contains_key(&((c - m) as u32)) {
+                return true;
+            }
         } else if c < me + MARGIN_COLS {
-            let mc = c - me;
-            self.right.keys().any(|(_, rc)| *rc == mc)
-        } else {
-            false
-        };
-        if data_region_has_content {
+            if self.right_col_counts.contains_key(&(c - me)) {
+                return true;
+            }
+        }
+        let col = ColumnAddr::from_global(c, mc);
+        if self.header_col_counts.contains_key(&col)
+            || self.footer_col_counts.contains_key(&col)
+        {
             return true;
         }
-        self.footer.keys().any(|&(_, col)| col.to_global(self.extent_main_cols as usize) == c)
+        // Out-of-extent `Main(i)` header/footer cells keep their absolute
+        // global column `MARGIN_COLS + i` even while the main region is
+        // narrower (see `Grid::set`): `from_global` maps such globals to
+        // `Right(..)`, so check the `Main` spelling too.
+        if c >= m {
+            if let Ok(main_idx) = u32::try_from(c - m) {
+                let main_col = ColumnAddr::Main(main_idx);
+                if main_col != col
+                    && (self.header_col_counts.contains_key(&main_col)
+                        || self.footer_col_counts.contains_key(&main_col))
+                {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     fn resize_header_footer_width(&mut self) {
@@ -804,17 +1438,17 @@ impl Grid {
     /// and does NOT emit any SetMainSize op. Returns true if either extent
     /// was reduced.
     fn shrink_to_content(&mut self) -> bool {
-        // Compute new main cols from main_cells, headers, and footers.
+        // Compute new main cols from the occupancy index (ALGORITHMS.md §2.7):
+        // same maxima the full scans produced, in O(log n).
         let mut max_col_plus1: u32 = 0;
-        for (&(_r, c), _) in &self.main_cells {
+        if let Some(&c) = self.main_col_counts.keys().next_back() {
             max_col_plus1 = max_col_plus1.max(c.saturating_add(1));
         }
-        for (&(_r, col), _) in &self.header {
-            if let ColumnAddr::Main(mc) = col {
-                max_col_plus1 = max_col_plus1.max(mc.saturating_add(1));
-            }
-        }
-        for (&(_r, col), _) in &self.footer {
+        for col in self
+            .header_col_counts
+            .keys()
+            .chain(self.footer_col_counts.keys())
+        {
             if let ColumnAddr::Main(mc) = col {
                 max_col_plus1 = max_col_plus1.max(mc.saturating_add(1));
             }
@@ -825,15 +1459,14 @@ impl Grid {
         // Apply cursor floor (prevents shrinking past cursor position).
         max_col_plus1 = max_col_plus1.max(self.min_extent_main_cols);
 
-        // Compute new main rows from main, left and right stored cells.
+        // Compute new main rows from main, left and right occupancy.
         let mut max_row_plus1: u32 = 0;
-        for (&(r, _), _) in &self.main_cells {
-            max_row_plus1 = max_row_plus1.max(r.saturating_add(1));
-        }
-        for (&(r, _), _) in &self.left {
-            max_row_plus1 = max_row_plus1.max(r.saturating_add(1));
-        }
-        for (&(r, _), _) in &self.right {
+        for &r in self
+            .main_row_counts
+            .keys()
+            .chain(self.left_row_counts.keys())
+            .chain(self.right_row_counts.keys())
+        {
             max_row_plus1 = max_row_plus1.max(r.saturating_add(1));
         }
         if max_row_plus1 == 0 {
@@ -890,6 +1523,9 @@ impl Grid {
         self.left.retain(|&(r, _), _| r < self.extent_main_rows);
         self.right.retain(|&(r, _), _| r < self.extent_main_rows);
         self.resize_header_footer_width();
+        self.rebuild_occupancy();
+        self.rebuild_width_index();
+        self.recount_formulas();
         self.mark_spills_stale();
 
         #[cfg(debug_assertions)]
@@ -965,51 +1601,15 @@ impl Grid {
         }
     }
 
+    /// Max stored content width for a global column, `O(log W)` via the
+    /// content-width index (ALGORITHMS.md §2.2). Identical results to the old
+    /// full scan: buckets hold exactly the stored non-empty cells, each
+    /// contributing `chars + 1`, floored at 4, `None` when empty.
     pub fn content_width_for_column(&self, global_col: usize) -> Option<usize> {
-        let mut maxw = 0usize;
-        let mut saw_content = false;
-        let main_cols = self.main_cols();
-
-        for (&(_, col), val) in &self.header {
-            if col.to_global(main_cols) == global_col {
-                saw_content = true;
-                maxw = maxw.max(val.chars().count() + 1);
-            }
-        }
-        for (&(_, col), val) in &self.footer {
-            if col.to_global(main_cols) == global_col {
-                saw_content = true;
-                maxw = maxw.max(val.chars().count() + 1);
-            }
-        }
-        for r in 0..self.extent_main_rows as usize {
-            if global_col < MARGIN_COLS {
-                if let Some(val) = self.left.get(&(r as u32, global_col as usize)) {
-                    if !val.is_empty() {
-                        saw_content = true;
-                        maxw = maxw.max(val.chars().count() + 1);
-                    }
-                }
-            } else if global_col < MARGIN_COLS + main_cols {
-                let mc = global_col - MARGIN_COLS;
-                if let Some(val) = self.main_cells.get(&(r as u32, mc as u32)) {
-                    if !val.is_empty() {
-                        saw_content = true;
-                        maxw = maxw.max(val.chars().count() + 1);
-                    }
-                }
-            } else {
-                let rc = global_col - MARGIN_COLS - main_cols;
-                if let Some(val) = self.right.get(&(r as u32, rc as usize)) {
-                    if !val.is_empty() {
-                        saw_content = true;
-                        maxw = maxw.max(val.chars().count() + 1);
-                    }
-                }
-            }
-        }
-
-        saw_content.then_some(maxw.max(4))
+        self.col_content_widths
+            .get(&global_col)
+            .and_then(|buckets| buckets.keys().next_back().copied())
+            .map(|maxw| maxw.max(4))
     }
 
     pub fn auto_fit_column(&mut self, global_col: usize) {
@@ -1199,7 +1799,24 @@ impl Grid {
     }
 
     /// Logical main-row order for the current view sort.
+    /// Cached per (`view_sort_cols`, `data_revision`) so the several
+    /// per-frame callers share one computation (ALGORITHMS.md §2.3).
     pub fn sorted_main_rows(&self) -> Vec<usize> {
+        if let Some(cached) = self.sort_cache.borrow().as_ref() {
+            if cached.specs == self.view_sort_cols && cached.revision == self.data_revision {
+                return cached.order.clone();
+            }
+        }
+        let order = self.compute_sorted_main_rows();
+        *self.sort_cache.borrow_mut() = Some(SortCache {
+            specs: self.view_sort_cols.clone(),
+            revision: self.data_revision,
+            order: order.clone(),
+        });
+        order
+    }
+
+    fn compute_sorted_main_rows(&self) -> Vec<usize> {
         let mut rows: Vec<usize> = (0..self.extent_main_rows as usize).collect();
         if self.view_sort_cols.is_empty() {
             return rows;
@@ -1277,12 +1894,39 @@ impl Grid {
                 // columns and should not be silently dropped when the main
                 // region is narrower at the time the SET arrives.
                 if (*row as usize) < HEADER_ROWS {
+                    let c = col.to_global(self.extent_main_cols as usize);
                     if value.is_empty() {
-                        self.header.remove(&(*row, *col));
+                        if let Some(old) = self.header.remove(&(*row, *col)) {
+                            Self::occ_dec(&mut self.header_row_counts, row);
+                            Self::occ_dec_hash(&mut self.header_col_counts, col);
+                            self.note_formula_replace(Some(&old), false);
+                            Self::width_dec(
+                                &mut self.col_content_widths,
+                                c,
+                                Self::display_width(&old),
+                            );
+                        }
                     } else {
-                        let c = col.to_global(self.extent_main_cols as usize) as u32;
-                        self.header.insert((*row, *col), value);
-                        self.auto_fit_column(c as usize);
+                        let w = Self::display_width(&value);
+                        let new_is_formula = is_formula(&value);
+                        match self.header.insert((*row, *col), value) {
+                            None => {
+                                Self::occ_inc(&mut self.header_row_counts, *row);
+                                Self::occ_inc_hash(&mut self.header_col_counts, *col);
+                                Self::width_inc(&mut self.col_content_widths, c, w);
+                                self.note_formula_replace(None, new_is_formula);
+                            }
+                            Some(old) => {
+                                self.note_formula_replace(Some(&old), new_is_formula);
+                                Self::width_replace(
+                                    &mut self.col_content_widths,
+                                    c,
+                                    Self::display_width(&old),
+                                    w,
+                                );
+                            }
+                        }
+                        self.note_column_touched(c);
                     }
                 }
             }
@@ -1291,30 +1935,89 @@ impl Grid {
                 // current total_cols; do not drop them just because the
                 // main region is presently narrow.
                 if (*row as usize) < FOOTER_ROWS {
+                    let c = col.to_global(self.extent_main_cols as usize);
                     if value.is_empty() {
-                        self.footer.remove(&(*row, *col));
+                        if let Some(old) = self.footer.remove(&(*row, *col)) {
+                            Self::occ_dec(&mut self.footer_row_counts, row);
+                            Self::occ_dec_hash(&mut self.footer_col_counts, col);
+                            self.note_formula_replace(Some(&old), false);
+                            Self::width_dec(
+                                &mut self.col_content_widths,
+                                c,
+                                Self::display_width(&old),
+                            );
+                        }
                     } else {
-                        let c = col.to_global(self.extent_main_cols as usize) as u32;
-                        self.footer.insert((*row, *col), value);
-                        self.auto_fit_column(c as usize);
+                        let w = Self::display_width(&value);
+                        let new_is_formula = is_formula(&value);
+                        match self.footer.insert((*row, *col), value) {
+                            None => {
+                                Self::occ_inc(&mut self.footer_row_counts, *row);
+                                Self::occ_inc_hash(&mut self.footer_col_counts, *col);
+                                Self::width_inc(&mut self.col_content_widths, c, w);
+                                self.note_formula_replace(None, new_is_formula);
+                            }
+                            Some(old) => {
+                                self.note_formula_replace(Some(&old), new_is_formula);
+                                Self::width_replace(
+                                    &mut self.col_content_widths,
+                                    c,
+                                    Self::display_width(&old),
+                                    w,
+                                );
+                            }
+                        }
+                        self.note_column_touched(c);
                     }
                 }
             }
             CellAddr::Main { row, col } => {
                 let r = *row;
                 let c = *col;
+                let gc = MARGIN_COLS + c as usize;
                 if value.is_empty() {
                     // Only shrink when an actual stored main cell was removed.
-                    if self.main_cells.remove(&(r, c)).is_some() {
+                    if let Some(old) = self.main_cells.remove(&(r, c)) {
+                        Self::occ_dec(&mut self.main_row_counts, &r);
+                        Self::occ_dec(&mut self.main_col_counts, &c);
+                        self.note_formula_replace(Some(&old), false);
+                        Self::width_dec(
+                            &mut self.col_content_widths,
+                            gc,
+                            Self::display_width(&old),
+                        );
                         // Silent in-memory shrink (no SetMainSize op emitted).
                         let _ = self.shrink_to_content();
                     }
                 } else {
                     self.extent_main_rows = self.extent_main_rows.max(r + 1);
+                    // Growing the main width shifts right-margin globals, so
+                    // content-width buckets keyed by global must be rebuilt.
+                    let grew_cols = c + 1 > self.extent_main_cols;
                     self.extent_main_cols = self.extent_main_cols.max(c + 1);
-                    self.main_cells.insert((r, c), value);
-                    self.auto_fit_column(MARGIN_COLS + c as usize);
-                    self.resize_header_footer_width();
+                    let w = Self::display_width(&value);
+                    let new_is_formula = is_formula(&value);
+                    match self.main_cells.insert((r, c), value) {
+                        None => {
+                            Self::occ_inc(&mut self.main_row_counts, r);
+                            Self::occ_inc(&mut self.main_col_counts, c);
+                            Self::width_inc(&mut self.col_content_widths, gc, w);
+                            self.note_formula_replace(None, new_is_formula);
+                        }
+                        Some(old) => {
+                            self.note_formula_replace(Some(&old), new_is_formula);
+                            Self::width_replace(
+                                &mut self.col_content_widths,
+                                gc,
+                                Self::display_width(&old),
+                                w,
+                            );
+                        }
+                    }
+                    if grew_cols {
+                        self.rebuild_width_index();
+                    }
+                    self.note_column_touched(gc);
                 }
             }
             CellAddr::Left { col, row } => {
@@ -1323,14 +2026,39 @@ impl Grid {
                 if mc < MARGIN_COLS {
                     if value.is_empty() {
                         // Shrink only if a stored left-margin cell was removed.
-                        if self.left.remove(&(r, mc)).is_some() {
+                        if let Some(old) = self.left.remove(&(r, mc)) {
+                            Self::occ_dec(&mut self.left_row_counts, &r);
+                            Self::occ_dec(&mut self.left_col_counts, &mc);
+                            self.note_formula_replace(Some(&old), false);
+                            Self::width_dec(
+                                &mut self.col_content_widths,
+                                mc,
+                                Self::display_width(&old),
+                            );
                             let _ = self.shrink_to_content();
                         }
                     } else {
                         self.extent_main_rows = self.extent_main_rows.max(r + 1);
-                        self.left.insert((r, mc), value);
-                        self.auto_fit_column(mc);
-                        self.resize_header_footer_width();
+                        let w = Self::display_width(&value);
+                        let new_is_formula = is_formula(&value);
+                        match self.left.insert((r, mc), value) {
+                            None => {
+                                Self::occ_inc(&mut self.left_row_counts, r);
+                                Self::occ_inc(&mut self.left_col_counts, mc);
+                                Self::width_inc(&mut self.col_content_widths, mc, w);
+                                self.note_formula_replace(None, new_is_formula);
+                            }
+                            Some(old) => {
+                                self.note_formula_replace(Some(&old), new_is_formula);
+                                Self::width_replace(
+                                    &mut self.col_content_widths,
+                                    mc,
+                                    Self::display_width(&old),
+                                    w,
+                                );
+                            }
+                        }
+                        self.note_column_touched(mc);
                     }
                 }
             }
@@ -1338,16 +2066,42 @@ impl Grid {
                 let mc = *col;
                 let r = *row;
                 if mc < MARGIN_COLS {
+                    let gc = MARGIN_COLS + self.extent_main_cols as usize + mc;
                     if value.is_empty() {
                         // Shrink only if a stored right-margin cell was removed.
-                        if self.right.remove(&(r, mc)).is_some() {
+                        if let Some(old) = self.right.remove(&(r, mc)) {
+                            Self::occ_dec(&mut self.right_row_counts, &r);
+                            Self::occ_dec(&mut self.right_col_counts, &mc);
+                            self.note_formula_replace(Some(&old), false);
+                            Self::width_dec(
+                                &mut self.col_content_widths,
+                                gc,
+                                Self::display_width(&old),
+                            );
                             let _ = self.shrink_to_content();
                         }
                     } else {
                         self.extent_main_rows = self.extent_main_rows.max(r + 1);
-                        self.right.insert((r, mc), value);
-                        self.auto_fit_column(MARGIN_COLS + self.extent_main_cols as usize + mc);
-                        self.resize_header_footer_width();
+                        let w = Self::display_width(&value);
+                        let new_is_formula = is_formula(&value);
+                        match self.right.insert((r, mc), value) {
+                            None => {
+                                Self::occ_inc(&mut self.right_row_counts, r);
+                                Self::occ_inc(&mut self.right_col_counts, mc);
+                                Self::width_inc(&mut self.col_content_widths, gc, w);
+                                self.note_formula_replace(None, new_is_formula);
+                            }
+                            Some(old) => {
+                                self.note_formula_replace(Some(&old), new_is_formula);
+                                Self::width_replace(
+                                    &mut self.col_content_widths,
+                                    gc,
+                                    Self::display_width(&old),
+                                    w,
+                                );
+                            }
+                        }
+                        self.note_column_touched(gc);
                     }
                 }
             }
@@ -1358,14 +2112,17 @@ impl Grid {
     pub(crate) fn clear_spills(&mut self) {
         self.spill_followers.clear();
         self.spill_errors.clear();
+        self.bump_data_revision();
     }
 
     pub(crate) fn set_spill_value(&mut self, addr: CellAddr, value: String) {
         self.spill_followers.insert(addr, value);
+        self.bump_data_revision();
     }
 
     pub(crate) fn set_spill_error(&mut self, addr: CellAddr, err: &'static str) {
         self.spill_errors.insert(addr, err);
+        self.bump_data_revision();
     }
 
     pub(crate) fn bump_volatile_seed(&mut self) {
@@ -1376,6 +2133,19 @@ impl Grid {
     #[inline]
     pub(crate) fn mark_spills_stale(&mut self) {
         self.spills_dirty = true;
+        // Every stored-content/extent mutation funnels through here, so the
+        // sort-cache revision rides along (ALGORITHMS.md §2.3). Pure
+        // width/format setters do not call this and keep the cache valid.
+        self.data_revision = self.data_revision.wrapping_add(1);
+        // Memoised cell results are only valid for unchanged content.
+        crate::formula::clear_eval_memo();
+    }
+
+    /// Spill followers surface through `get`, so spill edits also invalidate
+    /// the cached view-sort order and memoised cell results.
+    fn bump_data_revision(&mut self) {
+        self.data_revision = self.data_revision.wrapping_add(1);
+        crate::formula::clear_eval_memo();
     }
 
     #[inline]
@@ -1397,36 +2167,41 @@ impl Grid {
         let taken: Vec<u32> = order.drain(from..from + count).collect();
         order.splice(insert_at..insert_at, taken);
 
-        let mut new_main = HashMap::new();
+        // Sparse remap (ALGORITHMS.md §2.7): touch stored cells only, O(n),
+        // instead of dense R×C / R×1404 HashMap lookups.
+        let mut new_pos_of_old = vec![0u32; order.len()];
         for (new_pos, &old_r) in order.iter().enumerate() {
-            let old_r = old_r;
-            for c in 0..self.extent_main_cols {
-                if let Some(v) = self.main_cells.get(&(old_r, c)).cloned() {
-                    new_main.insert((new_pos as u32, c), v);
-                }
-            }
+            new_pos_of_old[old_r as usize] = new_pos as u32;
+        }
+        let mut new_main = HashMap::with_capacity(self.main_cells.len());
+        for ((r, c), v) in self.main_cells.drain() {
+            new_main.insert((new_pos_of_old[r as usize], c), v);
         }
         self.main_cells = new_main;
 
-        let mut new_left = HashMap::new();
-        for (new_pos, &old_r) in order.iter().enumerate() {
-            for mc in 0..MARGIN_COLS as usize {
-                if let Some(v) = self.left.get(&(old_r, mc)).cloned() {
-                    new_left.insert((new_pos as u32, mc), v);
-                }
-            }
+        let mut new_left = HashMap::with_capacity(self.left.len());
+        for ((r, mc), v) in self.left.drain() {
+            new_left.insert((new_pos_of_old[r as usize], mc), v);
         }
         self.left = new_left;
 
-        let mut new_right = HashMap::new();
-        for (new_pos, &old_r) in order.iter().enumerate() {
-            for mc in 0..MARGIN_COLS as usize {
-                if let Some(v) = self.right.get(&(old_r, mc)).cloned() {
-                    new_right.insert((new_pos as u32, mc), v);
-                }
-            }
+        let mut new_right = HashMap::with_capacity(self.right.len());
+        for ((r, mc), v) in self.right.drain() {
+            new_right.insert((new_pos_of_old[r as usize], mc), v);
         }
         self.right = new_right;
+
+        // Permute row occupancy the same way (column counts are unaffected).
+        let permuted = |counts: &mut BTreeMap<u32, usize>| {
+                let mut next = BTreeMap::new();
+                for (old_r, cnt) in counts.iter() {
+                    next.insert(new_pos_of_old[*old_r as usize], *cnt);
+                }
+                *counts = next;
+            };
+        permuted(&mut self.main_row_counts);
+        permuted(&mut self.left_row_counts);
+        permuted(&mut self.right_row_counts);
 
         self.extent_main_rows = order.len() as u32;
         self.mark_spills_stale();
@@ -1446,15 +2221,22 @@ impl Grid {
         let taken: Vec<u32> = order.drain(from..from + count).collect();
         order.splice(insert_at..insert_at, taken);
 
-        let mut new_main = HashMap::new();
-        for r in 0..self.extent_main_rows {
-            for (new_pos, &old_c) in order.iter().enumerate() {
-                if let Some(v) = self.main_cells.get(&(r, old_c)).cloned() {
-                    new_main.insert((r, new_pos as u32), v);
-                }
-            }
+        // Sparse remap (ALGORITHMS.md §2.7): touch stored cells only, O(n).
+        let mut new_pos_of_old = vec![0u32; order.len()];
+        for (new_pos, &old_c) in order.iter().enumerate() {
+            new_pos_of_old[old_c as usize] = new_pos as u32;
+        }
+        let mut new_main = HashMap::with_capacity(self.main_cells.len());
+        for ((r, c), v) in self.main_cells.drain() {
+            new_main.insert((r, new_pos_of_old[c as usize]), v);
         }
         self.main_cells = new_main;
+        // Permute main-column occupancy the same way (row counts unaffected).
+        let mut next_main_cols = BTreeMap::new();
+        for (old_c, cnt) in self.main_col_counts.iter() {
+            next_main_cols.insert(new_pos_of_old[*old_c as usize], *cnt);
+        }
+        self.main_col_counts = next_main_cols;
 
         fn remap_sparse_main_cols_addr(
             cells: &mut HashMap<(u32, ColumnAddr), String>,
@@ -1481,10 +2263,35 @@ impl Grid {
 
         remap_sparse_main_cols_addr(&mut self.header, &order, ec);
         remap_sparse_main_cols_addr(&mut self.footer, &order, ec);
+        // Header/footer occupancy is keyed by objective ColumnAddr, so Main
+        // entries move with the same permutation.
+        let mut old_to_new = vec![0usize; ec];
+        for (new_pos, &old_pos) in order.iter().enumerate() {
+            old_to_new[old_pos as usize] = new_pos;
+        }
+        for counts in [
+            &mut self.header_col_counts,
+            &mut self.footer_col_counts,
+        ] {
+            let mut next: HashMap<ColumnAddr, usize> = HashMap::new();
+            for (col, cnt) in counts.iter() {
+                let remapped = match col {
+                    ColumnAddr::Main(idx) if (*idx as usize) < ec => {
+                        ColumnAddr::Main(old_to_new[*idx as usize] as u32)
+                    }
+                    other => *other,
+                };
+                *next.entry(remapped).or_insert(0) += *cnt;
+            }
+            *counts = next;
+        }
 
         self.remap_main_col_width_overrides_for_order(&order);
 
         self.extent_main_cols = order.len() as u32;
+        // Header/footer `Main` cells changed globals: rebuild width buckets.
+        // (Row occupancy was permuted incrementally above; widths rebuild.)
+        self.rebuild_width_index();
         self.mark_spills_stale();
     }
 }
@@ -1534,34 +2341,31 @@ impl GridImpl for Grid {
     fn iter_nonempty(&self) -> Box<dyn Iterator<Item = (CellAddr, String)> + '_> {
         // Build a vec of non-empty cells across regions and return an iterator.
         let mut v: Vec<(CellAddr, String)> = Vec::new();
+        self.for_each_nonempty(&mut |addr, val| {
+            v.push((*addr, val.to_string()));
+        });
+        Box::new(v.into_iter())
+    }
+
+    fn for_each_nonempty(&self, f: &mut dyn FnMut(&CellAddr, &str)) {
+        // Region visit order matches the historical `iter_nonempty` sequence
+        // (header, footer, main, left, right) so filtered collectors observe
+        // the same order as before.
         for (&(r, col), val) in &self.header {
-            v.push((
-                CellAddr::Header {
-                    row: r,
-                    col,
-                },
-                val.clone(),
-            ));
+            f(&CellAddr::Header { row: r, col }, val);
         }
         for (&(r, col), val) in &self.footer {
-            v.push((
-                CellAddr::Footer {
-                    row: r,
-                    col,
-                },
-                val.clone(),
-            ));
+            f(&CellAddr::Footer { row: r, col }, val);
         }
         for (&(r, c), val) in &self.main_cells {
-            v.push((CellAddr::Main { row: r, col: c }, val.clone()));
+            f(&CellAddr::Main { row: r, col: c }, val);
         }
         for (&(r, mc), val) in &self.left {
-            v.push((CellAddr::Left { col: mc, row: r }, val.clone()));
+            f(&CellAddr::Left { col: mc, row: r }, val);
         }
         for (&(r, mc), val) in &self.right {
-            v.push((CellAddr::Right { col: mc, row: r }, val.clone()));
+            f(&CellAddr::Right { col: mc, row: r }, val);
         }
-        Box::new(v.into_iter())
     }
 
     fn total_logical_rows(&self) -> usize {
@@ -1718,7 +2522,44 @@ impl GridImpl for Grid {
         self.main_cells.clear();
         self.left.clear();
         self.right.clear();
+        self.main_row_counts.clear();
+        self.main_col_counts.clear();
+        self.left_row_counts.clear();
+        self.left_col_counts.clear();
+        self.right_row_counts.clear();
+        self.right_col_counts.clear();
+        // Header/footer buckets survive; the rest is rebuilt.
+        self.rebuild_width_index();
+        self.recount_formulas();
         self.mark_spills_stale()
+    }
+
+    fn content_summary(&self) -> GridContentSummary {
+        self.content_summary()
+    }
+
+    fn suspend_auto_fit(&mut self) {
+        self.suspend_auto_fit()
+    }
+
+    fn resume_auto_fit(&mut self) {
+        self.resume_auto_fit()
+    }
+
+    fn set_many(&mut self, cells: Vec<(CellAddr, String)>) {
+        self.set_many(cells)
+    }
+
+    fn stored_main_count(&self) -> usize {
+        self.stored_main_count()
+    }
+
+    fn formula_cell_count(&self) -> usize {
+        self.formula_cell_count
+    }
+
+    fn main_range_eval_plan(&self, range: &MainRange) -> MainRangeEvalPlan {
+        self.main_range_eval_plan(range)
     }
 
     fn set_col_width_overrides(&mut self, overrides: Vec<(usize, usize)>) {
@@ -1867,6 +2708,645 @@ pub fn addr_logical_col(addr: &CellAddr, grid: &Grid) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Brute-force occupancy (the pre-index implementation) for cross-checks.
+    fn brute_row_has_content(g: &Grid, r: usize) -> bool {
+        let hr = HEADER_ROWS;
+        if r < hr {
+            let row = r as u32;
+            return g.header.keys().any(|&(sr, _)| sr == row);
+        }
+        if r < hr + g.extent_main_rows as usize {
+            let mru = (r - hr) as u32;
+            return g.main_cells.keys().any(|(row, _)| *row == mru)
+                || g.left.keys().any(|(row, _)| *row == mru)
+                || g.right.keys().any(|(row, _)| *row == mru);
+        }
+        let fr = (r - hr - g.extent_main_rows as usize) as u32;
+        g.footer.keys().any(|&(sr, _)| sr == fr)
+    }
+
+    fn brute_col_has_content(g: &Grid, c: usize) -> bool {
+        let tc = g.total_cols();
+        if c >= tc {
+            return false;
+        }
+        let mc = g.extent_main_cols as usize;
+        if g
+            .header
+            .keys()
+            .any(|&(_, col)| col.to_global(mc) == c)
+        {
+            return true;
+        }
+        let m = MARGIN_COLS;
+        let me = m + mc;
+        let data = if c < m {
+            g.left.keys().any(|(_, mc)| *mc == c)
+        } else if c < me {
+            let mcc = (c - m) as u32;
+            g.main_cells.keys().any(|(_, col)| *col == mcc)
+        } else if c < me + MARGIN_COLS {
+            g.right.keys().any(|(_, rc)| *rc == c - me)
+        } else {
+            false
+        };
+        data || g
+            .footer
+            .keys()
+            .any(|&(_, col)| col.to_global(mc) == c)
+    }
+
+    fn assert_occupancy_matches_brute_force(g: &Grid) {
+        // Sample every region boundary: header rows, main rows, footer rows,
+        // plus one past each boundary.
+        let hr = HEADER_ROWS;
+        let mr = g.main_rows();
+        let mut rows = vec![0, 1, hr - 1, hr, hr + 1];
+        for r in 0..mr {
+            rows.push(hr + r);
+        }
+        rows.push(hr + mr);
+        rows.push(hr + mr + 1);
+        rows.push(hr + mr + 2);
+        for r in rows {
+            assert_eq!(
+                g.logical_row_has_content(r),
+                brute_row_has_content(g, r),
+                "row probe mismatch at logical row {r}"
+            );
+        }
+        let tc = g.total_cols();
+        let mut cols = vec![0, 1, MARGIN_COLS - 1, MARGIN_COLS, MARGIN_COLS + 1];
+        for c in 0..g.main_cols() {
+            cols.push(MARGIN_COLS + c);
+        }
+        cols.push(MARGIN_COLS + mc_end(g));
+        cols.push(tc - 1);
+        cols.push(tc);
+        cols.sort_unstable();
+        cols.dedup();
+        for c in cols {
+            assert_eq!(
+                g.logical_col_has_content(c),
+                brute_col_has_content(g, c),
+                "col probe mismatch at global col {c}"
+            );
+        }
+        // Index totals must equal stored-cell counts exactly.
+        assert_eq!(
+            g.main_row_counts.values().sum::<usize>(),
+            g.main_cells.len(),
+            "main row counts disagree with stored cells"
+        );
+        assert_eq!(
+            g.main_col_counts.values().sum::<usize>(),
+            g.main_cells.len(),
+            "main col counts disagree with stored cells"
+        );
+        assert_eq!(
+            g.left_row_counts.values().sum::<usize>(),
+            g.left.len()
+        );
+        assert_eq!(
+            g.right_row_counts.values().sum::<usize>(),
+            g.right.len()
+        );
+        assert_eq!(
+            g.header_row_counts.values().sum::<usize>(),
+            g.header.len()
+        );
+        assert_eq!(
+            g.footer_row_counts.values().sum::<usize>(),
+            g.footer.len()
+        );
+    }
+
+    fn mc_end(g: &Grid) -> usize {
+        g.main_cols()
+    }
+
+    #[test]
+    fn occupancy_index_tracks_writes_clears_and_overwrites() {
+        let mut g = Grid::new(4, 3);
+        assert_occupancy_matches_brute_force(&g);
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "a".into());
+        g.set(&CellAddr::Main { row: 3, col: 2 }, "b".into());
+        g.set(&CellAddr::Left { col: 0, row: 1 }, "L".into());
+        g.set(&CellAddr::Right { col: 5, row: 2 }, "R".into());
+        g.set(
+            &CellAddr::Header {
+                row: 0,
+                col: ColumnAddr::Main(1),
+            },
+            "H".into(),
+        );
+        g.set(
+            &CellAddr::Footer {
+                row: 0,
+                col: ColumnAddr::Right(0),
+            },
+            "F".into(),
+        );
+        assert_occupancy_matches_brute_force(&g);
+        // Overwrite must not double-count.
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "a2".into());
+        g.set(
+            &CellAddr::Header {
+                row: 0,
+                col: ColumnAddr::Main(1),
+            },
+            "H2".into(),
+        );
+        assert_occupancy_matches_brute_force(&g);
+        // Clearing row 3's only main cell leaves that main row blank
+        // (logical row HEADER_ROWS+3 now shows footer _1, which is content).
+        g.set(&CellAddr::Main { row: 3, col: 2 }, "".into());
+        assert_occupancy_matches_brute_force(&g);
+        // Column A still holds "a2"; the cleared column's only remaining
+        // occupant is footer Right(0), which the brute-force cross-check pins.
+        assert!(g.logical_col_has_content(MARGIN_COLS));
+        // Clearing a no-op empty cell changes nothing.
+        g.set(&CellAddr::Main { row: 2, col: 2 }, "".into());
+        assert_occupancy_matches_brute_force(&g);
+        // Clear everything; probes must go blank.
+        for addr in [
+            CellAddr::Main { row: 0, col: 0 },
+            CellAddr::Left { col: 0, row: 1 },
+            CellAddr::Right { col: 5, row: 2 },
+            CellAddr::Header {
+                row: 0,
+                col: ColumnAddr::Main(1),
+            },
+            CellAddr::Footer {
+                row: 0,
+                col: ColumnAddr::Right(0),
+            },
+        ] {
+            g.set(&addr, "".into());
+        }
+        assert_occupancy_matches_brute_force(&g);
+        assert!(!g.logical_row_has_content(HEADER_ROWS));
+        assert!(!g.logical_col_has_content(MARGIN_COLS));
+    }
+
+    #[test]
+    fn occupancy_sees_out_of_extent_main_header_cols() {
+        // Header/footer `Main(i)` cells survive while the main region is
+        // narrower; they sit at absolute global MARGIN_COLS + i.
+        let mut g = Grid::new(1, 2);
+        g.set(
+            &CellAddr::Header {
+                row: (HEADER_ROWS - 1) as u32,
+                col: ColumnAddr::Main(2),
+            },
+            "H".into(),
+        );
+        assert_eq!(g.main_cols(), 2);
+        assert!(g.logical_col_has_content(MARGIN_COLS + 2));
+        assert_occupancy_matches_brute_force(&g);
+        // Widening the extent keeps the same column occupied (same spelling).
+        g.set_main_size(1, 4);
+        assert!(g.logical_col_has_content(MARGIN_COLS + 2));
+        assert_occupancy_matches_brute_force(&g);
+    }
+
+    #[test]
+    fn occupancy_survives_moves_resizes_and_clear() {
+        let mut g = Grid::new(6, 4);
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "a".into());
+        g.set(&CellAddr::Main { row: 5, col: 3 }, "b".into());
+        g.set(&CellAddr::Left { col: 3, row: 2 }, "L".into());
+        g.set(&CellAddr::Right { col: 1, row: 4 }, "R".into());
+        g.set(
+            &CellAddr::Header {
+                row: 2,
+                col: ColumnAddr::Main(2),
+            },
+            "H".into(),
+        );
+        g.move_main_rows(0, 2, 6);
+        assert_occupancy_matches_brute_force(&g);
+        // Row 0's "a" moved to row 4; row 5's "b" moved to row 3.
+        assert_eq!(g.get(&CellAddr::Main { row: 4, col: 0 }), Some("a"));
+        assert_eq!(g.get(&CellAddr::Main { row: 3, col: 3 }), Some("b"));
+        g.move_main_cols(0, 1, 4);
+        assert_occupancy_matches_brute_force(&g);
+        // Column order is now [1,2,3,0]: "a" moved 0->3, header Main(2)->Main(1).
+        assert_eq!(g.get(&CellAddr::Main { row: 4, col: 3 }), Some("a"));
+        assert_eq!(
+            g.get(&CellAddr::Header {
+                row: 2,
+                col: ColumnAddr::Main(1),
+            }),
+            Some("H")
+        );
+        g.set_main_size(8, 6);
+        assert_occupancy_matches_brute_force(&g);
+        g.set_main_size(2, 2);
+        assert_occupancy_matches_brute_force(&g);
+        g.clear_cells();
+        assert_occupancy_matches_brute_force(&g);
+        assert!(!g.logical_row_has_content(HEADER_ROWS));
+    }
+
+    #[test]
+    fn shrink_tracks_trailing_clears_stepwise() {
+        let mut g = Grid::new(1, 1);
+        for r in 0..5u32 {
+            g.set(&CellAddr::Main { row: r, col: 0 }, format!("v{r}"));
+        }
+        assert_eq!(g.main_rows(), 5);
+        for (r, expect_rows) in [(4, 4), (3, 3), (2, 2), (1, 1)] {
+            g.set(&CellAddr::Main { row: r, col: 0 }, "".into());
+            assert_eq!(g.main_rows(), expect_rows, "after clearing row {r}");
+            assert_occupancy_matches_brute_force(&g);
+        }
+    }
+
+    #[test]
+    fn sort_cache_invalidates_on_data_moves_and_sizes() {
+        let mut g = Grid::new(3, 1);
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "b".into());
+        g.set(&CellAddr::Main { row: 1, col: 0 }, "a".into());
+        g.set(&CellAddr::Main { row: 2, col: 0 }, "c".into());
+        g.set_view_sort_cols(vec![SortSpec {
+            col: MARGIN_COLS,
+            desc: false,
+        }]);
+        assert_eq!(g.sorted_main_rows(), vec![1, 0, 2]);
+        // Cached second call agrees.
+        assert_eq!(g.sorted_main_rows(), vec![1, 0, 2]);
+        // Data edit invalidates.
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "z".into());
+        assert_eq!(g.sorted_main_rows(), vec![1, 2, 0]);
+        // Row move invalidates.
+        g.move_main_rows(2, 1, 0);
+        assert_eq!(g.sorted_main_rows(), g.compute_sorted_main_rows());
+        // Resize invalidates (extent rows included in order).
+        g.set_main_size(5, 1);
+        assert_eq!(g.sorted_main_rows().len(), 5);
+        assert_eq!(g.sorted_main_rows(), g.compute_sorted_main_rows());
+        // Width-only change must not disturb the order.
+        let before = g.sorted_main_rows();
+        g.set_col_width(MARGIN_COLS, Some(9));
+        assert_eq!(g.sorted_main_rows(), before);
+    }
+
+    #[test]
+    fn set_many_matches_sequential_set_widths() {
+        let cells = vec![
+            (CellAddr::Main { row: 0, col: 0 }, "alpha".to_string()),
+            (CellAddr::Main { row: 1, col: 0 }, "a".to_string()),
+            (CellAddr::Main { row: 2, col: 0 }, "alphabet soup".to_string()),
+            (CellAddr::Main { row: 0, col: 1 }, "xy".to_string()),
+        ];
+        let mut seq = Grid::new(3, 2);
+        for (addr, v) in &cells {
+            seq.set(addr, v.clone());
+        }
+        let mut batched = Grid::new(3, 2);
+        batched.set_many(cells);
+        assert_eq!(batched.col_width_overrides, seq.col_width_overrides);
+        assert_eq!(batched.main_cells, seq.main_cells);
+        assert_occupancy_matches_brute_force(&batched);
+    }
+
+    #[test]
+    fn auto_fit_suspend_defers_until_resume() {
+        let mut g = Grid::new(4, 1);
+        g.suspend_auto_fit();
+        g.suspend_auto_fit();
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "alphabet".into());
+        g.set(&CellAddr::Main { row: 1, col: 0 }, "ab".into());
+        // Still suspended: no override fitted yet (nested depth 2 -> 1).
+        g.resume_auto_fit();
+        assert_eq!(g.get_col_width_override(MARGIN_COLS), None);
+        // Outermost resume fits each touched column exactly once.
+        g.resume_auto_fit();
+        assert_eq!(g.get_col_width_override(MARGIN_COLS), Some(9));
+        // Extra resume without suspend is a harmless no-op.
+        g.resume_auto_fit();
+        assert_eq!(g.get_col_width_override(MARGIN_COLS), Some(9));
+        assert_occupancy_matches_brute_force(&g);
+    }
+
+    #[test]
+    fn range_plan_lists_stored_and_spills_row_major() {
+        let mut g = Grid::new(600, 30);
+        g.set(&CellAddr::Main { row: 500, col: 20 }, "7".into());
+        g.set(&CellAddr::Main { row: 3, col: 2 }, "8".into());
+        g.set(&CellAddr::Left { col: 0, row: 9 }, "L".into());
+        // Spill followers join the plan even without stored cells.
+        g.set_spill_value(CellAddr::Main { row: 100, col: 4 }, "9".into());
+        let range = MainRange {
+            row_start: 0,
+            row_end: 600,
+            col_start: 0,
+            col_end: 30,
+        };
+        let plan = g.main_range_eval_plan(&range);
+        assert!(!plan.has_template);
+        assert_eq!(plan.stored_sorted, vec![(3, 2), (100, 4), (500, 20)]);
+        // Out-of-range cells are excluded.
+        let narrow = MainRange {
+            row_start: 0,
+            row_end: 10,
+            col_start: 0,
+            col_end: 10,
+        };
+        let plan = g.main_range_eval_plan(&narrow);
+        assert_eq!(plan.stored_sorted, vec![(3, 2)]);
+    }
+
+    #[test]
+    fn range_plan_flags_header_and_row_templates() {
+        let mut g = Grid::new(4, 3);
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "5".into());
+        let plain = MainRange {
+            row_start: 0,
+            row_end: 4,
+            col_start: 0,
+            col_end: 3,
+        };
+        assert!(!g.main_range_eval_plan(&plain).has_template);
+        // Header control formula templates column 1 (labeled form).
+        g.set(
+            &CellAddr::Header {
+                row: (HEADER_ROWS - 1) as u32,
+                col: ColumnAddr::Main(1),
+            },
+            "=A*0.1 -- TAX".into(),
+        );
+        let col1 = MainRange {
+            row_start: 0,
+            row_end: 4,
+            col_start: 1,
+            col_end: 2,
+        };
+        assert!(g.main_range_eval_plan(&col1).has_template);
+        // Untouched column 0 still plans sparse.
+        let col0 = MainRange {
+            row_start: 0,
+            row_end: 4,
+            col_start: 0,
+            col_end: 1,
+        };
+        assert!(!g.main_range_eval_plan(&col0).has_template);
+        // Left key-column formula templates its row.
+        g.set(
+            &CellAddr::Left {
+                col: MARGIN_COLS - 1,
+                row: 2,
+            },
+            "=TOTAL".into(),
+        );
+        let row2 = MainRange {
+            row_start: 2,
+            row_end: 3,
+            col_start: 0,
+            col_end: 3,
+        };
+        assert!(g.main_range_eval_plan(&row2).has_template);
+        // Aggregate directives and plain labels never template.
+        let mut g2 = Grid::new(4, 3);
+        g2.set(
+            &CellAddr::Header {
+                row: (HEADER_ROWS - 1) as u32,
+                col: ColumnAddr::Main(1),
+            },
+            "==SUM".into(),
+        );
+        g2.set(
+            &CellAddr::Left {
+                col: MARGIN_COLS - 1,
+                row: 1,
+            },
+            "note".into(),
+        );
+        assert!(!g2.main_range_eval_plan(&plain).has_template);
+    }
+
+    /// The pre-index full scan, for cross-checking the width index.
+    fn brute_content_width(g: &Grid, global_col: usize) -> Option<usize> {
+        let mut maxw = 0usize;
+        let mut saw_content = false;
+        let mc = g.main_cols();
+        for (&(_, col), val) in &g.header {
+            if col.to_global(mc) == global_col {
+                saw_content = true;
+                maxw = maxw.max(val.chars().count() + 1);
+            }
+        }
+        for (&(_, col), val) in &g.footer {
+            if col.to_global(mc) == global_col {
+                saw_content = true;
+                maxw = maxw.max(val.chars().count() + 1);
+            }
+        }
+        for r in 0..g.main_rows() {
+            let hit = if global_col < MARGIN_COLS {
+                g.left.get(&(r as u32, global_col))
+            } else if global_col < MARGIN_COLS + mc {
+                g.main_cells.get(&(r as u32, (global_col - MARGIN_COLS) as u32))
+            } else {
+                g.right.get(&(r as u32, global_col - MARGIN_COLS - mc))
+            };
+            if let Some(val) = hit {
+                if !val.is_empty() {
+                    saw_content = true;
+                    maxw = maxw.max(val.chars().count() + 1);
+                }
+            }
+        }
+        saw_content.then_some(maxw.max(4))
+    }
+
+    fn assert_widths_match_brute_force(g: &Grid) {
+        let mut cols = vec![0, 1, MARGIN_COLS - 1, MARGIN_COLS, MARGIN_COLS + 1];
+        for c in 0..g.main_cols() + 2 {
+            cols.push(MARGIN_COLS + c);
+        }
+        cols.push(g.total_cols() - 1);
+        cols.sort_unstable();
+        cols.dedup();
+        for c in cols {
+            assert_eq!(
+                g.content_width_for_column(c),
+                brute_content_width(g, c),
+                "width mismatch at global col {c}"
+            );
+        }
+        // Bucket totals must equal stored-cell counts exactly.
+        let bucketed: usize = g
+            .col_content_widths
+            .values()
+            .map(|m| m.values().sum::<usize>())
+            .sum();
+        assert_eq!(
+            bucketed,
+            g.main_cells.len() + g.left.len() + g.right.len() + g.header.len() + g.footer.len(),
+            "width buckets disagree with stored cells"
+        );
+    }
+
+    #[test]
+    fn width_index_tracks_writes_overwrites_clears() {
+        let mut g = Grid::new(5, 3);
+        assert_widths_match_brute_force(&g);
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "alpha".into());
+        g.set(&CellAddr::Main { row: 4, col: 0 }, "a".into());
+        g.set(&CellAddr::Main { row: 1, col: 2 }, "alphabet soup".into());
+        g.set(&CellAddr::Left { col: 0, row: 2 }, "lefty".into());
+        g.set(&CellAddr::Right { col: 1, row: 3 }, "right".into());
+        g.set(
+            &CellAddr::Header {
+                row: 0,
+                col: ColumnAddr::Main(0),
+            },
+            "hdr".into(),
+        );
+        g.set(
+            &CellAddr::Footer {
+                row: 0,
+                col: ColumnAddr::Right(0),
+            },
+            "ftr".into(),
+        );
+        assert_widths_match_brute_force(&g);
+        // Column A fitted to "alpha" (5+1).
+        assert_eq!(g.col_width(MARGIN_COLS), 6);
+        // Overwrite the max with a narrower value: max must shrink to "a".
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "zz".into());
+        assert_widths_match_brute_force(&g);
+        assert_eq!(g.content_width_for_column(MARGIN_COLS), Some(4));
+        // Clearing the last body cell in the column leaves the header's width.
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "".into());
+        g.set(&CellAddr::Main { row: 4, col: 0 }, "".into());
+        assert_widths_match_brute_force(&g);
+        assert_eq!(g.content_width_for_column(MARGIN_COLS), Some(4));
+        // Clearing the header too empties the column.
+        g.set(
+            &CellAddr::Header {
+                row: 0,
+                col: ColumnAddr::Main(0),
+            },
+            "".into(),
+        );
+        assert_widths_match_brute_force(&g);
+        assert_eq!(g.content_width_for_column(MARGIN_COLS), None);
+    }
+
+    #[test]
+    fn width_index_survives_growth_moves_resizes() {
+        let mut g = Grid::new(2, 2);
+        g.set(&CellAddr::Right { col: 0, row: 0 }, "wide-right".into());
+        assert_widths_match_brute_force(&g);
+        let right_global = MARGIN_COLS + 2;
+        assert_eq!(
+            g.content_width_for_column(right_global),
+            Some("wide-right".len() + 1)
+        );
+        // Growing the main width shifts right globals: the old global goes
+        // blank and the width follows the cell.
+        g.set(&CellAddr::Main { row: 0, col: 5 }, "x".into());
+        assert_widths_match_brute_force(&g);
+        assert_eq!(g.content_width_for_column(right_global), None);
+        assert_eq!(
+            g.content_width_for_column(MARGIN_COLS + 6),
+            Some("wide-right".len() + 1)
+        );
+        g.move_main_cols(0, 1, 2);
+        assert_widths_match_brute_force(&g);
+        g.move_main_rows(0, 1, 2);
+        assert_widths_match_brute_force(&g);
+        g.set_main_size(6, 8);
+        assert_widths_match_brute_force(&g);
+        g.set_main_size(1, 1);
+        assert_widths_match_brute_force(&g);
+        g.clear_cells();
+        assert_widths_match_brute_force(&g);
+        // Header/footer buckets survive clear_cells.
+        assert!(g.content_width_for_column(MARGIN_COLS).is_none());
+    }
+
+    fn brute_formula_count(g: &Grid) -> usize {
+        let mut n = 0usize;
+        for val in g.main_cells.values() {
+            n += is_formula(val) as usize;
+        }
+        for val in g.left.values() {
+            n += is_formula(val) as usize;
+        }
+        for val in g.right.values() {
+            n += is_formula(val) as usize;
+        }
+        for val in g.header.values() {
+            n += is_formula(val) as usize;
+        }
+        for val in g.footer.values() {
+            n += is_formula(val) as usize;
+        }
+        n
+    }
+
+    fn assert_formula_count_matches(g: &Grid) {
+        assert_eq!(
+            g.formula_cell_count, brute_formula_count(g),
+            "formula counter disagrees with stored cells"
+        );
+    }
+
+    #[test]
+    fn formula_counter_tracks_writes_and_bulk_ops() {
+        let mut g = Grid::new(4, 3);
+        assert_formula_count_matches(&g);
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "=1+1".into());
+        g.set(&CellAddr::Main { row: 1, col: 0 }, "plain".into());
+        // `==` directives are not spreadsheet formulas.
+        g.set(&CellAddr::Main { row: 2, col: 0 }, "==SUM".into());
+        g.set(&CellAddr::Left { col: 0, row: 0 }, "=A1".into());
+        g.set(&CellAddr::Right { col: 0, row: 1 }, "r".into());
+        g.set(
+            &CellAddr::Header {
+                row: 0,
+                col: ColumnAddr::Main(0),
+            },
+            "=A*2 -- X".into(),
+        );
+        g.set(
+            &CellAddr::Footer {
+                row: 0,
+                col: ColumnAddr::Main(1),
+            },
+            "=TOTAL".into(),
+        );
+        assert_formula_count_matches(&g);
+        assert_eq!(g.formula_cell_count, 4);
+        // Overwrite formula->plain and plain->formula.
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "7".into());
+        g.set(&CellAddr::Main { row: 1, col: 0 }, "=2*3".into());
+        assert_formula_count_matches(&g);
+        assert_eq!(g.formula_cell_count, 4);
+        // Overwrite formula->formula keeps the count.
+        g.set(&CellAddr::Main { row: 1, col: 0 }, "=3*3".into());
+        assert_formula_count_matches(&g);
+        assert_eq!(g.formula_cell_count, 4);
+        // Removals decrement only for formulas.
+        g.set(&CellAddr::Main { row: 1, col: 0 }, "".into());
+        g.set(&CellAddr::Main { row: 2, col: 0 }, "".into());
+        assert_formula_count_matches(&g);
+        assert_eq!(g.formula_cell_count, 3);
+        g.move_main_rows(0, 1, 4);
+        g.move_main_cols(0, 1, 3);
+        assert_formula_count_matches(&g);
+        g.set_main_size(6, 5);
+        assert_formula_count_matches(&g);
+        g.set_main_size(1, 1);
+        assert_formula_count_matches(&g);
+        g.clear_cells();
+        assert_formula_count_matches(&g);
+    }
 
     #[test]
     fn move_rows_sparse() {

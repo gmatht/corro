@@ -18,11 +18,192 @@ mod nwg_adapter {
         }
     }
 
+    /// Translate a WM_KEYDOWN wParam (raw Win32 virtual-key code) for the
+    /// app key callback, honouring Shift/CapsLock and the active keyboard
+    /// layout (Shift+9 is '(' on US layouts, not '9'; Shift+letter gives
+    /// capitals). Returns:
+    /// - `Some(raw VK)` when Ctrl/Alt is held (accelerator/menu paths must
+    ///   keep raw codes) or when no printable character results (special
+    ///   keys keep their VK so app dispatch by constant keeps working);
+    /// - `Some(translated char)` when the char cannot collide with an app
+    ///   dispatched VK;
+    /// - `None` when the translated char numerically collides with an app
+    ///   dispatched VK (`!"#$%&'()*` are VK_PRIOR..VK_DOWN, `.` is
+    ///   VK_DELETE). Callers must decline (return None) so the native
+    ///   control inserts the character and the change event resyncs app
+    ///   state. Passing the char on would misfire menu/cursor actions —
+    ///   e.g. '(' (0x28) would commit the edit and move down as VK_DOWN.
+    /// Known limitation: dead-key compositions fall back to the raw VK.
+    fn translate_vk(wparam: usize) -> Option<u32> {
+        let vk = (wparam & 0xFF) as u32;
+        unsafe {
+            const VK_CONTROL: i32 = 0x11;
+            const VK_MENU: i32 = 0x12;
+            if winapi::um::winuser::GetKeyState(VK_CONTROL) as u16 & 0x8000 != 0 {
+                return Some(vk);
+            }
+            if winapi::um::winuser::GetKeyState(VK_MENU) as u16 & 0x8000 != 0 {
+                return Some(vk);
+            }
+            let mut state: [u8; 256] = [0; 256];
+            if winapi::um::winuser::GetKeyboardState(state.as_mut_ptr()) == 0 {
+                return Some(vk);
+            }
+            let scan =
+                winapi::um::winuser::MapVirtualKeyW(vk, winapi::um::winuser::MAPVK_VK_TO_VSC);
+            let mut buf: [u16; 4] = [0; 4];
+            let n = winapi::um::winuser::ToUnicodeEx(
+                vk,
+                scan,
+                state.as_ptr(),
+                buf.as_mut_ptr(),
+                buf.len() as i32,
+                0,
+                winapi::um::winuser::GetKeyboardLayout(0),
+            );
+            // Exactly one printable char, no pending dead-key composition —
+            // unless it collides with an app-dispatched VK (see doc).
+            if n == 1 && buf[0] >= 32 {
+                let c = buf[0] as u32;
+                if matches!(c, 0x21..=0x28 | 0x2E) {
+                    return None;
+                }
+                return Some(c);
+            }
+            Some(vk)
+        }
+    }
+
+    /// GDK-compatible modifier mask for the current physical key state:
+    /// bit 0 = Shift, bit 2 = Ctrl, bit 3 = Alt. Lets widget callbacks see
+    /// the same modifiers GTK delivers, so Ctrl/Alt guards in app code
+    /// (copy/paste decline, menu propagation, quit) work on Windows too.
+    /// Previously only Shift was reported, so Ctrl+C typed 'C' instead of
+    /// copying and Ctrl+Q could never quit.
+    fn modifier_state() -> u32 {
+        unsafe {
+            const VK_SHIFT: i32 = 0x10;
+            const VK_CONTROL: i32 = 0x11;
+            const VK_MENU: i32 = 0x12;
+            let mut mods: u32 = 0;
+            if winapi::um::winuser::GetKeyState(VK_SHIFT) as u16 & 0x8000 != 0 {
+                mods |= 1;
+            }
+            if winapi::um::winuser::GetKeyState(VK_CONTROL) as u16 & 0x8000 != 0 {
+                mods |= 4;
+            }
+            if winapi::um::winuser::GetKeyState(VK_MENU) as u16 & 0x8000 != 0 {
+                mods |= 8;
+            }
+            mods
+        }
+    }
+
+    /// True when pure Ctrl (no Alt) is physically held: accelerators and
+    /// native edit shortcuts own the key, so a canvas must decline rather
+    /// than type it. Ctrl+Alt (AltGr) returns false so international text
+    /// input still reaches the widget.
+    fn pure_ctrl_held() -> bool {
+        modifier_state() & 0xC == 0x4
+    }
+
+    /// True when pure Alt (no Ctrl) is physically held: the key belongs to
+    /// OS menu/accelerator handling, not widget editing. Ctrl+Alt (AltGr)
+    /// returns false so international text input still reaches the widget.
+    fn pure_alt_held() -> bool {
+        unsafe {
+            const VK_MENU: i32 = 0x12;
+            const VK_CONTROL: i32 = 0x11;
+            let alt = winapi::um::winuser::GetKeyState(VK_MENU) as u16 & 0x8000 != 0;
+            let ctrl = winapi::um::winuser::GetKeyState(VK_CONTROL) as u16 & 0x8000 != 0;
+            crate::win32_portable::should_yield_to_menu(alt, ctrl)
+        }
+    }
+
+    /// Current outer size of a control, if measurable.
+    fn control_size(hwnd: winapi::shared::windef::HWND) -> Option<(i32, i32)> {
+        unsafe {
+            let mut rect: winapi::shared::windef::RECT = std::mem::zeroed();
+            if winapi::um::winuser::GetWindowRect(hwnd, &mut rect) == 0 {
+                return None;
+            }
+            Some((rect.right - rect.left, rect.bottom - rect.top))
+        }
+    }
+
+    /// Dialog content+button layout shared by `Dialog::layout_dialog` and
+    /// the dialog WM_SIZE binding (which fires before any Dialog exists).
+    fn layout_nwg_dialog_parts(
+        dlg_hwnd: winapi::shared::windef::HWND,
+        content: &RefCell<Vec<*mut c_void>>,
+        buttons: &RefCell<Vec<(nwg::Button, nwg::EventHandler)>>,
+    ) {
+        let (cw, ch) = unsafe {
+            let mut rect: winapi::shared::windef::RECT = std::mem::zeroed();
+            if winapi::um::winuser::GetClientRect(dlg_hwnd, &mut rect) == 0 {
+                return;
+            }
+            (rect.right - rect.left, rect.bottom - rect.top)
+        };
+        let mut specs: Vec<(i32, i32, bool)> = Vec::new();
+        for &ptr in content.borrow().iter() {
+            let (w, h) = control_size(ptr as _).unwrap_or((0, 0));
+            if w <= 8 && h <= 8 {
+                specs.push((0, 0, true));
+            } else {
+                specs.push((w, if h > 10 { h } else { 26 }, false));
+            }
+        }
+        let mut btn_sizes: Vec<(i32, i32)> = Vec::new();
+        for (btn, _) in buttons.borrow().iter() {
+            let (w, h) = btn
+                .handle
+                .hwnd()
+                .and_then(control_size)
+                .unwrap_or((0, 0));
+            btn_sizes.push((
+                if (40..=220).contains(&w) { w } else { 96 },
+                if (16..=48).contains(&h) { h } else { 28 },
+            ));
+        }
+        let (content_rects, btn_rects) =
+            crate::win32_portable::dialog_layout_geometry(cw, ch, &specs, &btn_sizes);
+        let content = content.borrow();
+        for (i, r) in content_rects.iter().enumerate() {
+            if i >= content.len() {
+                break;
+            }
+            set_window_pos(content[i], r.x, r.y, r.w, r.h);
+            unsafe {
+                let l = ((r.h & 0xFFFF) << 16) | (r.w & 0xFFFF);
+                winapi::um::winuser::SendMessageW(
+                    content[i] as _,
+                    winapi::um::winuser::WM_SIZE,
+                    0,
+                    l as _,
+                );
+            }
+        }
+        let buttons = buttons.borrow();
+        for (i, r) in btn_rects.iter().enumerate() {
+            if i >= buttons.len() {
+                break;
+            }
+            if let Some(h) = buttons[i].0.handle.hwnd() {
+                set_window_pos(h as *mut c_void, r.x, r.y, r.w, r.h);
+            }
+        }
+    }
+
     // -- Window --
 
     pub struct Window {
         pub(crate) inner: Rc<nwg::Window>,
         pub(crate) _handler: Rc<nwg::EventHandler>,
+        // Stable hwnd snapshot for AsRef. The previous body referenced a
+        // temporary (`&handle.hwnd().unwrap_or(..) as ...`) — a dangling
+        // reference (UB), garbage hwnds in release builds.
+        hwnd: *mut c_void,
         root_child: Rc<RefCell<Option<*mut c_void>>>,
         layout_cb: Rc<RefCell<Option<Box<dyn FnMut(i32, i32)>>>>,
         event_key_cb: Rc<RefCell<Option<Box<dyn FnMut(u32, u32) -> i32>>>>,
@@ -34,6 +215,7 @@ mod nwg_adapter {
             Window {
                 inner: self.inner.clone(),
                 _handler: self._handler.clone(),
+                hwnd: self.hwnd,
                 root_child: self.root_child.clone(),
                 layout_cb: self.layout_cb.clone(),
                 event_key_cb: self.event_key_cb.clone(),
@@ -50,7 +232,7 @@ mod nwg_adapter {
 
     impl AsRef<*mut c_void> for Window {
         fn as_ref(&self) -> &*mut c_void {
-            unsafe { &*(&self.inner.handle.hwnd().unwrap_or(std::ptr::null_mut()) as *const _ as *const *mut c_void) }
+            &self.hwnd
         }
     }
 
@@ -160,8 +342,8 @@ mod nwg_adapter {
 
             // Bind raw WM_KEYDOWN/WM_SYSKEYDOWN handler for on_event_key.
             // The state parameter is a GDK-compatible modifier mask:
-            //   bit 0 = Shift, bit 3 = Alt (MOD1_MASK)
-            // Alt is detected from WM_SYSKEYDOWN; Shift via GetKeyState.
+            //   bit 0 = Shift, bit 2 = Ctrl, bit 3 = Alt (MOD1_MASK)
+            // Alt is detected from WM_SYSKEYDOWN; Shift/Ctrl via GetKeyState.
             // If the callback returns 0 (not consumed), the message is forwarded
             // to the focused child window via PostMessage so the canvas or entry
             // raw handlers can process it.  After forwarding, we consume the
@@ -184,17 +366,20 @@ mod nwg_adapter {
                         if msg == winapi::um::winuser::WM_SYSKEYDOWN {
                             state |= 8; // GDK_MOD1_MASK (Alt)
                         }
-                        // Win32 key messages carry no Shift state; query it
-                        // directly so Shift+arrows (selection extend) work.
-                        // (Control/Alt handling is unchanged.)
-                        unsafe {
-                            const VK_SHIFT: i32 = 0x10;
-                            if winapi::um::winuser::GetKeyState(VK_SHIFT) as u16 & 0x8000 != 0 {
-                                state |= 1; // GDK_SHIFT_MASK
+                        // Win32 key messages carry no modifier state; query
+                        // it directly so Shift+arrows (selection extend) and
+                        // Ctrl accelerators (Ctrl+Q quit) work. Alt keeps its
+                        // message-derived bit above.
+                        state |= modifier_state() & 0x5;
+                        // Translate Shift pairs/capitals; specials keep raw
+                        // VKs. The forwarded PostMessage below stays raw so
+                        // the child translates for itself. A colliding
+                        // translation (None) skips the callback; flow continues
+                        // to forwarding below like any unhandled key.
+                        if let Some(k) = translate_vk(w) {
+                            if f(k, state) != 0 {
+                                return Some(0); // consumed, do not forward
                             }
-                        }
-                        if f(w as u32, state) != 0 {
-                            return Some(0); // consumed, do not forward
                         }
                     }
                     // Alt+letter (WM_SYSKEYDOWN): let DefWindowProc activate the
@@ -266,7 +451,7 @@ mod nwg_adapter {
             }
         }
 
-        Ok(Window { inner: Rc::new(inner), _handler: Rc::new(handler), root_child, layout_cb, event_key_cb, close_cb })
+        Ok(Window { hwnd: inner.handle.hwnd().unwrap_or(std::ptr::null_mut()) as *mut c_void, inner: Rc::new(inner), _handler: Rc::new(handler), root_child, layout_cb, event_key_cb, close_cb })
     }
 
     // -- Button --
@@ -275,6 +460,9 @@ mod nwg_adapter {
     pub struct Button {
         pub(crate) inner: Rc<nwg::Button>,
         pub(crate) _handler: Rc<nwg::EventHandler>,
+        // Stable hwnd snapshot for AsRef (see Window). *mut c_void is
+        // Copy, so #[derive(Clone)] keeps working.
+        hwnd: *mut c_void,
         pub(crate) click_cb: Rc<RefCell<Option<Box<dyn FnMut()>>>>,
         pub(crate) _raw_click_handler: Rc<RefCell<Vec<nwg::RawEventHandler>>>,
     }
@@ -335,10 +523,9 @@ mod nwg_adapter {
 
     impl AsRef<*mut c_void> for Button {
         fn as_ref(&self) -> &*mut c_void {
-            unsafe { &*(&self.inner.handle.hwnd().unwrap_or(std::ptr::null_mut()) as *const _ as *const *mut c_void) }
+            &self.hwnd
         }
     }
-
     pub fn create_button(parent: *mut c_void, text: &str) -> Result<Button, Error> {
         let (inner, click_cb, handler) = crate::backends::nwg::create_button(parent, text)
             .map_err(|e| Error::Backend(format!("{}", e)))?;
@@ -378,23 +565,27 @@ mod nwg_adapter {
                 raw_handlers.borrow_mut().push(raw);
             }
         }
-        Ok(Button { inner: Rc::new(inner), _handler: Rc::new(handler), click_cb, _raw_click_handler: raw_handlers })
+        Ok(Button { hwnd: hwnd as *mut c_void, inner: Rc::new(inner), _handler: Rc::new(handler), click_cb, _raw_click_handler: raw_handlers })
     }
 
     // -- Label --
 
     #[derive(Clone)]
-    pub struct Label(pub(crate) Rc<nwg::Label>);
+    pub struct Label {
+        pub(crate) inner: Rc<nwg::Label>,
+        // Stable hwnd snapshot for AsRef (see Window).
+        hwnd: *mut c_void,
+    }
 
     impl Label {
         pub fn set_text(&self, text: &str) {
-            self.0.set_text(text);
+            self.inner.set_text(text);
             // Nudge the parent to re-run its layout (if it has a WM_SIZE
             // layout handler, i.e. a BoxWidget): label width is measured
             // from text at layout time, so a text change must re-layout
             // to keep the label fitted (parity with GTK auto-sizing).
             // Harmless when the parent has no such handler.
-            if let Some(hwnd) = self.0.handle.hwnd() {
+            if let Some(hwnd) = self.inner.handle.hwnd() {
                 unsafe {
                     let parent = winapi::um::winuser::GetParent(hwnd as _);
                     if !parent.is_null() {
@@ -407,32 +598,35 @@ mod nwg_adapter {
                 }
             }
         }
-        pub fn get_text(&self) -> Option<String> { Some(self.0.text()) }
-        pub fn set_visible(&self, visible: bool) { self.0.set_visible(visible); }
-        pub fn set_markup(&self, markup: &str) { self.0.set_text(markup); }
+        pub fn get_text(&self) -> Option<String> { Some(self.inner.text()) }
+        pub fn set_visible(&self, visible: bool) { self.inner.set_visible(visible); }
+        pub fn set_markup(&self, markup: &str) { self.inner.set_text(markup); }
         pub fn set_margin_start(&self, _px: i32) {}
         pub fn set_margin_top(&self, _px: i32) {}
         pub fn set_halign(&self, _align: i32) {}
         pub fn set_valign(&self, _align: i32) {}
         pub fn raw_handle(&self) -> *mut c_void {
-            self.0.handle.hwnd().unwrap_or(std::ptr::null_mut()) as *mut c_void
+            self.inner.handle.hwnd().unwrap_or(std::ptr::null_mut()) as *mut c_void
         }
     }
 
     impl AsRef<*mut c_void> for Label {
         fn as_ref(&self) -> &*mut c_void {
-            unsafe { &*(&self.0.handle.hwnd().unwrap_or(std::ptr::null_mut()) as *const _ as *const *mut c_void) }
+            &self.hwnd
         }
     }
 
     impl Widget for Label {
         fn raw_handle(&self) -> *mut c_void {
-            self.0.handle.hwnd().unwrap_or(std::ptr::null_mut()) as *mut c_void
+            self.inner.handle.hwnd().unwrap_or(std::ptr::null_mut()) as *mut c_void
         }
     }
 
     pub fn create_label(parent: *mut c_void) -> Result<Label, Error> {
-        crate::backends::nwg::create_label(parent).map(|l| Label(Rc::new(l))).map_err(|e| Error::Backend(format!("{}", e)))
+        crate::backends::nwg::create_label(parent).map(|l| {
+            let hwnd = l.handle.hwnd().unwrap_or(std::ptr::null_mut()) as *mut c_void;
+            Label { inner: Rc::new(l), hwnd }
+        }).map_err(|e| Error::Backend(format!("{}", e)))
     }
 
     // -- BoxWidget --
@@ -507,6 +701,12 @@ mod nwg_adapter {
             children.extend(hwnds.into_iter().filter(|&c| !c.is_null()));
             vex.resize(children.len(), false);
             hex.resize(children.len(), false);
+            drop(children);
+            drop(vex);
+            drop(hex);
+            // Never depend on a future WM_SIZE: lay out now with the
+            // current size (re-runs on every later WM_SIZE anyway).
+            self.request_layout();
         }
         pub fn set_child_vexpand(&self, child: &impl AsRef<*mut c_void>, expand: bool) {
             let ptr = *child.as_ref();
@@ -521,6 +721,9 @@ mod nwg_adapter {
             if let Some(idx) = children.iter().position(|&c| c == ptr) {
                 vex[idx] = expand;
             }
+            drop(children);
+            drop(vex);
+            self.request_layout();
         }
         pub fn set_child_hexpand(&self, child: &impl AsRef<*mut c_void>, expand: bool) {
             let ptr = *child.as_ref();
@@ -535,6 +738,9 @@ mod nwg_adapter {
             if let Some(idx) = children.iter().position(|&c| c == ptr) {
                 hex[idx] = expand;
             }
+            drop(children);
+            drop(hex);
+            self.request_layout();
         }
         pub fn layout(&self, _x: i32, _y: i32, w: i32, h: i32) {
             let children = self.children.borrow();
@@ -542,7 +748,6 @@ mod nwg_adapter {
             let hex = self.child_hexpand.borrow();
             let n = children.len();
             if n == 0 { return; }
-            let spacing_total = self.spacing * (n as i32 - 1).max(0);
             let (fixed_w, fixed_h) = match self.orientation {
                 crate::backends::nwg::Orientation::Horizontal => {
                     (0, h - 10)
@@ -550,12 +755,6 @@ mod nwg_adapter {
                 crate::backends::nwg::Orientation::Vertical => {
                     (w - 10, 0)
                 }
-            };
-            let expand_count = match self.orientation {
-                crate::backends::nwg::Orientation::Horizontal =>
-                    hex.iter().filter(|&&e| e).count(),
-                crate::backends::nwg::Orientation::Vertical =>
-                    vex.iter().filter(|&&e| e).count(),
             };
             let mut desired_sizes: Vec<i32> = Vec::with_capacity(n);
             for i in 0..n {
@@ -607,37 +806,66 @@ mod nwg_adapter {
                     desired_sizes.push(0);
                 }
             }
-            let fixed_total: i32 = desired_sizes.iter().sum();
-            let mut pos = 5;
-            let remaining = match self.orientation {
-                crate::backends::nwg::Orientation::Horizontal => (w - 10 - fixed_total - spacing_total).max(0),
-                crate::backends::nwg::Orientation::Vertical => (h - 10 - fixed_total - spacing_total).max(0),
+            // Shared span math (unit-tested in win32_portable): fixed sizes
+            // from `desired_sizes`, expanders splitting the remainder with
+            // GTK fill parity (no lost remainder pixel).
+            let flags: Vec<bool> = (0..n)
+                .map(|i| match self.orientation {
+                    crate::backends::nwg::Orientation::Horizontal => hex[i],
+                    crate::backends::nwg::Orientation::Vertical => vex[i],
+                })
+                .collect();
+            let avail = match self.orientation {
+                crate::backends::nwg::Orientation::Horizontal => w - 10,
+                crate::backends::nwg::Orientation::Vertical => h - 10,
             };
-            let expand_size = if expand_count > 0 { remaining / expand_count as i32 } else { 0 };
+            let spans = crate::win32_portable::distribute_spans(
+                5,
+                avail,
+                self.spacing,
+                &desired_sizes,
+                &flags,
+            );
 
             for i in 0..n {
                 let child = children[i];
-                let is_expand = match self.orientation {
-                    crate::backends::nwg::Orientation::Horizontal => hex[i],
-                    crate::backends::nwg::Orientation::Vertical => vex[i],
-                };
+                let (pos, span) = spans[i];
                 let (cw, ch) = match self.orientation {
-                    crate::backends::nwg::Orientation::Horizontal => {
-                        if is_expand { (expand_size, fixed_h) } else { (desired_sizes[i], fixed_h) }
-                    }
-                    crate::backends::nwg::Orientation::Vertical => {
-                        if is_expand { (fixed_w, expand_size) } else { (fixed_w, desired_sizes[i]) }
-                    }
+                    crate::backends::nwg::Orientation::Horizontal => (span, fixed_h),
+                    crate::backends::nwg::Orientation::Vertical => (fixed_w, span),
                 };
-                match self.orientation {
-                    crate::backends::nwg::Orientation::Horizontal => {
-                        set_window_pos(child, pos, 5, cw, ch);
-                        pos += cw + self.spacing;
-                    }
-                    crate::backends::nwg::Orientation::Vertical => {
-                        set_window_pos(child, 5, pos, cw, ch);
-                        pos += ch + self.spacing;
-                    }
+                let (cx, cy) = match self.orientation {
+                    crate::backends::nwg::Orientation::Horizontal => (pos, 5),
+                    crate::backends::nwg::Orientation::Vertical => (5, pos),
+                };
+                set_window_pos(child, cx, cy, cw, ch);
+                // Airtight cascade: SetWindowPos only delivers WM_SIZE when
+                // the size actually changed, so a nested box that keeps its
+                // size would never re-lay-out its own children (the cram
+                // failure). Synthesize WM_SIZE unconditionally — leaf
+                // controls ignore it, nested boxes re-run their layout.
+                unsafe {
+                    let l = ((ch & 0xFFFF) << 16) | (cw & 0xFFFF);
+                    winapi::um::winuser::SendMessageW(
+                        child as _,
+                        winapi::um::winuser::WM_SIZE,
+                        0,
+                        l as _,
+                    );
+                }
+            }
+        }
+        /// Re-run layout with the box's current client size. Called after
+        /// every structural mutation (append, expand-flag change) so layout
+        /// never depends on a future WM_SIZE that may never arrive.
+        pub fn request_layout(&self) {
+            if self.hwnd.is_null() {
+                return;
+            }
+            unsafe {
+                let mut rect: winapi::shared::windef::RECT = std::mem::zeroed();
+                if winapi::um::winuser::GetClientRect(self.hwnd as _, &mut rect) != 0 {
+                    self.layout(0, 0, rect.right - rect.left, rect.bottom - rect.top);
                 }
             }
         }
@@ -681,7 +909,7 @@ mod nwg_adapter {
         let mut frame = nwg::Frame::default();
         if !parent.is_null() {
             nwg::Frame::builder()
-                .flags(nwg::FrameFlags::NONE)
+                .flags(nwg::FrameFlags::VISIBLE)
                 .size((0, 0))
                 .position((0, 0))
                 .parent(&nwg::ControlHandle::Hwnd(parent as _))
@@ -736,6 +964,8 @@ mod nwg_adapter {
     pub struct Entry {
         pub(crate) inner: Rc<nwg::TextInput>,
         pub(crate) _handler: Rc<nwg::EventHandler>,
+        // Stable hwnd snapshot for AsRef (see Window).
+        hwnd: *mut c_void,
         pub(crate) changed_cb: Rc<RefCell<Option<Box<dyn FnMut()>>>>,
         focus_in_cb: Rc<RefCell<Option<Box<dyn FnMut(*mut c_void) -> i32>>>>,
         focus_out_cb: Rc<RefCell<Option<Box<dyn FnMut(*mut c_void) -> i32>>>>,
@@ -743,6 +973,7 @@ mod nwg_adapter {
         _focus_out_handler: Option<nwg::RawEventHandler>,
         key_cb: Rc<RefCell<Option<Box<dyn FnMut(u32, u32) -> bool>>>>,
         _key_handler: Option<nwg::RawEventHandler>,
+        activate_cb: Rc<RefCell<Option<Box<dyn FnMut(*mut c_void)>>>>,
         pub(crate) pos_x: std::cell::Cell<i32>,
         pub(crate) pos_y: std::cell::Cell<i32>,
     }
@@ -759,6 +990,8 @@ mod nwg_adapter {
                 _focus_out_handler: None,
                 key_cb: self.key_cb.clone(),
                 _key_handler: None,
+                activate_cb: self.activate_cb.clone(),
+                hwnd: self.hwnd,
                 pos_x: std::cell::Cell::new(self.pos_x.get()),
                 pos_y: std::cell::Cell::new(self.pos_y.get()),
             }
@@ -766,7 +999,27 @@ mod nwg_adapter {
     }
 
     impl Entry {
-        pub fn set_text(&self, text: &str) { self.inner.set_text(text); }
+        pub fn set_text(&self, text: &str) {
+            self.inner.set_text(text);
+            // Caret to end: SetWindowText leaves the caret at position 0,
+            // so a natively-inserted char (a WM_CHAR the key handlers
+            // declined, e.g. '(') would land at the front ("(=" for
+            // "=("), fail the resync guard, and be clobbered by the next
+            // sync. Caret-at-end keeps native insertions appending, which
+            // is also what every other backend does after a programmatic
+            // set. Harmless when unfocused (caret invisible).
+            if let Some(hwnd) = self.inner.handle.hwnd() {
+                unsafe {
+                    let len = winapi::um::winuser::GetWindowTextLengthW(hwnd as _);
+                    winapi::um::winuser::SendMessageW(
+                        hwnd as _,
+                        winapi::um::winuser::EM_SETSEL as u32,
+                        len as usize,
+                        len as isize,
+                    );
+                }
+            }
+        }
         pub fn get_text(&self) -> Option<String> { Some(self.inner.text()) }
         pub fn connect_changed(&self, f: impl FnMut() + 'static) -> Result<u64, Error> {
             *self.changed_cb.borrow_mut() = Some(Box::new(f));
@@ -861,7 +1114,10 @@ mod nwg_adapter {
         pub fn on_key_raw(&self, cb: Box<dyn FnMut(u32, u32) -> bool>) {
             *self.key_cb.borrow_mut() = Some(cb);
         }
-        pub fn connect_activate(&self, _f: impl FnMut(*mut c_void) + 'static) -> Result<u64, Error> { Ok(0) }
+        pub fn connect_activate(&self, f: impl FnMut(*mut c_void) + 'static) -> Result<u64, Error> {
+            *self.activate_cb.borrow_mut() = Some(Box::new(f));
+            Ok(0)
+        }
         pub fn connect_focus_in_event(&self, f: impl FnMut(*mut c_void) -> i32 + 'static) -> Result<u64, Error> {
             *self.focus_in_cb.borrow_mut() = Some(Box::new(f));
             Ok(0)
@@ -874,7 +1130,7 @@ mod nwg_adapter {
 
     impl AsRef<*mut c_void> for Entry {
         fn as_ref(&self) -> &*mut c_void {
-            unsafe { &*(&self.inner.handle.hwnd().unwrap_or(std::ptr::null_mut()) as *const _ as *const *mut c_void) }
+            &self.hwnd
         }
     }
 
@@ -890,6 +1146,8 @@ mod nwg_adapter {
         let focus_in_cb: Rc<RefCell<Option<Box<dyn FnMut(*mut c_void) -> i32>>>> = Rc::new(RefCell::new(None));
         let focus_out_cb: Rc<RefCell<Option<Box<dyn FnMut(*mut c_void) -> i32>>>> = Rc::new(RefCell::new(None));
         let key_cb: Rc<RefCell<Option<Box<dyn FnMut(u32, u32) -> bool>>>> = Rc::new(RefCell::new(None));
+        let activate_cb: Rc<RefCell<Option<Box<dyn FnMut(*mut c_void)>>>> =
+            Rc::new(RefCell::new(None));
         let hwnd = inner.handle.hwnd().unwrap_or(std::ptr::null_mut());
         if hwnd != std::ptr::null_mut() {
             unsafe {
@@ -937,6 +1195,8 @@ mod nwg_adapter {
 
         let _key_handler = if hwnd != std::ptr::null_mut() {
             let kc = key_cb.clone();
+            let act = activate_cb.clone();
+            let act_hwnd = hwnd as *mut c_void;
             // When a WM_KEYDOWN is consumed by key_cb (the app handled the
             // key itself and synced the widget text), the message loop's
             // TranslateMessage still posts a WM_CHAR for it, and the edit
@@ -967,25 +1227,67 @@ mod nwg_adapter {
                         return None;
                     }
                     if msg == winapi::um::winuser::WM_KEYDOWN || msg == winapi::um::winuser::WM_SYSKEYDOWN {
-                        if let Some(ref mut f) = *kc.borrow_mut() {
-                            // Modifier mask (GDK-compatible): Shift only — the
-                            // app needs it for Shift+arrows (selection extend).
-                            let mut mods: u32 = 0;
-                            unsafe {
-                                const VK_SHIFT: i32 = 0x10;
-                                if winapi::um::winuser::GetKeyState(VK_SHIFT) as u16 & 0x8000 != 0 {
-                                    mods |= 1;
-                                }
+                        // Pure Alt+key belongs to the native menu (DefWindowProc
+                        // opens the popup); decline so it is neither typed nor
+                        // swallowed. Without this, Alt+F in a focused entry
+                        // was consumed as printable text and menus were
+                        // mouse-only. Ctrl+Alt (AltGr) still passes through.
+                        if pure_alt_held() {
+                            return None;
+                        }
+                        // GTK4 parity: an entry-level activate callback owns
+                        // Return exclusively (the CAPTURE handler consumes it
+                        // before on_key_raw fires there), so exactly one
+                        // submit path runs per press on every backend.
+                        if crate::win32_portable::entry_return_fires_activate(
+                            (w & 0xFF) as u32,
+                            act.borrow().is_some(),
+                        ) {
+                            if let Some(ref mut a) = *act.borrow_mut() {
+                                a(act_hwnd);
                             }
-                            if f(w as u32, mods) {
-                                // Printable VKs reliably produce exactly one
-                                // WM_CHAR, as does Backspace (0x08); arrows etc.
-                                // produce none.
-                                let vk = w & 0xFF;
-                                if vk == 0x08 || (32..=126).contains(&vk) {
-                                    suppress_set.set(true);
+                            return Some(0);
+                        }
+                        if let Some(ref mut f) = *kc.borrow_mut() {
+                            // Full modifier mask (Shift/Ctrl/Alt): the app
+                            // needs Shift for arrows, Ctrl/Alt to decline
+                            // accelerators (copy/paste stay native) instead
+                            // of typing them.
+                            let mods = modifier_state();
+                            // Translate Shift pairs/capitals (Shift+9 is '(',
+                            // not '9'); specials keep raw VKs for dispatch. A
+                            // colliding translation (None) declines so native
+                            // insertion + resync handle the character.
+                            if let Some(k) = translate_vk(w) {
+                                if f(k, mods) {
+                                    // Suppress the follow-on WM_CHAR exactly
+                                    // when this VK produces one — otherwise
+                                    // the native control inserts a second
+                                    // copy ("==" for '='). Always *set*
+                                    // (never just arm): a stale flag from a
+                                    // non-producing key would swallow the
+                                    // *next* genuine character.
+                                    let vk = w & 0xFF;
+                                    let mut suppress =
+                                        crate::win32_portable::vk_produces_wm_char(vk as u32);
+                                    if suppress && (0x60..=0x6F).contains(&vk) {
+                                        // Numpad without NumLock is navigation
+                                        // (no WM_CHAR follows).
+                                        unsafe {
+                                            const VK_NUMLOCK: i32 = 0x90;
+                                            if winapi::um::winuser::GetKeyState(VK_NUMLOCK) as u16
+                                                & 1
+                                                == 0
+                                            {
+                                                suppress = false;
+                                            }
+                                        }
+                                    }
+                                    suppress_set.set(suppress);
+                                    return Some(0);
                                 }
-                                return Some(0);
+                            } else {
+                                return None;
                             }
                         }
                     }
@@ -994,7 +1296,7 @@ mod nwg_adapter {
             ).ok()
         } else { None };
 
-        Ok(Entry { inner: Rc::new(inner), _handler: Rc::new(handler), changed_cb, focus_in_cb, focus_out_cb, _focus_in_handler, _focus_out_handler, key_cb, _key_handler, pos_x: std::cell::Cell::new(0), pos_y: std::cell::Cell::new(0) })
+        Ok(Entry { hwnd: hwnd as *mut c_void, inner: Rc::new(inner), _handler: Rc::new(handler), changed_cb, focus_in_cb, focus_out_cb, _focus_in_handler, _focus_out_handler, key_cb, _key_handler, activate_cb, pos_x: std::cell::Cell::new(0), pos_y: std::cell::Cell::new(0) })
     }
 
     // ========== DropDown ==========
@@ -1003,6 +1305,8 @@ mod nwg_adapter {
     pub struct DropDown {
         pub(crate) inner: Rc<nwg::ComboBox<String>>,
         pub(crate) _handler: Rc<nwg::EventHandler>,
+        // Stable hwnd snapshot for AsRef (see Window).
+        hwnd: *mut c_void,
     }
 
     impl DropDown {
@@ -1024,14 +1328,14 @@ mod nwg_adapter {
 
     impl AsRef<*mut c_void> for DropDown {
         fn as_ref(&self) -> &*mut c_void {
-            unsafe { &*(&self.inner.handle.hwnd().unwrap_or(std::ptr::null_mut()) as *const _ as *const *mut c_void) }
+            &self.hwnd
         }
     }
 
     pub fn create_dropdown(parent: *mut c_void, items: &[&str]) -> Result<DropDown, Error> {
         let (inner, handler) = crate::backends::nwg::create_dropdown(parent, items)
             .map_err(|e| Error::Backend(format!("{}", e)))?;
-        Ok(DropDown { inner: Rc::new(inner), _handler: Rc::new(handler) })
+        Ok(DropDown { hwnd: inner.handle.hwnd().unwrap_or(std::ptr::null_mut()) as *mut c_void, inner: Rc::new(inner), _handler: Rc::new(handler) })
     }
 
     // ========== CheckButton ==========
@@ -1040,6 +1344,8 @@ mod nwg_adapter {
     pub struct CheckButton {
         pub(crate) inner: Rc<nwg::CheckBox>,
         pub(crate) _handler: Rc<nwg::EventHandler>,
+        // Stable hwnd snapshot for AsRef (see Window).
+        hwnd: *mut c_void,
     }
 
     impl CheckButton {
@@ -1058,14 +1364,14 @@ mod nwg_adapter {
 
     impl AsRef<*mut c_void> for CheckButton {
         fn as_ref(&self) -> &*mut c_void {
-            unsafe { &*(&self.inner.handle.hwnd().unwrap_or(std::ptr::null_mut()) as *const _ as *const *mut c_void) }
+            &self.hwnd
         }
     }
 
     pub fn create_checkbutton(parent: *mut c_void) -> Result<CheckButton, Error> {
         let (inner, handler) = crate::backends::nwg::create_checkbox(parent, "Check")
             .map_err(|e| Error::Backend(format!("{}", e)))?;
-        Ok(CheckButton { inner: Rc::new(inner), _handler: Rc::new(handler) })
+        Ok(CheckButton { hwnd: inner.handle.hwnd().unwrap_or(std::ptr::null_mut()) as *mut c_void, inner: Rc::new(inner), _handler: Rc::new(handler) })
     }
 
     // ========== RadioButton ==========
@@ -1074,9 +1380,16 @@ mod nwg_adapter {
     pub struct RadioButton {
         pub(crate) inner: Rc<nwg::RadioButton>,
         pub(crate) _handler: Rc<nwg::EventHandler>,
+        // Stable hwnd snapshot for AsRef (see Window).
+        hwnd: *mut c_void,
     }
 
     impl RadioButton {
+        pub fn grab_focus(&self) {
+            unsafe {
+                winapi::um::winuser::SetFocus(self.hwnd as _);
+            }
+        }
         pub fn set_active(&self, active: bool) {
             self.inner.set_check_state(if active { nwg::RadioButtonState::Checked } else { nwg::RadioButtonState::Unchecked });
         }
@@ -1088,18 +1401,23 @@ mod nwg_adapter {
         pub fn connect_toggled(&self, _f: impl FnMut() + 'static) -> Result<u64, Error> {
             Ok(0)
         }
+        pub fn set_hexpand(&self, _expand: bool) {}
+        pub fn set_vexpand(&self, _expand: bool) {}
     }
 
     impl AsRef<*mut c_void> for RadioButton {
         fn as_ref(&self) -> &*mut c_void {
-            unsafe { &*(&self.inner.handle.hwnd().unwrap_or(std::ptr::null_mut()) as *const _ as *const *mut c_void) }
+            &self.hwnd
         }
     }
 
-    pub fn create_radiobutton(parent: *mut c_void) -> Result<RadioButton, Error> {
-        let (inner, handler) = crate::backends::nwg::create_radiobutton(parent, "Radio", false)
+    /// `group_start` marks the first radio of a mutually-exclusive group
+    /// (WS_GROUP): arrows then move selection natively within the group.
+    /// Without it every radio is independent and arrows do nothing.
+    pub fn create_radiobutton(parent: *mut c_void, group_start: bool) -> Result<RadioButton, Error> {
+        let (inner, handler) = crate::backends::nwg::create_radiobutton(parent, "Radio", group_start)
             .map_err(|e| Error::Backend(format!("{}", e)))?;
-        Ok(RadioButton { inner: Rc::new(inner), _handler: Rc::new(handler) })
+        Ok(RadioButton { hwnd: inner.handle.hwnd().unwrap_or(std::ptr::null_mut()) as *mut c_void, inner: Rc::new(inner), _handler: Rc::new(handler) })
     }
 
     // ========== TextView ==========
@@ -1109,6 +1427,8 @@ mod nwg_adapter {
         pub(crate) inner: Rc<nwg::TextBox>,
         pub(crate) changed_cb: Rc<RefCell<Option<Box<dyn FnMut()>>>>,
         pub(crate) _handler: Rc<nwg::EventHandler>,
+        // Stable hwnd snapshot for AsRef (see Window).
+        hwnd: *mut c_void,
     }
 
     impl TextView {
@@ -1122,25 +1442,29 @@ mod nwg_adapter {
 
     impl AsRef<*mut c_void> for TextView {
         fn as_ref(&self) -> &*mut c_void {
-            unsafe { &*(&self.inner.handle.hwnd().unwrap_or(std::ptr::null_mut()) as *const _ as *const *mut c_void) }
+            &self.hwnd
         }
     }
 
     pub fn create_textview(parent: *mut c_void) -> Result<TextView, Error> {
         let (inner, changed_cb, handler) = crate::backends::nwg::create_textview(parent)
             .map_err(|e| Error::Backend(format!("{}", e)))?;
-        Ok(TextView { inner: Rc::new(inner), changed_cb, _handler: Rc::new(handler) })
+        Ok(TextView { hwnd: inner.handle.hwnd().unwrap_or(std::ptr::null_mut()) as *mut c_void, inner: Rc::new(inner), changed_cb, _handler: Rc::new(handler) })
     }
 
     // ========== Dialog ==========
 
     pub struct Dialog {
         pub(crate) inner: Rc<nwg::Window>,
+        // Stable hwnd snapshot for AsRef (see Window).
+        hwnd: *mut c_void,
         pub(crate) buttons: Rc<RefCell<Vec<(nwg::Button, nwg::EventHandler)>>>,
         pub(crate) response_cb: Rc<RefCell<Option<Box<dyn FnMut(i32)>>>>,
         pub(crate) _handler: Rc<nwg::EventHandler>,
         layout_cb: Rc<RefCell<Vec<Box<dyn FnMut(i32, i32)>>>>,
-        esc_handlers: Rc<RefCell<Vec<nwg::RawEventHandler>>>,
+        dlg_key_handlers: Rc<RefCell<Vec<nwg::RawEventHandler>>>,
+        esc_bound: Rc<RefCell<bool>>,
+        content: Rc<RefCell<Vec<*mut c_void>>>,
     }
 
     impl Clone for Dialog {
@@ -1150,8 +1474,11 @@ mod nwg_adapter {
                 buttons: self.buttons.clone(),
                 response_cb: self.response_cb.clone(),
                 _handler: self._handler.clone(),
+                hwnd: self.hwnd,
                 layout_cb: self.layout_cb.clone(),
-                esc_handlers: self.esc_handlers.clone(),
+                dlg_key_handlers: self.dlg_key_handlers.clone(),
+                esc_bound: self.esc_bound.clone(),
+                content: self.content.clone(),
             }
         }
     }
@@ -1180,9 +1507,12 @@ mod nwg_adapter {
                 // callback with 0 (the Cancel convention used by corro's prompt
                 // dialogs). Keyboard focus is usually on a child (button/entry),
                 // so bind on the dialog and every descendant. Bound once; the
-                // RawEventHandlers are kept alive in esc_handlers. All call sites
+                // RawEventHandlers are kept alive in dlg_key_handlers. All call sites
                 // append content before present(), so the subtree is complete.
-                if self.esc_handlers.borrow().is_empty() {
+                // Own once-flag (not vec-emptiness): other dialog key bindings
+                // (e.g. set_default_response) share the vec.
+                if !*self.esc_bound.borrow() {
+                    *self.esc_bound.borrow_mut() = true;
                     self.bind_esc_dismiss(hwnd);
                 }
                 unsafe {
@@ -1194,6 +1524,9 @@ mod nwg_adapter {
                     for cb in self.layout_cb.borrow_mut().iter_mut() {
                         cb(w, h);
                     }
+                    // Content over buttons (GtkDialog parity); also runs on
+                    // dialog WM_SIZE and after add_button().
+                    self.layout_dialog();
                     winapi::um::winuser::RedrawWindow(
                         hwnd as _,
                         std::ptr::null_mut(),
@@ -1210,18 +1543,24 @@ mod nwg_adapter {
                         let dlg = self.inner.handle.hwnd().unwrap_or(std::ptr::null_mut());
                         winapi::um::winuser::SetParent(ptr as _, dlg as _);
                         winapi::um::winuser::ShowWindow(ptr as _, winapi::um::winuser::SW_SHOW);
-                        winapi::um::winuser::SetWindowPos(
-                            ptr as _, winapi::um::winuser::HWND_TOP,
-                            0, 0, 0, 0,
-                            winapi::um::winuser::SWP_NOMOVE | winapi::um::winuser::SWP_NOSIZE,
-                        );
                     }
-                    let child_hwnd = ptr;
-                    self.layout_cb.borrow_mut().push(Box::new(move |w, h| {
-                        set_window_pos(child_hwnd, 0, 0, w, h);
-                    }));
+                    // Recorded for layout_dialog(): content stacks vertically
+                    // over the button row (GtkDialog anatomy). Positioning
+                    // happens there — never a full-area stretch per child,
+                    // which overlapped every child at (0,0).
+                    self.content.borrow_mut().push(ptr);
                 }
             }
+        }
+        /// Lay out content (stacked, full-width, above the buttons) and the
+        /// button row (bottom-right), GtkDialog parity. Runs on present(),
+        /// on dialog WM_SIZE, and after add_button().
+        pub fn layout_dialog(&self) {
+            let hwnd = self.inner.handle.hwnd().unwrap_or(std::ptr::null_mut());
+            if hwnd == std::ptr::null_mut() {
+                return;
+            }
+            layout_nwg_dialog_parts(hwnd as _, &self.content, &self.buttons);
         }
         pub fn add_button(&self, text: &str, response_id: i32) {
             let hwnd = self.inner.handle.hwnd().unwrap_or(std::ptr::null_mut());
@@ -1229,11 +1568,62 @@ mod nwg_adapter {
             let result = crate::backends::nwg::create_dialog_button(hwnd as *mut c_void, text, response_id, cb);
             if let Ok(btn) = result {
                 self.buttons.borrow_mut().push(btn);
+                // Buttons were never positioned (all piled at 0,0); lay out
+                // now in case the dialog is already visible.
+                self.layout_dialog();
             }
         }
         pub fn connect_response<F: FnMut(i32) + 'static>(&self, f: F) -> Result<u64, Error> {
             *self.response_cb.borrow_mut() = Some(Box::new(f));
             Ok(0)
+        }
+        /// Make `response_id` the dialog's default response: Return anywhere
+        /// unhandled (e.g. on a focused radio button, which consumes nothing)
+        /// fires it and dismisses, mirroring GtkDialog default-response
+        /// semantics. Handlers bind on the dialog and all current
+        /// descendants (like bind_esc_dismiss) because keys go to the focused
+        /// control. Children that consume Return themselves (entries via
+        /// activate) swallow it first, so no double-confirm.
+        ///
+
+        pub fn set_default_response(&self, response_id: i32) {
+            let dlg_hwnd = self.inner.handle.hwnd().unwrap_or(std::ptr::null_mut());
+            if dlg_hwnd.is_null() {
+                return;
+            }
+            fn collect(hwnd: winapi::shared::windef::HWND, out: &mut Vec<winapi::shared::windef::HWND>) {
+                out.push(hwnd);
+                unsafe {
+                    let mut child = winapi::um::winuser::GetWindow(hwnd, winapi::um::winuser::GW_CHILD);
+                    while child != std::ptr::null_mut() {
+                        collect(child, out);
+                        child = winapi::um::winuser::GetWindow(child, winapi::um::winuser::GW_HWNDNEXT);
+                    }
+                }
+            }
+            let mut hwnds = Vec::new();
+            collect(dlg_hwnd as _, &mut hwnds);
+            static DEFRESP_ID: AtomicUsize = AtomicUsize::new(0xD1000000);
+            for child in hwnds {
+                let cb = self.response_cb.clone();
+                let id = DEFRESP_ID.fetch_add(1, Ordering::SeqCst);
+                if let Ok(h) = nwg::bind_raw_event_handler(
+                    &nwg::ControlHandle::Hwnd(child), id,
+                    move |_h, msg, w, _l| {
+                        if msg == winapi::um::winuser::WM_KEYDOWN && (w & 0xFF) == 0x0D {
+                            if let Some(ref mut f) = *cb.borrow_mut() { f(response_id); }
+                            // Dismiss like the button path: confirming must close.
+                            unsafe {
+                                winapi::um::winuser::ShowWindow(dlg_hwnd as _, winapi::um::winuser::SW_HIDE);
+                            }
+                            return Some(0);
+                        }
+                        None
+                    },
+                ) {
+                    self.dlg_key_handlers.borrow_mut().push(h);
+                }
+            }
         }
         /// Bind an Escape-to-dismiss raw handler on the dialog window and all
         /// of its current descendants (see present()).
@@ -1272,7 +1662,7 @@ mod nwg_adapter {
                         None
                     },
                 ) {
-                    self.esc_handlers.borrow_mut().push(h);
+                    self.dlg_key_handlers.borrow_mut().push(h);
                 }
             }
         }
@@ -1287,7 +1677,7 @@ mod nwg_adapter {
 
     impl AsRef<*mut c_void> for Dialog {
         fn as_ref(&self) -> &*mut c_void {
-            unsafe { &*(&self.inner.handle.hwnd().unwrap_or(std::ptr::null_mut()) as *const _ as *const *mut c_void) }
+            &self.hwnd
         }
     }
 
@@ -1315,10 +1705,15 @@ mod nwg_adapter {
 
         let layout_cb: Rc<RefCell<Vec<Box<dyn FnMut(i32, i32)>>>> = Rc::new(RefCell::new(Vec::new()));
 
+        let content: Rc<RefCell<Vec<*mut c_void>>> = Rc::new(RefCell::new(Vec::new()));
+        let buttons: Rc<RefCell<Vec<(nwg::Button, nwg::EventHandler)>>> =
+            Rc::new(RefCell::new(Vec::new()));
         // Bind raw WM_SIZE handler for dialog
         let dlg_hwnd = inner.handle.hwnd().unwrap_or(std::ptr::null_mut());
         if dlg_hwnd != std::ptr::null_mut() {
             let cb = layout_cb.clone();
+            let content_wm = content.clone();
+            let buttons_wm = buttons.clone();
             static DIALOG_RAW_HANDLER_ID: AtomicUsize = AtomicUsize::new(0x20000000);
             let handler_id = DIALOG_RAW_HANDLER_ID.fetch_add(1, Ordering::SeqCst);
             nwg::bind_raw_event_handler(
@@ -1331,13 +1726,14 @@ mod nwg_adapter {
                         for cb_item in cb.borrow_mut().iter_mut() {
                             cb_item(w, h);
                         }
+                        layout_nwg_dialog_parts(dlg_hwnd, &content_wm, &buttons_wm);
                     }
                     None
                 },
             ).map_err(|e| Error::Backend(format!("{}", e)))?;
         }
 
-        Ok(Dialog { inner: Rc::new(inner), buttons: Rc::new(RefCell::new(Vec::new())), response_cb, _handler: Rc::new(handler), layout_cb, esc_handlers: Rc::new(RefCell::new(Vec::new())) })
+        Ok(Dialog { hwnd: inner.handle.hwnd().unwrap_or(std::ptr::null_mut()) as *mut c_void, inner: Rc::new(inner), buttons, response_cb, _handler: Rc::new(handler), layout_cb, dlg_key_handlers: Rc::new(RefCell::new(Vec::new())), esc_bound: Rc::new(RefCell::new(false)), content })
     }
 
     pub fn create_dialog_button(
@@ -1560,7 +1956,7 @@ mod nwg_adapter {
         let mut frame = nwg::Frame::default();
         if !parent.is_null() {
             nwg::Frame::builder()
-                .flags(nwg::FrameFlags::NONE)
+                .flags(nwg::FrameFlags::VISIBLE)
                 .size((0, 0))
                 .position((0, 0))
                 .parent(&nwg::ControlHandle::Hwnd(parent as _))
@@ -1589,8 +1985,27 @@ mod nwg_adapter {
                     &nwg::ControlHandle::Hwnd(raw_hwnd), kid,
                     move |_h, msg, w, _l| {
                         if msg == winapi::um::winuser::WM_KEYDOWN || msg == winapi::um::winuser::WM_SYSKEYDOWN {
+                            // Same pure-Alt yield as the entry handler: Alt+letter
+                            // must reach DefWindowProc (native menu), never the
+                            // grid edit path. Ctrl+Alt (AltGr) passes through.
+                            if pure_alt_held() {
+                                return None;
+                            }
+                            // Pure Ctrl is accelerators, not grid input: decline
+                            // instead of typing the letter (Ctrl+C must never
+                            // insert 'c'). Ctrl+Alt (AltGr) passes through.
+                            if pure_ctrl_held() {
+                                return None;
+                            }
                             if let Some(ref mut f) = *kc.borrow_mut() {
-                                if f(w as u32) { return Some(0); }
+                                // Translate Shift pairs/capitals like the
+                                // entry path; specials keep raw VKs. A
+                                // colliding translation (None) declines.
+                                if let Some(k) = translate_vk(w) {
+                                    if f(k) { return Some(0); }
+                                } else {
+                                    return None;
+                                }
                             }
                         }
                         None
@@ -1684,8 +2099,20 @@ mod nwg_adapter {
                     &nwg::ControlHandle::Hwnd(raw_hwnd), kid,
                     move |_h, msg, w, _l| {
                         if msg != winapi::um::winuser::WM_KEYDOWN && msg != winapi::um::winuser::WM_SYSKEYDOWN { return None; }
+                        // Pure Alt/Ctrl yield (menus/accelerators own those
+                        // keys); Ctrl+Alt (AltGr) passes through.
+                        if pure_alt_held() || pure_ctrl_held() {
+                            return None;
+                        }
                         if let Some(ref mut f) = *kc.borrow_mut() {
-                            if f(w as u32) { return Some(0); }
+                            // Translate Shift pairs/capitals like the entry
+                            // path; specials keep raw VKs. A colliding
+                            // translation (None) declines.
+                            if let Some(k) = translate_vk(w) {
+                                if f(k) { return Some(0); }
+                            } else {
+                                return None;
+                            }
                         }
                         None
                     },
@@ -1777,7 +2204,7 @@ mod nwg_adapter {
         let mut frame = nwg::Frame::default();
         if !parent.is_null() {
             nwg::Frame::builder()
-                .flags(nwg::FrameFlags::NONE)
+                .flags(nwg::FrameFlags::VISIBLE)
                 .size((0, 0))
                 .position((0, 0))
                 .parent(&nwg::ControlHandle::Hwnd(parent as _))
@@ -1885,7 +2312,7 @@ mod nwg_adapter {
         let mut frame = nwg::Frame::default();
         if !parent.is_null() {
             nwg::Frame::builder()
-                .flags(nwg::FrameFlags::NONE)
+                .flags(nwg::FrameFlags::VISIBLE)
                 .size((0, 0))
                 .position((0, 0))
                 .parent(&nwg::ControlHandle::Hwnd(parent as _))
@@ -2058,14 +2485,16 @@ mod nwg_adapter {
     impl Menu {
         pub fn append(&mut self, label: &str, detailed_action: &str) {
             self.items.push(MenuItem {
-                label: label.to_string(),
+                // The model speaks GTK (`_` mnemonics); translate once to
+                // the Win32 `&` marker here so no call site invents its own.
+                label: crate::win32_portable::gtk_mnemonic_to_win32(label),
                 action: detailed_action.to_string(),
                 submenu: None,
             });
         }
         pub fn append_submenu(&mut self, label: &str, submenu: &Menu) {
             self.items.push(MenuItem {
-                label: label.to_string(),
+                label: crate::win32_portable::gtk_mnemonic_to_win32(label),
                 action: String::new(),
                 submenu: Some(submenu.clone()),
             });
@@ -2114,13 +2543,27 @@ mod nwg_adapter {
         }
     }
 
+    // Keyboard-menu shims required by common.rs: native Win32 menus handle
+    // Alt+letter mnemonics in the OS (see the `&` prefixes in
+    // `create_menubar`), so the manual popover-navigation contract is a
+    // no-op here — matching the documented "On NWG ... this is a no-op".
     impl MenuBar {
-        pub fn activate_submenu_by_mnemonic(&self, _keyval: u32) -> bool { false }
-        pub fn activate_submenu_item_by_mnemonic(&self, _keyval: u32) -> bool { false }
+        pub fn activate_submenu_by_mnemonic(&self, _keyval: u32) -> bool {
+            false
+        }
+        pub fn activate_submenu_item_by_mnemonic(&self, _keyval: u32) -> bool {
+            false
+        }
         pub unsafe fn insert_action_group(&self, _name: &str, _group_ptr: *mut c_void) {}
-        pub fn handle_mnemonic_key(&self, _keyval: u32) -> bool { false }
-        pub fn handle_menu_key(&self, _keyval: u32, _mod: u32) -> bool { false }
-        pub fn menu_active(&self) -> bool { false }
+        pub fn handle_mnemonic_key(&self, _keyval: u32) -> bool {
+            false
+        }
+        pub fn handle_menu_key(&self, _keyval: u32, _modifiers: u32) -> bool {
+            false
+        }
+        pub fn menu_active(&self) -> bool {
+            false
+        }
         pub fn menu_close(&self) {}
     }
 
@@ -2137,7 +2580,7 @@ mod nwg_adapter {
             if let Some(ref children) = item.submenu {
                 let mut sub = nwg::Menu::default();
                 nwg::Menu::builder()
-                    .text(&format!("&{}", item.label))
+                    .text(&item.label)
                     .popup(false)
                     .parent(parent_handle.clone())
                     .build(&mut sub)?;
@@ -2152,7 +2595,7 @@ mod nwg_adapter {
             } else {
                 let mut mi = nwg::MenuItem::default();
                 nwg::MenuItem::builder()
-                    .text(&format!("&{}", item.label))
+                    .text(&item.label)
                     .parent(parent_handle.clone())
                     .build(&mut mi)?;
                 let parent_hmenu: *mut c_void = match parent_handle {
@@ -2199,7 +2642,7 @@ mod nwg_adapter {
             if let Some(ref children) = item.submenu {
                 let mut menu = nwg::Menu::default();
                 nwg::Menu::builder()
-                    .text(&format!("&{}", item.label))
+                    .text(&item.label)
                     .popup(false)
                     .parent(&window_handle)
                     .build(&mut menu)
@@ -2215,7 +2658,7 @@ mod nwg_adapter {
             } else {
                 let mut mi = nwg::MenuItem::default();
                 nwg::MenuItem::builder()
-                    .text(&format!("&{}", item.label))
+                    .text(&item.label)
                     .parent(&window_handle)
                     .build(&mut mi)
                     .map_err(|e| Error::Backend(format!("{}", e)))?;
@@ -2322,6 +2765,49 @@ mod nwg_adapter {
 
     pub fn quit_main_loop() {
         crate::backends::nwg::quit_main_loop();
+    }
+
+    /// Diagnostic: dump the native window tree under `root` (hwnd, class,
+    /// rect, visibility, leading text) to `path`. Env-gated by callers;
+    /// no behavior change when unused. Exists so layout bugs can be
+    /// diagnosed from real Windows screenshots' ground truth.
+    pub fn debug_dump_native_tree(root: *mut c_void, path: &str) {
+        struct Ctx {
+            lines: Vec<String>,
+        }
+        unsafe extern "system" fn enum_cb(
+            hwnd: winapi::shared::windef::HWND,
+            lparam: winapi::shared::minwindef::LPARAM,
+        ) -> i32 {
+            let ctx = &mut *(lparam as *mut Ctx);
+            unsafe {
+                let mut cls: [u16; 64] = [0; 64];
+                let n = winapi::um::winuser::GetClassNameW(hwnd, cls.as_mut_ptr(), 64);
+                let class = String::from_utf16_lossy(&cls[..n.max(0) as usize]);
+                let mut rect: winapi::shared::windef::RECT = std::mem::zeroed();
+                winapi::um::winuser::GetWindowRect(hwnd, &mut rect);
+                let vis = winapi::um::winuser::IsWindowVisible(hwnd) != 0;
+                let tlen = winapi::um::winuser::GetWindowTextLengthW(hwnd);
+                let mut text = String::new();
+                if tlen > 0 && tlen < 80 {
+                    let mut buf: Vec<u16> = vec![0; (tlen + 1) as usize];
+                    winapi::um::winuser::GetWindowTextW(hwnd, buf.as_mut_ptr(), tlen + 1);
+                    text = String::from_utf16_lossy(&buf[..tlen as usize]);
+                }
+                ctx.lines.push(format!(
+                    "hwnd={:p} class={} rect=({},{})-({},{}) visible={} text={:?}",
+                    hwnd, class, rect.left, rect.top, rect.right, rect.bottom, vis, text
+                ));
+            }
+            1
+        }
+        unsafe {
+            let mut ctx = Ctx { lines: Vec::new() };
+            // Root itself first.
+            enum_cb(root as _, &mut ctx as *mut Ctx as _);
+            winapi::um::winuser::EnumChildWindows(root as _, Some(enum_cb), &mut ctx as *mut Ctx as _);
+            let _ = std::fs::write(path, ctx.lines.join("\n") + "\n");
+        }
     }
 }
 

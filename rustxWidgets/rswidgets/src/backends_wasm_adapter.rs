@@ -564,6 +564,7 @@ impl AsElement for BoxWidget {
             Some(self.elem.value())
         }
 
+
         pub fn set_width_chars(&self, n: i32) {
             self.elem.set_size(n as u32);
         }
@@ -776,12 +777,8 @@ impl AsElement for MenuBar {
         }
     }
 
-     impl MenuBar {
-         pub fn handle_mnemonic_key(&self, _keyval: u32) -> bool { false }
-         pub fn handle_menu_key(&self, _keyval: u32, _mod: u32) -> bool { false }
-         pub fn menu_active(&self) -> bool { false }
-         pub fn menu_close(&self) {}
-     }
+    impl MenuBar {
+    }
 
     pub fn create_menubar(model: &Menu, _action_group: *mut c_void) -> Result<MenuBar, Error> {
         let bar: HtmlDivElement = create_element("div").dyn_into().map_err(|e| {

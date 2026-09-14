@@ -30,6 +30,35 @@ pub struct PartialReplay {
     pub error: Option<String>,
 }
 
+/// RAII batching for bulk log replay (ALGORITHMS.md §§2.2, 2.8): suspends
+/// per-write auto-fit on every live sheet grid, then fits each touched
+/// column once on drop — covering all early-return paths. Sheets created
+/// mid-replay start unsuspended; resuming them is a harmless no-op.
+struct ReplayFitGuard<'a> {
+    workbook: &'a mut WorkbookState,
+}
+
+impl<'a> ReplayFitGuard<'a> {
+    fn new(workbook: &'a mut WorkbookState) -> Self {
+        for sheet in &mut workbook.sheets {
+            sheet.state.grid.suspend_auto_fit();
+        }
+        Self { workbook }
+    }
+
+    fn workbook(&mut self) -> &mut WorkbookState {
+        self.workbook
+    }
+}
+
+impl Drop for ReplayFitGuard<'_> {
+    fn drop(&mut self) {
+        for sheet in &mut self.workbook.sheets {
+            sheet.state.grid.resume_auto_fit();
+        }
+    }
+}
+
 fn parse_log_header_version(line: &str) -> Option<Result<u32, std::io::Error>> {
     let trimmed = line.trim();
     if !trimmed.starts_with(LOG_HEADER_PREFIX) {
@@ -113,8 +142,11 @@ pub fn load_workbook_revisions(
         return Ok((data.len() as u64, 0));
     }
     let mut n = 0usize;
+    // Batch auto-fit across the whole replay (ALGORITHMS.md §§2.2, 2.8): the
+    // guard resumes (fitting once per touched column) on every exit path.
+    let mut _fit_guard = ReplayFitGuard::new(workbook);
     for (_, line) in logical_lines {
-        apply_log_line_to_workbook(&line, workbook, active_sheet)?;
+        apply_log_line_to_workbook(&line, _fit_guard.workbook(), active_sheet)?;
         n += 1;
         if n >= limit {
             break;
@@ -154,8 +186,9 @@ pub fn load_workbook_revisions_partial(
         ));
     }
     let mut n = 0usize;
+    let mut _fit_guard = ReplayFitGuard::new(workbook);
     for (line_no, line) in logical_lines {
-        if let Err(err) = apply_log_line_to_workbook(&line, workbook, active_sheet) {
+        if let Err(err) = apply_log_line_to_workbook(&line, _fit_guard.workbook(), active_sheet) {
             return Ok((
                 data.len() as u64,
                 PartialReplay {
@@ -213,6 +246,19 @@ pub fn save_workbook(path: &Path, workbook: &WorkbookSnapshot) -> Result<(), IoE
 
 fn workbook_addr_label(addr: &CellAddr) -> String {
     crate::addr::cell_ref_text(addr, 0)
+}
+
+/// Template path for new documents (`CORRO_TEMPLATE`): a `.corro` file
+/// whose whole workbook becomes the fresh document. Blank/unset means
+/// built-in seeded blank. Pure lookup — loading + fallback live with the
+/// caller so both stay unit-testable without touching process env.
+pub(crate) fn template_path_from_env() -> Option<std::path::PathBuf> {
+    let raw = std::env::var("CORRO_TEMPLATE").ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(std::path::PathBuf::from(trimmed))
 }
 
 /// Load a template workbook for new documents (`CORRO_TEMPLATE`): the whole
@@ -288,7 +334,8 @@ pub fn load_workbook_snapshot(path: &Path) -> Result<WorkbookSnapshot, IoError> 
         let mut parts = line.split_whitespace();
         match parts.next() {
             Some("SHEET") => {
-                if let Some(sheet) = current.take() {
+                if let Some(mut sheet) = current.take() {
+                    sheet.state.grid.resume_auto_fit();
                     sheets.push(sheet);
                 }
                 let id = parts
@@ -298,10 +345,14 @@ pub fn load_workbook_snapshot(path: &Path) -> Result<WorkbookSnapshot, IoError> 
                         std::io::Error::new(std::io::ErrorKind::InvalidData, "bad sheet header")
                     })?;
                 let title = parts.collect::<Vec<_>>().join(" ");
+                // Batch per-cell auto-fit across the sheet body (ALGORITHMS.md
+                // §2.2); resumed at END_SHEET / end of input below.
+                let mut fresh_state = SheetState::new(1, 1);
+                fresh_state.grid.suspend_auto_fit();
                 current = Some(crate::ops::SheetRecord {
                     id,
                     title,
-                    state: SheetState::new(1, 1),
+                    state: fresh_state,
                     linked_source: None,
                 });
             }
@@ -317,7 +368,8 @@ pub fn load_workbook_snapshot(path: &Path) -> Result<WorkbookSnapshot, IoError> 
                 }
             }
             Some("END_SHEET") => {
-                if let Some(sheet) = current.take() {
+                if let Some(mut sheet) = current.take() {
+                    sheet.state.grid.resume_auto_fit();
                     sheets.push(sheet);
                 }
             }
@@ -330,7 +382,8 @@ pub fn load_workbook_snapshot(path: &Path) -> Result<WorkbookSnapshot, IoError> 
         }
     }
 
-    if let Some(sheet) = current.take() {
+    if let Some(mut sheet) = current.take() {
+        sheet.state.grid.resume_auto_fit();
         sheets.push(sheet);
     }
     if sheets.is_empty() {
@@ -555,8 +608,9 @@ pub fn tail_apply_workbook(
         let mut rest = String::new();
         f.read_to_string(&mut rest)?;
         let logical_lines = collect_workbook_log_lines(&rest)?;
+        let mut _fit_guard = ReplayFitGuard::new(workbook);
         for (_, line) in logical_lines {
-            apply_log_line_to_workbook(&line, workbook, active_sheet)?;
+            apply_log_line_to_workbook(&line, _fit_guard.workbook(), active_sheet)?;
         }
         Ok(len)
     }
@@ -635,6 +689,10 @@ fn import_delimited(data: &str, state: &mut SheetState, delim: char) {
         .grid
         .set_main_size(mr.max(1) as usize, mc.max(1) as usize);
 
+    // Batch the writes so each touched column is auto-fitted once at the end
+    // instead of once per cell (ALGORITHMS.md §2.2). The pre-fit loop the old
+    // code ran here was a no-op (columns are still empty at that point).
+    state.grid.suspend_auto_fit();
     if let Some(hdr) = header_row {
         use crate::grid::HEADER_ROWS;
         let header_idx = (HEADER_ROWS - 1) as u32;
@@ -652,10 +710,6 @@ state.grid.set(
         }
     }
 
-    for ci in 0..max_cols {
-        state.grid.auto_fit_column(crate::grid::MARGIN_COLS + ci);
-    }
-
     for (ri, row) in data_rows.iter().enumerate() {
         for (ci, val) in row.iter().enumerate() {
             if !val.is_empty() {
@@ -669,6 +723,7 @@ state.grid.set(
             }
         }
     }
+    state.grid.resume_auto_fit();
 }
 
 fn parse_csv_line(line: &str) -> Vec<String> {
@@ -778,7 +833,6 @@ use crate::grid::{CellAddr, ColumnAddr};
     use tempfile::NamedTempFile;
 
     #[test]
-    #[test]
     fn template_loads_workbook_content() {
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
@@ -823,6 +877,7 @@ use crate::grid::{CellAddr, ColumnAddr};
         let _ = std::fs::remove_file(&txt);
     }
 
+    #[test]
     fn commit_workbook_op_roundtrip() {
         let path = NamedTempFile::new().unwrap();
         let mut workbook = WorkbookState::new();

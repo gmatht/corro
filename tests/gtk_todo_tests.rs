@@ -111,10 +111,18 @@ fn extract_match_arm_strings(text: &str) -> Vec<String> {
 #[test]
 fn gui_menu_action_names_cover_all_defined_actions() {
     // Verify that every action name defined in menu.rs::action_kind_to_name()
-    // has a corresponding match arm in gui_backend.rs::handle_menu_action().
-    // This ensures the GUI backend dispatches all defined menu actions.
+    // is dispatched somewhere. Dispatch is split across three sites (do not
+    // re-narrow this to one without updating the others):
+    //   1. gui_backend.rs::handle_menu_action() (legacy string-arm dispatch),
+    //   2. actions.rs::dispatch_menu_action() (shared MenuDispatch dispatch),
+    //   3. actions.rs::run_prompt_action() (Prompt-routed actions like
+    //      copy_sheet/go_to_cell: name -> dialog -> action string),
+    //   4. menu.rs::handle_action() (inline dialog wiring for non-GUI
+    //      backends: find, balance_books, rename_sheet, ...).
+    // An action counts as handled if it appears in ANY of the three.
     let menu_rs = fs::read_to_string("src/gui/menu.rs").unwrap();
     let gui_backend_rs = fs::read_to_string("src/gui/gui_backend.rs").unwrap();
+    let actions_rs = fs::read_to_string("src/gui/actions.rs").unwrap();
 
     // Extract action names from action_kind_to_name() in menu.rs
     let menu_normalized = strip_leading(&menu_rs);
@@ -128,15 +136,35 @@ fn gui_menu_action_names_cover_all_defined_actions() {
 
     // Extract action names from handle_menu_action() match arms in gui_backend.rs
     let gui_normalized = strip_leading(&gui_backend_rs);
-    let handled_names: Vec<String> = {
+    let mut handled_names: Vec<String> = {
         let start_marker = "fn handle_menu_action";
         let start = gui_normalized.find(start_marker)
             .expect("handle_menu_action not found in gui_backend.rs");
         let body = &gui_normalized[start..];
         extract_match_arm_strings(body)
     };
+    // ... plus dispatch_menu_action() and run_prompt_action() match arms
+    // in actions.rs ...
+    let actions_normalized = strip_leading(&actions_rs);
+    for start_marker in ["fn dispatch_menu_action", "fn run_prompt_action"] {
+        let start = actions_normalized.find(start_marker)
+            .unwrap_or_else(|| panic!("{start_marker} not found in actions.rs"));
+        let body = &actions_normalized[start..];
+        handled_names.extend(extract_match_arm_strings(body));
+    }
+    // ... plus the inline handle_action() match arms in menu.rs itself.
+    {
+        let start_marker = "fn handle_action";
+        let start = menu_normalized.find(start_marker)
+            .expect("handle_action not found in menu.rs");
+        let body = &menu_normalized[start..];
+        handled_names.extend(extract_match_arm_strings(body));
+    }
+    handled_names.sort();
+    handled_names.dedup();
 
-    // Verify: every action name from menu.rs must appear in gui_backend.rs
+    // Verify: every action name from menu.rs must appear in at least one
+    // dispatch site.
     let mut missing: Vec<&str> = Vec::new();
     for name in &action_names {
         if !handled_names.iter().any(|h| h == name) {
@@ -146,7 +174,7 @@ fn gui_menu_action_names_cover_all_defined_actions() {
 
     assert!(
         missing.is_empty(),
-        "Menu actions defined in menu.rs but missing from gui_backend.rs::handle_menu_action:\n  {}",
+        "Menu actions defined in menu.rs but dispatched nowhere (checked handle_menu_action, dispatch_menu_action, run_prompt_action, handle_action):\n  {}",
         missing.join("\n  ")
     );
 }

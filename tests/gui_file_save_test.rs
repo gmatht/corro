@@ -6,7 +6,6 @@
 
 use corro::gui::App as GuiApp;
 use corro::gui::Backend;
-use corro::grid::CellAddr;
 use std::fs;
 
 /// Test that when running corro --gui with a non-existent file,

@@ -609,7 +609,7 @@ fn gui_viewport_thumb_follows_scrolled_viewport() {
     // Poll for the thumb to ride down with the viewport (frames lag keys
     // under load; deadline, not sleep).
     let deadline = Instant::now() + Duration::from_secs(20);
-    let (n1, min1, max1) = loop {
+    let (n1, _, max1) = loop {
         let shot = screenshot(&wid, "vpfollow");
         let t = vthumb(&shot);
         if t.1 - min0 > 30 {

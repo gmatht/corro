@@ -67,13 +67,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
     let row_heights: Rc<RefCell<Vec<i32>>> = Rc::new(RefCell::new(vec![CELL_H; ROWS]));
     let sel: Rc<RefCell<Option<(usize, usize)>>> = Rc::new(RefCell::new(Some((0, 0))));
-    let editing_entry: Rc<RefCell<Option<Entry>>> = Rc::new(RefCell::new(None));
+    let editing_entry: Rc<RefCell<Option<gtk::Entry>>> = Rc::new(RefCell::new(None));
     let text_input_active: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
 
     // Seed demo data
     {
         let mut t = texts.borrow_mut();
-        let mut f = fmts.borrow_mut();
         t[0][0] = "Short".into();
         t[1][0] = "VeryLongHeaderThatOverflows".into();
         t[2][0] = "CellWithAVeryLongWordThatWillSpanMultipleCells".into();
@@ -501,7 +500,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let commit_kb = commit_edit.clone();
     let start_kb = start_edit.clone();
     let refresh_kb = refresh_selection.clone();
-    canvas.on_key(Box::new(move |keyval: u32| -> bool {
+    canvas.on_key(Box::new(move |keyval: u32, _state: u32| -> bool {
         if *text_active_kb.borrow() { return false; }
         if edit_kb.borrow().is_some() {
             if keyval == 0xFF1B { // Escape
@@ -552,7 +551,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }));
 
     // Helper: apply cell formatting CSS classes to an entry widget
-    fn apply_fmt(entry: &Entry, r: usize, c: usize, fmts: &RefCell<Vec<Vec<CellFormat>>>) {
+    fn apply_fmt(entry: &gtk::Entry, r: usize, c: usize, fmts: &RefCell<Vec<Vec<CellFormat>>>) {
         let b = fmts.borrow();
         if r >= b.len() || c >= b[r].len() { return; }
         let fmt = &b[r][c];
@@ -608,7 +607,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let edit_entry_al = editing_entry.clone();
     let _ = al_l.on_click({
         let sel_al = sel.clone(); let fmts_al = fmts.clone(); let cv_al = canvas.clone();
         let ed_al = editing_entry.clone();

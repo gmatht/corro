@@ -175,6 +175,163 @@ pub struct Action {
     pub checked: bool,
 }
 
+// ---------------------------------------------------------------------------
+// Labels and the translator hook (i18n *mechanism*, not policy)
+// ---------------------------------------------------------------------------
+
+use std::sync::OnceLock;
+
+/// A menu/widget label before or after translation.
+///
+/// `Literal` is a pre-resolved string: existing behavior, and the right choice
+/// when the app translates itself. `Key` is a deferred, app-owned lookup key,
+/// resolved at render time via the installed [`set_translator`].
+///
+/// The toolkit owns the *mechanism* (deferred label + resolution point); the
+/// app owns the *catalog* (key -> text). No translated string ever lives in
+/// this crate — see AGENTS.md "Toolkit purity".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Label {
+    Literal(String),
+    Key(&'static str),
+}
+
+impl Label {
+    /// Resolve to display text through the installed translator. Literals pass
+    /// through unchanged; keys go to the translator (identity until one is
+    /// installed, so an untranslated app renders readable keys, not blanks).
+    pub fn resolve(&self) -> String {
+        match self {
+            Label::Literal(s) => s.clone(),
+            Label::Key(k) => resolve_key(k),
+        }
+    }
+
+    /// The locale-independent identity: the literal text, or the key itself.
+    /// Use this for parity walks, dispatch, and tests that must be stable
+    /// across locales.
+    pub fn identity(&self) -> &str {
+        match self {
+            Label::Literal(s) => s,
+            Label::Key(k) => k,
+        }
+    }
+
+    /// True when this label defers resolution to the translator.
+    pub fn is_key(&self) -> bool {
+        matches!(self, Label::Key(_))
+    }
+}
+
+impl From<String> for Label {
+    fn from(s: String) -> Self { Label::Literal(s) }
+}
+impl From<&str> for Label {
+    fn from(s: &str) -> Self { Label::Literal(s.to_string()) }
+}
+impl From<&String> for Label {
+    fn from(s: &String) -> Self { Label::Literal(s.clone()) }
+}
+
+type TranslatorFn = Box<dyn Fn(&str) -> String + Send + Sync>;
+
+/// A swappable cell, not a bare `OnceLock`: resolving a key before the app
+/// installs its translator must not permanently freeze the cell at identity.
+/// `OnceLock<RwLock<Option<..>>>` keeps the first-use path lock-free-ish while
+/// still allowing exactly the install/swap the app needs.
+static TRANSLATOR: OnceLock<std::sync::RwLock<Option<TranslatorFn>>> = OnceLock::new();
+
+fn cell() -> &'static std::sync::RwLock<Option<TranslatorFn>> {
+    TRANSLATOR.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+/// Install (or replace) the app's translator.
+///
+/// Until one is installed, `Label::Key` resolves to the key itself (identity),
+/// so an untranslated app renders readable keys and every existing test that
+/// compares raw labels keeps passing. Replacing it later (locale switch) takes
+/// effect on the next render — apps that switch locale should also trigger a
+/// redraw.
+pub fn set_translator<F: Fn(&str) -> String + Send + Sync + 'static>(f: F) {
+    *cell().write().unwrap() = Some(Box::new(f));
+}
+
+/// Resolve a key through the installed translator, or identity.
+fn resolve_key(key: &str) -> String {
+    match cell().read() {
+        Ok(g) => match g.as_ref() {
+            Some(f) => f(key),
+            None => key.to_string(),
+        },
+        Err(_) => key.to_string(),
+    }
+}
+
+/// Resolve a label key through the installed translator. Convenience for
+/// backends and apps that hold a bare key rather than a [`Label`].
+pub fn tr(key: &str) -> String {
+    resolve_key(key)
+}
+
+/// Documented key namespace for the *generic* action vocabulary
+/// (docs/STANDARD_ACTIONS.md). These are keys only — no English (or any)
+/// string ships in this crate. An app translates them if it wants to; an app
+/// that installs no translator renders the keys themselves.
+pub mod std_action_keys {
+    pub const ABOUT:    &str = "std.about";
+    pub const EXIT:     &str = "std.exit";
+    pub const OPEN:     &str = "std.open";
+    pub const SAVE:     &str = "std.save";
+    pub const SAVE_AS:  &str = "std.save_as";
+    pub const NEW:      &str = "std.new";
+    pub const CLOSE:    &str = "std.close";
+    pub const HELP:     &str = "std.help";
+    pub const CUT:      &str = "std.cut";
+    pub const COPY:     &str = "std.copy";
+    pub const PASTE:    &str = "std.paste";
+    pub const FIND:     &str = "std.find";
+    pub const REPLACE:  &str = "std.replace";
+    pub const UNDO:     &str = "std.undo";
+    pub const REDO:     &str = "std.redo";
+}
+
+/// Layout direction for locales that read right-to-left.
+///
+/// This is the one i18n concern that belongs to *backends*: text is data (app
+/// layer), but mirroring is platform behavior with a native API (GTK:
+/// `gtk_widget_set_default_direction`; NWG: `WS_EX_LAYOUTRTL`). The core only
+/// carries the policy-free flag.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum LayoutDir {
+    #[default]
+    Ltr,
+    Rtl,
+}
+
+static LAYOUT_DIR: OnceLock<Box<dyn Fn(LayoutDir) + Send + Sync>> = OnceLock::new();
+
+/// Register the backend's layout-direction hook. Backends call this at init;
+/// apps call [`set_layout_direction`] to change it.
+pub fn set_layout_direction_hook<F: Fn(LayoutDir) + Send + Sync + 'static>(f: F) {
+    let _ = LAYOUT_DIR.set(Box::new(f));
+}
+
+/// Ask the active backend to mirror (or un-mirror) its layout. No-op when no
+/// backend registered a hook (e.g. headless tests).
+pub fn set_layout_direction(dir: LayoutDir) {
+    if let Some(f) = LAYOUT_DIR.get() {
+        f(dir);
+    }
+}
+
+/// True when the app's locale is a known RTL locale (by BCP-47-ish prefix).
+/// Purely a convenience heuristic; apps may ignore it and call
+/// [`set_layout_direction`] directly.
+pub fn locale_is_rtl(tag: &str) -> bool {
+    let base = tag.split(['-', '_']).next().unwrap_or("").to_ascii_lowercase();
+    matches!(base.as_str(), "ar" | "he" | "fa" | "ur" | "yi" | "dv" | "ps" | "sd" | "ug")
+}
+
 /// A menu item in a backend-agnostic menu model. Backends render and navigate
 /// this model with their own widgets; the model itself is shared so an
 /// application can build one menu and hand it to any backend.
@@ -183,13 +340,17 @@ pub struct Action {
 /// radio items (one-of-a-group), separators, and submenus. `shortcut` is the
 /// accelerator text (e.g. "Ctrl+O") for backends that can wire real
 /// keybindings.
+///
+/// `label` is a [`Label`], so an app may mix pre-translated literals and
+/// deferred translation keys in one tree (`From<String>`/`From<&str>` keep
+/// literal construction unchanged).
 #[derive(Clone, Debug)]
 pub enum MenuItem {
-    Action { label: String, action: String, shortcut: Option<String> },
-    Check { label: String, action: String, checked: bool },
-    Radio { label: String, action: String, group: u32 },
+    Action { label: Label, action: String, shortcut: Option<String> },
+    Check { label: Label, action: String, checked: bool },
+    Radio { label: Label, action: String, group: u32 },
     Separator,
-    Submenu { label: String, items: Vec<MenuItem>, shortcut: Option<String> },
+    Submenu { label: Label, items: Vec<MenuItem>, shortcut: Option<String> },
 }
 
 /// A data grid (mirrors wxGrid): cells, cursor, viewport, editing state,
@@ -493,8 +654,8 @@ impl App {
     }
 
     #[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
-    pub fn create_radiobutton(&self, label: &str) -> Result<crate::backends_gtk_adapter::RadioButton, Error> {
-        crate::backends_gtk_adapter::create_radiobutton(None, label).map_err(|e| e)
+    pub fn create_radiobutton(&self, group: Option<&crate::backends_gtk_adapter::RadioButton>, label: &str) -> Result<crate::backends_gtk_adapter::RadioButton, Error> {
+        crate::backends_gtk_adapter::create_radiobutton(group, label).map_err(|e| e)
     }
 
     #[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
@@ -607,9 +768,11 @@ impl App {
     }
 
     #[cfg(all(windows, not(feature = "zork")))]
-    pub fn create_radiobutton(&self, label: &str) -> Result<crate::backends_nwg_adapter::RadioButton, Error> {
+    pub fn create_radiobutton(&self, group: Option<&crate::backends_nwg_adapter::RadioButton>, label: &str) -> Result<crate::backends_nwg_adapter::RadioButton, Error> {
+        // Win32 groups by WS_GROUP: the first radio (no group yet) starts it.
+        let group_start = group.is_none();
         let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
-        let rb = crate::backends_nwg_adapter::create_radiobutton(parent)?;
+        let rb = crate::backends_nwg_adapter::create_radiobutton(parent, group_start)?;
         rb.set_label(label);
         Ok(rb)
     }
@@ -713,7 +876,8 @@ impl App {
     }
 
     #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
-    pub fn create_radiobutton(&self, label: &str) -> Result<crate::backends_pancurses_adapter::RadioButton, Error> {
+    pub fn create_radiobutton(&self, group: Option<&crate::backends_pancurses_adapter::RadioButton>, label: &str) -> Result<crate::backends_pancurses_adapter::RadioButton, Error> {
+        let _ = group;
         crate::backends_pancurses_adapter::create_radiobutton(None, label)
     }
 
@@ -840,7 +1004,8 @@ impl App {
     }
 
     #[cfg(feature = "zork")]
-    pub fn create_radiobutton(&self, label: &str) -> Result<crate::backends_zork_adapter::RadioButton, Error> {
+    pub fn create_radiobutton(&self, group: Option<&crate::backends_zork_adapter::RadioButton>, label: &str) -> Result<crate::backends_zork_adapter::RadioButton, Error> {
+        let _ = group;
         crate::backends_zork_adapter::create_radiobutton(None, label)
     }
 
@@ -912,7 +1077,8 @@ impl App {
     }
 
     #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
-    pub fn create_radiobutton(&self, label: &str) -> Result<crate::backends_wasm_adapter::RadioButton, Error> {
+    pub fn create_radiobutton(&self, group: Option<&crate::backends_wasm_adapter::RadioButton>, label: &str) -> Result<crate::backends_wasm_adapter::RadioButton, Error> {
+        let _ = group;
         crate::backends_wasm_adapter::create_radiobutton(None, label)
     }
 
@@ -978,7 +1144,8 @@ pub fn create_checkbutton(&self, label: &str) -> Result<crate::backends_android_
 }
 
 #[cfg(all(target_os = "android", not(feature = "zork")))]
-pub fn create_radiobutton(&self, label: &str) -> Result<crate::backends_android_adapter::RadioButton, Error> {
+pub fn create_radiobutton(&self, group: Option<&crate::backends_android_adapter::RadioButton>, label: &str) -> Result<crate::backends_android_adapter::RadioButton, Error> {
+    let _ = group;
     crate::backends_android_adapter::create_radiobutton(None, label)
 }
 
@@ -1364,5 +1531,108 @@ impl From<Box<dyn crate::backends::BackendApp>> for App {
             #[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
             action_group: Rc::new(RefCell::new(None)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // NOTE: the translator is process-global, so these tests must not run
+    // concurrently with each other. `cargo test` runs tests in one binary on
+    // multiple threads; keep all translator-dependent assertions in ONE test.
+    #[test]
+    fn label_keys_resolve_through_installed_translator() {
+        // Before install: identity, so existing tests keep passing.
+        assert_eq!(Label::Key("menu.file").resolve(), "menu.file");
+        assert_eq!(tr("std.exit"), "std.exit");
+
+        // Install a catalog, then swap it (locale switch) — the early
+        // identity resolution above must not have frozen the cell.
+        set_translator(|k| match k {
+            "menu.file" => "File".to_string(),
+            "std.exit" => "Exit".to_string(),
+            _ => k.to_string(),
+        });
+        assert_eq!(Label::Key("menu.file").resolve(), "File");
+        assert_eq!(tr("std.exit"), "Exit");
+
+        set_translator(|k| match k {
+            "menu.file" => "Datei".to_string(),
+            "std.exit" => "Beenden".to_string(),
+            _ => k.to_string(),
+        });
+        assert_eq!(Label::Key("menu.file").resolve(), "Datei");
+        assert_eq!(tr("std.exit"), "Beenden");
+
+        // Unknown key falls back to the key itself (benign).
+        assert_eq!(tr("no.such.key"), "no.such.key");
+    }
+
+    #[test]
+    fn literal_label_ignores_translator_and_identity_is_locale_stable() {
+        // Literals never consult the translator.
+        assert_eq!(Label::Literal("Open file".to_string()).resolve(), "Open file");
+        assert!(!Label::Literal("x".to_string()).is_key());
+        assert!(Label::Key("x").is_key());
+
+        // identity() is the locale-independent contract (dispatch/parity).
+        assert_eq!(Label::Key("menu.file").identity(), "menu.file");
+        assert_eq!(Label::Literal("Open".to_string()).identity(), "Open");
+    }
+
+    #[test]
+    fn from_impls_keep_literal_construction_unchanged() {
+        assert_eq!(Label::from("x"), Label::Literal("x".to_string()));
+        assert_eq!(Label::from("x".to_string()), Label::Literal("x".to_string()));
+        assert_eq!(Label::from(&"x".to_string()), Label::Literal("x".to_string()));
+    }
+
+    #[test]
+    fn literal_and_key_coexist_in_one_tree() {
+        let tree = MenuItem::Submenu {
+            label: Label::Key("menu.file"),
+            shortcut: None,
+            items: vec![
+                MenuItem::Action { label: "Open".into(), action: "open".into(), shortcut: None },
+                MenuItem::Action {
+                    label: Label::Key(std_action_keys::SAVE_AS),
+                    action: "save_as".into(),
+                    shortcut: Some("Ctrl+S".into()),
+                },
+                MenuItem::Separator,
+            ],
+        };
+        match &tree {
+            MenuItem::Submenu { label, items, .. } => {
+                assert!(label.is_key());
+                assert_eq!(items.len(), 3);
+                // Dispatch identity is the action string, untouched by translation.
+                match &items[1] {
+                    MenuItem::Action { action, label, .. } => {
+                        assert_eq!(action, "save_as");
+                        assert_eq!(label.identity(), std_action_keys::SAVE_AS);
+                    }
+                    _ => panic!("expected action"),
+                }
+            }
+            _ => panic!("expected submenu"),
+        }
+    }
+
+    #[test]
+    fn layout_direction_hook_is_receives_changes() {
+        // Headless: no backend hook installed, so this is a no-op (must not panic).
+        set_layout_direction(LayoutDir::Rtl);
+    }
+
+    #[test]
+    fn rtl_locale_heuristic() {
+        assert!(locale_is_rtl("ar"));
+        assert!(locale_is_rtl("ar-EG"));
+        assert!(locale_is_rtl("he_IL"));
+        assert!(!locale_is_rtl("en-US"));
+        assert!(!locale_is_rtl("de"));
+        assert!(!locale_is_rtl(""));
     }
 }

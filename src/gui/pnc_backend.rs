@@ -49,6 +49,29 @@ fn show_info_dialog(title: &str, text: &str) {
     rswidgets::backends::pancurses::show_dialog(title, text);
 }
 
+/// Splice a picked special character into the widget's in-progress edit at
+/// its caret (ratatui parity: the picker never commits, it splices and
+/// stays in edit mode; the user commits with Enter). When not editing,
+/// snapshot the cursor cell's display text first (caret at end), mirroring
+/// the ratatui picker's snapshot. Positions are byte indices (the widget
+/// inserts bytes); clamp to a char boundary so multibyte choices stay valid.
+fn splice_special_pick(ss: &Spreadsheet, app: &mut super::App, choice: &str) {
+    let (editing, buf, pos) = ss.edit_state();
+    let base = if editing {
+        buf
+    } else {
+        let grid = &app.core.workbook.active_sheet().grid;
+        crate::agg::cell_display(grid, &app.core.cursor.to_addr(grid))
+    };
+    let mut base = base;
+    let mut at = pos.min(base.len());
+    while at > 0 && !base.is_char_boundary(at) {
+        at -= 1;
+    }
+    base.insert_str(at, choice);
+    ss.set_editing(true, &base, at + choice.len());
+}
+
 /// Borrow the host [`App`](super::App) behind a raw UI-thread pointer.
 /// Centralised here so the raw dereference happens in exactly one place and
 /// call sites stay `unsafe`-free.
@@ -329,10 +352,13 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     }
 
     // Alt+letter shortcuts matching the ratatui reference: Alt+O/T/W/A/X open
-    // specific File items/submenus.  The toolkit's generic alt-key callback
-    // lets the app decide; the backend itself knows nothing about corro's menus.
+    // specific File items/submenus, Alt+R opens the Format menu (root index
+    // 3; disambiguates File &F vs Format &F so Alt+F is File everywhere).
+    // The toolkit's generic alt-key callback lets the app decide; the
+    // backend itself knows nothing about corro's menus.
     rswidgets::backends::pancurses::set_alt_key_callback(Box::new(|ch: char| {
         match ch.to_ascii_lowercase() {
+            'r' => { rswidgets::backends::pancurses::open_menu(3, vec![], 0); true } // Format menu
             'o' => { rswidgets::backends::pancurses::open_menu(0, vec![], 0); true } // File -> Open file
             't' => { rswidgets::backends::pancurses::open_menu(0, vec![2], 0); true } // File -> Export
             'w' => { rswidgets::backends::pancurses::open_menu(0, vec![3], 0); true } // File -> Width
@@ -640,6 +666,17 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
             MenuDispatch::Prompt(label, action) => {
                 rswidgets::backends::pancurses::set_prompt(label, action);
             }
+            MenuDispatch::SpecialPicker => {
+                // 10-choice picker (ratatui parity): shared selection state,
+                // toolkit list popup for display, key hook below for arrows
+                // /digits/Enter/Esc. Committing splices into the edit (never
+                // the log) exactly like the reference picker.
+                super::special_picker::open(app);
+                let rows: Vec<String> =
+                    super::special_picker::items().into_iter().collect();
+                rswidgets::backends::pancurses::show_list_picker(" Special Char ", &rows, 0);
+                rswidgets::backends::pancurses::request_redraw();
+            }
             MenuDispatch::About { status } => {
                 show_info_dialog(" About ", &about_body());
                 apply_status(&status);
@@ -666,18 +703,62 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         );
     }));
 
-    // Interactive extrapolate keyboard hook: while extrapolate mode is active,
-    // Enter commits and Escape cancels; everything else (including arrows, which
-    // the widget moves and the cursor-move callback re-previews) passes through.
+    // Interactive modal keyboard hook: extrapolate (Enter commits, Escape
+    // cancels; arrows pass through for selection extend) and the special-char
+    // picker (arrows navigate, digits commit directly, Enter splices,
+    // Escape cancels; anything else passes through, matching the ratatui
+    // picker's fallthrough). One hook serves both: the toolkit supports a
+    // single pre-dispatch hook, and picker/extrapolate never overlap.
     let extrap_ss = spreadsheet.clone();
     let sid_extrap = sid;
     let display_rows_extrap = display_rows_for_cb.clone();
     rswidgets::backends::pancurses::set_key_input_hook(Some(Box::new(move |key: &Option<rswidgets::backends::pancurses::KeyInput>| {
         let app = app_from_raw(app_ptr);
-        if app.extrapolate.is_none() {
-            return false;
-        }
-        match key {
+        use rswidgets::backends::pancurses::KeyInput;
+        if app.special_picker.is_some() {
+            let step_sel = |app: &mut super::App, delta: i32| {
+                super::special_picker::step(app, delta);
+                let idx = super::special_picker::index(app).unwrap_or(0);
+                rswidgets::backends::pancurses::set_list_picker_selection(idx);
+                rswidgets::backends::pancurses::request_redraw();
+            };
+            let commit_sel = |app: &mut super::App| {
+                if let Some(choice) = super::special_picker::take(app) {
+                    splice_special_pick(&extrap_ss, app, &choice);
+                }
+                rswidgets::backends::pancurses::close_list_picker();
+                rswidgets::backends::pancurses::request_redraw();
+            };
+            match key {
+                Some(KeyInput::ArrowDown) | Some(KeyInput::ArrowRight) => {
+                    step_sel(app, 1);
+                    true
+                }
+                Some(KeyInput::ArrowUp) | Some(KeyInput::ArrowLeft) => {
+                    step_sel(app, -1);
+                    true
+                }
+                Some(KeyInput::Enter) => {
+                    commit_sel(app);
+                    true
+                }
+                Some(KeyInput::Escape) => {
+                    super::special_picker::close(app);
+                    rswidgets::backends::pancurses::close_list_picker();
+                    rswidgets::backends::pancurses::request_redraw();
+                    true
+                }
+                Some(KeyInput::Char(c)) if c.is_ascii_digit() => {
+                    if let Some(idx) = super::special_picker::index_for_digit(*c) {
+                        super::special_picker::set(app, idx);
+                        commit_sel(app);
+                    }
+                    true
+                }
+                _ => false,
+            }
+        } else if app.extrapolate.is_some() {
+            match key {
             Some(rswidgets::backends::pancurses::KeyInput::Enter) => {
                 extrapolate::commit(app);
                 refresh_viewport_after_action(
@@ -695,6 +776,9 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                 true
             }
             _ => false,
+        }
+        } else {
+            false
         }
     })));
 

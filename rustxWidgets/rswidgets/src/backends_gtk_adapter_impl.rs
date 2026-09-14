@@ -554,6 +554,7 @@ mod gtk_adapter {
         pub fn set_title(&self, title: &str) { self.0.set_title(title); }
         pub fn set_default_size(&self, w: i32, h: i32) { self.0.set_default_size(w, h); }
         pub fn add_button(&self, text: &str, response_id: i32) { self.0.add_button(text, response_id); }
+        pub fn set_default_response(&self, response_id: i32) { self.0.set_default_response(response_id); }
         pub fn get_content_area(&self) -> *mut c_void { self.0.get_content_area() }
         pub fn append_content_area(&self, child: &impl AsRef<*mut c_void>) { self.0.append_content_area(child); }
         pub fn present(&self) { self.0.present(); }
@@ -630,6 +631,7 @@ mod gtk_adapter {
     impl RadioButton {
         pub fn is_active(&self) -> bool { self.0.is_active() }
         pub fn set_active(&self, active: bool) { self.0.set_active(active); }
+        pub fn grab_focus(&self) { self.0.grab_focus(); }
         pub fn connect_toggled<F: FnMut() + 'static>(&self, f: F) -> Result<u64, Error> {
             self.0.connect_toggled(f).map_err(|e| Error::Backend(format!("{}", e)))
         }
@@ -666,6 +668,12 @@ mod gtk_adapter {
         let t = crate::backends::gtk::create_textview().map_err(|e| Error::Backend(format!("{}", e)))?;
         Ok(TextView(t))
     }
+
+    /// Run `f` once after `ms` milliseconds (see backends::gtk::timeout_add_once).
+    pub fn timeout_add_once(ms: u32, f: Box<dyn FnOnce()>) -> Result<(), Error> {
+        crate::backends::gtk::timeout_add_once(ms, f).map_err(|e| Error::Backend(format!("{}", e)))
+    }
+
 
     // ---- Canvas (cross-platform drawing surface) ----
 

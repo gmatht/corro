@@ -269,7 +269,7 @@ mod nwg_backend {
     // -- Dialog (window with button callbacks) --
 
     pub fn create_dialog(
-        parent_cell: &Rc<RefCell<Option<*mut c_void>>>,
+        _parent_cell: &Rc<RefCell<Option<*mut c_void>>>,
         _button_cb: Rc<RefCell<Option<Box<dyn FnMut(i32)>>>>,
     ) -> Result<(nwg::Window, Vec<(nwg::Button, nwg::EventHandler)>, nwg::EventHandler), nwg::NwgError> {
         let mut win = nwg::Window::default();
@@ -278,7 +278,12 @@ mod nwg_backend {
             .size((450, 500))
             .build(&mut win)?;
         let hwnd = win.handle.hwnd().unwrap_or(std::ptr::null_mut());
-        *parent_cell.borrow_mut() = Some(hwnd as *mut c_void);
+        // NOTE: deliberately does NOT overwrite parent_cell (unlike
+        // create_window): dialogs are transient siblings, not the widget
+        // parent. Later new_entry/new_box calls keep the main window as
+        // parent until append_content_area reparents them into the dialog.
+        // Overwriting here orphaned subsequently created widgets onto dead
+        // dialogs.
         let handler = nwg::bind_event_handler(
             &nwg::ControlHandle::Hwnd(hwnd),
             &nwg::ControlHandle::Hwnd(hwnd),
@@ -387,7 +392,7 @@ mod nwg_backend {
     pub fn create_scrolled_window(parent: *mut c_void) -> Result<ScrolledWindowParts, nwg::NwgError> {
         let mut frame = nwg::Frame::default();
         nwg::Frame::builder()
-            .flags(nwg::FrameFlags::NONE)
+            .flags(nwg::FrameFlags::VISIBLE)
             .parent(&nwg::ControlHandle::Hwnd(parent as _))
             .build(&mut frame)?;
 

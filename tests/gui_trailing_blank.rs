@@ -311,7 +311,7 @@ fn white_runs(shot: &PathBuf, y0: i32, y1: i32) -> Vec<(i32, i32)> {
 /// white across rows 1-2. The first margin (_1/]A) sits one further out
 /// (row 3 / col C), grey like the rest of the margin.
 #[test]
-fn gui_empty_startup_shows_data_row2_and_colB() {
+fn gui_empty_startup_shows_data_row2_and_col_b() {
     let _guard = GUI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     assert!(
         std::env::var("DISPLAY").is_ok(),
@@ -338,7 +338,7 @@ fn gui_empty_startup_shows_data_row2_and_colB() {
     // Poll for row 2 to render white (setup growth + first frames lag
     // under load; deadline, not sleep). Settles twice identically first.
     let deadline = Instant::now() + Duration::from_secs(25);
-    let runs_b = loop {
+    loop {
         let runs_a = white_runs(&screenshot(&wid, "ringa"), 94, 110);
         std::thread::sleep(Duration::from_millis(500));
         let runs_b = white_runs(&screenshot(&wid, "ringb"), 94, 110);

@@ -70,7 +70,7 @@ default = ["gtk"]
 gtk = ["dep:gtk_dynamic_loader"]
 pancurses = ["dep:pancurses", "dep:pdcurses-sys"]
 zork = ["dep:rustyline", "dep:serde", "dep:serde_json"]
-gtk4-rs = ["dep:gtk4", "dep:glib-sys", "dep:gio-sys", "dep:gtk4-sys", "dep:gdk4-sys", "dep:cairo-sys-rs", "dep:gtk_dynamic_loader", "gtk_dynamic_loader/gtk4rs"]
+gtk4-rs = ["dep:gtk4", "dep:glib-sys", "dep:gio-sys", "dep:gtk4-sys", "dep:gdk4-sys", "dep:cairo-sys-rs", "dep:gtk_dynamic_loader"]
 # TRUE official-crate backends (statically linked, safe) for debugging the
 # dlopen-based production backends.  Not the default.
 gtk3-rs = ["dep:gtk3"]

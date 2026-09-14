@@ -1,3 +1,4 @@
+#[cfg(feature = "pancurses")]
 use std::process::Command;
 
 /// Run the dialog example and verify the TUI is not blank:

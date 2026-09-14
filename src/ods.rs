@@ -1594,10 +1594,14 @@ fn parse_ods_content_with_layout(
                     let ti = next_table;
                     next_table += 1;
                     open_table_i = Some(ti);
+                    let mut fresh_state = SheetState::new(1, 1);
+                    // Batch per-cell auto-fit across the table (ALGORITHMS.md
+                    // §2.2); resumed (fitted once) at table close below.
+                    fresh_state.grid.suspend_auto_fit();
                     current_sheet = Some(SheetRecord {
                         id: workbook.next_sheet_id,
                         title,
-                        state: SheetState::new(1, 1),
+                        state: fresh_state,
                         linked_source: None,
                     });
                     workbook.next_sheet_id += 1;
@@ -1708,7 +1712,8 @@ fn parse_ods_content_with_layout(
                 }
                 b"table:table-row" => row_idx += current_row_repeat,
                 b"table:table" => {
-                    if let Some(sheet) = current_sheet.take() {
+                    if let Some(mut sheet) = current_sheet.take() {
+                        sheet.state.grid.resume_auto_fit();
                         workbook.sheets.push(sheet);
                     }
                     open_table_i = None;

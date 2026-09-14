@@ -37,7 +37,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // add a checkbutton
     let cb = app.create_checkbutton("Check me")?;
-    let cb2 = cb.clone();
     cb.connect_toggled(move || {
         println!("Checkbox toggled");
     })?;

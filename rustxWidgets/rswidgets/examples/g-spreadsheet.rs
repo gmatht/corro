@@ -1,6 +1,7 @@
 fn main() {
     #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
     return gtk_main().unwrap_or_else(|e: Box<dyn std::error::Error>| { eprintln!("Error: {}", e); std::process::exit(1); });
+    #[cfg(not(all(feature = "gtk", target_os = "linux", not(feature = "zork"))))]
     println!("skipped (requires GTK on Linux)");
 }
 

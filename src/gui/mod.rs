@@ -18,6 +18,7 @@ pub mod keymap;
 pub mod menu;
 pub mod render;
 pub mod sheet;
+pub mod special_picker;
 
 #[cfg(any(feature = "gui", all(feature = "wasm", target_arch = "wasm32")))]
 mod gui_backend;
@@ -38,10 +39,37 @@ pub struct App {
     backend: Option<Backend>,
     /// Interactive extrapolate modal state (shared by all GUI backends).
     pub extrapolate: Option<extrapolate::ExtrapolateModal>,
+    /// Insert > Special Char picker selection (shared by all GUI backends).
+    /// `Some(idx)` while the picker is open; backends render
+    /// [`special_picker::items`] and drive it via that module's
+    /// open/step/set/close/take functions.
+    pub special_picker: Option<usize>,
 }
 
 impl App {
     pub fn new_with_paths(paths: Vec<PathBuf>) -> Self {
+        // Fresh-document content mirrors the TUI (App::new_with_revision_limit):
+        // a CORRO_TEMPLATE workbook when set and readable, else the built-in
+        // seeded blank (margin TOTAL seeds). Loads replay file ops onto a
+        // plain blank, exactly like the TUI, so only genuinely fresh docs
+        // (no paths) branch here.
+        let (workbook, template_note) = if paths.is_empty() {
+            match crate::io::template_path_from_env() {
+                Some(tpath) => match crate::io::load_workbook_template(tpath.as_path()) {
+                    Ok(wb) => (wb, None),
+                    Err(msg) => (
+                        WorkbookState::new_seeded(),
+                        Some(format!(
+                            "Template {} failed ({msg}); opened blank instead",
+                            tpath.display()
+                        )),
+                    ),
+                },
+                None => (WorkbookState::new_seeded(), None),
+            }
+        } else {
+            (WorkbookState::new(), None)
+        };
         App {
             core: CoreApp {
                 path: paths.first().cloned(),
@@ -52,11 +80,10 @@ impl App {
                 revision_browse_limit: 0,
                 offset: 0,
                 state: Default::default(),
-                workbook: WorkbookState::new(),
+                workbook,
                 cursor: SheetCursor { row: HEADER_ROWS, col: MARGIN_COLS },
                 anchor: None,
                 watcher: None,
-                status: String::new(),
                 ops_applied: 0,
                 op_history: Vec::new(),
                 redo_history: Vec::new(),
@@ -65,6 +92,7 @@ impl App {
                 linked_source_mtimes: Default::default(),
                 unsaved_file: None,
                 unsaved_auto_create: false,
+                status: template_note.unwrap_or_default(),
                 exit_message: None,
                 clipboard_snapshot: None,
                 edit_target_addr: None,
@@ -76,6 +104,7 @@ impl App {
             rev_browse: false,
             backend: None,
             extrapolate: None,
+            special_picker: None,
         }
     }
 

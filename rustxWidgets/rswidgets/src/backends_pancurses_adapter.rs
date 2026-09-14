@@ -283,14 +283,14 @@ mod pancurses_adapter {
     impl Menu {
         pub fn append(&self, label: &str, action_name: &str) {
             self.items.borrow_mut().push(crate::MenuItem::Action {
-                label: label.to_string(),
+                label: label.into(),
                 action: action_name.to_string(),
                 shortcut: None,
             });
         }
         pub fn append_with_shortcut(&self, label: &str, action_name: &str, shortcut: &str) {
             self.items.borrow_mut().push(crate::MenuItem::Action {
-                label: label.to_string(),
+                label: label.into(),
                 action: action_name.to_string(),
                 shortcut: Some(shortcut.to_string()),
             });
@@ -300,14 +300,14 @@ mod pancurses_adapter {
         }
         pub fn append_check(&self, label: &str, action_name: &str, checked: bool) {
             self.items.borrow_mut().push(crate::MenuItem::Check {
-                label: label.to_string(),
+                label: label.into(),
                 action: action_name.to_string(),
                 checked,
             });
         }
         pub fn append_radio(&self, label: &str, action_name: &str, group: u32) {
             self.items.borrow_mut().push(crate::MenuItem::Radio {
-                label: label.to_string(),
+                label: label.into(),
                 action: action_name.to_string(),
                 group,
             });
@@ -318,9 +318,26 @@ mod pancurses_adapter {
         pub fn append_submenu_with_shortcut(&self, label: &str, shortcut: &str, submenu: &Menu) {
             let sub_items = submenu.items.borrow().clone();
             self.items.borrow_mut().push(crate::MenuItem::Submenu {
-                label: label.to_string(),
+                label: label.into(),
                 items: sub_items,
                 shortcut: if shortcut.is_empty() { None } else { Some(shortcut.to_string()) },
+            });
+        }
+        /// Append an action whose label is a deferred translation key
+        /// (resolved at render time via the installed translator).
+        pub fn append_key(&self, key: &'static str, action_name: &str) {
+            self.items.borrow_mut().push(crate::MenuItem::Action {
+                label: crate::Label::Key(key),
+                action: action_name.to_string(),
+                shortcut: None,
+            });
+        }
+        pub fn append_submenu_key(&self, key: &'static str, submenu: &Menu) {
+            let sub_items = submenu.items.borrow().clone();
+            self.items.borrow_mut().push(crate::MenuItem::Submenu {
+                label: crate::Label::Key(key),
+                items: sub_items,
+                shortcut: None,
             });
         }
         pub fn append_item(&self, _label: &str, _action: &SimpleAction) {}
@@ -328,7 +345,7 @@ mod pancurses_adapter {
     }
 
     /// Extract the menubar model: (root label, items) for each root menu.
-    pub(crate) fn collect_menu_items(menu: &Menu) -> Vec<(String, Vec<crate::MenuItem>)> {
+    pub(crate) fn collect_menu_items(menu: &Menu) -> Vec<(crate::Label, Vec<crate::MenuItem>)> {
         menu.items
             .borrow()
             .iter()
@@ -754,6 +771,11 @@ mod pancurses_adapter {
         }
         pub fn set_editing(&self, editing: bool, edit_buf: &str, edit_pos: usize) {
             crate::backends::pancurses::spreadsheet_set_edit_state(self.id, editing, edit_buf, edit_pos);
+        }
+        /// Current edit state (generic mechanism for hosts that splice text
+        /// into an in-progress edit, e.g. a picker commit).
+        pub fn edit_state(&self) -> (bool, String, usize) {
+            crate::backends::pancurses::spreadsheet_get_edit_state(self.id)
         }
         pub fn set_grid_config(&self, margin_cols: u32, main_cols: u32) {
             crate::backends::pancurses::spreadsheet_set_grid_config(self.id, margin_cols, main_cols);

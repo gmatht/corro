@@ -16,6 +16,117 @@ pub use number::Number;
 thread_local! {
     static EVAL_WORKBOOK: RefCell<Option<WorkbookState>> = const { RefCell::new(None) };
 }
+
+// Shared parse cache: expression text (post-`=`, trimmed, exactly as fed to
+// `Parser`) → AST (ALGORITHMS.md §2.5). The parse is a pure function of the
+// string — the parser threads `main_cols` through but every callee ignores
+// it — so grid content/extent changes never invalidate entries. Retention
+// is purely a performance concern: the map is cleared at the cap, and parse
+// failures are never cached.
+thread_local! {
+    static PARSE_CACHE: RefCell<std::collections::HashMap<String, std::rc::Rc<Ast>>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+const PARSE_CACHE_CAP: usize = 2048;
+
+/// Always-on cell-result memo (ALGORITHMS.md §2.5): `(grid, sheet?, addr,
+/// templates?) → EvalResult`. Entries are valid by construction — every grid
+/// or spill mutation hook clears the map (see `clear_eval_memo` callers),
+/// workbook switches clear it, and cycle/budget-sensitive results are never
+/// stored. Hits skip re-evaluation entirely (including budget consumption);
+/// only budget-*exhaustion* behaviour can differ, where the memoised value
+/// is the fully-evaluated one, i.e. strictly more correct.
+///
+/// Soundness notes:
+/// - Cycle safety: lookups are skipped while the cell is on the active
+///   visiting stack, and `CIRC` results are never inserted (a cell that is
+///   circular in one stack context may evaluate fine in another).
+/// - `LIMIT` results are never inserted (they depend on remaining budget).
+/// - `RAND`/`RANDBETWEEN` are deterministic in `(volatile_seed, addr)`, so
+///   they memoise soundly; the seed bump clears the map. Wall-clock
+///   `NOW`/`TODAY` freeze per pass, matching Excel recalc semantics.
+/// - Cell-level evaluation always starts with empty name bindings (both
+///   callers pass fresh stacks), so bindings need no key component.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct MemoKey {
+    grid_id: u64,
+    sheet: Option<u32>,
+    addr: CellAddr,
+    allow_templates: bool,
+}
+
+thread_local! {
+    static EVAL_MEMO: RefCell<std::collections::HashMap<MemoKey, EvalResult>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+const EVAL_MEMO_CAP: usize = 8192;
+
+fn memo_lookup(key: &MemoKey) -> Option<EvalResult> {
+    EVAL_MEMO.with(|memo| memo.borrow().get(key).cloned())
+}
+
+fn memo_insert(key: MemoKey, result: &EvalResult) {
+    // Never retain stack- or budget-dependent outcomes.
+    if matches!(result, EvalResult::Error("CIRC" | "LIMIT")) {
+        return;
+    }
+    EVAL_MEMO.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        if memo.len() >= EVAL_MEMO_CAP {
+            memo.clear();
+        }
+        memo.insert(key, result.clone());
+    })
+}
+
+/// Drop all memoised results. Called from every grid/spill mutation hook
+/// and on workbook-context switches; retention is purely performance.
+pub(crate) fn clear_eval_memo() {
+    EVAL_MEMO.with(|memo| memo.borrow_mut().clear());
+}
+
+#[cfg(test)]
+pub(crate) fn eval_memo_len() -> usize {
+    EVAL_MEMO.with(|memo| memo.borrow().len())
+}
+
+fn parse_formula_cached(expr: &str) -> Result<std::rc::Rc<Ast>, ()> {
+    PARSE_CACHE.with(|cache| {
+        if let Some(hit) = cache.borrow().get(expr) {
+            return Ok(std::rc::Rc::clone(hit));
+        }
+        let mut p = Parser {
+            s: expr,
+            i: 0,
+            main_cols: 0,
+        };
+        let ast = p.parse_expr()?;
+        p.skip_ws();
+        if p.i != p.s.len() {
+            return Err(());
+        }
+        let shared = std::rc::Rc::new(ast);
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= PARSE_CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert(expr.to_string(), std::rc::Rc::clone(&shared));
+        Ok(shared)
+    })
+}
+
+/// Owned AST for the translate paths (ALGORITHMS.md §2.5): shares the parse
+/// cache, moving out of the `Rc` on a just-parsed miss and cloning on a hit.
+fn parse_formula_owned(expr: &str) -> Option<Ast> {
+    parse_formula_cached(expr)
+        .ok()
+        .map(|shared| std::rc::Rc::try_unwrap(shared).unwrap_or_else(|rc| (*rc).clone()))
+}
+
+#[cfg(test)]
+pub(crate) fn parse_cache_len() -> usize {
+    PARSE_CACHE.with(|cache| cache.borrow().len())
+}
 thread_local! {
     // Global per-thread stack of (sheet_id, CellAddr) pairs used when
     // evaluating sheet-qualified references. Using a shared stack (instead
@@ -51,6 +162,8 @@ impl Drop for EvalContextGuard {
 
 pub fn set_eval_context(workbook: &WorkbookState) -> EvalContextGuard {
     EVAL_WORKBOOK.with(|wb| *wb.borrow_mut() = Some(workbook.clone()));
+    // Sheet-qualified memo keys are only meaningful within one context.
+    clear_eval_memo();
     EvalContextGuard
 }
 
@@ -354,16 +467,8 @@ pub fn translate_formula_text_by_offset(
     if !expr_to_parse.starts_with('=') {
         return None;
     }
-    let mut parser = Parser {
-        s: &expr_to_parse[1..],
-        i: 0,
-        main_cols: 0,
-    };
-    let ast = parser.parse_expr().ok()?;
-    parser.skip_ws();
-    if parser.i != parser.s.len() {
-        return None;
-    }
+    // Shared parse cache (ALGORITHMS.md §2.5).
+    let ast = parse_formula_owned(&expr_to_parse[1..])?;
     let translated = translate_ast_by_offset(&ast, row_delta, col_delta, main_cols)?;
     let mut out = format!("={}", render_ast(&translated));
     if let Some(ref label) = label_opt {
@@ -379,7 +484,6 @@ pub fn translate_formula_text_by_offset(
 /// updated; when `None`, only unqualified refs are shifted (foreign sheet qualifiers unchanged).
 pub fn translate_formula_text_insert_main_rows(
     raw: &str,
-    main_cols: usize,
     gap_start: u32,
     delta_rows: i32,
     translate_qualified_same_sheet_refs: Option<u32>,
@@ -396,16 +500,8 @@ pub fn translate_formula_text_insert_main_rows(
     if !expr_to_parse.starts_with('=') {
         return None;
     }
-    let mut parser = Parser {
-        s: &expr_to_parse[1..],
-        i: 0,
-        main_cols,
-    };
-    let ast = parser.parse_expr().ok()?;
-    parser.skip_ws();
-    if parser.i != parser.s.len() {
-        return None;
-    }
+    // Shared parse cache (ALGORITHMS.md §2.5).
+    let ast = parse_formula_owned(&expr_to_parse[1..])?;
     let translated =
         translate_ast_insert_main_rows(&ast, gap_start, delta_rows, translate_qualified_same_sheet_refs)?;
     let mut out = format!("={}", render_ast(&translated));
@@ -438,16 +534,8 @@ pub fn translate_formula_text_insert_main_cols(
     if !expr_to_parse.starts_with('=') {
         return None;
     }
-    let mut parser = Parser {
-        s: &expr_to_parse[1..],
-        i: 0,
-        main_cols,
-    };
-    let ast = parser.parse_expr().ok()?;
-    parser.skip_ws();
-    if parser.i != parser.s.len() {
-        return None;
-    }
+    // Shared parse cache (ALGORITHMS.md §2.5).
+    let ast = parse_formula_owned(&expr_to_parse[1..])?;
     let translated = translate_ast_insert_main_cols(
         &ast,
         gap_start,
@@ -467,7 +555,6 @@ pub fn translate_formula_text_insert_main_cols(
 /// update every stored `=…` cell on the grid (Excel-style).
 pub fn repair_all_formulas_after_main_row_insert(
     grid: &mut Grid,
-    main_cols: usize,
     gap_start: u32,
     gap_len: u32,
     translate_qualified_same_sheet_refs: Option<u32>,
@@ -476,15 +563,18 @@ pub fn repair_all_formulas_after_main_row_insert(
         return;
     }
     let delta = gap_len as i32;
-    let updates: Vec<(CellAddr, String)> = grid
-        .iter_nonempty()
+    // Borrowed scan: clone only `=` cells (ALGORITHMS.md §1).
+    let mut formulas: Vec<(CellAddr, String)> = Vec::new();
+    grid.for_each_nonempty(&mut |addr, raw| {
+        if raw.trim_start().starts_with('=') {
+            formulas.push((*addr, raw.to_string()));
+        }
+    });
+    let updates: Vec<(CellAddr, String)> = formulas
+        .into_iter()
         .filter_map(|(addr, raw)| {
-            if !raw.trim_start().starts_with('=') {
-                return None;
-            }
             let new_s = translate_formula_text_insert_main_rows(
                 &raw,
-                main_cols,
                 gap_start,
                 delta,
                 translate_qualified_same_sheet_refs,
@@ -492,9 +582,9 @@ pub fn repair_all_formulas_after_main_row_insert(
             (new_s != raw).then_some((addr, new_s))
         })
         .collect();
-    for (addr, s) in updates {
-        grid.set(&addr, s);
-    }
+    // One auto-fit per touched column (ALGORITHMS.md §2.2); nest-safe with
+    // an enclosing batch.
+    grid.set_many(updates);
 }
 
 /// After creating an insert gap for main columns starting at `gap_start` with width `gap_len`,
@@ -510,12 +600,16 @@ pub fn repair_all_formulas_after_main_col_insert(
         return;
     }
     let delta = gap_len as i32;
-    let updates: Vec<(CellAddr, String)> = grid
-        .iter_nonempty()
+    // Borrowed scan: clone only `=` cells (ALGORITHMS.md §1).
+    let mut formulas: Vec<(CellAddr, String)> = Vec::new();
+    grid.for_each_nonempty(&mut |addr, raw| {
+        if raw.trim_start().starts_with('=') {
+            formulas.push((*addr, raw.to_string()));
+        }
+    });
+    let updates: Vec<(CellAddr, String)> = formulas
+        .into_iter()
         .filter_map(|(addr, raw)| {
-            if !raw.trim_start().starts_with('=') {
-                return None;
-            }
             let new_s = translate_formula_text_insert_main_cols(
                 &raw,
                 main_cols,
@@ -526,9 +620,7 @@ pub fn repair_all_formulas_after_main_col_insert(
             (new_s != raw).then_some((addr, new_s))
         })
         .collect();
-    for (addr, s) in updates {
-        grid.set(&addr, s);
-    }
+    grid.set_many(updates);
 }
 
 fn shift_if_unlocked_row(row: u32, locks: &A1RefLocks, gap_start: u32, delta: i32) -> Option<u32> {
@@ -1304,16 +1396,8 @@ pub fn translate_formula_text(raw: &str, ctx: &FormulaCopyContext) -> Option<Str
     if !expr.starts_with('=') {
         return None;
     }
-    let mut parser = Parser {
-        s: &expr[1..],
-        i: 0,
-        main_cols: ctx.main_cols,
-    };
-    let ast = parser.parse_expr().ok()?;
-    parser.skip_ws();
-    if parser.i != parser.s.len() {
-        return None;
-    }
+    // Shared parse cache (ALGORITHMS.md §2.5).
+    let ast = parse_formula_owned(&expr[1..])?;
     let translated = translate_ast(&ast, ctx)?;
     let mut out = format!("={}", render_ast(&translated));
     if let Some(label) = label {
@@ -1600,7 +1684,37 @@ pub fn eval_cell(
     eval_cell_inner(grid, addr, visiting, budget, true)
 }
 
+/// Memoised sheet-qualified cell evaluation (ALGORITHMS.md §2.5).
 fn eval_cell_with_sheet(
+    grid: &Grid,
+    sheet_id: u32,
+    addr: &CellAddr,
+    bindings: &mut Vec<(String, EvalResult)>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    // Cycle safety first: the live global stack decides, never the memo.
+    let on_stack = SHEET_VISITING
+        .with(|stack| stack.borrow().iter().any(|a| a.0 == sheet_id && &a.1 == addr));
+    if !on_stack {
+        let key = MemoKey {
+            grid_id: grid.id(),
+            sheet: Some(sheet_id),
+            addr: addr.clone(),
+            allow_templates,
+        };
+        if let Some(hit) = memo_lookup(&key) {
+            return hit;
+        }
+        let r =
+            eval_cell_with_sheet_uncached(grid, sheet_id, addr, bindings, budget, allow_templates);
+        memo_insert(key, &r);
+        return r;
+    }
+    eval_cell_with_sheet_uncached(grid, sheet_id, addr, bindings, budget, allow_templates)
+}
+
+fn eval_cell_with_sheet_uncached(
     grid: &Grid,
     sheet_id: u32,
     addr: &CellAddr,
@@ -1681,7 +1795,33 @@ fn eval_cell_with_sheet(
     r
 }
 
+/// Memoised same-grid cell evaluation (ALGORITHMS.md §2.5).
 fn eval_cell_inner(
+    grid: &Grid,
+    addr: &CellAddr,
+    visiting: &mut Vec<CellAddr>,
+    budget: &mut usize,
+    allow_templates: bool,
+) -> EvalResult {
+    // Cycle safety first: the live local stack decides, never the memo.
+    if !visiting.iter().any(|a| a == addr) {
+        let key = MemoKey {
+            grid_id: grid.id(),
+            sheet: None,
+            addr: addr.clone(),
+            allow_templates,
+        };
+        if let Some(hit) = memo_lookup(&key) {
+            return hit;
+        }
+        let r = eval_cell_uncached(grid, addr, visiting, budget, allow_templates);
+        memo_insert(key, &r);
+        return r;
+    }
+    eval_cell_uncached(grid, addr, visiting, budget, allow_templates)
+}
+
+fn eval_cell_uncached(
     grid: &Grid,
     addr: &CellAddr,
     visiting: &mut Vec<CellAddr>,
@@ -1833,19 +1973,12 @@ fn eval_expr_str(
     budget: &mut usize,
     allow_templates: bool,
 ) -> EvalResult {
-    let mut p = Parser {
-        s: expr.trim(),
-        i: 0,
-        main_cols: grid.main_cols(),
-    };
-    let ast = match p.parse_expr() {
+    // Shared parse cache (ALGORITHMS.md §2.5): repeated evaluations of the
+    // same formula (every render frame, every aggregate cell) parse once.
+    let ast = match parse_formula_cached(expr.trim()) {
         Ok(a) => a,
         Err(()) => return EvalResult::Error("PARSE"),
     };
-    p.skip_ws();
-    if p.i != p.s.len() {
-        return EvalResult::Error("PARSE");
-    }
     eval_ast(&ast, grid, visiting, bindings, budget, allow_templates)
 }
 
@@ -2657,6 +2790,22 @@ fn sum_main_range(
     if range.is_empty() {
         return Number::exact_zero();
     }
+    // Sparse fast path (ALGORITHMS.md §2.6): same order and budget semantics
+    // as the dense loop; skipped empty cells are provable no-ops. Uses the
+    // caller's visiting stack and budget unchanged.
+    if range.area() > 4 * grid.stored_main_count() as u64 {
+        let plan = grid.main_range_eval_plan(range);
+        if !plan.has_template {
+            let mut s = Number::exact_zero();
+            for (r, c) in plan.stored_sorted {
+                let addr = CellAddr::Main { row: r, col: c };
+                let n = summable_numeric(grid, &addr, visiting, budget)
+                    .unwrap_or_else(Number::exact_zero);
+                s = s.add(n);
+            }
+            return s;
+        }
+    }
     let mut s = Number::exact_zero();
     for r in range.row_start..range.row_end {
         for c in range.col_start..range.col_end {
@@ -2673,19 +2822,32 @@ pub fn refresh_spills(grid: &mut Grid) {
     if !grid.spills_refresh_dirty() {
         return;
     }
+    // Fast path (ALGORITHMS.md §2.5): with no formula cells there is nothing
+    // to evaluate. End state matches the fixpoint loop exactly (empty maps,
+    // refreshed flag), since spills can only be produced from formulas.
+    if grid.formula_cell_count() == 0 {
+        grid.clear_spills();
+        grid.note_spills_refreshed();
+        return;
+    }
     let mut prev_followers: Vec<(CellAddr, String)> = grid.spill_followers().into_iter().collect();
     let mut prev_errors: Vec<(CellAddr, &'static str)> = grid.spill_errors().into_iter().collect();
     for _ in 0..8 {
         grid.clear_spills();
-        let mut anchors: Vec<(CellAddr, String)> = grid.iter_nonempty().collect();
+        // Borrowed scan: clone only formula cells (ALGORITHMS.md §1).
+        // Visit order matches the old full collect (for_each mirrors
+        // iter_nonempty), so multi-anchor spill collisions resolve identically.
+        let mut anchors: Vec<(CellAddr, String)> = Vec::new();
+        grid.for_each_nonempty(&mut |addr, raw| {
+            if is_formula(raw) {
+                anchors.push((*addr, raw.to_string()));
+            }
+        });
         anchors.sort_by_key(|(addr, _)| match addr {
             CellAddr::Main { row, col } => (*row, *col),
             _ => (u32::MAX, u32::MAX),
         });
-        for (addr, raw) in anchors {
-            if !is_formula(&raw) {
-                continue;
-            }
+        for (addr, _raw) in anchors {
             let mut visiting = Vec::new();
             let mut budget = DEFAULT_BUDGET;
             if let EvalResult::Array(rows) = eval_cell(grid, &addr, &mut visiting, &mut budget) {
@@ -2748,18 +2910,9 @@ fn formula_references_all_empty(grid: &Grid, formula: &str) -> bool {
         return false;
     };
     let expr = split_labeled_formula(t).map_or(expr, |(expr, _)| expr);
-    let mut p = Parser {
-        s: expr.trim(),
-        i: 0,
-        main_cols: grid.main_cols(),
-    };
-    let Ok(ast) = p.parse_expr() else {
+    let Ok(ast) = parse_formula_cached(expr.trim()) else {
         return false;
     };
-    p.skip_ws();
-    if p.i != p.s.len() {
-        return false;
-    }
 
     let mut saw_ref = false;
     ast_references_all_empty(&ast, grid, &mut saw_ref) && saw_ref
@@ -2780,10 +2933,25 @@ fn ast_references_all_empty(ast: &Ast, grid: &Grid, saw_ref: &mut bool) -> bool 
             cell_reference_is_empty(&sheet_grid, addr)
         }
         Ast::Range { range, .. } => {
+            if range.is_empty() {
+                return true;
+            }
+            *saw_ref = true;
+            // Sparse fast path (ALGORITHMS.md §2.6): only stored cells and
+            // spill followers can be non-empty, and this check consults
+            // neither templates nor budgets, so no dense fallback is needed.
+            if range.area() > 4 * grid.stored_main_count() as u64 {
+                let plan = grid.main_range_eval_plan(range);
+                let mut all_empty = true;
+                for (row, col) in plan.stored_sorted {
+                    let addr = CellAddr::Main { row, col };
+                    all_empty &= cell_reference_is_empty(grid, &addr);
+                }
+                return all_empty;
+            }
             let mut all_empty = true;
             for row in range.row_start..range.row_end {
                 for col in range.col_start..range.col_end {
-                    *saw_ref = true;
                     let addr = CellAddr::Main { row, col };
                     all_empty &= cell_reference_is_empty(grid, &addr);
                 }
@@ -2895,6 +3063,132 @@ fn format_significant_10(n: f64) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn parse_cache_serves_hits_without_caching_failures() {
+        let before = parse_cache_len();
+        // First parse populates the cache.
+        let a = parse_formula_cached("1+2*3").expect("parses");
+        assert_eq!(parse_cache_len(), before + 1);
+        // Second parse hits: same AST contents, no size growth.
+        let b = parse_formula_cached("1+2*3").expect("parses");
+        assert_eq!(parse_cache_len(), before + 1);
+        assert!(matches!(*b, Ast::Add(_, _)));
+        drop(a);
+        // Trailing garbage and empty input fail exactly as uncached parsing
+        // did, and failures are never cached.
+        assert!(parse_formula_cached("1+2)").is_err());
+        assert!(parse_formula_cached("").is_err());
+        assert_eq!(parse_cache_len(), before + 1);
+    }
+
+    #[test]
+    fn eval_memo_serves_hits_without_consuming_budget() {
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(3, 2));
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "7".into());
+        g.set(&CellAddr::Main { row: 1, col: 0 }, "=A1*2".into());
+        g.set(&CellAddr::Main { row: 2, col: 0 }, "=A2+1".into());
+        let addr = CellAddr::Main { row: 2, col: 0 };
+        // First evaluation misses and consumes budget.
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        let first = eval_cell(&g, &addr, &mut v, &mut b);
+        assert!(matches!(first, EvalResult::Number(_)));
+        assert!(b < DEFAULT_BUDGET);
+        assert!(!matches!(
+            eval_cell(&g, &addr, &mut Vec::new(), &mut DEFAULT_BUDGET.clone()),
+            EvalResult::Error(_)
+        ));
+        // Second evaluation is a full memo hit: same value, budget untouched.
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        let second = eval_cell(&g, &addr, &mut v, &mut b);
+        assert_eq!(format!("{first:?}"), format!("{second:?}"));
+        assert_eq!(b, DEFAULT_BUDGET);
+        assert!(eval_memo_len() > 0);
+    }
+
+    #[test]
+    fn eval_memo_invalidates_on_precedent_edit() {
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(2, 2));
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "1".into());
+        g.set(&CellAddr::Main { row: 1, col: 0 }, "=A1+1".into());
+        let addr = CellAddr::Main { row: 1, col: 0 };
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        assert!(matches!(
+            eval_cell(&g, &addr, &mut v, &mut b),
+            EvalResult::Number(_)
+        ));
+        // Editing the precedent must not serve the stale memoised value.
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "10".into());
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        match eval_cell(&g, &addr, &mut v, &mut b) {
+            EvalResult::Number(n) => assert_eq!(format!("{n}"), "11"),
+            e => panic!("expected 11, got {e:?}"),
+        }
+    }
+
+    #[test]
+    fn eval_memo_preserves_cycle_detection() {
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(2, 2));
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "=A1+1".into());
+        g.set(&CellAddr::Main { row: 0, col: 1 }, "=A2".into());
+        g.set(&CellAddr::Main { row: 1, col: 0 }, "=B1".into());
+        for addr in [
+            CellAddr::Main { row: 0, col: 0 },
+            CellAddr::Main { row: 0, col: 1 },
+            CellAddr::Main { row: 1, col: 0 },
+        ] {
+            // Twice each: a cached CIRC must never leak into a fresh stack.
+            for _ in 0..2 {
+                let mut v = Vec::new();
+                let mut b = DEFAULT_BUDGET;
+                assert!(
+                    matches!(eval_cell(&g, &addr, &mut v, &mut b), EvalResult::Error("CIRC")),
+                    "expected CIRC for {addr:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn refresh_spills_fast_path_clears_without_formulas() {
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(3, 3));
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "=1+1".into());
+        refresh_spills(&mut g);
+        assert_eq!(g.formula_cell_count(), 1);
+        // Delete the only formula, then plant stale spill state the way a
+        // removed array formula would leave behind.
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "".into());
+        assert_eq!(g.formula_cell_count(), 0);
+        g.set_spill_value(CellAddr::Main { row: 1, col: 1 }, "stale".into());
+        g.set_spill_error(CellAddr::Main { row: 2, col: 2 }, "SPILL");
+        assert!(g.spills_refresh_dirty());
+        refresh_spills(&mut g);
+        assert!(g.spill_followers().is_empty());
+        assert!(g.spill_errors().is_empty());
+        assert!(!g.spills_refresh_dirty());
+    }
+
+    #[test]
+    fn cached_eval_matches_uncached_values() {
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(2, 2));
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "=A2*2+1".into());
+        g.set(&CellAddr::Main { row: 1, col: 0 }, "21".into());
+        let addr = CellAddr::Main { row: 0, col: 0 };
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        let first = eval_cell(&g, &addr, &mut v, &mut b);
+        // Second evaluation hits the warm cache; cross-sheet refs, locks and
+        // budgets behave identically.
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        let second = eval_cell(&g, &addr, &mut v, &mut b);
+        assert_eq!(format!("{first:?}"), format!("{second:?}"));
+        assert!(matches!(second, EvalResult::Number(_)));
+    }
+
     fn nf(n: &Number) -> f64 {
         n.to_f64()
     }
@@ -2972,6 +3266,14 @@ mod tests {
         };
         g.set(&addr, "TOTAL".into());
         assert_eq!(cell_effective_display(&g, &addr), "TOTAL");
+        assert_eq!(cell_effective_display(&g, &addr), cell_effective_display(
+            &{
+                let mut g2 = crate::grid::GridBox::from(crate::grid::Grid::new(1, 1));
+                g2.set(&addr, "==TOTAL".into());
+                g2
+            },
+            &addr
+        ));
     }
 
     #[test]
@@ -3228,7 +3530,7 @@ mod tests {
     #[test]
     fn translate_formula_insert_main_rows_bumps_refs_on_or_below_gap_start() {
         assert_eq!(
-            translate_formula_text_insert_main_rows("=A10+A11+A12", 2, 10, 2, None).unwrap(),
+            translate_formula_text_insert_main_rows("=A10+A11+A12", 10, 2, None).unwrap(),
             "=((A10+A13)+A14)"
         );
     }

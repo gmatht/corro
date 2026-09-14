@@ -38,6 +38,54 @@ pub fn clock_string() -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Special-character picker (Insert > Special Char)
+// ---------------------------------------------------------------------------
+
+/// Canonical special-character choices for Insert > Special Char, in
+/// navigation order. Shared by the ratatui picker and the GUI/pancurses
+/// picker dialogs so every backend offers byte-identical items in the same
+/// order; Down*n must land on the nth item here on all of them. The order
+/// is the navigation contract — never reorder without updating every
+/// backend's picker and the parity tests.
+pub const SPECIAL_VALUE_CHOICES: [&str; 10] = ["∞", "Σ", "Ω", "π", "μ", "Δ", "√", "φ", "λ", "θ"];
+
+/// Picker label for a choice index: `1`..=`9` then `0` (matches the digit
+/// hotkey that selects it). Shared so list widgets render identical rows.
+pub fn special_choice_label(idx: usize) -> Option<char> {
+    match idx {
+        0..=8 => char::from_digit((idx + 1) as u32, 10),
+        9 => Some('0'),
+        _ => None,
+    }
+}
+
+/// Digit hotkey → choice index (`1`..=`9` → 0..=8, `0` → 9). Shared so every
+/// backend's picker commits the same choice for the same digit.
+pub fn special_choice_index_for_digit(digit: char) -> Option<usize> {
+    match digit {
+        '1'..='9' => Some((digit as u8 - b'1') as usize),
+        '0' => Some(9),
+        _ => None,
+    }
+}
+
+/// One clamped navigation step from `idx` (`delta` is +1/-1 for Down/Up).
+/// Shared by the ratatui picker arm and the GUI/pancurses picker state so
+/// arrow navigation can never drift between backends.
+pub fn special_step_index(idx: usize, delta: i32) -> usize {
+    let next = idx as i32 + delta;
+    next.clamp(0, SPECIAL_VALUE_CHOICES.len() as i32 - 1) as usize
+}
+
+/// List-widget row texts (`"1: ∞"` … `"0: θ"`), in navigation order.
+/// Every backend's picker renders exactly these rows.
+pub fn special_labelled_choices() -> [String; 10] {
+    std::array::from_fn(|i| {
+        format!("{}: {}", special_choice_label(i).unwrap_or('?'), SPECIAL_VALUE_CHOICES[i])
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
@@ -608,15 +656,15 @@ pub fn visible_row_indices(
     let hr = HEADER_ROWS;
     let mr = g.main_rows();
     let main_order = g.sorted_main_rows();
-    let mut header_rows = Vec::new();
-    let mut footer_rows = Vec::new();
-    for (addr, _) in g.iter_nonempty() {
-        match addr {
-            CellAddr::Header { row, .. } => header_rows.push(row as usize),
-            CellAddr::Footer { row, .. } => footer_rows.push(hr + mr + row as usize),
-            _ => {}
-        }
-    }
+    // Row-id sets from the occupancy summary (ALGORITHMS.md §9.3.1): no
+    // per-cell clones on this per-frame path. Sorted/deduped below anyway.
+    let summary = g.content_summary();
+    let mut header_rows: Vec<usize> = summary.header_rows.iter().map(|&r| r as usize).collect();
+    let mut footer_rows: Vec<usize> = summary
+        .footer_rows
+        .iter()
+        .map(|&r| hr + mr + r as usize)
+        .collect();
     if cursor.row < hr {
         let window = 5usize;
         let lo = cursor.row.saturating_sub(window / 2);

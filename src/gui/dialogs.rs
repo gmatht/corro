@@ -97,6 +97,16 @@ pub fn show_keybinds_help() {
 }
 
 
+/// Focus a dialog's text entry after present(): modeless (NWG) dialogs do
+/// not take focus on their own the way modal GTK dialogs do — without this,
+/// typing goes to whatever had focus before and Enter submits nothing.
+#[cfg(feature = "gui")]
+fn focus_dialog_entry(entry_ptr: usize) {
+    use rswidgets::common::Entry as CommonEntry;
+    let entry: &CommonEntry = unsafe { &*(entry_ptr as *const CommonEntry) };
+    entry.grab_focus();
+}
+
 /// Wire OK/Cancel buttons (response path) and Enter-in-entry (activate path)
 /// to one once-only confirm for a single-entry prompt dialog. Enter commits
 /// exactly like the OK button (ratatui parity: type + Enter commits, Esc
@@ -179,6 +189,7 @@ pub fn prompt_dialog<F: FnOnce(Option<String>) + 'static>(
                     let entry_ptr = Box::into_raw(Box::new(entry)) as usize;
                     wire_prompt_confirm(&dialog, entry_ptr, on_result);
                     dialog.present();
+                    focus_dialog_entry(entry_ptr);
                     let _ = Box::into_raw(Box::new(dialog));
                     return;
                 }
@@ -201,6 +212,7 @@ pub fn find_dialog<F: FnOnce(Option<String>) + 'static>(on_result: F) {
                     let entry_ptr = Box::into_raw(Box::new(entry)) as usize;
                     wire_prompt_confirm(&dialog, entry_ptr, on_result);
                     dialog.present();
+                    focus_dialog_entry(entry_ptr);
                     let _ = Box::into_raw(Box::new(dialog));
                     return;
                 }
@@ -290,6 +302,115 @@ pub fn replace_dialog<F: FnOnce(Option<(String, String)>) + 'static>(on_result: 
                     replace_ref.connect_activate(move |_| c2()).ok();
                 }
                 dialog.present();
+                focus_dialog_entry(find_ptr);
+                let _ = Box::into_raw(Box::new(dialog));
+                return;
+            }
+        }
+    }
+    on_result(None);
+}
+
+/// Chrome for the Insert > Special Char picker dialog. Pinned by test so a
+/// mislabeled dialog (recycled "Find") fails headlessly instead of in
+/// screenshots.
+pub const SPECIAL_CHAR_DIALOG_TITLE: &str = "Insert special char";
+pub const SPECIAL_CHAR_DIALOG_OK: &str = "Insert";
+
+/// Insert > Special Char picker dialog: the 10 labelled choices
+/// (`"1: ∞"` … `"0: θ"`, same items/order as the ratatui picker) as a
+/// native radio group with Cancel/Insert chrome. Arrows move selection
+/// natively inside the group on every backend, Enter confirms via the
+/// dialog default response, Esc cancels. Yields the selected INDEX (into
+/// the shared choice table), not text: there is deliberately no free-text
+/// entry — the formula bar is the arbitrary-input path.
+///
+/// Radios (not a dropdown) because a focused combo consumes Return on some
+/// backends, which would swallow the confirm; radio groups navigate with
+/// arrows and never eat Enter, so Down*n+Enter works identically everywhere.
+/// Single column, deliberately: a multi-column grid would navigate
+/// spatially (Down from row 1 lands 4 rows down the indices), breaking the
+/// Down*n → nth-choice contract the ratatui reference defines (verified:
+/// Down*2 in a 4-column trial landed on index 8, not 2). Linear layout
+/// keeps arrows stepping ±1 through the indices on every backend.
+pub fn special_char_dialog<F: FnOnce(Option<usize>) + 'static>(
+    items: &[String],
+    initial: usize,
+    on_result: F,
+) {
+    #[cfg(feature = "gui")]
+    {
+        use rswidgets::prelude::*;
+        if let Ok(rxapp) = rswidgets::App::init() {
+            if let (Ok(dialog), Ok(vbox)) =
+                (rxapp.new_dialog(), rxapp.new_box(Orientation::Vertical, 4))
+            {
+                dialog.set_title(SPECIAL_CHAR_DIALOG_TITLE);
+                dialog.set_default_size(300, 340);
+                // One radio group in choice order: the first stands alone,
+                // each next joins the previous (native mutual exclusion +
+                // arrow navigation in creation order, so Down*n lands on
+                // the nth choice on every backend). Single column (see doc
+                // above for why a grid would break the contract).
+                let mut radios: Vec<RadioButton> = Vec::new();
+                let mut built_ok = !items.is_empty();
+                for item in items {
+                    let group = radios.last();
+                    match rxapp.create_radiobutton(group, item) {
+                        Ok(rb) => {
+                            rb.set_hexpand(true);
+                            vbox.append(&rb);
+                            radios.push(rb);
+                        }
+                        Err(_) => {
+                            built_ok = false;
+                            break;
+                        }
+                    }
+                }
+                if !built_ok {
+                    on_result(None);
+                    return;
+                }
+                let sel = initial.min(radios.len() - 1);
+                radios[sel].set_active(true);
+                dialog.append_content_area(&vbox);
+                dialog.add_button("Cancel", 0);
+                dialog.add_button(SPECIAL_CHAR_DIALOG_OK, 1);
+                // Enter anywhere unhandled confirms (Insert): GTK natively,
+                // NWG via dialog-level raw routing. Both inners expose the
+                // same method, so no per-platform branching here.
+                dialog.inner.set_default_response(1);
+                let rb_ptr = Box::into_raw(Box::new(radios)) as usize;
+                let mut on_result = Some(on_result);
+                let callback_called = std::cell::RefCell::new(false);
+                // Close FIRST, then report: teardown restores focus
+                // synchronously, so the callee's entry grab (splice path)
+                // lands instead of racing the destroy. The wrapper's own
+                // post-response close becomes a harmless no-op.
+                let dlg_close = dialog.clone();
+                dialog.connect_response(move |response_id| {
+                    let mut called = callback_called.borrow_mut();
+                    if !*called {
+                        *called = true;
+                        if let Some(f) = on_result.take() {
+                            let rbs: &Vec<RadioButton> =
+                                unsafe { &*(rb_ptr as *const Vec<RadioButton>) };
+                            let result = if response_id == 1 {
+                                let idx = rbs.iter().position(|r| r.is_active()).unwrap_or(0);
+                                Some(idx)
+                            } else {
+                                None
+                            };
+                            dlg_close.close();
+                            f(result);
+                        }
+                    }
+                }).ok();
+                dialog.present();
+                // Arrows navigate from the focused radio.
+                let rbs: &Vec<RadioButton> = unsafe { &*(rb_ptr as *const Vec<RadioButton>) };
+                rbs[sel].grab_focus();
                 let _ = Box::into_raw(Box::new(dialog));
                 return;
             }
@@ -378,6 +499,7 @@ pub fn balance_dialog<F: FnOnce(Option<String>) + 'static>(on_result: F) {
                     }
                 }).ok();
                 dialog.present();
+                focus_dialog_entry(entry_ptr);
                 let _ = Box::into_raw(Box::new(dialog));
                 return;
             }

@@ -357,7 +357,8 @@ pub(crate) enum BalanceBooksFocus {
     Cancel,
 }
 
-const SPECIAL_VALUE_CHOICES: [&str; 10] = ["∞", "Σ", "Ω", "π", "μ", "Δ", "√", "φ", "λ", "θ"];
+// SPECIAL_VALUE_CHOICES and its label/digit helpers now live in ui_core
+// (shared with the GUI/pancurses pickers); imported via `use crate::ui_core::*`.
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MenuSection {
@@ -1710,15 +1711,15 @@ fn visible_row_indices(
     let hr = HEADER_ROWS;
     let mr = g.main_rows();
     let main_order = g.sorted_main_rows();
-    let mut header_rows = Vec::new();
-    let mut footer_rows = Vec::new();
-    for (addr, _) in g.iter_nonempty() {
-        match addr {
-            CellAddr::Header { row, .. } => header_rows.push(row as usize),
-            CellAddr::Footer { row, .. } => footer_rows.push(hr + mr + row as usize),
-            _ => {}
-        }
-    }
+    // Row-id sets from the occupancy summary (ALGORITHMS.md §9.3.1): no
+    // per-cell clones on this per-frame path. Sorted/deduped below anyway.
+    let summary = g.content_summary();
+    let mut header_rows: Vec<usize> = summary.header_rows.iter().map(|&r| r as usize).collect();
+    let mut footer_rows: Vec<usize> = summary
+        .footer_rows
+        .iter()
+        .map(|&r| hr + mr + r as usize)
+        .collect();
     if cursor.row < hr {
         // Show header rows near the cursor, up to a window.
         let window = 5usize;
@@ -2162,21 +2163,8 @@ fn special_value_for_digit(digit: char) -> Option<&'static str> {
     special_choice_index_for_digit(digit).map(|i| SPECIAL_VALUE_CHOICES[i])
 }
 
-fn special_choice_label(idx: usize) -> Option<char> {
-    match idx {
-        0..=8 => char::from_digit((idx + 1) as u32, 10),
-        9 => Some('0'),
-        _ => None,
-    }
-}
-
-fn special_choice_index_for_digit(digit: char) -> Option<usize> {
-    match digit {
-        '1'..='9' => Some((digit as u8 - b'1') as usize),
-        '0' => Some(9),
-        _ => None,
-    }
-}
+// special_choice_label / special_choice_index_for_digit now live in ui_core
+// (shared with the GUI/pancurses pickers); imported via `use crate::ui_core::*`.
 
 fn cycle_special_value(current: &str, choices: &[&'static str]) -> Option<String> {
     if choices.is_empty() {
@@ -2507,51 +2495,41 @@ impl App {
             env::var("CORRO_AUTO_UNSAVED").map(|v| v != "0").unwrap_or(true)
         };
 
-/// Template path for new documents (`CORRO_TEMPLATE`): a `.corro` file
-/// whose whole workbook becomes the fresh document. Blank/unset means
-/// built-in seeded blank. Pure lookup — loading + fallback live with the
-/// caller so both stay unit-testable without touching process env.
-fn template_path_from_env() -> Option<std::path::PathBuf> {
-    let raw = std::env::var("CORRO_TEMPLATE").ok()?;
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    Some(std::path::PathBuf::from(trimmed))
-}
-
-/// Fresh-document content: template workbook when CORRO_TEMPLATE
-/// points at a readable .corro file, built-in seeded blank otherwise
-/// (and on any template failure, with a status note).
-fn fresh_document_parts() -> (WorkbookState, SheetState, Option<String>) {
-    match template_path_from_env() {
-        Some(path) => match crate::io::load_workbook_template(&path) {
-            Ok(wb) => {
-                let st = wb.active_sheet().clone();
-                (wb, st, None)
-            }
-            Err(msg) => {
-                let note = format!(
-                    "Template {} failed ({msg}); opened blank instead",
-                    path.display()
-                );
-                (
-                    WorkbookState::new_seeded(),
-                    SheetState::new_seeded(),
-                    Some(note),
-                )
-            }
-        },
-        None => (
-            WorkbookState::new_seeded(),
-            SheetState::new_seeded(),
-            None,
-        ),
-    }
-}
-
-        let (workbook, state, template_note) = fresh_document_parts();
+        // Fresh-document content: template workbook when CORRO_TEMPLATE
+        // points at a readable .corro file, built-in seeded blank
+        // otherwise (and on any template failure, with a status note).
+        // Loads overwrite all of this, so unit-test fixtures that load
+        // files are unaffected; only genuinely fresh docs branch here.
+        let (workbook, state, template_note): (
+            WorkbookState,
+            SheetState,
+            Option<String>,
+        ) = match crate::io::template_path_from_env() {
+            Some(path) => match crate::io::load_workbook_template(&path) {
+                Ok(wb) => {
+                    let st = wb.active_sheet().clone();
+                    (wb, st, None)
+                }
+                Err(msg) => {
+                    let note = format!(
+                        "Template {} failed ({msg}); opened blank instead",
+                        path.display()
+                    );
+                    (
+                        WorkbookState::new_seeded(),
+                        SheetState::new_seeded(),
+                        Some(note),
+                    )
+                }
+            },
+            None => (
+                WorkbookState::new_seeded(),
+                SheetState::new_seeded(),
+                None,
+            ),
+        };
         let view_sheet_id = workbook.sheet_id(workbook.active_sheet);
+
         let app = App {
             path,
             capturer: None,
@@ -4096,15 +4074,15 @@ fn fresh_document_parts() -> (WorkbookState, SheetState, Option<String>) {
         let hr = HEADER_ROWS;
         let mr = g.main_rows();
         let first_footer = hr + mr;
-        let mut header_rows = Vec::new();
-        let mut footer_rows = Vec::new();
-        for (addr, _) in g.iter_nonempty() {
-            match addr {
-                CellAddr::Header { row, .. } => header_rows.push(row as usize),
-                CellAddr::Footer { row, .. } => footer_rows.push(first_footer + row as usize),
-                _ => {}
-            }
-        }
+        // Row-id sets from the occupancy summary (ALGORITHMS.md §9.3.1).
+        let summary = g.content_summary();
+        let mut header_rows: Vec<usize> =
+            summary.header_rows.iter().map(|&r| r as usize).collect();
+        let mut footer_rows: Vec<usize> = summary
+            .footer_rows
+            .iter()
+            .map(|&r| first_footer + r as usize)
+            .collect();
         if self.cursor.row < hr {
             header_rows.push(self.cursor.row);
         } else if self.cursor.row >= first_footer {
@@ -10414,11 +10392,13 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                     return Ok(false);
                 }
                 KeyCode::Left | KeyCode::Up => {
-                    self.special_picker = Some(selected.saturating_sub(1));
+                    // Shared step (ui_core) so arrow navigation matches the
+                    // GUI/pancurses pickers exactly.
+                    self.special_picker = Some(special_step_index(selected, -1));
                     return Ok(false);
                 }
                 KeyCode::Right | KeyCode::Down => {
-                    self.special_picker = Some((selected + 1).min(SPECIAL_VALUE_CHOICES.len() - 1));
+                    self.special_picker = Some(special_step_index(selected, 1));
                     return Ok(false);
                 }
                 KeyCode::Char(c) if c.is_ascii_digit() => {
@@ -10711,6 +10691,14 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                             }],
                             &mode,
                         );
+                        return Ok(false);
+                    }
+                    // Root shortcut R (FoRmat): unique at the menubar level
+                    // on every backend (File &F vs Format &F collided, so
+                    // Alt+F is File; Alt+O stays File→Open). Mirrors the
+                    // shared tree's Format ("R") root shortcut.
+                    'r' | 'R' => {
+                        self.open_menu_with_prior_mode(MenuSection::Format, &mode);
                         return Ok(false);
                     }
                     _ => {}
@@ -13469,6 +13457,23 @@ mod drive_feature_tests {
         assert!(matches!(app.mode, Mode::SetColWidth { .. }), "Width▸Column opens SetColWidth mode");
     }
 
+    // ── Format menu direct (Alt+r; root shortcut R disambiguates File &F
+    // vs Format &F on GUI backends) ──
+    #[test]
+    fn drive_format_menu_direct() {
+        let mut app = App::new(None);
+        open_menu(&mut app, 'r');
+        let section = match &app.mode {
+            Mode::Menu { stack } => stack.first().map(|l| l.section),
+            _ => None,
+        };
+        assert_eq!(
+            section,
+            Some(MenuSection::Format),
+            "Alt+r opens the Format menu (mode={:?})",
+            app.mode
+        );
+    }
     // ── Format menu (Alt+e, then two Rights to reach Format) ──
     #[test]
     fn drive_format_reset() {
@@ -13881,7 +13886,7 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::path::PathBuf;
 
-#[test]
+    #[test]
     fn fresh_hints_line_matches_shared_normal_hints() {
         // The Mode::Normal arm must stay a pure delegation: if this fails,
         // the terminal bottom row and the GUI bottom strip have drifted

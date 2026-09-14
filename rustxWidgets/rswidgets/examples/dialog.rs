@@ -7,7 +7,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     dialog.set_title("Widget Test Dialog");
     dialog.set_default_size(450, 500);
 
-    let mut vbox = app.new_box(
+    let vbox = app.new_box(
         rswidgets::prelude::Orientation::Vertical, 1,
     )?;
 
@@ -32,9 +32,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     vbox.append(&cb);
 
     // --- RadioButton ---
-    let rb_a = app.create_radiobutton("Option A")?;
-    let rb_b = app.create_radiobutton("Option B")?;
-    let rb_c = app.create_radiobutton("Option C")?;
+    let rb_a = app.create_radiobutton(None, "Option A")?;
+    let rb_b = app.create_radiobutton(Some(&rb_a), "Option B")?;
+    let rb_c = app.create_radiobutton(Some(&rb_b), "Option C")?;
     rb_a.set_active(true);
     assert!(rb_a.is_active());
     println!("RadioButton: OK");

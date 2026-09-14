@@ -13,7 +13,7 @@ fn log_trampoline_panic(what: &str, err: Box<dyn std::any::Any + Send>) {
         "<non-string panic payload>".to_string()
     };
     let line = format!("corro: panic in GTK callback ({what}): {msg}\n");
-    let _ = std::fs::write("/tmp/corro-panic.log", &line);
+    let _ = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/corro-panic.log").and_then(|mut f| { use std::io::Write as _; writeln!(f, "{line}") });
     eprintln!("{line}");
 }
 

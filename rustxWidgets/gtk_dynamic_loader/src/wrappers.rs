@@ -2231,14 +2231,32 @@ impl MenuBar {
             take_ownership(&symbols, &loader.version, inner);
             let mut mnemonic_index = HashMap::new();
             for (i, item) in model.items.iter().enumerate() {
-                // Strip app-layer '_' mnemonic markers before indexing: this
-                // keeps the GTK4 lookup byte-identical to the pre-marker
-                // behavior (first character of the plain label).  GTK4 menu
-                // handling itself is intentionally untouched.
-                // label is "_File" → skip '_' → mnemonic is first remaining char 'F'
-                // If no '_' is found, fall back to the first character of the label.
-                let plain = item.label.replace('_', "");
-                let m = plain.chars().next().map(|c| c.to_ascii_uppercase());
+                // Honor the app-layer '_' mnemonic marker: the marked
+                // character is the mnemonic ("_File" → 'F', "Fo_r_mat"
+                // → 'R'). '__' is a literal underscore, never a marker.
+                // Fall back to the first character only when no marker is
+                // present. GTK4 menu handling itself is untouched.
+                let label = &item.label;
+                let mut chars = label.chars().peekable();
+                let mut marked = None;
+                while let Some(c) = chars.next() {
+                    if c != '_' {
+                        continue;
+                    }
+                    match chars.peek() {
+                        Some(&'_') => {
+                            chars.next();
+                        }
+                        Some(&m) => {
+                            marked = Some(m);
+                            break;
+                        }
+                        None => {}
+                    }
+                }
+                let m = marked
+                    .or_else(|| label.replace('_', "").chars().next())
+                    .map(|c| c.to_ascii_uppercase());
                 if let Some(m) = m {
                     mnemonic_index.entry(m).or_insert(i);
                 }
@@ -2813,6 +2831,15 @@ impl Dialog {
         }
     }
 
+    /// Make `response_id` the dialog's default response (Enter anywhere in
+    /// the dialog activates it). No-op when the symbol is unavailable.
+    pub fn set_default_response(&self, response_id: i32) {
+        guard_widget!(self, "Dialog", "set_default_response");
+        if let Some(set_def) = self.loader.symbols.gtk_dialog_set_default_response {
+            unsafe { set_def(self.inner, response_id); }
+        }
+    }
+
     pub fn get_content_area(&self) -> *mut c_void {
         if !guard_widget_ptr(self.inner, "Dialog", "get_content_area") {
             return std::ptr::null_mut();
@@ -3184,11 +3211,18 @@ pub struct RadioButton {
 impl RadioButton {
     pub fn new(loader: Arc<Loader>, group: Option<&RadioButton>, label: &str) -> Result<Self, Error> {
         let symbols = &loader.symbols;
-        // GTK3: use gtk_radio_button_new_with_label
+        // GTK3: use gtk_radio_button_new_with_label. Its `group` arg is a
+        // GSList* from gtk_radio_button_get_group, never a widget pointer.
         if let Some(ctor) = symbols.gtk_radio_button_new_with_label {
             let c = CString::new(label).unwrap();
-            let group_ptr = group.map(|r| r.inner).unwrap_or(std::ptr::null_mut());
-            let inner = unsafe { ctor(group_ptr, c.as_ptr()) };
+            let group_list = match group {
+                Some(g) => symbols
+                    .gtk_radio_button_get_group
+                    .map(|get| unsafe { get(g.inner) })
+                    .unwrap_or(std::ptr::null_mut()),
+                None => std::ptr::null_mut(),
+            };
+            let inner = unsafe { ctor(group_list, c.as_ptr()) };
             if inner.is_null() { return Err(Error::Other("gtk_radio_button_new_with_label returned null".into())); }
             unsafe { take_ownership(&symbols, &loader.version, inner); }
             return Ok(RadioButton { inner, loader, _not_send: PhantomData });
@@ -3257,6 +3291,13 @@ impl RadioButton {
         guard_widget!(self, "RadioButton", "set_size_request");
         if let Some(sr) = self.loader.symbols.gtk_widget_set_size_request {
             unsafe { sr(self.inner, w, h); }
+        }
+    }
+
+    pub fn grab_focus(&self) {
+        guard_widget!(self, "RadioButton", "grab_focus");
+        if let Some(f) = self.loader.symbols.gtk_widget_grab_focus {
+            unsafe { f(self.inner); }
         }
     }
 }

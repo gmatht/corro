@@ -50,17 +50,52 @@ fn collect_numbers_summable(grid: &Grid, range: &MainRange) -> Vec<Number> {
     if range.is_empty() {
         return v;
     }
+    // Median is the only caller that needs the whole vector; every other
+    // aggregate streams through `fold_numbers_summable` instead
+    // (ALGORITHMS.md §2.6).
+    fold_numbers_summable(grid, range, &mut v, |v, n| v.push(n));
+    v
+}
+
+/// Stream summable cells through `f` without materialising a vector.
+/// Shares one `visiting` stack and eval budget across the range, exactly as
+/// the old collect-then-scan did, so evaluation semantics are unchanged.
+fn fold_numbers_summable<T>(
+    grid: &Grid,
+    range: &MainRange,
+    acc: &mut T,
+    mut f: impl FnMut(&mut T, Number),
+) {
+    if range.is_empty() {
+        return;
+    }
     let mut visiting = Vec::new();
     let mut budget = formula::EVAL_BUDGET_AGG;
+    // Sparse fast path (ALGORITHMS.md §2.6): for ranges much larger than the
+    // stored content with no applicable templates, evaluate only stored and
+    // spilled cells in row-major order. Order matches the dense loop, and
+    // skipped empty cells consume no budget and touch no visiting stack.
+    if range.area() > 4 * grid.stored_main_count() as u64 {
+        let plan = grid.main_range_eval_plan(range);
+        if !plan.has_template {
+            for (r, c) in plan.stored_sorted {
+                let addr = CellAddr::Main { row: r, col: c };
+                if let Some(n) = formula::summable_numeric(grid, &addr, &mut visiting, &mut budget)
+                {
+                    f(acc, n);
+                }
+            }
+            return;
+        }
+    }
     for r in range.row_start..range.row_end {
         for c in range.col_start..range.col_end {
             let addr = CellAddr::Main { row: r, col: c };
             if let Some(n) = formula::summable_numeric(grid, &addr, &mut visiting, &mut budget) {
-                v.push(n);
+                f(acc, n);
             }
         }
     }
-    v
 }
 
 fn count_numeric_cells(grid: &Grid, range: &MainRange) -> usize {
@@ -70,6 +105,20 @@ fn count_numeric_cells(grid: &Grid, range: &MainRange) -> usize {
     }
     let mut visiting = Vec::new();
     let mut budget = formula::EVAL_BUDGET_AGG;
+    // Sparse fast path (ALGORITHMS.md §2.6): same argument as
+    // `fold_numbers_summable` above.
+    if range.area() > 4 * grid.stored_main_count() as u64 {
+        let plan = grid.main_range_eval_plan(range);
+        if !plan.has_template {
+            for (r, c) in plan.stored_sorted {
+                let addr = CellAddr::Main { row: r, col: c };
+                if formula::effective_numeric(grid, &addr, &mut visiting, &mut budget).is_some() {
+                    n += 1;
+                }
+            }
+            return n;
+        }
+    }
     for r in range.row_start..range.row_end {
         for c in range.col_start..range.col_end {
             let addr = CellAddr::Main { row: r, col: c };
@@ -93,43 +142,71 @@ pub fn compute_aggregate(grid: &Grid, def: &AggregateDef) -> String {
             }
         }
         AggFunc::Sum => {
-            let xs = collect_numbers_summable(grid, &def.source);
-            if xs.is_empty() {
+            let mut sum = Number::exact_zero();
+            let mut count = 0usize;
+            fold_numbers_summable(grid, &def.source, &mut (), |_, n| {
+                sum = sum.clone().add(n);
+                count += 1;
+            });
+            if count == 0 {
                 String::new()
             } else {
-                let s = xs
-                    .iter()
-                    .cloned()
-                    .fold(Number::exact_zero(), |a, b| a.add(b));
-                format_aggregate_number(&s)
+                format_aggregate_number(&sum)
             }
         }
         AggFunc::Mean => {
-            let xs = collect_numbers_summable(grid, &def.source);
-            if xs.is_empty() {
+            let mut sum = Number::exact_zero();
+            let mut count = 0usize;
+            fold_numbers_summable(grid, &def.source, &mut (), |_, n| {
+                sum = sum.clone().add(n);
+                count += 1;
+            });
+            if count == 0 {
                 String::new()
             } else {
-                let sum = xs
-                    .iter()
-                    .cloned()
-                    .fold(Number::exact_zero(), |a, b| a.add(b));
-                let s = sum.div(Number::from_i64(xs.len() as i64));
+                let s = sum.div(Number::from_i64(count as i64));
                 format_aggregate_number(&s)
             }
         }
         AggFunc::Median => median_aggregate(collect_numbers_summable(grid, &def.source))
             .map(|m| format_aggregate_number(&m))
             .unwrap_or_default(),
-        AggFunc::Min => collect_numbers_summable(grid, &def.source)
-            .into_iter()
-            .min_by(|a, b| cmp_number_aggregate(a, b))
-            .map(|n| format_aggregate_number(&n))
-            .unwrap_or_default(),
-        AggFunc::Max => collect_numbers_summable(grid, &def.source)
-            .into_iter()
-            .max_by(|a, b| cmp_number_aggregate(a, b))
-            .map(|n| format_aggregate_number(&n))
-            .unwrap_or_default(),
+        AggFunc::Min => {
+            let mut best: Option<Number> = None;
+            fold_numbers_summable(grid, &def.source, &mut (), |_, n| {
+                best = Some(match best.take() {
+                    None => n,
+                    // `Iterator::min_by` keeps the *last* equally-minimum
+                    // element; match that tie rule exactly.
+                    Some(b) => {
+                        if cmp_number_aggregate(&n, &b) == std::cmp::Ordering::Greater {
+                            b
+                        } else {
+                            n
+                        }
+                    }
+                });
+            });
+            best.map(|n| format_aggregate_number(&n)).unwrap_or_default()
+        }
+        AggFunc::Max => {
+            let mut best: Option<Number> = None;
+            fold_numbers_summable(grid, &def.source, &mut (), |_, n| {
+                best = Some(match best.take() {
+                    None => n,
+                    // `Iterator::max_by` keeps the *last* equally-maximum
+                    // element; match that tie rule exactly.
+                    Some(b) => {
+                        if cmp_number_aggregate(&n, &b) == std::cmp::Ordering::Less {
+                            b
+                        } else {
+                            n
+                        }
+                    }
+                });
+            });
+            best.map(|n| format_aggregate_number(&n)).unwrap_or_default()
+        }
     }
 }
 
@@ -179,6 +256,59 @@ mod tests {
         };
         let gb = GridBox::from(g);
         assert_eq!(compute_aggregate(&gb, &def), "5");
+    }
+
+    #[test]
+    fn sparse_range_aggregates_match_dense() {
+        // 26x500 range with a handful of cells: area dwarfs stored count,
+        // forcing the sparse plan. Results must equal dense evaluation.
+        let mut g = Grid::new(500, 26);
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "2".into());
+        g.set(&CellAddr::Main { row: 499, col: 25 }, "4".into());
+        g.set(&CellAddr::Main { row: 250, col: 13 }, "=2*3".into());
+        g.set(&CellAddr::Main { row: 100, col: 1 }, "text".into());
+        let gb = GridBox::from(g);
+        let source = MainRange {
+            row_start: 0,
+            row_end: 500,
+            col_start: 0,
+            col_end: 26,
+        };
+        assert!(!gb.main_range_eval_plan(&source).has_template);
+        assert!(gb.main_range_eval_plan(&source).stored_sorted.len() < 10);
+        for (func, expect) in [
+            (AggFunc::Sum, "12"),
+            (AggFunc::Mean, "4"),
+            (AggFunc::Min, "2"),
+            (AggFunc::Max, "6"),
+            (AggFunc::Count, "3"),
+            (AggFunc::Median, "4"),
+        ] {
+            let def = AggregateDef {
+                func,
+                source: source.clone(),
+            };
+            assert_eq!(compute_aggregate(&gb, &def), expect, "{func:?}");
+        }
+    }
+
+    #[test]
+    fn sparse_range_includes_spill_followers() {
+        let mut g = Grid::new(200, 4);
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "3".into());
+        // A spilled array value with no stored cell must still aggregate.
+        g.set_spill_value(CellAddr::Main { row: 150, col: 0 }, "7".into());
+        let gb = GridBox::from(g);
+        let def = AggregateDef {
+            func: AggFunc::Sum,
+            source: MainRange {
+                row_start: 0,
+                row_end: 200,
+                col_start: 0,
+                col_end: 4,
+            },
+        };
+        assert_eq!(compute_aggregate(&gb, &def), "10");
     }
 
     #[test]

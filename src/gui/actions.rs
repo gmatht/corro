@@ -197,7 +197,11 @@ pub fn menu_action_needs_prompt(name: &str) -> Option<&'static str> {
         "rename_sheet" => "Rename sheet to",
         "copy_sheet" => "Copy sheet as",
         "delete_sheet" => "Delete sheet named",
-        "insert_special_chars" => "Insert special char",
+        // NOTE: insert_special_chars is NOT free-text: it opens the
+        // 10-choice picker (same items/order as the ratatui reference),
+        // dispatched via MenuDispatch::SpecialPicker. The formula bar
+        // remains the arbitrary-input path, so the picker box needs no
+        // free-text entry.
         "insert_hyperlink" => "Insert hyperlink",
         "sort_view" => "sort cols [A,B,C]",
         "persist_sort" => "sort cols [A,B,C] (save)",
@@ -214,6 +218,10 @@ pub enum MenuDispatch {
     Status(String),
     /// Backend should open a text prompt with (label, action name).
     Prompt(&'static str, &'static str),
+    /// Backend should open the Insert > Special Char 10-choice picker over
+    /// shared [`super::special_picker`] state (same items, order, arrows,
+    /// digits, Enter, Esc as the ratatui reference).
+    SpecialPicker,
     /// Backend should enter edit mode on the cursor cell with `value` as the
     /// in-progress buffer (matching ratatui's start_edit_mode actions such as
     /// Insert Date / Insert Time).
@@ -274,6 +282,12 @@ pub fn dispatch_menu_action(
                 app.core.workbook.active_sheet_mut().grid.grow_main_row_at_bottom();
                 MenuDispatch::Status("Inserted row".into())
             }
+        }
+        "insert_special_chars" => {
+            // Picker, not free-text (ratatui parity): the backend opens
+            // its 10-choice dialog/popup over shared picker state.
+            super::special_picker::open(app);
+            MenuDispatch::SpecialPicker
         }
         "insert_mitosis_row" => {
             // Mitosis COPIES the cursor's main row into a new row below it
@@ -831,7 +845,7 @@ pub fn run_prompt_action(app: &mut App, action: &str, text: &str) {
                 app.core.status = "Cannot delete the last sheet".into();
             }
         }
-        "insert_special_chars" | "insert_hyperlink" => {
+        "insert_hyperlink" => {
             if !path.is_empty() {
                 let hr = HEADER_ROWS;
                 let lm = MARGIN_COLS;
@@ -840,11 +854,7 @@ pub fn run_prompt_action(app: &mut App, action: &str, text: &str) {
                     col: app.core.cursor.col.saturating_sub(lm) as u32,
                 };
                 commit_cell(app, addr.clone(), path.clone());
-                app.core.status = if action == "insert_special_chars" {
-                    format!("Inserted '{}'", path)
-                } else {
-                    format!("Inserted hyperlink {path}")
-                };
+                app.core.status = format!("Inserted hyperlink {path}");
             }
         }
         _ => { app.core.status = format!("Menu: {action}"); }

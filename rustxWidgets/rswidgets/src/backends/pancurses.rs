@@ -441,7 +441,7 @@ mod pancurses_backend {
         RadioButton { label: String, checked: bool, group_id: usize },
         Dialog { title: String },
         Menu,
-        MenuBar { labels: Vec<String>, submenu_items: Vec<(String, Vec<crate::MenuItem>)> },
+        MenuBar { labels: Vec<crate::Label>, submenu_items: Vec<(crate::Label, Vec<crate::MenuItem>)> },
         SimpleAction,
         DropDown { items: Vec<String>, selected: Option<usize> },
         TextView { text: String },
@@ -578,6 +578,17 @@ mod pancurses_backend {
         static FRAME_HOOK: RefCell<Option<Box<dyn FnMut()>>> = RefCell::new(None);
         /// Generic pre-dispatch key hook (see set_key_input_hook).
         static KEY_INPUT_HOOK: RefCell<Option<Box<dyn FnMut(&Option<KeyInput>) -> bool>>> = RefCell::new(None);
+        /// Redraw requested by the host (see request_redraw): consumed by the
+        /// main loop after a hook-consumed key so modal state changes (e.g.
+        /// a picker highlight move) repaint without waiting for the next
+        /// backend-handled key.
+        static REDRAW_REQUESTED: RefCell<bool> = RefCell::new(false);
+        /// Active single-choice list popup (title, rows, selected index),
+        /// drawn via SGR on top of everything like the info dialog. Generic
+        /// mechanism: the host supplies items/selection/keys, the toolkit
+        /// only renders. Shown by show_list_picker(), dismissed by
+        /// close_list_picker().
+        static ACTIVE_PICKER: RefCell<Option<(String, Vec<String>, usize)>> = RefCell::new(None);
         /// Commit-edit callbacks captured while inside a `with_state` call are stashed
         /// here and fired *outside* any `with_state` borrow (in the main loop) on the
         /// next iteration. The callbacks themselves call `with_state`-using adapter
@@ -749,6 +760,37 @@ mod pancurses_backend {
         if let Some(mut cb) = result {
             cb(crate::MessageBoxResult::Ok);
         }
+    }
+
+    /// Request a full redraw after the current key is processed (generic
+    /// mechanism for host key hooks: a consumed key skips default handling,
+    /// which is also what would have repainted, so the host asks explicitly).
+    pub fn request_redraw() {
+        REDRAW_REQUESTED.with(|f| *f.borrow_mut() = true);
+    }
+
+    /// Show a single-choice list popup (generic mechanism; see ACTIVE_PICKER).
+    /// `selected` is clamped to the rows. The host updates it with
+    /// [`set_list_picker_selection`] as keys arrive.
+    pub fn show_list_picker(title: &str, rows: &[String], selected: usize) {
+        let sel = if rows.is_empty() { 0 } else { selected.min(rows.len() - 1) };
+        ACTIVE_PICKER.with(|p| {
+            *p.borrow_mut() = Some((title.to_string(), rows.to_vec(), sel));
+        });
+    }
+
+    /// Move the list-popup highlight (clamped). No-op when closed.
+    pub fn set_list_picker_selection(selected: usize) {
+        ACTIVE_PICKER.with(|p| {
+            if let Some((_, rows, sel)) = p.borrow_mut().as_mut() {
+                *sel = if rows.is_empty() { 0 } else { selected.min(rows.len() - 1) };
+            }
+        });
+    }
+
+    /// Dismiss the list popup. No-op when closed.
+    pub fn close_list_picker() {
+        ACTIVE_PICKER.with(|p| *p.borrow_mut() = None);
     }
 
     /// Erase the dialog box area (spaces) so closing it does not leave stale
@@ -1207,6 +1249,64 @@ mod pancurses_backend {
                 out.push('\u{2518}');
                 emit_sgr(&out);
             }
+            // Single-choice list popup (picker) — centered box with one row
+            // per item and a highlighted selected row, on top of the dialog
+            // (a picker is always opened above any info dialog). Same box
+            // drawing and highlight convention as the menu popups.
+            // NOTE: inside redraw_frame (per-frame), not with the one-shot
+            // setup below: the popup must repaint on every navigation key.
+            if let Some((ptitle, prows, psel)) = ACTIVE_PICKER.with(|p| p.borrow().clone()) {
+                let (my, mx) = root.get_max_yx();
+                let inner_w = prows
+                    .iter()
+                    .map(|r| r.chars().count())
+                    .max()
+                    .unwrap_or(0)
+                    .max(ptitle.chars().count())
+                    + 4;
+                let bw = (inner_w + 2).min(mx.max(1) as usize) as i32;
+                let bh = (prows.len() + 2).max(3) as i32;
+                let left = ((mx - bw) / 2).max(0);
+                let top = ((my - bh) / 2).max(0);
+                let mut out = String::new();
+                for y in top..(top + bh).min(my) {
+                    out.push_str(&sgr_cup(y, left));
+                    out.push_str(SGR_RESET);
+                    out.push_str(&" ".repeat((bw as usize).min((mx - left).max(0) as usize)));
+                }
+                out.push_str(&sgr_cup(top, left));
+                out.push_str(SGR_RESET);
+                out.push('\u{250c}');
+                out.push_str(&"\u{2500}".repeat((bw - 2).max(0) as usize));
+                out.push('\u{2510}');
+                out.push_str(&sgr_cup(top, left + 1));
+                out.push_str(sgr_header_active());
+                let t: String = ptitle.chars().take((bw - 4).max(1) as usize).collect();
+                out.push_str(&t);
+                out.push_str(SGR_RESET);
+                for (i, row) in prows.iter().enumerate() {
+                    if top + 1 + i as i32 >= my - 1 {
+                        break;
+                    }
+                    out.push_str(&sgr_cup(top + 1 + i as i32, left));
+                    out.push_str(SGR_RESET);
+                    out.push('\u{2502}');
+                    out.push_str(if i == psel { sgr_row_cursor() } else { sgr_menu() });
+                    out.push_str(if i == psel { "▸ " } else { "  " });
+                    let cell: String = row.chars().take((bw - 6).max(1) as usize).collect();
+                    out.push_str(&cell);
+                    out.push_str(SGR_RESET);
+                    out.push_str(&sgr_cup(top + 1 + i as i32, left + bw - 1));
+                    out.push_str(SGR_RESET);
+                    out.push('\u{2502}');
+                }
+                out.push_str(&sgr_cup(top + bh - 1, left));
+                out.push_str(SGR_RESET);
+                out.push('\u{2514}');
+                out.push_str(&"\u{2500}".repeat((bw - 2).max(0) as usize));
+                out.push('\u{2518}');
+                emit_sgr(&out);
+            }
             };
 
             // Prompt overlay (Open/Save/Export path entry) — drawn whenever a
@@ -1251,6 +1351,9 @@ mod pancurses_backend {
                     })
                 });
                 if consumed {
+                    if REDRAW_REQUESTED.with(|f| std::mem::replace(&mut *f.borrow_mut(), false)) {
+                        redraw_frame(&mut root);
+                    }
                     continue;
                 }
 
@@ -1694,7 +1797,7 @@ mod pancurses_backend {
                                                 if let Some(n) = state.node(mid) {
                                                     if let PcWidgetKind::MenuBar { labels, .. } = &n.kind {
                                                         let lower = ac.to_ascii_lowercase();
-                                                        if let Some(pos) = labels.iter().position(|l| l.to_ascii_lowercase().starts_with(&lower.to_string())) {
+                                                        if let Some(pos) = labels.iter().position(|l| l.resolve().to_ascii_lowercase().starts_with(&lower.to_string())) {
                                                             state.active_submenu = pos;
                                                             state.menu_stack.clear();
                                                             state.active_item = 0;
@@ -2650,8 +2753,9 @@ mod pancurses_backend {
                 }
                 let mut cx = rect.x + 1;
                 for label in labels {
+                    let label = label.resolve();
                     if cx + label.len() as i32 + 2 > rect.x + rect.w { break; }
-                    root.mvaddstr(rect.y, cx, label);
+                    root.mvaddstr(rect.y, cx, &label);
                     cx += label.len() as i32 + 2;
                 }
                 if has_colors() {
@@ -3811,13 +3915,13 @@ mod pancurses_backend {
     fn menu_item_width(item: &crate::MenuItem) -> usize {
         match item {
             crate::MenuItem::Action { label, shortcut, .. } => {
-                label.len() + if shortcut.as_ref().map_or(false, |s| !s.is_empty()) { 2 } else { 0 }
+                label.resolve().len() + if shortcut.as_ref().map_or(false, |s| !s.is_empty()) { 2 } else { 0 }
             }
-            crate::MenuItem::Check { label, .. } => label.len() + 2,
-            crate::MenuItem::Radio { label, .. } => label.len() + 2,
+            crate::MenuItem::Check { label, .. } => label.resolve().len() + 2,
+            crate::MenuItem::Radio { label, .. } => label.resolve().len() + 2,
             crate::MenuItem::Separator => 1,
             crate::MenuItem::Submenu { label, shortcut, .. } => {
-                label.len() + 2 + if shortcut.as_ref().map_or(false, |s| !s.is_empty()) { 2 } else { 0 }
+                label.resolve().len() + 2 + if shortcut.as_ref().map_or(false, |s| !s.is_empty()) { 2 } else { 0 }
             }
         }
     }
@@ -3828,22 +3932,26 @@ mod pancurses_backend {
     fn menu_item_label(item: &crate::MenuItem) -> String {
         match item {
             crate::MenuItem::Action { label, shortcut, .. } => {
+                let label = label.resolve();
                 if let Some(sc) = shortcut {
-                    if !sc.is_empty() { format!("{sc}\u{00b7}{label}") } else { label.clone() }
+                    if !sc.is_empty() { format!("{sc}\u{00b7}{label}") } else { label }
                 } else {
-                    label.clone()
+                    label
                 }
             }
             crate::MenuItem::Check { label, action, checked } => {
+                let label = label.resolve();
                 let checked = action_state(action).map(|(_, c)| c).unwrap_or(*checked);
                 if checked { format!("\u{2713} {label}") } else { format!("  {label}") }
             }
             crate::MenuItem::Radio { label, action, .. } => {
+                let label = label.resolve();
                 let checked = action_state(action).map(|(_, c)| c).unwrap_or(false);
                 if checked { format!("\u{25cf} {label}") } else { format!("  {label}") }
             }
             crate::MenuItem::Separator => "\u{2500}".repeat(8),
             crate::MenuItem::Submenu { label, shortcut, .. } => {
+                let label = label.resolve();
                 if let Some(sc) = shortcut {
                     if !sc.is_empty() { format!("{sc}\u{00b7}{label} \u{25b6}") } else { format!("{label} \u{25b6}") }
                 } else {
@@ -3868,7 +3976,7 @@ mod pancurses_backend {
             // separator, so the popup x is 1 + Σ(len+4) — derived from the bar
             // layout (matching ratatui's menu_bar_x) instead of adhoc columns.
             for i in 0..state.active_submenu {
-                mx += labels[i].len() as i32 + 4;
+                mx += labels[i].resolve().len() as i32 + 4;
             }
             let (mut py, mut px) = (dy, mx);
             let mut cur = &submenu_items[state.active_submenu].1;
@@ -3907,7 +4015,7 @@ mod pancurses_backend {
         if let Some(n) = state.node(mid) {
             if let PcWidgetKind::MenuBar { labels, .. } = &n.kind {
                 if state.active_submenu < labels.len() {
-                    return labels[state.active_submenu].clone();
+                    return labels[state.active_submenu].resolve();
                 }
             }
         }
@@ -3935,16 +4043,17 @@ mod pancurses_backend {
             };
             let mut s = String::from(" ");
             for (i, l) in labels.iter().enumerate() {
+                let l = l.resolve();
                 if i > 0 {
                     s.push_str("  ");
                 }
                 if i == active {
                     s.push('[');
-                    s.push_str(l);
+                    s.push_str(&l);
                     s.push(']');
                 } else {
                     s.push(' ');
-                    s.push_str(l);
+                    s.push_str(&l);
                     s.push(' ');
                 }
             }
@@ -4378,8 +4487,8 @@ mod pancurses_backend {
         Ok(with_state(|s| s.add_node(PcWidgetKind::SimpleAction, find_window_id(s))))
     }
 
-    pub unsafe fn create_menubar(submenu_items: Vec<(String, Vec<crate::MenuItem>)>, _action_group: *mut c_void) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-        let labels: Vec<String> = submenu_items.iter().map(|(l, _)| l.clone()).collect();
+    pub unsafe fn create_menubar(submenu_items: Vec<(crate::Label, Vec<crate::MenuItem>)>, _action_group: *mut c_void) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        let labels: Vec<crate::Label> = submenu_items.iter().map(|(l, _)| l.clone()).collect();
         Ok(with_state(|s| s.add_node(PcWidgetKind::MenuBar { labels, submenu_items }, find_window_id(s))))
     }
 
@@ -4742,6 +4851,20 @@ mod pancurses_backend {
                 }
             }
         });
+    }
+
+    /// Read back a spreadsheet's edit state (generic mechanism for hosts
+    /// that splice text into an in-progress edit, e.g. a picker commit).
+    /// Returns (editing, buffer, byte position); missing widget → default.
+    pub fn spreadsheet_get_edit_state(id: usize) -> (bool, String, usize) {
+        with_state(|s| {
+            if let Some(n) = s.node(id) {
+                if let PcWidgetKind::Spreadsheet { ref grid, .. } = n.kind {
+                    return (grid.editing, grid.edit_buf.clone(), grid.edit_pos);
+                }
+            }
+            (false, String::new(), 0)
+        })
     }
 
     pub fn spreadsheet_commit_formula_bar(spreadsheet_id: usize) {
@@ -5889,6 +6012,31 @@ mod pancurses_backend {
 
             let pos = spreadsheet_cursor_position(sid);
             assert_eq!(pos, Some((0, 0)), "cursor should remain at (0, 0)");
+        }
+
+        /// A keyed menu label renders as its key until a translator is
+        /// installed, then renders the translated text — and translation never
+        /// changes the action string that dispatch/parity depends on.
+        #[test]
+        fn menu_keyed_label_translates_without_changing_action() {
+            let item = crate::MenuItem::Action {
+                label: crate::Label::Key("test.menu.open"),
+                action: "open".into(),
+                shortcut: None,
+            };
+            // Identity translator (default): key renders verbatim.
+            assert_eq!(menu_item_label(&item), "test.menu.open");
+
+            crate::set_translator(|k| {
+                if k == "test.menu.open" { "Öffnen".to_string() } else { k.to_string() }
+            });
+            assert_eq!(menu_item_label(&item), "Öffnen");
+
+            // The action string is the contract; translation must not touch it.
+            match &item {
+                crate::MenuItem::Action { action, .. } => assert_eq!(action, "open"),
+                _ => panic!("expected action"),
+            }
         }
 
         /// Moving cursor and committing advances cursor.

@@ -142,6 +142,7 @@ pub type GdkDisplaySync = unsafe extern "C" fn(display: *mut c_void);
 // Dialog
 pub type GtkDialogNew = unsafe extern "C" fn() -> *mut c_void;
 pub type GtkDialogAddButton = unsafe extern "C" fn(dialog: *mut c_void, button_text: *const i8, response_id: i32) -> *mut c_void;
+pub type GtkDialogSetDefaultResponse = unsafe extern "C" fn(dialog: *mut c_void, response_id: i32);
 pub type GtkDialogGetContentArea = unsafe extern "C" fn(dialog: *mut c_void) -> *mut c_void;
 pub type GtkDialogRun = unsafe extern "C" fn(dialog: *mut c_void) -> i32;
 // Dropdown - GTK3 ComboBoxText
@@ -167,6 +168,9 @@ pub type GtkToggleButtonSetActive = unsafe extern "C" fn(toggle_button: *mut c_v
 
 // RadioButton
 pub type GtkRadioButtonNewWithLabel = unsafe extern "C" fn(group: *mut c_void, label: *const i8) -> *mut c_void;
+// Returns the GSList* group of a radio button (NOT a widget pointer: passing
+// a widget as the ctor's `group` arg segfaults inside GTK).
+pub type GtkRadioButtonGetGroup = unsafe extern "C" fn(widget: *mut c_void) -> *mut c_void;
 
 // TextView / TextArea
 pub type GtkTextViewNew = unsafe extern "C" fn() -> *mut c_void;
@@ -382,6 +386,7 @@ pub struct Symbols {
     pub gtk_init: Option<GtkInit>,
     pub g_signal_emit_by_name: Option<GSignalEmitByName>,
     pub g_idle_add: Option<unsafe extern "C" fn(func: Option<unsafe extern "C" fn(*mut c_void) -> i32>, data: *mut c_void) -> u32>,
+    pub g_timeout_add: Option<unsafe extern "C" fn(interval_ms: u32, func: Option<unsafe extern "C" fn(*mut c_void) -> i32>, data: *mut c_void) -> u32>,
     // pango (optional)
     pub pango_layout_new: Option<unsafe extern "C" fn(context: *mut c_void) -> *mut c_void>,
     pub pango_layout_set_text: Option<unsafe extern "C" fn(layout: *mut c_void, text: *const i8, len: i32)>,
@@ -438,6 +443,7 @@ pub struct Symbols {
     // Dialog
     pub gtk_dialog_new: Option<GtkDialogNew>,
     pub gtk_dialog_add_button: Option<GtkDialogAddButton>,
+    pub gtk_dialog_set_default_response: Option<GtkDialogSetDefaultResponse>,
     pub gtk_dialog_get_content_area: Option<GtkDialogGetContentArea>,
     pub gtk_dialog_run: Option<GtkDialogRun>,
 
@@ -464,6 +470,7 @@ pub struct Symbols {
 
     // RadioButton
     pub gtk_radio_button_new_with_label: Option<GtkRadioButtonNewWithLabel>,
+    pub gtk_radio_button_get_group: Option<GtkRadioButtonGetGroup>,
 
     // TextView / TextArea
     pub gtk_text_view_new: Option<GtkTextViewNew>,
@@ -649,6 +656,7 @@ impl Symbols {
         let gtk_init = unsafe { sym::<GtkInit>(gtk, "gtk_init") };
         let g_signal_emit_by_name = unsafe { sym::<GSignalEmitByName>(gobject, "g_signal_emit_by_name") };
         let g_idle_add = unsafe { sym::<unsafe extern "C" fn(func: Option<unsafe extern "C" fn(*mut c_void) -> i32>, data: *mut c_void) -> u32>(glib, "g_idle_add") };
+        let g_timeout_add = unsafe { sym::<unsafe extern "C" fn(interval_ms: u32, func: Option<unsafe extern "C" fn(*mut c_void) -> i32>, data: *mut c_void) -> u32>(glib, "g_timeout_add") };
         // pango symbols are optional; we try to resolve them from the gtk lib too (some symbols may be available)
         let pango_layout_new = None;
         let pango_layout_set_text = None;
@@ -748,6 +756,7 @@ impl Symbols {
         // Dialog
         let gtk_dialog_new = unsafe { sym::<GtkDialogNew>(gtk, "gtk_dialog_new") };
         let gtk_dialog_add_button = unsafe { sym::<GtkDialogAddButton>(gtk, "gtk_dialog_add_button") };
+        let gtk_dialog_set_default_response = unsafe { sym::<GtkDialogSetDefaultResponse>(gtk, "gtk_dialog_set_default_response") };
         let gtk_dialog_get_content_area = unsafe { sym::<GtkDialogGetContentArea>(gtk, "gtk_dialog_get_content_area") };
         let gtk_dialog_run = unsafe { sym::<GtkDialogRun>(gtk, "gtk_dialog_run") };
 
@@ -774,6 +783,7 @@ impl Symbols {
 
         // RadioButton
         let gtk_radio_button_new_with_label = unsafe { sym::<GtkRadioButtonNewWithLabel>(gtk, "gtk_radio_button_new_with_label") };
+        let gtk_radio_button_get_group = unsafe { sym::<GtkRadioButtonGetGroup>(gtk, "gtk_radio_button_get_group") };
 
         // TextView / TextArea
         let gtk_text_view_new = unsafe { sym::<GtkTextViewNew>(gtk, "gtk_text_view_new") };
@@ -853,7 +863,7 @@ impl Symbols {
             gtk_label_get_text,
             gtk_entry_set_editable,
             gtk_drawing_area_new,
-            g_idle_add,
+            g_idle_add, g_timeout_add,
             pango_layout_new, pango_layout_set_text, pango_layout_get_size,
             cairo_create, cairo_font_face_destroy,
             cairo_move_to, cairo_set_source_rgb, cairo_set_source_rgba, cairo_rectangle, cairo_fill, cairo_stroke, cairo_set_line_width, cairo_select_font_face, cairo_set_font_size, cairo_show_text,
@@ -885,11 +895,11 @@ impl Symbols {
             gtk_scrolled_window_get_vadjustment,
             gtk_scrolled_window_get_hadjustment,
             gtk_adjustment_get_value, gtk_adjustment_configure,
-            gtk_dialog_new, gtk_dialog_add_button, gtk_dialog_get_content_area, gtk_dialog_run,
+            gtk_dialog_new, gtk_dialog_add_button, gtk_dialog_set_default_response, gtk_dialog_get_content_area, gtk_dialog_run,
             gtk_combo_box_text_new, gtk_combo_box_text_append_text, gtk_combo_box_text_get_active_text, gtk_combo_box_set_active, gtk_combo_box_get_active,
             gtk_drop_down_new, gtk_drop_down_set_selected, gtk_drop_down_get_selected, gtk_string_list_new,
             gtk_check_button_new_with_label, gtk_check_button_get_active, gtk_check_button_set_active, gtk_check_button_set_group, gtk_toggle_button_get_active, gtk_toggle_button_set_active,
-            gtk_radio_button_new_with_label,
+            gtk_radio_button_new_with_label, gtk_radio_button_get_group,
             gtk_text_view_new, gtk_text_buffer_new, gtk_text_view_get_buffer, gtk_text_buffer_set_text, gtk_text_buffer_get_text, gtk_text_buffer_get_start_iter, gtk_text_buffer_get_end_iter, gtk_text_iter_copy, gtk_text_iter_free, gtk_text_view_set_wrap_mode,
             gtk_widget_set_hexpand, gtk_widget_set_vexpand,
             gtk_widget_get_hexpand, gtk_widget_get_vexpand,

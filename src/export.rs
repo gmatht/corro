@@ -1,7 +1,7 @@
 //! TSV and CSV export for the main data region.
 
 use crate::formula;
-use crate::grid::{CellAddr, ColumnAddr, GridBox as Grid, FOOTER_ROWS, HEADER_ROWS, MARGIN_COLS};
+use crate::grid::{CellAddr, ColumnAddr, GridBox as Grid, GridContentSummary, FOOTER_ROWS, HEADER_ROWS, MARGIN_COLS};
 use std::collections::HashSet;
 use std::io::Write;
 use zip::write::FileOptions;
@@ -1085,7 +1085,18 @@ fn delimited_table_col_span_and_rows(
     } else {
         (lm, lm + mc)
     };
-    let main_spans = main_row_index_bounds_for_export(grid);
+    // One occupancy summary shared by the bounds, the row order and the
+    // row filter below (ALGORITHMS.md §9.3.3).
+
+    // Occupancy sets, computed once from the grid index instead of re-scanning
+    // every stored cell per row (ALGORITHMS.md §2.4). Membership below is the
+    // same predicate the per-row scans evaluated.
+    let summary = grid.content_summary();
+    let main_spans = main_row_index_bounds_for_export(&summary);
+    let header_set: HashSet<u32> = summary.header_rows.iter().copied().collect();
+    let main_right_set: HashSet<usize> =
+        summary.main_rows_main_right.iter().copied().collect();
+    let footer_set: HashSet<u32> = summary.footer_rows.iter().copied().collect();
 
     // For delimited export we prefer rows that matter to the main data block and
     // file consumers: header rows, main rows that have main/right content, and
@@ -1094,40 +1105,18 @@ fn delimited_table_col_span_and_rows(
     // out here while still preserving contiguous main ranges when `main_spans`
     // forces them to exist.
     let mut rows: Vec<usize> = Vec::new();
-    for r in row_order(grid, total_rows) {
-        let mut include = false;
-        if r < hr {
-            // header band: include if any header cell exists for this logical row
-            for (addr, _) in grid.iter_nonempty() {
-                match addr {
-                    CellAddr::Header { row, .. } if row as usize == r => {
-                        include = true;
-                        break;
-                    }
-                    _ => {}
-                }
-            }
+    for r in row_order(grid, &summary, total_rows) {
+        let include = if r < hr {
+            // header band: row_order only emits header rows that have cells.
+            header_set.contains(&(r as u32))
         } else if r < hr + mr {
             // main band: include if any Main or Right cell exists for this main row
-            let main_row = (r - hr) as u32;
-            for (addr, _) in grid.iter_nonempty() {
-                match addr {
-                    CellAddr::Main { row, .. } if row == main_row => {
-                        include = true;
-                        break;
-                    }
-                    CellAddr::Right { row, .. } if row == main_row => {
-                        include = true;
-                        break;
-                    }
-                    _ => {}
-                }
-            }
+            let main_row = r - hr;
+            let mut include = main_right_set.contains(&main_row);
             // If not present but the main spans force inclusion, include it.
             if !include {
                 if let Some((mmin, mmax)) = main_spans {
-                    let mr_idx = r - hr;
-                    if mr_idx >= mmin && mr_idx <= mmax {
+                    if main_row >= mmin && main_row <= mmax {
                         include = true;
                     }
                 }
@@ -1139,25 +1128,18 @@ fn delimited_table_col_span_and_rows(
             if !include {
                 let left_raw = grid.text(&CellAddr::Left {
                     col: MARGIN_COLS - 1,
-                    row: main_row,
+                    row: main_row as u32,
                 });
                 if crate::ods::subtotal_code_for_label(&left_raw).is_some() {
                     include = true;
                 }
             }
+            include
         } else {
-            // footer band: include if any Footer cell exists for this footer row
+            // footer band: row_order only emits footer rows that have cells.
             let fr_idx = (r - hr - mr) as u32;
-            for (addr, _) in grid.iter_nonempty() {
-                match addr {
-                    CellAddr::Footer { row, .. } if row == fr_idx => {
-                        include = true;
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-        }
+            footer_set.contains(&fr_idx)
+        };
         if include {
             rows.push(r);
         }
@@ -1362,9 +1344,35 @@ fn odt_escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
+/// Column span for ODT tables (ALGORITHMS.md §2.4, item 10): the trimmed
+/// content span from `ascii_col_bounds` — the same rule every other export
+/// uses — expanded to cover spill followers. Spills render values through
+/// `get` but are not stored content, so without the expansion a spill-only
+/// trailing column would be silently dropped. Bounds mirror the old full
+/// `0..total_cols` loop: columns stay globally numbered (`co{global}`) and
+/// an empty grid still emits one (possibly past-the-end, empty) column.
+fn odt_col_span(grid: &Grid) -> (usize, usize) {
+    let tc = grid.total_cols();
+    let (mut start, mut end) = ascii_col_bounds(grid);
+    let mc = grid.main_cols();
+    for (addr, _) in grid.spill_followers() {
+        let gc = addr.to_global_col(mc);
+        // The old loop rendered `0..tc`; never widen past what it showed.
+        if gc >= tc {
+            continue;
+        }
+        if gc < start {
+            start = gc;
+        }
+        if gc + 1 > end {
+            end = gc + 1;
+        }
+    }
+    (start, end.max(start + 1))
+}
+
 fn odt_content_xml(grid: &Grid) -> String {
     let mr = grid.main_rows();
-    let tc = grid.total_cols();
     let total_rows = HEADER_ROWS + mr + FOOTER_ROWS;
 
     let mut s = String::from(
@@ -1372,16 +1380,18 @@ fn odt_content_xml(grid: &Grid) -> String {
 <office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" office:version="1.2"><office:body><office:text><table:table>"#,
     );
 
-    for c in 0..tc {
+    let (col_start, col_end) = odt_col_span(grid);
+    for c in col_start..col_end {
         s.push_str(&format!(
             r#"<table:table-column table:number-columns-repeated="1" table:style-name="co{}"/>"#,
             c
         ));
     }
 
-    for r in row_order(grid, total_rows) {
+    let odt_summary = grid.content_summary();
+    for r in row_order(grid, &odt_summary, total_rows) {
         s.push_str("<table:table-row>");
-        for c in 0..tc {
+        for c in col_start..col_end {
             let val = odt_escape(&cell_value_at(grid, r, c));
             let text = if val.is_empty() {
                 String::new()
@@ -1404,7 +1414,7 @@ fn ascii_row_bounds(grid: &Grid) -> (usize, usize) {
     let hr = HEADER_ROWS;
     let mr = grid.main_rows();
     let fr = FOOTER_ROWS;
-    let rows = row_order(grid, hr + mr + fr);
+    let rows = row_order(grid, &grid.content_summary(), hr + mr + fr);
     match (rows.first().copied(), rows.last().copied()) {
         (Some(start), Some(end)) => (start, end + 1),
         _ => (hr, hr + 1),
@@ -1435,58 +1445,36 @@ fn odt_manifest_xml() -> String {
 }
 
 /// Min/max main **row** indices (0-based) with any main/margin content.
-fn main_row_index_bounds_for_export(grid: &Grid) -> Option<(usize, usize)> {
-    let mut set = HashSet::new();
-    for (addr, _) in grid.iter_nonempty() {
-        match addr {
-            // Only consider main-block and right-margin cells when deciding the
-            // contiguous main-row span for exports. Left-margin-only entries are
-            // labels/annotations and should not by themselves extend the exported
-            // main-row range (they remain visible in exported rows when paired
-            // with main/right content via the filter below).
-            CellAddr::Main { row, .. } | CellAddr::Right { row, .. } => {
-                set.insert(row as usize);
-            }
-            _ => {}
-        }
-    }
-    if set.is_empty() {
+fn main_row_index_bounds_for_export(summary: &GridContentSummary) -> Option<(usize, usize)> {
+    // Only consider main-block and right-margin cells when deciding the
+    // contiguous main-row span for exports. Left-margin-only entries are
+    // labels/annotations and should not by themselves extend the exported
+    // main-row range (they remain visible in exported rows when paired
+    // with main/right content via the filter below).
+    let rows = &summary.main_rows_main_right;
+    if rows.is_empty() {
         None
     } else {
-        Some((*set.iter().min().unwrap(), *set.iter().max().unwrap()))
+        Some((rows[0], rows[rows.len() - 1]))
     }
 }
 
-fn row_order(grid: &Grid, _total_rows: usize) -> Vec<usize> {
+fn row_order(grid: &Grid, summary: &GridContentSummary, _total_rows: usize) -> Vec<usize> {
     let hr = HEADER_ROWS;
     let mr = grid.main_rows();
-    let mut header_rows = Vec::new();
-    let mut main_rows = HashSet::new();
-    let mut footer_rows = Vec::new();
-
-    for (addr, _) in grid.iter_nonempty() {
-        match addr {
-            CellAddr::Header { row, .. } => header_rows.push(row as usize),
-            CellAddr::Footer { row, .. } => footer_rows.push(hr + mr + row as usize),
-            CellAddr::Main { row, .. }
-            | CellAddr::Left { row, .. }
-            | CellAddr::Right { row, .. } => {
-                main_rows.insert(row as usize);
-            }
-        }
-    }
-
-    header_rows.sort_unstable();
-    header_rows.dedup();
-    footer_rows.sort_unstable();
-    footer_rows.dedup();
+    let header_rows: Vec<usize> = summary.header_rows.iter().map(|&r| r as usize).collect();
+    let footer_rows: Vec<usize> = summary
+        .footer_rows
+        .iter()
+        .map(|&r| hr + mr + r as usize)
+        .collect();
 
     let mut rows = header_rows;
     // Contiguous main row indices: include "gap" main rows (no cells yet) so export matches
     // a sheet that shows row numbers through empty interstitial rows.
-    if !main_rows.is_empty() {
-        let mmin = *main_rows.iter().min().unwrap();
-        let mmax = *main_rows.iter().max().unwrap();
+    if !summary.main_rows_all.is_empty() {
+        let mmin = summary.main_rows_all[0];
+        let mmax = summary.main_rows_all[summary.main_rows_all.len() - 1];
         rows.extend((mmin..=mmax).map(|r| hr + r));
     }
     rows.extend(footer_rows);
@@ -1549,6 +1537,118 @@ pub fn export_sorted_tsv(grid: &Grid, out: &mut dyn Write, sort_cols: &[usize]) 
 mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
+
+    fn odt_rows(xml: &str) -> Vec<usize> {
+        // Cell count per emitted table row.
+        xml.split("<table:table-row>")
+            .skip(1)
+            .map(|row| row.matches("<table:table-cell").count())
+            .collect()
+    }
+
+    fn odt_column_styles(xml: &str) -> Vec<usize> {
+        // Global column numbers from `style-name="co{N}"`.
+        let mut out = Vec::new();
+        for part in xml.split("style-name=\"co").skip(1) {
+            let digits: String = part.chars().take_while(|c| c.is_ascii_digit()).collect();
+            out.push(digits.parse().unwrap());
+        }
+        out
+    }
+
+    #[test]
+    fn odt_emits_content_span_not_full_margins() {
+        let mut g = crate::grid::Grid::new(2, 2);
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "a".into());
+        g.set(&CellAddr::Main { row: 1, col: 1 }, "b".into());
+        g.set(
+            &CellAddr::Header {
+                row: (HEADER_ROWS - 1) as u32,
+                col: ColumnAddr::Main(0),
+            },
+            "H".into(),
+        );
+        let gb = crate::grid::GridBox::from(g);
+        let xml = odt_content_xml(&gb);
+        let (start, end) = odt_col_span(&gb);
+        // Content lives in main cols 0..2: globals MARGIN_COLS..MARGIN_COLS+2.
+        assert_eq!((start, end), (MARGIN_COLS, MARGIN_COLS + 2));
+        // Every row has exactly the span width; style names stay global.
+        let rows = odt_rows(&xml);
+        assert!(!rows.is_empty());
+        assert!(rows.iter().all(|&n| n == end - start), "{rows:?}");
+        assert_eq!(odt_column_styles(&xml), vec![MARGIN_COLS, MARGIN_COLS + 1]);
+        // Rendered values are present; empty margin ocean is gone.
+        assert!(xml.contains(">a<"));
+        assert!(xml.contains(">b<"));
+        assert!(xml.contains(">H<"));
+        assert!(!xml.contains(&format!("style-name=\"co{}\"", MARGIN_COLS + 2)));
+    }
+
+    #[test]
+    fn odt_keeps_spill_only_trailing_column() {
+        let mut g = crate::grid::Grid::new(3, 2);
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "v".into());
+        g.set_spill_value(CellAddr::Main { row: 0, col: 1 }, "9".into());
+        let gb = crate::grid::GridBox::from(g);
+        let xml = odt_content_xml(&gb);
+        let (start, end) = odt_col_span(&gb);
+        assert_eq!((start, end), (MARGIN_COLS, MARGIN_COLS + 2));
+        assert!(xml.contains(">9<"));
+    }
+
+    #[test]
+    fn threaded_row_helpers_match_hand_computed_order() {
+        // Mixed grid: header, main rows 0 and 2 (gap at 1), a left-only
+        // row 3, and a footer. Pins gap-fill, left-only span membership,
+        // and Main|Right-only bounds through the threaded summary.
+        let mut g = crate::grid::Grid::new(5, 3);
+        g.set(
+            &CellAddr::Header {
+                row: (HEADER_ROWS - 1) as u32,
+                col: ColumnAddr::Main(0),
+            },
+            "H".into(),
+        );
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "a".into());
+        g.set(&CellAddr::Main { row: 2, col: 1 }, "b".into());
+        g.set(
+            &CellAddr::Left {
+                col: MARGIN_COLS - 1,
+                row: 3,
+            },
+            "lbl".into(),
+        );
+        g.set(
+            &CellAddr::Footer {
+                row: 0,
+                col: ColumnAddr::Main(0),
+            },
+            "F".into(),
+        );
+        let gb = crate::grid::GridBox::from(g);
+        let summary = gb.content_summary();
+        // Bounds exclude the left-only row 3.
+        assert_eq!(main_row_index_bounds_for_export(&summary), Some((0, 2)));
+        // Row order fills the gap (hr+1) and spans through the left-only
+        // row (hr+3); footer sits past the 5-row extent.
+        let hr = HEADER_ROWS;
+        assert_eq!(
+            row_order(&gb, &summary, 0),
+            vec![hr - 1, hr, hr + 1, hr + 2, hr + 3, hr + 5]
+        );
+    }
+
+    #[test]
+    fn odt_empty_grid_stays_valid() {
+        let gb = crate::grid::GridBox::from(crate::grid::Grid::new(1, 1));
+        let xml = odt_content_xml(&gb);
+        // Exactly one (empty) column: table stays non-degenerate.
+        assert_eq!(odt_column_styles(&xml).len(), 1);
+        for n in odt_rows(&xml) {
+            assert_eq!(n, 1);
+        }
+    }
 
     fn load_fixture(path: &Path) -> crate::ops::WorkbookState {
         let data = std::fs::read_to_string(path).unwrap();

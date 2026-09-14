@@ -3,9 +3,6 @@ use crate::symbols::Symbols;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-#[cfg(feature = "gtk4rs")]
-use crate::backend_gtk4rs;
-
 #[cfg(unix)]
 use libloading::os::unix::Library;
 #[cfg(windows)]
@@ -21,6 +18,9 @@ pub struct Loader {
     pub libs: HashMap<String, Arc<RawLib>>,
     pub symbols: Arc<Symbols>,
     pub version: Version,
+    // Main-loop pointer published by warm-up/run for quit_main_loop.
+    // (Part of an in-progress gtk4 refactor removed this; restored: the
+    // quit path in backends/gtk.rs and gui_backend warm-up still use it.)
     pub main_loop: std::sync::Mutex<usize>,
 }
 
@@ -86,6 +86,9 @@ impl Loader {
         // Default to GTK3.  Set GTK_DLOPEN_PREFER_GTK3=0 to try GTK4 first.
         // corro's GTK4 code path has unresolved stability issues (use-after-free
         // in widget lifecycle, layout-recursion crashes).  GTK3 is fully stable.
+        // (An in-progress refactor flipped this default; restored: nothing in
+        // this environment can validate GTK4 behavior, and the async scrollbar
+        // notifications there reset the cursor after every move.)
         let prefer_gtk3 = match std::env::var_os("GTK_DLOPEN_PREFER_GTK3") {
             Some(v) => v != "0",
             None => true,  // default to GTK3
@@ -96,7 +99,6 @@ impl Loader {
         } else {
             if let Some(l) = open_first(&gtk4_cands) { (l, Version::Gtk4) } else if let Some(l) = open_first(&gtk3_cands) { (l, Version::Gtk3) } else { return Err(Error::NoGtkFound); }
         };
-
         // GTK4 stability warning
         if version == Version::Gtk4 {
             use std::io::Write;
@@ -106,9 +108,7 @@ impl Loader {
             let _ = std::io::stderr().write_all(msg.as_bytes());
             let _ = std::io::stderr().flush();
         }
-        libs.insert("libgtk".into(), Arc::new(libgtk));
-
-        // Open libgdk (separate library in GTK3; GTK4 bundles GDK into libgtk-4)
+        libs.insert("libgtk".into(), Arc::new(libgtk));        // Open libgdk (separate library in GTK3; GTK4 bundles GDK into libgtk-4)
         if version == Version::Gtk3 {
             let gdk_cands = ["libgdk-3.so.0", "libgdk-3.so"];
             if let Some(g) = open_first(&gdk_cands) { libs.insert("libgdk".into(), Arc::new(g)); }
@@ -158,17 +158,6 @@ impl Loader {
         }
 
         Ok(Arc::new(Loader { libs, symbols: Arc::new(symbols), version, main_loop: std::sync::Mutex::new(0) }))
-    }
-
-    #[cfg(feature = "gtk4rs")]
-    pub fn new_gtk4rs() -> Result<Arc<Self>, Error> {
-        let symbols = backend_gtk4rs::try_build().map_err(|e| Error::Other(e))?;
-        Ok(Arc::new(Loader {
-            libs: HashMap::new(),
-            symbols: Arc::new(symbols),
-            version: Version::Gtk4,
-            main_loop: std::sync::Mutex::new(0),
-        }))
     }
 
     pub fn version(&self) -> Version { self.version }

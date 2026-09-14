@@ -339,7 +339,10 @@ pub fn menu_bar() -> Vec<MenuAction> {
         "Time"          => InsertTime (":"),
         "Hyperlink"     => InsertHyperlink ("H"),
     ],
-    "Format" => [
+    // Root shortcut R (FoRmat): disambiguates File &F vs Format &F so Alt+F
+    // uniquely opens File on every backend. R is free at every layer
+    // (Alt+O stays File→Open; see the Alt block in ui and the pnc callback).
+    "Format" => ("R") [
         "Scope"  => ("S") [
             "All"        => FormatApplyAll ("A"),
             "Full col"   => FormatApplyFullColumn ("F"),

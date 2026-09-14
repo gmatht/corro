@@ -1,6 +1,7 @@
 fn main() {
     #[cfg(target_arch = "wasm32")]
     return wasm_main();
+    #[cfg(not(target_arch = "wasm32"))]
     println!("skipped (requires wasm32 target)");
 }
 
