@@ -188,7 +188,16 @@ struct GuiState {
     canvas: Canvas,
     formula_entry: Entry,
     addr_label: Label,
-    status_label: Label,
+    /// Bottom strip: the shared hints line (ratatui parity — ratatui's
+    /// bottom row always shows hints, never status). Renamed from
+    /// status_label when status moved to the formula row.
+    hints_label: Label,
+    /// Formula-row `· status` suffix (ratatui parity): a SEPARATE label
+    /// after the entry, never entry text, so status can never leak into
+    /// the edit buffer. Visible only when status is non-empty and no
+    /// edit/dialog owns the formula row (ratatui's Edit/input arms show
+    /// the buffer with no status span).
+    formula_status: Label,
     editing: Cell<bool>,
     edit_buf: RefCell<String>,
     mode: Cell<GuiMode>,
@@ -1069,6 +1078,14 @@ fn handle_key(keyval: u32, state_rc: &Rc<GuiState>, mods: u32) -> bool {
                     return handle_edit_key(key, state);
                 }
             }
+            // Focus can drift off the entry (setup grab_focus races
+            // present()'s pump): a window-observed Return with a non-empty
+            // buffer is a commit, not navigation — the entry's CAPTURE
+            // intercept only fires when focused. Ratatui parity: Edit +
+            // Return commits; bare Return with an empty buffer still moves.
+            if state.editing.get() && !state.edit_buf.borrow().is_empty() {
+                return handle_edit_key(key, state);
+            }
             log_key_action(keyval, "move_cursor_down", &format!("cell={}", format_cell(state)));
             move_cursor(state, 1, 0);
             true
@@ -1368,6 +1385,11 @@ fn commit_edit(state: &GuiState) {
         }
         app.core.status = format!("Set cell {}", crate::addr::cell_ref_text(&addr, app.core.workbook.active_sheet().grid.main_cols()));
         recompute_viewport(state);
+        // Refresh chrome here, not just the canvas: commits arriving via
+        // the window key path (unfocused Return) otherwise leave the
+        // formula row and hints showing pre-commit text until the next
+        // cursor event. Idempotent for paths that refresh separately.
+        update_formula_bar(state, state.last_row.get(), state.last_col.get());
     }
     state.edit_buf.borrow_mut().clear();
     state.canvas.queue_redraw();
@@ -1855,10 +1877,42 @@ fn update_formula_bar(state: &GuiState, row: usize, col: usize) {
     if !state.editing.get() {
         state.formula_entry.set_text(&val);
     }
-    state.status_label.set_text(&app.core.status);
-    if state.status_label.raw_handle().is_null() {
-        // status label will be updated; no-op
+    sync_chrome_labels(state);
+}
+
+/// Push ratatui-parity chrome labels: bottom strip always shows the shared
+/// hints line; the formula row shows `· status` trailing only when status
+/// is non-empty and no edit/dialog owns the row. The edit gate is the
+/// BUFFER, not the `editing` flag: the GUI idles with `editing=true`
+/// (entry focused, ready to type — its type-first design), so gating on
+/// the flag would hide every at-rest status. A non-empty buffer means a
+/// genuine in-progress edit (ratatui's Edit arm shows the buffer with no
+/// status span); Help mode hides it like ratatui's About arm. Plain text
+/// on every backend (no markup: nwg/wasm render markup tags literally,
+/// so shared code must not emit any — the DarkGray hint tint stays
+/// terminal-only).
+fn sync_chrome_labels(state: &GuiState) {
+    let app = state.app_ref();
+    // Same text as the ratatui bottom row (never status).
+    state.hints_label.set_text(&crate::core::state::normal_hints(
+        app.core.anchor.is_some(),
+        !app.core.op_history.is_empty(),
+        !app.core.redo_history.is_empty(),
+        app.core.path.is_some(),
+    ));
+    let show = state.edit_buf.borrow().is_empty()
+        && matches!(state.mode.get(), GuiMode::Normal)
+        && !app.core.status.is_empty();
+    if show {
+        state
+            .formula_status
+            .set_text(&format!("   ·  {}", app.core.status));
+    } else {
+        // Clear as well as hide: a backend that still measures hidden
+        // children must allocate nothing for the suffix.
+        state.formula_status.set_text("");
     }
+    state.formula_status.set_visible(show);
 }
 
 // ---------------------------------------------------------------------------
@@ -2255,10 +2309,10 @@ fn handle_menu_action(name: &str, state: &Rc<GuiState>) {
     // Refresh the formula bar — unless an Edit{value} action just preset an
     // edit buffer (Insert Date/Time). update_formula_bar copies the grid cell
     // into the entry widget, which would wipe the preset (and the entry's
-    // change handler could then eat edit_buf too). The status label still
-    // needs the new status text.
+    // change handler could then eat edit_buf too). The chrome labels
+    // (hints + formula status suffix) still need the new text.
     if state.editing.get() {
-        state.status_label.set_text(&state.app_ref().core.status);
+        sync_chrome_labels(state);
     } else {
         update_formula_bar(state, state.last_row.get(), state.last_col.get());
     }
@@ -2332,6 +2386,9 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     formula_bar.append(&f_label);
     formula_bar.append(&formula_entry);
     formula_bar.set_child_hexpand(&formula_entry, true);
+    let formula_status = rxapp.new_label("")?;
+    formula_status.set_visible(false);
+    formula_bar.append(&formula_status);
 
     // Canvas inside native scrollbars: the thumb tracks the viewport and
     // scrollbar interaction moves the cursor (selection), so the selected
@@ -2347,8 +2404,8 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     scrolled.set_child(&canvas);
     scrolled.set_vexpand(true);
 
-    // Status label
-    let status_label = rxapp.new_label("Ready")?;
+    // Bottom strip: the shared hints line (ratatui parity).
+    let hints_label = rxapp.new_label("Ready")?;
 
     // Sheet tab strip (below the grid): one tab per sheet once the workbook
     // has 2+ sheets. Hidden until then — the first New sheet creates the
@@ -2365,7 +2422,8 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         canvas: canvas.clone(),
         formula_entry: formula_entry.clone(),
         addr_label: addr_label.clone(),
-        status_label: status_label.clone(),
+        hints_label: hints_label.clone(),
+        formula_status: formula_status.clone(),
         editing: Cell::new(false),
         edit_buf: RefCell::new(String::new()),
         mode: Cell::new(GuiMode::Normal),
@@ -2791,7 +2849,7 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // Sheet tabs sit below the grid (above the status line), like the
     // terminal reference rendering tabs in its bottom row.
     vbox.append(&tabbar);
-    vbox.append(&status_label);
+    vbox.append(&hints_label);
 
     // Register the draw callback BEFORE present() so the extensive event
     // pumping inside present() — which waits for the frame clock to fire
@@ -2848,6 +2906,17 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // to be processed by the window-level BUBBLE handler — which can race
     // with a later grab_focus() call and produce a mixed-flow data corruption
     // where edit_buf gets overwritten by incomplete entry text.
+    // Initial chrome sync (ratatui parity): event paths refresh the formula
+    // row and tab strip, but nothing runs between construction and the
+    // first key/click — without this the labels keep constructor text
+    // ("Ready", "A1") on the first paint and any startup status (e.g. a
+    // template note) is invisible until the user acts. Runs BEFORE
+    // present(): present() pumps events for a very long time on slow
+    // displays (so long that tests only ever observe the pumped phase),
+    // and anything placed after it never runs there. GtkLabel applies
+    // set_text/visibility on realize, so pre-present sync paints correctly.
+    update_formula_bar(&shared, shared.last_row.get(), shared.last_col.get());
+    sync_tabbar(&shared);
     formula_entry.grab_focus();
     eprintln!("PHASE: about_to_present");
     win.present();

@@ -4,10 +4,11 @@
 //! - Sheet > New sheet: the tab bar appears with one tab per sheet, the new
 //!   sheet active (bold on yellow, mirroring the terminal's black-on-yellow
 //!   active tab; inactive tabs gutter-gray).
-//! - Clicking a tab switches to that sheet (status names it, highlight moves).
+//! - Clicking a tab switches to that sheet (formula-row status names it,
+//!   highlight moves).
 //!
 //! Method (no fixed sleeps for verdicts, no shared files): pixel-structure
-//! analysis (exact tab fill/divider colors) plus OCR for titles/status, all
+//! analysis (exact tab fill/divider colors) plus OCR for titles and the
 //! polled with deadlines. Sheet creation goes through the real Sheet menu
 //! (Alt+S, then clicking "New sheet" — synthetic keys cannot drive GTK's
 //! grab-based menus, per gui_menu_key.rs).
@@ -303,7 +304,7 @@ fn gui_new_sheet_shows_two_tabs() {
         std::thread::sleep(Duration::from_millis(300));
     }
     // Dismiss the menu (a grab-open menu can starve main-window redraws):
-    // click the status label, which has no click handler and is harmless.
+    // click the hints label, which has no click handler and is harmless.
     xdotool(&["mousemove", "--window", &wid, "600", "785", "click", "1"]);
     // Appearance event: the active-tab yellow must show up (deadline).
     let deadline = Instant::now() + Duration::from_secs(12);
@@ -327,18 +328,19 @@ fn gui_new_sheet_shows_two_tabs() {
         divs.len() >= 2,
         "two tabs need two trailing dividers, got {divs:?}"
     );
-    // Titles, not just boxes: "Sheet" reads twice (tesseract renders
-    // Sheet1's 1 as `|`), Sheet2 reads exact, and the yellow starts past the
-    // first divider — the new tab is titled, second, and active.
+    // Titles, not just boxes: both sheets titled (tesseract mangles case
+    // unpredictably — "Se/sheet/sheet2" fragments — so match the stable
+    // "heet" core case-insensitively; the hints line now sharing the
+    // crop contains no "heet" and cannot fake this).
     let shot = screenshot(&wid, "newtabtitles");
     let text = ocr_region(&shot, 0, stripy - 20, 700, 44, "6");
     let _ = std::fs::remove_file(&shot);
     assert!(
-        text.matches("Sheet").count() >= 2,
+        text.to_lowercase().matches("heet").count() >= 2,
         "tab bar must title both sheets, OCR got: {text:?}"
     );
     assert!(
-        text.contains("Sheet2"),
+        text.to_lowercase().contains("heet2"),
         "new tab must read Sheet2, OCR got: {text:?}"
     );
     assert!(
@@ -385,13 +387,16 @@ fn gui_tab_click_switches_active_sheet() {
         "click",
         "1",
     ]);
-    // Verdict 1 (polled): the status names the new active sheet.
+    // Verdict 1 (polled): the formula-row status suffix names the new
+    // active sheet (ratatui parity: status lives in the formula bar
+    // trailing, the bottom strip always shows hints).
     let deadline = Instant::now() + Duration::from_secs(10);
     let status = loop {
         std::thread::sleep(Duration::from_millis(300));
         let shot = screenshot(&wid, "clicktabstatus");
-        // Status label lives at the very bottom of the 1200x800 window.
-        let text = ocr_region(&shot, 0, 770, 1200, 30, "6");
+        // Formula row at the top of the 1200x800 window (address, fx,
+        // entry, then the `· status` suffix label).
+        let text = ocr_region(&shot, 0, 0, 1200, 50, "6");
         let _ = std::fs::remove_file(&shot);
         if text.contains("Sheet 2 of 2") || Instant::now() > deadline {
             break text;

@@ -9884,27 +9884,15 @@ fn fresh_document_parts() -> (WorkbookState, SheetState, Option<String>) {
     pub fn hints_line(&self) -> String {
         match &self.mode {
             Mode::Normal => {
-                if self.anchor.is_some() {
-                    "  r·move-rows   c·move-cols   v·deselect   Esc·cancel".into()
-                } else {
-                    let mut hints =
-                        vec!["type/F2·edit", "Ctrl+C·copy", "Ctrl+X·cut", "Ctrl+V·paste"];
-                    if !self.op_history.is_empty() {
-                        hints.push("Ctrl+Z·undo");
-                    }
-                    if !self.redo_history.is_empty() {
-                        hints.push("Ctrl+Y·redo");
-                    }
-                    hints.push("Ctrl+;·date");
-                    hints.push("Ctrl+:·time");
-                    hints.push(if self.path.is_some() {
-                        "Ctrl+S·save"
-                    } else {
-                        "Ctrl+S·save as"
-                    });
-                    hints.push("F1·help");
-                    format!("  {}", hints.join("; "))
-                }
+                // Single source of truth lives in core::state::normal_hints
+                // (shared with the GUI bottom strip); keep this arm a
+                // pure delegation so the text cannot drift between UIs.
+                crate::core::state::normal_hints(
+                    self.anchor.is_some(),
+                    !self.op_history.is_empty(),
+                    !self.redo_history.is_empty(),
+                    self.path.is_some(),
+                )
             }
             Mode::Edit { .. } => {
                 "  type to edit (or addr: val)   Enter·confirm   Esc·discard".into()
@@ -13892,6 +13880,18 @@ mod tests {
     use crate::ops::AggFunc;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::path::PathBuf;
+
+#[test]
+    fn fresh_hints_line_matches_shared_normal_hints() {
+        // The Mode::Normal arm must stay a pure delegation: if this fails,
+        // the terminal bottom row and the GUI bottom strip have drifted
+        // apart — update core::state::normal_hints (both UIs), not this.
+        let app = App::new(None);
+        assert_eq!(
+            app.hints_line(),
+            crate::core::state::normal_hints(false, false, false, false)
+        );
+    }
 
     /// Drive the *real* ratatui input handler with faked keypresses and assert a
     /// genuine feature (view-sort) executes. This is a behavioural driver test:
