@@ -84,10 +84,6 @@ getch
 
 **man-end****************************************************************/
 
-#ifdef PDC_TRACE
-extern void _pdc_trace_mark(const char *s, int len);
-#endif
-
 #define _INBUFSIZ   512 /* size of terminal input buffer */
 #define NUNGETCH    256 /* max # chars to ungetch() */
 
@@ -194,16 +190,10 @@ int wgetch(WINDOW *win)
 
     /* refresh window when wgetch is called if there have been changes
        to it and it is not a pad */
-#ifdef PDC_TRACE
-    _pdc_trace_mark("R\r\n", 3);
-#endif
     if (!(win->_flags & _PAD) && ((!win->_leaveit &&
          (win->_begx + win->_curx != SP->curscol ||
           win->_begy + win->_cury != SP->cursrow)) || is_wintouched(win)))
         wrefresh(win);
-#ifdef PDC_TRACE
-    _pdc_trace_mark("r\r\n", 3);
-#endif
 
     /* if ungotten char exists, remove and return it */
 
@@ -221,13 +211,6 @@ int wgetch(WINDOW *win)
     c_gindex = 0;
 
     /* to get here, no keys are buffered. go and get one. */
-
-#ifdef PDC_TRACE
-    {
-        char m[6] = { 'W', (char)('0' + (waitcount > 9 ? 9 : waitcount)), '\r', '\n' };
-        _pdc_trace_mark(m, 4);
-    }
-#endif
 
     for (;;)            /* loop for any buffering */
     {
@@ -248,16 +231,10 @@ int wgetch(WINDOW *win)
                 if (win->_nodelay)
                     return ERR;
 
-#ifdef PDC_TRACE
-            _pdc_trace_mark("N\r\n", 3);
-#endif
             napms(50);  /* sleep for 1/20th second */
             continue;   /* then check again */
         }
 
-#ifdef PDC_TRACE
-        _pdc_trace_mark("G\r\n", 3);
-#endif
         /* if there is, fetch it */
 
         key = PDC_get_key();
@@ -279,12 +256,7 @@ int wgetch(WINDOW *win)
         /* unwanted key? loop back */
 
         if (key == -1)
-        {
-#ifdef PDC_TRACE
-            _pdc_trace_mark("K\r\n", 3);
-#endif
             continue;
-        }
 
         /* translate CR */
 

@@ -34,6 +34,13 @@ pub const A_RIGHTLINE: chtype = 0x002 << PDC_CHARTEXT_BITS;
 pub const A_STRIKEOUT: chtype = 0x200 << PDC_CHARTEXT_BITS;
 pub const A_UNDERLINE: chtype = 0x010 << PDC_CHARTEXT_BITS;
 
+// On rust9x (Windows 9x) PDC_WIDE is compiled out (the W console APIs are
+// unimplemented stubs on 9x), so PDCurses key codes are 0x100-based
+// (KEY_RIGHT = 0x105). Everywhere else the wide build uses 0xec00-based
+// codes. Keep this in sync with vendor/pdcurses-sys/build.rs.
+#[cfg(target_family = "rust9x")]
+pub const KEY_OFFSET: i32 = 0x100;
+#[cfg(not(target_family = "rust9x"))]
 pub const KEY_OFFSET: i32 = 0xec00;
 pub const KEY_F15: i32 = KEY_OFFSET + 0x17;
 pub const KEY_UNDO: i32 = KEY_OFFSET + 0x96;

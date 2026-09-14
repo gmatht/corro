@@ -364,46 +364,6 @@ void PDC_scr_free(void)
 /* open the physical screen -- allocate SP, miscellaneous intialization,
    and may save the existing screen for later restoration */
 
-#ifdef PDC_TRACE
-/* TEMPORARY diagnostic: poll the input queue for ~3s and record whether
-   events are visible after init step <id>.  Type keys while the app starts. */
-void _pdc_probe_alive(int id)
-{
-    extern DWORD WINAPI WaitForSingleObject(HANDLE, DWORD);
-    extern void _pdc_trace_init_mark(const char *s, int len);
-    int i;
-    int seen = 0;
-
-    for (i = 0; i < 12; i++)
-    {
-        DWORD n = 0;
-        INPUT_RECORD ip;
-        DWORD cnt = 0;
-
-        GetNumberOfConsoleInputEvents(pdc_con_in, &n);
-        PeekConsoleInput(pdc_con_in, &ip, 1, &cnt);
-        if (n > 0 || cnt > 0)
-        {
-            seen = 1;
-            break;
-        }
-        Sleep(250);
-    }
-    {
-        extern void _pdc_trace_init_mark(const char *s, int len);
-        DWORD wr = WaitForSingleObject(pdc_con_in, 250);
-        DWORD n2 = 0xFFFFFFFF;
-        char m[8];
-        m[0] = 'a';
-        m[1] = (char)('0' + id);
-        m[2] = (char)('0' + seen);
-        m[3] = (wr == 0) ? 'w' : (wr == 258) ? 't' : 'x';
-        m[4] = '\n';
-        _pdc_trace_init_mark(m, 5);
-    }
-}
-#endif
-
 int PDC_scr_open(int argc, char **argv)
 {
     const char *str;
@@ -442,31 +402,7 @@ int PDC_scr_open(int argc, char **argv)
             NULL, OPEN_EXISTING, 0, NULL);
         if (con_in != INVALID_HANDLE_VALUE)
             pdc_con_in = con_in;
-#ifdef PDC_TRACE
-    {
-        extern void _pdc_trace_init_mark(const char *s, int len);
-        /* mark: input handle low 16 bits as 4 hex digits + output handle */
-        char m[16]; int i;
-        m[0]='I'; m[1]='n';
-        for (i = 0; i < 4; i++)
-        {
-            int nib = (int)(((unsigned long)pdc_con_in >> (12 - i * 4)) & 0xF);
-            m[2 + i] = (char)(nib < 10 ? '0' + nib : 'A' + nib - 10);
-        }
-        m[6]='O'; m[7]='u'; m[8]='t';
-        for (i = 0; i < 4; i++)
-        {
-            int nib = (int)(((unsigned long)pdc_con_out >> (12 - i * 4)) & 0xF);
-            m[9 + i] = (char)(nib < 10 ? '0' + nib : 'A' + nib - 10);
-        }
-        m[13] = '\r'; m[14] = '\n';
-        _pdc_trace_init_mark(m, 15);
     }
-#endif
-    }
-#endif
-#ifdef PDC_TRACE
-    _pdc_probe_alive(1);
 #endif
 
     if (GetFileType(pdc_con_in) != FILE_TYPE_CHAR)
@@ -498,9 +434,6 @@ int PDC_scr_open(int argc, char **argv)
     }
 
     GetConsoleMode(pdc_con_in, &old_console_mode);
-#ifdef PDC_TRACE
-    _pdc_probe_alive(2);
-#endif
 
     /* preserve QuickEdit Mode setting for use in PDC_mouse_set() when
        the mouse is not enabled -- other console input settings are
@@ -561,16 +494,10 @@ int PDC_scr_open(int argc, char **argv)
 
     xcpt_filter = SetUnhandledExceptionFilter(_restore_console);
     SetConsoleCtrlHandler(_ctrl_break, TRUE);
-#ifdef PDC_TRACE
-    _pdc_probe_alive(3);
-#endif
 
     SP->_preserve = (getenv("PDC_PRESERVE_SCREEN") != NULL);
 
     PDC_reset_prog_mode();
-#ifdef PDC_TRACE
-    _pdc_probe_alive(4);
-#endif
 
     SP->mono = FALSE;
 

@@ -334,40 +334,6 @@ void PDC_set_keyboard_binary(bool on)
     PDC_LOG(("PDC_set_keyboard_binary() - called\n"));
 }
 
-#ifdef PDC_TRACE
-/* Temporary diagnostic: append a marker (with optional digit) to a fixed
-   trace file via raw CreateFileA. Enabled by -DPDC_TRACE in build.rs. */
-void _pdc_trace_mark(const char *s, int len)
-{
-    HANDLE h = CreateFileA("c:\\pdc.trace",
-        GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_ALWAYS, 0, NULL);
-    if (h == INVALID_HANDLE_VALUE)
-        return;
-    SetFilePointer(h, 0, NULL, FILE_END);
-    {
-        DWORD w;
-        WriteFile(h, s, len, &w, NULL);
-    }
-    CloseHandle(h);
-}
-
-void _pdc_trace_init_mark(const char *s, int len)
-{
-    HANDLE h = CreateFileA("c:\\pdcinit.trace",
-        GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_ALWAYS, 0, NULL);
-    if (h == INVALID_HANDLE_VALUE)
-        return;
-    SetFilePointer(h, 0, NULL, FILE_END);
-    {
-        DWORD w;
-        WriteFile(h, s, len, &w, NULL);
-    }
-    CloseHandle(h);
-}
-#endif
-
-/* check if a key or mouse event is waiting */
-
 bool PDC_check_key(void)
 {
     if (key_count > 0)
@@ -379,11 +345,14 @@ bool PDC_check_key(void)
        WaitForSingleObject do report queued events.  Never use Peek here. */
     if (_pdc_is_win9x())
     {
-        /* Three-way experiment: old handle GetNumberOf, old handle Wait,
-           fresh CONIN$ handle GetNumberOf. */
+        /* Wait-based poll on a dedicated fresh CONIN$ handle: the
+           GetNumberOf/Peek count calls report nothing in the
+           steady-state loop, but WaitForSingleObject signals queued
+           events on a fresh handle (see the probe runs). Adopt the fresh
+           handle for all subsequent input (including PDC_get_key's
+           ReadConsoleInput). */
         static HANDLE fresh = INVALID_HANDLE_VALUE;
         static int inited = 0;
-        static int logged = 0;
         extern DWORD WINAPI WaitForSingleObject(HANDLE, DWORD);
         if (!inited)
         {
@@ -392,42 +361,19 @@ bool PDC_check_key(void)
                 GENERIC_READ | GENERIC_WRITE,
                 FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
             if (fresh != INVALID_HANDLE_VALUE)
+            {
                 SetConsoleMode(fresh, 0x18);
+                pdc_con_in = fresh;
+            }
         }
         for (;;)
         {
-            DWORD n1 = 0, n2 = 0, wres;
-            GetNumberOfConsoleInputEvents(pdc_con_in, &n1);
-            wres = WaitForSingleObject(pdc_con_in, 0);
-            GetNumberOfConsoleInputEvents(fresh, &n2);
-            if (n1 != 0 || n2 != 0 || wres == 0)
-                logged = 4000;
-            else if (logged < 40)
-                logged++;
-            if (logged != 0 && logged < 4000)
+            if (WaitForSingleObject(pdc_con_in, 100) == 0)
             {
-                char m[8];
-                m[0] = 'V';
-                m[1] = (char)('0' + (n1 > 9 ? 9 : n1));
-                m[2] = (wres == 0) ? 'w' : 't';
-                m[3] = (char)('0' + (n2 > 9 ? 9 : n2));
-                m[4] = '\n';
-                _pdc_trace_mark(m, 5);
-                logged--;
-            }
-            if (n1 != 0 || wres == 0)
-            {
-                event_count = (n1 != 0) ? n1 : 1;
+                event_count = 1;
                 return TRUE;
             }
-            if (n2 != 0)
-            {
-                /* fresh handle sees it: adopt it for this check */
-                pdc_con_in = fresh;
-                event_count = n2;
-                return TRUE;
-            }
-            Sleep(250);
+            Sleep(50);
         }
     }
 #endif
@@ -435,12 +381,6 @@ bool PDC_check_key(void)
     {
         DWORD local_n = 0;
         GetNumberOfConsoleInputEvents(pdc_con_in, &local_n);
-#ifdef PDC_TRACE
-        {
-            char m[3] = { 'C', (char)('0' + (local_n > 9 ? 9 : local_n)), '\n' };
-            _pdc_trace_mark(m, 3);
-        }
-#endif
         return (local_n != 0);
     }
 }
@@ -793,9 +733,6 @@ static int _process_mouse_event(void)
 int PDC_get_key(void)
 {
     pdc_key_modifiers = 0L;
-#ifdef PDC_TRACE
-    _pdc_trace_mark("g\r\n", 3);
-#endif
 
     if (!key_count)
     {
@@ -834,15 +771,7 @@ void PDC_flushinp(void)
 {
     PDC_LOG(("PDC_flushinp() - called\n"));
 
-#ifdef PDC_TRACE
-    {
-        BOOL ok = FlushConsoleInputBuffer(pdc_con_in);
-        char m[4] = { 'F', (char)('0' + (ok ? 1 : 0)), '\r', '\n' };
-        _pdc_trace_init_mark(m, 4);
-    }
-#else
     FlushConsoleInputBuffer(pdc_con_in);
-#endif
 }
 
 int PDC_mouse_set(void)

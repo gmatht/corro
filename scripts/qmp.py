@@ -231,6 +231,7 @@ CHAR_MAP = {
     "/": ["slash"],
     ";": ["semicolon"],
     "'": ["apostrophe"],
+    '"': ["shift", "2"],  # UK layout: double-quote is shift+2
     ":": ["shift", "semicolon"],
     "_": ["shift", "shift-minus"],
     "\\": ["less"],  # this layout maps backslash to the ISO key ('less' qcode)

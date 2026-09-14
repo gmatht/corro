@@ -83,9 +83,6 @@ fn main() {
         // Use the REAL console (CONOUT$/CONIN$) instead of the (possibly
         // redirected) standard handles.
         build.define("_WIN32_W9X_CONSOLE", Some("1"));
-        // TEMPORARY diagnostic trace of the wgetch input loop to c:\pdc.trace.
-        build.define("PDC_TRACE", Some("1"));
-        build.define("PDC_TRACE_REV", Some("A"));
     } else {
         build.define("PDC_WIDE", Some("Y")); // Build with wide-character (Unicode) support
     }

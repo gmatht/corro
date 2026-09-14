@@ -64,12 +64,6 @@ int PDC_curs_set(int visibility)
         return ERR;
 
     SP->visibility = visibility;
-#ifdef PDC_TRACE
-    {
-        extern void _pdc_probe_alive(int id);
-        _pdc_probe_alive(5);
-    }
-#endif
     return ret_vis;
 }
 
@@ -85,12 +79,6 @@ void PDC_set_title(const char *title)
     SetConsoleTitleW(wtitle);
 #else
     SetConsoleTitleA(title);
-#endif
-#ifdef PDC_TRACE
-    {
-        extern void _pdc_probe_alive(int id);
-        _pdc_probe_alive(6);
-    }
 #endif
 }
 
