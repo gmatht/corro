@@ -23,7 +23,13 @@ cairo-sys-rs = { path = "/root/tmp/gtk4-rs/generated/cairo-sys-rs-dlopen", optio
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-native-windows-gui = { version = "1.0", features = ["flexbox", "menu", "combobox", "textbox", "scroll-bar"] }
+# default-features = false is REQUIRED for Win95: upstream's default `all`
+# enables the `file-dialog` feature, whose Win7+ IFileDialog COM path imports
+# SHELL32!SHCreateItemFromParsingName — absent on Win95, and a single missing
+# static import makes the whole exe refuse to load. The feature list below is
+# exactly what backends_nwg_adapter.rs uses (see vendor/native-windows-gui/
+# README-WIN95.md).
+native-windows-gui = { version = "1.0", default-features = false, features = ["flexbox", "menu", "combobox", "textbox", "scroll-bar", "frame", "notice", "file-dialog"] }
 winapi = { version = "0.3", features = ["winuser", "windef", "processenv", "winbase", "wincon", "handleapi"] }
 
 [target.'cfg(target_os = "android")'.dependencies]

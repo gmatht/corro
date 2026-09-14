@@ -185,6 +185,12 @@ struct GuiState {
     app: *mut super::App,
     rxapp: rswidgets::App,
     window: Window,
+    /// Menu bar handle: lets modal flows (e.g. the special-char picker)
+    /// dismiss an open menu grab that would otherwise swallow all later
+    /// keys (an open keyboard menu routes everything past the window and
+    /// entry handlers, so a staged edit could never commit). Set once
+    /// after build_menu (which needs the state for callbacks).
+    menubar: std::cell::OnceCell<MenuBar>,
     canvas: Canvas,
     formula_entry: Entry,
     addr_label: Label,
@@ -1653,7 +1659,6 @@ fn maintain_extent(state: &GuiState, allow_shrink: bool) {
     // then grow toward target always but shrink only when allowed (fresh
     // loads/switches must not second-guess stored extents).
     let (mr, mc) = (grid.main_rows(), grid.main_cols());
-    let (mr, mc) = (grid.main_rows(), grid.main_cols());
     let tb_r = compute::trailing_blank_main_rows(grid).min(mr);
     let tb_c = compute::trailing_blank_main_cols(grid).min(mc);
     let content_r = mr - tb_r;
@@ -2056,6 +2061,60 @@ fn refresh_after_dialog(state: &Rc<GuiState>) {
     sync_tabbar(state);
 }
 
+/// Open the Insert > Special Char picker dialog over shared picker state
+/// (ratatui/pancurses parity: same 10 items, order, arrows, digits,
+/// Enter, Esc — see dialogs::special_char_dialog). Confirming splices the
+/// choice into the edit: fresh cells snapshot the visible cell text first
+/// (caret at end), mid-edit picks append to the buffer end — no
+/// widget-caret API exists on every backend, so the ratatui mid-caret
+/// splice degrades to append here. Cancel closes picker state and stages
+/// nothing.
+fn open_special_char_picker(state: &Rc<GuiState>) {
+    // Dismiss any open menu grab FIRST: Alt+I,s leaves the Insert menu
+    // open behind the dialog, and its grab would swallow every later key
+    // (including the main-window Return that commits the staged edit).
+    // Same as the user pressing Esc on the menu: closes the menu only.
+    if state.menubar.get().map(|mb| mb.menu_active()).unwrap_or(false) {
+        if let Some(mb) = state.menubar.get() {
+            mb.handle_menu_key(ESCAPE, 0);
+        }
+    }
+    let items: Vec<String> = super::special_picker::items().into_iter().collect();
+    let initial = super::special_picker::index(state.app_ref()).unwrap_or(0);
+    let shared = state.clone();
+    dialogs::special_char_dialog(&items, initial, move |result| {
+        let app = shared.app_mut();
+        match result {
+            Some(idx) => {
+                super::special_picker::set(app, idx);
+                if let Some(choice) = super::special_picker::take(&mut *app) {
+                    if shared.editing.get() {
+                        shared.edit_buf.borrow_mut().push_str(&choice);
+                        sync_entry_to_buf(&shared);
+                        shared.formula_entry.grab_focus();
+                    } else {
+                        // Snapshot the visible cell text first so the staged
+                        // edit starts from what the user sees.
+                        let grid = &app.core.workbook.active_sheet().grid;
+                        let addr = crate::addr::sheet_cursor_to_addr(
+                            crate::addr::LogicalRow(shared.last_row.get()),
+                            crate::addr::GlobalCol(shared.last_col.get()),
+                            crate::addr::MainRows(grid.main_rows()),
+                            crate::addr::MainCols(grid.main_cols()),
+                        );
+                        let cur = grid.get(&addr).unwrap_or_default();
+                        start_edit_with_text(&shared, &format!("{cur}{choice}"));
+                    }
+                }
+            }
+            None => {
+                super::special_picker::close(app);
+            }
+        }
+        refresh_after_dialog(&shared);
+    });
+}
+
 /// Route a menu action through the shared `actions::dispatch_menu_action`
 /// implementation (the same code the pancurses backend uses), then apply the
 /// result to GUI state. This is what keeps GUI menu behavior identical to the
@@ -2086,6 +2145,9 @@ fn delegate_shared_action(name: &str, state: &Rc<GuiState>) {
                     run_prompt_action(state.app_mut(), action, &path.display().to_string());
                 }
             }
+        }
+        MenuDispatch::SpecialPicker => {
+            open_special_char_picker(state);
         }
         MenuDispatch::About { status } => {
             state.app_mut().core.status = status;
@@ -2216,10 +2278,11 @@ fn handle_menu_action(name: &str, state: &Rc<GuiState>) {
         }
         "export_tsv" | "export_csv" | "export_ods" | "export_ascii" | "export_all" => {
             // Shared export logic writes the file (same as pancurses/ratatui);
-            // the save dialog only supplies the destination path.
+            // the export dialog supplies a type-filtered destination path
+            // (format extension appended when the user types a bare name).
             let st = state.clone();
             let action = name.to_string();
-            if let Some(path) = dialogs::file_save_dialog() {
+            if let Some(path) = dialogs::file_export_dialog(&action) {
                 run_prompt_action(st.app_mut(), &action, &path.display().to_string());
                 refresh_after_dialog(&st);
             }
@@ -2228,6 +2291,11 @@ fn handle_menu_action(name: &str, state: &Rc<GuiState>) {
         | "insert_date" | "insert_time" => {
             // Shared insert logic (same as pancurses/ratatui). Date/Time
             // arrive as Edit{value} and preset the edit buffer for Enter.
+            delegate_shared_action(name, state);
+        }
+        "insert_special_chars" => {
+            // 10-choice picker dialog over shared picker state (same as
+            // pancurses/ratatui); arrives as MenuDispatch::SpecialPicker.
             delegate_shared_action(name, state);
         }
 
@@ -2419,6 +2487,7 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         app: corro_app as *mut super::App,
         rxapp: rxapp.clone(),
         window: win.clone(),
+        menubar: std::cell::OnceCell::new(),
         canvas: canvas.clone(),
         formula_entry: formula_entry.clone(),
         addr_label: addr_label.clone(),
@@ -2472,6 +2541,7 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
 
     // Build menu
     let menubar = build_menu(&rxapp, &win, &shared)?;
+    let _ = shared.menubar.set(menubar.clone());
     let menubar_cb = menubar.clone();
     vbox.append(&menubar);
 
@@ -2841,7 +2911,6 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // expand/fill params at append time, so setting vexpand after appending
     // has no effect and the scrolled sheet would never grow vertically.
     scrolled.set_vexpand(true);
-    vbox.set_child_vexpand(&scrolled, true);
     vbox.append(&scrolled);
     // The nwg manual box layout looks the child up by handle, so it needs
     // the flag set AFTER append as well (a no-op repeat everywhere else).

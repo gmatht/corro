@@ -6,6 +6,11 @@
 
 use corro::grid::{CellAddr, ColumnAddr, HEADER_ROWS, MARGIN_COLS};
 
+// CORRO_TEMPLATE is process-global: these tests mutate it, so serialize
+// them against each other (default parallel threads would race set/remove
+// across tests and flake).
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn footer_seed() -> CellAddr {
     CellAddr::Footer {
         row: 0,
@@ -20,6 +25,10 @@ fn header_seed() -> CellAddr {
     }
 }
 
+fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+    ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn without_template() -> Option<String> {
     let prev = std::env::var("CORRO_TEMPLATE").ok();
     std::env::remove_var("CORRO_TEMPLATE");
@@ -28,6 +37,7 @@ fn without_template() -> Option<String> {
 
 #[test]
 fn fresh_gui_doc_carries_total_seeds() {
+    let _guard = lock_env();
     let prev = without_template();
     let app = corro::gui::App::new_with_paths(vec![]);
     let sheet = app.core.workbook.active_sheet();
@@ -53,6 +63,7 @@ fn fresh_gui_doc_carries_total_seeds() {
 
 #[test]
 fn fresh_gui_matches_tui_seeds() {
+    let _guard = lock_env();
     let prev = without_template();
     let gui = corro::gui::App::new_with_paths(vec![]);
     let tui = corro::ui::App::new(None);
@@ -70,6 +81,7 @@ fn fresh_gui_matches_tui_seeds() {
 
 #[test]
 fn fresh_gui_honors_template_workbook() {
+    let _guard = lock_env();
     let dir = std::env::temp_dir().join(format!("corro_tpl_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let tpl = dir.join("t.corro");
@@ -92,6 +104,7 @@ fn fresh_gui_honors_template_workbook() {
 
 #[test]
 fn fresh_gui_bad_template_falls_back_to_seeds_with_note() {
+    let _guard = lock_env();
     let prev = std::env::var("CORRO_TEMPLATE").ok();
     std::env::set_var(
         "CORRO_TEMPLATE",

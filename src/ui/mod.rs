@@ -258,10 +258,33 @@ impl PlainArrowAxis {
     }
 }
 
+/// What a confirmed overwrite writes (see `Mode::ConfirmOverwrite`).
+/// Export variants recompute their payload on confirm (clipboard-empty
+/// input never reaches the mode; the anchor can no longer move while a
+/// prompt mode owns input, so recompute matches the Enter-time bytes).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum OverwriteAction {
+    Save,
+    ExportTsv,
+    ExportCsv,
+    ExportAscii,
+    ExportOdt,
+    ExportAll,
+}
+
 /// Logical cursor position across header+main+footer rows × total global columns.
 #[derive(Clone, Debug)]
 pub(crate) enum Mode {
     Normal,
+    /// Overwrite confirm for typed file paths (Save As / exports): the
+    /// target exists, so Enter/`y` proceeds with `action` on `path` and
+    /// `n`/Esc cancels back to Normal. Mirrors QuitPrompt (red banner +
+    /// footer hints). Native file dialogs on GUI backends confirm
+    /// themselves, so only the typed TUI paths enter this mode.
+    ConfirmOverwrite {
+        path: PathBuf,
+        action: OverwriteAction,
+    },
     RevisionBrowse,
     Edit {
         buffer: String,
@@ -7660,6 +7683,51 @@ impl App {
         self.paste_pasted_tsv_cells(cells, preserve_formulas)
     }
 
+    /// Typed-path overwrite gate (Save As / exports): when `fname` names
+    /// an existing file, stage `Mode::ConfirmOverwrite` and report true
+    /// (caller must not write); otherwise report false. Empty names
+    /// (clipboard) never gate. The returned mode carries the exact checked
+    /// path, so confirm proceeds on the same bytes Enter saw.
+    fn check_overwrite(&mut self, action: OverwriteAction, name: &'static str, fname: &str) -> Option<Mode> {
+        let existing = crate::ui_core::prompt_action_write_target(name, fname)?;
+        self.status = format!("File exists: {} — overwrite?", existing.display());
+        Some(Mode::ConfirmOverwrite { path: existing, action })
+    }
+
+    /// Shared file writers for the typed export modes (also used by the
+    /// overwrite-confirm path so confirmed bytes equal Enter-time bytes).
+    fn write_export_ascii(&mut self, fname: &str) {
+        match std::fs::write(fname.trim(), self.do_export_ascii()) {
+            Ok(()) => self.status = format!("ASCII table exported to {}", fname.trim()),
+            Err(e) => self.status = format!("Write error: {e}"),
+        }
+    }
+
+    fn write_export_ods(&mut self, fname: &str) {
+        match std::fs::write(fname.trim(), self.do_export_ods()) {
+            Ok(()) => self.status = format!("ODS saved to {}", fname.trim()),
+            Err(e) => self.status = format!("Write error: {e}"),
+        }
+    }
+
+    fn write_export_all(&mut self, fname: &str) {
+        let data = if self.anchor.is_some() {
+            self.do_export_selection()
+        } else {
+            self.do_export_all()
+        };
+        match std::fs::write(fname.trim(), data) {
+            Ok(()) => {
+                self.status = if self.anchor.is_some() {
+                    format!("Selection saved to {}", fname.trim())
+                } else {
+                    format!("Full export saved to {}", fname.trim())
+                }
+            }
+            Err(e) => self.status = format!("Write error: {e}"),
+        }
+    }
+
     fn finish_export(&mut self, csv: bool, filename: &str) {
         let data = self.do_export(csv);
         let ext = if csv { "csv" } else { "tsv" };
@@ -9990,6 +10058,9 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                 "  arrows·extend selection   Enter·duplicate   Esc·cancel".into()
             }
             Mode::QuitPrompt => "  Q·quit   B·back   Esc·cancel".into(),
+            // Mirrors QuitPrompt per the variant's own doc (Enter/y
+            // proceeds, n/Esc cancels); owner to adjust wording.
+            Mode::ConfirmOverwrite { .. } => "  Enter/y·overwrite   n·back   Esc·cancel".into(),
             Mode::Help => "  up/down·scroll   Esc·close   ?·help   A·about".into(),
             Mode::About => "  up/down·scroll   Esc·close   ?·help   A·about".into(),
             Mode::Menu { .. } => {
@@ -10783,6 +10854,30 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
         }
 
         match &mut mode {
+            Mode::ConfirmOverwrite { path, action } => match key.code {
+                // Confirm path mirrors the staging arms (SavePath Enter /
+                // export Enter): same writers, same bytes Enter-time saw.
+                // Owner to adjust wording/behavior.
+                KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    let fname = path.to_string_lossy().into_owned();
+                    match *action {
+                        OverwriteAction::Save => {
+                            self.save_to_path(path)?;
+                        }
+                        OverwriteAction::ExportTsv => self.finish_export(false, &fname),
+                        OverwriteAction::ExportCsv => self.finish_export(true, &fname),
+                        OverwriteAction::ExportAscii => self.write_export_ascii(&fname),
+                        OverwriteAction::ExportOdt => self.write_export_ods(&fname),
+                        OverwriteAction::ExportAll => self.write_export_all(&fname),
+                    }
+                    mode = self.exit_to_normal();
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.status = "Overwrite cancelled".into();
+                    mode = self.exit_to_normal();
+                }
+                _ => {}
+            },
             Mode::Help => match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => mode = Mode::Normal,
                 KeyCode::Char('a') | KeyCode::Char('A') => {
@@ -10894,8 +10989,16 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                         _ if self.handle_export_scroll(key.code) => {}
                         KeyCode::Enter => {
                             let fname = buffer.clone();
-                            self.finish_export(false, &fname);
-                            mode = self.exit_to_normal();
+                            if let Some(confirm) = self.check_overwrite(
+                                OverwriteAction::ExportTsv,
+                                "export_tsv",
+                                &fname,
+                            ) {
+                                mode = confirm;
+                            } else {
+                                self.finish_export(false, &fname);
+                                mode = self.exit_to_normal();
+                            }
                         }
                         KeyCode::Esc => mode = Mode::Normal,
                         _ if Self::handle_plain_text_input_key(
@@ -10922,8 +11025,16 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                         _ if self.handle_export_scroll(key.code) => {}
                         KeyCode::Enter => {
                             let fname = buffer.clone();
-                            self.finish_export(true, &fname);
-                            mode = self.exit_to_normal();
+                            if let Some(confirm) = self.check_overwrite(
+                                OverwriteAction::ExportCsv,
+                                "export_csv",
+                                &fname,
+                            ) {
+                                mode = confirm;
+                            } else {
+                                self.finish_export(true, &fname);
+                                mode = self.exit_to_normal();
+                            }
                         }
                         KeyCode::Esc => mode = Mode::Normal,
                         _ if Self::handle_plain_text_input_key(
@@ -11045,17 +11156,20 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                             if fname.trim().is_empty() {
                                 let data = self.do_export_ascii();
                                 self.copy_with_status(&data, "ASCII table copied to clipboard");
+                                self.input_cursor = None;
+                                mode = Mode::Normal;
+                            } else if let Some(confirm) = self.check_overwrite(
+                                OverwriteAction::ExportAscii,
+                                "export_ascii",
+                                &fname,
+                            ) {
+                                self.input_cursor = None;
+                                mode = confirm;
                             } else {
-                                match std::fs::write(fname.trim(), self.do_export_ascii()) {
-                                    Ok(()) => {
-                                        self.status =
-                                            format!("ASCII table exported to {}", fname.trim())
-                                    }
-                                    Err(e) => self.status = format!("Write error: {e}"),
-                                }
+                                self.write_export_ascii(&fname);
+                                self.input_cursor = None;
+                                mode = Mode::Normal;
                             }
-                            self.input_cursor = None;
-                            mode = Mode::Normal;
                         }
                         KeyCode::Esc => mode = Mode::Normal,
                         _ if Self::handle_plain_text_input_key(
@@ -11093,14 +11207,20 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                             let fname = buffer.clone();
                             if fname.trim().is_empty() {
                                 self.status = "ODS requires a filename".into();
+                                self.input_cursor = None;
+                                mode = Mode::Normal;
+                            } else if let Some(confirm) = self.check_overwrite(
+                                OverwriteAction::ExportOdt,
+                                "export_ods",
+                                &fname,
+                            ) {
+                                self.input_cursor = None;
+                                mode = confirm;
                             } else {
-                                match std::fs::write(fname.trim(), self.do_export_ods()) {
-                                    Ok(()) => self.status = format!("ODS saved to {}", fname.trim()),
-                                    Err(e) => self.status = format!("Write error: {e}"),
-                                }
+                                self.write_export_ods(&fname);
+                                self.input_cursor = None;
+                                mode = Mode::Normal;
                             }
-                            self.input_cursor = None;
-                            mode = Mode::Normal;
                         }
                         KeyCode::Esc => mode = Mode::Normal,
                         _ if Self::handle_plain_text_input_key(
@@ -11152,24 +11272,17 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                                         "Full export copied to clipboard"
                                     },
                                 );
+                                mode = self.exit_to_normal();
+                            } else if let Some(confirm) = self.check_overwrite(
+                                OverwriteAction::ExportAll,
+                                "export_all",
+                                &fname,
+                            ) {
+                                mode = confirm;
                             } else {
-                                let data = if self.anchor.is_some() {
-                                    self.do_export_selection()
-                                } else {
-                                    self.do_export_all()
-                                };
-                                match std::fs::write(fname.trim(), data) {
-                                    Ok(()) => {
-                                        self.status = if self.anchor.is_some() {
-                                            format!("Selection saved to {}", fname.trim())
-                                        } else {
-                                            format!("Full export saved to {}", fname.trim())
-                                        }
-                                    }
-                                    Err(e) => self.status = format!("Write error: {e}"),
-                                }
+                                self.write_export_all(&fname);
+                                mode = self.exit_to_normal();
                             }
-                            mode = self.exit_to_normal();
                         }
                         KeyCode::Esc => mode = Mode::Normal,
                         _ if Self::handle_plain_text_input_key(
@@ -11674,12 +11787,23 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
             },
             Mode::SavePath { buffer } => match key.code {
                 KeyCode::Enter => {
-                    let path = PathBuf::from(buffer.trim());
-                    if path.as_os_str().is_empty() {
+                    let raw = PathBuf::from(buffer.trim());
+                    if raw.as_os_str().is_empty() {
                         self.status = "Save path required".into();
                     } else {
-                        self.save_to_path(&path)?;
-                        mode = self.exit_to_normal();
+                        // Save As replaces the target wholesale: ask first
+                        // when it exists (normal Ctrl+S onto the open file
+                        // bypasses this mode and never asks).
+                        let path = Self::to_corro_path(&raw);
+                        let resolved = path.to_string_lossy().into_owned();
+                        if let Some(confirm) =
+                            self.check_overwrite(OverwriteAction::Save, "save_as", &resolved)
+                        {
+                            mode = confirm;
+                        } else {
+                            self.save_to_path(&path)?;
+                            mode = self.exit_to_normal();
+                        }
                     }
                 }
                 KeyCode::Esc => mode = Mode::Normal,
@@ -12775,6 +12899,13 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
             .style(Self::prompt_style()),
             Mode::QuitPrompt => Paragraph::new(" Quit Corro? (Q)uit, (B)ack ")
                 .style(Style::default().fg(Color::White).bg(Color::Red)),
+            // Red banner mirroring QuitPrompt, per the variant's own doc.
+            // Owner to adjust wording.
+            Mode::ConfirmOverwrite { path, .. } => Paragraph::new(format!(
+                " Overwrite {}? (y)es, (n)o ",
+                path.display()
+            ))
+            .style(Style::default().fg(Color::White).bg(Color::Red)),
             Mode::Help => Paragraph::new(" Help - Up/Down scroll, Esc closes ")
                 .style(Style::default().fg(Color::White).bg(Color::Blue)),
             Mode::About => Paragraph::new(" About - Up/Down scroll, Esc closes ")
@@ -13268,6 +13399,164 @@ mod drive_feature_tests {
         menu(&mut app, 'e', 'e');
         assert!(matches!(app.mode, Mode::Extrapolate { .. }), "Edit▸Extrapolate opens Extrapolate mode");
     }
+    // ── Overwrite confirm (Save As / typed exports) ──
+    fn ow_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("corro_owmode_{}_{}", std::process::id(), tag));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn drive_savepath_existing_enters_confirm_without_writing() {
+        let dir = ow_dir("save");
+        let target = dir.join("w.corro");
+        std::fs::write(&target, "SET $1:A1 OLD\n").unwrap();
+        let mut app = App::new(None);
+        app.mode = Mode::SavePath {
+            buffer: target.to_string_lossy().into_owned(),
+        };
+        press(&mut app, KeyCode::Enter, KeyModifiers::empty());
+        let (path, action) = match &app.mode {
+            Mode::ConfirmOverwrite { path, action } => (path.clone(), action.clone()),
+            m => panic!("existing target must enter ConfirmOverwrite, got {m:?}"),
+        };
+        assert_eq!(path, target, "confirm must carry the exact checked path");
+        assert!(
+            matches!(action, OverwriteAction::Save),
+            "save path stages a Save action"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "SET $1:A1 OLD\n",
+            "entering confirm must not touch the file"
+        );
+        assert!(app.status.contains("exists"), "status names the conflict");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn drive_confirm_yes_replaces_and_no_cancels() {
+        let dir = ow_dir("yn");
+        let target = dir.join("w.corro");
+        std::fs::write(&target, "SET $1:A1 OLD\n").unwrap();
+        let buf = target.to_string_lossy().into_owned();
+        // Yes: file replaced, back to Normal.
+        let mut app = App::new(None);
+        app.state.grid.set(&main_cell(0, 0), "NEW".into());
+        app.mode = Mode::SavePath { buffer: buf.clone() };
+        press(&mut app, KeyCode::Enter, KeyModifiers::empty());
+        assert!(matches!(app.mode, Mode::ConfirmOverwrite { .. }));
+        press(&mut app, KeyCode::Char('y'), KeyModifiers::empty());
+        assert!(
+            matches!(app.mode, Mode::Normal),
+            "confirming returns to Normal"
+        );
+        let after = std::fs::read_to_string(&target).unwrap();
+        assert!(
+            after.contains("NEW") && !after.contains("OLD"),
+            "confirming replaces wholesale (got {after:?})"
+        );
+        // No: file untouched, back to Normal with a note.
+        std::fs::write(&target, "SET $1:A1 OLD\n").unwrap();
+        let mut app2 = App::new(None);
+        app2.mode = Mode::SavePath { buffer: buf };
+        press(&mut app2, KeyCode::Enter, KeyModifiers::empty());
+        press(&mut app2, KeyCode::Char('n'), KeyModifiers::empty());
+        assert!(matches!(app2.mode, Mode::Normal));
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "SET $1:A1 OLD\n",
+            "cancelling must not touch the file"
+        );
+        assert!(app2.status.contains("cancelled"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn drive_savepath_missing_saves_directly() {
+        let dir = ow_dir("miss");
+        let target = dir.join("fresh.corro");
+        let mut app = App::new(None);
+        app.mode = Mode::SavePath {
+            buffer: target.to_string_lossy().into_owned(),
+        };
+        press(&mut app, KeyCode::Enter, KeyModifiers::empty());
+        assert!(
+            matches!(app.mode, Mode::Normal),
+            "missing target saves without confirm"
+        );
+        assert!(target.is_file(), "save must create the file");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn drive_exporttsv_existing_confirms_and_missing_writes() {
+        let dir = ow_dir("tsv");
+        let target = dir.join("out.tsv");
+        std::fs::write(&target, "OLD\n").unwrap();
+        let buf = target.to_string_lossy().into_owned();
+        let mut app = App::new(None);
+        app.mode = Mode::ExportTsv { buffer: buf };
+        press(&mut app, KeyCode::Enter, KeyModifiers::empty());
+        assert!(
+            matches!(
+                app.mode,
+                Mode::ConfirmOverwrite {
+                    action: OverwriteAction::ExportTsv,
+                    ..
+                }
+            ),
+            "existing export target must confirm"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "OLD\n",
+            "entering confirm must not touch the file"
+        );
+        press(&mut app, KeyCode::Enter, KeyModifiers::empty());
+        assert_ne!(
+            std::fs::read_to_string(&target).unwrap(),
+            "OLD\n",
+            "confirming replaces the export file"
+        );
+        let missing = dir.join("new.tsv");
+        let mut app2 = App::new(None);
+        app2.mode = Mode::ExportTsv {
+            buffer: missing.to_string_lossy().into_owned(),
+        };
+        press(&mut app2, KeyCode::Enter, KeyModifiers::empty());
+        assert!(
+            matches!(app2.mode, Mode::Normal),
+            "missing export target writes without confirm"
+        );
+        assert!(missing.is_file());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn drive_confirm_renders_overwrite_banner() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut app = App::new(None);
+        app.mode = Mode::ConfirmOverwrite {
+            path: std::path::PathBuf::from("/tmp/x.corro"),
+            action: OverwriteAction::Save,
+        };
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let text: String = (0..buffer.area.height)
+            .flat_map(|y| {
+                (0..buffer.area.width).map(move |x| buffer[(x, y)].symbol().to_string())
+            })
+            .collect();
+        assert!(
+            text.contains("Overwrite") && text.contains("x.corro"),
+            "confirm banner must name the action and file"
+        );
+    }
+
     #[test]
     fn drive_duplicate_copies_selection() {
         let mut app = App::new(None);

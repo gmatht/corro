@@ -682,10 +682,18 @@ impl App {
     pub fn open_file(&self, title: &str) -> Result<Option<String>, Error> {
         crate::backends_gtk_adapter::open_file(title)
     }
+    #[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
+    pub fn open_file_filtered(&self, title: &str, filters: &[(&str, &[&str])]) -> Result<Option<String>, Error> {
+        crate::backends_gtk_adapter::open_file_filtered(title, filters)
+    }
 
     #[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
     pub fn save_file(&self, title: &str) -> Result<Option<String>, Error> {
         crate::backends_gtk_adapter::save_file(title)
+    }
+    #[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
+    pub fn save_file_filtered(&self, title: &str, filters: &[(&str, &[&str])], current_name: &str) -> Result<Option<String>, Error> {
+        crate::backends_gtk_adapter::save_file_filtered(title, filters, current_name)
     }
 
     #[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
@@ -806,11 +814,21 @@ impl App {
         let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
         crate::backends_nwg_adapter::open_file(title, parent)
     }
+    #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+    pub fn open_file_filtered(&self, title: &str, filters: &[(&str, &[&str])]) -> Result<Option<String>, Error> {
+        let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
+        crate::backends_nwg_adapter::open_file_filtered(title, parent, filters)
+    }
 
     #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
     pub fn save_file(&self, title: &str) -> Result<Option<String>, Error> {
         let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
         crate::backends_nwg_adapter::save_file(title, parent)
+    }
+    #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+    pub fn save_file_filtered(&self, title: &str, filters: &[(&str, &[&str])], current_name: &str) -> Result<Option<String>, Error> {
+        let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
+        crate::backends_nwg_adapter::save_file_filtered(title, parent, filters, current_name)
     }
 
     // -- Pancurses paths --
@@ -983,8 +1001,16 @@ impl App {
     pub fn open_file(&self, title: &str) -> Result<Option<String>, Error> {
         crate::backends_pancurses_adapter::open_file(title)
     }
+#[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
+    pub fn open_file_filtered(&self, title: &str, _filters: &[(&str, &[&str])]) -> Result<Option<String>, Error> {
+        crate::backends_pancurses_adapter::open_file(title)
+    }
 #[cfg(all(windows, feature = "pancurses", not(feature = "zork")))]
     pub fn open_file(&self, title: &str) -> Result<Option<String>, Error> {
+        crate::backends_pancurses_adapter::open_file(title)
+    }
+#[cfg(all(windows, feature = "pancurses", not(feature = "zork")))]
+    pub fn open_file_filtered(&self, title: &str, _filters: &[(&str, &[&str])]) -> Result<Option<String>, Error> {
         crate::backends_pancurses_adapter::open_file(title)
     }
 
@@ -992,8 +1018,16 @@ impl App {
     pub fn save_file(&self, title: &str) -> Result<Option<String>, Error> {
         crate::backends_pancurses_adapter::save_file(title)
     }
+#[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
+    pub fn save_file_filtered(&self, title: &str, _filters: &[(&str, &[&str])], _current_name: &str) -> Result<Option<String>, Error> {
+        crate::backends_pancurses_adapter::save_file(title)
+    }
 #[cfg(all(windows, feature = "pancurses", not(feature = "zork")))]
     pub fn save_file(&self, title: &str) -> Result<Option<String>, Error> {
+        crate::backends_pancurses_adapter::save_file(title)
+    }
+#[cfg(all(windows, feature = "pancurses", not(feature = "zork")))]
+    pub fn save_file_filtered(&self, title: &str, _filters: &[(&str, &[&str])], _current_name: &str) -> Result<Option<String>, Error> {
         crate::backends_pancurses_adapter::save_file(title)
     }
 
@@ -1018,9 +1052,17 @@ impl App {
     pub fn open_file(&self, title: &str) -> Result<Option<String>, Error> {
         crate::backends_zork_adapter::open_file(title)
     }
+    #[cfg(feature = "zork")]
+    pub fn open_file_filtered(&self, title: &str, _filters: &[(&str, &[&str])]) -> Result<Option<String>, Error> {
+        crate::backends_zork_adapter::open_file(title)
+    }
 
     #[cfg(feature = "zork")]
     pub fn save_file(&self, title: &str) -> Result<Option<String>, Error> {
+        crate::backends_zork_adapter::save_file(title)
+    }
+    #[cfg(feature = "zork")]
+    pub fn save_file_filtered(&self, title: &str, _filters: &[(&str, &[&str])], _current_name: &str) -> Result<Option<String>, Error> {
         crate::backends_zork_adapter::save_file(title)
     }
 
@@ -1186,9 +1228,17 @@ impl App {
     pub fn open_file(&self, _title: &str) -> Result<Option<String>, Error> {
         Ok(None) // File dialogs not available in WASM
     }
+    #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
+    pub fn open_file_filtered(&self, _title: &str, _filters: &[(&str, &[&str])]) -> Result<Option<String>, Error> {
+        Ok(None) // File dialogs not available in WASM
+    }
 
     #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
     pub fn save_file(&self, _title: &str) -> Result<Option<String>, Error> {
+        Ok(None) // File dialogs not available in WASM
+    }
+    #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
+    pub fn save_file_filtered(&self, _title: &str, _filters: &[(&str, &[&str])], _current_name: &str) -> Result<Option<String>, Error> {
         Ok(None) // File dialogs not available in WASM
     }
 

@@ -15,19 +15,88 @@ fn log_dialog_action(action: &str, detail: &str) {
     }
 }
 
+/// Spreadsheet file types the loaders accept (see `load_initial`): the
+/// Open dialog filters to these by default, with an All-files fallback.
+/// Extensions come from `ui_core::SPREADSHEET_EXTS` so the filter can't
+/// drift from what the loaders actually open (unit-tested headlessly).
+/// Only the `gui` Open-dialog body calls this.
+#[allow(dead_code)]
+pub(crate) fn spreadsheet_filter_patterns() -> Vec<String> {
+    crate::ui_core::SPREADSHEET_EXTS
+        .iter()
+        .map(|e| format!("*.{e}"))
+        .collect()
+}
+
 pub fn file_open_dialog() -> Option<PathBuf> {
     #[cfg(feature = "gui")]
     return App::init().ok().and_then(|app| {
-        app.open_file("Open Spreadsheet").ok().flatten().map(PathBuf::from)
+        let patterns = spreadsheet_filter_patterns();
+        let refs: Vec<&str> = patterns.iter().map(|s| s.as_str()).collect();
+        let filters = [
+            ("Spreadsheets", refs.as_slice()),
+            ("All files", &["*.*"][..]),
+        ];
+        app.open_file_filtered("Open Spreadsheet", &filters)
+            .ok()
+            .flatten()
+            .map(PathBuf::from)
     });
     #[allow(unreachable_code)]
     None
 }
 
+/// Save As dialog: filtered to `.corro`, suggesting a `.corro` name, and
+/// forcing the extension on return (a workbook under a foreign extension
+/// will not reopen as one). Mirrors the ratatui `to_corro_path` rule.
 pub fn file_save_dialog() -> Option<PathBuf> {
+    file_save_dialog_named("Sheet1.corro")
+}
+
+/// Save As dialog with a suggested filename (e.g. the current workbook
+/// name); the `.corro` default still applies.
+/// Params feed only the `gui` body; other builds take the None fallback.
+#[allow(unused_variables)]
+pub fn file_save_dialog_named(suggested: &str) -> Option<PathBuf> {
     #[cfg(feature = "gui")]
     return App::init().ok().and_then(|app| {
-        app.save_file("Save Spreadsheet").ok().flatten().map(PathBuf::from)
+        app.save_file_filtered(
+            "Save Spreadsheet",
+            &[("Corro workbooks (*.corro)", &["*.corro"])],
+            suggested,
+        )
+        .ok()
+        .flatten()
+        .map(|p| crate::ui_core::force_extension(&PathBuf::from(p), "corro"))
+    });
+    #[allow(unreachable_code)]
+    None
+}
+
+/// Export dialog for `action` (`export_tsv/csv/ods/ascii`): matching type
+/// filter, suggested filename with the format extension, and the extension
+/// appended when the user types a bare name.
+/// Params feed only the `gui` body; other builds take the None fallback.
+#[allow(unused_variables)]
+pub fn file_export_dialog(action: &str) -> Option<PathBuf> {
+    let ext = crate::ui_core::export_ext_for_action(action);
+    let title = match action {
+        "export_csv" => "Export CSV",
+        "export_ods" => "Export ODS",
+        "export_ascii" => "Export ASCII",
+        _ => "Export TSV",
+    };
+    let filter = crate::ui_core::ext_filter_label(ext);
+    let suggested = format!("Sheet1.{ext}");
+    let pat = format!("*.{ext}");
+    let pats = [pat.as_str()];
+    let filters = [(filter, pats.as_slice())];
+    #[cfg(feature = "gui")]
+    return App::init().ok().and_then(|app| {
+        app.save_file_filtered(title, &filters, &suggested)
+            .ok()
+            .flatten()
+            .map(|p| crate::ui_core::append_extension_if_missing(&PathBuf::from(p), ext))
     });
     #[allow(unreachable_code)]
     None
@@ -170,6 +239,9 @@ fn wire_prompt_confirm<F: FnOnce(Option<String>) + 'static>(
 /// sheet, go to cell, column widths, ...) each get correctly labeled chrome
 /// through this — never a recycled "Find" dialog (which is what Rename
 /// Sheet showed before this existed).
+/// Params are consumed only by the `gui` body below; other backends take
+/// the `on_result(None)` fallback (typed TUI prompts live elsewhere).
+#[allow(unused_variables)]
 pub fn prompt_dialog<F: FnOnce(Option<String>) + 'static>(
     title: &str,
     ok_label: &str,
@@ -333,6 +405,9 @@ pub const SPECIAL_CHAR_DIALOG_OK: &str = "Insert";
 /// Down*n → nth-choice contract the ratatui reference defines (verified:
 /// Down*2 in a 4-column trial landed on index 8, not 2). Linear layout
 /// keeps arrows stepping ±1 through the indices on every backend.
+/// Params are consumed only by the `gui` body below; other backends take
+/// the `on_result(None)` fallback (the picker lives in shared state).
+#[allow(unused_variables)]
 pub fn special_char_dialog<F: FnOnce(Option<usize>) + 'static>(
     items: &[String],
     initial: usize,

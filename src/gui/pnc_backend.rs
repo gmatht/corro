@@ -208,110 +208,11 @@ fn append_marker_raw(path: &str, bytes: &[u8]) {
     }
 }
 
-pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Error>> {    // Win9x: environment variables do not propagate to Win32 processes (neither
-    // DOS-box `set` nor AUTOEXEC.BAT), so fall back to fixed diagnostic paths
-    // when built for the rust9x-msvc (Win95) target.
-    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
-    let trace_fallback = {
-        rswidgets::backends::pancurses::set_input_trace_file("c:\\corro.keys");
-        true
-    };
-    #[cfg(not(all(target_family = "rust9x", target_env = "msvc")))]
-    let trace_fallback = false;
-    let _ = trace_fallback;
-
+pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Error>> {
     let _ = std::env::var("INPUT_TRACE_FILE").inspect(|v| {
         eprintln!("[corro] input trace file: {v}");
     });
 
-    // TEMPORARY Win95 diagnosis: run the probe95 input sequence (open CONIN$,
-    // SetConsoleMode, poll GetNumberOfConsoleInputEvents + ReadConsoleInputA)
-    // BEFORE pancurses init, to A/B against the post-init state.
-    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
-    unsafe fn input_probe_pre() {
-        use std::os::raw::c_void;
-        unsafe extern "system" {
-            fn CreateFileA(
-                name: *const u8, access: u32, share: u32, sa: *mut c_void,
-                disp: u32, flags: u32, tmpl: *mut c_void) -> *mut c_void;
-            fn SetConsoleMode(h: *mut c_void, mode: u32) -> i32;
-            fn GetNumberOfConsoleInputEvents(h: *mut c_void, n: *mut u32) -> i32;
-            fn ReadConsoleInputA(h: *mut c_void, rec: *mut c_void, len: u32, read: *mut u32) -> i32;
-            fn CloseHandle(h: *mut c_void) -> i32;
-            fn Sleep(ms: u32);
-        }
-        let h = CreateFileA(
-            b"CONIN$\0".as_ptr(), 0xC000_0000, 3, std::ptr::null_mut(),
-            3, 0x80, std::ptr::null_mut());
-        let mut out = String::new();
-        if h.is_null() || h as isize == -1 {
-            out.push_str("open=fail\n");
-        } else {
-            let m = SetConsoleMode(h, 0x18);
-            out.push_str(&format!("open=ok mode0x18={m}\n"));
-            for _ in 0..20 {
-                let mut n = 0u32;
-                GetNumberOfConsoleInputEvents(h, &mut n);
-                if n > 0 {
-                    let mut buf = [0u32; 5];
-                    let mut r = 0u32;
-                    let ok = ReadConsoleInputA(h, buf.as_mut_ptr() as *mut c_void, 1, &mut r);
-                    let et = buf[0];
-                    out.push_str(&format!("ev ok={ok} et={et}\n"));
-                } else {
-                    out.push_str(&format!("n={n}\n"));
-                    Sleep(150);
-                }
-            }
-            CloseHandle(h);
-        }
-        append_marker_raw("c:\\corro.inq", out.as_bytes());
-    }
-    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
-    unsafe { input_probe_pre() };
-
-    /// TEMPORARY Win95 diagnosis: after pancurses init + first frame, poll the
-    /// console input queue and log whether events arrive.
-    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
-    unsafe fn input_probe_post() {
-        use std::os::raw::c_void;
-        unsafe extern "system" {
-            fn CreateFileA(
-                name: *const u8, access: u32, share: u32, sa: *mut c_void,
-                disp: u32, flags: u32, tmpl: *mut c_void) -> *mut c_void;
-            fn SetConsoleMode(h: *mut c_void, mode: u32) -> i32;
-            fn GetNumberOfConsoleInputEvents(h: *mut c_void, n: *mut u32) -> i32;
-            fn ReadConsoleInputA(h: *mut c_void, rec: *mut c_void, len: u32, read: *mut u32) -> i32;
-            fn CloseHandle(h: *mut c_void) -> i32;
-            fn Sleep(ms: u32);
-        }
-        let h = CreateFileA(
-            b"CONIN$\0".as_ptr(), 0xC000_0000, 3, std::ptr::null_mut(),
-            3, 0x80, std::ptr::null_mut());
-        let mut out = String::new();
-        if h.is_null() || h as isize == -1 {
-            out.push_str("post open=fail\n");
-        } else {
-            let m = SetConsoleMode(h, 0x18);
-            out.push_str(&format!("post open=ok mode0x18={m}\n"));
-            for _ in 0..10 {
-                let mut n = 0u32;
-                GetNumberOfConsoleInputEvents(h, &mut n);
-                if n > 0 {
-                    let mut buf = [0u32; 5];
-                    let mut r = 0u32;
-                    let ok = ReadConsoleInputA(h, buf.as_mut_ptr() as *mut c_void, 1, &mut r);
-                    let et = buf[0];
-                    out.push_str(&format!("post ev ok={ok} et={et}\n"));
-                } else {
-                    out.push_str(&format!("post n={n}\n"));
-                    Sleep(150);
-                }
-            }
-            CloseHandle(h);
-        }
-        append_marker_raw("c:\\corro.inq", out.as_bytes());
-    }
     let _backend = rswidgets::backends::pancurses::init()
         .map_err(|e| format!("pancurses init failed: {e}"))?;
 
@@ -332,20 +233,6 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     };
     if let Some(path) = idle_path {
         eprintln!("[corro] idle marker file: {path}");
-        // TEMPORARY Win95 diagnosis: on the FIRST after-redraw (post-init, post
-        // first frame), poll the input queue and log whether events arrive.
-        #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
-        {
-            use std::sync::atomic::{AtomicBool, Ordering};
-            static FIRST: AtomicBool = AtomicBool::new(true);
-            rswidgets::backends::pancurses::set_after_redraw_callback(Box::new(move || {
-                if FIRST.swap(false, Ordering::SeqCst) {
-                    unsafe { input_probe_post() };
-                }
-                append_marker_raw(&path, b"idle\n");
-            }));
-        }
-        #[cfg(not(all(target_family = "rust9x", target_env = "msvc")))]
         rswidgets::backends::pancurses::set_after_redraw_callback(Box::new(move || {
             append_marker_raw(&path, b"idle\n");
         }));
@@ -805,12 +692,48 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     }));
 
     // Prompt callback: perform the real file operation for path/name actions
-    // (Open/Save As/Export) submitted via the TUI text prompt.
+    // (Open/Save As/Export) submitted via the TUI text prompt. Save As and
+    // exports replace their target wholesale, and typed TUI paths have no
+    // native overwrite dialog (GUI backends confirm in the file chooser),
+    // so an existing target first arms a y/n confirm through the same
+    // prompt: `pending_ow` holds the deferred (action, text) until the
+    // `__confirm_overwrite` submission resolves it.
     let prompt_ss = spreadsheet.clone();
     let sid_prompt = sid;
     let display_rows_prompt = display_rows_for_cb.clone();
+    let pending_ow: std::rc::Rc<std::cell::RefCell<Option<(String, String)>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
     rswidgets::backends::pancurses::set_prompt_callback(Box::new(move |action: String, text: String| {
         let app = app_from_raw(app_ptr);
+        if action == "__confirm_overwrite" {
+            if let Some((a, t)) = pending_ow.borrow_mut().take() {
+                if matches!(text.trim(), "y" | "Y") {
+                    run_prompt_action(app, &a, &t);
+                } else {
+                    app.core.status = "Overwrite cancelled".into();
+                }
+            }
+            prompt_ss.set_formula_bar_trailing(&format!("   ·  {}", app.core.status));
+            refresh_viewport_after_action(
+                app, &prompt_ss, sid_prompt, &display_rows_prompt,
+                data_rows, data_cols, data_width, HEADER_ROWS,
+            );
+            return;
+        }
+        if let Some(target) = crate::ui_core::prompt_action_write_target(&action, &text) {
+            *pending_ow.borrow_mut() = Some((action, text));
+            app.core.status = format!("File exists: {} — overwrite?", target.display());
+            rswidgets::backends::pancurses::set_prompt(
+                &format!("Overwrite {}? (y/n)", target.display()),
+                "__confirm_overwrite",
+            );
+            prompt_ss.set_formula_bar_trailing(&format!("   ·  {}", app.core.status));
+            refresh_viewport_after_action(
+                app, &prompt_ss, sid_prompt, &display_rows_prompt,
+                data_rows, data_cols, data_width, HEADER_ROWS,
+            );
+            return;
+        }
         run_prompt_action(app, &action, &text);
         prompt_ss.set_formula_bar_trailing(&format!("   ·  {}", app.core.status));
         // A prompt action can replace the whole workbook (Open) or write cells

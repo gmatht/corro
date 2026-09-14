@@ -24,7 +24,12 @@
 #   - headless:    vncviewer localhost:5905
 #
 # Env overrides:
-#   WIN95_DISK=/root/vm/win95-flat.qcow2   scratch disk (recreated from source if missing)
+#   WIN95_DISK=/root/vm/win95-flat.qcow2   golden master (uploads target it;
+#                                        NEVER booted directly, so it stays clean)
+#   WIN95_SESSION=...                     per-run overlay booted by QEMU
+#                                        (default: <DISK>-session.qcow2; recreated
+#                                        every run, so kills/dirty shutdowns only
+#                                        ever trash the overlay, never the golden)
 #   WIN95_SOURCE=/root/vm/Win95.vmdk       pristine source image (never written)
 #   UNICOWS_DLL=/opt/wine-stable/lib/wine/i386-windows/unicows.dll
 #   QMP_PORT=4445
@@ -32,6 +37,19 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 DISK=${WIN95_DISK:-/root/vm/win95-flat.qcow2}
+SESSION_DISK=${WIN95_SESSION:-${DISK%.qcow2}-session.qcow2}
+QEMU_PIDFILE=/tmp/qemu-win95.pid
+# Prints the pidfile PID, but ONLY if that process is actually our QEMU
+# (matched by binary + our QMP port). A stale pidfile whose PID got
+# recycled by an innocent process must never become a kill target.
+our_qemu_pid() {
+  [ -f "$QEMU_PIDFILE" ] || return 0
+  local p; p=$(cat "$QEMU_PIDFILE")
+  if [ -n "$p" ] && tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | \
+      grep -q "qemu-system-i386.*$QMP_PORT"; then
+    echo "$p"
+  fi
+}
 SOURCE=${WIN95_SOURCE:-/root/vm/Win95.vmdk}
 UNICOWS=${UNICOWS_DLL:-/opt/wine-stable/lib/wine/i386-windows/unicows.dll}
 QMP_PORT=${QMP_PORT:-4445}
@@ -60,14 +78,18 @@ else
 fi
 
 # ------------------------------------------------------- 2. stop running VM
-echo "== 2/6 stopping any running VM"
-pids=$(ps aux | awk '/qemu-system-i386/ && !/awk/ {print $2}')
+# Scoped to OUR VM via the pidfile: a blanket pkill would murder other
+# operators' VMs sharing this host (their QMP/VNC ports differ, ours are
+# fixed below, so only our own pid is ever a candidate).
+echo "== 2/6 stopping our running VM (if any)"
+pids=$(our_qemu_pid)
 if [ -n "$pids" ]; then
   kill $pids 2>/dev/null || true
   sleep 3
   kill -9 $pids 2>/dev/null || true
   sleep 1
 fi
+rm -f "$QEMU_PIDFILE"
 
 # ------------------------------------------------------------ 3. upload exe
 echo "== 3/6 uploading to $DISK"
@@ -113,7 +135,14 @@ else
 fi
 
 # ------------------------------------------------------------- 4. boot VM
+# Boot a FRESH overlay backed by the golden master: every run starts from
+# the same scandisked snapshot, and whatever happens inside the guest
+# (kills, dirty shutdowns, test debris) lands in the overlay, which is
+# discarded next run. The golden is only ever touched offline by step 3.
 echo "== 4/6 booting VM (this takes a few minutes)"
+rm -f "$SESSION_DISK"
+qemu-img create -f qcow2 -F qcow2 -b "$DISK" "$SESSION_DISK" >/dev/null
+echo "   session overlay: $SESSION_DISK (backed by $DISK)"
 ACCEL=kvm
 [ -w /dev/kvm ] || ACCEL=tcg
 DISP_ARGS=(-display none -vnc "$VNC_DISPLAY")
@@ -121,14 +150,15 @@ if [ "$MODE" = show ]; then
   DISP_ARGS=(-display gtk)
 fi
 setsid qemu-system-i386 -machine pc -cpu pentium -m 256 -accel "$ACCEL" \
-  -drive file="$DISK",if=ide,index=0,media=disk -vga cirrus \
+  -drive file="$SESSION_DISK",if=ide,index=0,media=disk -vga cirrus \
   "${DISP_ARGS[@]}" \
   -qmp tcp:127.0.0.1:$QMP_PORT,server,nowait -rtc base=localtime -net none \
   > /tmp/qemu-win95.log 2>&1 &
-echo $! > /tmp/qemu-win95.pid
+echo $! > "$QEMU_PIDFILE"
 sleep 5
-if ! kill -0 "$(cat /tmp/qemu-win95.pid)" 2>/dev/null; then
+if ! kill -0 "$(cat "$QEMU_PIDFILE")" 2>/dev/null; then
   echo "ERROR: QEMU died at startup; see /tmp/qemu-win95.log" >&2
+  echo "       (another VM may already hold VNC $VNC_DISPLAY / QMP $QMP_PORT)" >&2
   exit 1
 fi
 
@@ -158,9 +188,9 @@ else
 fi
 
 # ------------------------------------------------- optional: clean shutdown
-# A clean shutdown clears the Windows dirty-shutdown flag, so the NEXT boot
-# is normal instead of Safe Mode (Safe Mode boots a 'Display Properties'
-# error dialog that delays the desktop). Skipped with --no-shutdown.
+# Courtesy only now (the overlay is discarded next run regardless): a halted
+# guest leaves tidy logs and avoids a ScanDisk pass if anyone reboots THIS
+# overlay by hand. Skipped with --no-shutdown.
 if [ "$NO_SHUTDOWN" != 1 ]; then
   echo "== shutting the guest down cleanly (Start > Shut Down)"
   python3 scripts/qmp.py combo ctrl+esc
@@ -170,8 +200,9 @@ if [ "$NO_SHUTDOWN" != 1 ]; then
   python3 scripts/qmp.py key ret        # confirm
   if python3 scripts/qmp.py wait-halt; then
     echo "   guest halted; stopping QEMU"
-    pids=$(ps aux | awk '/qemu-system-i386/ && !/awk/ {print $2}')
+    pids=$(our_qemu_pid)
     [ -n "$pids" ] && kill $pids 2>/dev/null || true
+    rm -f "$QEMU_PIDFILE"
   else
     echo "   WARNING: guest did not halt (corro may still be running and" >&2
     echo "            blocking shutdown); leaving QEMU up" >&2

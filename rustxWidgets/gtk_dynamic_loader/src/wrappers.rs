@@ -1329,6 +1329,55 @@ impl FileChooserNative {
         None
     }
 
+    /// Add a file-type filter shown in the dialog (`patterns` like
+    /// `*.corro`). Best-effort: silently skipped when the filter symbols
+    /// are unavailable (dialog still works, unfiltered). The chooser takes
+    /// ownership of the created filter, so no cleanup is needed here.
+    pub fn add_filter(&self, name: &str, patterns: &[&str]) {
+        if !guard_widget_ptr(self.inner, "FileChooserNative", "add_filter") {
+            return;
+        }
+        let syms = &self.loader.symbols;
+        let (Some(new), Some(set_name), Some(add_pattern), Some(add_filter), Some(set_filter)) = (
+            syms.gtk_file_filter_new,
+            syms.gtk_file_filter_set_name,
+            syms.gtk_file_filter_add_pattern,
+            syms.gtk_file_chooser_add_filter,
+            syms.gtk_file_chooser_set_filter,
+        ) else {
+            return;
+        };
+        let filter = unsafe { new() };
+        if filter.is_null() {
+            return;
+        }
+        if let Ok(name_c) = std::ffi::CString::new(name) {
+            unsafe { set_name(filter, name_c.as_ptr()); }
+        }
+        for pat in patterns {
+            if let Ok(pat_c) = std::ffi::CString::new(*pat) {
+                unsafe { add_pattern(filter, pat_c.as_ptr()); }
+            }
+        }
+        unsafe {
+            add_filter(self.inner, filter);
+            set_filter(self.inner, filter);
+        }
+    }
+
+    /// Suggest an initial filename in a save dialog (e.g. `Sheet1.corro`).
+    /// Best-effort like [`Self::add_filter`].
+    pub fn set_current_name(&self, name: &str) {
+        if !guard_widget_ptr(self.inner, "FileChooserNative", "set_current_name") {
+            return;
+        }
+        if let Some(set_fn) = self.loader.symbols.gtk_file_chooser_set_current_name {
+            if let Ok(name_c) = std::ffi::CString::new(name) {
+                unsafe { set_fn(self.inner, name_c.as_ptr()); }
+            }
+        }
+    }
+
     pub fn destroy(&self) {
         if !guard_widget_ptr(self.inner, "FileChooserNative", "destroy") {
             return;

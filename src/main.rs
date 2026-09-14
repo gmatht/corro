@@ -260,10 +260,48 @@ fn parse_args() -> Result<Args, String> {
 // Win95 entry point (rust9x msvc targets only; see the no_main note above).
 // The VC6 CRT startup calls this directly. Errors still exit non-zero via
 // std::process::exit inside corro_main.
-#[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+// NOTE: `not(feature = "gui-subsystem")` matters. The VC6 CRT ships two
+// startup objects: crt0.obj defines `_main`+`_mainCRTStartup` (console) and
+// wincrt0.obj defines `_WinMain@16`+`_WinMainCRTStartup` (GUI). Defining BOTH
+// `main` and `WinMain` makes the linker pull BOTH objects, which then collide
+// on the shared CRT globals (__amsg_exit, __aexit_rtn, ...) — "duplicate
+// symbol". Each build therefore exports exactly one entry point.
+#[cfg(all(
+    target_family = "rust9x",
+    target_env = "msvc",
+    not(feature = "gui-subsystem")
+))]
 #[no_mangle]
 pub extern "C" fn main() -> i32 {
     win9x_redirect_console_output();
+    corro_main();
+    0
+}
+
+// GUI-subsystem entry point for the nwg build (rust9x msvc, `gui` feature).
+//
+// A PE linked with /SUBSYSTEM:WINDOWS is entered through the CRT's
+// `WinMainCRTStartup`, which calls `WinMain` — *not* `main`. Without this the
+// nwg build would link against the GUI subsystem and then die before running
+// a single line. The signature is the classic one; the parameters are unused
+// because corro takes its input from the command line (fetched through the
+// same `win95_args` shim `main` uses) and from argv[0] dispatch.
+//
+// This is compiled only for the GUI link, so the console TUI build keeps its
+// `main` entry and console subsystem (see build95.sh / build95-gui.sh).
+#[cfg(all(
+    target_family = "rust9x",
+    target_env = "msvc",
+    feature = "gui",
+    feature = "gui-subsystem"
+))]
+#[no_mangle]
+pub extern "system" fn WinMain(
+    _instance: *mut std::os::raw::c_void,
+    _prev_instance: *mut std::os::raw::c_void,
+    _cmd_line: *mut u8,
+    _show_cmd: i32,
+) -> i32 {
     corro_main();
     0
 }

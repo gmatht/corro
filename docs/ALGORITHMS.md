@@ -604,3 +604,57 @@ a 4-column radio grid was tried for the Special Char picker and
 reverted — GTK radio arrows navigate spatially, so Down*2 landed on
 index 8 instead of 2; the single column keeps Down*n → nth choice on
 every backend.
+
+### 9.7 Overwrite confirm for typed file paths (Bugs.txt: overwrite w/o prompt)
+
+Normal `.corro` saves append ops (no prompt, by design). Save As and
+exports *replace* their target wholesale, so typed TUI paths confirm
+first; native GUI file dialogs already do (`GtkFileChooserNative` SAVE
+keeps `do-overwrite-confirmation=TRUE`; NWG `IFileDialog` Save prompts
+natively — no code needed there):
+- Shared gate: `ui_core::prompt_action_write_target` (pure,
+  headless-tested) flags an existing regular file for the six writing
+  actions (`save_as`, `export_tsv/csv/ods/ascii/all`); re-exported via
+  `gui::actions` for the dispatch path.
+- Ratatui: `Mode::ConfirmOverwrite { path, action }` (red banner with the
+  filename, footer hints, y/Enter proceeds, n/Esc cancels with a status
+  note). Staged by SavePath + all five export Enter arms via
+  `check_overwrite`; confirm reuses the same writers (`finish_export`,
+  `write_export_ascii/ods/all`), so confirmed bytes equal Enter-time
+  bytes. Ctrl+S onto the open file bypasses the mode and never asks.
+- Pancurses: `pending_ow` in the prompt callback re-prompts
+  `Overwrite …? (y/n)` (`__confirm_overwrite`); anything but `y` cancels.
+  Live-tested (`pnc_overwrite_confirm`: prompt appears, file intact,
+  n cancels, y replaces wholesale, missing path writes directly).
+
+### 9.8 Save/Open/Export dialogs: default file types (GTK + NWG)
+
+Bugs.txt follow-up. Before: every GTK/NWG file dialog was unfiltered and
+Save As accepted whatever the user typed, so `book.txt` saved a workbook
+the loader would not reopen, and Open listed every file in the folder.
+
+- Shared, headless-tested lists in `ui_core`: `SPREADSHEET_EXTS`
+  (`corro,csv,tsv,ods` — exactly `gui::load_initial`'s dispatch set),
+  `export_ext_for_action`, `ext_filter_label`, plus `force_extension`
+  (Save As always `.corro`) and `append_extension_if_missing` (exports
+  keep an explicit extension, add one to a bare name).
+- GTK: `FileChooserNative::add_filter`/`set_current_name` wrappers over
+  `gtk_file_filter_new`/`..._set_name`/`..._add_pattern` +
+  `gtk_file_chooser_{add,set}_filter`/`..._set_current_name`, all
+  best-effort (missing symbols degrade to the old unfiltered dialog
+  rather than failing). Open filters to the spreadsheet set + All files;
+  Save suggests `Sheet1.corro` and forces `.corro`; each export filters
+  to and appends its own extension.
+- NWG: filter spec built by `win32_portable::join_dialog_filters`
+  (`Name (*.a;*.b)|*.a;*.b`, pipe-joined; pure + unit-tested because the
+  backend's dialog strings are otherwise untestable on Linux) and passed
+  to `FileDialogBuilder::filters`. Windows' save dialog appends the
+  selected type's extension natively and prompts on overwrite itself;
+  nwg exposes no initial-filename setter, so the suggested name is
+  GTK-only and both backends still normalize the extension themselves.
+- Typed TUI paths normalize too (`run_prompt_action`): `save_as`
+  force-appends `.corro`, exports append their format extension, keeping
+  pancurses/ratatui byte-identical to the GUI dialogs.
+- Tests: `menu_all_items::{prompt_paths_resolve_format_extensions,
+  dialog_filters_cover_loader_and_export_types}` (headless) and
+  `win32_portable::portable_win32_tests::win32_filter_spec_formats_and_joins`.

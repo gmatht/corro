@@ -11,6 +11,10 @@ use crate::grid::{CellAddr, CellFormat, NumberFormat, SheetCursor, TextAlign, HE
 use crate::ops::{Op, SheetState, WorkbookOp};
 use crate::gui::App;
 
+/// Re-exported for the GUI/pancurses dispatch path (canonical home is
+/// [`crate::ui_core`], which ratatui-only builds can also see).
+pub use crate::ui_core::prompt_action_write_target;
+
 /// Set a main cell value in the grid and log it to the live `.corro` file (if any).
 pub fn commit_cell(app: &mut App, addr: CellAddr, value: String) {
     let sheet_id = app.core.workbook.sheet_id(app.core.workbook.active_sheet);
@@ -568,12 +572,17 @@ pub fn run_prompt_action(app: &mut App, action: &str, text: &str) {
         }
         "save_as" => {
             if !path.is_empty() {
-                let p = std::path::Path::new(&path);
+                // Workbooks must keep `.corro` (a foreign extension will not
+                // reopen as one); the GUI dialog already forces this, the
+                // typed pancurses path resolves here (ratatui resolves in
+                // its own Save arm via `to_corro_path`).
+                let final_path =
+                    crate::ui_core::force_extension(std::path::Path::new(&path), "corro");
                 let snap = crate::ops::WorkbookSnapshot::from_workbook(&app.core.workbook);
-                match crate::io::save_workbook(p, &snap) {
+                match crate::io::save_workbook(&final_path, &snap) {
                     Ok(()) => {
-                        app.core.path = Some(std::path::PathBuf::from(path.clone()));
-                        app.core.status = format!("Saved to {path}");
+                        app.core.path = Some(final_path.clone());
+                        app.core.status = format!("Saved to {}", final_path.display());
                     }
                     Err(e) => app.core.status = format!("Save error: {e}"),
                 }
@@ -581,8 +590,16 @@ pub fn run_prompt_action(app: &mut App, action: &str, text: &str) {
         }
         "export_tsv" | "export_csv" | "export_ods" | "export_ascii" | "export_all" => {
             if !path.is_empty() {
+                // A bare typed name lands on the format extension (the GUI
+                // dialog suggests/appends it already); an explicit
+                // extension is always respected.
+                let ext = crate::ui_core::export_ext_for_action(action);
+                let final_path = crate::ui_core::append_extension_if_missing(
+                    std::path::Path::new(&path),
+                    ext,
+                );
                 let g = app.core.workbook.active_sheet().grid.clone();
-                match std::fs::File::create(&path) {
+                match std::fs::File::create(&final_path) {
                     Ok(mut f) => {
                         let r: Result<(), String> = match action {
                             "export_tsv" => { crate::export::export_tsv(&g, &mut f); Ok(()) }
@@ -596,7 +613,10 @@ pub fn run_prompt_action(app: &mut App, action: &str, text: &str) {
                             _ => Ok(()),
                         };
                         match r {
-                            Ok(()) => app.core.status = format!("Exported {action} to {path}"),
+                            Ok(()) => {
+                                app.core.status =
+                                    format!("Exported {action} to {}", final_path.display())
+                            }
                             Err(e) => app.core.status = format!("Export error: {e}"),
                         }
                     }

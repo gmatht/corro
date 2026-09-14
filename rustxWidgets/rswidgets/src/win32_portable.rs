@@ -129,6 +129,26 @@ pub fn is_nonprinting_win_vk(_vk: u32) -> bool {
     false
 }
 
+/// Build the Win32 file-dialog filter spec from `(display name, patterns)`
+/// pairs. Win32 wants `Name (*.a;*.b)|*.a;*.b` entries joined by `|` (the
+/// name's parenthesised list is cosmetic; the second field is what filters).
+/// Empty input means "no filter" (the dialog then shows all files).
+/// Pure + unit-tested (the NWG backend has no other way to test its
+/// dialog strings on a Linux host).
+#[cfg(any(windows, test))]
+pub(crate) fn join_dialog_filters(filters: &[(&str, &[&str])]) -> Option<String> {
+    if filters.is_empty() {
+        return None;
+    }
+    Some(
+        filters
+            .iter()
+            .map(|(name, pats)| format!("{} ({})|{}", name, pats.join(";"), pats.join(";")))
+            .collect::<Vec<_>>()
+            .join("|"),
+    )
+}
+
 /// Distribute `avail` pixels over one box axis, GTK fill-parity semantics:
 /// fixed children keep `desired` sizes, expand children split the remainder
 /// (plus one extra pixel each for the first few, so no pixel is lost to
@@ -477,5 +497,29 @@ mod portable_win32_tests {
         // Leftover: 300 - 12(top) - 26 - 8(gap) - 8(above buttons) - 28 - 12 = 206.
         assert_eq!(content[1].h, 206);
         assert_eq!(content[1].y, 12 + 26 + 8);
+    }
+
+    #[test]
+    fn win32_filter_spec_formats_and_joins() {
+        // No filters -> None (dialog unfiltered, not an empty spec).
+        assert_eq!(join_dialog_filters(&[]), None);
+        // Single filter: name list is cosmetic, second field filters.
+        assert_eq!(
+            join_dialog_filters(&[("Corro workbooks", &["*.corro"])]),
+            Some("Corro workbooks (*.corro)|*.corro".to_string())
+        );
+        // Multiple patterns in one filter are semicolon-joined in both fields.
+        assert_eq!(
+            join_dialog_filters(&[("Spreadsheets", &["*.corro", "*.csv", "*.tsv", "*.ods"])]),
+            Some(
+                "Spreadsheets (*.corro;*.csv;*.tsv;*.ods)|*.corro;*.csv;*.tsv;*.ods"
+                    .to_string()
+            )
+        );
+        // Multiple filters are pipe-joined (Win32's separator).
+        assert_eq!(
+            join_dialog_filters(&[("Spreadsheets", &["*.corro"]), ("All files", &["*.*"])]),
+            Some("Spreadsheets (*.corro)|*.corro|All files (*.*)|*.*".to_string())
+        );
     }
 }

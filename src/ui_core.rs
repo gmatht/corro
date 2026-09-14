@@ -24,6 +24,79 @@ use crate::ops::{AggFunc, AggregateDef, SheetState};
 pub use crate::addr::ui_column_fragment as col_header_label;
 pub use crate::addr::ui_row_label as sheet_row_label;
 
+/// Typed-prompt actions that write files (`save_as`, `export_*`). Native
+/// file dialogs on GUI backends already ask before replacing; the typed
+/// TUI paths (ratatui modes, pancurses prompt) must ask themselves.
+/// Returns the target path when `text` names an existing regular file
+/// (the write would silently replace it); None otherwise — empty text
+/// (clipboard), missing path, directory, or a non-writing action.
+/// Callers resolve aliases first (e.g. ratatui Save appends `.corro`);
+/// this checks exactly the path it is given.
+pub fn prompt_action_write_target(action: &str, text: &str) -> Option<std::path::PathBuf> {
+    match action {
+        "save_as" | "export_tsv" | "export_csv" | "export_ods" | "export_ascii" | "export_all" => {}
+        _ => return None,
+    }
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let p = std::path::PathBuf::from(trimmed);
+    p.is_file().then(|| p)
+}
+
+/// Spreadsheet file extensions the loaders accept, in dialog-filter order
+/// (see `gui::load_initial`). Shared by the GUI Open/Save dialogs and
+/// tests so the filter list can't drift from what actually loads.
+pub const SPREADSHEET_EXTS: &[&str] = &["corro", "csv", "tsv", "ods"];
+
+/// Export extension for a menu action name; `tsv` is the catch-all
+/// (export_all writes TSV too). Drives the export dialog's filter,
+/// suggested filename and appended extension.
+pub fn export_ext_for_action(action: &str) -> &'static str {
+    match action {
+        "export_csv" => "csv",
+        "export_ods" => "ods",
+        "export_ascii" => "txt",
+        _ => "tsv",
+    }
+}
+
+/// Human name for an extension's filter row (`corro` -> `Corro workbooks`).
+pub fn ext_filter_label(ext: &str) -> &'static str {
+    match ext {
+        "corro" => "Corro workbooks",
+        "csv" => "CSV files",
+        "tsv" => "TSV files",
+        "ods" => "ODS files",
+        "txt" => "Text files",
+        _ => "Files",
+    }
+}
+
+/// Force `ext` (without dot) onto `path` for Save As: a workbook saved
+/// under a foreign extension will not reopen as one, so `foo.txt` becomes
+/// `foo.ext` (same rule as the ratatui Save path verification).
+pub fn force_extension(path: &std::path::Path, ext: &str) -> std::path::PathBuf {
+    path.with_extension(ext)
+}
+
+/// Append `ext` (without dot) to `path` only when it has no extension
+/// yet. Export flows use this so a dialog-typed `foo` lands on `foo.ext`
+/// instead of an extensionless file; an explicitly typed extension is
+/// always respected, even a surprising one.
+pub fn append_extension_if_missing(path: &std::path::Path, ext: &str) -> std::path::PathBuf {
+    if path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| !e.is_empty())
+    {
+        path.to_path_buf()
+    } else {
+        path.with_extension(ext)
+    }
+}
+
 /// Today's date as `YYYY-MM-DD` in local time: the Insert > Date preset.
 /// Shared by the ratatui reference and the GUI dispatch so every backend
 /// presets (and tests assert) byte-identical values.

@@ -51,13 +51,19 @@ mod nwg_adapter {
             }
             let scan =
                 winapi::um::winuser::MapVirtualKeyW(vk, winapi::um::winuser::MAPVK_VK_TO_VSC);
+            // Win95: ToUnicodeEx is a Win2000+ USER32 export (and absent from
+            // Win95's export table entirely — a hard loader failure, not just
+            // a W-stub). ToAsciiEx is the Win95-era ANSI equivalent: same
+            // VK/scan/keyboard-state inputs, same "1 char, 0 none, -1 dead
+            // key" contract, but it writes ANSI bytes into a WORD array.
+            // The app's key path only ever deals with ASCII key names and
+            // control codes, so the ANSI result is what it wants.
             let mut buf: [u16; 4] = [0; 4];
-            let n = winapi::um::winuser::ToUnicodeEx(
+            let n = winapi::um::winuser::ToAsciiEx(
                 vk,
                 scan,
                 state.as_ptr(),
                 buf.as_mut_ptr(),
-                buf.len() as i32,
                 0,
                 winapi::um::winuser::GetKeyboardLayout(0),
             );
@@ -2727,11 +2733,28 @@ mod nwg_adapter {
     }
     // ---- File dialogs ----
 
+    /// nwg filter-spec for `(name, patterns)` pairs:
+    /// `Name (*.a;*.b)|*.a;*.b|…`. Empty list means no filter.
+    /// nwg filter spec for `(name, patterns)` pairs; the format
+    /// (`Name (*.a;*.b)|*.a;*.b|…`) is built portably and unit-tested in
+    /// `win32_portable::join_dialog_filters`.
+    #[cfg(windows)]
+    fn join_filters(filters: &[(&str, &[&str])]) -> Option<String> {
+        crate::win32_portable::join_dialog_filters(filters)
+    }
+
     pub fn open_file(title: &str, parent: *mut c_void) -> Result<Option<String>, Error> {
+        open_file_filtered(title, parent, &[])
+    }
+
+    pub fn open_file_filtered(title: &str, parent: *mut c_void, filters: &[(&str, &[&str])]) -> Result<Option<String>, Error> {
         let mut dialog = nwg::FileDialog::default();
-        nwg::FileDialog::builder()
-            .title(title)
-            .action(nwg::FileDialogAction::Open)
+        let mut builder = nwg::FileDialog::builder();
+        builder = builder.title(title).action(nwg::FileDialogAction::Open);
+        if let Some(spec) = join_filters(filters) {
+            builder = builder.filters(&spec);
+        }
+        builder
             .build(&mut dialog)
             .map_err(|e| Error::Backend(format!("{}", e)))?;
         let parent_handle = nwg::ControlHandle::Hwnd(parent as _);
@@ -2746,10 +2769,24 @@ mod nwg_adapter {
     }
 
     pub fn save_file(title: &str, parent: *mut c_void) -> Result<Option<String>, Error> {
+        save_file_filtered(title, parent, &[], "")
+    }
+
+    /// Save dialog with file-type filters and an optional suggested
+    /// filename. Filters follow nwg's `Name (*.a;*.b)|*.a;*.b` spec; the
+    /// native dialog offers the selected type's extension, prompts on
+    /// overwrite, and appends the extension itself.
+    pub fn save_file_filtered(title: &str, parent: *mut c_void, filters: &[(&str, &[&str])], _current_name: &str) -> Result<Option<String>, Error> {
         let mut dialog = nwg::FileDialog::default();
-        nwg::FileDialog::builder()
-            .title(title)
-            .action(nwg::FileDialogAction::Save)
+        let mut builder = nwg::FileDialog::builder();
+        builder = builder.title(title).action(nwg::FileDialogAction::Save);
+        if let Some(spec) = join_filters(filters) {
+            builder = builder.filters(&spec);
+        }
+        // NOTE: nwg exposes no initial-filename setter; the suggested name
+        // is GTK-only (callers still append the extension themselves, so
+        // both backends land on the same bytes).
+        builder
             .build(&mut dialog)
             .map_err(|e| Error::Backend(format!("{}", e)))?;
         let parent_handle = nwg::ControlHandle::Hwnd(parent as _);

@@ -24,7 +24,8 @@
 #![cfg(all(target_os = "linux", any(feature = "gui", feature = "pancurses")))]
 
 use corro::gui::actions::{
-    dispatch_menu_action, menu_action_needs_prompt, run_prompt_action, MenuDispatch,
+    dispatch_menu_action, menu_action_needs_prompt, prompt_action_write_target,
+    run_prompt_action, MenuDispatch,
 };
 use corro::gui::menu::{action_kind_to_name, menu_bar, MenuAction, MenuActionKind};
 use corro::gui::special_picker;
@@ -642,6 +643,159 @@ fn ratatui_and_gui_menus_enumerate_the_same_items() {
         assert_eq!(
             r, t,
             "menu mismatch: ratatui has {r:?} where the shared tree has {t:?}"
+        );
+    }
+}
+
+/// `prompt_action_write_target`: the overwrite-confirm gate for typed TUI
+/// paths. Existing files flag Some (ask), everything else None (proceed).
+#[test]
+fn overwrite_gate_flags_existing_files_only() {
+    let dir = std::env::temp_dir().join(format!("corro_ow_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let existing = dir.join("w.corro");
+    std::fs::write(&existing, "SET $1:A1 1\n").unwrap();
+    let missing = dir.join("nope.corro");
+    let es = existing.to_string_lossy().into_owned();
+    let ms = missing.to_string_lossy().into_owned();
+
+    for action in [
+        "save_as",
+        "export_tsv",
+        "export_csv",
+        "export_ods",
+        "export_ascii",
+        "export_all",
+    ] {
+        assert_eq!(
+            prompt_action_write_target(action, &es),
+            Some(existing.clone()),
+            "{action} onto an existing file must flag for confirm"
+        );
+        assert_eq!(
+            prompt_action_write_target(action, &ms),
+            None,
+            "{action} onto a missing path must proceed without confirm"
+        );
+        assert_eq!(
+            prompt_action_write_target(action, ""),
+            None,
+            "{action} with empty text (clipboard) must not confirm"
+        );
+        assert_eq!(
+            prompt_action_write_target(action, "   "),
+            None,
+            "{action} with blank text must not confirm"
+        );
+    }
+    // Non-writing actions never flag, even for existing files.
+    for action in ["open", "go_to_cell", "find", "rename_sheet", "save"] {
+        assert_eq!(
+            prompt_action_write_target(action, &es),
+            None,
+            "{action} never writes a file so must not confirm"
+        );
+    }
+    // A directory is not a file: no confirm (the write errors as before).
+    assert_eq!(
+        prompt_action_write_target("save_as", &dir.to_string_lossy()),
+        None,
+        "directories must not flag for confirm"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Save As / export typed paths must land on the format extension (a
+/// foreign-extension workbook won't reopen; a bare export name should
+/// still be a `.tsv`/`.csv`/...). GUI dialogs force/append the same way.
+#[test]
+fn prompt_paths_resolve_format_extensions() {
+    use corro::ui_core::{append_extension_if_missing as append, force_extension as force};
+    use std::path::Path;
+
+    // force_extension (Save As): always `.corro`, replacing foreign ext.
+    assert_eq!(force(Path::new("book"), "corro"), Path::new("book.corro"));
+    assert_eq!(force(Path::new("book.txt"), "corro"), Path::new("book.corro"));
+    assert_eq!(force(Path::new("book.corro"), "corro"), Path::new("book.corro"));
+    assert_eq!(
+        force(Path::new("/tmp/a.b/name.ods"), "corro"),
+        Path::new("/tmp/a.b/name.corro")
+    );
+
+    // append_extension_if_missing (exports): bare names get the ext,
+    // explicit extensions (even surprising ones) are respected.
+    assert_eq!(append(Path::new("out"), "tsv"), Path::new("out.tsv"));
+    assert_eq!(append(Path::new("out.csv"), "tsv"), Path::new("out.csv"));
+    assert_eq!(append(Path::new("out.ods"), "ods"), Path::new("out.ods"));
+
+    let dir = std::env::temp_dir().join(format!("corro-ext-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Save As with a bare name must create `<name>.corro` and record that
+    // path on the app (so a subsequent Ctrl+S targets the right file).
+    let mut app = seeded_app(None);
+    let bare_save = dir.join("noext");
+    run_prompt_action(&mut app, "save_as", bare_save.to_str().unwrap());
+    let saved = dir.join("noext.corro");
+    assert!(saved.is_file(), "save_as must force .corro (got status {:?})", app.core.status);
+    assert!(!bare_save.exists(), "the extensionless path must not be written");
+    assert_eq!(app.core.path.as_deref(), Some(saved.as_path()));
+
+    // Export with a bare name must create `<name>.tsv`.
+    let mut app2 = seeded_app(None);
+    app2.core.workbook.active_sheet_mut().grid.set(
+        &corro::grid::CellAddr::main(0, 0),
+        "7".into(),
+    );
+    let bare_export = dir.join("export");
+    run_prompt_action(&mut app2, "export_tsv", bare_export.to_str().unwrap());
+    let exported = dir.join("export.tsv");
+    assert!(exported.is_file(), "export must append .tsv (got {:?})", app2.core.status);
+    assert!(!std::fs::read_to_string(&exported).unwrap_or_default().is_empty());
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The GUI Open/Save/Export dialog filters must cover exactly what the
+/// loaders open and what the writers emit — otherwise a filtered dialog
+/// would hide a supported type (or suggest a bad extension). Guards the
+/// shared lists in `ui_core` against drift.
+#[test]
+fn dialog_filters_cover_loader_and_export_types() {
+    use corro::ui_core::{export_ext_for_action, ext_filter_label, SPREADSHEET_EXTS};
+
+    // Open filter: the 4 types `gui::load_initial` dispatches on.
+    assert_eq!(
+        SPREADSHEET_EXTS,
+        &["corro", "csv", "tsv", "ods"],
+        "Open filter must list exactly the loader-supported spreadsheet types"
+    );
+    // Each has a real human label (no generic fallback).
+    for ext in SPREADSHEET_EXTS {
+        assert_ne!(
+            ext_filter_label(ext),
+            "Files",
+            "spreadsheet type `{ext}` needs a specific filter label"
+        );
+    }
+
+    // Export mapping: action -> extension (tsv catch-all, incl. export_all).
+    for (action, want) in [
+        ("export_tsv", "tsv"),
+        ("export_csv", "csv"),
+        ("export_ods", "ods"),
+        ("export_ascii", "txt"),
+        ("export_all", "tsv"),
+    ] {
+        assert_eq!(
+            export_ext_for_action(action),
+            want,
+            "{action} must write .{want}"
+        );
+        assert_ne!(
+            ext_filter_label(export_ext_for_action(action)),
+            "Files",
+            "{action} extension needs a specific filter label"
         );
     }
 }

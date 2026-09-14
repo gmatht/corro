@@ -17,10 +17,19 @@ crossterm = { path = "vendor/crossterm" }
 # same targets. See vendor/*/ and tools/zig-cc-msvc586.
 pdcurses-sys = { path = "vendor/pdcurses-sys" }
 pancurses = { path = "vendor/pancurses" }
+# Win95 native GUI (nwg): upstream statically imports four APIs that do not
+# exist on Windows 95 (GetAncestor, MonitorFromWindow/GetMonitorInfoW,
+# CreateActCtxW/ActivateActCtx) plus, via the file-dialog feature, the Win7+
+# IFileDialog COM path (SHELL32!SHCreateItemFromParsingName). A single missing
+# static import makes the whole exe fail to load on 9x, so the vendored copy
+# replaces them with Win95 equivalents and switches the many *W APIs that Win9x
+# exports as no-op stubs to their ANSI implementations. See
+# vendor/native-windows-gui/README-WIN95.md.
+native-windows-gui = { path = "vendor/native-windows-gui" }
 
 [package]
 name = "corro"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 default-run = "corro"
 
@@ -34,6 +43,11 @@ wasm = ["dep:rswidgets"]
 pancurses = ["rswidgets/pancurses"]
 gtk = ["gui"]
 combined-gui = ["gui", "pancurses"]
+# Win95 GUI build: link the nwg GUI as a /SUBSYSTEM:WINDOWS exe (entered via
+# WinMain, no console window). The rust9x link flags live in build95-gui.sh;
+# this feature only selects the WinMain entry point in src/main.rs. Never
+# enable it for the console TUI builds.
+gui-subsystem = []
 # Converge corro's terminal spreadsheet view onto rustxWidgets
 # (backend-agnostic SpreadsheetModel), keeping `src/ui` as the reference fork.
 rswidgets-term = ["gui", "rswidgets/ratatui", "rswidgets/headless"]

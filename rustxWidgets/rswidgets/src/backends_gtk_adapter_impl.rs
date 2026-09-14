@@ -1194,9 +1194,39 @@ mod gtk_adapter {
 
     /// Opens a file save dialog and returns the selected file path.
     pub fn save_file(title: &str) -> Result<Option<String>, Error> {
+        save_file_filtered(title, &[], "")
+    }
+
+    /// Save dialog with file-type filters (`(name, patterns)` with patterns
+    /// like `*.corro`) and an optional suggested filename. No filters (or
+    /// missing loader symbols) degrades to the plain dialog; empty
+    /// suggested name leaves the entry blank.
+    pub fn save_file_filtered(title: &str, filters: &[(&str, &[&str])], current_name: &str) -> Result<Option<String>, Error> {
         let loader = crate::backends::gtk::loader()
             .ok_or_else(|| Error::Backend("GTK loader not initialized".into()))?;
         if let Ok(chooser) = unsafe { gtk_dynamic_loader::FileChooserNative::save(loader.clone(), title, std::ptr::null_mut()) } {
+            for (name, pats) in filters {
+                chooser.add_filter(name, pats);
+            }
+            if !current_name.is_empty() {
+                chooser.set_current_name(current_name);
+            }
+            if chooser.run() == -3 {
+                return Ok(chooser.get_filename());
+            }
+        }
+        Ok(None)
+    }
+
+    /// Open dialog with file-type filters (same semantics as
+    /// [`Self::save_file_filtered`], minus the suggested name).
+    pub fn open_file_filtered(title: &str, filters: &[(&str, &[&str])]) -> Result<Option<String>, Error> {
+        let loader = crate::backends::gtk::loader()
+            .ok_or_else(|| Error::Backend("GTK loader not initialized".into()))?;
+        if let Ok(chooser) = unsafe { gtk_dynamic_loader::FileChooserNative::open(loader.clone(), title, std::ptr::null_mut()) } {
+            for (name, pats) in filters {
+                chooser.add_filter(name, pats);
+            }
             if chooser.run() == -3 {
                 return Ok(chooser.get_filename());
             }
