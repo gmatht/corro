@@ -62,7 +62,9 @@ pub fn file_save_dialog_named(suggested: &str) -> Option<PathBuf> {
     return App::init().ok().and_then(|app| {
         app.save_file_filtered(
             "Save Spreadsheet",
-            &[("Corro workbooks (*.corro)", &["*.corro"])],
+            // Plain name only: join_dialog_filters appends " (*.corro)"
+            // itself, so embedding it here shows "(*.corro) (*.corro)".
+            &[(crate::ui_core::ext_filter_label("corro"), &["*.corro"].as_slice())],
             suggested,
         )
         .ok()
