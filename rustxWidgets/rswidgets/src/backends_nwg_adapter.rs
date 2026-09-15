@@ -2639,6 +2639,11 @@ mod nwg_adapter {
 
     /// Table mapping (hmenu_ptr, item_index) → stripped action name
     type MenuIndex = HashMap<(*mut std::ffi::c_void, u32), String>;
+    /// Table mapping WM_COMMAND item id → detailed action name. Menus are
+    /// supposed to report WM_MENUCOMMAND (MNS_NOTIFYBYPOS), but the ids
+    /// arrive as classic WM_COMMAND on some hosts — without this table
+    /// every menu item silently does nothing.
+    type MenuIdIndex = HashMap<u32, String>;
 
     pub struct MenuBar {
         pub(crate) _menus: Rc<Vec<nwg::Menu>>,
@@ -2701,6 +2706,7 @@ mod nwg_adapter {
         parent_handle: &nwg::ControlHandle,
         items: &[crate::backends::nwg::MenuItemData],
         index: &mut MenuIndex,
+        id_index: &mut MenuIdIndex,
         menus: &mut Vec<nwg::Menu>,
         items_collector: &mut Vec<nwg::MenuItem>,
     ) -> Result<(), nwg::NwgError> {
@@ -2719,7 +2725,7 @@ mod nwg_adapter {
                     _ => unreachable!(),
                 };
                 menus.push(sub);
-                build_and_index(&sub_handle, children, index, menus, items_collector)?;
+                build_and_index(&sub_handle, children, index, id_index, menus, items_collector)?;
             } else {
                 let mut mi = nwg::MenuItem::default();
                 nwg::MenuItem::builder()
@@ -2733,6 +2739,11 @@ mod nwg_adapter {
                 };
                 if !item.detailed_action.is_empty() {
                     index.insert((parent_hmenu as *mut c_void, i as u32), item.detailed_action.clone());
+                    // WM_COMMAND fallback: record the numeric id NWG
+                    // assigned so the classic path dispatches too.
+                    if let nwg::ControlHandle::MenuItem(_, id) = mi.handle {
+                        id_index.insert(id, item.detailed_action.clone());
+                    }
                 }
                 items_collector.push(mi);
             }
@@ -2761,6 +2772,7 @@ mod nwg_adapter {
     ) -> Result<MenuBar, Error> {
         let window_handle = nwg::ControlHandle::Hwnd(window_hwnd as _);
         let mut index: MenuIndex = HashMap::new();
+        let mut id_index: MenuIdIndex = HashMap::new();
         let data = as_nwg_data(&model.items);
         let mut menus: Vec<nwg::Menu> = Vec::new();
         let mut items: Vec<nwg::MenuItem> = Vec::new();
@@ -2781,7 +2793,7 @@ mod nwg_adapter {
                     menu_hmenu,
                 );
                 menus.push(menu);
-                build_and_index(&menu_handle, children, &mut index, &mut menus, &mut items)
+                build_and_index(&menu_handle, children, &mut index, &mut id_index, &mut menus, &mut items)
                     .map_err(|e| Error::Backend(format!("{}", e)))?;
             } else {
                 let mut mi = nwg::MenuItem::default();
@@ -2790,19 +2802,42 @@ mod nwg_adapter {
                     .parent(&window_handle)
                     .build(&mut mi)
                     .map_err(|e| Error::Backend(format!("{}", e)))?;
+                if let nwg::ControlHandle::MenuItem(_, id) = mi.handle {
+                    id_index.insert(id, item.detailed_action.clone());
+                }
                 items.push(mi);
             }
         }
 
-        // Bind raw event handler for WM_MENUCOMMAND
+        // Bind raw event handler for menu activation, both flavours:
+        // WM_MENUCOMMAND (MNS_NOTIFYBYPOS position reports) and the
+        // classic WM_COMMAND (numeric item id, lparam 0). Either one may
+        // arrive depending on host; without both, menu items silently
+        // do nothing on hosts that send the other.
         // handler_id must be > 0xFFFF (NWG reserves lower IDs)
         const RAW_MENU_ID: usize = 0x10001;
         let idx = index.clone();
+        let ids = id_index.clone();
         let reg = action_registry.clone();
+        let reg2 = action_registry.clone();
         let raw_handler = nwg::bind_raw_event_handler(
             &nwg::ControlHandle::Hwnd(window_hwnd as _),
             RAW_MENU_ID,
             move |_hwnd, msg, wparam, lparam| {
+                // Classic path: HIWORD 0 (menu, not accelerator), lparam 0
+                // (menu, not control). Controls also send WM_COMMAND, so
+                // never claim those.
+                if msg == winapi::um::winuser::WM_COMMAND && lparam == 0 {
+                    let id = (wparam & 0xFFFF) as u32;
+                    if let Some(action_name) = ids.get(&id) {
+                        let stripped = action_name.rsplit('.').next().unwrap_or(action_name);
+                        if let Some(cb) = reg2.borrow_mut().get_mut(stripped) {
+                            cb();
+                        }
+                        return Some(0);
+                    }
+                    return None;
+                }
                 if msg != winapi::um::winuser::WM_MENUCOMMAND { return None; }
                 let item_index = (wparam & 0xFFFF) as u32;
                 let hmenu = lparam as *mut c_void;
