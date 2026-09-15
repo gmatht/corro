@@ -383,6 +383,10 @@ mod nwg_adapter {
                     if msg == winapi::um::winuser::WM_SIZE {
                         let w = (l & 0xFFFF) as i32;
                         let h = ((l >> 16) & 0xFFFF) as i32;
+                        // Drop zero sizes (stale setup-storm leftovers; a
+                        // zero-size toplevel has nothing to lay out and the
+                        // next real size repairs). See the box handler below.
+                        if w <= 0 || h <= 0 { return None; }
                         if let Some(ref mut cb) = *cb.borrow_mut() {
                             cb(w, h);
                         }
@@ -820,6 +824,14 @@ mod nwg_adapter {
             // TEMPORARY Win95 diagnosis.
             #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
             mark95xy(b"layot", w, h);
+            // Negative/zero sizes arise transiently (a box laid out before
+            // its parent is sized, or a wrapped synthetic WM_SIZE). A
+            // negative size is never valid: SetWindowPos clamps it to 0
+            // (hiding the child) while the synthetic WM_SIZE below would
+            // wrap it to ~65526 and fling children off-screen. Clamp here
+            // so garbage layouts are harmless no-ops at the right place.
+            let w = w.max(0);
+            let h = h.max(0);
             let children = self.children.borrow();
             let vex = self.child_vexpand.borrow();
             let hex = self.child_hexpand.borrow();
@@ -915,20 +927,31 @@ mod nwg_adapter {
                     crate::backends::nwg::Orientation::Horizontal => (pos, 5),
                     crate::backends::nwg::Orientation::Vertical => (5, pos),
                 };
+                // Clamp the span: distribute_spans can return negatives
+                // when the box itself was laid out at/near zero size
+                // (avail = w - 10 < fixed total). A negative size must
+                // never reach SetWindowPos (Wine clamps to 0, hiding the
+                // child) nor the synthetic WM_SIZE below (it would wrap
+                // to ~65526 and fling nested children off-screen).
+                let (cw, ch) = (cw.max(0), ch.max(0));
                 set_window_pos(child, cx, cy, cw, ch);
                 // Airtight cascade: SetWindowPos only delivers WM_SIZE when
                 // the size actually changed, so a nested box that keeps its
                 // size would never re-lay-out its own children (the cram
                 // failure). Synthesize WM_SIZE unconditionally — leaf
                 // controls ignore it, nested boxes re-run their layout.
-                unsafe {
-                    let l = ((ch & 0xFFFF) << 16) | (cw & 0xFFFF);
-                    winapi::um::winuser::SendMessageW(
-                        child as _,
-                        winapi::um::winuser::WM_SIZE,
-                        0,
-                        l as _,
-                    );
+                // Guard: a zero-size child has nothing to lay out, and
+                // packing a non-positive size would wrap (see above).
+                if cw > 0 && ch > 0 {
+                    unsafe {
+                        let l = ((ch & 0xFFFF) << 16) | (cw & 0xFFFF);
+                        winapi::um::winuser::SendMessageW(
+                            child as _,
+                            winapi::um::winuser::WM_SIZE,
+                            0,
+                            l as _,
+                        );
+                    }
                 }
             }
         }
@@ -1015,6 +1038,13 @@ mod nwg_adapter {
                     if msg == winapi::um::winuser::WM_SIZE {
                         let w = (l & 0xFFFF) as i32;
                         let h = ((l >> 16) & 0xFFFF) as i32;
+                        // A zero-size box has nothing to lay out, and these
+                        // arrive as stale queue leftovers from the un-pumped
+                        // setup storm (pump_events is a no-op on Windows):
+                        // honoring them crushes children to 0 and the white
+                        // screen never repairs (nothing re-invalidates).
+                        // The next real (non-zero) size re-runs layout.
+                        if w <= 0 || h <= 0 { return None; }
                         bw2.layout(0, 0, w, h);
                     }
                     None
@@ -1220,19 +1250,27 @@ mod nwg_adapter {
     pub fn create_entry(parent: *mut c_void) -> Result<Entry, Error> {
         let (inner, changed_cb, handler) = crate::backends::nwg::create_entry(parent)
             .map_err(|e| Error::Backend(format!("{}", e)))?;
+        #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+        mark95a(b"a-e0\n");
         let focus_in_cb: Rc<RefCell<Option<Box<dyn FnMut(*mut c_void) -> i32>>>> = Rc::new(RefCell::new(None));
         let focus_out_cb: Rc<RefCell<Option<Box<dyn FnMut(*mut c_void) -> i32>>>> = Rc::new(RefCell::new(None));
         let key_cb: Rc<RefCell<Option<Box<dyn FnMut(u32, u32) -> bool>>>> = Rc::new(RefCell::new(None));
         let activate_cb: Rc<RefCell<Option<Box<dyn FnMut(*mut c_void)>>>> =
             Rc::new(RefCell::new(None));
         let hwnd = inner.handle.hwnd().unwrap_or(std::ptr::null_mut());
+        #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+        mark95xy(b"a-hwn", hwnd as i32, 0);
         if hwnd != std::ptr::null_mut() {
             unsafe {
                 let ex = winapi::um::winuser::GetWindowLongW(
                     hwnd as _, winapi::um::winuser::GWL_EXSTYLE);
+                #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+                mark95xy(b"a-exs", ex, 0);
                 winapi::um::winuser::SetWindowLongW(
                     hwnd as _, winapi::um::winuser::GWL_EXSTYLE,
                     ex | winapi::um::winuser::WS_EX_CLIENTEDGE as i32);
+                #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+                mark95a(b"a-slw\n");
                 winapi::um::winuser::SetWindowPos(
                     hwnd as _, std::ptr::null_mut(), 0, 0, 0, 0,
                     winapi::um::winuser::SWP_NOMOVE | winapi::um::winuser::SWP_NOSIZE
@@ -1240,6 +1278,8 @@ mod nwg_adapter {
             }
         }
 
+        #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+        mark95a(b"a-e1\n");
         let _focus_in_handler = if hwnd != std::ptr::null_mut() {
             let cb = focus_in_cb.clone();
             static FOCUS_IN_ID: AtomicUsize = AtomicUsize::new(0x40000000);
@@ -1255,6 +1295,8 @@ mod nwg_adapter {
             ).ok()
         } else { None };
 
+        #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+        mark95a(b"a-e2\n");
         let _focus_out_handler = if hwnd != std::ptr::null_mut() {
             let cb = focus_out_cb.clone();
             static FOCUS_OUT_ID: AtomicUsize = AtomicUsize::new(0x50000000);
@@ -1270,6 +1312,8 @@ mod nwg_adapter {
             ).ok()
         } else { None };
 
+        #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+        mark95a(b"a-e3\n");
         let _key_handler = if hwnd != std::ptr::null_mut() {
             let kc = key_cb.clone();
             let act = activate_cb.clone();
@@ -1373,6 +1417,8 @@ mod nwg_adapter {
             ).ok()
         } else { None };
 
+        #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+        mark95a(b"a-e4\n");
         Ok(Entry { hwnd: hwnd as *mut c_void, inner: Rc::new(inner), _handler: Rc::new(handler), changed_cb, focus_in_cb, focus_out_cb, _focus_in_handler, _focus_out_handler, key_cb, _key_handler, activate_cb, pos_x: std::cell::Cell::new(0), pos_y: std::cell::Cell::new(0) })
     }
 
@@ -2441,6 +2487,11 @@ mod nwg_adapter {
                         winapi::um::winuser::GetClientRect(c_hwnd as _, &mut rect);
                         let w = rect.right;
                         let h = rect.bottom;
+                        // Drop zero sizes (stale setup-storm leftovers):
+                        // resizing the canvas to 0x0 would silence its
+                        // WM_PAINT forever (empty update region, nothing
+                        // re-invalidates). The next real size repairs.
+                        if w <= 0 || h <= 0 { return None; }
                         let scroll_w = 20i32;
                         let scroll_h = 20i32;
                         if let Ok(sb) = vscroll_sz.try_borrow() {
