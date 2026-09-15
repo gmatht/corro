@@ -107,6 +107,110 @@ fn argv0_ui(program: &str) -> Option<UiKind> {
     None
 }
 
+/// Windows console attach for GUI-subsystem launches (MSIX/Store builds).
+///
+/// A GUI-subsystem exe is born console-less even when started from a
+/// terminal. When the user wants a TUI anyway, AttachConsole claims the
+/// parent's console; success is also the "launched in a console" signal
+/// (a GetConsoleWindow-style check alone always reports NULL here, since a
+/// GUI-subsystem process starts detached). AttachConsole/AllocConsole are
+/// NT+ only and must stay out of the Win95 (rust9x) builds, hence the gate
+/// (raw declarations, no new dependencies).
+#[cfg(all(target_os = "windows", not(target_family = "rust9x")))]
+mod wincon {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn AttachConsole(dwProcessId: u32) -> i32;
+        fn FreeConsole() -> i32;
+        fn AllocConsole() -> i32;
+        fn GetStdHandle(nStdHandle: i32) -> *mut std::ffi::c_void;
+        fn GetConsoleMode(
+            hConsoleHandle: *mut std::ffi::c_void,
+            lpMode: *mut u32,
+        ) -> i32;
+    }
+    pub const ATTACH_PARENT_PROCESS: u32 = 0xFFFF_FFFF;
+    const STD_INPUT_HANDLE: i32 = -10;
+    const STD_OUTPUT_HANDLE: i32 = -11;
+
+    /// Claim the parent's console. True = launched from a console
+    /// (Explorer/tile/Run launches have no parent console: false).
+    pub fn attach_parent() -> bool {
+        unsafe { AttachConsole(ATTACH_PARENT_PROCESS) != 0 }
+    }
+    pub fn detach() {
+        unsafe {
+            FreeConsole();
+        }
+    }
+    /// Pop a fresh console window (tile/Run launches with explicit TUI).
+    pub fn alloc() -> bool {
+        unsafe { AllocConsole() != 0 }
+    }
+    fn handle_is_console(std: i32) -> bool {
+        unsafe {
+            let h = GetStdHandle(std);
+            if h.is_null() {
+                return false;
+            }
+            let mut mode = 0u32;
+            GetConsoleMode(h, &mut mode) != 0
+        }
+    }
+    /// stdio are live console handles (not redirected to file/pipe/nul).
+    /// Guards scripting: `gcorro --help > out.txt` from a console must not
+    /// flip into the TUI just because a parent console exists.
+    pub fn stdio_is_console() -> bool {
+        handle_is_console(STD_INPUT_HANDLE) && handle_is_console(STD_OUTPUT_HANDLE)
+    }
+}
+
+/// Headless-launch fallback for Unix desktops (pure; inputs are parameters
+/// so the table is unit-testable). A terminal UI with stdio on /dev/null
+/// (double-clicked in a file manager, launched without a terminal) can only
+/// die, so with no explicit --flag, no argv[0] request, and no terminal on
+/// stdio, a GUI-capable build opens the GUI instead. Explicit choices
+/// (flags and argv[0] names) are honored untouched.
+fn resolve_headless_default(
+    ui: UiKind,
+    explicit: bool,
+    argv0_matched: bool,
+    has_tty: bool,
+    gui_fallback: Option<UiKind>,
+) -> UiKind {
+    if explicit || argv0_matched || has_tty {
+        return ui;
+    }
+    gui_fallback.unwrap_or(ui)
+}
+
+/// Console-vs-GUI default resolution (pure: FFI inputs are parameters so the
+/// table is unit-testable on any host). Returns (ui, keep_attached).
+///
+/// - An explicit --gui/--ratatui/--pancurses flag always wins.
+/// - Otherwise, launched-in-a-console with live console stdio defaults to
+///   the terminal UI (`tui_default`: caller's first compiled-in TUI).
+/// - Otherwise the argv[0]/compiled default stands; an unneeded attachment
+///   is released (second element false = caller should FreeConsole).
+fn resolve_console_default(
+    ui: UiKind,
+    explicit: bool,
+    attached: bool,
+    stdio_console: bool,
+    tui_default: Option<UiKind>,
+) -> (UiKind, bool) {
+    if explicit {
+        // Caller ensures a console exists for an explicit TUI request.
+        return (ui, attached);
+    }
+    if attached && stdio_console {
+        if let Some(tui) = tui_default {
+            return (tui, true);
+        }
+    }
+    (ui, false)
+}
+
 #[cfg(not(all(target_family = "rust9x", target_env = "msvc")))]
 fn cli_args() -> impl Iterator<Item = String> {
     std::env::args().skip(1)
@@ -160,13 +264,22 @@ fn parse_args() -> Result<Args, String> {
     let mut show_help = false;
     let mut show_version = false;
     let debug_no_number = false;
+    // Whether --gui/--ratatui/--pancurses explicitly chose the UI (always
+    // wins over argv[0] and over the Windows console-launch default below).
+    // Modern-Windows-only input: other targets never read it.
+    #[cfg(any(all(target_os = "windows", not(target_family = "rust9x")), all(target_family = "unix", not(target_arch = "wasm32"))))]
+    let mut ui_explicit = false;
+    // (argv0_matched records whether the name itself requested a UI; the
+    // Unix headless fallback honors a name match like an explicit choice.)
+    // argv[0] dispatch comes first so explicit flags below can override
+    // it; a non-matching or uncompiled name falls back to the default.
+    // argv0 outlives this block: the Unix headless fallback below re-reads
+    // it to honor a name match like an explicit choice.
+    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+    let argv0 = win95_args().into_iter().next();
+    #[cfg(not(all(target_family = "rust9x", target_env = "msvc")))]
+    let argv0 = std::env::args().next();
     let mut ui = {
-        // argv[0] dispatch comes first so explicit flags below can override
-        // it; a non-matching or uncompiled name falls back to the default.
-        #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
-        let argv0 = win95_args().into_iter().next();
-        #[cfg(not(all(target_family = "rust9x", target_env = "msvc")))]
-        let argv0 = std::env::args().next();
         argv0
             .as_deref()
             .and_then(argv0_ui)
@@ -205,18 +318,24 @@ fn parse_args() -> Result<Args, String> {
                 movie = true;
             }
             "--ratatui" => {
+                #[cfg(any(all(target_os = "windows", not(target_family = "rust9x")), all(target_family = "unix", not(target_arch = "wasm32"))))]
+                { ui_explicit = true; }
                 #[cfg(feature = "ratatui")]
                 { ui = UiKind::Ratatui; }
                 #[cfg(not(feature = "ratatui"))]
                 { return Err("ratatui UI not compiled in; rebuild with --features ratatui".into()); }
             }
             "--gui" => {
+                #[cfg(any(all(target_os = "windows", not(target_family = "rust9x")), all(target_family = "unix", not(target_arch = "wasm32"))))]
+                { ui_explicit = true; }
                 #[cfg(feature = "gui")]
                 { ui = UiKind::Gui; }
                 #[cfg(not(feature = "gui"))]
                 { return Err("GTK GUI not compiled in; rebuild with --features gui".into()); }
             }
             "--pancurses" => {
+                #[cfg(any(all(target_os = "windows", not(target_family = "rust9x")), all(target_family = "unix", not(target_arch = "wasm32"))))]
+                { ui_explicit = true; }
                 #[cfg(feature = "pancurses")]
                 { ui = UiKind::Pancurses; }
                 #[cfg(not(feature = "pancurses"))]
@@ -239,6 +358,72 @@ fn parse_args() -> Result<Args, String> {
     }
 
     let files = positional.into_iter().map(PathBuf::from).collect();
+
+    // Unix headless-launch fallback (no attach step exists here: stdio is
+    // always inherited, so a missing terminal means stdio is /dev/null).
+    // Double-clicked from a file manager with no UI choice, a GUI-capable
+    // build opens the GUI instead of dying on dead stdio. Explicit flags
+    // and argv[0] names are honored untouched.
+    #[cfg(all(target_family = "unix", not(target_arch = "wasm32")))]
+    {
+        #[cfg(feature = "gui")]
+        let gui_fallback = Some(UiKind::Gui);
+        #[cfg(not(feature = "gui"))]
+        let gui_fallback: Option<UiKind> = None;
+        // SAFETY: isatty takes a raw fd, no retained state; -1 impossible
+        // here (constants), return is a plain 0/1 boolean.
+        let has_tty = unsafe {
+            libc::isatty(libc::STDIN_FILENO) != 0 && libc::isatty(libc::STDOUT_FILENO) != 0
+        };
+        let argv0_matched = argv0.as_deref().and_then(argv0_ui).is_some();
+        ui = resolve_headless_default(ui, ui_explicit, argv0_matched, has_tty, gui_fallback);
+    }
+
+    // Windows console handling (modern Windows only; Win95 builds are
+    // separate console/GUI exes and never reach this). A GUI-subsystem
+    // launch (e.g. the MSIX build) starts detached: without this block a
+    // TUI request fails silently on dead console handles.
+    #[cfg(all(target_os = "windows", not(target_family = "rust9x")))]
+    {
+        #[cfg(feature = "ratatui")]
+        let tui_default = Some(UiKind::Ratatui);
+        #[cfg(all(not(feature = "ratatui"), feature = "pancurses"))]
+        let tui_default = Some(UiKind::Pancurses);
+        #[cfg(all(not(feature = "ratatui"), not(feature = "pancurses")))]
+        let tui_default: Option<UiKind> = None;
+        if ui_explicit && matches!(ui, UiKind::Ratatui | UiKind::Pancurses) {
+            // Explicit TUI: guarantee a console. From a terminal the
+            // attach makes console APIs work; with no parent console
+            // (tile/Run dialog) pop a fresh window instead of dying
+            // silently on dead handles.
+            if !(wincon::attach_parent() || wincon::alloc()) {
+                return Err("no console available for the terminal UI".into());
+            }
+        } else if !ui_explicit {
+            // No explicit choice: a claimed parent console with live
+            // console stdio means "launched in a console" -> default to
+            // the TUI instead of popping a GUI window. Explorer/tile
+            // launches (no parent console) and redirected stdio
+            // (scripting) keep the argv[0]/compiled default.
+            let attached = wincon::attach_parent();
+            let (new_ui, keep) = resolve_console_default(
+                ui,
+                false,
+                attached,
+                if attached {
+                    wincon::stdio_is_console()
+                } else {
+                    false
+                },
+                tui_default,
+            );
+            ui = new_ui;
+            if attached && !keep {
+                wincon::detach();
+            }
+        }
+        // Explicit --gui (or anything else explicit): untouched, detached.
+    }
 
     Ok(Args {
         revision,
@@ -302,8 +487,99 @@ pub extern "system" fn WinMain(
     _cmd_line: *mut u8,
     _show_cmd: i32,
 ) -> i32 {
+    // TEMPORARY Win95 diagnosis: startup progression markers.
+    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+    unsafe {
+        mark95(b"winmain\n");
+    }
+    // TEMPORARY Win95 diagnosis: route panic messages to the log file so the
+    // aborting unwrap/expect identifies itself (GUI has no console).
+    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+    win9x_redirect_console_output();
+    // TEMPORARY Win95 diagnosis: raw panic hook (default hook dies in TLS).
+    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+    install_raw_panic_hook95();
     corro_main();
     0
+}
+
+/// TEMPORARY Win95 diagnosis: panic hook that records the panic site via raw
+/// CreateFileA (no std::fs, no TLS, no heap-alloc in the write path — the
+/// default hook dies in thread-local storage on 9x, masking the real site).
+#[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+fn install_raw_panic_hook95() {
+    use std::os::raw::c_void;
+    struct SliceW<'a> { b: &'a mut [u8], p: usize }
+    impl<'a> core::fmt::Write for SliceW<'a> {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let n = s.len().min(self.b.len().saturating_sub(self.p));
+            self.b[self.p..self.p + n].copy_from_slice(&s.as_bytes()[..n]);
+            self.p += n;
+            Ok(())
+        }
+    }
+    std::panic::set_hook(Box::new(|info| {
+        unsafe extern "system" {
+            fn CreateFileA(name: *const u8, access: u32, share: u32, sa: *mut c_void,
+                disp: u32, flags: u32, tmpl: *mut c_void) -> *mut c_void;
+            fn SetFilePointer(h: *mut c_void, lo: i32, hi: *mut i32, how: u32) -> u32;
+            fn WriteFile(h: *mut c_void, buf: *const u8, len: u32, w: *mut u32, ov: *mut c_void) -> i32;
+            fn CloseHandle(h: *mut c_void) -> i32;
+        }
+        let mut buf = [0u8; 768];
+        let mut w = SliceW { b: &mut buf, p: 0 };
+        {
+            use core::fmt::Write as _;
+            let _ = write!(w, "PANIC ");
+            if let Some(loc) = info.location() {
+                let _ = write!(w, "{}:{}:{} ", loc.file(), loc.line(), loc.column());
+            }
+            // (rust9x std predates PanicHookInfo::message; use payload.)
+            let pl = info.payload();
+            if let Some(s) = pl.downcast_ref::<&str>() {
+                let _ = write!(w, "{}", s);
+            } else if let Some(s) = pl.downcast_ref::<String>() {
+                let _ = write!(w, "{}", s);
+            } else {
+                let _ = write!(w, "<non-string payload>");
+            }
+            let _ = write!(w, "\n");
+        }
+        let n = w.p;
+        unsafe {
+            let h = CreateFileA(b"c:\\panic95.log\0".as_ptr(), 0x4000_0000, 1,
+                std::ptr::null_mut(), 4, 0x80, std::ptr::null_mut());
+            if !h.is_null() && h as isize != -1 {
+                SetFilePointer(h, 0, std::ptr::null_mut(), 2);
+                let mut wr = 0u32;
+                WriteFile(h, buf.as_ptr(), n as u32, &mut wr, std::ptr::null_mut());
+                CloseHandle(h);
+            }
+        }
+    }));
+}
+
+/// TEMPORARY Win95 diagnosis: append bytes to c:\gcorro.log via raw
+/// CreateFileA (std::fs is broken on 9x: CreateFileW stub, error 120).
+#[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+unsafe fn mark95(s: &[u8]) {
+    use std::os::raw::c_void;
+    unsafe extern "system" {
+        fn CreateFileA(name: *const u8, access: u32, share: u32, sa: *mut c_void,
+            disp: u32, flags: u32, tmpl: *mut c_void) -> *mut c_void;
+        fn SetFilePointer(h: *mut c_void, lo: i32, hi: *mut i32, how: u32) -> u32;
+        fn WriteFile(h: *mut c_void, buf: *const u8, len: u32, w: *mut u32, ov: *mut c_void) -> i32;
+        fn CloseHandle(h: *mut c_void) -> i32;
+    }
+    let h = CreateFileA(b"c:\\gcorro.log\0".as_ptr(), 0x4000_0000, 1,
+        std::ptr::null_mut(), 4, 0x80, std::ptr::null_mut());
+    if h.is_null() || h as isize == -1 {
+        return;
+    }
+    SetFilePointer(h, 0, std::ptr::null_mut(), 2);
+    let mut w = 0u32;
+    WriteFile(h, s.as_ptr(), s.len() as u32, &mut w, std::ptr::null_mut());
+    CloseHandle(h);
 }
 
 // Windows 9x only: std's console layer writes through WriteConsoleW, a no-op
@@ -668,6 +944,10 @@ fn cli_help_text() -> String {
     { ui_opts.push_str("  (invoked as pcorro* defaults to pancurses)\n"); }
     #[cfg(feature = "gui")]
     { ui_opts.push_str("  (invoked as gcorro* defaults to the GUI)\n"); }
+    #[cfg(all(target_os = "windows", not(target_family = "rust9x")))]
+    { ui_opts.push_str("  (a console launch with no UI flag defaults to the terminal UI)\n"); }
+    #[cfg(all(target_family = "unix", not(target_arch = "wasm32")))]
+    { ui_opts.push_str("  (a terminal-less launch with no UI flag defaults to the GUI)\n"); }
     format!(
         "corro {}\n\
 \n\
@@ -789,8 +1069,101 @@ fn export_workbook_to_path(
 
 #[cfg(test)]
 mod tests {
-    use super::{Args, RevisionMode};
+    use super::{resolve_console_default, resolve_headless_default, Args, RevisionMode, UiKind};
     use std::path::PathBuf;
+
+    // resolve_console_default decision table (pure; the AttachConsole /
+    // GetConsoleMode inputs are parameters so this runs on any host).
+    #[test]
+    fn console_launch_defaults_to_tui() {
+        // gcorro-named, no flag, parent console + live stdio -> TUI.
+        let (ui, keep) =
+            resolve_console_default(UiKind::Gui, false, true, true, Some(UiKind::Ratatui));
+        assert_eq!(ui, UiKind::Ratatui);
+        assert!(keep);
+    }
+
+    #[test]
+    fn explicit_flag_always_wins() {
+        // --gui from a console stays GUI (but keeps the attachment).
+        let (ui, keep) =
+            resolve_console_default(UiKind::Gui, true, true, true, Some(UiKind::Ratatui));
+        assert_eq!(ui, UiKind::Gui);
+        assert!(keep);
+        // Explicit TUI from a tile keeps the request; caller allocs.
+        let (ui, _) =
+            resolve_console_default(UiKind::Ratatui, true, false, false, Some(UiKind::Ratatui));
+        assert_eq!(ui, UiKind::Ratatui);
+    }
+
+    #[test]
+    fn tile_and_redirected_launches_stay_gui() {
+        // No parent console (tile/Explorer): GUI, nothing to release.
+        let (ui, keep) =
+            resolve_console_default(UiKind::Gui, false, false, false, Some(UiKind::Ratatui));
+        assert_eq!(ui, UiKind::Gui);
+        assert!(!keep);
+        // Parent console exists but stdio redirected (scripting): GUI and
+        // release the unneeded attachment.
+        let (ui, keep) =
+            resolve_console_default(UiKind::Gui, false, true, false, Some(UiKind::Ratatui));
+        assert_eq!(ui, UiKind::Gui);
+        assert!(!keep);
+    }
+
+    #[test]
+    fn no_tui_compiled_keeps_gui() {
+        // Pure-GUI build in a console: nothing to switch to, detach.
+        let (ui, keep) = resolve_console_default(UiKind::Gui, false, true, true, None);
+        assert_eq!(ui, UiKind::Gui);
+        assert!(!keep);
+    }
+
+    #[test]
+    fn pancurses_fallback_when_ratatui_absent() {
+        let (ui, keep) =
+            resolve_console_default(UiKind::Gui, false, true, true, Some(UiKind::Pancurses));
+        assert_eq!(ui, UiKind::Pancurses);
+        assert!(keep);
+    }
+
+    // resolve_headless_default table (Unix desktops; also pure).
+    #[test]
+    fn headless_launch_defaults_to_gui() {
+        // No flag, neutral name, no tty, GUI compiled -> GUI.
+        assert_eq!(
+            resolve_headless_default(UiKind::Ratatui, false, false, false, Some(UiKind::Gui)),
+            UiKind::Gui
+        );
+    }
+
+    #[test]
+    fn headless_honors_explicit_choices() {
+        // Explicit --ratatui with piped stdio stays a TUI attempt.
+        assert_eq!(
+            resolve_headless_default(UiKind::Ratatui, true, false, false, Some(UiKind::Gui)),
+            UiKind::Ratatui
+        );
+        // pcorro-named binary double-clicked: the name wins, GUI ignored.
+        assert_eq!(
+            resolve_headless_default(UiKind::Pancurses, false, true, false, Some(UiKind::Gui)),
+            UiKind::Pancurses
+        );
+    }
+
+    #[test]
+    fn tty_or_gui_less_stays_put() {
+        // Terminal present: default stands.
+        assert_eq!(
+            resolve_headless_default(UiKind::Ratatui, false, false, true, Some(UiKind::Gui)),
+            UiKind::Ratatui
+        );
+        // Headless with no GUI compiled: nothing to fall back to.
+        assert_eq!(
+            resolve_headless_default(UiKind::Ratatui, false, false, false, None),
+            UiKind::Ratatui
+        );
+    }
 
     #[test]
     fn parses_revision_limit() {

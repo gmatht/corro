@@ -18,6 +18,48 @@ mod nwg_adapter {
         }
     }
 
+    // TEMPORARY Win95 diagnosis: raw file marker (std::fs broken on 9x).
+    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+    fn mark95a(s: &[u8]) {
+        unsafe {
+            extern "system" {
+                fn CreateFileA(name: *const u8, access: u32, share: u32,
+                    sa: *mut c_void, disp: u32, flags: u32,
+                    tmpl: *mut c_void) -> *mut c_void;
+                fn SetFilePointer(h: *mut c_void, lo: i32, hi: *mut i32, how: u32) -> u32;
+                fn WriteFile(h: *mut c_void, buf: *const u8, len: u32, w: *mut u32,
+                    ov: *mut c_void) -> i32;
+                fn CloseHandle(h: *mut c_void) -> i32;
+            }
+            let h = CreateFileA(b"c:\\gcorro.log\0".as_ptr(), 0x4000_0000, 1,
+                std::ptr::null_mut(), 4, 0x80, std::ptr::null_mut());
+            if !h.is_null() && h as isize != -1 {
+                SetFilePointer(h, 0, std::ptr::null_mut(), 2);
+                let mut w = 0u32;
+                WriteFile(h, s.as_ptr(), s.len() as u32, &mut w, std::ptr::null_mut());
+                CloseHandle(h);
+            }
+        }
+    }
+
+    // TEMPORARY Win95 diagnosis: log a label + two i32s as hex.
+    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+    fn mark95xy(tag: &[u8; 5], a: i32, b: i32) {
+        let hx = b"0123456789abcdef";
+        let mut s = [0u8; 32];
+        let mut p = 0;
+        for i in 0..5 { s[p] = tag[i]; p += 1; }
+        s[p] = b' '; p += 1;
+        for v in [a as u32, b as u32] {
+            for sh in [28u32, 24, 20, 16, 12, 8, 4, 0] {
+                s[p] = hx[((v >> sh) & 0xf) as usize]; p += 1;
+            }
+            s[p] = b' '; p += 1;
+        }
+        s[p] = b'\n'; p += 1;
+        mark95a(&s[..p]);
+    }
+
     /// Translate a WM_KEYDOWN wParam (raw Win32 virtual-key code) for the
     /// app key callback, honouring Shift/CapsLock and the active keyboard
     /// layout (Shift+9 is '(' on US layouts, not '9'; Shift+letter gives
@@ -297,6 +339,9 @@ mod nwg_adapter {
                     winapi::um::winuser::GetClientRect(hwnd, &mut rect);
                     let w = rect.right - rect.left;
                     let h = rect.bottom - rect.top;
+                    // TEMPORARY Win95 diagnosis.
+                    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+                    mark95xy(b"pres ", w, h);
                     if let Some(ref mut cb) = *self.layout_cb.borrow_mut() {
                         cb(w, h);
                     }
@@ -444,6 +489,29 @@ mod nwg_adapter {
                     &nwg::ControlHandle::Hwnd(hwnd), cid,
                     move |_h, msg, _w, _l| {
                         if msg == winapi::um::winuser::WM_CLOSE {
+                            // TEMPORARY Win95 diagnosis.
+                            #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+                            unsafe {
+                                extern "system" {
+                                    fn CreateFileA(name: *const u8, access: u32, share: u32,
+                                        sa: *mut std::os::raw::c_void, disp: u32, flags: u32,
+                                        tmpl: *mut std::os::raw::c_void) -> *mut std::os::raw::c_void;
+                                    fn SetFilePointer(h: *mut std::os::raw::c_void, lo: i32,
+                                        hi: *mut i32, how: u32) -> u32;
+                                    fn WriteFile(h: *mut std::os::raw::c_void, buf: *const u8,
+                                        len: u32, w: *mut u32, ov: *mut std::os::raw::c_void) -> i32;
+                                    fn CloseHandle(h: *mut std::os::raw::c_void) -> i32;
+                                }
+                                let h = CreateFileA(b"c:\\gcorro.log\0".as_ptr(), 0x4000_0000, 1,
+                                    std::ptr::null_mut(), 4, 0x80, std::ptr::null_mut());
+                                if !h.is_null() && h as isize != -1 {
+                                    SetFilePointer(h, 0, std::ptr::null_mut(), 2);
+                                    let mut w = 0u32;
+                                    let s = b"got-close\n";
+                                    WriteFile(h, s.as_ptr(), s.len() as u32, &mut w, std::ptr::null_mut());
+                                    CloseHandle(h);
+                                }
+                            }
                             if let Some(ref mut f) = *cb.borrow_mut() {
                                 f();
                             }
@@ -749,6 +817,9 @@ mod nwg_adapter {
             self.request_layout();
         }
         pub fn layout(&self, _x: i32, _y: i32, w: i32, h: i32) {
+            // TEMPORARY Win95 diagnosis.
+            #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+            mark95xy(b"layot", w, h);
             let children = self.children.borrow();
             let vex = self.child_vexpand.borrow();
             let hex = self.child_hexpand.borrow();

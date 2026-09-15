@@ -42,7 +42,7 @@ ARGS=()
 PANCURSES=0
 for a in "$@"; do
   case "$a" in
-    --release) ARGS+=(--profile release); PROFILE=release ;;
+    --release) PROFILE=release ;;
     --pancurses) PANCURSES=1 ;;
     *) ARGS+=("$a") ;;
   esac

@@ -13,9 +13,27 @@ use std::sync::atomic::{AtomicU32, Ordering};
 static MENU_ITEMS_ID: AtomicU32 = AtomicU32::new(CUSTOM_ID_BEGIN); 
 
 
+/// Win95 patch: AppendMenuW is a stub on Windows 95, so menu items added
+/// with it never appear (empty menu bar). Route through AppendMenuA with
+/// lossy ANSI text on rust9x-msvc; other targets keep the UTF-16 path.
+#[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+unsafe fn append_menu95(h: HMENU, flags: UINT, id: usize, s: &str) {
+    use winapi::um::winuser::AppendMenuA;
+    let mut b: Vec<u8> = s.bytes().map(|c| if c == 0 { b'?' } else { c }).collect();
+    b.push(0);
+    AppendMenuA(h, flags, id, b.as_ptr() as *const i8);
+}
+
+#[cfg(not(all(target_family = "rust9x", target_env = "msvc")))]
+unsafe fn append_menu95(h: HMENU, flags: UINT, id: usize, s: &str) {
+    use winapi::um::winuser::AppendMenuW;
+    let t = to_utf16(s);
+    AppendMenuW(h, flags, id, t.as_ptr());
+}
+
 /// Build a system menu
 pub unsafe fn build_hmenu_control(text: Option<String>, item: bool, separator: bool, popup: bool, hmenu: Option<HMENU>, hwnd: Option<HWND>) -> Result<ControlHandle, NwgError> {
-    use winapi::um::winuser::{CreateMenu, CreatePopupMenu, GetMenu, SetMenu, DrawMenuBar, AppendMenuW};
+    use winapi::um::winuser::{CreateMenu, CreatePopupMenu, GetMenu, SetMenu, DrawMenuBar};
     use winapi::um::winuser::{MF_STRING, MF_POPUP};
 
     if separator {
@@ -47,7 +65,7 @@ pub unsafe fn build_hmenu_control(text: Option<String>, item: bool, separator: b
     let mut flags = MF_STRING;
     if !item { flags |= MF_POPUP; }
 
-    let text = to_utf16(text.unwrap_or("".to_string()).as_ref());
+    let label: String = text.unwrap_or("".to_string());
 
     if hwnd.is_some() {
         let hwnd = hwnd.unwrap();
@@ -62,7 +80,7 @@ pub unsafe fn build_hmenu_control(text: Option<String>, item: bool, separator: b
         if item {
             menu = menubar;
             item_id = MENU_ITEMS_ID.fetch_add(1, Ordering::SeqCst);
-            AppendMenuW(menubar, flags, item_id as usize, text.as_ptr());
+            append_menu95(menubar, flags, item_id as usize, &label);
         } else {
             parent_menu = menubar;
             menu = CreateMenu();
@@ -70,7 +88,7 @@ pub unsafe fn build_hmenu_control(text: Option<String>, item: bool, separator: b
                 return Err(NwgError::menu_create("Menu without parent"));
             }
             use_menu_command(menu);
-            AppendMenuW(menubar, flags, mem::transmute(menu), text.as_ptr());
+            append_menu95(menubar, flags, mem::transmute(menu), &label);
         }
 
         // Draw the menu bar to make sure the changes are visible
@@ -81,7 +99,7 @@ pub unsafe fn build_hmenu_control(text: Option<String>, item: bool, separator: b
         if item {
             menu = parent;
             item_id = MENU_ITEMS_ID.fetch_add(1, Ordering::SeqCst);
-            AppendMenuW(parent, flags, item_id as usize, text.as_ptr());
+            append_menu95(parent, flags, item_id as usize, &label);
         } else {
             parent_menu = parent;
             menu = CreateMenu();
@@ -89,7 +107,7 @@ pub unsafe fn build_hmenu_control(text: Option<String>, item: bool, separator: b
                 return Err(NwgError::menu_create("Menu without parent"));
             }
             use_menu_command(menu);
-            AppendMenuW(parent, flags, mem::transmute(menu), text.as_ptr());
+            append_menu95(parent, flags, mem::transmute(menu), &label);
         }
     }
 

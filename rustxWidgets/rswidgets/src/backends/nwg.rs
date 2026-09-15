@@ -11,6 +11,28 @@ mod nwg_backend {
         pub(crate) current_parent: Rc<RefCell<Option<*mut c_void>>>,
     }
 
+    // TEMPORARY Win95 diagnosis: raw file marker (std::fs broken on 9x).
+    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+    unsafe fn mark95nwg(s: &[u8]) {
+        use std::os::raw::c_void as CV;
+        unsafe extern "system" {
+            fn CreateFileA(name: *const u8, access: u32, share: u32, sa: *mut CV,
+                disp: u32, flags: u32, tmpl: *mut CV) -> *mut CV;
+            fn SetFilePointer(h: *mut CV, lo: i32, hi: *mut i32, how: u32) -> u32;
+            fn WriteFile(h: *mut CV, buf: *const u8, len: u32, w: *mut u32, ov: *mut CV) -> i32;
+            fn CloseHandle(h: *mut CV) -> i32;
+        }
+        let h = CreateFileA(b"c:\\gcorro.log\0".as_ptr(), 0x4000_0000, 1,
+            std::ptr::null_mut(), 4, 0x80, std::ptr::null_mut());
+        if h.is_null() || h as isize == -1 {
+            return;
+        }
+        SetFilePointer(h, 0, std::ptr::null_mut(), 2);
+        let mut w = 0u32;
+        WriteFile(h, s.as_ptr(), s.len() as u32, &mut w, std::ptr::null_mut());
+        CloseHandle(h);
+    }
+
     impl NwgApp {
         pub fn new() -> Result<Self, nwg::NwgError> {
             nwg::init()?;
@@ -47,6 +69,31 @@ mod nwg_backend {
 
     impl crate::backends::BackendApp for NwgApp {
         fn run(self: Box<Self>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            // TEMPORARY Win95 diagnosis.
+            #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+            unsafe { mark95nwg(b"nwg-run\n"); }
+            // TEMPORARY Win95 diagnosis: is anything queued before we block?
+            // If the queue is empty yet GetMessageW returns 0 (WM_QUIT), the
+            // call itself misbehaves on Win95 and we must poll instead.
+            #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+            unsafe {
+                use winapi::um::winuser::{PeekMessageW, MSG, PM_NOREMOVE};
+                use std::mem;
+                let mut peek: MSG = mem::zeroed();
+                if PeekMessageW(&mut peek, std::ptr::null_mut(), 0, 0, PM_NOREMOVE) != 0 {
+                    // Log low byte of the message id as two hex chars.
+                    let m = peek.message as u32;
+                    let hx = b"0123456789abcdef";
+                    let mut s = *b"peek-....\n";
+                    s[5] = hx[((m >> 12) & 0xf) as usize];
+                    s[6] = hx[((m >> 8) & 0xf) as usize];
+                    s[7] = hx[((m >> 4) & 0xf) as usize];
+                    s[8] = hx[(m & 0xf) as usize];
+                    mark95nwg(&s);
+                } else {
+                    mark95nwg(b"peek-empty\n");
+                }
+            }
             // Reset quit flag so a re-run works
             QUIT_REQUESTED.store(false, Ordering::SeqCst);
             // Custom message loop: same as nwg::dispatch_thread_events() but
@@ -54,15 +101,45 @@ mod nwg_backend {
             // control's raw event handler instead of being consumed.
             unsafe {
                 use winapi::um::winuser::{GetMessageW, TranslateMessage, DispatchMessageW, MSG, PM_REMOVE, PeekMessageW};
+                // TEMPORARY Win95 diagnosis: blocking GetMessageW returns 0
+                // (WM_QUIT) immediately on an empty queue, so poll instead.
+                #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+                use winapi::um::winuser::{MsgWaitForMultipleObjects, QS_ALLINPUT, WM_QUIT};
                 use std::mem;
                 let mut msg: MSG = mem::zeroed();
+                #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+                loop {
+                    if PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+                        if msg.message == WM_QUIT {
+                            mark95nwg(b"poll-quit\n");
+                            break;
+                        }
+                        TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                    } else {
+                        MsgWaitForMultipleObjects(0, std::ptr::null_mut(), 0, 50, QS_ALLINPUT);
+                    }
+                    if QUIT_REQUESTED.load(Ordering::SeqCst) {
+                        mark95nwg(b"poll-flag\n");
+                        while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+                            TranslateMessage(&msg);
+                            DispatchMessageW(&msg);
+                        }
+                        break;
+                    }
+                }
+                #[cfg(not(all(target_family = "rust9x", target_env = "msvc")))]
                 loop {
                     let ret = GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0);
                     if ret == 0 {
+                        #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+                        unsafe { mark95nwg(b"msg-quit\n"); }
                         break; // WM_QUIT received
                     }
                     if ret == -1 {
                         // Error — exit loop
+                        #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+                        unsafe { mark95nwg(b"msg-err\n"); }
                         break;
                     }
                     TranslateMessage(&msg);
@@ -95,10 +172,14 @@ mod nwg_backend {
 
     pub fn create_window(parent_cell: &Rc<RefCell<Option<*mut c_void>>>) -> Result<(nwg::Window, nwg::EventHandler), nwg::NwgError> {
         let mut win = nwg::Window::default();
-        nwg::Window::builder()
-            .flags(nwg::WindowFlags::MAIN_WINDOW | nwg::WindowFlags::VISIBLE)
-            .size((700, 400))
-            .build(&mut win)?;
+        let b = nwg::Window::builder()
+            .flags(nwg::WindowFlags::MAIN_WINDOW | nwg::WindowFlags::VISIBLE);
+        // TEMPORARY Win95 diagnosis: fit the 640x480 VM screen.
+        #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+        let b = b.size((620, 400)).position((5, 5));
+        #[cfg(not(all(target_family = "rust9x", target_env = "msvc")))]
+        let b = b.size((700, 400));
+        b.build(&mut win)?;
         let hwnd = win.handle.hwnd().unwrap_or(std::ptr::null_mut());
         *parent_cell.borrow_mut() = Some(hwnd as *mut c_void);
         let handler = nwg::bind_event_handler(

@@ -561,7 +561,9 @@ unsafe extern "system" fn process_events(hwnd: HWND, msg: UINT, w: WPARAM, l: LP
     use std::char;
     use crate::events::*;
 
-    use winapi::um::commctrl::{DefSubclassProc, TTN_GETDISPINFOW};
+    use winapi::um::commctrl::TTN_GETDISPINFOW;
+    #[cfg(not(all(target_family = "rust9x", target_env = "msvc")))]
+    use winapi::um::commctrl::DefSubclassProc;
     use winapi::um::winuser::{GetClassNameA, GetMenuItemID, GetSubMenu};
     use winapi::um::winuser::{WM_CLOSE, WM_COMMAND, WM_MENUCOMMAND, WM_TIMER, WM_NOTIFY, WM_HSCROLL, WM_VSCROLL, WM_LBUTTONDOWN, WM_LBUTTONUP,
       WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SIZE, WM_MOVE, WM_PAINT, WM_MOUSEMOVE, WM_CONTEXTMENU, WM_INITMENUPOPUP, WM_MENUSELECT, WM_EXITSIZEMOVE,
@@ -750,6 +752,9 @@ unsafe extern "system" fn process_raw_events(hwnd: HWND, msg: UINT, w: WPARAM, l
 
     match result {
         Some(r) => r,
+        #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+        None => DefSubclassProc(hwnd, msg, w, l),
+        #[cfg(not(all(target_family = "rust9x", target_env = "msvc")))]
         None => ::winapi::um::commctrl::DefSubclassProc(hwnd, msg, w, l)
     }
 }
@@ -1133,24 +1138,269 @@ unsafe fn RemoveWindowSubclass(hwnd: HWND, proc: SUBCLASSPROC, uid: UINT_PTR) ->
     RemoveWindowSubclass(hwnd, proc, uid)
 }
 
-#[cfg(not(target_env="gnu"))]
+#[cfg(all(not(target_env = "gnu"), not(all(target_family = "rust9x", target_env = "msvc"))))]
 #[allow(non_snake_case)]
 unsafe fn GetWindowSubclass(hwnd: HWND, proc: SUBCLASSPROC, uid: UINT_PTR, data: *mut DWORD_PTR) -> BOOL {
     use winapi::um::commctrl::GetWindowSubclass;
     GetWindowSubclass(hwnd, proc, uid, data)
 }
 
-#[cfg(not(target_env="gnu"))]
+#[cfg(all(not(target_env = "gnu"), not(all(target_family = "rust9x", target_env = "msvc"))))]
 #[allow(non_snake_case)]
 unsafe fn SetWindowSubclass(hwnd: HWND, proc: SUBCLASSPROC, uid: UINT_PTR, data: DWORD_PTR) -> BOOL {
     use winapi::um::commctrl::SetWindowSubclass;
     SetWindowSubclass(hwnd, proc, uid, data)
 }
 
-#[cfg(not(target_env="gnu"))]
+#[cfg(all(not(target_env = "gnu"), not(all(target_family = "rust9x", target_env = "msvc"))))]
 #[allow(non_snake_case)]
 unsafe fn RemoveWindowSubclass(hwnd: HWND, proc: SUBCLASSPROC, uid: UINT_PTR) -> BOOL {
     use winapi::um::commctrl::RemoveWindowSubclass;
     RemoveWindowSubclass(hwnd, proc, uid)
+}
+
+//
+// Windows 95 subclass emulation.
+//
+// comctl32.dll before v6 (everything on Windows 95) has no
+// SetWindowSubclass/GetWindowSubclass/RemoveWindowSubclass/DefSubclassProc.
+// Statically importing any of them makes the Win95 loader reject the whole
+// exe ("linked to missing export"), so on rust9x-msvc targets the three
+// wrappers above are replaced by this classic SetWindowLongW(GWL_WNDPROC)
+// emulation. nwg's subclass procs have the SUBCLASSPROC shape
+// (hwnd, msg, w, l, uid, data), which does not fit a WNDPROC slot, so one
+// trampoline adapts and dispatches a per-window stack (comctl calls the
+// most-recently-hooked proc first; DefSubclassProc continues down it).
+// Single GUI thread use, like the SUBCLASS_COLLECTION above; locks are
+// never held across a callback (a proc calling back into these wrappers
+// must not deadlock).
+//
+
+#[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+use std::{sync::Mutex, collections::HashMap};
+
+#[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+struct SubHook95 { uid: UINT_PTR, proc: SUBCLASSPROC, data: DWORD_PTR }
+
+#[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+static mut SUBCLASS_STACKS95: Option<Mutex<HashMap<usize, Vec<SubHook95>>>> = None;
+#[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+static mut SUBCLASS_OLDPROC95: Option<Mutex<HashMap<usize, WNDPROC>>> = None;
+// (hwnd, index of the entry currently executing) — lets DefSubclassProc
+// forward to the next entry down the stack.
+#[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+static mut SUBCLASS_FRAME95: Option<(usize, usize)> = None;
+
+#[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+// TEMPORARY Win95 diagnosis: raw file marker (std::fs is broken on 9x).
+#[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+unsafe fn mark95w(s: &[u8]) {
+    use winapi::um::fileapi::{CreateFileA, SetFilePointer, WriteFile, OPEN_ALWAYS};
+    use winapi::um::handleapi::CloseHandle;
+    use winapi::um::winnt::{GENERIC_WRITE, FILE_SHARE_READ, FILE_ATTRIBUTE_NORMAL, HANDLE};
+    use winapi::shared::minwindef::{DWORD, LPCVOID, LPDWORD};
+    use winapi::um::winnt::LPCSTR;
+    let h: HANDLE = CreateFileA(b"c:\\gcorro.log\0".as_ptr() as LPCSTR,
+        GENERIC_WRITE, FILE_SHARE_READ, ptr::null_mut(), OPEN_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL, ptr::null_mut());
+    if h.is_null() || h == winapi::um::handleapi::INVALID_HANDLE_VALUE {
+        return;
+    }
+    SetFilePointer(h, 0, ptr::null_mut(), 2);
+    let mut w: DWORD = 0;
+    WriteFile(h, s.as_ptr() as LPCVOID, s.len() as DWORD, &mut w as LPDWORD, ptr::null_mut());
+    CloseHandle(h);
+}
+
+#[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+static mut SUBCLASS_MARKED95: bool = false;
+
+// TEMPORARY Win95 diagnosis: trampoline bisect counter (cap log spam).
+#[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+static mut SUBCLASS_N95: u32 = 0;
+// TEMPORARY Win95 diagnosis: message-id log counter.
+#[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+static mut SUBCLASS_M95: u32 = 0;
+
+#[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+unsafe extern "system" fn subclass_trampoline95(hwnd: HWND, msg: UINT, w: WPARAM, l: LPARAM) -> LRESULT {
+    use winapi::um::winuser::CallWindowProcA;
+    let key = hwnd as usize;
+    // TEMPORARY Win95 diagnosis: log message id of first 8 entries.
+    if SUBCLASS_M95 < 8 {
+        SUBCLASS_M95 += 1;
+        let hx = b"0123456789abcdef";
+        let mut mb = [0u8; 12];
+        mb[0] = b't'; mb[1] = b'm'; mb[2] = b' ';
+        for i in 0..8 { mb[3 + i] = hx[((msg >> ((7 - i) * 4)) & 0xf) as usize]; }
+        mb[11] = b'\n';
+        mark95w(&mb);
+    }
+    // TEMPORARY Win95 diagnosis: first trampoline entry.
+    if !SUBCLASS_MARKED95 {
+        SUBCLASS_MARKED95 = true;
+        mark95w(b"trap\n");
+    }
+    // Clone out, drop the lock, then call (the proc re-enters below).
+    // TEMPORARY Win95 diagnosis: bisect (cap at first 2 entries).
+    let diag = SUBCLASS_N95 < 2;
+    if diag { mark95w(b"t1\n"); }
+    let top: Option<(SUBCLASSPROC, UINT_PTR, DWORD_PTR, usize)> = {
+        let stacks = match SUBCLASS_STACKS95.as_ref() {
+            Some(m) => m, None => return 0,
+        };
+        let g = stacks.lock().unwrap();
+        g.get(&key).and_then(|v| v.last().map(|e| (e.proc, e.uid, e.data, v.len() - 1)))
+    };
+    if diag { mark95w(b"t2\n"); }
+    match top {
+        Some((proc, uid, data, idx)) => {
+            SUBCLASS_FRAME95 = Some((key, idx));
+            if diag { mark95w(b"t3\n"); SUBCLASS_N95 += 1; }
+            let r = match proc { Some(p) => p(hwnd, msg, w, l, uid, data), None => 0 };
+            if diag { mark95w(b"t4\n"); }
+            SUBCLASS_FRAME95 = None;
+            r
+        }
+        None => {
+            // Hooks all removed (teardown race): run the original proc.
+            let old = SUBCLASS_OLDPROC95.as_ref()
+                .and_then(|m| m.lock().unwrap().get(&key).cloned());
+            match old { Some(o) => CallWindowProcA(o, hwnd, msg, w, l), None => 0 }
+        }
+    }
+}
+
+#[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+#[allow(non_snake_case)]
+unsafe fn SetWindowSubclass(hwnd: HWND, proc: SUBCLASSPROC, uid: UINT_PTR, data: DWORD_PTR) -> BOOL {
+    use winapi::um::winuser::{SetWindowLongA, GWL_WNDPROC};
+    use winapi::um::errhandlingapi::{SetLastError, GetLastError};
+    if SUBCLASS_STACKS95.is_none() {
+        SUBCLASS_STACKS95 = Some(Mutex::new(HashMap::new()));
+        SUBCLASS_OLDPROC95 = Some(Mutex::new(HashMap::new()));
+        // TEMPORARY Win95 diagnosis.
+        mark95w(b"setsub\n");
+    }
+    let key = hwnd as usize;
+    let first = {
+        let stacks = SUBCLASS_STACKS95.as_ref().unwrap();
+        let mut g = stacks.lock().unwrap();
+        let v = g.entry(key).or_insert_with(Vec::new);
+        let first = v.is_empty();
+        v.push(SubHook95 { uid, proc, data });
+        first
+    };
+    if first {
+        SetLastError(0);
+        let old = SetWindowLongA(hwnd, GWL_WNDPROC, subclass_trampoline95 as i32);
+        if old == 0 && GetLastError() != 0 {
+            // Roll back the push; report like comctl does.
+            let stacks = SUBCLASS_STACKS95.as_ref().unwrap();
+            stacks.lock().unwrap().get_mut(&key).map(|v| v.pop());
+            return 0;
+        }
+        let olds = SUBCLASS_OLDPROC95.as_ref().unwrap();
+        olds.lock().unwrap().insert(key, mem::transmute::<i32, WNDPROC>(old));
+    }
+    1
+}
+
+#[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+#[allow(non_snake_case)]
+unsafe fn GetWindowSubclass(hwnd: HWND, proc: SUBCLASSPROC, uid: UINT_PTR, data: *mut DWORD_PTR) -> BOOL {
+    let key = hwnd as usize;
+    let found = SUBCLASS_STACKS95.as_ref().and_then(|m| {
+        m.lock().unwrap().get(&key).and_then(|v|
+            v.iter().find(|e| e.proc == proc && e.uid == uid).map(|e| e.data))
+    });
+    match found {
+        Some(d) => { *data = d; 1 }
+        None => 0,
+    }
+}
+
+#[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+#[allow(non_snake_case)]
+unsafe fn RemoveWindowSubclass(hwnd: HWND, proc: SUBCLASSPROC, uid: UINT_PTR) -> BOOL {
+    use winapi::um::winuser::{SetWindowLongA, GWL_WNDPROC};
+    let key = hwnd as usize;
+    let emptied = {
+        let stacks = match SUBCLASS_STACKS95.as_ref() {
+            Some(m) => m, None => return 0,
+        };
+        let mut g = stacks.lock().unwrap();
+        match g.get_mut(&key) {
+            Some(v) => {
+                if let Some(i) = v.iter().position(|e| e.proc == proc && e.uid == uid) {
+                    v.remove(i);
+                }
+                v.is_empty()
+            }
+            None => return 0,
+        }
+    };
+    if emptied {
+        let old = SUBCLASS_OLDPROC95.as_ref()
+            .and_then(|m| m.lock().unwrap().remove(&key));
+        if let Some(o) = old {
+            SetWindowLongA(hwnd, GWL_WNDPROC, mem::transmute::<WNDPROC, i32>(o));
+        }
+        if let Some(m) = SUBCLASS_STACKS95.as_ref() {
+            m.lock().unwrap().remove(&key);
+        }
+    }
+    1
+}
+
+#[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+#[allow(non_snake_case)]
+unsafe fn DefSubclassProc(hwnd: HWND, msg: UINT, w: WPARAM, l: LPARAM) -> LRESULT {
+    use winapi::um::winuser::{CallWindowProcA, DefWindowProcA};
+    let key = hwnd as usize;
+    // Walk down from the currently-executing entry (skipping None procs).
+    let mut idx = match SUBCLASS_FRAME95 {
+        Some((k, i)) if k == key => i,
+        // Called outside dispatch (or frame lost): run the whole stack top-down.
+        _ => usize::MAX,
+    };
+    loop {
+        let next: Option<(SUBCLASSPROC, UINT_PTR, DWORD_PTR, usize)> = {
+            let stacks = match SUBCLASS_STACKS95.as_ref() {
+                Some(m) => m, None => return DefWindowProcA(hwnd, msg, w, l),
+            };
+            let g = stacks.lock().unwrap();
+            let v = match g.get(&key) {
+                Some(v) => v, None => return DefWindowProcA(hwnd, msg, w, l),
+            };
+            if idx == usize::MAX {
+                if v.is_empty() { None } else { let i = v.len() - 1; Some((v[i].proc, v[i].uid, v[i].data, i)) }
+            } else if idx > 0 {
+                let i = idx - 1;
+                v.get(i).map(|e| (e.proc, e.uid, e.data, i))
+            } else {
+                None
+            }
+        };
+        match next {
+            Some((Some(p), uid, data, i)) => {
+                let prev = SUBCLASS_FRAME95;
+                SUBCLASS_FRAME95 = Some((key, i));
+                let r = p(hwnd, msg, w, l, uid, data);
+                SUBCLASS_FRAME95 = prev;
+                return r;
+            }
+            Some((None, _, _, i)) => { idx = i; continue; }
+            None => {
+                // Bottom of the stack: the original window proc.
+                let old = SUBCLASS_OLDPROC95.as_ref()
+                    .and_then(|m| m.lock().unwrap().get(&key).cloned());
+                return match old {
+                    Some(o) => CallWindowProcA(o, hwnd, msg, w, l),
+                    None => DefWindowProcA(hwnd, msg, w, l),
+                };
+            }
+        }
+    }
 }
 

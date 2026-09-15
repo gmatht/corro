@@ -2417,13 +2417,99 @@ fn on_formula_entry_changed(state: &GuiState) {
 // Entry point
 // ---------------------------------------------------------------------------
 
+/// TEMPORARY Win95 diagnosis: append bytes to c:\gcorro.log via raw
+/// CreateFileA (std::fs is broken on 9x: CreateFileW stub, error 120).
+#[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+unsafe fn mark95(s: &[u8]) {
+    use std::os::raw::c_void;
+    unsafe extern "system" {
+        fn CreateFileA(name: *const u8, access: u32, share: u32, sa: *mut c_void,
+            disp: u32, flags: u32, tmpl: *mut c_void) -> *mut c_void;
+        fn SetFilePointer(h: *mut c_void, lo: i32, hi: *mut i32, how: u32) -> u32;
+        fn WriteFile(h: *mut c_void, buf: *const u8, len: u32, w: *mut u32, ov: *mut c_void) -> i32;
+        fn CloseHandle(h: *mut c_void) -> i32;
+    }
+    let h = CreateFileA(b"c:\\gcorro.log\0".as_ptr(), 0x4000_0000, 1,
+        std::ptr::null_mut(), 4, 0x80, std::ptr::null_mut());
+    if h.is_null() || h as isize == -1 {
+        return;
+    }
+    SetFilePointer(h, 0, std::ptr::null_mut(), 2);
+    let mut w = 0u32;
+    WriteFile(h, s.as_ptr(), s.len() as u32, &mut w, std::ptr::null_mut());
+    CloseHandle(h);
+}
+
+/// TEMPORARY Win95 diagnosis: log parent/class/rect/visible/text-len of one
+/// hwnd into c:\gcorro.log. `tag` is exactly 5 bytes (e.g. *b"main").
+#[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+unsafe fn probe95(hwnd: *mut std::os::raw::c_void, tag: [u8; 5]) {
+    use std::os::raw::c_void;
+    unsafe extern "system" {
+        fn GetParent(h: *mut c_void) -> *mut c_void;
+        fn GetClassNameA(h: *mut c_void, buf: *mut u8, max: i32) -> i32;
+        fn GetWindowRect(h: *mut c_void, r: *mut [i32; 4]) -> i32;
+        fn IsWindowVisible(h: *mut c_void) -> i32;
+        fn GetWindowTextLengthA(h: *mut c_void) -> i32;
+    }
+    let hx = b"0123456789abcdef";
+    let mut msg = [0u8; 110];
+    let mut p = 0;
+    for i in 0..5 { msg[p] = tag[i]; p += 1; }
+    msg[p] = b' '; p += 1;
+    let par = GetParent(hwnd);
+    for v in [hwnd as usize, par as usize] {
+        for sh in [28u32, 24, 20, 16] {
+            msg[p] = hx[((v >> sh) & 0xf) as usize]; p += 1;
+        }
+        msg[p] = b' '; p += 1;
+    }
+    let mut cls = [0u8; 24];
+    let cl = GetClassNameA(hwnd, cls.as_mut_ptr(), 24);
+    let mut i = 0;
+    while i < cl && p < 70 { msg[p] = cls[i as usize]; p += 1; i += 1; }
+    msg[p] = b' '; p += 1;
+    msg[p] = if IsWindowVisible(hwnd) != 0 { b'V' } else { b'h' }; p += 1;
+    msg[p] = b' '; p += 1;
+    let mut r = [0i32; 4];
+    GetWindowRect(hwnd, &mut r);
+    for v in [r[0], r[1], r[2], r[3]] {
+        let v = v as u32;
+        for sh in [12u32, 8, 4, 0] {
+            msg[p] = hx[((v >> sh) & 0xf) as usize]; p += 1;
+        }
+        msg[p] = b','; p += 1;
+    }
+    msg[p] = b'\n'; p += 1;
+    mark95(&msg[..p]);
+}
+
 pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Error>> {
     rswidgets::core::install_debug_crash_handlers();
+    // TEMPORARY Win95 diagnosis: startup progression (see mark95 below).
+    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+    unsafe {
+        mark95(b"nwgpre\n");
+    }
     let rxapp = rswidgets::App::init()
         .map_err(|e| format!("GUI init failed: {e}"))?;
+    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+    unsafe {
+        mark95(b"nwgpost\n");
+    }
 
     let win = rxapp.new_window()?;
+    // TEMPORARY Win95 diagnosis.
+    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+    unsafe {
+        mark95(b"winpost\n");
+    }
     win.set_title(&format!("corro {}", env!("CARGO_PKG_VERSION")));
+    // TEMPORARY Win95 diagnosis: fit the 640x480 VM screen (release keeps
+    // 1200x800 for real displays).
+    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+    win.set_default_size(620, 420);
+    #[cfg(not(all(target_family = "rust9x", target_env = "msvc")))]
     win.set_default_size(1200, 800);
 
     let vbox = rxapp.new_box(Orientation::Vertical, 0)?;
@@ -2456,6 +2542,9 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     formula_bar.set_child_hexpand(&formula_entry, true);
     let formula_status = rxapp.new_label("")?;
     formula_status.set_visible(false);
+    // TEMPORARY Win95 diagnosis.
+    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+    unsafe { mark95(b"m-entry\n"); }
     formula_bar.append(&formula_status);
 
     // Canvas inside native scrollbars: the thumb tracks the viewport and
@@ -2473,6 +2562,9 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     scrolled.set_vexpand(true);
 
     // Bottom strip: the shared hints line (ratatui parity).
+    // TEMPORARY Win95 diagnosis.
+    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+    unsafe { mark95(b"m-canvas\n"); }
     let hints_label = rxapp.new_label("Ready")?;
 
     // Sheet tab strip (below the grid): one tab per sheet once the workbook
@@ -2541,6 +2633,9 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
 
     // Build menu
     let menubar = build_menu(&rxapp, &win, &shared)?;
+    // TEMPORARY Win95 diagnosis.
+    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+    unsafe { mark95(b"m-menu\n"); }
     let _ = shared.menubar.set(menubar.clone());
     let menubar_cb = menubar.clone();
     vbox.append(&menubar);
@@ -2989,6 +3084,15 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     formula_entry.grab_focus();
     eprintln!("PHASE: about_to_present");
     win.present();
+    // TEMPORARY Win95 diagnosis: probe each known window (parent/class/
+    // rect/visible) to find where the controls really live.
+    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+    unsafe {
+        probe95(win.hwnd(), *b"main ");
+        probe95(*formula_entry.inner.as_ref(), *b"entry");
+        probe95(*canvas.inner.as_ref(), *b"canv ");
+        probe95(*addr_label.inner.as_ref(), *b"label");
+    }
     eprintln!("PHASE: after_present");
     let _ = std::fs::write("/tmp/gui_setup_phase3.txt", "after_present\n");
 
@@ -2997,6 +3101,9 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // the toplevel's frame clock.  Marking the window dirty ensures the
     // frame clock is armed before the start_edit() canvas queue_redraw.
     win.queue_redraw();
+    // TEMPORARY Win95 diagnosis.
+    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+    unsafe { mark95(b"m-queued\n"); }
 
     // Start editing at A1: grab_focus on the formula entry.
     // The draw callback was already registered before present(),
@@ -3037,6 +3144,9 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     }
 
     rxapp.pump_events(500);
+    // TEMPORARY Win95 diagnosis (bindings done, entering warm-up).
+    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+    unsafe { mark95(b"m-bound\n"); }
 
     // Second safety net: queue another redraw and pump again.  Some
     // virtual displays (WSLg, Xvfb) need multiple pump cycles before
@@ -3052,10 +3162,19 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // GSK_RENDERER=cairo).  The 1200x800 fallback dimensions match the
     // window default size, used when the surface reports zero size.
     canvas.force_draw(win.hwnd(), 1200, 800);
+    // TEMPORARY Win95 diagnosis.
+    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+    unsafe { mark95(b"pre-force\n"); }
 
     // Move rxapp.run() earlier — before pump_events — so the main loop
     // pointer is available for quit_main_loop before any user interaction.
+    // TEMPORARY Win95 diagnosis.
+    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+    unsafe { mark95(b"pre-run\n"); }
     rxapp.run()?;
+    // TEMPORARY Win95 diagnosis (unreachable if run() loops until quit).
+    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+    unsafe { mark95(b"post-run\n"); }
     Ok(())
 }
 

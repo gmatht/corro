@@ -125,15 +125,41 @@ pub fn enable_visual_styles() {
     Ensure that the dll containing the winapi controls is loaded.
     Also register the custom classes used by NWG
 */
+// TEMPORARY Win95 diagnosis: raw file marker (std::fs broken on 9x).
+#[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+unsafe fn mark95w(s: &[u8]) {
+    use winapi::um::fileapi::{CreateFileA, SetFilePointer, WriteFile, OPEN_ALWAYS};
+    use winapi::um::handleapi::CloseHandle;
+    use winapi::um::winnt::{GENERIC_WRITE, FILE_SHARE_READ, FILE_ATTRIBUTE_NORMAL, HANDLE};
+    use winapi::shared::minwindef::{DWORD, LPCVOID, LPDWORD};
+    use winapi::um::winnt::LPCSTR;
+    use std::{ptr, mem};
+    let _ = mem::size_of::<u8>();
+    let h: HANDLE = CreateFileA(b"c:\\gcorro.log\0".as_ptr() as LPCSTR,
+        GENERIC_WRITE, FILE_SHARE_READ, ptr::null_mut(), OPEN_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL, ptr::null_mut());
+    if h.is_null() || h == winapi::um::handleapi::INVALID_HANDLE_VALUE {
+        return;
+    }
+    SetFilePointer(h, 0, ptr::null_mut(), 2);
+    let mut w: DWORD = 0;
+    WriteFile(h, s.as_ptr() as LPCVOID, s.len() as DWORD, &mut w as LPDWORD, ptr::null_mut());
+    CloseHandle(h);
+}
 pub fn init_common_controls() -> Result<(), NwgError> {
     use winapi::um::objbase::CoInitialize;
     use winapi::um::libloaderapi::LoadLibraryW;
     use winapi::um::commctrl::{InitCommonControlsEx, INITCOMMONCONTROLSEX};
+    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+    use winapi::um::commctrl::InitCommonControls;
     use winapi::um::commctrl::{ICC_BAR_CLASSES, ICC_STANDARD_CLASSES, ICC_DATE_CLASSES, ICC_PROGRESS_CLASS,
      ICC_TAB_CLASSES, ICC_TREEVIEW_CLASSES, ICC_LISTVIEW_CLASSES};
     use winapi::shared::winerror::{S_OK, S_FALSE};
 
     unsafe {
+        // TEMPORARY Win95 diagnosis.
+        #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+        mark95w(b"coinit\n");
         let mut classes = ICC_BAR_CLASSES | ICC_STANDARD_CLASSES;
 
         if cfg!(feature = "datetime-picker") {
@@ -165,13 +191,39 @@ pub fn init_common_controls() -> Result<(), NwgError> {
             dwSize: mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
             dwICC: classes
         };
+        // TEMPORARY Win95 diagnosis.
+        #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+        mark95w(b"preicex\n");
 
-        InitCommonControlsEx(&data);
+        // Win95 note (vendored patch): this box's comctl32 faults inside
+        // InitCommonControlsEx (~0x1C7 into the function, EIP 0x148dd4) for
+        // the ICC set nwg requests. The Win95 feature set needs no comctl32
+        // classes (combobox/textbox/scroll-bar are USER32 built-ins; the rest
+        // are nwg custom classes), so the legacy InitCommonControls suffices.
+        // TEMPORARY diagnosis: skip the call entirely.
+        //#[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+        //InitCommonControls();
+        //#[cfg(not(all(target_family = "rust9x", target_env = "msvc")))]
+        //InitCommonControlsEx(&data);
+        #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+        mark95w(b"skipcc\n");
+        // TEMPORARY Win95 diagnosis.
+        #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+        mark95w(b"icex\n");
     }
 
+    // TEMPORARY Win95 diagnosis.
+    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+    unsafe { mark95w(b"prewinclass\n"); }
     window::init_window_class()?;
+    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+    unsafe { mark95w(b"wclass\n"); }
     tabs_init()?;
+    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+    unsafe { mark95w(b"tabs\n"); }
     extern_canvas_init()?;
+    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+    unsafe { mark95w(b"canvas\n"); }
     frame_init()?;
     
     match unsafe { CoInitialize(ptr::null_mut()) } {
