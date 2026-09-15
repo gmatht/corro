@@ -252,3 +252,65 @@ fn gui_spreadsheet_scrollbars() {
     let _has_scrolled_window = rswidgets::backends::gtk::create_scrolled_window().is_ok();
     // Scrollbars should be provided when content exceeds viewport
 }
+
+/// Regression: the About and Keybindings dialogs rendered empty because their
+/// content widget was dropped (destroying the native control) as soon as the
+/// builder function returned — only the dialog itself was leaked.
+///
+/// Pin the structural invariant: both builders must leak their content widget
+/// (`Box::into_raw`) alongside the dialog, and must attach that content with
+/// `append_content_area` before `present()`.
+#[test]
+fn about_and_help_dialogs_keep_their_content_widgets_alive() {
+    let src = fs::read_to_string("src/gui/dialogs.rs").unwrap();
+
+    for (name, content_var) in [("show_about_dialog", "tv"), ("show_keybinds_help", "tv")] {
+        let start = src
+            .find(&format!("pub fn {name}"))
+            .unwrap_or_else(|| panic!("{name} not found"));
+        // Body ends at the next top-level `pub fn` (or EOF).
+        let rest = &src[start..];
+        let end = rest[9..]
+            .find("\npub fn ")
+            .map(|i| i + 9)
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+
+        assert!(
+            body.contains("append_content_area"),
+            "{name} must attach its content to the dialog"
+        );
+        assert!(
+            body.contains(&format!("Box::into_raw(Box::new({content_var}))")),
+            "{name} must leak its content widget ({content_var}); dropping the \
+             wrapper destroys the native control and the dialog renders empty"
+        );
+        // The content must be attached before the dialog is shown.
+        let attach = body.find("append_content_area").unwrap();
+        let present = body.find(".present()").unwrap();
+        assert!(
+            attach < present,
+            "{name} must append content before present()"
+        );
+    }
+}
+
+/// Regression: a NWG STATIC label collapses its client area to a single line
+/// height, so the two-line About text lost its second line. About must use a
+/// multi-line text view (the control the Keybindings dialog already uses).
+#[test]
+fn about_dialog_uses_multiline_textview_not_a_label() {
+    let src = fs::read_to_string("src/gui/dialogs.rs").unwrap();
+    let start = src.find("pub fn show_about_dialog").unwrap();
+    let rest = &src[start..];
+    let end = rest[9..].find("\npub fn ").map(|i| i + 9).unwrap_or(rest.len());
+    let body = &rest[..end];
+    assert!(
+        body.contains("create_textview"),
+        "About must use a multi-line text view (a NWG STATIC label drops every line after the first)"
+    );
+    assert!(
+        !body.contains("new_label"),
+        "About must not use a single-line label"
+    );
+}

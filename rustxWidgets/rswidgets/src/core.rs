@@ -1812,3 +1812,52 @@ mod tests {
         assert!(!locale_is_rtl(""));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Portable periodic tick
+// ---------------------------------------------------------------------------
+
+/// Run `f` every `ms` milliseconds until it returns `false`, with no user
+/// input required (GTK timeout source / Win32 `WM_TIMER`).
+///
+/// Apps need this for work that must happen while idle — e.g. tailing an
+/// append-only log so another window's committed revisions show up here
+/// without the user having to press a key.
+#[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
+pub fn add_periodic_tick(
+    _window: &crate::common::Window,
+    ms: u32,
+    f: Box<dyn FnMut() -> bool>,
+) -> Result<(), Error> {
+    // GTK timeouts belong to the main context, not a window.
+    crate::backends_gtk_adapter::timeout_add_repeating(ms, f)
+}
+
+/// See the GTK variant. Win32 needs the window whose message loop should
+/// receive `WM_TIMER`, so the handle is taken from `window`.
+#[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+pub fn add_periodic_tick(
+    window: &crate::common::Window,
+    ms: u32,
+    f: Box<dyn FnMut() -> bool>,
+) -> Result<(), Error> {
+    // Ids are assigned by the backend: NWG needs handler ids above 0xFFFF
+    // (it reserves the low range) plus a separate small Win32 timer id, so it
+    // owns the numbering rather than taking one from here.
+    window.inner.start_repeating_timer(0, ms, f)
+}
+
+/// Backends that drive their own event loop and already poll for external
+/// changes (pancurses/terminal, wasm, zork, android) need no timer, so the
+/// request is accepted and dropped.
+#[cfg(not(any(
+    any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))),
+    all(windows, not(feature = "pancurses"), not(feature = "zork"))
+)))]
+pub fn add_periodic_tick(
+    _window: &crate::common::Window,
+    _ms: u32,
+    _f: Box<dyn FnMut() -> bool>,
+) -> Result<(), Error> {
+    Ok(())
+}

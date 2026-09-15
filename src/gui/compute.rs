@@ -242,6 +242,9 @@ pub fn compute_cell_info(
         false
     };
 
+    let raw_value = g.get(addr);
+    let formatted = crate::ui_core::format_cell_display(g, addr, effective);
+
     let style = if is_cursor_cell {
         CellDisplayStyle::Cursor
     } else if is_agg_cell {
@@ -250,12 +253,13 @@ pub fn compute_cell_info(
         } else {
             CellDisplayStyle::Aggregate
         }
+    } else if crate::ui_core::hyperlink_target(&formatted).is_some() {
+        // Hyperlinks render blue and underlined by default (same rule as
+        // the ratatui reference). Cursor/aggregate highlights win.
+        CellDisplayStyle::Hyperlink
     } else {
         CellDisplayStyle::Default
     };
-
-    let raw_value = g.get(addr);
-    let formatted = crate::ui_core::format_cell_display(g, addr, effective);
 
     CellInfo { formatted, style, raw_value, is_agg_cell }
 }
@@ -270,6 +274,8 @@ pub enum CellDisplayStyle {
     Selected,
     ActiveHeader,
     InactiveHeader,
+    /// Hyperlink cell: blue + underlined on every backend.
+    Hyperlink,
 }
 
 impl CellDisplayStyle {
@@ -284,6 +290,7 @@ impl CellDisplayStyle {
             CellDisplayStyle::Selected => 4,
             CellDisplayStyle::ActiveHeader => 5,
             CellDisplayStyle::InactiveHeader => 6,
+            CellDisplayStyle::Hyperlink => 7,
         }
     }
 }

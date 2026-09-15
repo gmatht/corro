@@ -179,6 +179,81 @@ mod nwg_adapter {
         }
     }
 
+    /// Measure a text control's *natural* content height for dialog layout.
+    ///
+    /// Controls are created at a fixed default size and `set_text` does not
+    /// resize them, so a multi-line STATIC label or multi-line EDIT text box
+    /// still reports a single-line window height (~25px). Layout then gives
+    /// it only that height and every line after the first is clipped away —
+    /// the "empty About/Help dialog" bug. Count embedded newlines and scale
+    /// the font line height so multi-line content is drawn in full.
+    ///
+    /// The line height is measured from the control's font each call (never
+    /// the control's current height, which the layout itself changes: using
+    /// that made the height grow geometrically across layout passes).
+    ///
+    /// Returns None for non-text controls / single-line content (callers keep
+    /// the measured window height then).
+    fn text_natural_height(hwnd: winapi::shared::windef::HWND) -> Option<i32> {
+        unsafe {
+            let mut cls: [u16; 64] = [0; 64];
+            let n = winapi::um::winuser::GetClassNameW(hwnd, cls.as_mut_ptr(), 64);
+            if n <= 0 {
+                return None;
+            }
+            let class = String::from_utf16_lossy(&cls[..n as usize]);
+            // STATIC labels and EDIT boxes both carry multi-line text; other
+            // controls (buttons, combos, ...) are single-line by nature.
+            if !class.eq_ignore_ascii_case("Static") && !class.eq_ignore_ascii_case("Edit") {
+                return None;
+            }
+            let tlen = winapi::um::winuser::GetWindowTextLengthW(hwnd);
+            if tlen <= 0 {
+                return None;
+            }
+            let mut buf: Vec<u16> = vec![0; (tlen + 1) as usize];
+            let got = winapi::um::winuser::GetWindowTextW(hwnd, buf.as_mut_ptr(), tlen + 1);
+            if got <= 0 {
+                return None;
+            }
+            let text = String::from_utf16_lossy(&buf[..got as usize]);
+            let lines = text.split('\n').count() as i32;
+            if lines <= 1 {
+                return None;
+            }
+            // One line's height from the control's font (fall back to the
+            // shell dialog font height if the control has none).
+            let line_h = {
+                let dc = winapi::um::winuser::GetDC(hwnd);
+                let mut h = 0i32;
+                if !dc.is_null() {
+                    let font = winapi::um::winuser::SendMessageW(
+                        hwnd,
+                        winapi::um::winuser::WM_GETFONT,
+                        0,
+                        0,
+                    );
+                    let old = if font != 0 {
+                        winapi::um::wingdi::SelectObject(dc, font as _)
+                    } else {
+                        std::ptr::null_mut()
+                    };
+                    let mut tm: winapi::um::wingdi::TEXTMETRICW = std::mem::zeroed();
+                    if winapi::um::wingdi::GetTextMetricsW(dc, &mut tm) != 0 {
+                        h = tm.tmHeight + tm.tmExternalLeading;
+                    }
+                    if !old.is_null() {
+                        winapi::um::wingdi::SelectObject(dc, old);
+                    }
+                    winapi::um::winuser::ReleaseDC(hwnd, dc);
+                }
+                if h > 0 { h } else { 16 }
+            };
+            // Padding so the last line's descenders are not clipped.
+            Some(line_h.saturating_mul(lines) + 6)
+        }
+    }
+
     /// Dialog content+button layout shared by `Dialog::layout_dialog` and
     /// the dialog WM_SIZE binding (which fires before any Dialog exists).
     fn layout_nwg_dialog_parts(
@@ -198,6 +273,10 @@ mod nwg_adapter {
             let (w, h) = control_size(ptr as _).unwrap_or((0, 0));
             if w <= 8 && h <= 8 {
                 specs.push((0, 0, true));
+            } else if let Some(natural_h) = text_natural_height(ptr as _) {
+                // Multi-line text: keep the measured width, use the full
+                // text height so no line is clipped (see helper doc).
+                specs.push((w, natural_h.max(h), false));
             } else {
                 specs.push((w, if h > 10 { h } else { 26 }, false));
             }
@@ -351,6 +430,65 @@ mod nwg_adapter {
         pub fn insert_action_group(&self, _name: &str, _group_ptr: *mut c_void) {}
         pub fn hwnd(&self) -> *mut c_void {
             self.inner.handle.hwnd().unwrap_or(std::ptr::null_mut()) as *mut c_void
+        }
+        /// Run `f` every `ms` milliseconds until it returns `false`, via a
+        /// Win32 timer on this window.
+        ///
+        /// The portable counterpart of GTK's `timeout_add_repeating`: apps
+        /// need a periodic tick for work that must happen with no user input
+        /// (e.g. tailing an append-only log so another window's revisions
+        /// appear here). `WM_TIMER` is delivered to this window's message
+        /// loop, so the app is woken even while idle.
+        ///
+        /// The raw handler is leaked on purpose: one per window, and it must
+        /// outlive every other reference (unbinding would need the app to
+        /// keep a handle it has no reason to hold).
+        pub fn start_repeating_timer(&self, _id: usize, ms: u32, f: Box<dyn FnMut() -> bool>) -> Result<(), Error> {
+            let hwnd = self.hwnd();
+            if hwnd.is_null() {
+                return Err(Error::Backend("timer: window has no hwnd".into()));
+            }
+            let cb = Rc::new(RefCell::new(f));
+            let cb_for_handler = cb.clone();
+            // Two distinct ids live here, and conflating them panics:
+            //   * the Win32 *timer* id (`SetTimer`); for an hWnd timer Windows
+            //     may substitute its own id, so the returned value is what
+            //     `KillTimer` and the WM_TIMER wparam must match.
+            //   * the NWG *handler* id, which must be > 0xFFFF — NWG reserves
+            //     the low range and `bind_raw_event_handler` panics on it
+            //     (`vendor/native-windows-gui/src/win32/window.rs`).
+            // Handler ids must be > 0xFFFF; timer request ids must be small
+            // and non-zero (0 is SetTimer's failure value), hence two counters.
+            static NEXT_HANDLER_ID: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0xD400_0000);
+            static NEXT_REQUEST_ID: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(1);
+            let handler_id = NEXT_HANDLER_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let request_id = NEXT_REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let timer_id = unsafe { winapi::um::winuser::SetTimer(hwnd as _, request_id, ms, None) };
+            if timer_id == 0 {
+                return Err(Error::Backend("SetTimer failed".into()));
+            }
+            let handler = nwg::bind_raw_event_handler(
+                &nwg::ControlHandle::Hwnd(hwnd as _),
+                handler_id,
+                move |_h, msg, w, _l| {
+                    if msg == winapi::um::winuser::WM_TIMER && w == timer_id {
+                        let keep = (cb_for_handler.borrow_mut())();
+                        if !keep {
+                            unsafe {
+                                winapi::um::winuser::KillTimer(hwnd as _, timer_id);
+                            }
+                        }
+                    }
+                    None
+                },
+            )
+            .map_err(|e| Error::Backend(format!("timer handler: {e}")))?;
+            std::mem::forget(handler);
+            // Keep the closure alive for the window's lifetime too.
+            std::mem::forget(cb);
+            Ok(())
         }
         pub fn queue_redraw(&self) {}
         pub fn on_event(&self, _cb: Box<dyn FnMut(*mut c_void) -> i32>) {}

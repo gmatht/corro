@@ -110,16 +110,28 @@ pub fn show_about_dialog() {
         log_dialog_action("about_dialog", "");
         if let Ok(rxapp) = rswidgets::App::init() {
             if let Ok(dialog) = rxapp.new_dialog() {
-                if let Ok(label) = rxapp.new_label(&format!(
-                    "corro {}\n\nAppend-only collaborative spreadsheet",
-                    env!("CARGO_PKG_VERSION"),
-                )) {
+                // A multi-line (read-only) text view rather than a Label: the
+                // NWG STATIC used for labels vertically centers a single line
+                // and collapses its client area to one line height, so a
+                // two-line label silently drops its second line. EDIT boxes
+                // keep their full client height and render the whole block on
+                // every backend (same control the Keybindings dialog uses).
+                if let Ok(tv) = rxapp.create_textview() {
+                    tv.set_text(&format!(
+                        "corro {}\n\nAppend-only collaborative spreadsheet",
+                        env!("CARGO_PKG_VERSION"),
+                    ));
                     dialog.set_title("About corro");
                     dialog.set_default_size(300, 200);
-                    dialog.append_content_area(&label);
+                    dialog.append_content_area(&tv);
                     dialog.add_button("Close", -7);
                     dialog.connect_response(move |_| {}).ok();
                     dialog.present();
+                    // Leak the content like every other dialog does with its
+                    // widgets (see prompt_dialog's entry_ptr): dropping the
+                    // wrapper destroys the native control, leaving the dialog
+                    // present but empty.
+                    let _ = Box::into_raw(Box::new(tv));
                     let _ = Box::into_raw(Box::new(dialog));
                     return;
                 }
@@ -157,6 +169,10 @@ pub fn show_keybinds_help() {
                     dialog.add_button("Close", -7);
                     dialog.connect_response(move |_| {}).ok();
                     dialog.present();
+                    // Leak the textview (see show_about_dialog): dropping the
+                    // wrapper destroys the native EDIT and the dialog renders
+                    // empty.
+                    let _ = Box::into_raw(Box::new(tv));
                     let _ = Box::into_raw(Box::new(dialog));
                     return;
                 }
