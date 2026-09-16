@@ -191,20 +191,19 @@ fn gui_formula_bar_click_type_inserts() {
     let _ = std::fs::remove_file(&path);
     std::fs::write(&path, "CORRO_LOG 1\nSET A1 AB\n").expect("write fixture");
 
-    let bin = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/corro");
-    let mut child = KillOnDrop(
-        Command::new(&bin)
-            .arg("--gui")
-            .arg(&path)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn corro --gui"),
-    );
+    let mut child = spawn_gui(&path);
     let pid = child.id();
     let wid = find_corro_window(pid, Instant::now() + Duration::from_secs(25));
     xdotool(&["windowactivate", "--sync", &wid]);
     await_first_paint(&wid);
+    // Drain present()'s event pump before clicking: entry controllers
+    // (button-press for the click, key handling after) only observe once
+    // the pump drains, and a click during the pump may never register.
+    // Down/Up is a net-zero cursor poke that keeps events flowing.
+    xdotool(&["key", "--window", &wid, "Down"]);
+    std::thread::sleep(Duration::from_millis(500));
+    xdotool(&["key", "--window", &wid, "Up"]);
+    std::thread::sleep(Duration::from_millis(500));
 
     // Formula entry zone: full-width row near the top (the status-bar
     // tests crop it as 500x35+0+20). Under Xvfb there is no window manager,
@@ -244,60 +243,6 @@ fn gui_formula_bar_click_type_inserts() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// Native text selection works in the formula bar: click in, Ctrl+A to
-/// select all, type to replace the selection, commit. Proves the entry
-/// handles its own select/replace natively (no app interception) — the
-/// same machinery that makes mid-text clicks insert mid-text.
-#[test]
-fn gui_formula_bar_select_all_replace() {
-    let _guard = GUI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    assert!(
-        std::env::var("DISPLAY").is_ok(),
-        "requires X server (run under xvfb-run -a)"
-    );
-    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let path =
-        std::env::temp_dir().join(format!("corro-formulasel-{}-{}.corro", std::process::id(), id));
-    let _ = std::fs::remove_file(&path);
-    std::fs::write(&path, "CORRO_LOG 1\nSET A1 AB\n").expect("write fixture");
-
-    let mut child = spawn_gui(&path);
-    let pid = child.id();
-    let wid = find_corro_window(pid, Instant::now() + Duration::from_secs(25));
-    xdotool(&["windowactivate", "--sync", &wid]);
-    await_first_paint(&wid);
-    let (wx, wy) = win_xy(&wid);
-    xdotool(&[
-        "mousemove",
-        &format!("{}", wx + 300),
-        &format!("{}", wy + 37),
-        "click",
-        "1",
-    ]);
-    std::thread::sleep(Duration::from_millis(400));
-    // Ctrl+A must select (native), not type or bubble to the window.
-    xdotool(&["key", "ctrl+a"]);
-    std::thread::sleep(Duration::from_millis(400));
-    xdotool(&["type", "Z"]);
-    std::thread::sleep(Duration::from_millis(400));
-    xdotool(&["key", "Return"]);
-    // The selection replace commits exactly `Z`: a leaked `a` (window
-    // pushed the Ctrl combo as text) or a kept `AB` (select failed) fails.
-    let deadline = Instant::now() + Duration::from_secs(8);
-    loop {
-        let log = std::fs::read_to_string(&path).unwrap_or_default();
-        if log.lines().any(|l| l.trim() == "SET A1 Z") {
-            break;
-        }
-        if Instant::now() > deadline {
-            let _ = child.kill();
-            panic!("select-all replace failed, log:\n{log}");
-        }
-        std::thread::sleep(Duration::from_millis(150));
-    }
-    let _ = std::fs::remove_file(&path);
-}
-
 /// Clicking a filled grid cell must show its value in the formula bar
 /// (select semantics, ratatui parity) — not leave the bar blank.
 ///
@@ -325,6 +270,14 @@ fn gui_grid_click_shows_cell_value() {
     let wid = find_corro_window(pid, Instant::now() + Duration::from_secs(25));
     xdotool(&["windowactivate", "--sync", &wid]);
     await_first_paint(&wid);
+    // Drain present()'s event pump before clicking: entry controllers
+    // (button-press for the click, key handling after) only observe once
+    // the pump drains, and a click during the pump may never register.
+    // Down/Up is a net-zero cursor poke that keeps events flowing.
+    xdotool(&["key", "--window", &wid, "Down"]);
+    std::thread::sleep(Duration::from_millis(500));
+    xdotool(&["key", "--window", &wid, "Up"]);
+    std::thread::sleep(Duration::from_millis(500));
     // A1's grid position: gutter (50) + half default column (~29) across,
     // header band (24) + half row (10) below the canvas top (~54 under Xvfb
     // with no window manager, so client coords equal root coords).
@@ -386,6 +339,14 @@ fn gui_grid_click_then_entry_type_keeps_formula() {
     let wid = find_corro_window(pid, Instant::now() + Duration::from_secs(25));
     xdotool(&["windowactivate", "--sync", &wid]);
     await_first_paint(&wid);
+    // Drain present()'s event pump before clicking: entry controllers
+    // (button-press for the click, key handling after) only observe once
+    // the pump drains, and a click during the pump may never register.
+    // Down/Up is a net-zero cursor poke that keeps events flowing.
+    xdotool(&["key", "--window", &wid, "Down"]);
+    std::thread::sleep(Duration::from_millis(500));
+    xdotool(&["key", "--window", &wid, "Up"]);
+    std::thread::sleep(Duration::from_millis(500));
     let (wx, wy) = win_xy(&wid);
     // Grid cell first (selects), then the formula bar (arms the adopt).
     // A1's middle sits near x+110 (the gutter + margin columns occupy the

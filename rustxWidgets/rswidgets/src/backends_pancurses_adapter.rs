@@ -248,6 +248,10 @@ mod pancurses_adapter {
         pub fn has_focus(&self) -> bool {
             false
         }
+        /// No pointer clicks on terminal entries: accept and never fire.
+        pub fn connect_button_press(&self, _f: impl FnMut() + 'static) -> Result<u64, Error> {
+            Ok(0)
+        }
         pub fn on_key_raw(&self, _cb: Box<dyn FnMut(u32, u32) -> bool>) {}
 
         pub fn connect_activate<F: FnMut(*mut c_void) + 'static>(&self, f: F) -> Result<u64, Error> {

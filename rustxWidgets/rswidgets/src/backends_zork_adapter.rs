@@ -230,6 +230,11 @@ impl Entry {
         false
     }
 
+    /// No pointer clicks on zork entries: accept and never fire.
+    pub fn connect_button_press(&self, _f: impl FnMut() + 'static) -> Result<u64, Error> {
+        Ok(0)
+    }
+
     pub fn connect_activate<F: FnMut(*mut c_void) + 'static>(&self, f: F) -> Result<u64, Error> {
         let mut f = f;
         crate::backends::zork::add_callback(self.id, Box::new(move || f(std::ptr::null_mut())));

@@ -255,6 +255,11 @@ mod android_adapter {
         pub fn has_focus(&self) -> bool {
             false
         }
+
+        /// No pointer clicks on android entries: accept and never fire.
+        pub fn connect_button_press(&self, _f: impl FnMut() + 'static) -> Result<u64, Error> {
+            Ok(0)
+        }
     }
 
     impl Clone for Entry {

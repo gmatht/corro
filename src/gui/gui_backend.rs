@@ -217,6 +217,18 @@ struct GuiState {
     formula_status: Label,
     editing: Cell<bool>,
     edit_buf: RefCell<String>,
+    /// Formula text displayed in the entry the last time the formula bar
+    /// was refreshed (the adopt source for click-to-edit repair). Refreshed
+    /// on every bar update, so it can never go stale.
+    entry_snapshot: RefCell<String>,
+    /// Set by a pointer click into the formula entry, consumed by the next
+    /// entry keystroke (repair) or cleared by navigation/commit/cancel
+    /// (then typing starts a fresh value, ratatui parity).
+    entry_clicked: Cell<bool>,
+    /// Cell address last shown in the formula bar. A bar refresh for a
+    /// different cell ends click-edit intent (navigation resets to
+    /// ratatui-style replace for the next keystroke).
+    entry_shown: Cell<(usize, usize)>,
     mode: Cell<GuiMode>,
     last_row: Cell<usize>,
     last_col: Cell<usize>,
@@ -1282,6 +1294,7 @@ fn handle_edit_key(key: u32, state: &GuiState) -> bool {
         ESCAPE => {
             log_key_action(key, "cancel_edit", &format!("cell={} mode=edit", format_cell(state)));
             state.editing.set(false);
+            state.entry_clicked.set(false);
             state.edit_buf.borrow_mut().clear();
             state.mode.set(GuiMode::Normal);
             update_formula_bar(state, state.last_row.get(), state.last_col.get());
@@ -1374,6 +1387,17 @@ fn handle_edit_key(key: u32, state: &GuiState) -> bool {
             }
             let ch = char::from_u32(key).unwrap_or('?');
             log_key_action(key, "edit_insert", &format!("char={ch} cell={} mode=edit", format_cell(state)));
+            // Click-to-edit adopt (same rule as `start_edit_with`): the user
+            // clicked into the formula bar and is typing with an edit
+            // session already open (grid click / setup selects with editing
+            // on). Pushing onto the empty buffer would wipe the displayed
+            // formula to this one char; restore it first (append-model).
+            if state.entry_clicked.get() && state.edit_buf.borrow().is_empty() {
+                if let Some(shown) = state.formula_entry.get_text() {
+                    *state.edit_buf.borrow_mut() = shown;
+                }
+                state.entry_clicked.set(false);
+            }
             state.edit_buf.borrow_mut().push(ch);
             sync_entry_to_buf(state);
             state.canvas.queue_redraw();
@@ -1414,6 +1438,19 @@ fn start_edit_keep_display(state: &GuiState) {
 fn start_edit_with(state: &GuiState, ch: char) {
     let already_editing = state.editing.get();
     state.editing.set(true);
+    // Click-to-edit adopt: the user clicked into the formula bar (which
+    // displays the cell's formula) and is now typing into it. Pushing onto
+    // the empty buffer would wipe the formula to this one char; restore
+    // the displayed text first (append-model — a mid-text click still
+    // appends at the end, but nothing is ever lost). Runs only on a fresh
+    // click (entry_clicked) with an empty buffer; every other flow keeps
+    // today's push/replace behavior byte-identical.
+    if state.entry_clicked.get() && state.edit_buf.borrow().is_empty() {
+        if let Some(shown) = state.formula_entry.get_text() {
+            *state.edit_buf.borrow_mut() = shown;
+        }
+        state.entry_clicked.set(false);
+    }
     state.edit_buf.borrow_mut().push(ch);
     // Keep the widget identical to edit_buf (see sync_entry_to_buf): the
     // widget text is what the user sees, edit_buf is what gets committed.
@@ -1439,6 +1476,9 @@ fn sync_entry_to_buf(state: &GuiState) {
 
 fn commit_edit(state: &GuiState) {
     state.editing.set(false);
+    // A commit is a fresh boundary (ratatui parity): later typing starts a
+    // new value, it never repairs into the committed formula.
+    state.entry_clicked.set(false);
     state.mode.set(GuiMode::Normal);
     let val = state.edit_buf.borrow().clone();
     if !val.is_empty() {
@@ -1968,6 +2008,14 @@ fn update_formula_bar(state: &GuiState, row: usize, col: usize) {
     if !state.editing.get() || state.edit_buf.borrow().is_empty() {
         state.formula_entry.set_text(&val);
     }
+    // Click-to-edit bookkeeping (see entry_clicked): a refresh for a
+    // different cell ends click-edit intent; the snapshot always tracks the
+    // displayed grid truth so a repair can never use stale text.
+    if (row, col) != state.entry_shown.get() {
+        state.entry_clicked.set(false);
+        state.entry_shown.set((row, col));
+    }
+    *state.entry_snapshot.borrow_mut() = val;
     sync_chrome_labels(state);
 }
 
@@ -2563,28 +2611,18 @@ fn on_formula_entry_changed(state: &GuiState) {
         return;
     }
     if let Some(text) = state.formula_entry.get_text() {
-        // Native-first: with keyboard focus in the entry, the native widget
-        // is the sole writer (both key layers defer printable/Backspace/
-        // Delete/Ctrl+A/C/V/X to it), so track it unconditionally —
-        // including mid-text insertions, which the prefix guard below would
-        // reject ("=1X+2" is neither a prefix nor an extension of "=1+2")
-        // and desync the commit source from the screen. Focus is read live,
-        // so this cannot fire for a stale focus assumption.
-        if state.formula_entry.has_focus() {
-            *state.edit_buf.borrow_mut() = text;
-        } else if {
-            let current = state.edit_buf.borrow();
-            // Safety check: only overwrite edit_buf from entry text when the
-            // entry text is a forward or backward extension of the current
-            // edit_buf.  This prevents data corruption when keystrokes from
-            // the window-level handler (start_edit_with/handle_edit_key) race
-            // with the entry's "changed" signal — a scenario where edit_buf
-            // contains "4" (from window handler) but the entry text is "2"
-            // (just arrived via entry default handler after grab_focus took
-            // effect).  Without this guard, edit_buf would be overwritten to
-            // "2", silently dropping the "4".
-            text.starts_with(&*current) || current.starts_with(&text)
-        } {
+        let current = state.edit_buf.borrow();
+        // Safety check: only overwrite edit_buf from entry text when the
+        // entry text is a forward or backward extension of the current
+        // edit_buf.  This prevents data corruption when keystrokes from
+        // the window-level handler (start_edit_with/handle_edit_key) race
+        // with the entry's "changed" signal — a scenario where edit_buf
+        // contains "4" (from window handler) but the entry text is "2"
+        // (just arrived via entry default handler after grab_focus took
+        // effect).  Without this guard, edit_buf would be overwritten to
+        // "2", silently dropping the "4".
+        if text.starts_with(&*current) || current.starts_with(&text) {
+            drop(current);
             *state.edit_buf.borrow_mut() = text;
         }
         state.canvas.queue_redraw();
@@ -2789,6 +2827,9 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         formula_status: formula_status.clone(),
         editing: Cell::new(false),
         edit_buf: RefCell::new(String::new()),
+        entry_snapshot: RefCell::new(String::new()),
+        entry_clicked: Cell::new(false),
+        entry_shown: Cell::new((usize::MAX, usize::MAX)),
         mode: Cell::new(GuiMode::Normal),
         last_row: Cell::new(cursor_row),
         last_col: Cell::new(cursor_col),
@@ -2891,6 +2932,16 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // Formula entry change
     let shared_entry = shared.clone();
     formula_entry.connect_changed(move || { on_formula_entry_changed(&shared_entry); })?;
+
+    // Pointer click into the formula entry arms click-to-edit repair: the
+    // next entry keystroke restores the displayed formula around a fresh
+    // single-char push instead of losing it. The click still focuses and
+    // places the caret natively; nothing is consumed here. No-op on
+    // backends without entry click support.
+    let shared_click = shared.clone();
+    formula_entry.connect_button_press(move || {
+        shared_click.entry_clicked.set(true);
+    })?;
 
 
     // Direct RETURN handling via connect_activate.  On GTK4 the entry's
@@ -3072,35 +3123,6 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                     }
                 }
             }
-    // Native-first text editing: the focused formula entry owns printable
-    // and Backspace/Delete keys (caret, selection, and Ctrl+A/C/V/X work
-    // natively, exactly like any GTK text field). Handling here would push
-    // behind the widget's back — appending at the end, or wiping a fresh
-    // focus to one char — so defer (return 0): the entry's own handler
-    // takes the same event, leaving a single native writer that the change
-    // handler tracks into the buffer. Whether the entry is focused is read
-    // live (not from a flag), so a stale focus assumption can never drop
-    // keys. Ctrl+Q, Alt combos, menu mnemonics, and all navigation/commit
-    // keys (arrows, Return/Escape/Tab/Home/End) keep their app flows
-    // below; unfocused keys keep today's push behavior.
-    if !ctrl_held && !alt_held
-        && ((32..=126).contains(&nk) || nk == BACKSPACE || nk == DELETE)
-        && s.editing.get()
-        && s.formula_entry.has_focus()
-    {
-        s.entry_processed_key.set(false);
-        return 0;
-    }
-    // Focused Ctrl+A/C/V/X (select-all, copy, paste, cut) likewise belong
-    // to the native widget; Ctrl+Q and every other combo keep today's
-    // flows (quit, menu mnemonics, window shortcuts).
-    if ctrl_held && !alt_held
-        && matches!(ch, 'a' | 'c' | 'v' | 'x')
-        && s.formula_entry.has_focus()
-    {
-        s.entry_processed_key.set(false);
-        return 0;
-    }
     let hk = handle_key(keyval, &state_w, state);
     append_keylog(&format!("handle_key={hk}\n"));
     if hk {
@@ -3169,31 +3191,8 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
             shared_k_cnt.entry_seen.set(true);
             let k = normalize(keyval);
             match k {
-                BACKSPACE | DELETE => {
-                    // Counted already: skip, exactly once (same guard as
-                    // the printable arm below).
-                    if shared_k.entry_processed_key.get() {
-                        shared_k.entry_processed_key.set(false);
-                        return false;
-                    }
-                    // Ctrl/Alt combos bubble to the window (today).
-                    if (state & (0x4 | 0x8)) != 0 {
-                        return false;
-                    }
-                    // Native-first deletion at the widget caret for an
-                    // in-progress edit (Backspace deletes before the caret,
-                    // Delete at it). Fresh keys keep today's routed flows
-                    // (delete-cell, pop) via handle_key below.
-                    if shared_k.editing.get() {
-                        return false;
-                    }
-                    handle_key(keyval, &shared_k, state);
-                    if !cfg!(windows) && shared_k.entry_seen.get() {
-                        shared_k.entry_processed_key.set(true);
-                    }
-                    true
-                }
-                RETURN | ESCAPE | TAB | LEFT | RIGHT | UP | DOWN | HOME | END | PAGE_UP | PAGE_DOWN => {
+                RETURN | ESCAPE | TAB | LEFT | RIGHT | UP | DOWN | HOME | END | PAGE_UP | PAGE_DOWN
+                | BACKSPACE | DELETE => {
                     // Same-event duplicate guard (mirrors the printable arm
                     // below): the window handler fires first and arms
                     // entry_processed_key; without this check a second
@@ -3217,34 +3216,12 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                     true
                 }
                 _ if (32..=126).contains(&k) => {
-                    // Counted already (window handled it, or a menu
-                    // consumed it): skip, exactly once. Must come first —
-                    // handling below would double-count the keystroke.
+                    // Counted already (window handled it, or a menu consumed
+                    // it): skip, exactly once. The window layer owns all
+                    // buffer updates (including click-to-edit adopt), so the
+                    // entry never reconciles here — it only avoids doubling.
                     if shared_k.entry_processed_key.get() {
                         shared_k.entry_processed_key.set(false);
-                        return false;
-                    }
-                    // Native-first text commands: Ctrl+A/C/V/X work directly
-                    // in the focused entry (select-all, copy, paste, cut).
-                    // The window defers the same event, so this is the only
-                    // handling. Every other Ctrl/Alt combo bubbles to the
-                    // window (Ctrl+Q, menu mnemonics).
-                    if (state & 0x4) != 0
-                        && (state & 0x8) == 0
-                        && matches!(char::from_u32(k).unwrap_or('\0').to_ascii_lowercase(), 'a' | 'c' | 'v' | 'x')
-                    {
-                        shared_k.editing.set(true);
-                        return false;
-                    }
-                    // Native-first typing: this handler firing is proof the
-                    // entry has focus, so an in-progress edit types natively
-                    // at the widget caret (mid-text clicks insert mid-text,
-                    // exactly like any GTK field). The window handler defers
-                    // the same event (it reads live focus too), leaving a
-                    // single native writer tracked into the buffer. Fresh
-                    // (non-editing) keys still go through handle_key for
-                    // ratatui-style replace semantics.
-                    if shared_k.editing.get() {
                         return false;
                     }
                     // Process the key to update edit_buf (via handle_key →

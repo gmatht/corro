@@ -1214,8 +1214,10 @@ mod nwg_adapter {
         pub(crate) changed_cb: Rc<RefCell<Option<Box<dyn FnMut()>>>>,
         focus_in_cb: Rc<RefCell<Option<Box<dyn FnMut(*mut c_void) -> i32>>>>,
         focus_out_cb: Rc<RefCell<Option<Box<dyn FnMut(*mut c_void) -> i32>>>>,
+        click_cb: Rc<RefCell<Option<Box<dyn FnMut()>>>>,
         _focus_in_handler: Option<nwg::RawEventHandler>,
         _focus_out_handler: Option<nwg::RawEventHandler>,
+        _click_handler: Option<nwg::RawEventHandler>,
         key_cb: Rc<RefCell<Option<Box<dyn FnMut(u32, u32) -> bool>>>>,
         _key_handler: Option<nwg::RawEventHandler>,
         activate_cb: Rc<RefCell<Option<Box<dyn FnMut(*mut c_void)>>>>,
@@ -1231,8 +1233,10 @@ mod nwg_adapter {
                 changed_cb: self.changed_cb.clone(),
                 focus_in_cb: self.focus_in_cb.clone(),
                 focus_out_cb: self.focus_out_cb.clone(),
+                click_cb: self.click_cb.clone(),
                 _focus_in_handler: None,
                 _focus_out_handler: None,
+                _click_handler: None,
                 key_cb: self.key_cb.clone(),
                 _key_handler: None,
                 activate_cb: self.activate_cb.clone(),
@@ -1302,6 +1306,14 @@ mod nwg_adapter {
                 return false;
             }
             unsafe { winapi::um::winuser::GetFocus() == self.hwnd as _ }
+        }
+        /// Pointer press (click) into the entry. Same raw-hook pattern as
+        /// the focus handlers: WM_LBUTTONDOWN on the edit hwnd fires the
+        /// stored callback (no consume — the click must still focus and
+        /// place the caret natively).
+        pub fn connect_button_press(&self, f: impl FnMut() + 'static) -> Result<u64, Error> {
+            *self.click_cb.borrow_mut() = Some(Box::new(f));
+            Ok(0)
         }
         pub fn grab_focus(&self) {
             let _ = self.inner.set_focus();
@@ -1400,6 +1412,7 @@ mod nwg_adapter {
         mark95a(b"a-e0\n");
         let focus_in_cb: Rc<RefCell<Option<Box<dyn FnMut(*mut c_void) -> i32>>>> = Rc::new(RefCell::new(None));
         let focus_out_cb: Rc<RefCell<Option<Box<dyn FnMut(*mut c_void) -> i32>>>> = Rc::new(RefCell::new(None));
+        let click_cb: Rc<RefCell<Option<Box<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
         let key_cb: Rc<RefCell<Option<Box<dyn FnMut(u32, u32) -> bool>>>> = Rc::new(RefCell::new(None));
         let activate_cb: Rc<RefCell<Option<Box<dyn FnMut(*mut c_void)>>>> =
             Rc::new(RefCell::new(None));
@@ -1443,6 +1456,20 @@ mod nwg_adapter {
 
         #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
         mark95a(b"a-e2\n");
+        let _click_handler = if hwnd != std::ptr::null_mut() {
+            let cb = click_cb.clone();
+            static CLICK_ID: AtomicUsize = AtomicUsize::new(0x70000000);
+            let id = CLICK_ID.fetch_add(1, Ordering::SeqCst);
+            nwg::bind_raw_event_handler(
+                &nwg::ControlHandle::Hwnd(hwnd), id,
+                move |_h, msg, _w, _l| {
+                    if msg == winapi::um::winuser::WM_LBUTTONDOWN {
+                        if let Some(ref mut f) = *cb.borrow_mut() { f(); }
+                    }
+                    None
+                },
+            ).ok()
+        } else { None };
         let _focus_out_handler = if hwnd != std::ptr::null_mut() {
             let cb = focus_out_cb.clone();
             static FOCUS_OUT_ID: AtomicUsize = AtomicUsize::new(0x50000000);
@@ -1565,7 +1592,7 @@ mod nwg_adapter {
 
         #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
         mark95a(b"a-e4\n");
-        Ok(Entry { hwnd: hwnd as *mut c_void, inner: Rc::new(inner), _handler: Rc::new(handler), changed_cb, focus_in_cb, focus_out_cb, _focus_in_handler, _focus_out_handler, key_cb, _key_handler, activate_cb, pos_x: std::cell::Cell::new(0), pos_y: std::cell::Cell::new(0) })
+        Ok(Entry { hwnd: hwnd as *mut c_void, inner: Rc::new(inner), _handler: Rc::new(handler), changed_cb, focus_in_cb, focus_out_cb, click_cb, _focus_in_handler, _focus_out_handler, _click_handler, key_cb, _key_handler, activate_cb, pos_x: std::cell::Cell::new(0), pos_y: std::cell::Cell::new(0) })
     }
 
     // ========== DropDown ==========

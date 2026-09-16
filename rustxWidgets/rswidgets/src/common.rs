@@ -133,6 +133,11 @@ macro_rules! common_types_mod {
             /// without a focus query report false, so callers there keep
             /// today's push behavior unchanged.
             pub fn has_focus(&self) -> bool { self.inner.has_focus() }
+            /// Fires on pointer press (click) into the entry. Generic
+            /// mechanism; apps use it for click-to-edit flows. Backends
+            /// without pointer support on entries accept the callback and
+            /// never fire it (behavior there is unchanged).
+            pub fn connect_button_press(&self, f: impl FnMut() + 'static) -> Result<u64, crate::Error> { self.inner.connect_button_press(f) }
             pub fn connect_focus_in_event<F: FnMut(*mut std::os::raw::c_void) -> i32 + 'static>(&self, f: F) -> Result<u64, crate::Error> { self.inner.connect_focus_in_event(f) }
             pub fn connect_focus_out_event<F: FnMut(*mut std::os::raw::c_void) -> i32 + 'static>(&self, f: F) -> Result<u64, crate::Error> { self.inner.connect_focus_out_event(f) }
             pub fn set_margin_start(&self, px: i32) { self.inner.set_margin_start(px); }
