@@ -172,12 +172,16 @@ pub fn fill_cells(
                     } else {
                         formatted.clone()
                     };
-                    let should_store = !store_text.is_empty()
-                        || (c >= lm && c < lm + mc)
-                        || (c >= lm + mc);
-                    if should_store {
-                        sink.set_cell(ri as u32, c as u32, &store_text);
-                        sink.set_cell_style(ri as u32, c as u32, cell_info.style);
+                    // Always store, even when empty: the sink is a persistent
+                    // (display_row, display_col) map, so skipping empty cells
+                    // leaves the *previous* frame's text visible once the
+                    // viewport scrolls (e.g. the footer's "TOTAL" key cell
+                    // lingering on a data row that now occupies that screen
+                    // line). Refill must be authoritative for every visible
+                    // position.
+                    sink.set_cell(ri as u32, c as u32, &store_text);
+                    sink.set_cell_style(ri as u32, c as u32, cell_info.style);
+                    if !store_text.is_empty() {
                         if let Some(ref raw_val) = cell_info.raw_value {
                             sink.set_raw_cell(ri as u32, c as u32, raw_val);
                         }
@@ -210,12 +214,12 @@ pub fn fill_cells(
                 } else {
                     display_text
                 };
-                let should_store = !store_text.is_empty()
-                    || (c >= lm && c < lm + mc)
-                    || (c >= lm + mc);
-                if should_store {
-                    sink.set_cell(ri as u32, c as u32, &store_text);
-                    sink.set_cell_style(ri as u32, c as u32, cell_info.style);
+                // Always store (see the spill branch): an empty cell must
+                // overwrite the previous frame's text at this display
+                // position, or stale content survives a scroll.
+                sink.set_cell(ri as u32, c as u32, &store_text);
+                sink.set_cell_style(ri as u32, c as u32, cell_info.style);
+                if !store_text.is_empty() {
                     if let Some(ref raw_val) = cell_info.raw_value {
                         sink.set_raw_cell(ri as u32, c as u32, raw_val);
                     }
@@ -291,5 +295,116 @@ fn cell_addr_for_coords(logical_row: usize, hr: usize, mr: usize, c: usize, lm: 
         } else {
             CellAddr::Footer { row: ftr_row, col: ColumnAddr::Right(c - lm - mc) }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// Recording sink: keeps the same persistent-map semantics the native
+    /// backends use (insert per position), so a stale entry survives unless
+    /// `fill_cells` overwrites it.
+    #[derive(Default)]
+    struct RecordingSink {
+        cells: HashMap<(u32, u32), String>,
+        styles: HashMap<(u32, u32), CellDisplayStyle>,
+    }
+
+    impl CellSink for RecordingSink {
+        fn set_cell(&mut self, r: u32, c: u32, text: &str) {
+            self.cells.insert((r, c), text.to_string());
+        }
+        fn set_cell_style(&mut self, r: u32, c: u32, style: CellDisplayStyle) {
+            self.styles.insert((r, c), style);
+        }
+        fn set_raw_cell(&mut self, _r: u32, _c: u32, _t: &str) {}
+        fn set_cursor(&mut self, _r: u32, _c: u32) {}
+    }
+
+    fn fill(g: &GridBox, display_rows: &[usize], cursor_row: usize, sink: &mut RecordingSink) {
+        let lm = crate::grid::MARGIN_COLS;
+        let mc = g.main_cols();
+        let mr = g.main_rows();
+        let hr = crate::grid::HEADER_ROWS;
+        let col_ixs: Vec<usize> = (0..(lm + mc + crate::grid::MARGIN_COLS)).collect();
+        let col_widths: HashMap<usize, usize> =
+            col_ixs.iter().map(|&c| (c, g.col_width(c).max(1))).collect();
+        let ragg = compute::compute_row_agg_func(g, display_rows, hr, mr);
+        fill_cells(
+            sink, display_rows, &col_ixs, &col_widths, g, hr, mr, mc, lm, 80,
+            cursor_row, lm, &ragg,
+        );
+    }
+
+    /// Regression: as the viewport scrolls, the screen position that used to
+    /// be the footer row (carrying the seeded margin-key `TOTAL`) becomes a
+    /// data row. `fill_cells` must overwrite that position with the now-empty
+    /// cell, or the stale "TOTAL" lingers on a data row — the reported
+    /// "scrolling shows TOTAL in rows that shouldn't have it" bug.
+    #[test]
+    fn refill_overwrites_stale_cells_after_scroll() {
+        let mut sheet = crate::ops::SheetState::new_seeded();
+        // Three main rows so the viewport can scroll over them.
+        sheet.grid.set_main_size(3, 1);
+        let g = &sheet.grid;
+        let hr = crate::grid::HEADER_ROWS;
+        let mr = g.main_rows();
+
+        // Frame 1: cursor in the footer — its display rows hold the margin
+        // key ("TOTAL") at the left-margin position.
+        let footer_rows: Vec<usize> = (0..5).map(|i| hr + mr + i).collect();
+        let mut sink = RecordingSink::default();
+        let cursor_footer = hr + mr;
+        fill(g, &footer_rows, cursor_footer, &mut sink);
+        let total_at = (0u32, (crate::grid::MARGIN_COLS - 1) as u32);
+        assert_eq!(
+            sink.cells.get(&total_at).map(|s| s.trim()),
+            Some("TOTAL"),
+            "frame 1: display row 0 is the footer row, whose margin key is TOTAL"
+        );
+
+        // Frame 2: same screen positions, but now they are plain data rows.
+        let data_rows: Vec<usize> = (0..5).map(|i| hr + i).collect();
+        fill(g, &data_rows, hr, &mut sink);
+        assert_eq!(
+            sink.cells.get(&total_at).map(|s| s.trim()),
+            Some(""),
+            "frame 2: the reused screen row must be cleared (stale TOTAL \
+             would otherwise show on a data row)"
+        );
+    }
+
+    /// The cursor style must be re-emitted each frame at the cursor's screen
+    /// position (the reported "selection disappears on scroll").
+    #[test]
+    fn refill_reemits_cursor_style_every_frame() {
+        let mut sheet = crate::ops::SheetState::new_seeded();
+        sheet.grid.set_main_size(3, 1);
+        let g = &sheet.grid;
+        let hr = crate::grid::HEADER_ROWS;
+        let mr = g.main_rows();
+        let rows: Vec<usize> = (0..5).map(|i| hr + i).collect();
+
+        let mut sink = RecordingSink::default();
+        fill(g, &rows, hr + 2, &mut sink);
+        assert_eq!(
+            sink.styles.get(&(2, crate::grid::MARGIN_COLS as u32)),
+            Some(&CellDisplayStyle::Cursor),
+            "cursor cell must be styled Cursor"
+        );
+        // Scrolling to a different row must move the cursor style, not drop it.
+        fill(g, &rows, hr, &mut sink);
+        assert_eq!(
+            sink.styles.get(&(2, crate::grid::MARGIN_COLS as u32)),
+            Some(&CellDisplayStyle::Default),
+            "the old cursor position must be reset to Default"
+        );
+        assert_eq!(
+            sink.styles.get(&(0, crate::grid::MARGIN_COLS as u32)),
+            Some(&CellDisplayStyle::Cursor),
+            "the new cursor position must carry Cursor"
+        );
     }
 }
