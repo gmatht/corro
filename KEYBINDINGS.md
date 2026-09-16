@@ -25,7 +25,7 @@ It favors spreadsheet conventions where they fit, and documents the bindings tha
 | `Ctrl+D` / `Cmd+D` | Fill right | Repeats or extends a single selected row to the right |
 | `Ctrl+R` / `Cmd+R` | Fill down | Repeats or extends a single selected column downward |
 | `Ctrl+Shift++` | Insert rows | Inserts rows above the current row or selected rows |
-| `Alt+E` | Open Edit menu | Menu includes cut, copy, paste, find, and replace |
+| `Alt+E` | Open Edit menu | Menu includes cut, copy, paste, find, replace, and follow link |
 | `Ctrl+Shift+P` | Paste | Same as `Ctrl+V` in this build |
 | `Alt+I` | Open Insert menu | Menu includes rows, cols, special chars, and hyperlink actions |
 | `v` | Toggle cell selection | Selects the current rectangle anchor, or clears selection |
@@ -39,6 +39,7 @@ It favors spreadsheet conventions where they fit, and documents the bindings tha
 | `c` | Export CSV or move cols | Exports CSV when no selection exists; otherwise moves selected columns |
 | `r` | Move rows or select rows | Expands to full rows first, then moves selected rows on the next `r` |
 | `Delete`, `Backspace` | Clear cell or selection | Deletes the current cell if nothing is selected |
+| `Ctrl+O` | Follow hyperlink | Opens the cursor cell's URL in the default browser; cells holding hyperlinks render blue and underlined |
 | `Ctrl+Z` | Undo | Appends and applies the inverse op |
 | `Ctrl+Q` | Quit immediately | Bypasses the quit prompt |
 | `?`, `h` | Help | Opens the help view |
@@ -51,6 +52,7 @@ Menu mode is an internal accelerator layer. It is mostly reached through `Alt` s
 
 | Key | Action | Notes |
 | --- | --- | --- |
+| `N` | New workbook | Blank workbook, detached from any file |
 | `F` | Open path prompt | Same as `o` / `Alt+F` |
 | `R` | Explain row ops | Returns to Normal mode with a hint in the status line |
 | `C` | Explain col ops | Returns to Normal mode with a hint in the status line |

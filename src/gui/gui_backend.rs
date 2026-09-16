@@ -1,4 +1,15 @@
+// Combined-gui builds flip the rswidgets root prelude to pancurses-adapter
+// types; the native backend always needs the common wrappers, so on Linux
+// it names them explicitly. Other platforms keep the prelude (unchanged).
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 use rswidgets::prelude::*;
+#[cfg(target_os = "linux")]
+use rswidgets::common::{Canvas, Entry, Label, MenuBar, Orientation, Window};
+// Windows uses the same common wrappers explicitly: under pancurses the
+// root prelude flips to pancurses-adapter types, so the glob alone would
+// silently rebind these names there.
+#[cfg(target_os = "windows")]
+use rswidgets::common::{Canvas, Entry, Label, MenuBar, Orientation, Window};
 use rswidgets::core::DrawContext;
 
 use std::cell::{Cell, RefCell};
@@ -420,6 +431,16 @@ fn render_to(
                     CellDisplayStyle::ActiveHeader | CellDisplayStyle::InactiveHeader => {
                         dc.draw_text(cx + 2.0, ry + 2.0, raw_text, "monospace", FONT_SIZE, 0.3, 0.3, 0.3, 1.0);
                     }
+                    CellDisplayStyle::Hyperlink => {
+                        // Hyperlinks render blue and underlined by default
+                        // (same rule as the terminal backends); cursor and
+                        // selection paints above already won for this cell.
+                        dc.draw_text(cx + 2.0, ry + 2.0, raw_text, "monospace", FONT_SIZE, 0.0, 0.0, 0.9, 1.0);
+                        let (tw, _, _, _) = dc.text_extents(raw_text, "monospace", FONT_SIZE);
+                        if tw > 0.0 {
+                            dc.fill_rect(cx + 2.0, ry + 2.0 + FONT_SIZE + 1.0, tw, 1.0, 0.0, 0.0, 0.9, 1.0);
+                        }
+                    }
                 }
             }
         }
@@ -486,12 +507,18 @@ fn paint_row_headers(
     mr: usize,
     pinned: &std::collections::BTreeSet<usize>,
     out_padlocks: &mut Vec<GutterPadlock>,
+    hl_rows: Option<(usize, usize)>,
 ) {
     for (ri, &logical_row) in display_rows.iter().enumerate().take(MAX_RENDER_ROWS) {
         let ry = HEADER_H + ri as f64 * ROW_H;
         let label = crate::addr::ui_row_label(logical_row, mr);
         let (_, _, tw, _) = dc.text_extents_styled(&label, "monospace", FONT_SIZE, 0, 1);
-        dc.fill_rect(0.0, ry, ROW_LABEL_W, ROW_H, 0.9, 0.9, 0.9, 1.0);
+        // Covered rows (anchor↔cursor selection) use the body selection
+        // fill so the gutter mirrors the selected band; plain rows keep the
+        // neutral header gray. With no selection nothing changes.
+        let hl = hl_rows.is_some_and(|(r0, r1)| logical_row >= r0 && logical_row <= r1);
+        let fill = if hl { (0.9, 0.95, 1.0, 1.0) } else { (0.9, 0.9, 0.9, 1.0) };
+        dc.fill_rect(0.0, ry, ROW_LABEL_W, ROW_H, fill.0, fill.1, fill.2, fill.3);
         // Row numbers sit 6px off the gutter's right gridline so glyphs
         // never touch it.
         dc.draw_text_styled(ROW_LABEL_W - tw - 6.0, ry + 2.0, &label, "monospace", FONT_SIZE, 0.3, 0.3, 0.3, 1.0, 0, 1);
@@ -524,12 +551,16 @@ fn paint_col_headers(
     mc: usize,
     pinned: &std::collections::BTreeSet<usize>,
     out_padlocks: &mut Vec<GutterPadlock>,
+    hl_cols: Option<(usize, usize)>,
 ) {
     for (ci, &c) in col_ixs.iter().enumerate().take(MAX_RENDER_COLS) {
         let cw = *col_widths.get(&c).unwrap_or(&8) as f64 * CHAR_W;
         let cx = ROW_LABEL_W + col_ixs.iter().take(ci).map(|&pc| *col_widths.get(&pc).unwrap_or(&8) as f64 * CHAR_W).sum::<f64>();
         let col_name = crate::addr::ui_column_fragment(c, mc);
-        dc.fill_rect(cx, 0.0, cw, HEADER_H, 0.9, 0.9, 0.9, 1.0);
+        // Same selection fill as covered row headers (see paint_row_headers).
+        let hl = hl_cols.is_some_and(|(c0, c1)| c >= c0 && c <= c1);
+        let fill = if hl { (0.9, 0.95, 1.0, 1.0) } else { (0.9, 0.9, 0.9, 1.0) };
+        dc.fill_rect(cx, 0.0, cw, HEADER_H, fill.0, fill.1, fill.2, fill.3);
         let (_, _, tw, _) = dc.text_extents_styled(&col_name, "monospace", FONT_SIZE, 0, 1);
         // Label and padlock center as a unit, so the icon fits inside its
         // own column instead of dangling past the gridline: the column is
@@ -890,13 +921,21 @@ fn render_grid(dc: &mut dyn DrawContext, state: &GuiState, w: i32, h: i32) {
     let pinned_cols: std::collections::BTreeSet<usize> =
         state.pinned_cols.borrow().iter().copied().collect();
     let mut padlocks: Vec<GutterPadlock> = Vec::new();
-    paint_row_headers(dc, &display_rows, mr, &pinned_rows, &mut padlocks);
+    // Header coverage mirrors the body's selection rectangle (anchor↔cursor
+    // on both axes — the GUI has no Rows/Cols-only modes). None while
+    // navigating plainly, so unselected chrome renders exactly as before.
+    let cover: Option<((usize, usize), (usize, usize))> = app.core.anchor.map(|a| {
+        let (r0, r1) = (a.row.min(cursor_row), a.row.max(cursor_row));
+        let (c0, c1) = (a.col.min(cursor_col), a.col.max(cursor_col));
+        ((r0, r1), (c0, c1))
+    });
+    paint_row_headers(dc, &display_rows, mr, &pinned_rows, &mut padlocks, cover.map(|(r, _)| r));
 
     // Selection rectangle (anchor..cursor, rows AND columns). None while
     // navigating plainly — only explicit selections highlight.
 
     // Column headers
-    paint_col_headers(dc, &col_ixs, &col_widths, mc, &pinned_cols, &mut padlocks);
+    paint_col_headers(dc, &col_ixs, &col_widths, mc, &pinned_cols, &mut padlocks, cover.map(|(_, c)| c));
     *state.padlocks.borrow_mut() = padlocks;
 
     let row_agg_func = compute::compute_row_agg_func(
@@ -1022,6 +1061,27 @@ fn handle_extrapolate_key(key: u32, state: &GuiState) -> bool {
 
 fn handle_key(keyval: u32, state_rc: &Rc<GuiState>, mods: u32) -> bool {
     let state: &GuiState = &**state_rc;
+    // Tail external changes on every keystroke (parity with the TUI loop,
+    // which polls sync_external each iteration): another window's committed
+    // cells land here without a reload. Commits append to the log
+    // immediately, so no save step is needed on either side. Redraw only
+    // when something actually arrived; tail errors become status text,
+    // never a lost keystroke.
+    let tailed = {
+        let app = state.app_mut();
+        match app.core.poll_log_tail() {
+            Ok(changed) => changed,
+            Err(e) => {
+                app.core.status = format!("Sync error: {e}");
+                true
+            }
+        }
+    };
+    if tailed {
+        update_formula_bar(state, HEADER_ROWS, MARGIN_COLS);
+        sync_chrome_labels(state);
+        state.canvas.queue_redraw();
+    }
     state.last_key.set(keyval);
     let app = state.app_mut();
     let key = normalize(keyval);
@@ -1956,6 +2016,24 @@ fn handle_click(x: f64, y: f64, state_rc: &Rc<GuiState>) {
             let display_rows: Vec<usize> = displayed_rows(state);
             if ri < display_rows.len() {
                 let logical_row = display_rows[ri];
+                // Clicking away from an in-progress edit commits it to the
+                // cell it was entered in: `last_row`/`last_col` still point
+                // there, and the `start_edit` below would otherwise clear
+                // `edit_buf` and silently discard the typed value (Esc is the
+                // cancel path — it remembers the text via `pending_lost_edit`,
+                // which this path never did).
+                let same_cell =
+                    logical_row == state.last_row.get() && c == state.last_col.get();
+                if state.editing.get() && !state.edit_buf.borrow().is_empty() {
+                    if same_cell {
+                        // Re-clicking the cell being edited keeps the text
+                        // in flight rather than committing and restarting.
+                        state.formula_entry.grab_focus();
+                        state.canvas.queue_redraw();
+                        return;
+                    }
+                    commit_edit(state);
+                }
                 state.last_row.set(logical_row);
                 state.last_col.set(c);
                 app.core.cursor.row = logical_row;
@@ -2069,6 +2147,37 @@ fn refresh_after_dialog(state: &Rc<GuiState>) {
 /// widget-caret API exists on every backend, so the ratatui mid-caret
 /// splice degrades to append here. Cancel closes picker state and stages
 /// nothing.
+/// Return keyboard focus to the formula entry once the picker dialog has
+/// fully torn down.
+///
+/// The dialog closes asynchronously (delete-event) and its own focus restore
+/// runs *after* a synchronous grab, stealing focus back — the staged edit then
+/// sits visible in the formula bar while every later key (including the Return
+/// that should commit it) is dropped, so the picker looks like a no-op.
+/// Deferring past teardown on GTK fixes it; backends with modeless dialogs
+/// grab immediately.
+fn restore_editor_focus(state: &Rc<GuiState>) {
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs")))]
+    {
+        let entry = state.formula_entry.clone();
+        let window = state.window.clone();
+        let _ = rswidgets::backends::gtk::timeout_add_once(
+            150,
+            Box::new(move || {
+                // The toplevel itself lost activation to the dialog; without
+                // re-presenting it, keys sent to the window are ignored even
+                // though the entry is focused.
+                window.present();
+                entry.grab_focus();
+            }),
+        );
+    }
+    #[cfg(not(all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
+    {
+        state.formula_entry.grab_focus();
+    }
+}
+
 fn open_special_char_picker(state: &Rc<GuiState>) {
     // Dismiss any open menu grab FIRST: Alt+I,s leaves the Insert menu
     // open behind the dialog, and its grab would swallow every later key
@@ -2091,7 +2200,7 @@ fn open_special_char_picker(state: &Rc<GuiState>) {
                     if shared.editing.get() {
                         shared.edit_buf.borrow_mut().push_str(&choice);
                         sync_entry_to_buf(&shared);
-                        shared.formula_entry.grab_focus();
+                        restore_editor_focus(&shared);
                     } else {
                         // Snapshot the visible cell text first so the staged
                         // edit starts from what the user sees.
@@ -2104,6 +2213,7 @@ fn open_special_char_picker(state: &Rc<GuiState>) {
                         );
                         let cur = grid.get(&addr).unwrap_or_default();
                         start_edit_with_text(&shared, &format!("{cur}{choice}"));
+                        restore_editor_focus(&shared);
                     }
                 }
             }
@@ -2200,9 +2310,9 @@ fn handle_menu_action(name: &str, state: &Rc<GuiState>) {
     match name {
         "open" => {
             if let Some(path) = dialogs::file_open_dialog() {
-                match crate::io::load_workbook_snapshot(&path) {
-                    Ok(snapshot) => {
-                        app.core.workbook = crate::ops::WorkbookState::from_snapshot(&snapshot);
+                match crate::io::load_workbook_file(&path) {
+                    Ok(workbook) => {
+                        app.core.workbook = workbook;
                         app.core.offset = 0;
                         app.core.ops_applied = 0;
                         app.core.path = Some(path);
@@ -2222,8 +2332,11 @@ fn handle_menu_action(name: &str, state: &Rc<GuiState>) {
         "save_as" => {
             if let Some(path) = dialogs::file_save_dialog() {
                 app.core.path = Some(path.clone());
-                let snapshot = crate::ops::WorkbookSnapshot::from_workbook(&app.core.workbook);
-                match crate::io::save_workbook(&path, &snapshot) {
+                match crate::io::write_workbook_log(
+                    &path,
+                    &app.core.workbook,
+                    &app.core.persisted_view_sort_cols,
+                ) {
                     Ok(()) => app.core.status = format!("Saved to {}", path.display()),
                     Err(e) => app.core.status = format!("Save error: {e}"),
                 }
@@ -2269,11 +2382,30 @@ fn handle_menu_action(name: &str, state: &Rc<GuiState>) {
             // Shared clipboard/history logic (same as pancurses/ratatui).
             delegate_shared_action(name, state);
         }
+        "follow_hyperlink" => {
+            // Shared follow-link logic (same status texts as
+            // pancurses/ratatui): opens the cursor cell's hyperlink.
+            delegate_shared_action(name, state);
+        }
+        "edit_workbook_external" => {
+            // Shared external-workbook logic: dispatch launches the GUI
+            // editor detached on Backend::Gui (probed lightest-first) and
+            // the save is picked up by the log-tail poll/tick, like another
+            // window's Save. (Cell-text "edit_external" stays unwired: its
+            // blocking $EDITOR roundtrip cannot run without a terminal.)
+            delegate_shared_action(name, state);
+        }
         "delete_cell" => {
             handle_delete(state);
         }
         "select_all" | "toggle_headers" | "toggle_margins" | "new_sheet" => {
             // Shared selection/chrome/sheet logic (same as pancurses/ratatui).
+            delegate_shared_action(name, state);
+        }
+        "new_file" => {
+            // Shared blank-document logic (same as pancurses/ratatui).
+            // The trailing refresh recomputes the viewport for the new
+            // workbook dims and syncs tabs, formula bar, and chrome.
             delegate_shared_action(name, state);
         }
         "export_tsv" | "export_csv" | "export_ods" | "export_ascii" | "export_all" => {
@@ -2341,9 +2473,12 @@ fn handle_menu_action(name: &str, state: &Rc<GuiState>) {
             delegate_shared_action(name, state);
         }
         // Ratatui-parity menu actions without dedicated GTK widgets yet.
-        // Each arm records an honest status (never a silent no-op) so menu
-        // activation is observable; the pancurses backend (`actions.rs`)
-        // carries the fully-wired implementations.
+        // Non-prompt leaves delegate to shared dispatch (which is total over
+        // the menu tree, so a newly-wired dispatch action works here with no
+        // per-backend arm — Edit ▸ Workbook (External) shipped broken until
+        // exactly this fallback existed). Prompt-gated leaves stay loud:
+        // shared dispatch only answers their prompts via dialogs, so
+        // delegating them would drop the prompt silently.
         "submenu" => {
             app.core.status = "Menu action: submenu placeholder (never dispatched)".into();
         }
@@ -2371,7 +2506,11 @@ fn handle_menu_action(name: &str, state: &Rc<GuiState>) {
             dialogs::show_keybinds_help();
         }
         _ => {
-            app.core.status = format!("Menu action: {name}");
+            if menu_action_needs_prompt(name).is_some() {
+                app.core.status = format!("Menu action: {name}");
+            } else {
+                delegate_shared_action(name, state);
+            }
         }
     }
     // Refresh the formula bar — unless an Edit{value} action just preset an
@@ -2505,6 +2644,9 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         mark95(b"winpost\n");
     }
     win.set_title(&format!("corro {}", env!("CARGO_PKG_VERSION")));
+    // TEMPORARY ReactOS diagnosis.
+    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+    unsafe { mark95(b"m-title\n"); }
     // TEMPORARY Win95 diagnosis: fit the 640x480 VM screen (release keeps
     // 1200x800 for real displays).
     #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
@@ -2512,10 +2654,19 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     #[cfg(not(all(target_family = "rust9x", target_env = "msvc")))]
     win.set_default_size(1200, 800);
 
+    // TEMPORARY ReactOS diagnosis.
+    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+    unsafe { mark95(b"m-size\n"); }
     let vbox = rxapp.new_box(Orientation::Vertical, 0)?;
+    // TEMPORARY ReactOS diagnosis.
+    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+    unsafe { mark95(b"m-box\n"); }
 
     // Fit column widths to rendered content
     corro_app.fit_main_columns_to_max_width();
+    // TEMPORARY ReactOS diagnosis.
+    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+    unsafe { mark95(b"m-fit\n"); }
 
     let hr = HEADER_ROWS;
     let lm = MARGIN_COLS;
@@ -2532,9 +2683,21 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
 
     // Formula bar
     let formula_bar = rxapp.new_box(Orientation::Horizontal, 2)?;
+    // TEMPORARY ReactOS diagnosis.
+    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+    unsafe { mark95(b"m-fbar\n"); }
     let addr_label = rxapp.new_label("A1")?;
+    // TEMPORARY ReactOS diagnosis.
+    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+    unsafe { mark95(b"m-alab\n"); }
     let f_label = rxapp.new_label("  fx  ")?;
+    // TEMPORARY ReactOS diagnosis.
+    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+    unsafe { mark95(b"m-flab\n"); }
     let formula_entry = rxapp.new_entry()?;
+    // TEMPORARY ReactOS diagnosis.
+    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+    unsafe { mark95(b"m-fentry\n"); }
     formula_entry.set_hexpand(true);
     formula_bar.append(&addr_label);
     formula_bar.append(&f_label);
@@ -3079,6 +3242,40 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // displays (so long that tests only ever observe the pumped phase),
     // and anything placed after it never runs there. GtkLabel applies
     // set_text/visibility on realize, so pre-present sync paints correctly.
+    // Mirror other windows (registered BEFORE present(): present() pumps
+    // events for a very long time on slow displays, and anything placed after
+    // it may never run at all — which is exactly why this tick never fired). `handle_key` also polls, but that only runs when
+    // a key arrives here: two windows editing the same file did not update
+    // each other until you pressed a key in the one you were watching. Poll
+    // on a timer instead, matching the TUI loop (which calls `sync_external`
+    // every iteration). Commits append to the log immediately, so no save
+    // step is needed on either side.
+    {
+        let tick_state = shared.clone();
+        match rswidgets::add_periodic_tick(
+            &win,
+            250,
+            Box::new(move || {
+                let changed = matches!(
+                    tick_state.app_mut().core.poll_log_tail(),
+                    Ok(true)
+                );
+                if changed {
+                    update_formula_bar(&tick_state, HEADER_ROWS, MARGIN_COLS);
+                    sync_chrome_labels(&tick_state);
+                    sync_tabbar(&tick_state);
+                    tick_state.canvas.queue_redraw();
+                }
+                true // keep ticking for the window's lifetime
+            }),
+        ) {
+            Ok(()) => {}
+            // No timer on this backend: the window still mirrors on
+            // keystrokes (handle_key), just not while idle.
+            Err(e) => eprintln!("periodic log-tail poll unavailable: {e}"),
+        }
+    }
+
     update_formula_bar(&shared, shared.last_row.get(), shared.last_col.get());
     sync_tabbar(&shared);
     formula_entry.grab_focus();
@@ -3196,6 +3393,41 @@ mod gutter_tests {
             .collect()
     }
 
+    /// Covered row headers use the body selection fill; uncovered rows keep
+    /// the neutral header gray (and `None` keeps everything gray, i.e. the
+    /// pre-existing unselected rendering).
+    #[test]
+    fn covered_row_headers_use_selection_fill() {
+        use std::collections::BTreeSet;
+        let mut dc = RecordingDrawContext::new();
+        let mut hits = Vec::new();
+        paint_row_headers(
+            &mut dc,
+            &[HEADER_ROWS, HEADER_ROWS + 1],
+            1,
+            &BTreeSet::new(),
+            &mut hits,
+            Some((HEADER_ROWS, HEADER_ROWS)),
+        );
+        let fills: Vec<(f64, f64, f64, f64)> = dc
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                DrawOp::FillRect { x, w, rgba, .. }
+                    if *x == 0.0 && *w == ROW_LABEL_W =>
+                {
+                    Some(*rgba)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            fills,
+            vec![(0.9, 0.95, 1.0, 1.0), (0.9, 0.9, 0.9, 1.0)],
+            "covered row must use the body selection fill, uncovered row header gray, got {fills:?}"
+        );
+    }
+
     /// Row gutter labels must paint bold (weight 1), with the row's label.
     /// Short labels (<=2 chars) additionally record a padlock hit rect.
     #[test]
@@ -3204,7 +3436,7 @@ mod gutter_tests {
         let mut dc = RecordingDrawContext::new();
         // Logical rows: main row 0 then footer rows (mr=1).
         let mut hits = Vec::new();
-        paint_row_headers(&mut dc, &[HEADER_ROWS, HEADER_ROWS + 1], 1, &BTreeSet::new(), &mut hits);
+        paint_row_headers(&mut dc, &[HEADER_ROWS, HEADER_ROWS + 1], 1, &BTreeSet::new(), &mut hits, None);
         let texts = styled_texts(&dc);
         assert_eq!(texts.len(), 2, "one label per row, got {texts:?}");
         assert_eq!(texts[0].0, "1", "main row label text, got {:?}", texts[0].0);
@@ -3233,6 +3465,42 @@ mod gutter_tests {
 
     /// Column gutter labels must paint bold (weight 1), with the column name.
     #[test]
+    fn covered_col_headers_use_selection_fill() {
+        use std::collections::BTreeSet;
+        let mut dc = RecordingDrawContext::new();
+        // Margin col, main col A (mc=1); cover only the main column.
+        let col_ixs = vec![MARGIN_COLS - 1, MARGIN_COLS];
+        let col_widths: HashMap<usize, usize> =
+            col_ixs.iter().map(|&c| (c, 8)).collect();
+        let mut hits = Vec::new();
+        paint_col_headers(
+            &mut dc,
+            &col_ixs,
+            &col_widths,
+            1,
+            &BTreeSet::new(),
+            &mut hits,
+            Some((MARGIN_COLS, MARGIN_COLS)),
+        );
+        let fills: Vec<(f64, f64, f64, f64)> = dc
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                DrawOp::FillRect { y, h, rgba, .. }
+                    if *y == 0.0 && *h == HEADER_H =>
+                {
+                    Some(*rgba)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            fills,
+            vec![(0.9, 0.9, 0.9, 1.0), (0.9, 0.95, 1.0, 1.0)],
+            "margin col keeps header gray, covered col uses selection fill, got {fills:?}"
+        );
+    }
+    #[test]
     fn col_headers_paint_bold() {
         use std::collections::BTreeSet;
         let mut dc = RecordingDrawContext::new();
@@ -3241,7 +3509,7 @@ mod gutter_tests {
         let col_widths: HashMap<usize, usize> =
             col_ixs.iter().map(|&c| (c, 8)).collect();
         let mut hits = Vec::new();
-        paint_col_headers(&mut dc, &col_ixs, &col_widths, 1, &BTreeSet::new(), &mut hits);
+        paint_col_headers(&mut dc, &col_ixs, &col_widths, 1, &BTreeSet::new(), &mut hits, None);
         let texts = styled_texts(&dc);
         assert_eq!(texts.len(), 2, "one label per column, got {texts:?}");
         assert_eq!(texts[1].0, "A", "main column label text, got {:?}", texts[1].0);
@@ -3712,7 +3980,7 @@ mod fill_tests {
             .collect();
         let mut dc = RecordingDrawContext::new();
         let mut hits = Vec::new();
-        paint_col_headers(&mut dc, &cols, &widths, mc, &BTreeSet::new(), &mut hits);
+        paint_col_headers(&mut dc, &cols, &widths, mc, &BTreeSet::new(), &mut hits, None);
         assert!(!hits.is_empty(), "expected padlock columns in the A1 view");
         // Replay the paint's x-accumulation; each padlock's right edge must
         // not pass its own column's right edge.

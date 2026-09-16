@@ -398,16 +398,28 @@ fn eval_numeric_aggregate(
                 EvalResult::Number(sum.div(Number::from_i64(nums.len() as i64)))
             }
         }
-        NumericAgg::Min => nums
-            .into_iter()
-            .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .map(EvalResult::Number)
-            .unwrap_or(EvalResult::Number(Number::exact_zero())),
-        NumericAgg::Max => nums
-            .into_iter()
-            .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .map(EvalResult::Number)
-            .unwrap_or(EvalResult::Number(Number::exact_zero())),
+        NumericAgg::Min => {
+            // Complex has no ordering: a non-real sample makes the result
+            // undefined (#NUM!) rather than an order-dependent pick.
+            if nums.iter().any(Number::is_nonreal) {
+                return EvalResult::Number(Number::approx(f64::NAN));
+            }
+            nums.into_iter()
+                .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .map(EvalResult::Number)
+                .unwrap_or(EvalResult::Number(Number::exact_zero()))
+        }
+        NumericAgg::Max => {
+            // Complex has no ordering: a non-real sample makes the result
+            // undefined (#NUM!) rather than an order-dependent pick.
+            if nums.iter().any(Number::is_nonreal) {
+                return EvalResult::Number(Number::approx(f64::NAN));
+            }
+            nums.into_iter()
+                .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .map(EvalResult::Number)
+                .unwrap_or(EvalResult::Number(Number::exact_zero()))
+        }
         NumericAgg::Product => EvalResult::Number(
             nums.into_iter()
                 .fold(Number::one(), |acc, n| acc.mul(n)),

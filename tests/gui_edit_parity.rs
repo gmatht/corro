@@ -352,6 +352,47 @@ fn gui_a_down_down_c_enter_grows_to_a3() {
     );
 }
 
+/// Type 1, Enter, type 2, Enter in the GUI: must commit exactly
+/// `SET A1 1` then `SET A2 2` in order (Enter commits and moves down —
+/// the ratatui oracle shows A3 afterwards), with no doubled digits.
+#[test]
+fn gui_1_enter_2_enter_commits_a1_then_a2() {
+    let _guard = GUI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    assert!(
+        std::env::var("DISPLAY").is_ok(),
+        "requires X server (run under xvfb-run -a)"
+    );
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let path = std::env::temp_dir().join(format!("corro-gui-1e2e-{}-{}.corro", std::process::id(), id));
+    let _ = std::fs::remove_file(&path);
+    std::fs::write(&path, "CORRO_LOG 1\n").expect("write fixture");
+
+    let mut child = spawn_gui(&path);
+    let wid = find_corro_window(child.id(), Instant::now() + Duration::from_secs(25));
+    xdotool(&["windowactivate", "--sync", &wid]);
+    std::thread::sleep(Duration::from_millis(400));
+    xdotool(&["type", "--window", &wid, "1"]);
+    std::thread::sleep(Duration::from_millis(400));
+    xdotool(&["key", "--window", &wid, "Return"]);
+    std::thread::sleep(Duration::from_millis(400));
+    xdotool(&["type", "--window", &wid, "2"]);
+    std::thread::sleep(Duration::from_millis(400));
+    xdotool(&["key", "--window", &wid, "Return"]);
+    // Verdict is event-based (both commits drained to the file), not a sleep.
+    let lines = wait_file_pred(&path, Instant::now() + Duration::from_secs(10), "both commits", |ls| {
+        ls.iter().any(|l| l == "SET A1 1") && ls.iter().any(|l| l == "SET A2 2")
+    });
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let sets: Vec<&String> = lines.iter().filter(|l| l.starts_with("SET ")).collect();
+    assert_eq!(
+        sets,
+        vec!["SET A1 1", "SET A2 2"],
+        "expected exactly the two commits in order (no doubles, no stray cells), got: {lines:?}"
+    );
+}
+
 /// Type HELLO, Backspace, Enter in A1: repeated chars must all land (no
 /// press/release-dedup drops) and Backspace must pop exactly once.
 /// Regression: the GUI backend lost the second L and double-popped,

@@ -1,6 +1,19 @@
 //! corro — append-only collaborative spreadsheet TUI.
 #![allow(unexpected_cfgs)] // Win95/rust9x custom target_family gates are intentional
 
+// NOTE on Windows subsystems: corro stays CONSOLE-subsystem on modern
+// Windows even with the GUI feature. That is deliberate: cmd/PowerShell only
+// *wait* for console-subsystem processes, and a TUI launched from a command
+// line must keep the shell waiting until the user quits (Ctrl+Q). A
+// GUI-subsystem exe returns the prompt immediately, so the shell and the TUI
+// contend for one console and the app looks like it "exits instantly".
+// Explorer double-clicks are handled at runtime instead: Win32 always
+// allocates a console for a console-subsystem process, but when it is a
+// FRESH console (only our process attached — no shell) `wincon` hides and
+// frees it and starts the GUI. A SHARED console means a command-line
+// launch and keeps the TUI (see `console_state`). The Win95 (rust9x) builds
+// manage their subsystems in the link scripts. See `windows_console_action`.
+
 // Win95 (rust9x targets): std::rt initialization hangs inside KERNEL32 on
 // Windows 95 (DBCS conversion loop). With `no_main`, the VC6 CRT startup
 // calls our `main` directly, skipping std::rt entirely. Normal targets keep
@@ -107,61 +120,72 @@ fn argv0_ui(program: &str) -> Option<UiKind> {
     None
 }
 
-/// Windows console attach for GUI-subsystem launches (MSIX/Store builds).
+/// Windows console handling (modern Windows only; Win95 builds manage their
+/// own subsystems in the link scripts).
 ///
-/// A GUI-subsystem exe is born console-less even when started from a
-/// terminal. When the user wants a TUI anyway, AttachConsole claims the
-/// parent's console; success is also the "launched in a console" signal
-/// (a GetConsoleWindow-style check alone always reports NULL here, since a
-/// GUI-subsystem process starts detached). AttachConsole/AllocConsole are
-/// NT+ only and must stay out of the Win95 (rust9x) builds, hence the gate
-/// (raw declarations, no new dependencies).
+/// corro links CONSOLE-subsystem so cmd/PowerShell *wait* for it and the TUI
+/// owns the shell's console until the user quits. The problem that creates is
+/// Explorer/`start`, where Win32 allocates a fresh console before `main()`.
+/// We cannot stop that at the PE level without losing the shell wait, so we
+/// detect it at runtime instead:
+///
+/// * [`ConsoleState::Shared`] — our console has another process attached
+///   (the command shell). Launched from a command line: keep the console and
+///   run the TUI in it.
+/// * [`ConsoleState::Fresh`] — we are the only process attached. Explorer/
+///   `start` gave us a throwaway console: hide + `FreeConsole` it and run the
+///   GUI (when compiled).
+/// * [`ConsoleState::None`] — no console at all (GUI parent, CREATE_NO_WINDOW):
+///   run the GUI, or `AllocConsole` for an explicit TUI.
+///
+/// All raw FFI (no new dependencies); NT+ only, hence the rust9x gate.
 #[cfg(all(target_os = "windows", not(target_family = "rust9x")))]
 mod wincon {
     #[link(name = "kernel32")]
     extern "system" {
-        fn AttachConsole(dwProcessId: u32) -> i32;
         fn FreeConsole() -> i32;
         fn AllocConsole() -> i32;
-        fn GetStdHandle(nStdHandle: i32) -> *mut std::ffi::c_void;
-        fn GetConsoleMode(
-            hConsoleHandle: *mut std::ffi::c_void,
-            lpMode: *mut u32,
-        ) -> i32;
+        fn GetConsoleWindow() -> *mut std::ffi::c_void;
+        fn GetConsoleProcessList(lpBuffer: *mut u32, count: u32) -> u32;
+        fn ShowWindow(hWnd: *mut std::ffi::c_void, nCmdShow: i32) -> i32;
     }
-    pub const ATTACH_PARENT_PROCESS: u32 = 0xFFFF_FFFF;
-    const STD_INPUT_HANDLE: i32 = -10;
-    const STD_OUTPUT_HANDLE: i32 = -11;
+    const SW_HIDE: i32 = 0;
 
-    /// Claim the parent's console. True = launched from a console
-    /// (Explorer/tile/Run launches have no parent console: false).
-    pub fn attach_parent() -> bool {
-        unsafe { AttachConsole(ATTACH_PARENT_PROCESS) != 0 }
+    /// How many processes are attached to our console (0 = none).
+    fn console_process_count() -> u32 {
+        let mut pids = [0u32; 16];
+        unsafe { GetConsoleProcessList(pids.as_mut_ptr(), pids.len() as u32) }
     }
-    pub fn detach() {
-        unsafe {
-            FreeConsole();
-        }
+
+    /// True if we have a console but are the only process attached to it:
+    /// a throwaway console Win32 created for a console-subsystem exe started
+    /// by Explorer/`start` (no shell is sitting in it).
+    pub fn console_is_fresh() -> bool {
+        !unsafe { GetConsoleWindow() }.is_null() && console_process_count() == 1
     }
-    /// Pop a fresh console window (tile/Run launches with explicit TUI).
+    /// True if another process (the command shell) shares our console.
+    pub fn console_is_shared() -> bool {
+        console_process_count() > 1
+    }
+    /// Pop a fresh console window (explicit/argv[0] TUI with none attached).
     pub fn alloc() -> bool {
         unsafe { AllocConsole() != 0 }
     }
-    fn handle_is_console(std: i32) -> bool {
-        unsafe {
-            let h = GetStdHandle(std);
-            if h.is_null() {
-                return false;
+    /// Drop the throwaway console. Hides it first only when it is fresh
+    /// (ours alone); a shared console belongs to the shell and must stay
+    /// visible. Safe to call with no console.
+    pub fn release_console(fresh: bool) {
+        if fresh {
+            let h = unsafe { GetConsoleWindow() };
+            if !h.is_null() {
+                unsafe {
+                    ShowWindow(h, SW_HIDE);
+                }
             }
-            let mut mode = 0u32;
-            GetConsoleMode(h, &mut mode) != 0
         }
-    }
-    /// stdio are live console handles (not redirected to file/pipe/nul).
-    /// Guards scripting: `gcorro --help > out.txt` from a console must not
-    /// flip into the TUI just because a parent console exists.
-    pub fn stdio_is_console() -> bool {
-        handle_is_console(STD_INPUT_HANDLE) && handle_is_console(STD_OUTPUT_HANDLE)
+        unsafe {
+            FreeConsole();
+        }
     }
 }
 
@@ -184,31 +208,82 @@ fn resolve_headless_default(
     gui_fallback.unwrap_or(ui)
 }
 
-/// Console-vs-GUI default resolution (pure: FFI inputs are parameters so the
-/// table is unit-testable on any host). Returns (ui, keep_attached).
+/// State of the process's Windows console, as detected by `wincon`.
+#[cfg(all(target_os = "windows", not(target_family = "rust9x")))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConsoleState {
+    /// No console at all (GUI parent, CREATE_NO_WINDOW).
+    None,
+    /// Only our process is attached: a throwaway console Win32 created for
+    /// Explorer/`start`. No shell is waiting in it.
+    Fresh,
+    /// Another process (the command shell) shares it: launched from a
+    /// command line, so the shell waits for us.
+    Shared,
+}
+
+/// What to do with the console, decided purely from the request and the
+/// console state so it is unit-testable on any host (FFI lives in the
+/// caller).
+#[cfg(all(target_os = "windows", not(target_family = "rust9x")))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConsoleAction {
+    /// Leave the console attached (command-line TUI).
+    Keep,
+    /// Allocate a console (explicit TUI launched with none).
+    Alloc,
+    /// Hide (if fresh) and free the console, then run the GUI.
+    Release,
+}
+
+/// Console-vs-GUI resolution for modern Windows.
 ///
-/// - An explicit --gui/--ratatui/--pancurses flag always wins.
-/// - Otherwise, launched-in-a-console with live console stdio defaults to
-///   the terminal UI (`tui_default`: caller's first compiled-in TUI).
-/// - Otherwise the argv[0]/compiled default stands; an unneeded attachment
-///   is released (second element false = caller should FreeConsole).
-fn resolve_console_default(
-    ui: UiKind,
+/// - An explicit `--gui` / or `gcorro*` name forces the GUI and releases any
+///   console (a throwaway Explorer one is hidden and freed).
+/// - An explicit `--ratatui`/`--pancurses` or `pcorro*` name forces the TUI:
+///   keep the shell's console, or allocate one if launched without any.
+/// - Otherwise the console state decides: shared -> TUI (the shell waits);
+///   fresh/none -> GUI when compiled in (Explorer double-click opens a
+///   window and no console survives), else the TUI default.
+#[cfg(all(target_os = "windows", not(target_family = "rust9x")))]
+fn windows_console_action(
     explicit: bool,
-    attached: bool,
-    stdio_console: bool,
-    tui_default: Option<UiKind>,
-) -> (UiKind, bool) {
-    if explicit {
-        // Caller ensures a console exists for an explicit TUI request.
-        return (ui, attached);
+    argv0_kind: Option<UiKind>,
+    ui: UiKind,
+    console: ConsoleState,
+    gui_available: bool,
+    tui_available: bool,
+) -> (UiKind, ConsoleAction) {
+    let tui = matches!(ui, UiKind::Ratatui | UiKind::Pancurses);
+    let gui_by_name = matches!(argv0_kind, Some(UiKind::Gui));
+    let tui_by_name =
+        matches!(argv0_kind, Some(UiKind::Ratatui) | Some(UiKind::Pancurses));
+    if matches!(ui, UiKind::Gui) && (explicit || gui_by_name) {
+        return (UiKind::Gui, ConsoleAction::Release);
     }
-    if attached && stdio_console {
-        if let Some(tui) = tui_default {
-            return (tui, true);
-        }
+    if tui && (explicit || tui_by_name) {
+        return (
+            ui,
+            match console {
+                ConsoleState::None => ConsoleAction::Alloc,
+                _ => ConsoleAction::Keep,
+            },
+        );
     }
-    (ui, false)
+    // Neutral request: the console state decides. Prefer the GUI only when
+    // it is compiled in and we are NOT in a command-line shell (a shared
+    // console must keep the TUI so the shell waits).
+    if gui_available && (!tui_available || !matches!(console, ConsoleState::Shared)) {
+        (UiKind::Gui, ConsoleAction::Release)
+    } else {
+        (
+            ui,
+            match console {
+                ConsoleState::None => ConsoleAction::Alloc,
+                _ => ConsoleAction::Keep,
+            },
+        )
+    }
 }
 
 #[cfg(not(all(target_family = "rust9x", target_env = "msvc")))]
@@ -254,6 +329,10 @@ fn win95_args() -> Vec<String> {
     }
 }
 
+// ui_explicit is written under every UI-flag arm but read only under the
+// platform gates below; allow the lint's flow analysis across cfg'd-out
+// reader configurations instead of warning on each writer.
+#[allow(unused_assignments)]
 fn parse_args() -> Result<Args, String> {
     let mut revision = None;
     let mut export = None;
@@ -266,7 +345,8 @@ fn parse_args() -> Result<Args, String> {
     let debug_no_number = false;
     // Whether --gui/--ratatui/--pancurses explicitly chose the UI (always
     // wins over argv[0] and over the Windows console-launch default below).
-    // Modern-Windows-only input: other targets never read it.
+    // Read only under the platform gates below; the allow covers the lint's
+    // flow analysis across cfg'd-out siblings on other targets.
     #[cfg(any(all(target_os = "windows", not(target_family = "rust9x")), all(target_family = "unix", not(target_arch = "wasm32"))))]
     let mut ui_explicit = false;
     // (argv0_matched records whether the name itself requested a UI; the
@@ -380,49 +460,44 @@ fn parse_args() -> Result<Args, String> {
     }
 
     // Windows console handling (modern Windows only; Win95 builds are
-    // separate console/GUI exes and never reach this). A GUI-subsystem
-    // launch (e.g. the MSIX build) starts detached: without this block a
-    // TUI request fails silently on dead console handles.
+    // separate console/GUI exes and never reach this). corro is
+    // console-subsystem so the shell waits for the TUI; this block only
+    // decides whether an Explorer/`start` throwaway console is released for
+    // the GUI, and guarantees a console for an explicit TUI.
     #[cfg(all(target_os = "windows", not(target_family = "rust9x")))]
     {
-        #[cfg(feature = "ratatui")]
-        let tui_default = Some(UiKind::Ratatui);
-        #[cfg(all(not(feature = "ratatui"), feature = "pancurses"))]
-        let tui_default = Some(UiKind::Pancurses);
-        #[cfg(all(not(feature = "ratatui"), not(feature = "pancurses")))]
-        let tui_default: Option<UiKind> = None;
-        if ui_explicit && matches!(ui, UiKind::Ratatui | UiKind::Pancurses) {
-            // Explicit TUI: guarantee a console. From a terminal the
-            // attach makes console APIs work; with no parent console
-            // (tile/Run dialog) pop a fresh window instead of dying
-            // silently on dead handles.
-            if !(wincon::attach_parent() || wincon::alloc()) {
-                return Err("no console available for the terminal UI".into());
+        let console = if wincon::console_is_shared() {
+            ConsoleState::Shared
+        } else if wincon::console_is_fresh() {
+            ConsoleState::Fresh
+        } else {
+            ConsoleState::None
+        };
+        // Busybox-style argv[0] dispatch is honored here too: a TUI name
+        // (pcorro*) is treated like an explicit TUI, and a GUI name
+        // (gcorro*) like an explicit --gui. Only the neutral `corro` name
+        // reaches the console-state default resolution.
+        let argv0_kind = argv0.as_deref().and_then(argv0_ui);
+        let (new_ui, action) = windows_console_action(
+            ui_explicit,
+            argv0_kind,
+            ui,
+            console,
+            cfg!(feature = "gui"),
+            cfg!(any(feature = "ratatui", feature = "pancurses")),
+        );
+        ui = new_ui;
+        match action {
+            ConsoleAction::Keep => {}
+            ConsoleAction::Alloc => {
+                if !wincon::alloc() {
+                    return Err("no console available for the terminal UI".into());
+                }
             }
-        } else if !ui_explicit {
-            // No explicit choice: a claimed parent console with live
-            // console stdio means "launched in a console" -> default to
-            // the TUI instead of popping a GUI window. Explorer/tile
-            // launches (no parent console) and redirected stdio
-            // (scripting) keep the argv[0]/compiled default.
-            let attached = wincon::attach_parent();
-            let (new_ui, keep) = resolve_console_default(
-                ui,
-                false,
-                attached,
-                if attached {
-                    wincon::stdio_is_console()
-                } else {
-                    false
-                },
-                tui_default,
-            );
-            ui = new_ui;
-            if attached && !keep {
-                wincon::detach();
+            ConsoleAction::Release => {
+                wincon::release_console(matches!(console, ConsoleState::Fresh));
             }
         }
-        // Explicit --gui (or anything else explicit): untouched, detached.
     }
 
     Ok(Args {
@@ -491,6 +566,8 @@ pub extern "system" fn WinMain(
     #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
     unsafe {
         mark95(b"winmain\n");
+        // TEMPORARY ReactOS diagnosis: build identity (NCCALCSIZE no-op).
+        mark95(b"fix2\n");
     }
     // TEMPORARY Win95 diagnosis: route panic messages to the log file so the
     // aborting unwrap/expect identifies itself (GUI has no console).
@@ -761,10 +838,7 @@ fn try_main() -> (Result<(), Box<dyn std::error::Error>>, Option<String>) {
     // use XDG_STATE_HOME/corro/debug.log or ~/.corro/debug.log. Attempt to
     // open/create the log and duplicate it onto STDERR so existing
     // eprintln! calls go to the file on Unix platforms. Ignore errors.
-    if let Some(path) = std::env::var("CORRO_DEBUG_LOG").ok().or_else(|| {
-        std::env::var("XDG_STATE_HOME").ok().map(|xdg| format!("{}/corro/debug.log", xdg))
-    }).or_else(|| std::env::var("HOME").ok().map(|h| format!("{}/.corro/debug.log", h))) {
-        let p = std::path::PathBuf::from(path);
+    if let Some(p) = corro::debug_log::debug_log_path() {
         if let Some(dir) = p.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
@@ -781,11 +855,28 @@ fn try_main() -> (Result<(), Box<dyn std::error::Error>>, Option<String>) {
                 // duplicated; leak it intentionally until process exit.
                 let _ = Box::leak(Box::new(f));
             }
-            #[cfg(not(unix))]
+            #[cfg(windows)]
             {
-                // On non-Unix platforms, just keep the file open but do not
-                // attempt to replace STDERR; callers may still see eprintln
-                // output on the terminal.
+                use std::os::raw::c_void;
+                use std::os::windows::io::AsRawHandle;
+                // Point STDERR_HANDLE at the log file so the TUI's console
+                // is never overwritten by debug traces (the Unix dup2
+                // equivalent; without it, eprintln! landed mid-grid).
+                // Safe to call before any stderr use: this block runs
+                // immediately after parse_args, which never prints.
+                unsafe extern "system" {
+                    fn SetStdHandle(nStdHandle: u32, h: *mut c_void) -> i32;
+                }
+                const STD_ERROR_HANDLE: u32 = -12i32 as u32;
+                unsafe {
+                    SetStdHandle(STD_ERROR_HANDLE, f.as_raw_handle() as *mut c_void);
+                }
+                // Keep the File (and thus the handle) alive for the process.
+                let _ = Box::leak(Box::new(f));
+            }
+            #[cfg(all(not(unix), not(windows)))]
+            {
+                // Other platforms: keep the file open but leave stderr as-is.
                 let _ = f;
             }
         }
@@ -1069,62 +1160,123 @@ fn export_workbook_to_path(
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_console_default, resolve_headless_default, Args, RevisionMode, UiKind};
+    use super::{resolve_headless_default, Args, RevisionMode, UiKind};
     use std::path::PathBuf;
+    #[cfg(all(target_os = "windows", not(target_family = "rust9x")))]
+    use super::{windows_console_action, ConsoleAction, ConsoleState};
 
-    // resolve_console_default decision table (pure; the AttachConsole /
-    // GetConsoleMode inputs are parameters so this runs on any host).
+    // windows_console_action table: explicit flags, argv[0] dispatch, and
+    // the console state (shared command shell vs fresh Explorer console)
+    // decide the UI and whether the console is kept, allocated, or released.
+#[cfg(all(target_os = "windows", not(target_family = "rust9x")))]
     #[test]
-    fn console_launch_defaults_to_tui() {
-        // gcorro-named, no flag, parent console + live stdio -> TUI.
-        let (ui, keep) =
-            resolve_console_default(UiKind::Gui, false, true, true, Some(UiKind::Ratatui));
+    fn shared_console_defaults_to_tui_for_shell_wait() {
+        // cmd/PowerShell share the console: default to the TUI so the shell
+        // waits for us until the user quits. Regression guard for the
+        // GUI-subsystem build returning the prompt immediately and leaving
+        // shell/TUI residue in one console.
+        let (ui, action) = windows_console_action(
+            false,
+            None,
+            UiKind::Ratatui,
+            ConsoleState::Shared,
+            true,
+            true,
+        );
         assert_eq!(ui, UiKind::Ratatui);
-        assert!(keep);
+        assert_eq!(action, ConsoleAction::Keep);
     }
 
+#[cfg(all(target_os = "windows", not(target_family = "rust9x")))]
     #[test]
-    fn explicit_flag_always_wins() {
-        // --gui from a console stays GUI (but keeps the attachment).
-        let (ui, keep) =
-            resolve_console_default(UiKind::Gui, true, true, true, Some(UiKind::Ratatui));
+    fn fresh_console_releases_for_gui() {
+        // Explorer/`start` allocates a throwaway console (only our process):
+        // hide + free it and open the GUI, so no console survives.
+        let (ui, action) = windows_console_action(
+            false,
+            None,
+            UiKind::Ratatui,
+            ConsoleState::Fresh,
+            true,
+            true,
+        );
         assert_eq!(ui, UiKind::Gui);
-        assert!(keep);
-        // Explicit TUI from a tile keeps the request; caller allocs.
-        let (ui, _) =
-            resolve_console_default(UiKind::Ratatui, true, false, false, Some(UiKind::Ratatui));
+        assert_eq!(action, ConsoleAction::Release);
+    }
+
+#[cfg(all(target_os = "windows", not(target_family = "rust9x")))]
+    #[test]
+    fn fresh_console_without_gui_keeps_tui() {
+        // TUI-only build: no GUI to release for, so keep the console it got.
+        let (ui, action) = windows_console_action(
+            false,
+            None,
+            UiKind::Ratatui,
+            ConsoleState::Fresh,
+            false,
+            true,
+        );
         assert_eq!(ui, UiKind::Ratatui);
+        assert_eq!(action, ConsoleAction::Keep);
     }
 
+#[cfg(all(target_os = "windows", not(target_family = "rust9x")))]
     #[test]
-    fn tile_and_redirected_launches_stay_gui() {
-        // No parent console (tile/Explorer): GUI, nothing to release.
-        let (ui, keep) =
-            resolve_console_default(UiKind::Gui, false, false, false, Some(UiKind::Ratatui));
-        assert_eq!(ui, UiKind::Gui);
-        assert!(!keep);
-        // Parent console exists but stdio redirected (scripting): GUI and
-        // release the unneeded attachment.
-        let (ui, keep) =
-            resolve_console_default(UiKind::Gui, false, true, false, Some(UiKind::Ratatui));
-        assert_eq!(ui, UiKind::Gui);
-        assert!(!keep);
+    fn explicit_flags_and_argv0_win() {
+        // Explicit/argv0 TUI: keep a shared console, allocate if none.
+        assert_eq!(
+            windows_console_action(
+                true, None, UiKind::Ratatui, ConsoleState::Shared, true, true
+            ),
+            (UiKind::Ratatui, ConsoleAction::Keep)
+        );
+        assert_eq!(
+            windows_console_action(
+                false,
+                Some(UiKind::Pancurses),
+                UiKind::Pancurses,
+                ConsoleState::None,
+                true,
+                true
+            ),
+            (UiKind::Pancurses, ConsoleAction::Alloc)
+        );
+        // Explicit/argv0 GUI: release the console (the shell still waits,
+        // because the exe is console-subsystem).
+        assert_eq!(
+            windows_console_action(true, None, UiKind::Gui, ConsoleState::Shared, true, true),
+            (UiKind::Gui, ConsoleAction::Release)
+        );
+        assert_eq!(
+            windows_console_action(
+                false,
+                Some(UiKind::Gui),
+                UiKind::Gui,
+                ConsoleState::Fresh,
+                true,
+                true
+            ),
+            (UiKind::Gui, ConsoleAction::Release)
+        );
     }
 
+#[cfg(all(target_os = "windows", not(target_family = "rust9x")))]
     #[test]
-    fn no_tui_compiled_keeps_gui() {
-        // Pure-GUI build in a console: nothing to switch to, detach.
-        let (ui, keep) = resolve_console_default(UiKind::Gui, false, true, true, None);
-        assert_eq!(ui, UiKind::Gui);
-        assert!(!keep);
-    }
-
-    #[test]
-    fn pancurses_fallback_when_ratatui_absent() {
-        let (ui, keep) =
-            resolve_console_default(UiKind::Gui, false, true, true, Some(UiKind::Pancurses));
-        assert_eq!(ui, UiKind::Pancurses);
-        assert!(keep);
+    fn no_console_and_no_gui_allocates_for_tui() {
+        // GUI-less build launched with no console at all: allocate one so
+        // an explicit or defaulted TUI has somewhere to draw.
+        assert_eq!(
+            windows_console_action(
+                true, None, UiKind::Ratatui, ConsoleState::None, false, true
+            ),
+            (UiKind::Ratatui, ConsoleAction::Alloc)
+        );
+        assert_eq!(
+            windows_console_action(
+                false, None, UiKind::Ratatui, ConsoleState::None, false, true
+            ),
+            (UiKind::Ratatui, ConsoleAction::Alloc)
+        );
     }
 
     // resolve_headless_default table (Unix desktops; also pure).

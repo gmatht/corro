@@ -213,39 +213,301 @@ pub fn load_workbook_revisions_partial(
     ))
 }
 
-pub fn save_workbook(path: &Path, workbook: &WorkbookSnapshot) -> Result<(), IoError> {
-    let mut out = String::new();
-    out.push_str(&format!(
-        "WORKBOOK {} {}\n",
-        workbook.next_sheet_id, workbook.active_sheet_id
+/// Serialize a whole workbook as the canonical `CORRO_LOG` op log.
+///
+/// This is the *single* `.corro` writer: the TUI saves through it and the GUI
+/// saves through it, so a file written by either backend is readable by both.
+/// Emits only real user ops (new/link sheet, cell sets and clears, view-sort
+/// cols, column formats) and omits synthetic UI-maintenance entries
+/// (SIZE / COL_WIDTH / MAX_COL_WIDTH), keeping the log compact.
+///
+/// Every region is walked, margins included: the built-in TOTAL seeds live in
+/// the header/footer margins, so a main-only sweep silently dropped them (and
+/// any other margin content) on save.
+pub fn serialize_workbook_log(
+    workbook: &WorkbookState,
+    persisted_view_sort_cols: &std::collections::HashMap<u32, Vec<crate::grid::SortSpec>>,
+) -> String {
+    let mut buf = String::new();
+    buf.push_str(&format!(
+        "{} {}\n",
+        crate::ops::LOG_HEADER_PREFIX,
+        crate::ops::LOG_VERSION
     ));
+    let omit_sheet1_prefix = workbook.sheet_count() == 1;
     for sheet in &workbook.sheets {
-        out.push_str(&format!("SHEET {} {}\n", sheet.id, sheet.title));
-        out.push_str(&format!(
-            "VOLATILE_SEED {}\n",
-            sheet.state.grid.volatile_seed()
-        ));
-        for row in 0..sheet.state.grid.main_rows() {
-            for col in 0..sheet.state.grid.main_cols() {
-                let addr = CellAddr::Main {
-                    row: row as u32,
-                    col: col as u32,
-                };
-                if let Some(value) = sheet.state.grid.get(&addr) {
-                    if !value.is_empty() {
-                        out.push_str(&format!("SET {} {}\n", workbook_addr_label(&addr), value));
+        // For linked sheets we prefer to encode the UI-visible title in
+        // the LINK entry and omit a separate NEW_SHEET line. This keeps
+        // the log compact and avoids duplicate title storage. Compute
+        // `linked_base` for later comparison of base values.
+        let linked_base = if let Some(source) = &sheet.linked_source {
+            // If the title contains the pipe separator we fallback to
+            // emitting a NEW_SHEET line to avoid ambiguity.
+            if sheet.title.contains(" | ") {
+                for line in (crate::ops::WorkbookOp::NewSheet {
+                    id: sheet.id,
+                    title: sheet.title.clone(),
+                })
+                .to_log_lines_with_policy(sheet.state.grid.main_cols(), omit_sheet1_prefix)
+                {
+                    buf.push_str(&line);
+                    buf.push('\n');
+                }
+                // Emit LINK without corrotitle in the fallback case.
+                for line in (crate::ops::WorkbookOp::LinkSheet {
+                    id: sheet.id,
+                    source: source.clone(),
+                })
+                .to_log_lines_with_policy(sheet.state.grid.main_cols(), omit_sheet1_prefix)
+                {
+                    buf.push_str(&line);
+                    buf.push('\n');
+                }
+            } else {
+                // Normal case: write LINK with an embedded corrotitle if
+                // the sheet title differs from the derived title.
+                let derived = crate::ops::derive_title_from_source(source);
+                let mut src_for_write = source.clone();
+                // If the sheet title equals the derived title then omit
+                // the corrotitle to keep the LINK compact.
+                if sheet.title != derived {
+                    src_for_write.corrotitle = Some(sheet.title.clone());
+                } else {
+                    src_for_write.corrotitle = None;
+                }
+                for line in (crate::ops::WorkbookOp::LinkSheet {
+                    id: sheet.id,
+                    source: src_for_write,
+                })
+                .to_log_lines_with_policy(sheet.state.grid.main_cols(), omit_sheet1_prefix)
+                {
+                    buf.push_str(&line);
+                    buf.push('\n');
+                }
+            }
+            linked_sheet_base_state(source)
+        } else {
+            for line in (crate::ops::WorkbookOp::NewSheet {
+                id: sheet.id,
+                title: sheet.title.clone(),
+            })
+            .to_log_lines_with_policy(sheet.state.grid.main_cols(), omit_sheet1_prefix)
+            {
+                buf.push_str(&line);
+                buf.push('\n');
+            }
+            None
+        };
+        let mut base_values = std::collections::HashMap::new();
+        let mut addrs = std::collections::HashSet::new();
+        if let Some(base) = &linked_base {
+            for (addr, value) in base.grid.iter_nonempty() {
+                addrs.insert(addr.clone());
+                base_values.insert(addr, value);
+            }
+        }
+        for (addr, value) in sheet.state.grid.iter_nonempty() {
+            addrs.insert(addr.clone());
+            if linked_base.is_none() || base_values.get(&addr) != Some(&value) {
+                for line in (crate::ops::WorkbookOp::SheetOp {
+                    sheet_id: sheet.id,
+                    op: Op::SetCell {
+                        addr: addr.clone(),
+                        value,
+                    },
+                })
+                .to_log_lines_with_policy(sheet.state.grid.main_cols(), omit_sheet1_prefix)
+                {
+                    buf.push_str(&line);
+                    buf.push('\n');
+                }
+            }
+        }
+        if linked_base.is_some() {
+            for addr in addrs {
+                {
+                    if !sheet.state.grid.get(&addr).is_some_and(|v| !v.is_empty()) {
+                        if base_values.get(&addr).is_some_and(|v| !v.is_empty()) {
+                            for line in (crate::ops::WorkbookOp::SheetOp {
+                                sheet_id: sheet.id,
+                                op: Op::SetCell {
+                                    addr: addr.clone(),
+                                    value: String::new(),
+                                },
+                            })
+                            .to_log_lines_with_policy(
+                                sheet.state.grid.main_cols(),
+                                omit_sheet1_prefix,
+                            ) {
+                                buf.push_str(&line);
+                                buf.push('\n');
+                            }
+                        }
                     }
                 }
             }
         }
-        out.push_str("END_SHEET\n");
     }
-    fs::write(path, out)?;
+
+        for sheet in &workbook.sheets {
+            // Persist per-sheet view-sort cols that the user requested to keep
+            // across saves. Use the persisted_view_sort_cols cache so we don't
+            // accidentally persist transient UI sort state.
+            if let Some(cols) = persisted_view_sort_cols.get(&sheet.id) {
+                if !cols.is_empty() {
+                    for line in (crate::ops::WorkbookOp::SheetOp {
+                        sheet_id: sheet.id,
+                        op: Op::SetViewSortCols { cols: cols.clone() },
+                    })
+                    .to_log_lines_with_policy(sheet.state.grid.main_cols(), omit_sheet1_prefix)
+                    {
+                        buf.push_str(&line);
+                        buf.push('\n');
+                    }
+                }
+            }
+
+            // Persist explicit column formats the user set. Iterate the three
+            // scoped maps (All, Data, Special) and emit FORMAT COL entries for
+            // each stored override.
+            for (col, format) in sheet.state.grid.col_all_formats() {
+                for line in (crate::ops::WorkbookOp::SheetOp {
+                    sheet_id: sheet.id,
+                    op: Op::SetColumnFormat {
+                        scope: crate::grid::FormatScope::All,
+                        col,
+                        format,
+                    },
+                })
+                .to_log_lines_with_policy(sheet.state.grid.main_cols(), omit_sheet1_prefix)
+                {
+                    buf.push_str(&line);
+                    buf.push('\n');
+                }
+            }
+            for (col, format) in sheet.state.grid.col_data_formats() {
+                for line in (crate::ops::WorkbookOp::SheetOp {
+                    sheet_id: sheet.id,
+                    op: Op::SetColumnFormat {
+                        scope: crate::grid::FormatScope::Data,
+                        col,
+                        format,
+                    },
+                })
+                .to_log_lines_with_policy(sheet.state.grid.main_cols(), omit_sheet1_prefix)
+                {
+                    buf.push_str(&line);
+                    buf.push('\n');
+                }
+            }
+            for (col, format) in sheet.state.grid.col_special_formats() {
+                for line in (crate::ops::WorkbookOp::SheetOp {
+                    sheet_id: sheet.id,
+                    op: Op::SetColumnFormat {
+                        scope: crate::grid::FormatScope::Special,
+                        col,
+                        format,
+                    },
+                })
+                .to_log_lines_with_policy(sheet.state.grid.main_cols(), omit_sheet1_prefix)
+                {
+                    buf.push_str(&line);
+                    buf.push('\n');
+                }
+            }
+
+            // Persist any exact-cell formats applied by the user.
+            for (addr, format) in sheet.state.grid.cell_formats() {
+                for line in (crate::ops::WorkbookOp::SheetOp {
+                    sheet_id: sheet.id,
+                    op: Op::SetCellFormat {
+                        addr: addr.clone(),
+                        format,
+                    },
+                })
+                .to_log_lines_with_policy(sheet.state.grid.main_cols(), omit_sheet1_prefix)
+                {
+                    buf.push_str(&line);
+                    buf.push('\n');
+                }
+            }
+        }
+
+    buf
+}
+
+/// Linked sheets are diffed against their source so the log stays compact.
+fn linked_sheet_base_state(source: &crate::ops::LinkedSource) -> Option<SheetState> {
+    crate::ops::load_linked_sheet_state(source).ok()
+}
+
+/// Write `workbook` to `path` as a canonical `CORRO_LOG`, atomically: the
+/// text is written to a temp file beside the destination and renamed over
+/// it, so an interrupted save can never leave a half-written log.
+///
+/// This is the single save entry point for the GUI backends; the TUI keeps
+/// its own (unsaved-file fast path, watcher/offset upkeep) but serializes
+/// through [`serialize_workbook_log`], so both write identical bytes.
+pub fn write_workbook_log(
+    path: &Path,
+    workbook: &WorkbookState,
+    persisted_view_sort_cols: &std::collections::HashMap<u32, Vec<crate::grid::SortSpec>>,
+) -> Result<(), IoError> {
+    let text = serialize_workbook_log(workbook, persisted_view_sort_cols);
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+    if let Some(parent) = parent {
+        fs::create_dir_all(parent)?;
+    }
+    let pid = std::process::id();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = parent
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!(".corro_save_tmp_{pid}_{now}.corro"));
+    fs::write(&tmp, text.as_bytes())?;
+    if path.exists() {
+        fs::remove_file(path)?;
+    }
+    fs::rename(&tmp, path)?;
     Ok(())
 }
 
-fn workbook_addr_label(addr: &CellAddr) -> String {
-    crate::addr::cell_ref_text(addr, 0)
+/// Load a `.corro` file written by *either* backend.
+///
+/// The canonical format is the `CORRO_LOG` op log; the old `WORKBOOK`
+/// snapshot dialect is still accepted (read-only, detected from the first
+/// line) so files written by earlier GUI builds keep opening.
+pub fn load_workbook_file(path: &Path) -> Result<WorkbookState, IoError> {
+    let data = fs::read_to_string(path)?;
+    let first = data
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    if first.split_whitespace().next() == Some("WORKBOOK") {
+        let snap = load_workbook_snapshot(path)?;
+        return Ok(WorkbookState::from_snapshot(&snap));
+    }
+    let mut workbook = WorkbookState::new();
+    let mut active_sheet = workbook.sheet_id(workbook.active_sheet);
+    let (_offset, replay) =
+        load_workbook_revisions_partial(path, usize::MAX, &mut workbook, &mut active_sheet)?;
+    if let Some(line) = replay.failed_line {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "bad log line {line}: {}",
+                replay.error.unwrap_or_else(|| "parse error".into())
+            ),
+        )
+        .into());
+    }
+    if let Some(i) = workbook.sheets.iter().position(|s| s.id == active_sheet) {
+        workbook.active_sheet = i;
+    }
+    Ok(workbook)
 }
 
 /// Template path for new documents (`CORRO_TEMPLATE`): a `.corro` file
@@ -368,10 +630,13 @@ pub fn load_workbook_snapshot(path: &Path) -> Result<WorkbookSnapshot, IoError> 
                 }
             }
             Some("END_SHEET") => {
-                if let Some(mut sheet) = current.take() {
-                    sheet.state.grid.resume_auto_fit();
-                    sheets.push(sheet);
-                }
+                // Legacy sheet terminator emitted by older `save_workbook`
+                // versions. Deliberately a no-op: a `SHEET` header already
+                // separates sheets and EOF closes the last one, so honouring
+                // the marker could only truncate the current sheet — silently
+                // dropping anything appended after it (live ops are appended
+                // to the same file after a Save As). Existing files that still
+                // carry the marker therefore load without loss.
             }
             Some(_) => {
                 if let Some(sheet) = current.as_mut() {
@@ -829,7 +1094,7 @@ use crate::grid::{CellAddr, ColumnAddr};
             .join("docs/tests")
             .join(name)
     }
-    use crate::ops::{Op, SheetRecord, SheetState, WorkbookSnapshot};
+    use crate::ops::{Op, SheetRecord, SheetState};
     use tempfile::NamedTempFile;
 
     #[test]
@@ -1230,12 +1495,11 @@ addr: CellAddr::Header {
     }
 
     #[test]
-    fn save_and_load_workbook_snapshot_roundtrip() {
+    fn save_and_load_workbook_log_roundtrip() {
+        // Multi-sheet round trip through the canonical CORRO_LOG writer +
+        // the dual-dialect reader (`load_workbook_file`).
         let path = NamedTempFile::new().unwrap();
-        let mut workbook = WorkbookSnapshot {
-            next_sheet_id: 3,
-            active_sheet_id: 2,
-            volatile_seed: 0,
+        let mut workbook = WorkbookState {
             sheets: vec![
                 SheetRecord {
                     id: 1,
@@ -1250,19 +1514,26 @@ addr: CellAddr::Header {
                     linked_source: None,
                 },
             ],
+            active_sheet: 1,
+            next_sheet_id: 3,
         };
         workbook.sheets[1]
             .state
             .grid
             .set(&CellAddr::Main { row: 0, col: 0 }, "hello".into());
 
-        save_workbook(path.path(), &workbook).unwrap();
-        let loaded = load_workbook_snapshot(path.path()).unwrap();
+        write_workbook_log(path.path(), &workbook, &Default::default()).unwrap();
+        let written = fs::read_to_string(path.path()).unwrap();
+        assert!(
+            written.starts_with(&format!("{} {}\n", LOG_HEADER_PREFIX, LOG_VERSION)),
+            "saves must be CORRO_LOG, got:\n{written}"
+        );
+        assert!(!written.contains("END_SHEET"), "no sheet terminator: {written}");
 
-        assert_eq!(loaded.next_sheet_id, 3);
-        assert_eq!(loaded.active_sheet_id, 2);
-        assert_eq!(loaded.sheets.len(), 2);
+        let loaded = load_workbook_file(path.path()).unwrap();
+        assert_eq!(loaded.sheets.len(), 2, "both sheets survive");
         assert_eq!(loaded.sheets[1].title, "Sheet2");
+        assert_eq!(loaded.next_sheet_id, 3);
         assert_eq!(
             loaded.sheets[1]
                 .state
@@ -1271,6 +1542,39 @@ addr: CellAddr::Header {
                 .as_deref(),
             Some("hello")
         );
+    }
+
+    #[test]
+    fn load_workbook_file_still_reads_legacy_snapshot_dialect() {
+        // Files written by older GUI builds (WORKBOOK snapshot + END_SHEET)
+        // must keep opening, including content after the legacy terminator.
+        let path = NamedTempFile::new().unwrap();
+        fs::write(
+            path.path(),
+            "WORKBOOK 2 1\nSHEET 1 Sheet1\nVOLATILE_SEED 0\nSET A1 1\nEND_SHEET\nSET B1 2\n",
+        )
+        .unwrap();
+        let loaded = load_workbook_file(path.path()).unwrap();
+        let grid = &loaded.active_sheet().grid;
+        assert_eq!(grid.get(&CellAddr::Main { row: 0, col: 0 }).as_deref(), Some("1"));
+        assert_eq!(
+            grid.get(&CellAddr::Main { row: 0, col: 1 }).as_deref(),
+            Some("2"),
+            "content after a legacy END_SHEET must not be dropped"
+        );
+    }
+
+    #[test]
+    fn serialize_workbook_log_includes_margin_total_seeds() {
+        // The built-in TOTAL seeds live in the margins; a main-only sweep
+        // dropped them on every save.
+        let wb = WorkbookState::new_seeded();
+        let text = serialize_workbook_log(&wb, &Default::default());
+        assert!(
+            text.contains("[A_1") && text.contains("]A~1"),
+            "margin TOTAL seeds must be written, got:\n{text}"
+        );
+        assert!(text.contains("TOTAL"), "seed values must be written");
     }
 
     #[test]

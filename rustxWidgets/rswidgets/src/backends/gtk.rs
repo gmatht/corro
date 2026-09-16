@@ -159,6 +159,31 @@ mod gtk_backend {
     }
 
 
+    /// Run `f` every `ms` milliseconds until it returns `false`.
+    ///
+    /// Repeating counterpart of [`timeout_add_once`]: the trampoline returns
+    /// `G_SOURCE_CONTINUE` (1) to stay registered, and only `G_SOURCE_REMOVE`
+    /// (0) once the callback asks to stop (freeing the boxed closure then, and
+    /// only then, so there is exactly one owner).
+    pub fn timeout_add_repeating(ms: u32, f: Box<dyn FnMut() -> bool>) -> Result<(), gtk_dynamic_loader::Error> {
+        use std::os::raw::c_void;
+        unsafe extern "C" fn trampoline(data: *mut c_void) -> i32 {
+            let b = &mut *(data as *mut Box<dyn FnMut() -> bool>);
+            if (*b)() {
+                1
+            } else {
+                drop(Box::from_raw(data as *mut Box<dyn FnMut() -> bool>));
+                0
+            }
+        }
+        let loader = LOADER.get().ok_or(gtk_dynamic_loader::Error::Other("loader not initialized".into()))?;
+        let timeout = loader.symbols.g_timeout_add.ok_or(gtk_dynamic_loader::Error::Other("g_timeout_add missing".into()))?;
+        let boxed: Box<Box<dyn FnMut() -> bool>> = Box::new(Box::new(f));
+        let raw = Box::into_raw(boxed) as *mut c_void;
+        unsafe { timeout(ms, Some(trampoline), raw); }
+        Ok(())
+    }
+
     pub fn create_drawing_area() -> Result<gtk_dynamic_loader::DrawingArea, gtk_dynamic_loader::Error> {
         let loader = LOADER.get().ok_or(gtk_dynamic_loader::Error::Other("loader not initialized".into()))?;
         gtk_dynamic_loader::DrawingArea::new(loader.clone())
@@ -201,4 +226,4 @@ mod gtk_backend {
 }
 
 #[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
-pub use gtk_backend::{init, create_window, create_button, create_label, create_box, create_grid, create_entry, create_menu, create_simple_action, create_menubar, create_dialog, create_dropdown, create_checkbutton, create_radiobutton, create_textview, create_drawing_area, create_overlay, create_scrolled_window, loader, quit_main_loop, timeout_add_once};
+pub use gtk_backend::{init, create_window, create_button, create_label, create_box, create_grid, create_entry, create_menu, create_simple_action, create_menubar, create_dialog, create_dropdown, create_checkbutton, create_radiobutton, create_textview, create_drawing_area, create_overlay, create_scrolled_window, loader, quit_main_loop, timeout_add_once, timeout_add_repeating};

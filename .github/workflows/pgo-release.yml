@@ -283,6 +283,12 @@ jobs:
           files: gcorro.gz
 
   # ── Windows x86_64: release (no PGO) ─────────────────────────────────
+  #
+  # Built with the GUI feature so Explorer double-clicks have a window to
+  # open. The exe stays CONSOLE-subsystem on purpose (see the note at the
+  # top of src/main.rs): that is what makes cmd/PowerShell *wait* for the
+  # TUI until the user quits. Explorer's throwaway console is detected at
+  # runtime (only our process attached) and hidden/freed by wincon.
   build-windows-x64:
     runs-on: windows-latest
     steps:
@@ -291,7 +297,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build
-        run: cargo build --release
+        run: cargo build --release --features gui
 
       - name: Compress with zip
         shell: bash
@@ -304,6 +310,7 @@ jobs:
           files: corro.exe.zip
 
   # ── Windows x86: release (no PGO) ────────────────────────────────────
+  # GUI feature for the same reason as x86_64 above.
   build-windows-x86:
     runs-on: windows-latest
     steps:
@@ -315,7 +322,7 @@ jobs:
         run: rustup target add i686-pc-windows-msvc
 
       - name: Build
-        run: cargo build --target i686-pc-windows-msvc --release
+        run: cargo build --target i686-pc-windows-msvc --release --features gui
 
       - name: Compress with zip
         shell: bash

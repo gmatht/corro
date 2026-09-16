@@ -2140,13 +2140,23 @@ pub fn apply_workbook_op(
     let bad = |msg: &'static str| std::io::Error::new(std::io::ErrorKind::InvalidData, msg);
     match op {
         WorkbookOp::NewSheet { id, title } => {
-            if workbook.sheet_index_by_id(id).is_none() {
-                workbook.add_sheet_record(SheetRecord {
-                    id,
-                    title,
-                    state: SheetState::new(1, 1),
-                    linked_source: None,
-                });
+            match workbook.sheet_index_by_id(id) {
+                // The log declares this sheet's title, so apply it: a renamed
+                // sheet must survive a save/load round trip. The id can only
+                // already exist because `WorkbookState::new()` pre-creates
+                // sheet 1 as "Sheet1", and previously the declared title was
+                // silently discarded, reverting the rename on every reload.
+                // (Linked sheets are unaffected: their LINK entry follows and
+                // sets the title from `corrotitle`/derived name.)
+                Some(i) => workbook.sheets[i].title = title,
+                None => {
+                    workbook.add_sheet_record(SheetRecord {
+                        id,
+                        title,
+                        state: SheetState::new(1, 1),
+                        linked_source: None,
+                    });
+                }
             }
             Ok(())
         }

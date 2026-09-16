@@ -1,6 +1,8 @@
 use crate::formula::cell_effective_display;
+use crate::formula::Number;
 use crate::grid::{CellAddr, GridBox as Grid, MainRange, MARGIN_COLS};
 use crate::ops::{AggFunc, AggregateDef};
+use num_complex::Complex64;
 
 // Re-exported for the always-compiled default UI (ui/mod.rs, ui_core.rs) which
 // cannot reach the gui-gated gui::compute version.
@@ -19,6 +21,7 @@ pub(crate) fn footer_special_col_aggregate(
     let row_func = right_col_agg_func(grid, global_col);
     let data_cols = data_main_col_count(grid);
     let mut samples: Vec<f64> = Vec::new();
+    let mut complex: Vec<Complex64> = Vec::new();
     for r in 0..main_rows {
         let row_val = if let Some(func) = row_func {
             crate::agg::compute_aggregate(
@@ -54,9 +57,13 @@ pub(crate) fn footer_special_col_aggregate(
         };
         if let Some(n) = parse_num(&row_val) {
             samples.push(n);
+        } else if let Some(c) = parse_complex_display(&row_val) {
+            // A complex row total is a real computed value, not text: keep
+            // it for the algebraic aggregates instead of dropping it.
+            complex.push(c);
         }
     }
-    Some(fold_numbers(footer_func, &samples))
+    Some(fold_numbers_with_complex(footer_func, &samples, &complex))
 }
 
 // Internal helpers kept private to this module
@@ -99,6 +106,83 @@ pub(crate) fn parse_num(s: &str) -> Option<f64> {
         return None;
     }
     t.parse::<f64>().ok()
+}
+
+/// Parse a complex row-total display back into a value.
+///
+/// Mirrors `format_complex` exactly: `{re}±{im}i` with an explicit sign and
+/// `i` suffix (e.g. `"5+1i"`, `"2-3i"`, `"0+1i"`). Anything else is `None`,
+/// so unparseable text keeps today's skip behavior — this only *adds* the
+/// complex forms the evaluator itself emits, it never reinterprets text.
+fn parse_complex_display(s: &str) -> Option<Complex64> {
+    let body = s.trim().strip_suffix('i')?;
+    // Split at the last interior sign so a negative real part survives.
+    let sep = body[1..].find(['+', '-']).map(|i| i + 1)?;
+    let (re_s, im_s) = body.split_at(sep);
+    let re: f64 = re_s.parse().ok()?;
+    let (neg, digits) = match im_s.strip_prefix('+') {
+        Some(d) => (false, d),
+        None => (true, im_s.strip_prefix('-')?),
+    };
+    let mut im: f64 = digits.parse().ok()?;
+    if neg {
+        im = -im;
+    }
+    if !re.is_finite() || !im.is_finite() {
+        return None;
+    }
+    Some(Complex64::new(re, im))
+}
+
+/// Aggregate samples for the algebraic functions (SUM, MEAN) when some row
+/// totals are complex.
+///
+/// Without complex samples this is exactly `fold_numbers` (bit-identical
+/// output — the all-real path below delegates untouched). With complex
+/// samples, reals join the complex sum and the result displays in the same
+/// shape column totals already use for complex values. A zero imaginary part
+/// collapses to the plain real rendering (`"5"`, not `"5+0i"`).
+///
+/// Ordering-based aggregates (MIN/MAX/MEDIAN) have no meaning for non-real
+/// complex samples, so those surface `#NUM!` instead of silently ignoring
+/// them. COUNT stays on real samples only, and zero-imaginary complex joins
+/// the reals by its real part (the same rule formulas use).
+fn fold_numbers_with_complex(func: AggFunc, reals: &[f64], complex: &[Complex64]) -> String {
+    if complex.is_empty() {
+        return fold_numbers(func, reals);
+    }
+    match func {
+        AggFunc::Sum | AggFunc::Mean => {
+            let mut acc = Complex64::new(reals.iter().sum(), 0.0);
+            for c in complex {
+                acc += *c;
+            }
+            let v = if matches!(func, AggFunc::Mean) {
+                acc / ((reals.len() + complex.len()) as f64)
+            } else {
+                acc
+            };
+            if v.im == 0.0 {
+                format!("{}", v.re)
+            } else {
+                super::format_aggregate_number(&Number::Complex(v))
+            }
+        }
+        AggFunc::Min | AggFunc::Max | AggFunc::Median => {
+            // No ordering for non-real complex: undefined (#NUM!), not a
+            // pick over the reals. Zero-imaginary complex joins the reals
+            // by its real part (the formula rule).
+            let mut xs: Vec<f64> = reals.to_vec();
+            for c in complex {
+                if c.im != 0.0 {
+                    return "#NUM!".to_string();
+                }
+                xs.push(c.re);
+            }
+            fold_numbers(func, &xs)
+        }
+        AggFunc::Count => fold_numbers(func, reals),
+    }
 }
 
 pub(crate) fn fold_numbers(func: AggFunc, xs: &[f64]) -> String {
@@ -205,8 +289,9 @@ pub(crate) fn left_margin_special_col_aggregate(
     data_cols: usize,
 ) -> Option<String> {
     let row_func = right_col_agg_func(grid, global_col)?;
-    let collect = |row_start: u32, row_end: u32| -> Vec<f64> {
+    let collect = |row_start: u32, row_end: u32| -> (Vec<f64>, Vec<Complex64>) {
         let mut samples: Vec<f64> = Vec::new();
+        let mut complex: Vec<Complex64> = Vec::new();
         for r in row_start..row_end {
             let row_val = crate::agg::compute_aggregate(
                 grid,
@@ -222,22 +307,149 @@ pub(crate) fn left_margin_special_col_aggregate(
             );
             if let Some(n) = parse_num(&row_val) {
                 samples.push(n);
+            } else if let Some(c) = parse_complex_display(&row_val) {
+                complex.push(c);
             }
         }
-        samples
+        (samples, complex)
     };
 
-    let mut samples = collect(row_start, row_end);
+    let (mut samples, mut complex) = collect(row_start, row_end);
     let mut end = row_start;
-    while samples.is_empty() && end > 0 {
+    while samples.is_empty() && complex.is_empty() && end > 0 {
         let Some((fallback_start, fallback_end)) = previous_raw_block(grid, end) else {
             break;
         };
-        samples = collect(fallback_start, fallback_end);
+        (samples, complex) = collect(fallback_start, fallback_end);
         if fallback_start == 0 {
             break;
         }
         end = fallback_start;
     }
-    Some(fold_numbers(subtotal_func, &samples))
+    Some(fold_numbers_with_complex(subtotal_func, &samples, &complex))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn complex_display_parses_back() {
+        // Exactly the shapes `format_complex` emits; anything else stays None
+        // (plain text keeps today's skip behavior).
+        assert_eq!(
+            parse_complex_display("5+1i"),
+            Some(Complex64::new(5.0, 1.0))
+        );
+        assert_eq!(
+            parse_complex_display("0+1i"),
+            Some(Complex64::new(0.0, 1.0))
+        );
+        assert_eq!(
+            parse_complex_display("2-3i"),
+            Some(Complex64::new(2.0, -3.0))
+        );
+        assert_eq!(
+            parse_complex_display("-2-3i"),
+            Some(Complex64::new(-2.0, -3.0))
+        );
+        assert_eq!(
+            parse_complex_display("  5+1i  "),
+            Some(Complex64::new(5.0, 1.0))
+        );
+        assert_eq!(parse_complex_display("hello"), None);
+        assert_eq!(parse_complex_display("3"), None);
+        assert_eq!(parse_complex_display("1/3"), None);
+        assert_eq!(parse_complex_display(""), None);
+        assert_eq!(parse_complex_display("5+i"), None);
+        assert_eq!(parse_complex_display("inf+1i"), None);
+    }
+
+    #[test]
+    fn complex_fold_matches_real_fold_without_complex() {
+        // No complex samples: bit-identical to the legacy f64 fold.
+        for func in [
+            AggFunc::Sum,
+            AggFunc::Mean,
+            AggFunc::Median,
+            AggFunc::Min,
+            AggFunc::Max,
+            AggFunc::Count,
+        ] {
+            let reals = vec![1.0, 2.0, 3.0];
+            assert_eq!(
+                fold_numbers_with_complex(func, &reals, &[]),
+                fold_numbers(func, &reals),
+                "{func:?} must be unchanged without complex samples"
+            );
+        }
+        assert_eq!(
+            fold_numbers_with_complex(AggFunc::Sum, &[], &[]),
+            "",
+            "empty stays blank"
+        );
+    }
+
+    #[test]
+    fn complex_sum_and_mean() {
+        assert_eq!(
+            fold_numbers_with_complex(
+                AggFunc::Sum,
+                &[3.0],
+                &[Complex64::new(5.0, 1.0)]
+            ),
+            "8+1i"
+        );
+        assert_eq!(
+            fold_numbers_with_complex(AggFunc::Sum, &[], &[Complex64::new(0.0, 1.0)]),
+            "0+1i"
+        );
+        assert_eq!(
+            fold_numbers_with_complex(
+                AggFunc::Mean,
+                &[2.0],
+                &[Complex64::new(4.0, 2.0)]
+            ),
+            "3+1i"
+        );
+        // Zero imaginary part collapses to the plain real rendering.
+        assert_eq!(
+            fold_numbers_with_complex(AggFunc::Sum, &[], &[Complex64::new(5.0, 0.0)]),
+            "5"
+        );
+    }
+
+    #[test]
+    fn ordering_aggregates_over_complex_are_undefined() {
+        // Complex has no ordering: MIN/MAX/MEDIAN over a non-real sample is
+        // #NUM!, not a pick over the reals. COUNT still counts real samples
+        // only, and zero-imaginary complex joins the reals by its real part.
+        let complex = vec![Complex64::new(5.0, 1.0)];
+        assert_eq!(
+            fold_numbers_with_complex(AggFunc::Min, &[3.0], &complex),
+            "#NUM!"
+        );
+        assert_eq!(
+            fold_numbers_with_complex(AggFunc::Max, &[3.0], &complex),
+            "#NUM!"
+        );
+        assert_eq!(
+            fold_numbers_with_complex(AggFunc::Median, &[3.0], &complex),
+            "#NUM!"
+        );
+        assert_eq!(
+            fold_numbers_with_complex(AggFunc::Count, &[3.0], &complex),
+            "1"
+        );
+        // Zero imaginary part participates by its real part.
+        let real_complex = vec![Complex64::new(7.0, 0.0)];
+        assert_eq!(
+            fold_numbers_with_complex(AggFunc::Max, &[3.0], &real_complex),
+            "7"
+        );
+        assert_eq!(
+            fold_numbers_with_complex(AggFunc::Min, &[3.0], &real_complex),
+            "3"
+        );
+    }
 }

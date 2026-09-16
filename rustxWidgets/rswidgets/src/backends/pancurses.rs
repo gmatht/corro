@@ -35,6 +35,53 @@ mod pancurses_backend {
     /// Menu item: white text on black (the submenu items).
     fn sgr_menu() -> &'static str { "\x1b[38;5;15m\x1b[48;5;0m" }
     fn sgr_formula() -> &'static str { "\x1b[38;5;6m\x1b[49m" }
+    /// ncurses keycodes for the CSI sequences registered at startup.
+    ///
+    /// Kept at module scope (not inline in the setup block) so a test can
+    /// assert the mapping without a terminal — in particular that
+    /// `ESC [ 1 ; 2 {A,B,C,D}` (shift+arrows) map to the *shifted* keycodes.
+    /// They used to alias onto the plain arrows, which silently turned every
+    /// Shift+arrow into plain movement and made selection-by-keyboard
+    /// impossible (the widget's `Input::KeyS*` handlers were unreachable).
+    #[cfg(not(windows))]
+    pub(crate) const CSI_KEY_BINDINGS: [(&[u8], i32); 14] = [
+        (b"\x1b[A\x00", 259),  // KEY_UP
+        (b"\x1b[B\x00", 258),  // KEY_DOWN
+        (b"\x1b[D\x00", 260),  // KEY_LEFT
+        (b"\x1b[C\x00", 261),  // KEY_RIGHT
+        (b"\x1b[1;2A\x00", 337),  // KEY_SR    (shift+Up)
+        (b"\x1b[1;2B\x00", 336),  // KEY_SF    (shift+Down)
+        (b"\x1b[1;2D\x00", 393),  // KEY_SLEFT
+        (b"\x1b[1;2C\x00", 402),  // KEY_SRIGHT
+        // Home/End/PageUp/PageDown. Without these the CSI tilde sequences leak
+        // into the formula bar as literal text while ratatui handles the keys.
+        (b"\x1b[H\x00", 262),  // KEY_HOME
+        (b"\x1b[1~\x00", 262),
+        (b"\x1b[F\x00", 360),  // KEY_END
+        (b"\x1b[4~\x00", 360),
+        (b"\x1b[5~\x00", 339),  // KEY_PPAGE
+        (b"\x1b[6~\x00", 338),  // KEY_NPAGE
+    ];
+
+    /// Header rows/columns covered by the selection (anchor↔cursor).
+    ///
+    /// Pure decision, kept separate from the renderer so it can be unit
+    /// tested without an ncurses screen: the pancurses backend has no
+    /// Rows/Cols-only selection modes, so both axes are always covered
+    /// (matching its body-cell selection rectangle). `None` per axis means
+    /// "no selection", i.e. only the cursor's own header glows.
+    fn header_cover(
+        anchor: Option<(u32, u32)>,
+        cursor: (u32, u32),
+    ) -> (Option<(u32, u32)>, Option<(u32, u32)>) {
+        match anchor {
+            Some((ar, ac)) => (
+                Some((ar.min(cursor.0), ar.max(cursor.0))),
+                Some((ac.min(cursor.1), ac.max(cursor.1))),
+            ),
+            None => (None, None),
+        }
+    }
     fn sgr_header_active() -> &'static str { "\x1b[1m\x1b[38;5;0m\x1b[48;5;3m" }
     fn sgr_header_inactive() -> &'static str { "\x1b[1m\x1b[38;5;6m" }
     fn sgr_row_cursor() -> &'static str { "\x1b[1;4m\x1b[38;5;0m\x1b[48;5;3m" }
@@ -45,8 +92,11 @@ mod pancurses_backend {
     fn sgr_cell_cursor() -> &'static str { "\x1b[48;5;8m" }
     fn sgr_cell_agg() -> &'static str { "\x1b[38;5;6m" }
     fn sgr_cell_footer_agg() -> &'static str { "\x1b[1m\x1b[38;5;6m" }
+    /// Hyperlink cell: blue foreground + underline (corro styles link
+    /// cells so on every backend; style bit 7, see `spreadsheet::style`).
+    fn sgr_cell_link() -> &'static str { "\x1b[38;5;4m\x1b[4m" }
     fn sgr_prompt() -> &'static str { "\x1b[38;5;15m\x1b[48;5;8m" }
-    fn sgr_caret() -> &'static str { "\x1b[38;5;0m\x1b[48;5;3m" }
+    fn sgr_caret() -> &'static str { "\x1b[1m\x1b[38;5;0m\x1b[48;5;3m" }
 
     /// -1 = disabled; a valid descriptor read from INPUT_TRACE_FD at init.
     static INPUT_TRACE_FD: std::sync::atomic::AtomicI32 =
@@ -769,6 +819,22 @@ mod pancurses_backend {
         REDRAW_REQUESTED.with(|f| *f.borrow_mut() = true);
     }
 
+    /// Suspend the terminal so the host can run an external subprocess
+    /// (e.g. `$EDITOR`) on the real screen: restores cooked mode and the
+    /// pre-TUI contents. Pair with [`resume_terminal`]. Generic mechanism;
+    /// the host decides when a subprocess needs it.
+    pub fn suspend_terminal() {
+        def_prog_mode();
+        endwin();
+    }
+
+    /// Re-enter curses mode after [`suspend_terminal`] and schedule a full
+    /// repaint (the subprocess may have drawn over everything).
+    pub fn resume_terminal() {
+        reset_prog_mode();
+        request_redraw();
+    }
+
     /// Show a single-choice list popup (generic mechanism; see ACTIVE_PICKER).
     /// `selected` is clamped to the rows. The host updates it with
     /// [`set_list_picker_selection`] as keys arrive.
@@ -896,44 +962,20 @@ mod pancurses_backend {
             flushinp();
             // Register CSI-form arrow keys so that \x1b[A etc. are
             // recognized even when terminfo uses SS3 (\x1bOA etc.).
-            // screen-256color lacks kri/kind/kLFT/kRIT, so also register
-            // \x1b[1;2{A,B,C,D} as the corresponding plain arrow keys.
+            // screen-256color lacks kri/kind/kLFT/kRIT, so \x1b[1;2{A,B,C,D}
+            // (shift+arrows) must be registered explicitly too — as the
+            // *shifted* keycodes, so Shift+arrow extends the selection
+            // (ratatui/GUI parity) instead of aliasing onto plain movement.
             // define_key is ncurses/PDCurses but is absent from the PDCurses
             // version bundled by pdcurses-sys 0.7.x. On Windows, ConPTY handles
             // these sequences natively, so skip the workaround there.
             #[cfg(not(windows))]
             {
-                use std::os::raw::{c_char, c_int};
+                use std::os::raw::c_char;
                 extern "C" {
-                    fn define_key(definition: *const c_char, keycode: c_int) -> c_int;
+                    fn define_key(definition: *const c_char, keycode: i32) -> i32;
                 }
-                const KUP: c_int = 259;
-                const KDOWN: c_int = 258;
-                const KLEFT: c_int = 260;
-                const KRIGHT: c_int = 261;
-                const KHOME: c_int = 262; // ncurses KEY_HOME (\x1b[H or \x1b[1~)
-                const KPPAGE: c_int = 339; // ncurses KEY_PPAGE (\x1b[5~)
-                const KNPAGE: c_int = 338; // ncurses KEY_NPAGE (\x1b[6~)
-                const KEND: c_int = 360;   // ncurses KEY_END (\x1b[F or \x1b[4~)
-                for (seq, code) in [
-                    (&b"\x1b[A\x00"[..], KUP),
-                    (&b"\x1b[B\x00"[..], KDOWN),
-                    (&b"\x1b[D\x00"[..], KLEFT),
-                    (&b"\x1b[C\x00"[..], KRIGHT),
-                    (&b"\x1b[1;2A\x00"[..], KUP),
-                    (&b"\x1b[1;2B\x00"[..], KDOWN),
-                    (&b"\x1b[1;2D\x00"[..], KLEFT),
-                    (&b"\x1b[1;2C\x00"[..], KRIGHT),
-                    // Home/End/PageUp/PageDown. Without these the CSI tilde
-                    // sequences leak into the formula bar as literal text
-                    // while ratatui handles the keys.
-                    (&b"\x1b[H\x00"[..], KHOME),
-                    (&b"\x1b[1~\x00"[..], KHOME),
-                    (&b"\x1b[F\x00"[..], KEND),
-                    (&b"\x1b[4~\x00"[..], KEND),
-                    (&b"\x1b[5~\x00"[..], KPPAGE),
-                    (&b"\x1b[6~\x00"[..], KNPAGE),
-                ] {
+                for (seq, code) in CSI_KEY_BINDINGS {
                     unsafe { define_key(seq.as_ptr() as *const c_char, code); }
                 }
             }
@@ -1842,20 +1884,32 @@ mod pancurses_backend {
                             // Ctrl+C — copy (standard action).  Dispatch any key
                             // callback registered for Ctrl+C (e.g. corro wires the
                             // cell copy here); do NOT quit, and never insert the
-                            // control char into the edit buffer.
-                            let cbs: Vec<Box<dyn FnMut()>> = with_state(|state| {
+                            // control char into the edit buffer.  Key callbacks
+                            // are persistent (take, fire, restore — the same
+                            // convention as the goto/cursor/commit callbacks),
+                            // so a registered key keeps working for the whole
+                            // session instead of firing once and silently
+                            // unregistering.
+                            let mut cbs: Vec<Box<dyn FnMut()>> = with_state(|state| {
                                 let mut out = Vec::new();
-                                let mut i = 0;
-                                while i < state.key_callbacks.len() {
-                                    if state.key_callbacks[i].0 == '\x03' {
-                                        out.push(state.key_callbacks.swap_remove(i).1);
+                                let all = std::mem::take(&mut state.key_callbacks);
+                                for (k, cb) in all {
+                                    if k == '\x03' {
+                                        out.push(cb);
                                     } else {
-                                        i += 1;
+                                        state.key_callbacks.push((k, cb));
                                     }
                                 }
                                 out
                             });
-                            fire_callbacks(cbs);
+                            for cb in cbs.iter_mut() {
+                                cb();
+                            }
+                            with_state(|state| {
+                                for cb in cbs {
+                                    state.key_callbacks.push(('\x03', cb));
+                                }
+                            });
                         } else if c == '\x07' {
                             // Ctrl+G — Go to a target cell (the target is registered
                             // by corro's pnc_backend, e.g. A1000) and re-render the
@@ -1913,23 +1967,31 @@ mod pancurses_backend {
                             });
                             fire_callbacks(callbacks);
                         } else {
-                            // Check registered key callbacks first
+                            // Check registered key callbacks first (persistent:
+                            // take, fire, restore — see the Ctrl+C branch).
                             let mut fired = false;
                             {
-                                let callbacks: Vec<Box<dyn FnMut()>> = with_state(|state| {
+                                let mut callbacks: Vec<Box<dyn FnMut()>> = with_state(|state| {
                                     let mut out = Vec::new();
-                                    let mut i = 0;
-                                    while i < state.key_callbacks.len() {
-                                        if state.key_callbacks[i].0 == c {
-                                            out.push(state.key_callbacks.swap_remove(i).1);
+                                    let all = std::mem::take(&mut state.key_callbacks);
+                                    for (k, cb) in all {
+                                        if k == c {
+                                            out.push(cb);
                                             fired = true;
                                         } else {
-                                            i += 1;
+                                            state.key_callbacks.push((k, cb));
                                         }
                                     }
                                     out
                                 });
-                                fire_callbacks(callbacks);
+                                for cb in callbacks.iter_mut() {
+                                    cb();
+                                }
+                                with_state(|state| {
+                                    for cb in callbacks {
+                                        state.key_callbacks.push((c, cb));
+                                    }
+                                });
                             }
                             if !fired {
                                 with_state(|state| {
@@ -2068,12 +2130,13 @@ mod pancurses_backend {
                                             }
                                             return None;
                                         } else {
-                                            // Discard the in-progress edit and move the cell left.
+                                            // Commit the in-progress edit, then move the cell left
+                                            // (mirrors Right-at-end, which commits and moves right).
+                                            // Previously this discarded the buffer, so `1 <- <-`
+                                            // lost the value instead of leaving it in its cell.
+                                            spreadsheet_commit_edit(state, fid);
                                             if let Some(n) = state.node_mut(fid) {
-                                                if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let editing = &mut grid.editing; let edit_buf = &mut grid.edit_buf; let edit_pos = &mut grid.edit_pos; let cursor_col = &mut grid.cursor_col;
-                                                    *editing = false;
-                                                    edit_buf.clear();
-                                                    *edit_pos = 0;
+                                                if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let cursor_col = &mut grid.cursor_col;
                                                     if *cursor_col > 0 { *cursor_col -= 1; }
                                                 }
                                             }
@@ -2471,7 +2534,9 @@ mod pancurses_backend {
                         with_state(|state| {
                             if let Some(fid) = state.focus_id {
                                 if is_spreadsheet_focused(state, fid) {
-                                    spreadsheet_prepare_move(state, fid, false);
+                                    // Shift+Up extends (see the registration
+                                    // above); plain Up is Input::KeyUp.
+                                    spreadsheet_prepare_move(state, fid, true);
                                     spreadsheet_commit_edit(state, fid);
                                     if let Some(n) = state.node_mut(fid) {
                                         if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let cursor_row = &mut grid.cursor_row;
@@ -2488,6 +2553,8 @@ mod pancurses_backend {
                         with_state(|state| {
                             if let Some(fid) = state.focus_id {
                                 if is_spreadsheet_focused(state, fid) {
+                                    // Shift+Down extends (see above).
+                                    spreadsheet_prepare_move(state, fid, true);
                                     spreadsheet_commit_edit(state, fid);
                                     if let Some(n) = state.node_mut(fid) {
                                         if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind { let cursor_row = &mut grid.cursor_row; let total_rows = grid.total_rows;
@@ -2820,6 +2887,12 @@ mod pancurses_backend {
                 let lm = *margin_cols as usize;
                 let mc = *main_cols as usize;
                 let use_layout = !column_layout.is_empty();
+                // Selection coverage for header chrome, derived from the same
+                // anchor the body selection uses (widget-local pair of ranges;
+                // the pancurses backend has no Rows/Cols-only modes, so both
+                // axes are covered exactly like the body rectangle).
+                let (cover_rows, cover_cols) =
+                    header_cover(grid.anchor, (*cursor_row, *cursor_col));
                 let mut out = String::new();
                 out.push_str(SGR_RESET);
                 let mut row_offset = rect.y;
@@ -2953,7 +3026,13 @@ mod pancurses_backend {
                             if hx + *w as i32 + gap_after > rect.x + rect.w - 1 { break; }
                             let padded = format!("{:<1$}", label, *w as usize);
                             let active_col = *ci == *cursor_col;
-                            let style = if active_col { sgr_header_active() } else { sgr_header_inactive() };
+                            let covered_col =
+                                cover_cols.is_some_and(|(c0, c1)| *ci >= c0 && *ci <= c1);
+                            let style = if active_col || covered_col {
+                                sgr_header_active()
+                            } else {
+                                sgr_header_inactive()
+                            };
                             out.push_str(&sgr_cup(hr, hx));
                             out.push_str(style);
                             out.push_str(&padded);
@@ -3005,7 +3084,13 @@ mod pancurses_backend {
                             if hx + cw + 6 > rect.x + rect.w { break; }
                             let padded = format!("{:<1$}", label, cw as usize);
                             let active_col = col_idx == *cursor_col;
-                            let style = if active_col { sgr_header_active() } else { sgr_header_inactive() };
+                            let covered_col =
+                                cover_cols.is_some_and(|(c0, c1)| col_idx >= c0 && col_idx <= c1);
+                            let style = if active_col || covered_col {
+                                sgr_header_active()
+                            } else {
+                                sgr_header_inactive()
+                            };
                             out.push_str(&sgr_cup(hr, hx));
                             out.push_str(style);
                             out.push_str(&padded);
@@ -3126,8 +3211,16 @@ mod pancurses_backend {
                     // last_display_main_row logic) instead of next-label heuristics
                     // that can fail when row_labels have gaps.
                     let is_boundary = boundary_row_indices.contains(&row_idx);
+                    let covered_row =
+                        cover_rows.is_some_and(|(r0, r1)| row_idx >= r0 && row_idx <= r1);
                     let row_label_style = if is_cursor_row {
                         if is_boundary { sgr_row_cursor() } else { sgr_header_active() }
+                    } else if covered_row {
+                        // Selected rows glow like the active one. Precedence
+                        // matches ratatui: coverage beats the footer style, so
+                        // a selection reaching into footers still reads as
+                        // selected (the body already highlights those cells).
+                        sgr_header_active()
                     } else if is_footer {
                         sgr_row_footer()
                     } else if is_boundary {
@@ -3524,9 +3617,10 @@ mod pancurses_backend {
                             //   1. cursor cell → bg(DarkGray)
                             //   2. footer agg  → bold + fg(Cyan)
                             //   3. agg         → fg(Cyan)
-                            //   4. border col  → fg(DarkGray)
-                            //   5. displaced by overflow → fg(DarkGray)
-                            //   6. default     → none
+                            //   4. hyperlink   → fg(Blue) + underline
+                            //   5. border col  → fg(DarkGray)
+                            //   6. displaced by overflow → fg(DarkGray)
+                            //   7. default     → none
                             //
                             // When a cell text overflows (can_overflow), the
                             // entire overflowed text uses default style (matching
@@ -3539,6 +3633,8 @@ mod pancurses_backend {
                                 sgr_cell_footer_agg()
                             } else if cell_style == 2 {
                                 sgr_cell_agg()
+                            } else if cell_style == 7 {
+                                sgr_cell_link()
                             } else if is_left_margin_col && cell_text.is_empty() {
                                 sgr_sep()
                             } else if is_right_margin_col && cell_text.is_empty()
@@ -3623,6 +3719,11 @@ mod pancurses_backend {
                                 } else if cell_style == 2 {
                                     out.push_str(SGR_FG_DEFAULT);
                                 } else if cell_style == 3 {
+                                    out.push_str(SGR_RESET);
+                                } else if cell_style == 7 {
+                                    // Link style sets fg AND underline: a full
+                                    // reset (FG_DEFAULT alone would leak the
+                                    // underline into the next cell).
                                     out.push_str(SGR_RESET);
                                 } else if is_boundary && !is_overflowing {
                                     if vi + 1 >= n {
@@ -3795,6 +3896,8 @@ mod pancurses_backend {
                                 out.push_str(sgr_cell_agg());
                             } else if cell_style == 3 {
                                 out.push_str(sgr_cell_footer_agg());
+                            } else if cell_style == 7 {
+                                out.push_str(sgr_cell_link());
                             } else if is_boundary {
                                 out.push_str(sgr_sep());
                             }
@@ -3804,6 +3907,10 @@ mod pancurses_backend {
                             } else if cell_style == 2 {
                                 out.push_str(SGR_FG_DEFAULT);
                             } else if cell_style == 3 {
+                                out.push_str(SGR_RESET);
+                            } else if cell_style == 7 {
+                                // Full reset: FG_DEFAULT alone would leak the
+                                // link underline into the next cell.
                                 out.push_str(SGR_RESET);
                             }
                             vc += 1 + overflow_cols;
@@ -4697,6 +4804,27 @@ mod pancurses_backend {
                 }
             })
         })
+    }
+
+    /// Push a selection anchor *into* the widget (the reverse of
+    /// [`spreadsheet_get_anchor`]).
+    ///
+    /// Shift+arrow input sets the widget's anchor by itself (the ncurses setup
+    /// registers `ESC [ 1 ; 2 {A,B,C,D}` as the shifted keycodes), but hosts
+    /// that hold a selection in their own state (corro's Select All, row and
+    /// column selection) must push it here or the renderer cannot highlight
+    /// the covered headers.
+    pub fn spreadsheet_set_anchor(fid: usize, anchor: Option<(u32, u32)>) {
+        with_state(|state| {
+            for n in state.nodes.iter_mut() {
+                if n.id == fid {
+                    if let PcWidgetKind::Spreadsheet { ref mut grid, .. } = n.kind {
+                        grid.anchor = anchor;
+                    }
+                    break;
+                }
+            }
+        });
     }
 
     pub fn spreadsheet_clear_anchor(fid: usize) {
@@ -6711,6 +6839,61 @@ with_state(|s| {
             // Header is at index 2 (index 0 = formula bar, index 1 = border, since menu_text is empty)
             assert!(buf[2].contains("X"), "header missing X in {:?}", &buf[2]);
             assert!(buf[2].contains("Y"), "header missing Y in {:?}", &buf[2]);
+        }
+
+        /// Shift+arrows must map to the *shifted* ncurses keycodes.
+        ///
+        /// They used to alias onto the plain arrows (a screen-256color
+        /// terminfo workaround), which turned every Shift+arrow into plain
+        /// movement: the widget's `Input::KeyS*` handlers were unreachable and
+        /// no keyboard selection was possible in this backend. Plain arrows
+        /// must keep their own keycodes.
+        #[cfg(not(windows))]
+        #[test]
+        fn shift_arrows_map_to_shifted_keycodes() {
+            let code = |seq: &[u8]| {
+                super::CSI_KEY_BINDINGS
+                    .iter()
+                    .find(|(s, _)| *s == seq)
+                    .map(|(_, c)| *c)
+                    .unwrap_or_else(|| panic!("{seq:?} not registered"))
+            };
+            // ncurses: KEY_UP/DOWN/LEFT/RIGHT, KEY_SR/SF, KEY_SLEFT/SRIGHT.
+            assert_eq!(code(b"\x1b[C\x00"), 261, "plain Right stays KEY_RIGHT");
+            assert_eq!(code(b"\x1b[A\x00"), 259, "plain Up stays KEY_UP");
+            assert_eq!(code(b"\x1b[1;2C\x00"), 402, "Shift+Right -> KEY_SRIGHT");
+            assert_eq!(code(b"\x1b[1;2D\x00"), 393, "Shift+Left -> KEY_SLEFT");
+            assert_eq!(code(b"\x1b[1;2A\x00"), 337, "Shift+Up -> KEY_SR");
+            assert_eq!(code(b"\x1b[1;2B\x00"), 336, "Shift+Down -> KEY_SF");
+            // Home/End/Page keys must not regress either.
+            assert_eq!(code(b"\x1b[H\x00"), 262, "Home -> KEY_HOME");
+            assert_eq!(code(b"\x1b[F\x00"), 360, "End -> KEY_END");
+            assert_eq!(code(b"\x1b[5~\x00"), 339, "PgUp -> KEY_PPAGE");
+            assert_eq!(code(b"\x1b[6~\x00"), 338, "PgDn -> KEY_NPAGE");
+        }
+
+        /// The coverage decision the header renderer consumes: anchor↔cursor
+        /// on both axes, `None` without a selection. (The SGR bytes it drives
+        /// are asserted end-to-end by the live tmux test
+        /// `pnc_selected_headers`, which captures the pane with `-e`.)
+        #[test]
+        fn header_cover_ranges() {
+            assert_eq!(header_cover(None, (4, 2)), (None, None), "no anchor, no cover");
+            assert_eq!(
+                header_cover(Some((4, 2)), (4, 2)),
+                (Some((4, 4)), Some((2, 2))),
+                "single-cell selection covers just that header"
+            );
+            assert_eq!(
+                header_cover(Some((4, 2)), (6, 5)),
+                (Some((4, 6)), Some((2, 5))),
+                "extended selection covers the whole span on both axes"
+            );
+            assert_eq!(
+                header_cover(Some((6, 5)), (4, 2)),
+                (Some((4, 6)), Some((2, 5))),
+                "reversed anchor (cursor above/left) normalises"
+            );
         }
 
         /// Reproduce blank spreadsheet: test with margin columns, header rows,

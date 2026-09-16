@@ -632,6 +632,51 @@ fn new_doc_left_moves_selection() {
     );
 }
 
+/// `1 <- <-` on a new sheet must leave `1` in A1 (commit, not discard).
+/// Regression: EdgeLeft discarded the edit buffer (both ratatui and pancurses),
+/// so the value vanished even though EdgeRight/Up/Down all commit. Structural:
+/// asserts the committed cell value itself, not just "the app did not crash".
+/// Covers ratatui in-process (deterministic oracle) and pancurses live (tmux).
+#[test]
+fn typed_1_left_left_leaves_1_in_a1() {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    // ── ratatui reference (in-process, deterministic) ──
+    let tmp = new_doc_fixture();
+    let mut app = corro::ui::App::new(Some(tmp));
+    app.load_initial().unwrap();
+    for code in [KeyCode::Char('1'), KeyCode::Left, KeyCode::Left] {
+        let ev = crossterm::event::KeyEvent::new(code, KeyModifiers::NONE);
+        app.bench_handle_key(ev).ok();
+    }
+    let a1 = app
+        .state
+        .grid
+        .get(&corro::grid::CellAddr::Main { row: 0, col: 0 });
+    assert_eq!(
+        a1.as_deref(),
+        Some("1"),
+        "ratatui: typing 1 then Left,Left must commit 1 to A1"
+    );
+    // ── pancurses must commit the SAME value (live tmux, file-backed) ──
+    let doc = new_doc_fixture();
+    let doc_str = doc.to_string_lossy().to_string();
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let session = format!("corro-1ll-{id}");
+    let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
+    start_session(&session, &format!("{bin} --pancurses {doc_str}; sleep 2"));
+    for key in ["1", "Left", "Left"] {
+        send_settled(&session, key);
+    }
+    let pane = capture_settled(&session, 30);
+    tmux::kill_session(&session);
+    let logged = std::fs::read_to_string(&doc).unwrap_or_default();
+    assert!(
+        logged.lines().any(|l| l.trim() == "SET A1 1"),
+        "pancurses must commit `SET A1 1` after 1,Left,Left (log:\n{logged})\n--- pane ---\n{}",
+        safe_slice(&pane, 1500)
+    );
+}
+
 /// Navigate to a cell via repeated arrow keys, enter "Hello World!", and verify
 /// the pancurses formula bar shows the correct address.
 #[test]
@@ -2619,6 +2664,126 @@ fn type_first_a_down_aaa_enter_parity() {
         vec!["SET A1 A".to_string(), "SET A2 AAA".to_string()],
         "pancurses must commit A@A1 then AAA@A2"
     );
+}
+
+/// Type 1, Enter (commit + move down), type 2, Enter.
+/// Expected everywhere: A1="1", A2="2", cursor A3 — still in Edit mode
+/// with an empty buffer, so the bar shows the caret block after ` A3  `.
+#[test]
+fn type_first_1_enter_2_enter_parity() {
+    use crossterm::event::KeyCode;
+    let keys = ["1", "Enter", "2", "Enter"];
+    let codes = [
+        KeyCode::Char('1'),
+        KeyCode::Enter,
+        KeyCode::Char('2'),
+        KeyCode::Enter,
+    ];
+
+    // ── ratatui reference ──
+    // (No render-contains for the digits: bare "1"/"2" also match the
+    // row/column headers, so the SET ops + formula-bar address are the
+    // verdict — they prove value, target cell, and cursor.)
+    let fix_rt = empty_fixture("rt-1e2e");
+    let (rt_bar, _rt_render, rt_path) = drive_ratatui(&fix_rt, &codes);
+    assert!(rt_bar.contains("A3"), "ratatui formula should show A3\n{rt_bar:?}");
+    assert_eq!(
+        file_set_tail(&rt_path, 2),
+        vec!["SET A1 1".to_string(), "SET A2 2".to_string()],
+        "ratatui must commit 1@A1 then 2@A2"
+    );
+    // Structural: the bar cell right after ` A3  ` (col 5) must be the
+    // bold caret block (Black/Yellow/BOLD), not a plain space. A missing
+    // caret style sails past every text-only assertion.
+    {
+        use crossterm::event::{KeyEvent, KeyModifiers};
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let tmp = std::env::temp_dir().join(format!(
+            "corro-rt-tf-{}-{}.corro",
+            std::process::id(),
+            id
+        ));
+        std::fs::copy(&fix_rt, &tmp).expect("copy ratatui fixture");
+        let mut app = corro::ui::App::new(Some(tmp));
+        app.load_initial().unwrap();
+        for &code in &codes {
+            app.bench_handle_key(KeyEvent::new(code, KeyModifiers::NONE)).ok();
+        }
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.bench_draw(f)).unwrap();
+        let caret = terminal.backend().buffer()[(5, 1)].clone();
+        assert!(
+            caret.modifier.contains(ratatui::style::Modifier::BOLD),
+            "ratatui bar caret at (5,1) must be BOLD, got {:?}",
+            caret.modifier
+        );
+    }
+
+    // ── pancurses must match: one marker-paced drive yields the plain
+    // pane (bar + grid text), the raw esc pane (styles), and the file.
+    // A single drive (not text-drive + esc-drive) keeps keys, bar, file
+    // and styles on the same run; marker pacing (not frame-settle) makes
+    // key delivery deterministic.
+    let fix_pnc = empty_fixture("pnc-1e2e");
+    let (pnc_bar, pnc_esc) = drive_pnc_full(&fix_pnc, &keys, 2);
+    assert!(pnc_bar.contains("A3"), "pancurses formula should show A3\n{pnc_bar:?}");
+    assert_eq!(
+        file_set_tail(&fix_pnc, 2),
+        vec!["SET A1 1".to_string(), "SET A2 2".to_string()],
+        "pancurses must commit 1@A1 then 2@A2"
+    );
+    // Structural: the raw stream must carry the BOLD caret block right
+    // after ` A3  ` (prompt style + address + bold black-on-yellow caret).
+    // Text-only captures cannot see a dropped bold bit.
+    assert!(
+        pnc_esc.contains("\x1b[38;5;15m\x1b[48;5;8m A3  \x1b[1m\x1b[38;5;0m\x1b[48;5;3m "),
+        "pancurses bar must show the bold caret block after ` A3  `"
+    );
+}
+
+/// Marker-paced pancurses drive returning (formula-bar line, esc pane).
+/// Each key is sent only after the previous key's redraw lands (idle
+/// marker), then commits are awaited in the file before capturing — so the
+/// verdict never races a slow commit the way frame-settle pacing can.
+/// `expect_sets` is the number of `SET ` ops the sequence must drain.
+fn drive_pnc_full(fixture: &str, keys: &[&str], expect_sets: usize) -> (String, String) {
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let session = format!("corro-tf-full-{}-{id}", std::process::id());
+    let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
+    let marker = std::env::temp_dir().join(format!(
+        "corro-tf-full-marker-{}-{id}.marker",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&marker);
+    start_session(
+        &session,
+        &format!(
+            "CORRO_IDLE_MARKER={} {bin} --pancurses {fixture}; sleep 2",
+            marker.display()
+        ),
+    );
+    wait_marker(&marker, 1); // initial redraw
+    for (i, key) in keys.iter().enumerate() {
+        tmux::send_keys(&session, key);
+        wait_marker(&marker, i + 2); // initial(1) + (i+1) keys
+    }
+    // Commits drain to the file; wait for all of them (deadline, not hope).
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let n = std::fs::read_to_string(fixture)
+            .map(|s| s.lines().filter(|l| l.starts_with("SET ")).count())
+            .unwrap_or(0);
+        if n >= expect_sets || std::time::Instant::now() > deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let pane = capture_settled(&session, 100);
+    let esc = tmux::capture_pane_esc(&session);
+    tmux::kill_session(&session);
+    let _ = std::fs::remove_file(&marker);
+    (pane.lines().nth(1).unwrap_or("").to_string(), esc)
 }
 
 /// Up, Left, type A, Enter: the edit happens in the header zone, so the

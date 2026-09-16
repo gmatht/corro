@@ -202,6 +202,25 @@ enum Expect {
     NestedOpens,
 }
 
+/// Fraction down a root-menu popup for the middle of `item_label`'s row,
+/// computed from the shared menu tree — the same tree the GTK backend builds
+/// its menus from. Hardcoded fractions rot on every insertion (Edit grew
+/// 7→11 rows, File 8→9, silently retargeting every click below the gap);
+/// deriving them keeps these tests honest when the menu changes.
+fn menu_item_frac(root_label: &str, item_label: &str) -> f64 {
+    let bar = corro::gui::menu::menu_bar();
+    let root = bar
+        .iter()
+        .find(|r| r.label == root_label)
+        .unwrap_or_else(|| panic!("no {root_label} menu"));
+    let items = root.submenu.as_deref().unwrap_or(&[]);
+    let idx = items
+        .iter()
+        .position(|it| it.label == item_label)
+        .unwrap_or_else(|| panic!("no {item_label} in {root_label}"));
+    (idx as f64 + 0.5) / items.len() as f64
+}
+
 fn alt_opens_menu(letter: &str, min_text_px: i32, item_frac: f64, expect: Expect) {
     let _guard = GUI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     assert!(
@@ -384,16 +403,21 @@ fn alt_opens_menu(letter: &str, min_text_px: i32, item_frac: f64, expect: Expect
 /// must dismiss it.
 #[test]
 fn gui_alt_f_opens_file_menu() {
-    // File menu holds ~8 items (~190 text px measured); require a healthy
-    // count so a blank/empty popup cannot pass. Exit is item 7 of 8.
-    alt_opens_menu("f", 120, 6.5 / 8.0, Expect::Quit);
+    // Require a healthy text count so a blank/empty popup cannot pass.
+    // Exit's row is derived from the shared tree (no pinned position).
+    alt_opens_menu("f", 120, menu_item_frac("File", "Exit"), Expect::Quit);
 }
 
 /// Alt+E must open the Edit menu visibly (same machinery, second mnemonic).
 #[test]
 fn gui_alt_e_opens_edit_menu() {
-    // Find is item 4 of 7; its dialog proves activation.
-    alt_opens_menu("e", 90, 3.5 / 7.0, Expect::Dialog("Find".into()));
+    // Find's dialog proves activation; its row comes from the shared tree.
+    alt_opens_menu(
+        "e",
+        90,
+        menu_item_frac("Edit", "Find"),
+        Expect::Dialog("Find".into()),
+    );
 }
 
 /// Alt+R must open the Format menu visibly (root shortcut R disambiguates
@@ -402,5 +426,108 @@ fn gui_alt_e_opens_edit_menu() {
 /// Text threshold scales with item count (4 items vs Edit's 7 at 90px).
 #[test]
 fn gui_alt_r_opens_format_menu() {
-    alt_opens_menu("r", 50, 0.5 / 4.0, Expect::NestedOpens);
+    alt_opens_menu("r", 50, menu_item_frac("Format", "Scope"), Expect::NestedOpens);
+}
+
+/// Edit ▸ Workbook (External) must launch a GUI editor on the live file
+/// through the REAL GTK menu path (not shared dispatch directly).
+///
+/// Regression: the GTK `handle_menu_action` match had no arm for this item,
+/// so the click fell into the `_` stub (a status string) and no editor ever
+/// launched — while every dispatch-level test passed. The proof is a marker
+/// file the stand-in editor writes with the path it received (appearance
+/// event with a deadline, no fixed sleeps for the verdict).
+#[test]
+fn gui_workbook_external_launches_gui_editor() {
+    let _guard = GUI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    assert!(
+        std::env::var("DISPLAY").is_ok(),
+        "requires X server (run under xvfb-run -a)"
+    );
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let stem = format!("corro-wbext-{}-{}", std::process::id(), id);
+    let dir = std::env::temp_dir().join(&stem);
+    std::fs::create_dir_all(&dir).expect("fixture dir");
+    let path = dir.join("book.corro");
+    std::fs::write(&path, "CORRO_LOG 1\n").expect("write fixture");
+    let marker = dir.join("launched");
+    let script = dir.join("mousepad.sh");
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\necho \"$1\" > \"{}\"\n", marker.display()),
+    )
+    .expect("write editor script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod editor script");
+    }
+
+    let bin = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/corro");
+    let mut child = KillOnDrop(
+        Command::new(&bin)
+            .arg("--gui")
+            .arg(&path)
+            .env("CORRO_GUI_EDITOR", &script)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn corro --gui"),
+    );
+    let pid = child.id();
+    let wid = find_corro_window(pid, Instant::now() + Duration::from_secs(25));
+    xdotool(&["windowactivate", "--sync", &wid]);
+    std::thread::sleep(Duration::from_millis(400));
+    xdotool(&["key", "--window", &wid, "alt+e"]);
+    let found = wait_popup(pid, &wid, Instant::now() + Duration::from_secs(8), true);
+    let popup = found[0].clone();
+    // Workbook (External)'s row comes from the shared tree (no pinned
+    // position — this is what rotted the sibling tests when Edit grew).
+    let geo = xdotool(&["getwindowgeometry", "--shell", &popup]);
+    let (mut px, mut py, mut pw, mut ph) = (0, 0, 0, 0);
+    for l in geo.lines() {
+        if let Some(v) = l.strip_prefix("X=") {
+            px = v.trim().parse().unwrap_or(0);
+        }
+        if let Some(v) = l.strip_prefix("Y=") {
+            py = v.trim().parse().unwrap_or(0);
+        }
+        if let Some(v) = l.strip_prefix("WIDTH=") {
+            pw = v.trim().parse().unwrap_or(0);
+        }
+        if let Some(v) = l.strip_prefix("HEIGHT=") {
+            ph = v.trim().parse().unwrap_or(0);
+        }
+    }
+    assert!(ph > 60, "Edit popup height implausible ({ph})");
+    std::thread::sleep(Duration::from_millis(400));
+    xdotool(&[
+        "mousemove",
+        &format!("{}", px + pw / 2),
+        &format!(
+            "{}",
+            py + (ph as f64 * menu_item_frac("Edit", "Workbook (External)")) as i32
+        ),
+        "click",
+        "1",
+    ]);
+    // The stand-in editor must run with the live log path (deadline poll).
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        if let Ok(arg) = std::fs::read_to_string(&marker) {
+            assert_eq!(
+                arg.trim(),
+                path.to_string_lossy().as_ref(),
+                "GUI editor launched with wrong path"
+            );
+            break;
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("Workbook (External) never launched the GUI editor");
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }

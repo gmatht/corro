@@ -4,13 +4,11 @@ fn save_load_roundtrip() {
     let addr = corro::grid::CellAddr::Main { row: 0, col: 0 };
     wb.active_sheet_mut().grid.set(&addr, "hello".to_string());
 
-    let snapshot = corro::ops::WorkbookSnapshot::from_workbook(&wb);
 
     let tmp = std::env::temp_dir().join("test_save_load_roundtrip.corro");
-    corro::io::save_workbook(&tmp, &snapshot).unwrap();
+    corro::io::write_workbook_log(&tmp, &wb, &Default::default()).unwrap();
 
-    let loaded_snapshot = corro::io::load_workbook_snapshot(&tmp).unwrap();
-    let loaded_wb = corro::ops::WorkbookState::from_snapshot(&loaded_snapshot);
+    let loaded_wb = corro::io::load_workbook_file(&tmp).unwrap();
 
     let val = loaded_wb.active_sheet().grid.get(&addr);
     assert_eq!(val, Some("hello".into()));
@@ -31,12 +29,10 @@ fn save_load_roundtrip_multiple_cells() {
         wb.active_sheet_mut().grid.set(addr, val.to_string());
     }
 
-    let snapshot = corro::ops::WorkbookSnapshot::from_workbook(&wb);
     let tmp = std::env::temp_dir().join("test_save_load_roundtrip_multi.corro");
-    corro::io::save_workbook(&tmp, &snapshot).unwrap();
+    corro::io::write_workbook_log(&tmp, &wb, &Default::default()).unwrap();
 
-    let loaded_snapshot = corro::io::load_workbook_snapshot(&tmp).unwrap();
-    let loaded_wb = corro::ops::WorkbookState::from_snapshot(&loaded_snapshot);
+    let loaded_wb = corro::io::load_workbook_file(&tmp).unwrap();
 
     for (addr, expected) in &cells {
         let val = loaded_wb.active_sheet().grid.get(addr);
@@ -49,12 +45,10 @@ fn save_load_roundtrip_multiple_cells() {
 #[test]
 fn save_load_roundtrip_empty_workbook() {
     let wb = corro::ops::WorkbookState::new();
-    let snapshot = corro::ops::WorkbookSnapshot::from_workbook(&wb);
     let tmp = std::env::temp_dir().join("test_save_load_roundtrip_empty.corro");
-    corro::io::save_workbook(&tmp, &snapshot).unwrap();
+    corro::io::write_workbook_log(&tmp, &wb, &Default::default()).unwrap();
 
-    let loaded_snapshot = corro::io::load_workbook_snapshot(&tmp).unwrap();
-    let loaded_wb = corro::ops::WorkbookState::from_snapshot(&loaded_snapshot);
+    let loaded_wb = corro::io::load_workbook_file(&tmp).unwrap();
 
     assert_eq!(wb.sheet_count(), loaded_wb.sheet_count());
     assert_eq!(wb.active_sheet().grid.main_rows(), loaded_wb.active_sheet().grid.main_rows());

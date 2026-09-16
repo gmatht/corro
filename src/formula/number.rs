@@ -79,6 +79,13 @@ impl Number {
         }
     }
 
+    /// `true` for a complex value whose imaginary part is nonzero (or NaN):
+    /// such values have no ordering, so MIN/MAX over them is undefined.
+    /// Complex with a zero imaginary part still participates by its real part.
+    pub fn is_nonreal(&self) -> bool {
+        matches!(self, Number::Complex(c) if c.im != 0.0)
+    }
+
     /// `true` for NaN, signed zero, or any value whose `f64` rounds to 0.0.
     /// Used for truthy / IF cond-style checks.
     pub fn is_zeroish(&self) -> bool {

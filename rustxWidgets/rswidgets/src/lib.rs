@@ -12,6 +12,8 @@ pub use core::{Action, Align, CallbackResult, Event, LayoutDir, Label, MessageBo
 // i18n mechanism (deferred labels + translator hook). No translated text lives
 // in this crate; the app owns the catalog.
 pub use core::{locale_is_rtl, set_layout_direction, set_layout_direction_hook, set_translator, tr};
+// Portable periodic tick (GTK timeout / Win32 WM_TIMER) — see core::add_periodic_tick.
+pub use core::add_periodic_tick;
 pub mod spreadsheet;
 pub mod overflow;
 
@@ -37,7 +39,10 @@ pub mod backends_gtk_adapter {
 mod backends_gtk_adapter_impl;
 #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs")))]
 pub mod backends_gtk_adapter;
-#[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+// Available on all Windows builds (not just non-pancurses ones) so
+// combined gui+pancurses builds can drive the native GUI side by side
+// with the terminal, mirroring the gtk adapter on Linux.
+#[cfg(all(windows, not(feature = "zork")))]
 pub mod backends_nwg_adapter;
 #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
 pub mod backends_wasm_adapter;

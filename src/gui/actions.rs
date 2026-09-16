@@ -432,16 +432,30 @@ pub fn dispatch_menu_action(
         }
         "edit_workbook_external" => {
             // Edit ▸ Workbook (External): open the append-only log itself in
-            // $EDITOR. Blocking/modal-like, like edit_external. The file is
-            // the source of truth, so afterwards the workbook is reloaded
-            // from it (anchored on the unchanged prefix: appends tail-apply,
-            // a rewrite falls back to a full reload — same paths as another
-            // window's Save).
+            // an editor. From a native GUI backend there is no terminal, so
+            // a blocking $EDITOR roundtrip (vi) would hang: instead the
+            // desktop's GUI editor is launched detached (probed lightest-
+            // first on Linux, xdg-open as last resort) and the save is
+            // picked up by the log-tail poll like another window's Save.
+            // Terminal backends (and headless/tests) keep the blocking
+            // $EDITOR roundtrip below. The file is the source of truth, so
+            // afterwards the workbook is reloaded from it (anchored on the
+            // unchanged prefix: appends tail-apply, a rewrite falls back to
+            // a full reload — same paths as another window's Save).
             let Some(path) = app.core.path.clone() else {
                 return MenuDispatch::Status(
                     "Save the workbook first (File ▸ Save as), then edit it externally".into(),
                 );
             };
+            if matches!(app.backend, Some(crate::gui::Backend::Gui)) {
+                return match crate::editor::open_gui_editor_detached(&path) {
+                    Ok(prog) => MenuDispatch::Status(format!(
+                        "Opened {} in {prog} (saves reload automatically)",
+                        path.display()
+                    )),
+                    Err(e) => MenuDispatch::Status(format!("Editor error: {e}")),
+                };
+            }
             match crate::editor::edit_workbook_externally(&path) {
                 Ok(true) => match app.core.poll_log_tail() {
                     Ok(_) => MenuDispatch::Status(format!(

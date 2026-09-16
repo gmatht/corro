@@ -316,7 +316,7 @@ pub fn replace_dialog<F: FnOnce(Option<(String, String)>) + 'static>(on_result: 
     #[cfg(feature = "gui")]
     {
         use rswidgets::common::Entry as CommonEntry;
-        use rswidgets::prelude::Orientation;
+        use rswidgets::common::Orientation;
         if let Ok(rxapp) = rswidgets::App::init() {
             if let (Ok(dialog), Ok(find_entry), Ok(replace_entry), Ok(vbox)) =
                 (rxapp.new_dialog(), rxapp.new_entry(), rxapp.new_entry(), rxapp.new_box(Orientation::Vertical, 4))
@@ -433,7 +433,16 @@ pub fn special_char_dialog<F: FnOnce(Option<usize>) + 'static>(
 ) {
     #[cfg(feature = "gui")]
     {
-        use rswidgets::prelude::*;
+        // Combined-gui flips the root prelude to pancurses-adapter types;
+        // these dialog widgets are always native: prefer the platform
+        // adapter, falling back to the prelude elsewhere (unchanged).
+        #[cfg(target_os = "linux")]
+        use rswidgets::backends_gtk_adapter::RadioButton;
+        #[cfg(windows)]
+        use rswidgets::backends_nwg_adapter::RadioButton;
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        use rswidgets::prelude::RadioButton;
+        use rswidgets::common::Orientation;
         if let Ok(rxapp) = rswidgets::App::init() {
             if let (Ok(dialog), Ok(vbox)) =
                 (rxapp.new_dialog(), rxapp.new_box(Orientation::Vertical, 4))
@@ -515,7 +524,14 @@ pub fn special_char_dialog<F: FnOnce(Option<usize>) + 'static>(
 pub fn sort_dialog<F: FnOnce(Option<(usize, bool)>) + 'static>(_workbook: &WorkbookState, on_result: F) {
     #[cfg(feature = "gui")]
     {
-        use rswidgets::prelude::*;
+        // (same native-widget shadowing as above)
+        #[cfg(target_os = "linux")]
+        use rswidgets::backends_gtk_adapter::{CheckButton, DropDown};
+        #[cfg(windows)]
+        use rswidgets::backends_nwg_adapter::{CheckButton, DropDown};
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        use rswidgets::prelude::{CheckButton, DropDown};
+        use rswidgets::common::Orientation;
         let cols: &[&str] = &["Column A", "Column B", "Column C", "Column D", "Column E"];
         if let Ok(rxapp) = rswidgets::App::init() {
             if let (Ok(dialog), Ok(sort_col), Ok(ascending), Ok(vbox)) =

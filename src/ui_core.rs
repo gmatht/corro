@@ -97,6 +97,140 @@ pub fn append_extension_if_missing(path: &std::path::Path, ext: &str) -> std::pa
     }
 }
 
+/// If `text` (a cell's display value) is a hyperlink, return the URL to open.
+///
+/// Whole trimmed cell must start with a known scheme (`http://`, `https://`,
+/// `ftp://`, `mailto:`, `file://`, case-insensitive) or a bare `www.` host
+/// (opened as `https://`). Anything else — including URLs buried inside
+/// longer text — is not a link, so plain prose never becomes clickable.
+/// Shared by every backend: link styling and follow-link target one source
+/// of truth instead of per-backend prefix tables.
+pub fn hyperlink_target(text: &str) -> Option<String> {
+    let t = text.trim();
+    // ASCII-only comparison: URLs are ASCII by construction; a non-ASCII
+    // lookalike must never match (homoglyph safety). Byte-wise matching
+    // allocates nothing, so per-frame render checks stay cheap (the
+    // allocation happens only on an actual match).
+    if t.is_empty() || !t.is_ascii() {
+        return None;
+    }
+    let b = t.as_bytes();
+    const SCHEMES: &[&str] = &["https://", "http://", "ftp://", "mailto:", "file://"];
+    for scheme in SCHEMES {
+        if b.len() > scheme.len() && b[..scheme.len()].eq_ignore_ascii_case(scheme.as_bytes())
+        {
+            return Some(t.to_string());
+        }
+    }
+    if b.len() > 4 && b[..4].eq_ignore_ascii_case(b"www.") {
+        return Some(format!("https://{t}"));
+    }
+    None
+}
+
+/// Build the OS command that opens `url` in the default browser, as
+/// `(program, args)`. Pure (no spawn) so tests pin the platform mapping.
+///
+/// `CORRO_URL_OPENER` overrides the launcher for tests and locked-down
+/// environments: `"<program> [extra args...]"`, whitespace-separated,
+/// with the URL appended as the final argument — or substituted for a
+/// `{}` placeholder when one is present (e.g. a recorder script that logs
+/// `$1` to a file instead of opening a browser).
+pub fn opener_command(url: &str) -> (String, Vec<String>) {
+    if let Ok(spec) = std::env::var("CORRO_URL_OPENER") {
+        let spec = spec.trim();
+        if !spec.is_empty() {
+            let mut parts: Vec<String> =
+                spec.split_whitespace().map(|s| s.to_string()).collect();
+            let prog = parts.remove(0);
+            if parts.iter().any(|a| a.contains("{}")) {
+                for a in parts.iter_mut() {
+                    if a.contains("{}") {
+                        *a = a.replace("{}", url);
+                    }
+                }
+            } else {
+                parts.push(url.to_string());
+            }
+            return (prog, parts);
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // `start` treats the first quoted argument as a window title, so an
+        // explicit empty title keeps the URL from being swallowed.
+        ("cmd".to_string(), vec!["/C".to_string(), "start".to_string(), String::new(), url.to_string()])
+    }
+    #[cfg(target_os = "macos")]
+    {
+        ("open".to_string(), vec![url.to_string()])
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        ("xdg-open".to_string(), vec![url.to_string()])
+    }
+}
+
+/// Spawn the URL opener detached: never blocks the UI waiting for the
+/// browser (launchers like `xdg-open` wait for their child). Stdio is
+/// nulled so the child can never scribble on the terminal/canvas.
+pub fn open_url_detached(url: &str) -> std::io::Result<()> {
+    let (prog, args) = opener_command(url);
+    std::process::Command::new(prog)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|_| ())
+}
+
+/// Follow the hyperlink in the cursor cell: open the cursor cell's effective
+/// display text (formulas evaluate first, so `="https://…"` follows) and
+/// return the status line for it. One shared implementation behind the
+/// ratatui Ctrl+O key, the Edit ▸ Follow link menu item on every backend,
+/// and the GUI dispatch — the status text is byte-identical everywhere.
+pub fn follow_hyperlink(grid: &Grid, cursor: SheetCursor) -> String {
+    let addr = cursor.to_addr(grid);
+    let text = cell_effective_display(grid, &addr);
+    let label = crate::addr::cell_ref_text(&addr, grid.main_cols());
+    follow_link_status(&text, &label)
+}
+
+/// Status text (and opener spawn) for following `display_text`. Pure apart
+/// from the spawn itself; split out so tests pin the texts without a grid.
+pub fn follow_link_status(display_text: &str, addr_label: &str) -> String {
+    match hyperlink_target(display_text) {
+        Some(url) => match open_url_detached(&url) {
+            Ok(()) => format!("Opened {url}"),
+            Err(e) => format!("Could not open {url}: {e}"),
+        },
+        None => format!("No hyperlink at {addr_label}"),
+    }
+}
+
+/// Fresh blank workbook for File ▸ New: the `CORRO_TEMPLATE` workbook when
+/// set and readable, else the built-in seeded blank (margin TOTAL seeds) —
+/// exactly what launching with no file produces. Returns the workbook plus
+/// a status note for the template-failure case (`None` on the clean path).
+/// Shared by the ratatui New arm and the GUI dispatch so every backend
+/// starts the identical document from one source of truth.
+pub fn fresh_blank_workbook() -> (crate::ops::WorkbookState, Option<String>) {
+    match crate::io::template_path_from_env() {
+        Some(path) => match crate::io::load_workbook_template(path.as_path()) {
+            Ok(wb) => (wb, None),
+            Err(msg) => (
+                crate::ops::WorkbookState::new_seeded(),
+                Some(format!(
+                    "Template {} failed ({msg}); opened blank instead",
+                    path.display()
+                )),
+            ),
+        },
+        None => (crate::ops::WorkbookState::new_seeded(), None),
+    }
+}
+
 /// Today's date as `YYYY-MM-DD` in local time: the Insert > Date preset.
 /// Shared by the ratatui reference and the GUI dispatch so every backend
 /// presets (and tests assert) byte-identical values.
@@ -302,17 +436,53 @@ pub fn inter_column_trailing_after_data_cell(
 // Display helpers
 // ---------------------------------------------------------------------------
 
+/// Numeric value of a cell's *display* text.
+///
+/// Accepts plain decimals, and the rational literals the evaluator emits for
+/// exact results (`"1/3"`, `"-2/7"` — see `rational_to_formula_literal`).
+/// Without the rational case every number format silently no-ops on a formula
+/// whose exact value is not a terminating decimal: `=2/6` displays as `1/3`,
+/// which does not parse as `f64`, so Fixed/Currency/Decimal left it alone.
+fn display_text_value(text: &str) -> Option<f64> {
+    let t = text.trim();
+    if let Ok(v) = t.parse::<f64>() {
+        return Some(v);
+    }
+    let (num, den) = t.split_once('/')?;
+    let num: f64 = num.trim().parse().ok()?;
+    let den: f64 = den.trim().parse().ok()?;
+    // A zero denominator is not a number; leave the text untouched.
+    (den != 0.0).then(|| num / den)
+}
+
 /// Apply cell-level formatting (number format, alignment heuristics) to the
 /// given display `text` and return the formatted string.
 pub fn format_cell_display(grid: &Grid, addr: &CellAddr, text: String) -> String {
     let fmt = grid.format_for_addr(addr);
     match fmt.number {
+        // Generic decimal: the documented meaning of this format — a plain
+        // decimal (with the evaluator's ~10 significant digits, and scientific
+        // notation for extremes) rather than the exact rational the cell shows
+        // by default.
+        Some(NumberFormat::DecimalGeneric) => {
+            let t = text.trim();
+            // The evaluator already renders extreme magnitudes in scientific
+            // form, which `f64` cannot even hold (`1e-999` parses to `0.0`);
+            // converting those would destroy the value, so keep them as-is.
+            if t.contains('e') || t.contains('E') {
+                return text;
+            }
+            match display_text_value(&text) {
+                Some(v) if v.is_finite() => crate::formula::format_decimal_generic(v),
+                _ => text,
+            }
+        },
         Some(NumberFormat::Fixed { decimals }) => {
-            match text.trim().parse::<f64>() {
-                Ok(v) if v.is_finite() => {
+            match display_text_value(&text) {
+                Some(v) if v.is_finite() => {
                     format!("{:.decimals$}", v, decimals = decimals)
                 }
-                Ok(_) => {
+                Some(_) => {
                     // Overflow to infinity — try scientific notation.
                     if let Some(sci) = exponential_numeric_display(text.trim(), 20) {
                         sci
@@ -320,23 +490,20 @@ pub fn format_cell_display(grid: &Grid, addr: &CellAddr, text: String) -> String
                         text
                     }
                 }
-                Err(_) => {
-                    // Not numeric — could be a formula result like "1/7".
-                    text
-                }
+                // Not numeric — a text cell, an error, …
+                None => text,
             }
         }
         Some(NumberFormat::Currency { decimals }) => {
-            match text.trim().parse::<f64>() {
-                Ok(v) if v.is_finite() => {
+            match display_text_value(&text) {
+                Some(v) if v.is_finite() => {
                     let sign = if v < 0.0 { "-" } else { "" };
                     format!("{}{:.decimals$}", sign, v.abs(), decimals = decimals)
                 }
-                Ok(_) => text,
-                Err(_) => text,
+                _ => text,
             }
         }
-        Some(NumberFormat::Rational) | Some(NumberFormat::DecimalGeneric) | None => text,
+        Some(NumberFormat::Rational) | None => text,
     }
 }
 
@@ -1419,7 +1586,9 @@ Basics\n\
 - Enter or e starts editing the current cell.\n\
 - Header/footer/margin cells use the active address syntax.\n\
 - Any printable key starts editing with that character.\n\
-- = followed by arrows builds a formula reference.\n\n\
+- = followed by arrows builds a formula reference.\n\
+- Cells holding a hyperlink (http/https/ftp/mailto/file URLs, or www. hosts) render blue and underlined.\n\
+- Ctrl+O or Edit ▸ Follow link opens the cursor cell's hyperlink in the default browser.\n\n\
 Selection and movement\n\
 - v toggles a cell selection.\n\
 - Shift+Arrow grows the selection one cell at a time.\n\
@@ -1438,6 +1607,7 @@ Menus\n\
 - Left goes back one menu level.\n\
  - Enter or the shortcut letter opens the selected item.\n\n\
 File menu\n\
+ - New starts a blank workbook (template or seeded blank), detached from any file.\n\
  - Open file loads a .corro, .csv, .tsv, or .ods file. Use `link <file> <revision>` to open a log at a revision.\n\
  - New sheet adds another sheet to the workbook.\n\
  - Ctrl+PageUp and Ctrl+PageDown switch between workbook tabs.\n\
@@ -1465,3 +1635,134 @@ Quit\n\
         );
         body
     }
+
+/// Process-global lock for tests that override `CORRO_URL_OPENER`.
+/// `std::env::set_var` is process-global, so every test that touches the
+/// opener — here and in `crate::ui`'s tests — must hold this shared lock.
+#[cfg(test)]
+pub(crate) static URL_OPENER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hyperlink_target_accepts_known_schemes() {
+        assert_eq!(
+            hyperlink_target("https://example.com"),
+            Some("https://example.com".to_string())
+        );
+        assert_eq!(
+            hyperlink_target("  http://example.com/path?q=1  "),
+            Some("http://example.com/path?q=1".to_string())
+        );
+        assert_eq!(
+            hyperlink_target("HTTPS://EXAMPLE.COM"),
+            Some("HTTPS://EXAMPLE.COM".to_string())
+        );
+        assert_eq!(
+            hyperlink_target("ftp://files.example.com/x"),
+            Some("ftp://files.example.com/x".to_string())
+        );
+        assert_eq!(
+            hyperlink_target("mailto:a@b.com"),
+            Some("mailto:a@b.com".to_string())
+        );
+        assert_eq!(
+            hyperlink_target("file:///tmp/x.corro"),
+            Some("file:///tmp/x.corro".to_string())
+        );
+    }
+
+    #[test]
+    fn hyperlink_target_prefixes_bare_www_hosts() {
+        assert_eq!(
+            hyperlink_target("www.example.com"),
+            Some("https://www.example.com".to_string())
+        );
+        assert_eq!(
+            hyperlink_target("WWW.EXAMPLE.COM/a"),
+            Some("https://WWW.EXAMPLE.COM/a".to_string())
+        );
+    }
+
+    #[test]
+    fn hyperlink_target_rejects_non_links() {
+        for text in [
+            "",
+            "   ",
+            "plain text",
+            "see https://example.com for details",
+            "https://",
+            "www.",
+            "www",
+            "httpx://example.com",
+            "javascript:alert(1)",
+            "=HYPERLINK(\"x\")",
+            "123",
+        ] {
+            assert_eq!(hyperlink_target(text), None, "must not link {text:?}");
+        }
+        // Non-ASCII lookalikes never match (homoglyph safety).
+        assert_eq!(hyperlink_target("https://exаmple.com"), None);
+    }
+
+    #[test]
+    fn follow_link_status_texts() {
+        let _guard = URL_OPENER_LOCK.lock().unwrap();
+        // Point the opener at `true` so the spawn succeeds without opening
+        // anything; the status text is what this pins.
+        std::env::set_var("CORRO_URL_OPENER", "true");
+        assert_eq!(
+            follow_link_status("https://example.com", "A1"),
+            "Opened https://example.com"
+        );
+        assert_eq!(
+            follow_link_status("www.example.com", "B2"),
+            "Opened https://www.example.com"
+        );
+        assert_eq!(
+            follow_link_status("not a link", "C3"),
+            "No hyperlink at C3"
+        );
+        assert_eq!(follow_link_status("", "A1"), "No hyperlink at A1");
+        std::env::remove_var("CORRO_URL_OPENER");
+    }
+
+    #[test]
+    fn follow_link_status_reports_spawn_failure() {
+        let _guard = URL_OPENER_LOCK.lock().unwrap();
+        // A nonexistent launcher must surface as an honest error, never a
+        // silent no-op or a panic.
+        std::env::set_var("CORRO_URL_OPENER", "/nonexistent-corro-opener-xyz");
+        let status = follow_link_status("https://example.com", "A1");
+        assert!(
+            status.starts_with("Could not open https://example.com: "),
+            "unexpected status {status:?}"
+        );
+        std::env::remove_var("CORRO_URL_OPENER");
+    }
+
+    #[test]
+    fn opener_command_placeholder_substitution() {
+        let _guard = URL_OPENER_LOCK.lock().unwrap();
+        std::env::set_var("CORRO_URL_OPENER", "rec --url {} --done");
+        assert_eq!(
+            opener_command("https://example.com"),
+            (
+                "rec".to_string(),
+                vec![
+                    "--url".to_string(),
+                    "https://example.com".to_string(),
+                    "--done".to_string()
+                ]
+            )
+        );
+        std::env::set_var("CORRO_URL_OPENER", "rec");
+        assert_eq!(
+            opener_command("https://example.com"),
+            ("rec".to_string(), vec!["https://example.com".to_string()])
+        );
+        std::env::remove_var("CORRO_URL_OPENER");
+    }
+}

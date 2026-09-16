@@ -35,15 +35,11 @@ mod platform {
     platform_module!(crate::backends_gtk_adapter, GtkOrientation);
 }
 
-#[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+#[cfg(all(windows, not(feature = "zork")))]
 mod platform {
     platform_module!(crate::backends_nwg_adapter, NwgOrientation);
 }
 
-#[cfg(all(windows, feature = "pancurses", not(feature = "zork")))]
-mod platform {
-    platform_module!(crate::backends_pancurses_adapter, PancursesOrientation);
-}
 
 #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
 mod platform {
@@ -269,7 +265,7 @@ mod common_types {
     }
 }
 
-#[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+#[cfg(all(windows, not(feature = "zork")))]
 mod common_types {
     common_types_mod!();
     impl Canvas {
@@ -292,8 +288,6 @@ mod common_types {
 #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
 mod common_types { common_types_mod!(); }
 
-#[cfg(all(windows, feature = "pancurses", not(feature = "zork")))]
-mod common_types { common_types_mod!(); }
 
 #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
 mod common_types {
@@ -335,11 +329,9 @@ pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleActi
 #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs")))]
 pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, ScrolledWindow};
 
-#[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+#[cfg(all(windows, not(feature = "zork")))]
 pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, ScrolledWindow};
 
-#[cfg(all(windows, feature = "pancurses", not(feature = "zork")))]
-pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, ScrolledWindow};
 
 #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
 pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, ScrolledWindow};
@@ -358,11 +350,9 @@ pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleActi
 pub use self::platform::GtkOrientation as Orientation;
 #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs")))]
 pub use self::platform::GtkOrientation as Orientation;
-#[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+#[cfg(all(windows, not(feature = "zork")))]
 pub use self::platform::NwgOrientation as Orientation;
 
-#[cfg(all(windows, feature = "pancurses", not(feature = "zork")))]
-pub use self::platform::PancursesOrientation as Orientation;
 #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
 pub use self::platform::PancursesOrientation as Orientation;
 #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]

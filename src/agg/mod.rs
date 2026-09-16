@@ -168,12 +168,28 @@ pub fn compute_aggregate(grid: &Grid, def: &AggregateDef) -> String {
                 format_aggregate_number(&s)
             }
         }
-        AggFunc::Median => median_aggregate(collect_numbers_summable(grid, &def.source))
-            .map(|m| format_aggregate_number(&m))
-            .unwrap_or_default(),
+        AggFunc::Median => {
+            let xs = collect_numbers_summable(grid, &def.source);
+            // Complex has no ordering: a non-real sample makes the result
+            // undefined (#NUM!) rather than an order-dependent pick.
+            if xs.iter().any(Number::is_nonreal) {
+                "#NUM!".to_string()
+            } else {
+                median_aggregate(xs)
+                    .map(|m| format_aggregate_number(&m))
+                    .unwrap_or_default()
+            }
+        }
         AggFunc::Min => {
             let mut best: Option<Number> = None;
+            // Complex has no ordering: a non-real sample makes the result
+            // undefined (#NUM!) rather than an order-dependent pick.
+            let mut undefined = false;
             fold_numbers_summable(grid, &def.source, &mut (), |_, n| {
+                if n.is_nonreal() {
+                    undefined = true;
+                    return;
+                }
                 best = Some(match best.take() {
                     None => n,
                     // `Iterator::min_by` keeps the *last* equally-minimum
@@ -187,11 +203,22 @@ pub fn compute_aggregate(grid: &Grid, def: &AggregateDef) -> String {
                     }
                 });
             });
-            best.map(|n| format_aggregate_number(&n)).unwrap_or_default()
+            if undefined {
+                "#NUM!".to_string()
+            } else {
+                best.map(|n| format_aggregate_number(&n)).unwrap_or_default()
+            }
         }
         AggFunc::Max => {
             let mut best: Option<Number> = None;
+            // Complex has no ordering: a non-real sample makes the result
+            // undefined (#NUM!) rather than an order-dependent pick.
+            let mut undefined = false;
             fold_numbers_summable(grid, &def.source, &mut (), |_, n| {
+                if n.is_nonreal() {
+                    undefined = true;
+                    return;
+                }
                 best = Some(match best.take() {
                     None => n,
                     // `Iterator::max_by` keeps the *last* equally-maximum
@@ -205,7 +232,11 @@ pub fn compute_aggregate(grid: &Grid, def: &AggregateDef) -> String {
                     }
                 });
             });
-            best.map(|n| format_aggregate_number(&n)).unwrap_or_default()
+            if undefined {
+                "#NUM!".to_string()
+            } else {
+                best.map(|n| format_aggregate_number(&n)).unwrap_or_default()
+            }
         }
     }
 }
@@ -290,6 +321,35 @@ mod tests {
             };
             assert_eq!(compute_aggregate(&gb, &def), expect, "{func:?}");
         }
+    }
+
+    #[test]
+    fn ordering_aggregates_over_complex_cells_are_undefined() {
+        // Row aggregates share the formula rule: no ordering for non-real
+        // complex, so MIN/MAX/MEDIAN are #NUM!, not a pick over the reals.
+        // SUM/MEAN over the same cells stay complex-valued.
+        let mut g = Grid::new(2, 1);
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "3+4i".into());
+        g.set(&CellAddr::Main { row: 1, col: 0 }, "5".into());
+        let gb = GridBox::from(g);
+        let source = MainRange {
+            row_start: 0,
+            row_end: 2,
+            col_start: 0,
+            col_end: 1,
+        };
+        for func in [AggFunc::Min, AggFunc::Max, AggFunc::Median] {
+            let def = AggregateDef {
+                func,
+                source: source.clone(),
+            };
+            assert_eq!(compute_aggregate(&gb, &def), "#NUM!", "{func:?}");
+        }
+        let def = AggregateDef {
+            func: AggFunc::Sum,
+            source: source.clone(),
+        };
+        assert_eq!(compute_aggregate(&gb, &def), "8+4i");
     }
 
     #[test]

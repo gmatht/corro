@@ -49,6 +49,7 @@ impl<'a> CellSink for SpreadsheetModelSink<'a> {
             CellDisplayStyle::Selected => 4,
             CellDisplayStyle::ActiveHeader => 5,
             CellDisplayStyle::InactiveHeader => 6,
+            CellDisplayStyle::Hyperlink => 7,
         };
         self.m.set_cell_style(dr, dc, s);
     }

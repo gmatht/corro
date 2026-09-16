@@ -229,6 +229,9 @@ CHAR_MAP = {
     "-": ["minus"],
     "=": ["equal"],
     "/": ["slash"],
+    "?": ["shift", "slash"],
+    "%": ["shift", "5"],
+    "|": ["shift", "backslash"],
     ";": ["semicolon"],
     "'": ["apostrophe"],
     '"': ["shift", "2"],  # UK layout: double-quote is shift+2
@@ -244,7 +247,7 @@ def type_text(q, text, delay=0.2):
         keys = CHAR_MAP.get(ch)
         if keys is None:
             if ch.isupper():
-                keys = ["shift", "shift-" + ch.lower()]
+                keys = ["shift", ch.lower()]
             else:
                 keys = [ch]
         q.cmd("send-key", {"keys": [{"type": "qcode", "data": k} for k in keys]})

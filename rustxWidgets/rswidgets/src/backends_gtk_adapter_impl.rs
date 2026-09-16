@@ -674,6 +674,15 @@ mod gtk_adapter {
         crate::backends::gtk::timeout_add_once(ms, f).map_err(|e| Error::Backend(format!("{}", e)))
     }
 
+    /// Run `f` every `ms` milliseconds until it returns `false`
+    /// (see backends::gtk::timeout_add_repeating). Used by apps that need a
+    /// periodic tick (e.g. polling an append-only log for another window's
+    /// revisions); the GTK main context keeps calling it with no input.
+    pub fn timeout_add_repeating(ms: u32, f: Box<dyn FnMut() -> bool>) -> Result<(), Error> {
+        crate::backends::gtk::timeout_add_repeating(ms, f)
+            .map_err(|e| Error::Backend(format!("{}", e)))
+    }
+
 
     // ---- Canvas (cross-platform drawing surface) ----
 

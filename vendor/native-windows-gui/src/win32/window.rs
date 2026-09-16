@@ -1194,7 +1194,7 @@ static mut SUBCLASS_FRAME95: Option<(usize, usize)> = None;
 #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
 // TEMPORARY Win95 diagnosis: raw file marker (std::fs is broken on 9x).
 #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
-unsafe fn mark95w(s: &[u8]) {
+pub(crate) unsafe fn mark95w(s: &[u8]) {
     use winapi::um::fileapi::{CreateFileA, SetFilePointer, WriteFile, OPEN_ALWAYS};
     use winapi::um::handleapi::CloseHandle;
     use winapi::um::winnt::{GENERIC_WRITE, FILE_SHARE_READ, FILE_ATTRIBUTE_NORMAL, HANDLE};
@@ -1221,6 +1221,12 @@ static mut SUBCLASS_N95: u32 = 0;
 // TEMPORARY Win95 diagnosis: message-id log counter.
 #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
 static mut SUBCLASS_M95: u32 = 0;
+// TEMPORARY ReactOS diagnosis: proc entry/exit log counter.
+#[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+static mut SUBCLASS_X95: u32 = 0;
+// TEMPORARY ReactOS diagnosis: WM_GETFONT storm counter.
+#[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+static mut SUBCLASS_S95: u32 = 0;
 
 #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
 unsafe extern "system" fn subclass_trampoline95(hwnd: HWND, msg: UINT, w: WPARAM, l: LPARAM) -> LRESULT {
@@ -1257,8 +1263,34 @@ unsafe extern "system" fn subclass_trampoline95(hwnd: HWND, msg: UINT, w: WPARAM
         Some((proc, uid, data, idx)) => {
             SUBCLASS_FRAME95 = Some((key, idx));
             if diag { mark95w(b"t3\n"); SUBCLASS_N95 += 1; }
+            // TEMPORARY ReactOS diagnosis: entry/exit with msg id (cap 64).
+            // WM_GETFONT (0x31) storms are counted silently as `sc <n>` so
+            // the cap is spent on interesting dispatches only.
+            let storm = msg == 0x31;
+            if storm { SUBCLASS_S95 += 1; }
+            if !storm && SUBCLASS_S95 > 0 {
+                let hx = b"0123456789abcdef";
+                let mut mb = [0u8; 12];
+                mb[0] = b's'; mb[1] = b'c'; mb[2] = b' ';
+                let n = SUBCLASS_S95;
+                for i in 0..8 { mb[3 + i] = hx[((n >> ((7 - i) * 4)) & 0xf) as usize]; }
+                mb[11] = b'\n';
+                mark95w(&mb);
+                SUBCLASS_S95 = 0;
+            }
+            let pe = !storm && SUBCLASS_X95 < 64;
+            if pe {
+                SUBCLASS_X95 += 1;
+                let hx = b"0123456789abcdef";
+                let mut mb = [0u8; 12];
+                mb[0] = b't'; mb[1] = b'p'; mb[2] = b' ';
+                for i in 0..8 { mb[3 + i] = hx[((msg >> ((7 - i) * 4)) & 0xf) as usize]; }
+                mb[11] = b'\n';
+                mark95w(&mb);
+            }
             let r = match proc { Some(p) => p(hwnd, msg, w, l, uid, data), None => 0 };
             if diag { mark95w(b"t4\n"); }
+            if pe { mark95w(b"tx\n"); }
             SUBCLASS_FRAME95 = None;
             r
         }
@@ -1303,6 +1335,12 @@ unsafe fn SetWindowSubclass(hwnd: HWND, proc: SUBCLASSPROC, uid: UINT_PTR, data:
         let olds = SUBCLASS_OLDPROC95.as_ref().unwrap();
         olds.lock().unwrap().insert(key, mem::transmute::<i32, WNDPROC>(old));
     }
+    // TEMPORARY ReactOS diagnosis: re-arm the message log on every install
+    // so the traffic right after a new subclass (e.g. an EDIT control's
+    // post-build SetWindowPos) is captured with ids.
+    SUBCLASS_N95 = 0;
+    SUBCLASS_M95 = 0;
+    mark95w(b"setsub\n");
     1
 }
 

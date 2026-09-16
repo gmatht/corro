@@ -424,9 +424,16 @@ impl<D: Display+Default> ComboBox<D> {
 
         unsafe {
 
+        // (Fix-ReactOS) Break the WM_SIZE -> SetWindowPos(FRAMECHANGED) ->
+        // WM_NCCALCSIZE -> WM_SIZE loop (see text_input.rs): only re-assert
+        // the frame when the size actually changed.
+        let last_size = std::cell::Cell::new((-1i32, -1i32));
         let handler0 = bind_raw_event_handler_inner(&self.handle, 0, move |hwnd, msg, w, l| {
             match msg {
                 WM_NCCALCSIZE  => {
+                    // TEMPORARY ReactOS diagnosis: victim id.
+                    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+                    crate::win32::window::mark95w(b"nc\n");
                     if w == 0 { return None }
 
                     // (Patch-Win95) GetTextMetricsA instead of the Win95-stubbed
@@ -499,7 +506,12 @@ impl<D: Display+Default> ComboBox<D> {
                     ReleaseDC(hwnd, dc);
                 },
                 WM_SIZE => {
-                    SetWindowPos(hwnd, ptr::null_mut(), 0, 0, 0, 0, SWP_NOOWNERZORDER | SWP_NOSIZE | SWP_NOMOVE | SWP_FRAMECHANGED);
+                    let size = l as u32;
+                    let now = ((size & 0xffff) as i32, ((size >> 16) & 0xffff) as i32);
+                    if last_size.get() != now {
+                        last_size.set(now);
+                        SetWindowPos(hwnd, ptr::null_mut(), 0, 0, 0, 0, SWP_NOOWNERZORDER | SWP_NOSIZE | SWP_NOMOVE | SWP_FRAMECHANGED);
+                    }
                 },
                 _ => {}
             }

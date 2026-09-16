@@ -431,6 +431,8 @@ pub(crate) enum MenuAction {
     Cut,
     Copy,
     Paste,
+    /// Whole main region as one cell selection (Edit ▸ Select all).
+    SelectAll,
     FollowHyperlink,
     Extrapolate,
     Find,
@@ -499,7 +501,7 @@ struct MenuItem {
     target: MenuTarget,
 }
 
-const EDIT_MENU_ITEMS: [MenuItem; 10] = [
+const EDIT_MENU_ITEMS: [MenuItem; 11] = [
     MenuItem {
         shortcut: 'X',
         label: "Cut",
@@ -514,6 +516,11 @@ const EDIT_MENU_ITEMS: [MenuItem; 10] = [
         shortcut: 'P',
         label: "Paste",
         target: MenuTarget::Action(MenuAction::Paste),
+    },
+    MenuItem {
+        shortcut: 'A',
+        label: "Select all",
+        target: MenuTarget::Action(MenuAction::SelectAll),
     },
     MenuItem {
         shortcut: 'F',
@@ -884,6 +891,16 @@ pub fn all_menu_shortcuts() -> Vec<(char, &'static str)> {
     .flat_map(|s| menu_items(*s))
     .map(|it| (it.shortcut, it.label))
     .collect()
+}
+
+/// Index of an action within a menu section. Test-only: lets tests activate a
+/// menu item without pinning a position that shifts when items are inserted.
+#[cfg(test)]
+fn menu_item_index(section: MenuSection, want: MenuAction) -> usize {
+    menu_items(section)
+        .iter()
+        .position(|it| it.target == MenuTarget::Action(want.clone()))
+        .unwrap_or_else(|| panic!("{want:?} not present in {section:?}"))
 }
 
 fn menu_items(section: MenuSection) -> &'static [MenuItem] {
@@ -1588,6 +1605,27 @@ impl App {
             },
             MenuAction::NewSheet => {
                 self.add_sheet(format!("Sheet{}", self.workbook.next_sheet_id));
+                Mode::Normal
+            }
+            MenuAction::SelectAll => {
+                // Whole main region as a cell selection: anchor at A1 and the
+                // cursor on the last main cell, exactly like the shared
+                // `select_all` dispatch the GUI/pancurses menu uses. Header
+                // chrome then highlights every covered row/column label.
+                let mr = self.state.grid.main_rows();
+                let mc = self.state.grid.main_cols();
+                if mr > 0 && mc > 0 {
+                    self.anchor = Some(SheetCursor {
+                        row: HEADER_ROWS,
+                        col: MARGIN_COLS,
+                    });
+                    self.cursor = SheetCursor {
+                        row: HEADER_ROWS + mr - 1,
+                        col: MARGIN_COLS + mc - 1,
+                    };
+                    self.selection_kind = SelectionKind::Cells;
+                    self.status = "Selected all".into();
+                }
                 Mode::Normal
             }
             MenuAction::HelpRows => {
@@ -12104,22 +12142,21 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                     match Self::handle_text_input_key(buffer, &mut self.edit_cursor, key.code) {
                         TextInputAction::Handled => {}
                         TextInputAction::EdgeLeft => {
-                            // Discard in-progress edit (same as Esc) but keep the edit target
-                            // aligned with the newly highlighted cell so subsequent operations
-                            // (or restores) target the cell the user navigated to.
-                            self.remember_lost_edit(buffer);
+                            // Commit the in-progress edit to its original cell, then move
+                            // the cell cursor left (mirrors EdgeRight/Up/Down: arrows commit).
+                            // Previously this discarded the buffer via remember_lost_edit, so
+                            // `1 <- <-` on a new sheet lost the `1` instead of leaving it in A1.
+                            let raw = buffer.clone();
                             self.edit_cursor = None;
                             self.edit_special_palette = false;
                             *formula_cursor = None;
                             *formula_ref_char_start = None;
-                            // Move the visible cursor left and snap the edit target to that cell.
+                            self.commit_edit_buffer(&raw)?;
                             self.cursor.col = self.cursor.col.saturating_sub(1);
                             self.cursor.clamp(&self.state.grid);
                             self.state
                                 .grid
                                 .ensure_extent_for_cursor(self.cursor.row, self.cursor.col);
-                            self.edit_target_addr = Some(self.cursor.to_addr(&self.state.grid));
-                            self.edit_range_addrs = None;
                             mode = Mode::Normal;
                         }
                         TextInputAction::EdgeRight => {
@@ -13628,6 +13665,50 @@ mod drive_feature_tests {
         app.cursor = a1();
         app
     }
+    /// Edit ▸ Select all: whole main region as a cell selection, so header
+    /// chrome highlights every covered label (the point of the item).
+    #[test]
+    fn select_all_selects_the_whole_main_region() {
+        let mut app = fresh_2x3();
+        // Alt+E opens Edit; 'A' is Select all (mnemonic for Select All).
+        menu(&mut app, 'e', 'a');
+        assert!(
+            matches!(app.mode, Mode::Normal),
+            "Select all leaves Normal mode, got {:?}",
+            app.mode
+        );
+        assert_eq!(
+            app.anchor,
+            Some(a1()),
+            "anchor must be A1 (top-left of the main region)"
+        );
+        assert_eq!(
+            app.cursor,
+            SheetCursor {
+                row: HEADER_ROWS + 1,
+                col: MARGIN_COLS + 2
+            },
+            "cursor must land on the last main cell (C2 in a 2x3 sheet)"
+        );
+        assert_eq!(app.selection_kind, SelectionKind::Cells);
+        assert_eq!(app.status, "Selected all");
+
+        // Every main header is covered, so all of them glow.
+        let buf = draw_grid(&mut app);
+        for label in ["A", "B", "C"] {
+            assert!(
+                is_header_highlighted(header_style(&buf, label)),
+                "column {label} header must glow after Select all"
+            );
+        }
+        for label in ["1", "2"] {
+            assert!(
+                is_header_highlighted(rowlabel_style(&buf, label)),
+                "row {label} label must glow after Select all"
+            );
+        }
+    }
+
     #[test]
     fn selected_headers_highlight_cells_range() {
         let mut app = fresh_2x3();
@@ -16880,6 +16961,66 @@ mod tests {
         assert!(app.pending_lost_edit.is_none());
     }
 
+    /// `1 <- <-` on a new sheet must leave `1` in A1 (commit, not discard).
+    /// Regression: EdgeLeft discarded the buffer via remember_lost_edit, so the
+    /// value vanished even though EdgeRight/Up/Down all commit.
+    #[test]
+    fn typed_1_left_left_leaves_1_in_a1_on_new_sheet() {
+        let mut app = App::new(None);
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        };
+        app.mode = Mode::Normal;
+        for code in [KeyCode::Char('1'), KeyCode::Left, KeyCode::Left] {
+            app.handle_key(KeyEvent::new(code, KeyModifiers::empty()))
+                .unwrap();
+        }
+        assert_eq!(
+            app.state
+                .grid
+                .get(&CellAddr::Main { row: 0, col: 0 })
+                .as_deref(),
+            Some("1"),
+            "typing 1 then Left,Left must commit 1 to A1"
+        );
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(app.pending_lost_edit.is_none());
+    }
+
+    /// Multi-char sibling: `12 <- <- <-` must leave `12` in A1.
+    /// (Two Lefts only walk the text caret; the third hits the left edge and
+    /// must commit, mirroring EdgeRight.)
+    #[test]
+    fn typed_12_left_left_left_leaves_12_in_a1_on_new_sheet() {
+        let mut app = App::new(None);
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        };
+        app.mode = Mode::Normal;
+        for code in [
+            KeyCode::Char('1'),
+            KeyCode::Char('2'),
+            KeyCode::Left,
+            KeyCode::Left,
+            KeyCode::Left,
+        ] {
+            app.handle_key(KeyEvent::new(code, KeyModifiers::empty()))
+                .unwrap();
+        }
+        assert_eq!(
+            app.state
+                .grid
+                .get(&CellAddr::Main { row: 0, col: 0 })
+                .as_deref(),
+            Some("12"),
+            "typing 12 then Left,Left,Left must commit 12 to A1"
+        );
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(app.pending_lost_edit.is_none());
+    }
+
     #[test]
     fn inserted_date_fits_rendered_literal() {
         let mut app = App::new(None);
@@ -19944,7 +20085,7 @@ mod tests {
         app.mode = Mode::Menu {
             stack: vec![MenuLevel {
                 section: MenuSection::Edit,
-                item: 3,
+                item: menu_item_index(MenuSection::Edit, MenuAction::Find),
             }],
         };
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
@@ -19979,7 +20120,7 @@ mod tests {
         app.mode = Mode::Menu {
             stack: vec![MenuLevel {
                 section: MenuSection::Edit,
-                item: 4,
+                item: menu_item_index(MenuSection::Edit, MenuAction::Replace),
             }],
         };
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
@@ -20498,6 +20639,10 @@ mod tests {
 
     #[test]
     fn edit_mode_left_from_column_b_syncs_edit_target_to_a() {
+        // EdgeLeft commits (like EdgeRight/Up/Down) instead of discarding: an
+        // empty buffer is a no-op commit to the ORIGINAL cell (B1), then the
+        // cursor moves left to A1. `edit_target_addr` stays at the committed
+        // cell, mirroring EdgeRight (which also leaves it at the old cell).
         let mut app = App::new(None);
         app.state.grid.set_main_size(1, 2);
         app.cursor = SheetCursor {
@@ -20519,8 +20664,38 @@ mod tests {
         assert_eq!(app.cursor.col, MARGIN_COLS);
         assert_eq!(
             app.edit_target_addr,
-            Some(CellAddr::Main { row: 0, col: 0 })
+            Some(CellAddr::Main { row: 0, col: 1 })
         );
+        assert!(app.pending_lost_edit.is_none());
+    }
+
+    #[test]
+    fn edit_mode_left_from_column_b_commits_to_b() {
+        // Non-empty sibling: typing in B1 then Left-at-edge must leave the value
+        // in B1 (not discard it, not move it to A1).
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(1, 2);
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS + 1,
+        };
+        app.mode = Mode::Edit {
+            buffer: "kept".into(),
+            formula_cursor: None,
+            formula_ref_char_start: None,
+        };
+        app.edit_target_addr = Some(CellAddr::Main { row: 0, col: 1 });
+        app.edit_cursor = Some(0);
+
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::empty()))
+            .unwrap();
+
+        assert_eq!(app.cursor.col, MARGIN_COLS);
+        assert_eq!(
+            app.state.grid.get(&CellAddr::Main { row: 0, col: 1 }).as_deref(),
+            Some("kept")
+        );
+        assert_eq!(app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }), None);
     }
 
     #[test]

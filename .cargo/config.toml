@@ -35,3 +35,14 @@ rustflags = [
   '-Clink-arg=/LIBPATH:/opt/msvc-toolchains/vc6/VC98Lib',
   '-Clink-arg=/LIBPATH:/opt/msvc-toolchains/stubs',
 ]
+
+# Store/x64 baseline: Windows 11 guarantees the x86-64-v2 ISA floor
+# (SSE4.2, POPCNT, CMPXCHG16B, LAHF/SAHF, PREFETCHW), so the 64-bit MSIX
+# build compiles for v2. Scoped to this triple ONLY: v3+ is not guaranteed
+# by the Win11 floor, and any global/leaked setting would silently nuke the
+# i586 Win95 builds and the ARM64 build. x86 (i686) and aarch64 keep their
+# defaults (legacy lifeboat / ARMv8.0 baseline).
+[target.x86_64-pc-windows-gnu]
+rustflags = [
+  '-Ctarget-cpu=x86-64-v2',
+]

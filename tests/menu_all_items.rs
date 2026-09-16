@@ -1099,6 +1099,105 @@ fn edit_workbook_external_opens_live_file_and_reloads() {
     );
 }
 
+/// From a native GUI backend (no terminal), Edit ▸ Workbook (External) must
+/// launch a GUI editor detached ($CORRO_GUI_EDITOR, else xdg-open on Linux)
+/// and report "Opened" — never block on the terminal $EDITOR (a `vi` wait
+/// with no terminal would hang the GUI). Uses a temp GUI-editor script; the
+/// `NoEditorGuard` is bypassed here on purpose (this test needs a *real*
+/// opener). The script's save is picked up afterwards by the log-tail poll,
+/// the same path as another window's Save landing mid-session.
+#[cfg(unix)]
+#[test]
+fn edit_workbook_external_from_gui_opens_gui_editor_detached() {
+    use std::os::unix::fs::PermissionsExt;
+    let _lock = EDITOR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("book.corro");
+    std::fs::write(&log, "CORRO_LOG 1\nSET A1 old\n").unwrap();
+
+    // Stand-in for gedit: appends a revision, like a user saving in a GUI
+    // editor (which happens after we return — hence the poll below).
+    let editor = dir.path().join("gedit.sh");
+    std::fs::write(
+        &editor,
+        "#!/bin/sh\nprintf 'CORRO_LOG 1\\nSET A1 old\\nSET B1 added\\n' > \"$1\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    // Even with a terminal EDITOR configured, the GUI path must ignore it.
+    let saved_visual = std::env::var("VISUAL").ok();
+    let saved_editor = std::env::var("EDITOR").ok();
+    let saved_gui_editor = std::env::var("CORRO_GUI_EDITOR").ok();
+    std::env::set_var("VISUAL", "vim");
+    std::env::set_var("EDITOR", "/nonexistent-terminal-editor-xyz");
+    std::env::set_var("CORRO_GUI_EDITOR", editor.to_string_lossy().as_ref());
+
+    let mut app = App::new_with_paths(vec![log.clone()]);
+    app.load_initial().unwrap();
+    app.set_backend(corro::gui::Backend::Gui);
+    let mut pending_scope = 0u8;
+    let mut clipboard = String::new();
+    let result = dispatch_menu_action(
+        &mut app,
+        "edit_workbook_external",
+        &mut pending_scope,
+        &mut clipboard,
+    );
+
+    match &saved_visual {
+        Some(v) => std::env::set_var("VISUAL", v),
+        None => std::env::remove_var("VISUAL"),
+    }
+    match &saved_editor {
+        Some(e) => std::env::set_var("EDITOR", e),
+        None => std::env::remove_var("EDITOR"),
+    }
+    match &saved_gui_editor {
+        Some(e) => std::env::set_var("CORRO_GUI_EDITOR", e),
+        None => std::env::remove_var("CORRO_GUI_EDITOR"),
+    }
+
+    match result {
+        MenuDispatch::Status(s) => {
+            assert!(
+                s.starts_with("Opened ") && s.contains("reload automatically"),
+                "GUI workbook edit should open detached, got {s:?}"
+            )
+        }
+        other => panic!("expected Status, got {}", dispatch_hint(&other)),
+    }
+    // The detached opener runs concurrently: wait (bounded) for its save,
+    // then the tail poll applies it — no manual reload involved.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let content = std::fs::read_to_string(&log).unwrap_or_default();
+        if content.contains("SET B1 added") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "GUI editor script never wrote the log"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        app.core.poll_log_tail().unwrap(),
+        "tail poll should pick up the GUI editor's save"
+    );
+    assert_eq!(
+        app.core
+            .workbook
+            .active_sheet()
+            .grid
+            .get(&corro::grid::CellAddr::main(0, 1))
+            .unwrap_or_default(),
+        "added",
+        "the GUI-editor-added B1 revision must be applied after the tail poll"
+    );
+}
+
 /// With no file bound yet, Edit ▸ Workbook (External) must report that the
 /// workbook has to be saved first instead of spawning an editor on nothing.
 #[test]

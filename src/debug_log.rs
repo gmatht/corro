@@ -2,11 +2,28 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
 
-fn debug_log_path() -> Option<PathBuf> {
-    std::env::var("CORRO_DEBUG_LOG").ok().map(PathBuf::from).or_else(|| {
-        std::env::var("XDG_STATE_HOME").ok().map(|xdg| PathBuf::from(format!("{}/corro/debug.log", xdg)))
-    })
-    .or_else(|| std::env::var("HOME").ok().map(|h| PathBuf::from(format!("{}/.corro/debug.log", h))))
+/// Where debug traces go, or None when no location can be determined.
+/// Checked in order: `CORRO_DEBUG_LOG`, `XDG_STATE_HOME`, `HOME` (Unix),
+/// then `LOCALAPPDATA` (Windows; mirrors the unsaved-file directory).
+/// Shared with `try_main`, which redirects the process's stderr here so
+/// debug `eprintln!` traces never corrupt the TUI.
+pub fn debug_log_path() -> Option<PathBuf> {
+    fn nonempty(v: Option<String>) -> Option<String> {
+        v.filter(|s| !s.trim().is_empty())
+    }
+    if let Some(p) = nonempty(std::env::var("CORRO_DEBUG_LOG").ok()) {
+        return Some(PathBuf::from(p));
+    }
+    if let Some(xdg) = nonempty(std::env::var("XDG_STATE_HOME").ok()) {
+        return Some(PathBuf::from(xdg).join("corro").join("debug.log"));
+    }
+    if let Some(home) = nonempty(std::env::var("HOME").ok()) {
+        return Some(PathBuf::from(home).join(".corro").join("debug.log"));
+    }
+    if let Some(local) = nonempty(std::env::var("LOCALAPPDATA").ok()) {
+        return Some(PathBuf::from(local).join("corro").join("debug.log"));
+    }
+    None
 }
 
 /// Write a debug line to the configured debug log (best-effort).

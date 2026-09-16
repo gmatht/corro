@@ -2883,6 +2883,17 @@ fn format_number(n: &Number) -> String {
     n.format_eval_display(format_significant_10)
 }
 
+/// Generic decimal display for a computed value: ~10 significant digits, and
+/// scientific notation for extreme magnitudes -- exactly the shape an
+/// approximate [`Number`] prints as.
+///
+/// Exposed so `NumberFormat::DecimalGeneric` (and Fixed/Currency applied to a
+/// formula result) render a formula's value the same way the evaluator would,
+/// instead of leaving the exact rational form (`1/3`) in place.
+pub fn format_decimal_generic(value: f64) -> String {
+    format_significant_10(value)
+}
+
 fn eval_result_to_string(result: &EvalResult) -> String {
     match result {
         EvalResult::Number(n) => {
@@ -4363,6 +4374,33 @@ mod tests {
             eval_cell(&g, &CellAddr::Main { row: 1, col: 1 }, &mut v, &mut b),
             EvalResult::Number(n) if (nf(&n) - 1.0).abs() < 1e-9
         ));
+    }
+
+    #[test]
+    fn max_min_over_nonreal_complex_is_undefined() {
+        // Complex has no ordering: a non-real sample makes MAX/MIN undefined
+        // (#NUM!), not an order-dependent pick. Both argument orders and the
+        // range form must agree.
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(3, 3));
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "3+4i".into());
+        g.set(&CellAddr::Main { row: 1, col: 0 }, "5".into());
+        g.set(&CellAddr::Main { row: 0, col: 1 }, "=MAX(A1:A2)".into());
+        g.set(&CellAddr::Main { row: 1, col: 1 }, "=MAX(A2,A1)".into());
+        g.set(&CellAddr::Main { row: 2, col: 1 }, "=MIN(A1:A2)".into());
+        let mut v = Vec::new();
+        let mut b = DEFAULT_BUDGET;
+        for (row, label) in [(0u32, "MAX range"), (1, "MAX scalar"), (2, "MIN range")] {
+            match eval_cell(&g, &CellAddr::Main { row, col: 1 }, &mut v, &mut b) {
+                EvalResult::Number(n) => assert!(n.is_nan(), "{label} should be NaN, got {n:?}"),
+                e => panic!("{label}: expected NaN number, got {e:?}"),
+            }
+            v.clear();
+            b = DEFAULT_BUDGET;
+        }
+        assert_eq!(
+            cell_effective_display(&g, &CellAddr::Main { row: 0, col: 1 }),
+            "#NUM!"
+        );
     }
 
     #[test]

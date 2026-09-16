@@ -22,6 +22,7 @@ pub mod ui_core;
 // the #[no_mangle] items before the linker gets a chance to pull them in.
 #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
 pub mod float_shim;
+pub mod editor;
 pub use ui_core::format_cell_display;
 
 #[cfg(feature = "ratatui")]

@@ -208,8 +208,11 @@ impl App {
             .path
             .clone()
             .ok_or_else(|| -> Box<dyn std::error::Error> { "no file path set".into() })?;
-        let snapshot = crate::ops::WorkbookSnapshot::from_workbook(&self.core.workbook);
-        crate::io::save_workbook(&p, &snapshot)?;
+        crate::io::write_workbook_log(
+            &p,
+            &self.core.workbook,
+            &self.core.persisted_view_sort_cols,
+        )?;
         self.core.status = "Saved".into();
         Ok(())
     }

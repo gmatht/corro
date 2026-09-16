@@ -6,7 +6,7 @@ use rswidgets::backends_pancurses_adapter::*;
 
 use unicode_width::UnicodeWidthStr;
 
-use super::actions::{commit_cell, dispatch_menu_action, main_addr_label, menu_action_needs_prompt, run_prompt_action, MenuDispatch};
+use super::actions::{commit_cell, dispatch_menu_action, main_addr_label, menu_action_needs_prompt, menu_action_needs_terminal_suspend, run_prompt_action, MenuDispatch};
 use super::extrapolate;
 use super::viewport::Viewport;
 use super::compute;
@@ -99,6 +99,30 @@ fn app_from_raw<'a>(app_ptr: *mut super::App) -> &'a mut super::App {
 /// kept showing the stale values until the next key press (e.g. Insert Date
 /// only appeared after arrowing away).  Every mutation entry point calls this
 /// so the grid reflects the change immediately.
+/// Push the app's selection anchor into the widget so the renderer can
+/// highlight covered headers.
+///
+/// The widget's own anchor is only set by Shift+arrow input, which the input
+/// parser cannot deliver (ncurses maps `ESC[1;2{A-D}` onto the plain arrows as
+/// a terminfo workaround), so app-level selections — Select All, the row/column
+/// selection actions — were invisible to the renderer and their headers never
+/// highlighted. Conversion mirrors the widget→app sync: app logical row →
+/// widget display row.
+fn push_anchor_to_widget(
+    app: &super::App,
+    sid: usize,
+    display_rows: &std::rc::Rc<std::cell::RefCell<Vec<usize>>>,
+) {
+    let widget_anchor = app.core.anchor.and_then(|a| {
+        display_rows
+            .borrow()
+            .iter()
+            .position(|&r| r == a.row)
+            .map(|di| (di as u32, a.col as u32))
+    });
+    rswidgets::backends::pancurses::spreadsheet_set_anchor(sid, widget_anchor);
+}
+
 fn refresh_viewport_after_action(
     app: &mut super::App,
     ss: &Spreadsheet,
@@ -117,6 +141,9 @@ fn refresh_viewport_after_action(
     spreadsheet_set_column_layout(sid, vp.column_layout.clone());
     *display_rows.borrow_mut() = vp.display_rows.clone();
     spreadsheet_set_grid_config(sid, MARGIN_COLS as u32, vp.mc as u32);
+    // Selection chrome: covered headers highlight, so the widget needs the
+    // app's anchor (app->widget; see push_anchor_to_widget).
+    push_anchor_to_widget(app, sid, display_rows);
     // Sync the tab bar (New/Copy/Rename/Move sheet change the workbook's sheet
     // list; without this the tab bar stays stale after a menu action).
     if app.core.workbook.sheet_count() > 1 {
@@ -246,11 +273,13 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     rswidgets::backends::pancurses::set_alt_key_callback(Box::new(|ch: char| {
         match ch.to_ascii_lowercase() {
             'r' => { rswidgets::backends::pancurses::open_menu(3, vec![], 0); true } // Format menu
-            'o' => { rswidgets::backends::pancurses::open_menu(0, vec![], 0); true } // File -> Open file
-            't' => { rswidgets::backends::pancurses::open_menu(0, vec![2], 0); true } // File -> Export
-            'w' => { rswidgets::backends::pancurses::open_menu(0, vec![3], 0); true } // File -> Width
-            'a' => { rswidgets::backends::pancurses::open_menu(0, vec![2], 2); true } // File -> Export -> ASCII table
-            'x' => { rswidgets::backends::pancurses::open_menu(0, vec![3], 1); true } // File -> Width -> Column width
+            // File child indices account for New at the top (Open=1,
+            // Export=3, Width=4); Alt+O stays File→Open.
+            'o' => { rswidgets::backends::pancurses::open_menu(0, vec![], 1); true } // File -> Open file
+            't' => { rswidgets::backends::pancurses::open_menu(0, vec![3], 0); true } // File -> Export
+            'w' => { rswidgets::backends::pancurses::open_menu(0, vec![4], 0); true } // File -> Width
+            'a' => { rswidgets::backends::pancurses::open_menu(0, vec![3], 2); true } // File -> Export -> ASCII table
+            'x' => { rswidgets::backends::pancurses::open_menu(0, vec![4], 1); true } // File -> Width -> Column width
             _ => false, // let the backend fall back to the root-menu prefix match
         }
     }));
@@ -530,12 +559,21 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
             );
             return;
         }
+        // External editor spawns a child on the real terminal: suspend
+        // curses around dispatch (see actions::menu_action_needs_terminal_suspend).
+        let suspend = menu_action_needs_terminal_suspend(&name);
+        if suspend {
+            rswidgets::backends::pancurses::suspend_terminal();
+        }
         let result = dispatch_menu_action(
             app,
             &name,
             &mut *pending_scope.borrow_mut(),
             &mut *clipboard.borrow_mut(),
         );
+        if suspend {
+            rswidgets::backends::pancurses::resume_terminal();
+        }
         let mut apply_status = |s: &str| {
             if !s.is_empty() {
                 app.core.status = s.to_string();
@@ -689,6 +727,24 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         } else {
             app.core.status = format!("Nothing to copy at {}", main_addr_label(main_row, main_col));
         }
+    }));
+
+    // Ctrl+O follows the hyperlink under the cursor (same shared logic and
+    // status texts as ratatui's Ctrl+O and Edit ▸ Follow link on every
+    // backend). Skipped while editing — ratatui only follows from Normal
+    // mode — but the key is consumed either way so 0x0F never lands in the
+    // edit buffer as a literal control character.
+    let follow_ss = spreadsheet.clone();
+    rswidgets::backends::pancurses::add_key_callback('\x0f', Box::new(move || {
+        let app = app_from_raw(app_ptr);
+        let (editing, _, _) = follow_ss.edit_state();
+        if editing {
+            return;
+        }
+        let grid = &app.core.workbook.active_sheet().grid;
+        let status = crate::ui_core::follow_hyperlink(grid, app.core.cursor);
+        app.core.status = status.clone();
+        follow_ss.set_formula_bar_trailing(&format!("   ·  {status}"));
     }));
 
     // Prompt callback: perform the real file operation for path/name actions

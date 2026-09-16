@@ -378,9 +378,23 @@ impl TextInput {
 
         unsafe {
 
+        // (Fix-ReactOS) Break the WM_SIZE -> SetWindowPos(FRAMECHANGED) ->
+        // WM_NCCALCSIZE -> WM_SIZE loop: ReactOS re-fires WM_SIZE for an
+        // unchanged client rect, recursing until the stack overflows.
+        // Only re-assert the frame when the size actually changed.
+        let last_size = std::cell::Cell::new((-1i32, -1i32));
         let handler = bind_raw_event_handler_inner(&self.handle, 0, move |hwnd, msg, w, l| {
             match msg {
                 WM_NCCALCSIZE  => {
+                    // TEMPORARY ReactOS diagnosis: victim id.
+                    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+                    crate::win32::window::mark95w(b"ni\n");
+                    // TEMPORARY ReactOS diagnosis: skip the centering body
+                    // (GDI measure + rgrc shrink) to test whether it drives
+                    // the NCCALCSIZE flood against the ReactOS EDIT proc.
+                    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+                    return None;
+                    #[cfg(not(all(target_family = "rust9x", target_env = "msvc")))]
                     if w == 0 { return None }
 
                     // (Patch-Win95) GetTextMetricsA instead of the Win95-stubbed
@@ -445,7 +459,17 @@ impl TextInput {
                     ReleaseDC(hwnd, dc);
                 },
                 WM_SIZE => {
-                    SetWindowPos(hwnd, ptr::null_mut(), 0, 0, 0, 0, SWP_NOOWNERZORDER | SWP_NOSIZE | SWP_NOMOVE | SWP_FRAMECHANGED);
+                    let size = l as u32;
+                    let now = ((size & 0xffff) as i32, ((size >> 16) & 0xffff) as i32);
+                    if last_size.get() != now {
+                        last_size.set(now);
+                        #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+                        crate::win32::window::mark95w(b"sz\n");
+                        SetWindowPos(hwnd, ptr::null_mut(), 0, 0, 0, 0, SWP_NOOWNERZORDER | SWP_NOSIZE | SWP_NOMOVE | SWP_FRAMECHANGED);
+                    } else {
+                        #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+                        crate::win32::window::mark95w(b"sk\n");
+                    }
                 },
                 _ => {}
             }

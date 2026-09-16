@@ -552,9 +552,9 @@ pub trait Widget {
 #[derive(Clone)]
 pub struct App {
     inner: Rc<RefCell<Option<Box<dyn crate::backends::BackendApp>>>>,
-    #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(windows, not(feature = "zork")))]
     parent_cell: Rc<RefCell<Option<*mut c_void>>>,
-    #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(windows, not(feature = "zork")))]
     action_registry: Rc<RefCell<HashMap<String, Box<dyn FnMut()>>>>,
     #[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
     action_group: Rc<RefCell<Option<crate::backends_gtk_adapter::Application>>>,
@@ -571,7 +571,7 @@ impl App {
             Ok(b) => b,
             Err(e) => return Err(Error::Backend(format!("{}", e))),
         };
-        #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+        #[cfg(all(windows, not(feature = "zork")))]
         {
             // Create a hidden parent window for child controls
             let parent_hwnd = crate::backends::nwg::create_hidden_parent()?;
@@ -581,7 +581,7 @@ impl App {
                 action_registry: Rc::new(RefCell::new(HashMap::new())),
             });
         }
-        #[cfg(not(all(windows, not(feature = "pancurses"), not(feature = "zork"))))]
+        #[cfg(not(all(windows, not(feature = "zork"))))]
         return Ok(App {
             inner: Rc::new(RefCell::new(Some(b))),
             #[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
@@ -703,18 +703,18 @@ impl App {
 
     // -- Windows paths --
 
-    #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(windows, not(feature = "zork")))]
     pub fn create_window(&self) -> Result<crate::backends_nwg_adapter::Window, Error> {
         crate::backends_nwg_adapter::create_window(&self.parent_cell)
     }
 
-    #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(windows, not(feature = "zork")))]
     pub fn create_button(&self, label: &str) -> Result<crate::backends_nwg_adapter::Button, Error> {
         let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
         crate::backends_nwg_adapter::create_button(parent, label)
     }
 
-    #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(windows, not(feature = "zork")))]
     pub fn create_label(&self, text: &str) -> Result<crate::backends_nwg_adapter::Label, Error> {
         let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
         let lbl = crate::backends_nwg_adapter::create_label(parent)?;
@@ -722,52 +722,52 @@ impl App {
         Ok(lbl)
     }
 
-    #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(windows, not(feature = "zork")))]
     pub fn create_box(&self, orientation: crate::backends::nwg::Orientation, spacing: i32) -> Result<crate::backends_nwg_adapter::BoxWidget, Error> {
         let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
         crate::backends_nwg_adapter::create_box(orientation, spacing, parent)
     }
 
-    #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(windows, not(feature = "zork")))]
     pub fn create_grid(&self) -> Result<crate::backends_nwg_adapter::Grid, Error> {
         crate::backends_nwg_adapter::create_grid()
     }
 
-    #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(windows, not(feature = "zork")))]
     pub fn create_entry(&self) -> Result<crate::backends_nwg_adapter::Entry, Error> {
         let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
         crate::backends_nwg_adapter::create_entry(parent)
     }
 
-    #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(windows, not(feature = "zork")))]
     pub fn create_menu(&self) -> Result<crate::backends_nwg_adapter::Menu, Error> {
         crate::backends_nwg_adapter::create_menu()
     }
 
-    #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(windows, not(feature = "zork")))]
     /// # Safety
     /// `window_hwnd` must be a valid HWND.
     pub unsafe fn create_menubar(&self, model: &crate::backends_nwg_adapter::Menu, window_hwnd: *mut c_void) -> Result<crate::backends_nwg_adapter::MenuBar, Error> {
         crate::backends_nwg_adapter::create_menubar(model, window_hwnd, self.action_registry.clone())
     }
 
-    #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(windows, not(feature = "zork")))]
     pub fn create_simple_action(&self, name: &str) -> Result<crate::backends_nwg_adapter::SimpleAction, Error> {
         crate::backends_nwg_adapter::create_simple_action(name, self.action_registry.clone())
     }
 
-    #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(windows, not(feature = "zork")))]
     pub fn create_dialog(&self) -> Result<crate::backends_nwg_adapter::Dialog, Error> {
         crate::backends_nwg_adapter::create_dialog(&self.parent_cell)
     }
 
-    #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(windows, not(feature = "zork")))]
     pub fn create_dropdown(&self, items: &[&str]) -> Result<crate::backends_nwg_adapter::DropDown, Error> {
         let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
         crate::backends_nwg_adapter::create_dropdown(parent, items)
     }
 
-    #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(windows, not(feature = "zork")))]
     pub fn create_checkbutton(&self, label: &str) -> Result<crate::backends_nwg_adapter::CheckButton, Error> {
         let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
         let cb = crate::backends_nwg_adapter::create_checkbutton(parent)?;
@@ -775,7 +775,7 @@ impl App {
         Ok(cb)
     }
 
-    #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(windows, not(feature = "zork")))]
     pub fn create_radiobutton(&self, group: Option<&crate::backends_nwg_adapter::RadioButton>, label: &str) -> Result<crate::backends_nwg_adapter::RadioButton, Error> {
         // Win32 groups by WS_GROUP: the first radio (no group yet) starts it.
         let group_start = group.is_none();
@@ -785,47 +785,47 @@ impl App {
         Ok(rb)
     }
 
-    #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(windows, not(feature = "zork")))]
     pub fn create_textview(&self) -> Result<crate::backends_nwg_adapter::TextView, Error> {
         let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
         crate::backends_nwg_adapter::create_textview(parent)
     }
 
-    #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(windows, not(feature = "zork")))]
     pub fn create_canvas(&self) -> Result<crate::backends_nwg_adapter::Canvas, Error> {
         let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
         crate::backends_nwg_adapter::create_canvas(parent)
     }
 
-    #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(windows, not(feature = "zork")))]
     pub fn create_overlay(&self) -> Result<crate::backends_nwg_adapter::Overlay, Error> {
         let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
         crate::backends_nwg_adapter::create_overlay(parent)
     }
 
-    #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(windows, not(feature = "zork")))]
     pub fn create_scrolled_window(&self) -> Result<crate::backends_nwg_adapter::ScrolledWindow, Error> {
         let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
         crate::backends_nwg_adapter::create_scrolled_window(parent)
     }
 
-    #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(windows, not(feature = "zork")))]
     pub fn open_file(&self, title: &str) -> Result<Option<String>, Error> {
         let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
         crate::backends_nwg_adapter::open_file(title, parent)
     }
-    #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(windows, not(feature = "zork")))]
     pub fn open_file_filtered(&self, title: &str, filters: &[(&str, &[&str])]) -> Result<Option<String>, Error> {
         let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
         crate::backends_nwg_adapter::open_file_filtered(title, parent, filters)
     }
 
-    #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(windows, not(feature = "zork")))]
     pub fn save_file(&self, title: &str) -> Result<Option<String>, Error> {
         let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
         crate::backends_nwg_adapter::save_file(title, parent)
     }
-    #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+    #[cfg(all(windows, not(feature = "zork")))]
     pub fn save_file_filtered(&self, title: &str, filters: &[(&str, &[&str])], current_name: &str) -> Result<Option<String>, Error> {
         let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
         crate::backends_nwg_adapter::save_file_filtered(title, parent, filters, current_name)
@@ -837,16 +837,8 @@ impl App {
     pub fn create_window(&self) -> Result<crate::backends_pancurses_adapter::Window, Error> {
         crate::backends_pancurses_adapter::create_window()
     }
-#[cfg(all(windows, feature = "pancurses", not(feature = "zork")))]
-    pub fn create_window(&self) -> Result<crate::backends_pancurses_adapter::Window, Error> {
-        crate::backends_pancurses_adapter::create_window()
-    }
 
     #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
-    pub fn create_button(&self, label: &str) -> Result<crate::backends_pancurses_adapter::Button, Error> {
-        crate::backends_pancurses_adapter::create_button(label)
-    }
-#[cfg(all(windows, feature = "pancurses", not(feature = "zork")))]
     pub fn create_button(&self, label: &str) -> Result<crate::backends_pancurses_adapter::Button, Error> {
         crate::backends_pancurses_adapter::create_button(label)
     }
@@ -855,16 +847,8 @@ impl App {
     pub fn create_label(&self, text: &str) -> Result<crate::backends_pancurses_adapter::Label, Error> {
         crate::backends_pancurses_adapter::create_label(text)
     }
-#[cfg(all(windows, feature = "pancurses", not(feature = "zork")))]
-    pub fn create_label(&self, text: &str) -> Result<crate::backends_pancurses_adapter::Label, Error> {
-        crate::backends_pancurses_adapter::create_label(text)
-    }
 
     #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
-    pub fn create_box(&self, orientation: crate::backends_pancurses_adapter::Orientation, spacing: i32) -> Result<crate::backends_pancurses_adapter::BoxWidget, Error> {
-        crate::backends_pancurses_adapter::create_box(orientation, spacing)
-    }
-#[cfg(all(windows, feature = "pancurses", not(feature = "zork")))]
     pub fn create_box(&self, orientation: crate::backends_pancurses_adapter::Orientation, spacing: i32) -> Result<crate::backends_pancurses_adapter::BoxWidget, Error> {
         crate::backends_pancurses_adapter::create_box(orientation, spacing)
     }
@@ -873,16 +857,8 @@ impl App {
     pub fn create_grid(&self) -> Result<crate::backends_pancurses_adapter::Grid, Error> {
         crate::backends_pancurses_adapter::create_grid()
     }
-#[cfg(all(windows, feature = "pancurses", not(feature = "zork")))]
-    pub fn create_grid(&self) -> Result<crate::backends_pancurses_adapter::Grid, Error> {
-        crate::backends_pancurses_adapter::create_grid()
-    }
 
     #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
-    pub fn create_entry(&self) -> Result<crate::backends_pancurses_adapter::Entry, Error> {
-        crate::backends_pancurses_adapter::create_entry()
-    }
-#[cfg(all(windows, feature = "pancurses", not(feature = "zork")))]
     pub fn create_entry(&self) -> Result<crate::backends_pancurses_adapter::Entry, Error> {
         crate::backends_pancurses_adapter::create_entry()
     }
@@ -891,16 +867,8 @@ impl App {
     pub fn create_menu(&self) -> Result<crate::backends_pancurses_adapter::Menu, Error> {
         crate::backends_pancurses_adapter::create_menu()
     }
-#[cfg(all(windows, feature = "pancurses", not(feature = "zork")))]
-    pub fn create_menu(&self) -> Result<crate::backends_pancurses_adapter::Menu, Error> {
-        crate::backends_pancurses_adapter::create_menu()
-    }
 
     #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
-    pub fn create_menubar(&self, model: &crate::backends_pancurses_adapter::Menu, _action_group: *mut std::os::raw::c_void) -> Result<crate::backends_pancurses_adapter::MenuBar, Error> {
-        crate::backends_pancurses_adapter::create_menubar(model, _action_group)
-    }
-#[cfg(all(windows, feature = "pancurses", not(feature = "zork")))]
     pub fn create_menubar(&self, model: &crate::backends_pancurses_adapter::Menu, _action_group: *mut std::os::raw::c_void) -> Result<crate::backends_pancurses_adapter::MenuBar, Error> {
         crate::backends_pancurses_adapter::create_menubar(model, _action_group)
     }
@@ -909,16 +877,8 @@ impl App {
     pub fn create_simple_action(&self, name: &str) -> Result<crate::backends_pancurses_adapter::SimpleAction, Error> {
         crate::backends_pancurses_adapter::create_simple_action(name)
     }
-#[cfg(all(windows, feature = "pancurses", not(feature = "zork")))]
-    pub fn create_simple_action(&self, name: &str) -> Result<crate::backends_pancurses_adapter::SimpleAction, Error> {
-        crate::backends_pancurses_adapter::create_simple_action(name)
-    }
 
     #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
-    pub fn create_dialog(&self) -> Result<crate::backends_pancurses_adapter::Dialog, Error> {
-        crate::backends_pancurses_adapter::create_dialog()
-    }
-#[cfg(all(windows, feature = "pancurses", not(feature = "zork")))]
     pub fn create_dialog(&self) -> Result<crate::backends_pancurses_adapter::Dialog, Error> {
         crate::backends_pancurses_adapter::create_dialog()
     }
@@ -927,16 +887,8 @@ impl App {
     pub fn create_dropdown(&self, items: &[&str]) -> Result<crate::backends_pancurses_adapter::DropDown, Error> {
         crate::backends_pancurses_adapter::create_dropdown(items)
     }
-#[cfg(all(windows, feature = "pancurses", not(feature = "zork")))]
-    pub fn create_dropdown(&self, items: &[&str]) -> Result<crate::backends_pancurses_adapter::DropDown, Error> {
-        crate::backends_pancurses_adapter::create_dropdown(items)
-    }
 
     #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
-    pub fn create_checkbutton(&self, label: &str) -> Result<crate::backends_pancurses_adapter::CheckButton, Error> {
-        crate::backends_pancurses_adapter::create_checkbutton(label)
-    }
-#[cfg(all(windows, feature = "pancurses", not(feature = "zork")))]
     pub fn create_checkbutton(&self, label: &str) -> Result<crate::backends_pancurses_adapter::CheckButton, Error> {
         crate::backends_pancurses_adapter::create_checkbutton(label)
     }
@@ -946,17 +898,8 @@ impl App {
         let _ = group;
         crate::backends_pancurses_adapter::create_radiobutton(None, label)
     }
-#[cfg(all(windows, feature = "pancurses", not(feature = "zork")))]
-    pub fn create_radiobutton(&self, group: Option<&crate::backends_pancurses_adapter::RadioButton>, label: &str) -> Result<crate::backends_pancurses_adapter::RadioButton, Error> {
-        let _ = group;
-        crate::backends_pancurses_adapter::create_radiobutton(None, label)
-    }
 
     #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
-    pub fn create_textview(&self) -> Result<crate::backends_pancurses_adapter::TextView, Error> {
-        crate::backends_pancurses_adapter::create_textview()
-    }
-#[cfg(all(windows, feature = "pancurses", not(feature = "zork")))]
     pub fn create_textview(&self) -> Result<crate::backends_pancurses_adapter::TextView, Error> {
         crate::backends_pancurses_adapter::create_textview()
     }
@@ -965,16 +908,8 @@ impl App {
     pub fn create_spreadsheet(&self, rows: u32, cols: u32) -> Result<crate::backends_pancurses_adapter::Spreadsheet, Error> {
         crate::backends_pancurses_adapter::create_spreadsheet(rows, cols)
     }
-#[cfg(all(windows, feature = "pancurses", not(feature = "zork")))]
-    pub fn create_spreadsheet(&self, rows: u32, cols: u32) -> Result<crate::backends_pancurses_adapter::Spreadsheet, Error> {
-        crate::backends_pancurses_adapter::create_spreadsheet(rows, cols)
-    }
 
     #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
-    pub fn create_canvas(&self) -> Result<crate::backends_pancurses_adapter::Canvas, Error> {
-        crate::backends_pancurses_adapter::create_canvas()
-    }
-#[cfg(all(windows, feature = "pancurses", not(feature = "zork")))]
     pub fn create_canvas(&self) -> Result<crate::backends_pancurses_adapter::Canvas, Error> {
         crate::backends_pancurses_adapter::create_canvas()
     }
@@ -983,16 +918,8 @@ impl App {
     pub fn create_overlay(&self) -> Result<crate::backends_pancurses_adapter::Overlay, Error> {
         crate::backends_pancurses_adapter::create_overlay()
     }
-#[cfg(all(windows, feature = "pancurses", not(feature = "zork")))]
-    pub fn create_overlay(&self) -> Result<crate::backends_pancurses_adapter::Overlay, Error> {
-        crate::backends_pancurses_adapter::create_overlay()
-    }
 
     #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
-    pub fn create_scrolled_window(&self) -> Result<crate::backends_pancurses_adapter::ScrolledWindow, Error> {
-        crate::backends_pancurses_adapter::create_scrolled_window()
-    }
-#[cfg(all(windows, feature = "pancurses", not(feature = "zork")))]
     pub fn create_scrolled_window(&self) -> Result<crate::backends_pancurses_adapter::ScrolledWindow, Error> {
         crate::backends_pancurses_adapter::create_scrolled_window()
     }
@@ -1005,28 +932,12 @@ impl App {
     pub fn open_file_filtered(&self, title: &str, _filters: &[(&str, &[&str])]) -> Result<Option<String>, Error> {
         crate::backends_pancurses_adapter::open_file(title)
     }
-#[cfg(all(windows, feature = "pancurses", not(feature = "zork")))]
-    pub fn open_file(&self, title: &str) -> Result<Option<String>, Error> {
-        crate::backends_pancurses_adapter::open_file(title)
-    }
-#[cfg(all(windows, feature = "pancurses", not(feature = "zork")))]
-    pub fn open_file_filtered(&self, title: &str, _filters: &[(&str, &[&str])]) -> Result<Option<String>, Error> {
-        crate::backends_pancurses_adapter::open_file(title)
-    }
 
     #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
     pub fn save_file(&self, title: &str) -> Result<Option<String>, Error> {
         crate::backends_pancurses_adapter::save_file(title)
     }
 #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
-    pub fn save_file_filtered(&self, title: &str, _filters: &[(&str, &[&str])], _current_name: &str) -> Result<Option<String>, Error> {
-        crate::backends_pancurses_adapter::save_file(title)
-    }
-#[cfg(all(windows, feature = "pancurses", not(feature = "zork")))]
-    pub fn save_file(&self, title: &str) -> Result<Option<String>, Error> {
-        crate::backends_pancurses_adapter::save_file(title)
-    }
-#[cfg(all(windows, feature = "pancurses", not(feature = "zork")))]
     pub fn save_file_filtered(&self, title: &str, _filters: &[(&str, &[&str])], _current_name: &str) -> Result<Option<String>, Error> {
         crate::backends_pancurses_adapter::save_file(title)
     }
@@ -1301,17 +1212,12 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
             let inner = crate::backends_gtk_adapter::create_window()?;
             return Ok(crate::common::Window { inner });
         }
-        #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+        #[cfg(all(windows, not(feature = "zork")))]
         {
             let inner = crate::backends_nwg_adapter::create_window(&self.parent_cell)?;
             Ok(crate::common::Window { inner })
         }
         #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
-        {
-            let inner = crate::backends_pancurses_adapter::create_window()?;
-            Ok(crate::common::Window { inner })
-        }
-#[cfg(all(windows, feature = "pancurses", not(feature = "zork")))]
         {
             let inner = crate::backends_pancurses_adapter::create_window()?;
             Ok(crate::common::Window { inner })
@@ -1334,7 +1240,7 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
             let inner = crate::backends_gtk_adapter::create_box(gtk_orient, spacing)?;
             return Ok(crate::common::WidgetBox { inner });
         }
-        #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+        #[cfg(all(windows, not(feature = "zork")))]
         {
             let nwg_orient = match orientation {
                 crate::common::Orientation::Horizontal => crate::backends::nwg::Orientation::Horizontal,
@@ -1345,11 +1251,6 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
             Ok(crate::common::WidgetBox { inner })
         }
         #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
-        {
-            let inner = crate::backends_pancurses_adapter::create_box(orientation, spacing)?;
-            Ok(crate::common::WidgetBox { inner })
-        }
-#[cfg(all(windows, feature = "pancurses", not(feature = "zork")))]
         {
             let inner = crate::backends_pancurses_adapter::create_box(orientation, spacing)?;
             Ok(crate::common::WidgetBox { inner })
@@ -1368,7 +1269,7 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
             let inner = crate::backends_gtk_adapter::create_label(text)?;
             return Ok(crate::common::Label { inner });
         }
-        #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+        #[cfg(all(windows, not(feature = "zork")))]
         {
             let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
             let inner = crate::backends_nwg_adapter::create_label(parent)?;
@@ -1376,11 +1277,6 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
             Ok(crate::common::Label { inner })
         }
         #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
-        {
-            let inner = crate::backends_pancurses_adapter::create_label(text)?;
-            Ok(crate::common::Label { inner })
-        }
-#[cfg(all(windows, feature = "pancurses", not(feature = "zork")))]
         {
             let inner = crate::backends_pancurses_adapter::create_label(text)?;
             Ok(crate::common::Label { inner })
@@ -1399,18 +1295,13 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
             let inner = crate::backends_gtk_adapter::create_entry()?;
             return Ok(crate::common::Entry { inner });
         }
-        #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+        #[cfg(all(windows, not(feature = "zork")))]
         {
             let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
             let inner = crate::backends_nwg_adapter::create_entry(parent)?;
             Ok(crate::common::Entry { inner })
         }
         #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
-        {
-            let inner = crate::backends_pancurses_adapter::create_entry()?;
-            Ok(crate::common::Entry { inner })
-        }
-#[cfg(all(windows, feature = "pancurses", not(feature = "zork")))]
         {
             let inner = crate::backends_pancurses_adapter::create_entry()?;
             Ok(crate::common::Entry { inner })
@@ -1429,18 +1320,13 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
             let inner = crate::backends_gtk_adapter::create_canvas()?;
             return Ok(crate::common::Canvas { inner });
         }
-        #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+        #[cfg(all(windows, not(feature = "zork")))]
         {
             let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
             let inner = crate::backends_nwg_adapter::create_canvas(parent)?;
             Ok(crate::common::Canvas { inner })
         }
         #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
-        {
-            let inner = crate::backends_pancurses_adapter::create_canvas()?;
-            Ok(crate::common::Canvas { inner })
-        }
-#[cfg(all(windows, feature = "pancurses", not(feature = "zork")))]
         {
             let inner = crate::backends_pancurses_adapter::create_canvas()?;
             Ok(crate::common::Canvas { inner })
@@ -1460,7 +1346,7 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
             let inner = crate::backends_gtk_adapter::create_scrolled_window()?;
             return Ok(crate::common::ScrolledWindow { inner });
         }
-        #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+        #[cfg(all(windows, not(feature = "zork")))]
         {
             let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
             let inner = crate::backends_nwg_adapter::create_scrolled_window(parent)?;
@@ -1487,17 +1373,12 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
             let inner = crate::backends_gtk_adapter::create_menu()?;
             return Ok(crate::common::Menu { inner });
         }
-        #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+        #[cfg(all(windows, not(feature = "zork")))]
         {
             let inner = crate::backends_nwg_adapter::create_menu()?;
             Ok(crate::common::Menu { inner })
         }
         #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
-        {
-            let inner = crate::backends_pancurses_adapter::create_menu()?;
-            Ok(crate::common::Menu { inner })
-        }
-#[cfg(all(windows, feature = "pancurses", not(feature = "zork")))]
         {
             let inner = crate::backends_pancurses_adapter::create_menu()?;
             Ok(crate::common::Menu { inner })
@@ -1517,17 +1398,12 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
             let inner = crate::backends_gtk_adapter::create_simple_action(name)?;
             return Ok(crate::common::SimpleAction { inner });
         }
-        #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+        #[cfg(all(windows, not(feature = "zork")))]
         {
             let inner = crate::backends_nwg_adapter::create_simple_action(name, self.action_registry.clone())?;
             Ok(crate::common::SimpleAction { inner })
         }
         #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
-        {
-            let inner = crate::backends_pancurses_adapter::create_simple_action(name)?;
-            Ok(crate::common::SimpleAction { inner })
-        }
-#[cfg(all(windows, feature = "pancurses", not(feature = "zork")))]
         {
             let inner = crate::backends_pancurses_adapter::create_simple_action(name)?;
             Ok(crate::common::SimpleAction { inner })
@@ -1548,18 +1424,13 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
             let inner = unsafe { crate::backends_gtk_adapter::create_menubar(&model.inner, _action_group) }?;
             return Ok(crate::common::MenuBar { inner });
         }
-        #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+        #[cfg(all(windows, not(feature = "zork")))]
         {
             let hwnd = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
             let inner = crate::backends_nwg_adapter::create_menubar(&model.inner, hwnd, self.action_registry.clone())?;
             Ok(crate::common::MenuBar { inner })
         }
         #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
-        {
-            let inner = crate::backends_pancurses_adapter::create_menubar(&model.inner, _action_group)?;
-            Ok(crate::common::MenuBar { inner })
-        }
-#[cfg(all(windows, feature = "pancurses", not(feature = "zork")))]
         {
             let inner = crate::backends_pancurses_adapter::create_menubar(&model.inner, _action_group)?;
             Ok(crate::common::MenuBar { inner })
@@ -1602,17 +1473,12 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
             let inner = crate::backends_gtk_adapter::create_dialog()?;
             return Ok(crate::common::Dialog { inner });
         }
-        #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+        #[cfg(all(windows, not(feature = "zork")))]
         {
             let inner = crate::backends_nwg_adapter::create_dialog(&self.parent_cell)?;
             Ok(crate::common::Dialog { inner })
         }
         #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
-        {
-            let inner = crate::backends_pancurses_adapter::create_dialog()?;
-            Ok(crate::common::Dialog { inner })
-        }
-#[cfg(all(windows, feature = "pancurses", not(feature = "zork")))]
         {
             let inner = crate::backends_pancurses_adapter::create_dialog()?;
             Ok(crate::common::Dialog { inner })
@@ -1667,7 +1533,7 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
         crate::backends_wasm_adapter::quit_main_loop();
         #[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
         let _ = crate::backends_gtk_adapter::quit_main_loop();
-        #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+        #[cfg(all(windows, not(feature = "zork")))]
         crate::backends_nwg_adapter::quit_main_loop();
     }
 
@@ -1700,9 +1566,9 @@ impl From<Box<dyn crate::backends::BackendApp>> for App {
     fn from(b: Box<dyn crate::backends::BackendApp>) -> Self {
         App {
             inner: Rc::new(RefCell::new(Some(b))),
-            #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+            #[cfg(all(windows, not(feature = "zork")))]
             parent_cell: Rc::new(RefCell::new(None)),
-            #[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+            #[cfg(all(windows, not(feature = "zork")))]
             action_registry: Rc::new(RefCell::new(HashMap::new())),
             #[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
             action_group: Rc::new(RefCell::new(None)),
@@ -1835,7 +1701,7 @@ pub fn add_periodic_tick(
 
 /// See the GTK variant. Win32 needs the window whose message loop should
 /// receive `WM_TIMER`, so the handle is taken from `window`.
-#[cfg(all(windows, not(feature = "pancurses"), not(feature = "zork")))]
+#[cfg(all(windows, not(feature = "zork")))]
 pub fn add_periodic_tick(
     window: &crate::common::Window,
     ms: u32,
@@ -1852,7 +1718,7 @@ pub fn add_periodic_tick(
 /// request is accepted and dropped.
 #[cfg(not(any(
     any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))),
-    all(windows, not(feature = "pancurses"), not(feature = "zork"))
+    all(windows, not(feature = "zork"))
 )))]
 pub fn add_periodic_tick(
     _window: &crate::common::Window,

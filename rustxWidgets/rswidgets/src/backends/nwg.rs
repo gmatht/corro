@@ -230,15 +230,21 @@ mod nwg_backend {
     pub fn create_entry(
         parent: *mut c_void,
     ) -> Result<(nwg::TextInput, Rc<RefCell<Option<Box<dyn FnMut()>>>>, nwg::EventHandler), nwg::NwgError> {
+        #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+        unsafe { mark95nwg(b"n-e0\n"); }
         let mut entry = nwg::TextInput::default();
         nwg::TextInput::builder()
             .text("")
             .flags(nwg::TextInputFlags::VISIBLE | nwg::TextInputFlags::TAB_STOP | nwg::TextInputFlags::AUTO_SCROLL)
             .parent(&nwg::ControlHandle::Hwnd(parent as _))
             .build(&mut entry)?;
+        #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+        unsafe { mark95nwg(b"n-e1\n"); }
         let changed_cb: Rc<RefCell<Option<Box<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
         let cb = changed_cb.clone();
         let hwnd = entry.handle.hwnd().unwrap();
+        #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+        unsafe { mark95nwg(b"n-e2\n"); }
         let parent_h = nwg::ControlHandle::Hwnd(parent as _);
         let handler = nwg::bind_event_handler(
             &nwg::ControlHandle::Hwnd(hwnd), &parent_h,
@@ -248,6 +254,8 @@ mod nwg_backend {
                 }
             },
         );
+        #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+        unsafe { mark95nwg(b"n-e3\n"); }
         Ok((entry, changed_cb, handler))
     }
 

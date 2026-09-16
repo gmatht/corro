@@ -21,6 +21,8 @@ pub mod style {
     pub const SELECTED: u8 = 4;
     pub const ACTIVE_HEADER: u8 = 5;
     pub const INACTIVE_HEADER: u8 = 6;
+    /// Hyperlink cell: blue text + underline (corro styles link cells so).
+    pub const HYPERLINK: u8 = 7;
 }
 
 pub type CursorMoveCb = Box<dyn FnMut(u32, u32)>;
@@ -305,6 +307,15 @@ pub fn paint(model: &SpreadsheetModel, dc: &mut dyn DrawContext, _w: i32, _h: i3
                 } else {
                     dc.draw_text(cx + 2.0, ry + 3.0, &text, "monospace", 13.0, fr, fg, fb, 1.0);
                 }
+                // Hyperlinks render blue and underlined by default (same
+                // rule as the terminal backends); no font-underline API
+                // exists, so rule the line with a 1px fill under the text.
+                if style == style::HYPERLINK {
+                    let (_, _, tw, th) = dc.text_extents(&text, "monospace", 13.0);
+                    if tw > 0.0 {
+                        dc.fill_rect(cx + 2.0, ry + 3.0 + th, tw, 1.0, fr, fg, fb, 1.0);
+                    }
+                }
             }
 
             // cursor outline
@@ -425,6 +436,7 @@ fn bg_for(s: u8, is_cursor: bool, editing: bool) -> (f64, f64, f64, f64) {
 fn fg_for(s: u8) -> (f64, f64, f64) {
     match s {
         style::AGGREGATE | style::FOOTER_AGGREGATE => (0.4, 0.4, 0.4),
+        style::HYPERLINK => (0.0, 0.0, 0.85),
         _ => (0.05, 0.05, 0.1),
     }
 }
@@ -461,4 +473,57 @@ pub type SharedModel = Rc<RefCell<SpreadsheetModel>>;
 /// Construct a fresh shared model handle.
 pub fn new_shared_model(rows: u32, cols: u32) -> SharedModel {
     Rc::new(RefCell::new(SpreadsheetModel::new(rows, cols)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::style;
+    use super::{paint, SpreadsheetModel};
+    use crate::backends::headless::{DrawOp, RecordingDrawContext};
+
+    /// Style bit 7 (hyperlink) paints blue text plus a 1px underline rule
+    /// in the same blue; other cells keep the default dark text and no
+    /// rule. Structural: asserts the recorded draw ops, not just that the
+    /// text was drawn.
+    #[test]
+    fn hyperlink_style_paints_blue_text_with_underline() {
+        let mut model = SpreadsheetModel::new(3, 3);
+        model.set_cell(1, 1, "https://example.com");
+        model.set_cell_style(1, 1, style::HYPERLINK);
+        model.set_cell(1, 2, "plain");
+        let mut dc = RecordingDrawContext::new();
+        paint(&model, &mut dc, 400, 300);
+        let blue = (0.0, 0.0, 0.85, 1.0);
+        let link_texts: Vec<(f64, f64, f64, f64)> = dc
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                DrawOp::Text { text, rgba, .. } if text.contains("https") => Some(*rgba),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(link_texts, vec![blue], "link text must be blue, got {link_texts:?}");
+        let rules: Vec<(f64, f64, f64, f64)> = dc
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                DrawOp::FillRect { h, rgba, .. } if *h == 1.0 && *rgba == blue => Some(*rgba),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rules.len(), 1, "exactly one blue underline rule expected");
+        let plain_texts: Vec<(f64, f64, f64, f64)> = dc
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                DrawOp::Text { text, rgba, .. } if text == "plain" => Some(*rgba),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            plain_texts,
+            vec![(0.05, 0.05, 0.1, 1.0)],
+            "plain cell must keep default dark text"
+        );
+    }
 }

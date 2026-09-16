@@ -333,6 +333,7 @@ pub fn menu_bar() -> Vec<MenuAction> {
         "Cut"         => Cut ("X"),
         "Copy"        => Copy ("C"),
         "Paste"       => Paste ("P"),
+        "Select all"  => SelectAll ("A"),
         "Find"        => Find ("F"),
         "Replace"     => Replace ("R"),
         "Duplicate"   => Duplicate ("D"),
