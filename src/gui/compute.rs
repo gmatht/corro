@@ -224,9 +224,13 @@ pub fn compute_cell_info(
                 },
             },
         );
+        // Ratatui parity: the reference shows the aggregate directly, so a
+        // numberless row renders blank — never a hardcoded "0" (commit
+        // 4746249 added the zero thinking of Excel's SUM-of-empty, but an
+        // empty TOTAL cell must stay empty). A margin cell with its own
+        // content (manual override/label) still shows it.
         if agg.is_empty() {
-            let own = cell_effective_display(g, addr);
-            if own.is_empty() { "0".to_string() } else { own }
+            cell_effective_display(g, addr)
         } else {
             agg
         }

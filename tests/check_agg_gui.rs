@@ -254,6 +254,56 @@ fn test_full_agg_pipeline() {
     }
 }
 
+/// Empty data rows must render an empty right-TOTAL cell (ratatui
+/// parity: the reference shows `compute_aggregate` directly, which is ""
+/// for numberless rows). Numbered rows still sum; a margin cell with its
+/// own content keeps showing it.
+#[test]
+fn test_empty_row_total_is_blank_not_zero() {
+    let mut raw = Grid::new(3, 2);
+    raw.set(&CellAddr::Main { row: 0, col: 0 }, "10".into());
+    raw.set(&CellAddr::Main { row: 0, col: 1 }, "20".into());
+    // Row 1 deliberately empty.
+    raw.set(&CellAddr::Main { row: 2, col: 0 }, "30".into());
+    raw.set(&CellAddr::Main { row: 2, col: 1 }, "40".into());
+    raw.set(
+        &CellAddr::Header {
+            row: 0,
+            col: ColumnAddr::Right(0),
+        },
+        "=TOTAL".into(),
+    );
+    let gb = GridBox::from(raw);
+    let lm = MARGIN_COLS;
+    let mc = gb.main_cols();
+    let mr = gb.main_rows();
+    let rca = right_col_agg(&gb, lm + mc);
+    assert_eq!(rca, Some(corro::ops::AggFunc::Sum));
+    let cell = |mri: u32| {
+        compute::compute_cell_info(
+            &gb,
+            &CellAddr::Right { col: 0, row: mri },
+            false,
+            None,
+            Some(mri),
+            None,
+            rca,
+            lm + mc,
+            lm,
+            mc,
+            mr,
+        )
+        .formatted
+    };
+    assert_eq!(cell(0), "30", "numbered row must sum");
+    assert!(
+        cell(1).is_empty(),
+        "empty row must be blank, got {:?}",
+        cell(1)
+    );
+    assert_eq!(cell(2), "70", "numbered row must sum");
+}
+
 /// Bare `TOTAL` in a margin cell aggregates like `==TOTAL` (Sum); quoted
 /// `'TOTAL` stays literal text with no aggregate.
 #[test]
