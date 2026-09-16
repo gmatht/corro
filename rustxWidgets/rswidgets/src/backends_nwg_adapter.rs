@@ -1295,6 +1295,14 @@ mod nwg_adapter {
             }
         }
         pub fn set_visible(&self, v: bool) { self.inner.set_visible(v); }
+        /// Whether this entry currently holds keyboard focus (Win32
+        /// GetFocus equals its hwnd). A null hwnd reads as false.
+        pub fn has_focus(&self) -> bool {
+            if self.hwnd.is_null() {
+                return false;
+            }
+            unsafe { winapi::um::winuser::GetFocus() == self.hwnd as _ }
+        }
         pub fn grab_focus(&self) {
             let _ = self.inner.set_focus();
             if let Some(hwnd) = self.inner.handle.hwnd() {

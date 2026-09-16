@@ -617,6 +617,11 @@ impl AsElement for BoxWidget {
             Ok(id)
         }
 
+        /// No focus query on wasm entries: report false (unchanged).
+        pub fn has_focus(&self) -> bool {
+            false
+        }
+
         pub fn connect_button_press(&self, f: impl FnMut() + 'static) -> Result<u64, Error> {
             let cb = Rc::new(RefCell::new(f));
             let cb2 = cb.clone();

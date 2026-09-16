@@ -243,6 +243,11 @@ mod pancurses_adapter {
         pub fn add_class(&self, _class_name: &str) {}
         pub fn remove_class(&self, _class_name: &str) {}
         pub fn grab_focus(&self) {}
+        /// Terminal entries never take GTK-style focus: report false so
+        /// callers keep today's push behavior.
+        pub fn has_focus(&self) -> bool {
+            false
+        }
         pub fn on_key_raw(&self, _cb: Box<dyn FnMut(u32, u32) -> bool>) {}
 
         pub fn connect_activate<F: FnMut(*mut c_void) + 'static>(&self, f: F) -> Result<u64, Error> {

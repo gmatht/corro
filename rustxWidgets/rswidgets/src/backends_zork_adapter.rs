@@ -225,6 +225,11 @@ impl Entry {
     pub fn remove_class(&self, _class_name: &str) {}
     pub fn grab_focus(&self) {}
 
+    /// No focus query on zork entries: report false (unchanged behavior).
+    pub fn has_focus(&self) -> bool {
+        false
+    }
+
     pub fn connect_activate<F: FnMut(*mut c_void) + 'static>(&self, f: F) -> Result<u64, Error> {
         let mut f = f;
         crate::backends::zork::add_callback(self.id, Box::new(move || f(std::ptr::null_mut())));

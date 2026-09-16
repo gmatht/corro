@@ -34,6 +34,7 @@ pub type GtkInit = unsafe extern "C" fn(argc: *mut libc::c_int, argv: *mut *mut 
 pub type GtkLabelSetMarkup = unsafe extern "C" fn(label: *mut c_void, markup: *const i8);
 pub type GtkWidgetSetVisible = unsafe extern "C" fn(widget: *mut c_void, visible: i32);
 pub type GtkWidgetGrabFocus = unsafe extern "C" fn(widget: *mut c_void);
+pub type GtkWidgetHasFocus = unsafe extern "C" fn(widget: *mut c_void) -> i32;
 pub type GtkWidgetGetStyleContext = unsafe extern "C" fn(widget: *mut c_void) -> *mut c_void;
 pub type GtkStyleContextAddClass = unsafe extern "C" fn(context: *mut c_void, class_name: *const i8);
 pub type GtkStyleContextRemoveClass = unsafe extern "C" fn(context: *mut c_void, class_name: *const i8);
@@ -339,6 +340,7 @@ pub struct Symbols {
     pub gtk_label_set_markup: Option<GtkLabelSetMarkup>,
     pub gtk_widget_set_visible: Option<GtkWidgetSetVisible>,
     pub gtk_widget_grab_focus: Option<GtkWidgetGrabFocus>,
+    pub gtk_widget_has_focus: Option<GtkWidgetHasFocus>,
     pub gtk_widget_get_style_context: Option<GtkWidgetGetStyleContext>,
     pub gtk_style_context_add_class: Option<GtkStyleContextAddClass>,
     pub gtk_style_context_remove_class: Option<GtkStyleContextRemoveClass>,
@@ -657,6 +659,10 @@ impl Symbols {
         let gtk_label_set_markup = unsafe { sym::<GtkLabelSetMarkup>(gtk, "gtk_label_set_markup") };
         let gtk_widget_set_visible = unsafe { sym::<GtkWidgetSetVisible>(gtk, "gtk_widget_set_visible") };
         let gtk_widget_grab_focus = unsafe { sym::<GtkWidgetGrabFocus>(gtk, "gtk_widget_grab_focus") };
+        // Optional: a missing symbol stays None (load never fails on it)
+        // and reads as "never focused" — every caller treats None as
+        // false, so exotic builds keep today's behavior.
+        let gtk_widget_has_focus = unsafe { sym::<GtkWidgetHasFocus>(gtk, "gtk_widget_has_focus") };
         let gtk_widget_get_style_context = unsafe { sym::<GtkWidgetGetStyleContext>(gtk, "gtk_widget_get_style_context") };
         let gtk_style_context_add_class = unsafe { sym::<GtkStyleContextAddClass>(gtk, "gtk_style_context_add_class") };
         let gtk_style_context_remove_class = unsafe { sym::<GtkStyleContextRemoveClass>(gtk, "gtk_style_context_remove_class") };
@@ -872,7 +878,7 @@ impl Symbols {
             gtk_widget_show_all, gtk_window_present,
             gtk_grid_new, gtk_grid_attach, gtk_entry_new, gtk_entry_set_text, gtk_entry_get_text,
             gtk_entry_set_width_chars, gtk_widget_set_size_request, gtk_entry_set_has_frame,
-            gtk_label_set_markup, gtk_widget_set_visible, gtk_widget_grab_focus,
+            gtk_label_set_markup, gtk_widget_set_visible, gtk_widget_grab_focus, gtk_widget_has_focus,
             gtk_widget_get_style_context, gtk_style_context_add_class, gtk_style_context_remove_class,
             gtk_css_provider_new, gtk_css_provider_load_from_data, gtk_style_context_add_provider,
             gtk_overlay_new, gtk_overlay_add_overlay, gtk_overlay_set_overlay_pass_through, gtk_overlay_set_child,

@@ -250,6 +250,11 @@ mod android_adapter {
         pub fn connect_changed(&self, _f: impl FnMut() + 'static) -> Result<u64, Error> {
             Ok(0)
         }
+
+        /// No focus query on android entries: report false (unchanged).
+        pub fn has_focus(&self) -> bool {
+            false
+        }
     }
 
     impl Clone for Entry {

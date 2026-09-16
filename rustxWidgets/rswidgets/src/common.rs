@@ -129,6 +129,10 @@ macro_rules! common_types_mod {
             pub fn set_valign(&self, align: i32) { self.inner.set_valign(align); }
             pub fn set_width_chars(&self, n: i32) { self.inner.set_width_chars(n); }
             pub fn connect_activate<F: FnMut(*mut std::os::raw::c_void) + 'static>(&self, f: F) -> Result<u64, crate::Error> { self.inner.connect_activate(f) }
+            /// Whether the entry currently holds keyboard focus. Backends
+            /// without a focus query report false, so callers there keep
+            /// today's push behavior unchanged.
+            pub fn has_focus(&self) -> bool { self.inner.has_focus() }
             pub fn connect_focus_in_event<F: FnMut(*mut std::os::raw::c_void) -> i32 + 'static>(&self, f: F) -> Result<u64, crate::Error> { self.inner.connect_focus_in_event(f) }
             pub fn connect_focus_out_event<F: FnMut(*mut std::os::raw::c_void) -> i32 + 'static>(&self, f: F) -> Result<u64, crate::Error> { self.inner.connect_focus_out_event(f) }
             pub fn set_margin_start(&self, px: i32) { self.inner.set_margin_start(px); }

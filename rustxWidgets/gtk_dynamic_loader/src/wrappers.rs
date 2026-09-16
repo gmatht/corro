@@ -1642,6 +1642,20 @@ impl Entry {
         if let Some(grab) = self.loader.symbols.gtk_widget_grab_focus { unsafe { grab(self.inner); } }
     }
 
+    /// Whether this entry currently holds keyboard focus. Missing symbol
+    /// (or a dropped widget) reads as false — callers keep today's
+    /// behavior instead of failing.
+    pub fn has_focus(&self) -> bool {
+        if !guard_widget_ptr(self.inner, "Entry", "has_focus") {
+            return false;
+        }
+        if let Some(has) = self.loader.symbols.gtk_widget_has_focus {
+            unsafe { has(self.inner) != 0 }
+        } else {
+            false
+        }
+    }
+
     pub fn set_margin_start(&self, margin: i32) {
         guard_widget!(self, "Entry", "set_margin_start");
         if let Some(set_margin) = self.loader.symbols.gtk_widget_set_margin_start {

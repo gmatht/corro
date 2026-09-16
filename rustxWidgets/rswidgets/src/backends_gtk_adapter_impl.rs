@@ -337,6 +337,7 @@ mod gtk_adapter {
         pub fn add_class(&self, class_name: &str) { self.inner.add_class(class_name); }
         pub fn remove_class(&self, class_name: &str) { self.inner.remove_class(class_name); }
         pub fn grab_focus(&self) { self.inner.grab_focus(); }
+        pub fn has_focus(&self) -> bool { self.inner.has_focus() }
         pub fn connect_focus_in_event<F: FnMut(*mut c_void) -> i32 + 'static>(&self, f: F) -> Result<u64, Error> {
             self.inner.connect_focus_in_event(f).map_err(|e| Error::Backend(format!("{}", e)))
         }
