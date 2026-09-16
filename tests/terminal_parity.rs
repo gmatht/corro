@@ -293,9 +293,10 @@ fn overflow_renders_cell_text() {
 /// Replay — whose status message proves the selection wrapped around.
 #[test]
 fn menu_up_wraps_to_last_item() {
-    let pane = run_in_tmux("--pancurses docs/tests/overflow.corro", &["Escape", "f", "Up", "Enter"], 2200);
+    // Up on New (first) wraps to Exit (last); a second Up reaches Replay.
+    let pane = run_in_tmux("--pancurses docs/tests/overflow.corro", &["Escape", "f", "Up", "Up", "Enter"], 2200);
     assert!(pane.contains("Replayed"),
-        "Up on the first item should wrap to the last (Replay) and Enter fire it\n{}",
+        "Up on the first item should wrap to the last (Exit), then to Replay, and Enter fire it\n{}",
         safe_slice(&pane, 1500));
 }
 
@@ -737,7 +738,7 @@ fn walk_menu_items(sm: usize, labels: &[&str]) -> String {
 #[test]
 fn menu_file_items() {
     let s = walk_menu_items(0, &[
-        "Open file", "Save as", "Export", "Width", "Sort view", "Persist sort", "Exit", "Replay",
+        "New", "Open file", "Save as", "Export", "Width", "Sort view", "Persist sort", "Replay", "Exit",
     ]);
     tmux::kill_session(&s);
 }
@@ -746,6 +747,7 @@ fn menu_file_items() {
 fn menu_edit_items() {
     let s = walk_menu_items(1, &[
         "Cut", "Copy", "Paste", "Find", "Replace", "Duplicate", "Extrapolate",
+        "Edit in Text Editor", "Workbook (External)", "Follow link",
     ]);
     tmux::kill_session(&s);
 }
@@ -776,6 +778,285 @@ fn menu_sheet_items() {
 fn menu_help_items() {
     let s = walk_menu_items(5, &["About", "Row ops", "Col ops", "Full help"]);
     tmux::kill_session(&s);
+}
+
+/// Temp .corro fixture whose A1 holds a hyperlink and B1 plain text.
+/// Unique per call: the pancurses backend commits through to the open
+/// file, so tests must never share a fixture path.
+fn hyperlink_fixture() -> String {
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let dst = std::env::temp_dir().join(format!("corro-link-{}-{}.corro", std::process::id(), id));
+    std::fs::write(&dst, "CORRO_LOG 1\nSET A1 https://example.com/docs\nSET B1 plain\n").unwrap();
+    dst.to_string_lossy().to_string()
+}
+
+/// Extract the text of the first blue-underlined run from an SGR capture:
+/// the pancurses link style. Returns None when no such run exists
+/// (structural assertion, not just text-present). Note tmux re-emits SGR
+/// attributes in its own canonical order on `capture-pane -e`, so the
+/// blue (`38;5;4`) and underline (`4`) codes need not be adjacent — the
+/// underline only has to be active (set after the last full reset).
+fn link_run_text(esc: &str) -> Option<String> {
+    let blue = "38;5;4m";
+    let mut search = esc;
+    loop {
+        let start = search.find(blue)?;
+        let rest = &search[start + blue.len()..];
+        let end = rest.find("\x1b[").unwrap_or(rest.len());
+        let text = &rest[..end];
+        // Underline active? It must have been set after the last reset.
+        let before = &search[..start];
+        let since_reset = match before.rfind("\x1b[0m") {
+            Some(i) => &before[i + "\x1b[0m".len()..],
+            None => before,
+        };
+        if since_reset.contains("\x1b[4m") && text.starts_with("https") {
+            return Some(text.to_string());
+        }
+        search = rest;
+    }
+}
+
+/// Hyperlink cells render blue and underlined on BOTH backends for the
+/// same fixture and cursor state (the cursor starts on A1 where its own
+/// highlight wins, so both sides step Down first). Structural: asserts
+/// the style run itself, not mere text presence.
+#[test]
+fn hyperlink_cells_render_blue_and_underlined() {
+    let fixture = hyperlink_fixture();
+    let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let session = format!("corro-linkstyle-{}-{}", std::process::id(), id);
+    start_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
+    send_settled(&session, "Down"); // cursor off A1 so its link style shows
+    let esc = tmux::capture_pane_esc(&session);
+    tmux::kill_session(&session);
+    let run = link_run_text(&esc).unwrap_or_else(|| panic!(
+        "pancurses must render the URL blue+underlined\n--- esc ---\n{}",
+        safe_slice(&esc, 1500)
+    ));
+    assert!(run.starts_with("https"), "link-styled run must be the URL, got {run:?}");
+
+    // Ratatui reference on the same fixture with the same cursor move.
+    let mut app = corro::ui::App::new(Some(PathBuf::from(&fixture)));
+    app.load_initial().unwrap();
+    ratatui_send(&mut app, crossterm::event::KeyCode::Down, crossterm::event::KeyModifiers::NONE);
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal.draw(|f| app.bench_draw(f)).unwrap();
+    let buf = terminal.backend().buffer();
+    let mut link_symbols = String::new();
+    for y in 0..buf.area.height {
+        for x in 0..buf.area.width {
+            let cell = &buf[(x, y)];
+            if cell.symbol() != " "
+                && cell.fg == ratatui::style::Color::Blue
+                && cell.modifier.contains(ratatui::style::Modifier::UNDERLINED)
+            {
+                link_symbols.push_str(cell.symbol());
+            }
+        }
+    }
+    assert!(!link_symbols.is_empty(), "ratatui must render the URL blue+underlined");
+    assert!(link_symbols.starts_with("https"), "link-styled run must be the URL, got {link_symbols:?}");
+}
+
+/// Recorder script standing in for a browser: appends its $1 to `log`.
+/// Returns the script path (pass via CORRO_URL_OPENER).
+fn opener_recorder_script(log: &std::path::Path) -> String {
+    let script = log.with_extension("sh");
+    std::fs::write(&script, format!("#!/bin/sh\necho \"$1\" >> \"{}\"\n", log.display())).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+    }
+    script.to_string_lossy().to_string()
+}
+
+/// Poll `log` until it holds exactly `want` (the opener spawns detached).
+fn wait_recorded(log: &std::path::Path, want: &str) {
+    for _ in 0..200 {
+        if std::fs::read_to_string(log).map(|s| s.trim() == want).unwrap_or(false) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("recorder never received {want:?} (got {:?})", std::fs::read_to_string(log).unwrap_or_default());
+}
+
+/// Ctrl+O follows the cursor cell's hyperlink on BOTH backends: same
+/// status text and same recorded URL. A second Ctrl+O on the plain cell
+/// reports "No hyperlink" and spawns nothing — which also proves the
+/// key keeps working on repeat presses.
+#[test]
+fn follow_hyperlink_opens_url_both_backends() {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let fixture = hyperlink_fixture();
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    // Separate recorder logs per backend side so each side's spawn is
+    // observable independently.
+    let log_r = std::env::temp_dir().join(format!("corro-follow-r-{}-{}.log", std::process::id(), id));
+    let log_p = std::env::temp_dir().join(format!("corro-follow-p-{}-{}.log", std::process::id(), id));
+    let _ = std::fs::remove_file(&log_r);
+    let _ = std::fs::remove_file(&log_p);
+    let script_r = opener_recorder_script(&log_r);
+    let script_p = opener_recorder_script(&log_p);
+    let prev = std::env::var("CORRO_URL_OPENER").ok();
+    std::env::set_var("CORRO_URL_OPENER", &script_r);
+
+    // ── ratatui ──
+    let mut app = corro::ui::App::new(Some(PathBuf::from(&fixture)));
+    app.load_initial().unwrap();
+    ratatui_send(&mut app, KeyCode::Char('o'), KeyModifiers::CONTROL);
+    assert_eq!(app.status, "Opened https://example.com/docs", "ratatui Ctrl+O status");
+    wait_recorded(&log_r, "https://example.com/docs");
+
+    // ── pancurses (tmux) ──
+    // CORRO_URL_OPENER goes on the session command line: tmux sessions
+    // inherit the long-lived SERVER's environment, not this process's.
+    let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
+    let session = format!("corro-follow-{}-{}", std::process::id(), id);
+    start_session(
+        &session,
+        &format!("CORRO_URL_OPENER={} {} --pancurses {}; sleep 2", script_p, bin, fixture),
+    );
+    tmux::send_keys(&session, "C-o");
+    wait_for_text(&session, "Opened https://example.com/docs");
+    wait_recorded(&log_p, "https://example.com/docs");
+    // Step onto the plain cell and follow again: honest report, no spawn
+    // (and the key still works — no one-shot unregister).
+    send_settled(&session, "Right");
+    tmux::send_keys(&session, "C-o");
+    wait_for_text(&session, "No hyperlink at B1");
+    std::thread::sleep(Duration::from_millis(300));
+    let lines = std::fs::read_to_string(&log_p).unwrap_or_default();
+    assert_eq!(lines.lines().count(), 1, "plain cell must not spawn the opener (log: {lines:?})");
+    tmux::kill_session(&session);
+
+    match prev {
+        Some(v) => std::env::set_var("CORRO_URL_OPENER", v),
+        None => std::env::remove_var("CORRO_URL_OPENER"),
+    }
+    for p in [&log_r, &log_p] {
+        let _ = std::fs::remove_file(p);
+    }
+    for p in [script_r, script_p] {
+        let _ = std::fs::remove_file(PathBuf::from(p));
+    }
+}
+
+/// Edit ▸ Follow link in the pancurses menu dispatches a real follow (not
+/// a no-op): the formula bar reports the opened URL and the recorder gets
+/// it. The item is last in the Edit menu (index 8).
+#[test]
+fn menu_edit_follow_link_activates() {
+    let fixture = hyperlink_fixture();
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let log = std::env::temp_dir().join(format!("corro-mfollow-{}-{}.log", std::process::id(), id));
+    let _ = std::fs::remove_file(&log);
+    let script = opener_recorder_script(&log);
+    let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
+    let session = format!("corro-mfollow-{}-{}", std::process::id(), id);
+    start_session(
+        &session,
+        &format!("CORRO_URL_OPENER={} {} --pancurses {}; sleep 2", script, bin, fixture),
+    );
+    open_root_menu(&session, 1); // Edit
+    for _ in 0..8 {
+        send_settled(&session, "Down"); // to "Follow link" (last Edit item)
+    }
+    send_settled(&session, "Enter");
+    wait_for_text(&session, "Opened https://example.com/docs");
+    wait_recorded(&log, "https://example.com/docs");
+    tmux::kill_session(&session);
+    let _ = std::fs::remove_file(&log);
+    let _ = std::fs::remove_file(&script);
+}
+
+/// Edit ▸ Edit in Text Editor suspends the TUI, runs $EDITOR on the cursor
+/// cell, and commits the result back into the grid: with a script editor
+/// that rewrites the file, the formula bar must show the new value with an
+/// "External edit applied" status (the app resumes and repaints instead of
+/// hanging on the suspended screen). EDITOR rides the session command line
+/// (tmux sessions inherit the server environment, not this process's).
+#[test]
+fn menu_edit_external_editor_roundtrip() {
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("corro-ed-{}-{}", std::process::id(), id));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("ed.sh");
+    std::fs::write(&script, "#!/bin/sh\nprintf 'EDITED' > \"$1\"\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+    }
+    let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
+    let fixture = menu_fixture();
+    let session = format!("corro-ed-{}-{}", std::process::id(), id);
+    start_session(
+        &session,
+        &format!(
+            "VISUAL={0} EDITOR={0} {1} --pancurses {2}; sleep 2",
+            script.display(),
+            bin,
+            fixture
+        ),
+    );
+    // Cursor starts on A1; Edit ▸ Edit in Text Editor runs the script.
+    open_root_menu(&session, 1); // Edit
+    for _ in 0..7 {
+        send_settled(&session, "Down"); // to "Edit in Text Editor" (index 7)
+    }
+    send_settled(&session, "Enter");
+    // The script's text lands in the cell and the status reports it:
+    // suspend → spawn → commit → resume all fired (not a no-op).
+    wait_for_text(&session, "External edit applied");
+    let pane = capture_settled(&session, 30);
+    tmux::kill_session(&session);
+    let bar = pane.lines().nth(1).unwrap_or("");
+    assert!(
+        bar.contains("A1") && bar.contains("EDITED"),
+        "formula bar must show the edited cell value\n--- bar ---\n{bar}"
+    );
+    assert!(
+        pane.contains("EDITED"),
+        "grid must repaint the edited value\n--- pane ---\n{}",
+        safe_slice(&pane, 1500)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// File ▸ New in the pancurses menu dispatches a real reset (not a no-op):
+/// the formula bar reports "New workbook" and the fixture's content
+/// disappears from the grid (fresh seeded blank). "New" is item index 0.
+#[test]
+fn menu_file_new_resets_workbook() {
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let bin = format!("{}/target/debug/corro", env!("CARGO_MANIFEST_DIR"));
+    let fixture = menu_fixture(); // overflow.corro: A1 holds long text
+    let session = format!("corro-fnew-{}-{}", std::process::id(), id);
+    start_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
+    let before = tmux::capture_pane(&session);
+    assert!(
+        before.contains("This Text is really long"),
+        "fixture content must be visible before New"
+    );
+    open_root_menu(&session, 0); // File; "New" is already highlighted
+    send_settled(&session, "Enter");
+    wait_for_text(&session, "New workbook");
+    let pane = capture_settled(&session, 30);
+    tmux::kill_session(&session);
+    assert!(
+        !pane.contains("This Text is really long"),
+        "New must clear the grid\n--- pane ---\n{}",
+        safe_slice(&pane, 1500)
+    );
 }
 
 /// Actually *activate* a menu item and verify it took effect.
@@ -913,8 +1194,9 @@ fn menu_item_activation_smoke() {
     activate_menu_item(3, 3, "Reset", "Format reset", false);
     activate_menu_item(1, 0, "Cut", "Selection cut", false);
     activate_menu_item(4, 2, "New sheet", "New sheet created", false);
-    // Quit must actually terminate the app.
-    activate_menu_item(0, 6, "Exit", "", true);
+    activate_menu_item(0, 0, "New", "New workbook", false);
+    // Quit must actually terminate the app (Exit is last in File now).
+    activate_menu_item(0, 8, "Exit", "", true);
 }
 #[test]
 fn menu_export_tsv_writes_file() {
@@ -926,9 +1208,9 @@ fn menu_export_tsv_writes_file() {
     let _ = std::fs::remove_file(&export_path);
     start_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
     send_settled(&session, "M-f");
-    // File -> Export -> TSV: Down to Export (idx 2), Right to enter the
-    // submenu, then Enter on TSV (idx 0).
-    for _ in 0..2 {
+    // File -> Export -> TSV: Down to Export (idx 3, New sits at 0),
+    // Right to enter the submenu, then Enter on TSV (idx 0).
+    for _ in 0..3 {
         send_settled(&session, "Down");
     }
     send_settled(&session, "Right"); // enter the Export submenu
@@ -956,16 +1238,15 @@ fn menu_export_tsv_writes_file() {
 
 #[test]
 fn menu_open_loads_file() {
-    // Build a loadable WORKBOOK snapshot from the fixture, then open it via the
+    // Build a loadable CORRO_LOG from the fixture, then open it via the
     // File -> Open menu (typing the path into the TUI prompt). This verifies the
     // Open action genuinely loads a file, not just records a status.
     let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs/tests/overflow.corro");
     let mut app = corro::ui::App::new(Some(src));
     app.load_initial().unwrap();
-    let snap = corro::ops::WorkbookSnapshot::from_workbook(&app.workbook);
     let snap_id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let snap_path = std::env::temp_dir().join(format!("corro-open-snap-{}-{}.corro", std::process::id(), snap_id));
-    corro::io::save_workbook(&snap_path, &snap).unwrap();
+    corro::io::write_workbook_log(&snap_path, &app.workbook, &Default::default()).unwrap();
 
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let session = format!("corro-act-{}-{}", std::process::id(), id);
@@ -973,7 +1254,8 @@ fn menu_open_loads_file() {
     let fixture = menu_fixture();
     start_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
     send_settled(&session, "M-f");
-    // Open is the first item (idx 0) — already highlighted.
+    // Open is item idx 1 (New sits at 0) — Down once, then Enter.
+    send_settled(&session, "Down");
     send_settled(&session, "Enter"); // opens the Open-file prompt
     // Fixed sleep (not settle): the prompt needs a beat before it routes
     // typed input (see activate_menu_item_prompt).
@@ -1579,7 +1861,7 @@ fn sort_view_prompt_sorts_and_reports() {
     start_session(&session, &format!("{} --pancurses {}; sleep 2", bin, fixture));
     send_settled(&session, "M-f");
     wait_for_text(&session, "┌File");
-    for _ in 0..4 { send_settled(&session, "Down"); } // Sort view (idx 4)
+    for _ in 0..5 { send_settled(&session, "Down"); } // Sort view (idx 5, New sits at 0)
     send_settled(&session, "Enter"); // opens the prompt
     wait_for_text(&session, "sort cols [A,B,C]");
     for ch in "A".chars() {

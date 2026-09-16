@@ -83,6 +83,46 @@ fn seeded_app(tmp: Option<PathBuf>) -> App {
     app
 }
 
+/// External-editor actions spawn $EDITOR on dispatch. Point it at a
+/// missing binary for the suite's duration so no test ever launches a real
+/// editor (instant deterministic Err, no hangs on any platform). Saves and
+/// restores the environment; hold the guard for the whole dispatching test.
+struct NoEditorGuard {
+    visual: Option<String>,
+    editor: Option<String>,
+    // Held for the guard's lifetime: $VISUAL/$EDITOR are process-global, so a
+    // concurrent test restoring them (guard drop) while another test dispatches
+    // an editor-spawning action would launch the real editor (vim under CI).
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+static EDITOR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+impl NoEditorGuard {
+    fn take() -> Self {
+        let _lock = EDITOR_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let visual = std::env::var("VISUAL").ok();
+        let editor = std::env::var("EDITOR").ok();
+        std::env::set_var("VISUAL", "/nonexistent-corro-test-editor");
+        std::env::set_var("EDITOR", "/nonexistent-corro-test-editor");
+        Self { visual, editor, _lock }
+    }
+}
+impl Drop for NoEditorGuard {
+    fn drop(&mut self) {
+        match &self.visual {
+            Some(v) => std::env::set_var("VISUAL", v),
+            None => std::env::remove_var("VISUAL"),
+        }
+        match &self.editor {
+            Some(e) => std::env::set_var("EDITOR", e),
+            None => std::env::remove_var("EDITOR"),
+        }
+    }
+}
+
 /// A short human-readable key for a `MenuDispatch` (which isn't `Debug`).
 fn dispatch_hint(d: &MenuDispatch) -> &'static str {
     match d {
@@ -168,6 +208,7 @@ fn menu_tree_is_well_formed() {
 /// text prompt, or a backend-special name such as `quit`.
 #[test]
 fn every_menu_item_is_handled() {
+    let _no_editor = NoEditorGuard::take();
     let mut app = seeded_app(None);
     let mut pending_scope = 0u8;
     let mut clipboard = String::new();
@@ -391,7 +432,7 @@ fn dispatch_actions_apply_real_effects() {
 fn action_names_are_exhaustive() {
     use MenuActionKind::*;
     let all = [
-        Open, Save, SaveAs, Quit, Undo, Redo, Cut, Copy, Paste, Find, Replace,
+        NewFile, Open, Save, SaveAs, Quit, Undo, Redo, Cut, Copy, Paste, Find, Replace,
         DeleteCell, SelectAll, ToggleHeaders, ToggleMargins, NewSheet, RenameSheet,
         DeleteSheet, SortAsc, SortDesc, BalanceBooks, ExportTsv, ExportCsv, ExportOds,
         ExportAscii, About, HelpKeybinds, InsertRows, InsertMitosisRow, InsertMitosisCol,
@@ -401,7 +442,7 @@ fn action_names_are_exhaustive() {
         FormatRational, FormatFixed0, FormatFixed1, FormatFixed2, FormatFixedCustom,
         FormatAlignLeft, FormatAlignCenter, FormatAlignRight, FormatAlignDefault,
         FormatReset, ExportAll, Submenu, SortView, SaveSort, Replay, SetMaxColWidth,
-        SetColWidth, ExportOdt, Duplicate, Extrapolate, SheetPrev, SheetNext, CopySheet,
+        SetColWidth, ExportOdt, Duplicate, Extrapolate, EditExternal, EditWorkbookExternal, FollowHyperlink, SheetPrev, SheetNext, CopySheet,
         MoveSheet, GoToCell, HelpRows, HelpCols, HelpFull,
     ];
     for (i, kind) in all.iter().enumerate() {
@@ -453,6 +494,7 @@ fn leaf_count_is_substantial() {
 /// of shipping another silent no-op like Insert Date was.
 #[test]
 fn gui_routing_covers_every_menu_item() {
+    let _no_editor = NoEditorGuard::take();
     // gui_backend arms that keep native dialogs/file ops (verified working).
     const GUI_NATIVE_DIALOG: &[&str] = &["open", "save_as", "about"];
     // gui_backend arms that open a dialog and feed run_prompt_action.
@@ -551,6 +593,18 @@ fn gui_routing_covers_every_menu_item() {
     );
 }
 
+/// File menu order: New at the top, Exit at the bottom (same arrangement
+/// the ratatui reference pins in `file_menu_new_first_exit_last`).
+#[test]
+fn file_menu_new_first_exit_last() {
+    let bar = menu_bar();
+    let file = bar.iter().find(|m| m.label == "File").expect("File menu");
+    let items = file.submenu.as_deref().unwrap_or(&[]);
+    assert_eq!(items.first().map(|i| i.label), Some("New"));
+    assert_eq!(items.last().map(|i| i.label), Some("Exit"));
+    assert_eq!(items.first().map(|i| i.shortcut), Some("N"));
+}
+
 /// Insert > Special Char is picker-gated, not prompt-gated: the shared layer
 /// offers no free-text prompt for it, dispatch opens shared picker state,
 /// and the rows/digits/clamp match the ratatui reference. Guards the
@@ -584,6 +638,127 @@ fn special_picker_routing() {
     assert_eq!(special_picker::take(&mut app), Some("θ".to_string()), "out-of-range clamps to last");
     assert_eq!(special_picker::index_for_digit('3'), Some(2));
     assert_eq!(special_picker::index_for_digit('0'), Some(9));
+}
+
+/// Edit ▸ Follow link dispatches through the shared action: a link cell
+/// opens in the (overridden, recording) browser with an "Opened …" status,
+/// a non-link cell reports "No hyperlink …" without spawning anything.
+/// The recorder script stands in for a real browser so the test never
+/// opens a window; `CORRO_URL_OPENER` is process-global, so the override
+/// is lock-guarded and always restored.
+#[test]
+fn follow_hyperlink_dispatch_opens_link_and_reports() {
+    static OPENER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = OPENER_LOCK.lock().unwrap();
+    let prev = std::env::var("CORRO_URL_OPENER").ok();
+
+    let dir = std::env::temp_dir().join(format!("corro-follow-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let record = dir.join("opened.log");
+    let _ = std::fs::remove_file(&record);
+    let script = dir.join("record.sh");
+    std::fs::write(&script, format!("#!/bin/sh\necho \"$1\" >> \"{}\"\n", record.display())).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+    }
+    std::env::set_var("CORRO_URL_OPENER", script.to_str().unwrap());
+
+    let mut app = seeded_app(None);
+    // Cursor onto main A1 (display coords: one header row, one margin col).
+    app.core.cursor = corro::grid::SheetCursor {
+        row: corro::grid::HEADER_ROWS,
+        col: corro::grid::MARGIN_COLS,
+    };
+    app.core.workbook.active_sheet_mut().grid.set(
+        &corro::grid::CellAddr::main(0, 0),
+        "https://example.com/a".into(),
+    );
+    let mut scope = 0u8;
+    let mut clipboard = String::new();
+    match dispatch_menu_action(&mut app, "follow_hyperlink", &mut scope, &mut clipboard) {
+        MenuDispatch::Status(s) => assert_eq!(s, "Opened https://example.com/a", "unexpected status {s:?}"),
+        d => panic!("follow_hyperlink must dispatch Status, got {}", dispatch_hint(&d)),
+    }
+    // The recorder (not a browser) received exactly the link. The opener
+    // spawns detached, so poll for the record instead of assuming the
+    // child has run already.
+    let mut logged = String::new();
+    for _ in 0..200 {
+        logged = std::fs::read_to_string(&record).unwrap_or_default();
+        if !logged.trim().is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert_eq!(logged.trim(), "https://example.com/a", "opener got {logged:?}");
+
+    // A non-link cell reports honestly and spawns nothing new.
+    app.core.workbook.active_sheet_mut().grid.set(
+        &corro::grid::CellAddr::main(0, 0),
+        "just text".into(),
+    );
+    match dispatch_menu_action(&mut app, "follow_hyperlink", &mut scope, &mut clipboard) {
+        MenuDispatch::Status(s) => assert_eq!(s, "No hyperlink at A1", "unexpected status {s:?}"),
+        d => panic!("follow_hyperlink must dispatch Status, got {}", dispatch_hint(&d)),
+    }
+    let logged = std::fs::read_to_string(&record).unwrap_or_default();
+    assert_eq!(logged.lines().count(), 1, "non-link must not spawn the opener");
+
+    match prev {
+        Some(v) => std::env::set_var("CORRO_URL_OPENER", v),
+        None => std::env::remove_var("CORRO_URL_OPENER"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// File ▸ New dispatches through the shared action: the workbook resets to
+/// the seeded blank, the app detaches from any file, and histories clear —
+/// with a "New workbook" status. Guards the routing the menu-tree test
+/// pins (every leaf must be non-stub) with real state assertions.
+#[test]
+fn new_file_dispatch_resets_to_blank_workbook() {
+    let mut app = seeded_app(None);
+    // Dirty the app: content, a second sheet, cursor off A1, history.
+    app.core.workbook.active_sheet_mut().grid.set(
+        &corro::grid::CellAddr::main(0, 0),
+        "old".into(),
+    );
+    app.core.workbook.add_sheet("Extra".into(), corro::ops::SheetState::new(1, 1));
+    app.core.cursor = corro::grid::SheetCursor { row: 5, col: 5 };
+    app.core.op_history.push(corro::ops::Op::SetCell {
+        addr: corro::grid::CellAddr::main(0, 0),
+        value: "old".into(),
+    });
+    let mut scope = 0u8;
+    let mut clipboard = String::new();
+    match dispatch_menu_action(&mut app, "new_file", &mut scope, &mut clipboard) {
+        MenuDispatch::Status(s) => assert_eq!(s, "New workbook", "unexpected status {s:?}"),
+        d => panic!("new_file must dispatch Status, got {}", dispatch_hint(&d)),
+    }
+    // Blank seeded workbook: one sheet, empty main cells.
+    assert_eq!(app.core.workbook.sheet_count(), 1);
+    assert_eq!(app.core.workbook.sheet_title(0), "Sheet1");
+    assert_eq!(
+        app.core.workbook.active_sheet().grid.get(&corro::grid::CellAddr::main(0, 0)),
+        None,
+        "old content must not survive New"
+    );
+    // Detached from any file; histories and cursor reset.
+    assert!(app.core.path.is_none());
+    assert!(app.core.op_history.is_empty());
+    assert!(app.core.redo_history.is_empty());
+    assert_eq!(
+        app.core.cursor,
+        corro::grid::SheetCursor {
+            row: corro::grid::HEADER_ROWS,
+            col: corro::grid::MARGIN_COLS
+        }
+    );
+    assert!(app.core.anchor.is_none());
 }
 
 /// The ratatui reference menu tables and the shared `gui::menu::menu_bar()`
@@ -797,5 +972,179 @@ fn dialog_filters_cover_loader_and_export_types() {
             "Files",
             "{action} extension needs a specific filter label"
         );
+    }
+}
+
+/// Regression: deleting a named sheet with a live file path must delete
+/// exactly ONE sheet. `commit_workbook_op` replays the appended log line into
+/// the workbook, so the old code's extra `sheets.remove(idx)` deleted a second
+/// sheet — emptying the workbook, after which any `active_sheet()` panicked
+/// (surfaced by `prompt_actions_run_cleanly` once Open started working).
+#[test]
+fn delete_sheet_deletes_exactly_one_sheet_with_a_live_path() {
+    let dir = std::env::temp_dir().join(format!("corro_delone_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("wb.corro");
+    std::fs::write(&path, "CORRO_LOG 1\n").unwrap();
+
+    let mut app = seeded_app(Some(path.clone()));
+    app.core.path = Some(path.clone());
+    app.core.workbook.add_sheet("Sheet2".into(), corro::ops::SheetState::new(1, 1));
+    app.core.workbook.add_sheet("Sheet3".into(), corro::ops::SheetState::new(1, 1));
+    let before = app.core.workbook.sheets.len();
+    assert_eq!(before, 3, "setup: three sheets");
+
+    run_prompt_action(&mut app, "delete_sheet", "Sheet2");
+    let after = app.core.workbook.sheets.len();
+    assert_eq!(
+        after,
+        before - 1,
+        "deleting one named sheet must remove exactly one (before={before}, after={after}, status={:?})",
+        app.core.status
+    );
+    assert!(
+        !app.core.workbook.sheets.iter().any(|s| s.title == "Sheet2"),
+        "the named sheet is gone"
+    );
+    // The workbook must still be usable (this panicked before the fix).
+    run_prompt_action(&mut app, "insert_hyperlink", "https://example.com");
+    assert!(
+        !app.core.status.contains("Open error"),
+        "workbook still usable, status={:?}",
+        app.core.status
+    );
+
+    // And the deletion is recorded in the log, once.
+    let log = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(
+        log.matches("DELETE_SHEET").count(),
+        1,
+        "exactly one DELETE_SHEET line, got:\n{log}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Edit ▸ Workbook (External) must open the **live** `.corro` file (not a
+/// scratch copy) and reload the workbook from whatever the editor left, so an
+/// externally-added revision shows up without a manual reload. Uses a temp
+/// $EDITOR script; the `NoEditorGuard` is bypassed here on purpose (this test
+/// needs a *real* editor).
+#[cfg(unix)]
+#[test]
+fn edit_workbook_external_opens_live_file_and_reloads() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Serialize against every other $EDITOR-touching test in this binary: the
+    // env is process-global, so a concurrent NoEditorGuard drop would restore
+    // a real editor mid-test (or vice versa).
+    let _lock = EDITOR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("book.corro");
+    std::fs::write(&log, "CORRO_LOG 1\nSET A1 old\n").unwrap();
+
+    // Editor rewrites the file with an extra revision appended.
+    let editor = dir.path().join("ed.sh");
+    std::fs::write(
+        &editor,
+        "#!/bin/sh\nprintf 'CORRO_LOG 1\\nSET A1 old\\nSET B1 added\\n' > \"$1\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let saved_visual = std::env::var("VISUAL").ok();
+    let saved_editor = std::env::var("EDITOR").ok();
+    std::env::remove_var("VISUAL");
+    std::env::set_var("EDITOR", editor.to_string_lossy().as_ref());
+
+    let mut app = App::new_with_paths(vec![log.clone()]);
+    app.load_initial().unwrap();
+    let mut pending_scope = 0u8;
+    let mut clipboard = String::new();
+    let result = dispatch_menu_action(
+        &mut app,
+        "edit_workbook_external",
+        &mut pending_scope,
+        &mut clipboard,
+    );
+
+    match &saved_visual {
+        Some(v) => std::env::set_var("VISUAL", v),
+        None => std::env::remove_var("VISUAL"),
+    }
+    match &saved_editor {
+        Some(e) => std::env::set_var("EDITOR", e),
+        None => std::env::remove_var("EDITOR"),
+    }
+
+    match result {
+        MenuDispatch::Status(s) => {
+            assert!(
+                s.contains("Reloaded"),
+                "external workbook edit should reload, got {s:?}"
+            )
+        }
+        other => panic!("expected Status, got {}", dispatch_hint(&other)),
+    }
+    // The editor's new revision is live in the workbook.
+    assert_eq!(
+        app.core
+            .workbook
+            .active_sheet()
+            .grid
+            .get(&corro::grid::CellAddr::main(0, 1))
+            .unwrap_or_default(),
+        "added",
+        "the externally-added B1 revision must be applied after reload"
+    );
+}
+
+/// With no file bound yet, Edit ▸ Workbook (External) must report that the
+/// workbook has to be saved first instead of spawning an editor on nothing.
+#[test]
+fn edit_workbook_external_without_a_path_reports_save_first() {
+    let mut app = App::new_with_paths(vec![]);
+    app.load_initial().unwrap();
+    let mut pending_scope = 0u8;
+    let mut clipboard = String::new();
+    let result = dispatch_menu_action(
+        &mut app,
+        "edit_workbook_external",
+        &mut pending_scope,
+        &mut clipboard,
+    );
+    match result {
+        MenuDispatch::Status(s) => assert!(
+            s.contains("Save the workbook first"),
+            "unsaved workbook must ask for a save first, got {s:?}"
+        ),
+        other => panic!("expected Status, got {}", dispatch_hint(&other)),
+    }
+}
+
+/// A failing editor must surface as a status, never a panic or a lost workbook.
+#[test]
+fn edit_workbook_external_editor_error_is_a_status() {
+    let _no_editor = NoEditorGuard::take();
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("book.corro");
+    std::fs::write(&log, "CORRO_LOG 1\n").unwrap();
+
+    let mut app = App::new_with_paths(vec![log.clone()]);
+    app.load_initial().unwrap();
+    let mut pending_scope = 0u8;
+    let mut clipboard = String::new();
+    let result = dispatch_menu_action(
+        &mut app,
+        "edit_workbook_external",
+        &mut pending_scope,
+        &mut clipboard,
+    );
+    match result {
+        MenuDispatch::Status(s) => assert!(
+            s.contains("Editor error"),
+            "a missing editor must be reported, got {s:?}"
+        ),
+        other => panic!("expected Status, got {}", dispatch_hint(&other)),
     }
 }

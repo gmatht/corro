@@ -11,6 +11,7 @@ pub struct MenuAction {
 
 #[derive(Clone, Copy)]
 pub enum MenuActionKind {
+    NewFile,
     Open,
     Save,
     SaveAs,
@@ -79,6 +80,9 @@ pub enum MenuActionKind {
     // Edit menu (ratatui parity)
     Duplicate,
     Extrapolate,
+    EditExternal,
+    EditWorkbookExternal,
+    FollowHyperlink,
     // Sheet menu (ratatui parity)
     SheetPrev,
     SheetNext,
@@ -93,6 +97,7 @@ pub enum MenuActionKind {
 
 pub fn action_kind_to_name(kind: MenuActionKind) -> &'static str {
     match kind {
+        MenuActionKind::NewFile => "new_file",
         MenuActionKind::Open => "open",
         MenuActionKind::Save => "save",
         MenuActionKind::SaveAs => "save_as",
@@ -156,6 +161,9 @@ pub fn action_kind_to_name(kind: MenuActionKind) -> &'static str {
         MenuActionKind::ExportOdt => "export_ods",
         MenuActionKind::Duplicate => "duplicate",
         MenuActionKind::Extrapolate => "extrapolate",
+        MenuActionKind::EditExternal => "edit_external",
+        MenuActionKind::EditWorkbookExternal => "edit_workbook_external",
+        MenuActionKind::FollowHyperlink => "follow_hyperlink",
         MenuActionKind::SheetPrev => "sheet_prev",
         MenuActionKind::SheetNext => "sheet_next",
         MenuActionKind::CopySheet => "copy_sheet",
@@ -302,6 +310,7 @@ macro_rules! menu_items {
 pub fn menu_bar() -> Vec<MenuAction> {
     menu_items! {
     "File" => [
+        "New"          => NewFile ("N"),
         "Open file"    => Open ("O"),
         "Save as"      => SaveAs ("A"),
         "Export"       => ("T") [
@@ -317,8 +326,8 @@ pub fn menu_bar() -> Vec<MenuAction> {
         ],
         "Sort view"    => SortView ("S"),
         "Persist sort" => SaveSort ("P"),
-        "Exit"         => Quit ("X"),
         "Replay"       => Replay ("R"),
+        "Exit"         => Quit ("X"),
     ],
     "Edit" => [
         "Cut"         => Cut ("X"),
@@ -328,6 +337,9 @@ pub fn menu_bar() -> Vec<MenuAction> {
         "Replace"     => Replace ("R"),
         "Duplicate"   => Duplicate ("D"),
         "Extrapolate" => Extrapolate ("E"),
+        "Edit in Text Editor" => EditExternal ("T"),
+        "Workbook (External)" => EditWorkbookExternal ("W"),
+        "Follow link" => FollowHyperlink ("O"),
     ],
     "Insert" => [
         "Rows"          => InsertRows ("R"),

@@ -431,10 +431,12 @@ pub(crate) enum MenuAction {
     Cut,
     Copy,
     Paste,
+    FollowHyperlink,
     Extrapolate,
     Find,
     Replace,
     Duplicate,
+    NewFile,
     OpenFile,
     Replay,
     SaveAs,
@@ -486,6 +488,8 @@ pub(crate) enum MenuAction {
     HelpCols,
     About,
     HelpFull,
+    EditExternal,
+    EditWorkbookExternal,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -495,7 +499,7 @@ struct MenuItem {
     target: MenuTarget,
 }
 
-const EDIT_MENU_ITEMS: [MenuItem; 7] = [
+const EDIT_MENU_ITEMS: [MenuItem; 10] = [
     MenuItem {
         shortcut: 'X',
         label: "Cut",
@@ -531,9 +535,29 @@ const EDIT_MENU_ITEMS: [MenuItem; 7] = [
         label: "Extrapolate",
         target: MenuTarget::Action(MenuAction::Extrapolate),
     },
+    MenuItem {
+        shortcut: 'T',
+        label: "Edit in Text Editor",
+        target: MenuTarget::Action(MenuAction::EditExternal),
+    },
+    MenuItem {
+        shortcut: 'W',
+        label: "Workbook (External)",
+        target: MenuTarget::Action(MenuAction::EditWorkbookExternal),
+    },
+    MenuItem {
+        shortcut: 'O',
+        label: "Follow link",
+        target: MenuTarget::Action(MenuAction::FollowHyperlink),
+    },
 ];
 
-const FILE_MENU_ITEMS: [MenuItem; 8] = [
+const FILE_MENU_ITEMS: [MenuItem; 9] = [
+    MenuItem {
+        shortcut: 'N',
+        label: "New",
+        target: MenuTarget::Action(MenuAction::NewFile),
+    },
     MenuItem {
         shortcut: 'O',
         label: "Open file",
@@ -565,14 +589,14 @@ const FILE_MENU_ITEMS: [MenuItem; 8] = [
         target: MenuTarget::Action(MenuAction::SaveSort),
     },
     MenuItem {
-        shortcut: 'X',
-        label: "Exit",
-        target: MenuTarget::Action(MenuAction::Exit),
-    },
-    MenuItem {
         shortcut: 'R',
         label: "Replay",
         target: MenuTarget::Action(MenuAction::Replay),
+    },
+    MenuItem {
+        shortcut: 'X',
+        label: "Exit",
+        target: MenuTarget::Action(MenuAction::Exit),
     },
 ];
 
@@ -1126,6 +1150,49 @@ impl App {
         )
     }
 
+    /// Re-enter the alternate screen after $EDITOR exits and re-sync ratatui
+    /// with the physical screen. The editor drew over the terminal while
+    /// ratatui's buffer cache still holds the pre-editor frame: without the
+    /// clear below, the next draw() diffs to nearly nothing and the editor's
+    /// leftovers stay visible (the UI never repaints). Clear resets both the
+    /// screen and the cache, so the pending redraw is a full repaint.
+    /// Generic over the backend writer so headless tests can drive it.
+    fn reenter_terminal_after_external_edit<W: std::io::Write>(
+        terminal: &mut Terminal<CrosstermBackend<W>>,
+    ) -> Result<(), RunError> {
+        if let Err(e) = execute!(terminal.backend_mut(), EnterAlternateScreen) {
+            return Err(RunError::Term(e));
+        }
+        if let Err(e) = execute!(terminal.backend_mut(), Hide) {
+            return Err(RunError::Term(e));
+        }
+        if let Err(e) = terminal.clear() {
+            return Err(RunError::Term(e));
+        }
+        Ok(())
+    }
+
+    /// Stage the cursor cell for the external-editor roundtrip (Ctrl+E /
+    /// Edit menu): the run loop suspends the TUI and runs $EDITOR on the
+    /// current raw text; [`App::finish_external_edit`] commits the result.
+    fn request_external_edit(&mut self) {
+        let addr = self.cursor.to_addr(&self.state.grid);
+        let cur = self.state.grid.get(&addr).unwrap_or_default();
+        self.pending_external_edit = Some((addr, cur));
+    }
+
+    /// Commit an external-editor result (empty = aborted/unchanged).
+    /// Data cells only: gutter cursors report instead of guessing.
+    fn finish_external_edit(&mut self, addr: CellAddr, text: String) -> Result<(), RunError> {
+        if let CellAddr::Main { .. } = addr {
+            self.apply_single_op(Op::SetCell { addr, value: text })?;
+            self.status = "External edit applied".into();
+        } else {
+            self.status = "External edit needs a data cell".into();
+        }
+        Ok(())
+    }
+
     fn snapshot_for_special_insert(&self) -> (String, usize, Option<SheetCursor>, Option<usize>) {
         if let Some((buffer, caret, fc, frs)) = self.pending_menu_edit.as_ref() {
             return (
@@ -1191,6 +1258,58 @@ impl App {
         self.edit_cursor = Some(caret);
     }
 
+    /// Follow the hyperlink in the cursor cell, if any (Edit ▸ Follow link
+    /// and Ctrl+O). The shared `ui_core::follow_hyperlink` computes the
+    /// target and the status text so every backend reports byte-identical
+    /// results; this only stores the status.
+    fn follow_hyperlink_under_cursor(&mut self) {
+        self.status = crate::ui_core::follow_hyperlink(&self.state.grid, self.cursor);
+    }
+
+    /// File ▸ New: replace the current document with a fresh blank workbook
+    /// (template or seeded blank — the same content a launch with no file
+    /// produces) and detach from any file. Histories, caches, watchers, and
+    /// in-flight interaction state are reset so nothing from the old document
+    /// leaks into the new one (stale undo ops, sort caches, staged edits, or
+    /// commit targets would corrupt it). Mirrors Open's reset sequence, minus
+    /// the path (like Open, unsaved work is abandoned, not guarded).
+    fn new_blank_workbook(&mut self) {
+        let (workbook, note) = crate::ui_core::fresh_blank_workbook();
+        self.workbook = workbook;
+        self.workbook.ensure_active_sheet();
+        self.view_sheet_id = self.workbook.sheet_id(self.workbook.active_sheet);
+        self.sync_active_sheet_cache();
+        self.persisted_view_sort_cols.clear();
+        self.path = None;
+        self.source_path = None;
+        self.import_source = None;
+        self.offset = 0;
+        self.ops_applied = 0;
+        self.revision_limit = None;
+        self.revision_browse = false;
+        self.revision_browse_limit = 1;
+        self.watcher = None;
+        self.op_history.clear();
+        self.redo_history.clear();
+        self.cursor = SheetCursor {
+            row: HEADER_ROWS,
+            col: MARGIN_COLS,
+        };
+        self.anchor = None;
+        self.selection_kind = SelectionKind::Cells;
+        self.unsaved_file = None;
+        self.special_picker = None;
+        self.special_insert_snap = None;
+        self.pending_menu_edit = None;
+        self.pending_external_edit = None;
+        self.pending_workbook_edit = None;
+        self.edit_target_addr = None;
+        self.edit_range_addrs = None;
+        self.pending_lost_edit = None;
+        self.refresh_linked_source_mtimes();
+        self.status = note.unwrap_or_else(|| "New workbook".into());
+    }
+
     fn menu_action_mode(&mut self, action: MenuAction) -> Mode {
         self.edit_special_palette = false;
         if !matches!(action, MenuAction::InsertSpecialChars) {
@@ -1245,6 +1364,35 @@ impl App {
                 }
                 self.status = "Use arrows to extend selection, Enter to duplicate, Esc to cancel".into();
                 Mode::Duplicate
+            }
+            MenuAction::EditExternal => {
+                // Staged only: the run loop suspends the TUI and runs the
+                // editor (menu_action_mode has no terminal access).
+                self.request_external_edit();
+                Mode::Normal
+            }
+            MenuAction::EditWorkbookExternal => {
+                // Staged only, like EditExternal: the run loop suspends the
+                // TUI, runs $EDITOR on the live .corro file, then reloads it.
+                match self.path.clone() {
+                    Some(path) => {
+                        self.pending_workbook_edit = Some(path);
+                    }
+                    None => {
+                        self.status =
+                            "Save the workbook first (File ▸ Save as), then edit it externally"
+                                .into();
+                    }
+                }
+                Mode::Normal
+            }
+            MenuAction::FollowHyperlink => {
+                self.follow_hyperlink_under_cursor();
+                Mode::Normal
+            }
+            MenuAction::NewFile => {
+                self.new_blank_workbook();
+                Mode::Normal
             }
             MenuAction::OpenFile => {
                 let buffer = self.open_path_prompt_buffer();
@@ -1721,6 +1869,7 @@ mod menu_tests {
         let visible = buf.content().iter().map(|c| c.symbol().to_string()).collect::<String>();
         assert!(visible.contains("Extrapolate"), "Edit menu missing Extrapolate: {}", visible);
         assert!(visible.contains("Duplicate"), "Edit menu missing Duplicate: {}", visible);
+        assert!(visible.contains("Follow link"), "Edit menu missing Follow link: {}", visible);
     }
 }
 
@@ -2370,6 +2519,14 @@ fn read_clipboard() -> Result<String, String> {
     /// Buffer, caret (`char` index), formula ref mode, ref token start char index — saved when entering the menu bar from Edit mode
     /// so Insert → Special Character can splice at the real caret.
     pending_menu_edit: Option<(String, usize, Option<SheetCursor>, Option<usize>)>,
+    /// (CellAddr, initial text) awaiting the external-editor roundtrip
+    /// (Ctrl+E / Edit menu). The run loop suspends the TUI, runs the
+    /// editor, and commits via [`App::finish_external_edit`].
+    pending_external_edit: Option<(CellAddr, String)>,
+    /// Set by Edit ▸ Workbook (External): the run loop suspends the TUI, runs
+    /// $EDITOR on the live `.corro` file, then reloads it. `Some(path)` keeps
+    /// the target explicit (the path can change between staging and dispatch).
+    pending_workbook_edit: Option<std::path::PathBuf>,
     /// Text and caret when opening the special-character picker (`formula_cursor` restores `=`-ref picks).
     special_insert_snap: Option<(String, usize, Option<SheetCursor>, Option<usize>)>,
     pending_format_target: Option<FormatTarget>,
@@ -2590,6 +2747,8 @@ impl App {
             input_cursor: None,
             special_picker: None,
             pending_menu_edit: None,
+            pending_external_edit: None,
+            pending_workbook_edit: None,
             special_insert_snap: None,
             pending_format_target: None,
             view_sheet_id,
@@ -3169,10 +3328,6 @@ impl App {
                     .iter()
                     .find_map(|sheet| sheet.linked_source.as_ref().map(|source| source.path.as_path()))
             })
-    }
-
-    fn linked_sheet_base_state(source: &LinkedSource) -> Option<SheetState> {
-        crate::ops::load_linked_sheet_state(source).ok()
     }
 
     fn refresh_linked_source_mtimes(&mut self) {
@@ -4244,6 +4399,24 @@ impl App {
     fn move_cursor_horizontal_steps(&mut self, steps: usize, right: bool) {
         for _ in 0..steps {
             self.move_cursor_one_col_horizontal(right);
+        }
+    }
+
+    /// Logical row/column ranges covered by the current selection, for header
+    /// highlight. Mirrors the body's selection test exactly: `Cells` covers
+    /// the anchor↔cursor rectangle on both axes; `Rows` covers rows only;
+    /// `Cols` covers columns only. With no anchor nothing is covered — the
+    /// cursor row/column keep their existing active highlight.
+    fn selection_cover(&self) -> (Option<(usize, usize)>, Option<(usize, usize)>) {
+        let Some(a) = self.anchor else {
+            return (None, None);
+        };
+        let rows = (a.row.min(self.cursor.row), a.row.max(self.cursor.row));
+        let cols = (a.col.min(self.cursor.col), a.col.max(self.cursor.col));
+        match self.selection_kind {
+            SelectionKind::Cells => (Some(rows), Some(cols)),
+            SelectionKind::Rows => (Some(rows), None),
+            SelectionKind::Cols => (None, Some(cols)),
         }
     }
 
@@ -6789,218 +6962,12 @@ impl App {
             }
         }
 
-        // Fallback: build a compact CORRO log that contains only real user
-        // ops (NewSheet / LinkSheet and main-region SETs including explicit
-        // clears). Omit synthetic SIZE, COL_WIDTH, MAX_COL_WIDTH, FORMAT
-        // entries which are typically produced by UI maintenance.
-        let mut buf = String::new();
-        buf.push_str(&format!(
-            "{} {}\n",
-            crate::ops::LOG_HEADER_PREFIX,
-            crate::ops::LOG_VERSION
-        ));
-        let omit_sheet1_prefix = self.workbook.sheet_count() == 1;
-        for sheet in &self.workbook.sheets {
-            // For linked sheets we prefer to encode the UI-visible title in
-            // the LINK entry and omit a separate NEW_SHEET line. This keeps
-            // the log compact and avoids duplicate title storage. Compute
-            // `linked_base` for later comparison of base values.
-            let linked_base = if let Some(source) = &sheet.linked_source {
-                // If the title contains the pipe separator we fallback to
-                // emitting a NEW_SHEET line to avoid ambiguity.
-                if sheet.title.contains(" | ") {
-                    for line in (crate::ops::WorkbookOp::NewSheet {
-                        id: sheet.id,
-                        title: sheet.title.clone(),
-                    })
-                    .to_log_lines_with_policy(sheet.state.grid.main_cols(), omit_sheet1_prefix)
-                    {
-                        buf.push_str(&line);
-                        buf.push('\n');
-                    }
-                    // Emit LINK without corrotitle in the fallback case.
-                    for line in (crate::ops::WorkbookOp::LinkSheet {
-                        id: sheet.id,
-                        source: source.clone(),
-                    })
-                    .to_log_lines_with_policy(sheet.state.grid.main_cols(), omit_sheet1_prefix)
-                    {
-                        buf.push_str(&line);
-                        buf.push('\n');
-                    }
-                } else {
-                    // Normal case: write LINK with an embedded corrotitle if
-                    // the sheet title differs from the derived title.
-                    let derived = crate::ops::derive_title_from_source(source);
-                    let mut src_for_write = source.clone();
-                    // If the sheet title equals the derived title then omit
-                    // the corrotitle to keep the LINK compact.
-                    if sheet.title != derived {
-                        src_for_write.corrotitle = Some(sheet.title.clone());
-                    } else {
-                        src_for_write.corrotitle = None;
-                    }
-                    for line in (crate::ops::WorkbookOp::LinkSheet {
-                        id: sheet.id,
-                        source: src_for_write,
-                    })
-                    .to_log_lines_with_policy(sheet.state.grid.main_cols(), omit_sheet1_prefix)
-                    {
-                        buf.push_str(&line);
-                        buf.push('\n');
-                    }
-                }
-                Self::linked_sheet_base_state(source)
-            } else {
-                for line in (crate::ops::WorkbookOp::NewSheet {
-                    id: sheet.id,
-                    title: sheet.title.clone(),
-                })
-                .to_log_lines_with_policy(sheet.state.grid.main_cols(), omit_sheet1_prefix)
-                {
-                    buf.push_str(&line);
-                    buf.push('\n');
-                }
-                None
-            };
-            let mut base_values = std::collections::HashMap::new();
-            let mut addrs = std::collections::HashSet::new();
-            if let Some(base) = &linked_base {
-                for (addr, value) in base.grid.iter_nonempty() {
-                    if matches!(addr, CellAddr::Main { .. }) {
-                        addrs.insert(addr.clone());
-                        base_values.insert(addr, value);
-                    }
-                }
-            }
-            for (addr, value) in sheet.state.grid.iter_nonempty() {
-                if matches!(addr, CellAddr::Main { .. }) {
-                    addrs.insert(addr.clone());
-                    if linked_base.is_none() || base_values.get(&addr) != Some(&value) {
-                        for line in (crate::ops::WorkbookOp::SheetOp {
-                            sheet_id: sheet.id,
-                            op: Op::SetCell {
-                                addr: addr.clone(),
-                                value,
-                            },
-                        })
-                        .to_log_lines_with_policy(sheet.state.grid.main_cols(), omit_sheet1_prefix)
-                        {
-                            buf.push_str(&line);
-                            buf.push('\n');
-                        }
-                    }
-                }
-            }
-            if linked_base.is_some() {
-                for addr in addrs {
-                    if let CellAddr::Main { .. } = addr {
-                        if !sheet.state.grid.get(&addr).is_some_and(|v| !v.is_empty()) {
-                            if base_values.get(&addr).is_some_and(|v| !v.is_empty()) {
-                                for line in (crate::ops::WorkbookOp::SheetOp {
-                                    sheet_id: sheet.id,
-                                    op: Op::SetCell {
-                                        addr: addr.clone(),
-                                        value: String::new(),
-                                    },
-                                })
-                                .to_log_lines_with_policy(
-                                    sheet.state.grid.main_cols(),
-                                    omit_sheet1_prefix,
-                                ) {
-                                    buf.push_str(&line);
-                                    buf.push('\n');
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-            for sheet in &self.workbook.sheets {
-                // Persist per-sheet view-sort cols that the user requested to keep
-                // across saves. Use the persisted_view_sort_cols cache so we don't
-                // accidentally persist transient UI sort state.
-                if let Some(cols) = self.persisted_view_sort_cols.get(&sheet.id) {
-                    if !cols.is_empty() {
-                        for line in (crate::ops::WorkbookOp::SheetOp {
-                            sheet_id: sheet.id,
-                            op: Op::SetViewSortCols { cols: cols.clone() },
-                        })
-                        .to_log_lines_with_policy(sheet.state.grid.main_cols(), omit_sheet1_prefix)
-                        {
-                            buf.push_str(&line);
-                            buf.push('\n');
-                        }
-                    }
-                }
-
-                // Persist explicit column formats the user set. Iterate the three
-                // scoped maps (All, Data, Special) and emit FORMAT COL entries for
-                // each stored override.
-                for (col, format) in sheet.state.grid.col_all_formats() {
-                    for line in (crate::ops::WorkbookOp::SheetOp {
-                        sheet_id: sheet.id,
-                        op: Op::SetColumnFormat {
-                            scope: FormatScope::All,
-                            col,
-                            format,
-                        },
-                    })
-                    .to_log_lines_with_policy(sheet.state.grid.main_cols(), omit_sheet1_prefix)
-                    {
-                        buf.push_str(&line);
-                        buf.push('\n');
-                    }
-                }
-                for (col, format) in sheet.state.grid.col_data_formats() {
-                    for line in (crate::ops::WorkbookOp::SheetOp {
-                        sheet_id: sheet.id,
-                        op: Op::SetColumnFormat {
-                            scope: FormatScope::Data,
-                            col,
-                            format,
-                        },
-                    })
-                    .to_log_lines_with_policy(sheet.state.grid.main_cols(), omit_sheet1_prefix)
-                    {
-                        buf.push_str(&line);
-                        buf.push('\n');
-                    }
-                }
-                for (col, format) in sheet.state.grid.col_special_formats() {
-                    for line in (crate::ops::WorkbookOp::SheetOp {
-                        sheet_id: sheet.id,
-                        op: Op::SetColumnFormat {
-                            scope: FormatScope::Special,
-                            col,
-                            format,
-                        },
-                    })
-                    .to_log_lines_with_policy(sheet.state.grid.main_cols(), omit_sheet1_prefix)
-                    {
-                        buf.push_str(&line);
-                        buf.push('\n');
-                    }
-                }
-
-                // Persist any exact-cell formats applied by the user.
-                for (addr, format) in sheet.state.grid.cell_formats() {
-                    for line in (crate::ops::WorkbookOp::SheetOp {
-                        sheet_id: sheet.id,
-                        op: Op::SetCellFormat {
-                            addr: addr.clone(),
-                            format,
-                        },
-                    })
-                    .to_log_lines_with_policy(sheet.state.grid.main_cols(), omit_sheet1_prefix)
-                    {
-                        buf.push_str(&line);
-                        buf.push('\n');
-                    }
-                }
-            }
+        // Canonical CORRO_LOG serialization lives in io so the GUI backend
+        // writes the identical format (one implementation, both callers).
+        let buf = crate::io::serialize_workbook_log(
+            &self.workbook,
+            &self.persisted_view_sort_cols,
+        );
 
         // Write to a temporary file next to the destination and atomically
         // rename over the target. This mirrors save semantics used elsewhere.
@@ -9054,6 +9021,55 @@ impl App {
                         pending_redraw = true;
                     }
                 }
+
+                // External-editor roundtrip (Ctrl+E / Edit menu): suspend
+                // the TUI, run $EDITOR on the staged cell text, commit on
+                // return. Staged by request_external_edit, which has no
+                // terminal access of its own.
+                if let Some((addr, initial)) = self.pending_external_edit.take() {
+                    let _ = disable_raw_mode();
+                    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+                    let result = crate::editor::edit_text_externally(&initial);
+                    if let Err(e) = enable_raw_mode() {
+                        return Err(RunError::Term(e));
+                    }
+                    Self::reenter_terminal_after_external_edit(&mut terminal)?;
+                    match result {
+                        Ok(Some(text)) => {
+                            self.finish_external_edit(addr, text)?;
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            self.status = format!("Editor error: {e}");
+                        }
+                    }
+                    pending_redraw = true;
+                }
+
+                // Workbook (External) roundtrip (Edit ▸ Workbook (External)):
+                // suspend the TUI, run $EDITOR on the live .corro file, then
+                // reload it. Staged by menu_action_mode (no terminal access).
+                if let Some(path) = self.pending_workbook_edit.take() {
+                    let _ = disable_raw_mode();
+                    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+                    let result = crate::editor::edit_workbook_externally(&path);
+                    if let Err(e) = enable_raw_mode() {
+                        return Err(RunError::Term(e));
+                    }
+                    Self::reenter_terminal_after_external_edit(&mut terminal)?;
+                    match result {
+                        Ok(true) => match self.reload_workbook_from_log_path(&path) {
+                            Ok(()) => {
+                                self.status =
+                                    format!("Reloaded {} after external edit", path.display())
+                            }
+                            Err(e) => self.status = format!("Reload error: {e}"),
+                        },
+                        Ok(false) => self.status = "Unchanged".into(),
+                        Err(e) => self.status = format!("Editor error: {e}"),
+                    }
+                    pending_redraw = true;
+                }
             }
             Ok(())
         })();
@@ -9315,10 +9331,14 @@ impl App {
                 format!("{:>width$}", "", width = ROW_LABEL_CHARS),
                 Style::default().add_modifier(Modifier::BOLD),
             )];
+            let (_, cover_cols) = self.selection_cover();
             for (i, &c) in col_ixs.iter().enumerate() {
                 let name = col_header_label(c, grid.main_cols());
                 let active_col = c == self.cursor.col;
-                let style = if active_col {
+                // Covered columns glow like the active one (Excel parity:
+                // selecting A1:B2 highlights the A and B headers).
+                let covered_col = cover_cols.is_some_and(|(c0, c1)| c >= c0 && c <= c1);
+                let style = if active_col || covered_col {
                     Style::default()
                         .fg(Color::Black)
                         .bg(Color::Yellow)
@@ -9393,11 +9413,14 @@ impl App {
         let show_right_divider = col_ixs.contains(&(lm + mc));
         let max_data_lines = inner_h.saturating_sub(1);
         let last_display_main_row = grid.sorted_main_rows().last().map(|row| hr + *row);
+        let (cover_rows, _) = self.selection_cover();
         for &r in row_ixs.iter().take(max_data_lines) {
             let active_row = r == self.cursor.row;
+            // Covered rows glow like the active one (same rule as columns).
+            let covered_row = cover_rows.is_some_and(|(r0, r1)| r >= r0 && r <= r1);
             let is_underlined_boundary_row =
                 (hr > 0 && r == hr - 1) || last_display_main_row == Some(r);
-            let mut row_label_style = if active_row {
+            let mut row_label_style = if active_row || covered_row {
                 Style::default()
                     .fg(Color::Black)
                     .bg(Color::Yellow)
@@ -9643,6 +9666,17 @@ impl App {
                         if is_underlined_boundary_row {
                             st_src = st_src.add_modifier(Modifier::UNDERLINED);
                         }
+                        // Hyperlinks render blue and underlined by default
+                        // (spilled text keeps the source cell's link style).
+                        // Cursor/selection highlights win for readability.
+                        if !is_cur_src
+                            && !sel_src
+                            && hyperlink_target(&formatted).is_some()
+                        {
+                            st_src = st_src
+                                .fg(Color::Blue)
+                                .add_modifier(Modifier::UNDERLINED);
+                        }
 
                         // Render each included column.  Structural separators
                         // (pipes) are emitted as separate spans so that
@@ -9795,6 +9829,15 @@ impl App {
                 }
                 if is_underlined_boundary_row {
                     st = st.add_modifier(Modifier::UNDERLINED);
+                }
+                // Hyperlinks render blue and underlined by default.
+                // Cursor/selection/aggregate highlights win for readability.
+                if !is_cur
+                    && !sel
+                    && !is_agg_cell
+                    && hyperlink_target(&formatted).is_some()
+                {
+                    st = st.fg(Color::Blue).add_modifier(Modifier::UNDERLINED);
                 }
                 spans_raw.push((disp.clone(), st));
                 match inter_column_trailing_after_data_cell(i, c, &col_ixs, lm, mc, show_right_divider) {
@@ -10416,6 +10459,25 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                 return Ok(false);
             }
 
+            // Ctrl+E: stage the cursor cell for the external editor (the
+            // run loop suspends the TUI and runs $EDITOR; see
+            // request_external_edit). Free: no other Ctrl+E binding exists.
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(key.code, KeyCode::Char('e') | KeyCode::Char('E'))
+            {
+                self.request_external_edit();
+                return Ok(false);
+            }
+
+            // Ctrl+O: follow the hyperlink under the cursor (same as
+            // Edit ▸ Follow link). Free: no other Ctrl+O binding exists.
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(key.code, KeyCode::Char('o') | KeyCode::Char('O'))
+            {
+                self.follow_hyperlink_under_cursor();
+                return Ok(false);
+            }
+
             if key.modifiers.contains(KeyModifiers::CONTROL)
                 && matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S'))
             {
@@ -10737,8 +10799,9 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                     'o' | 'O' => {
                         self.open_menu_path_with_prior_mode(
                             vec![MenuLevel {
+                                // Open file is File item 1 (New sits at 0).
                                 section: MenuSection::File,
-                                item: 0,
+                                item: 1,
                             }],
                             &mode,
                         );
@@ -13294,6 +13357,143 @@ mod drive_feature_tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+    // ── external editor (Ctrl+E / Edit menu stage; the run loop runs $EDITOR) ──
+    #[test]
+    fn ctrl_e_stages_cursor_cell_for_external_edit() {
+        let mut app = App::new(None);
+        app.cursor = a1();
+        app.state.grid.set(&main_cell(0, 0), "celltext".into());
+        press(&mut app, KeyCode::Char('e'), KeyModifiers::CONTROL);
+        let (addr, initial) = app
+            .pending_external_edit
+            .clone()
+            .expect("Ctrl+E must stage the cell");
+        assert_eq!(addr, main_cell(0, 0));
+        assert_eq!(initial, "celltext");
+    }
+
+    #[test]
+    fn edit_menu_text_editor_item_stages_cell() {
+        let mut app = App::new(None);
+        app.cursor = a1();
+        app.open_menu(MenuSection::Edit);
+        choose(&mut app, 't');
+        assert!(
+            app.pending_external_edit.is_some(),
+            "Edit > Edit in Text Editor (T) must stage the cell"
+        );
+    }
+
+    #[test]
+    fn edit_menu_workbook_external_stages_the_live_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("book.corro");
+        std::fs::write(&path, "CORRO_LOG 1\n").unwrap();
+        let mut app = App::new(Some(path.clone()));
+        app.load_initial().unwrap();
+        app.open_menu(MenuSection::Edit);
+        choose(&mut app, 'w');
+        assert_eq!(
+            app.pending_workbook_edit.as_deref(),
+            Some(path.as_path()),
+            "Edit > Workbook (External) (W) must stage the live .corro path"
+        );
+    }
+
+    #[test]
+    fn edit_menu_workbook_external_without_a_file_asks_to_save_first() {
+        let mut app = App::new(None);
+        app.open_menu(MenuSection::Edit);
+        choose(&mut app, 'w');
+        assert!(app.pending_workbook_edit.is_none());
+        assert!(
+            app.status.contains("Save the workbook first"),
+            "unsaved workbook must report the save-first hint, got {:?}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn finish_external_edit_commits_data_cells() {
+        let mut app = App::new(None);
+        app.finish_external_edit(main_cell(0, 0), "NEW".into()).unwrap();
+        assert_eq!(
+            app.state.grid.get(&main_cell(0, 0)).as_deref(),
+            Some("NEW")
+        );
+        assert_eq!(app.status, "External edit applied");
+        // Gutter cursors report instead of committing somewhere odd.
+        app.finish_external_edit(CellAddr::Left { col: 0, row: 0 }, "X".into())
+            .unwrap();
+        assert_eq!(app.status, "External edit needs a data cell");
+        assert_ne!(
+            app.state.grid.get(&main_cell(0, 0)).as_deref(),
+            Some("X")
+        );
+    }
+
+    /// After the external editor returns, re-entering must reset ratatui's
+    /// screen state so the next draw is a FULL repaint. The editor scribbles
+    /// outside ratatui's knowledge (its buffer cache still holds the
+    /// pre-editor frame), so without the clear the draw diffs to nearly
+    /// nothing and the editor's leftovers stay visible — the UI "fails to
+    /// re-draw". Structural: scribbles over a headless terminal, resumes,
+    /// and asserts the repaint output actually contains the frame content
+    /// (it would be empty without the clear).
+    #[test]
+    fn reenter_after_external_edit_forces_full_repaint() {
+        use ratatui::backend::CrosstermBackend;
+        use ratatui::Terminal;
+        use std::io::Write as _;
+
+        // Headless stand-in for the real terminal: everything ratatui (and
+        // the simulated editor) writes lands in this shared buffer, which
+        // the test inspects (CrosstermBackend's own reader is unstable).
+        #[derive(Clone, Default)]
+        struct SharedOut(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+        impl std::io::Write for SharedOut {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.borrow_mut().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let out = SharedOut::default();
+        let mut terminal = Terminal::new(CrosstermBackend::new(out.clone())).unwrap();
+        let paint = |terminal: &mut Terminal<CrosstermBackend<SharedOut>>| {
+            terminal
+                .draw(|f| {
+                    f.render_widget(
+                        ratatui::widgets::Paragraph::new("GRID-CONTENT"),
+                        f.area(),
+                    );
+                })
+                .unwrap();
+        };
+        // 1. The app paints its frame (ratatui caches it).
+        paint(&mut terminal);
+        // 2. The external editor scribbles outside ratatui's knowledge.
+        write!(terminal.backend_mut(), "EDITOR-LEFTOVERS").unwrap();
+        assert!(
+            out.0.borrow().windows(16).any(|w| w == b"EDITOR-LEFTOVERS"),
+            "scribble must reach the backend"
+        );
+        // 3. Resume (the fix): re-enter + clear.
+        App::reenter_terminal_after_external_edit(&mut terminal).unwrap();
+        // 4. The next draw must be a full repaint: its output contains the
+        //    frame content. Without the clear it would diff to (nearly)
+        //    nothing and the leftovers would stay on screen.
+        let before = out.0.borrow().len();
+        paint(&mut terminal);
+        let after = out.0.borrow();
+        assert!(
+            after[before..].windows(12).any(|w| w == b"GRID-CONTENT"),
+            "post-editor draw must fully repaint the frame"
+        );
+    }
+
     // ── helpers: drive the *real* input handler with faked keypresses ──
     fn press(app: &mut App, code: KeyCode, mods: KeyModifiers) {
         app.handle_key(KeyEvent::new(code, mods)).unwrap();
@@ -13364,6 +13564,130 @@ mod drive_feature_tests {
         );
     }
 
+    // ── Selected-header highlight ──
+    // The grid renders inside a bordered titled panel, so header/label
+    // positions are *located* (never hardcoded): the title line carries
+    // "r ×", the next line is the column-header line, and row gutters sit
+    // at the line start. Byte indices convert to cells via chars().count()
+    // (the box-drawing border is multibyte).
+    fn line_text(buffer: &ratatui::buffer::Buffer, y: u16) -> String {
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect()
+    }
+    fn header_line_y(buffer: &ratatui::buffer::Buffer) -> u16 {
+        for y in 0..buffer.area.height {
+            if line_text(buffer, y).contains("r \u{00d7}") {
+                return y + 1;
+            }
+        }
+        panic!("grid title line not found");
+    }
+    /// Style of a main-column header label (`"A"`, `"B"`, …). The label is
+    /// the space-padded occurrence (`" A "`); bracketed margin labels
+    /// (`"[A"`, `"]B"`) never match the spaced needle.
+    fn header_style(buffer: &ratatui::buffer::Buffer, label: &str) -> (Color, Color, Modifier) {
+        let hy = header_line_y(buffer);
+        let line = line_text(buffer, hy);
+        let needle = format!(" {label} ");
+        let bi = line.find(&needle).expect("header label");
+        let x = (line[..bi].chars().count() + 1) as u16;
+        let c = &buffer[(x, hy)];
+        (c.fg, c.bg, c.modifier)
+    }
+    /// Style of a row label (`"1"`, `"2"`, …): right-aligned in the
+    /// gutter at the line start.
+    fn rowlabel_style(buffer: &ratatui::buffer::Buffer, label: &str) -> (Color, Color, Modifier) {
+        let needle = format!("   {label} ");
+        for y in 0..buffer.area.height {
+            let line = line_text(buffer, y);
+            if let Some(bi) = line.find(&needle) {
+                if bi < 12 {
+                    let x = (line[..bi].chars().count() + 3) as u16;
+                    let c = &buffer[(x, y)];
+                    return (c.fg, c.bg, c.modifier);
+                }
+            }
+        }
+        panic!("row label {label:?} not found");
+    }
+    fn is_header_highlighted(s: (Color, Color, Modifier)) -> bool {
+        s.0 == Color::Black && s.1 == Color::Yellow && s.2.contains(Modifier::BOLD)
+    }
+    fn draw_grid(app: &mut App) -> ratatui::buffer::Buffer {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+    fn fresh_2x3() -> App {
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(2, 3);
+        app.cursor = a1();
+        app
+    }
+    #[test]
+    fn selected_headers_highlight_cells_range() {
+        let mut app = fresh_2x3();
+        // Baseline, no anchor: only the cursor headers glow.
+        let buf = draw_grid(&mut app);
+        assert!(is_header_highlighted(header_style(&buf, "A")));
+        assert!(!is_header_highlighted(header_style(&buf, "B")));
+        assert_eq!(header_style(&buf, "B").0, Color::Cyan);
+        assert!(is_header_highlighted(rowlabel_style(&buf, "1")));
+        assert!(!is_header_highlighted(rowlabel_style(&buf, "2")));
+        // Shift+Right, Shift+Down: anchor A1, cursor B2 — covered headers
+        // glow on both axes, including covered-but-not-active ones (col A,
+        // row 1); col C stays plain.
+        press(&mut app, KeyCode::Right, KeyModifiers::SHIFT);
+        press(&mut app, KeyCode::Down, KeyModifiers::SHIFT);
+        let buf = draw_grid(&mut app);
+        assert!(is_header_highlighted(header_style(&buf, "A")));
+        assert!(is_header_highlighted(header_style(&buf, "B")));
+        assert!(!is_header_highlighted(header_style(&buf, "C")));
+        assert!(is_header_highlighted(rowlabel_style(&buf, "1")));
+        assert!(is_header_highlighted(rowlabel_style(&buf, "2")));
+        // Collapsing the anchor removes the coverage (cursor-only rule).
+        app.anchor = None;
+        let buf = draw_grid(&mut app);
+        assert!(!is_header_highlighted(header_style(&buf, "A")));
+        assert!(is_header_highlighted(header_style(&buf, "B")));
+        assert!(!is_header_highlighted(rowlabel_style(&buf, "1")));
+        assert!(is_header_highlighted(rowlabel_style(&buf, "2")));
+    }
+    #[test]
+    fn selected_headers_rows_kind_covers_rows_only() {
+        let mut app = fresh_2x3();
+        app.expand_selection_to_rows();
+        // Extend down: anchor row 1, cursor row 2, still Rows-kind. Row 1's
+        // label must glow via coverage (it is not the active row); no
+        // column is covered, so only the active column (last, C) keeps its
+        // cursor highlight.
+        press(&mut app, KeyCode::Down, KeyModifiers::SHIFT);
+        let buf = draw_grid(&mut app);
+        assert!(is_header_highlighted(rowlabel_style(&buf, "1")));
+        assert!(is_header_highlighted(rowlabel_style(&buf, "2")));
+        assert!(!is_header_highlighted(header_style(&buf, "A")));
+        assert!(!is_header_highlighted(header_style(&buf, "B")));
+    }
+    #[test]
+    fn selected_headers_cols_kind_covers_cols_only() {
+        let mut app = fresh_2x3();
+        app.expand_selection_to_cols();
+        // Extend right: anchor col A, cursor col B, still Cols-kind. Col A's
+        // header must glow via coverage (it is not the active column); no
+        // row is covered, so only the active row (last, 2) keeps its cursor
+        // highlight.
+        press(&mut app, KeyCode::Right, KeyModifiers::SHIFT);
+        let buf = draw_grid(&mut app);
+        assert!(is_header_highlighted(header_style(&buf, "A")));
+        assert!(is_header_highlighted(header_style(&buf, "B")));
+        assert!(!is_header_highlighted(header_style(&buf, "C")));
+        assert!(!is_header_highlighted(rowlabel_style(&buf, "1")));
+        assert!(is_header_highlighted(rowlabel_style(&buf, "2")));
+    }
     // ── Editing (direct key) ──
     #[test]
     fn drive_edit_cell_commits_value() {
@@ -14892,8 +15216,9 @@ mod tests {
         let mut app = App::new(None);
         app.mode = Mode::Menu {
             stack: vec![MenuLevel {
+                // Export is File item 3 (New sits at 0).
                 section: MenuSection::File,
-                item: 2,
+                item: 3,
             }],
         };
 
@@ -14912,9 +15237,10 @@ mod tests {
 
     #[test]
     fn menu_preview_includes_child_submenu() {
+        // Export is File item 3 (New sits at 0).
         let levels = App::menu_render_levels(&[MenuLevel {
             section: MenuSection::File,
-            item: 2,
+            item: 3,
         }]);
 
         assert_eq!(levels.len(), 2);
@@ -16040,6 +16366,268 @@ mod tests {
             Mode::Edit { buffer, .. } => assert_eq!(buffer, "https://example.com"),
             other => panic!("unexpected mode: {other:?}"),
         }
+    }
+
+    // `CORRO_URL_OPENER` is process-global: follow-link tests serialize on
+    // the shared `ui_core::URL_OPENER_LOCK` (also used by ui_core's own
+    // opener tests) and always restore the previous value.
+
+    /// Point the URL opener at a recorder script; returns the guard (held
+    /// for the override's duration), the previous value, and the log path.
+    fn record_opener() -> (
+        std::sync::MutexGuard<'static, ()>,
+        Option<String>,
+        std::path::PathBuf,
+    ) {
+        let guard = crate::ui_core::URL_OPENER_LOCK.lock().unwrap();
+        let prev = std::env::var("CORRO_URL_OPENER").ok();
+        let dir = std::env::temp_dir().join(format!("corro-follow-ui-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let record = dir.join("opened.log");
+        let _ = std::fs::remove_file(&record);
+        let script = dir.join("record.sh");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\necho \"$1\" >> \"{}\"\n", record.display()),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).unwrap();
+        }
+        std::env::set_var("CORRO_URL_OPENER", script.to_str().unwrap());
+        (guard, prev, record)
+    }
+
+    fn restore_opener(_guard: std::sync::MutexGuard<'static, ()>, prev: Option<String>) {
+        match prev {
+            Some(v) => std::env::set_var("CORRO_URL_OPENER", v),
+            None => std::env::remove_var("CORRO_URL_OPENER"),
+        }
+    }
+
+    /// Poll the recorder log until it holds `want` (the opener spawns
+    /// detached, so the child may not have run yet).
+    fn wait_recorded(record: &std::path::Path, want: &str) {
+        for _ in 0..200 {
+            let logged = std::fs::read_to_string(record).unwrap_or_default();
+            if logged.trim() == want {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        panic!(
+            "recorder never received {want:?} (got {:?})",
+            std::fs::read_to_string(record).unwrap_or_default()
+        );
+    }
+
+    #[test]
+    fn ctrl_o_follows_hyperlink_under_cursor() {
+        let (guard, prev, record) = record_opener();
+        let mut app = App::new(None);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "https://example.com".into());
+        app.cursor = SheetCursor { row: HEADER_ROWS, col: MARGIN_COLS };
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL)).unwrap();
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(app.status, "Opened https://example.com");
+        wait_recorded(&record, "https://example.com");
+        restore_opener(guard, prev);
+    }
+
+    #[test]
+    fn ctrl_o_reports_no_hyperlink() {
+        let (guard, prev, record) = record_opener();
+        let mut app = App::new(None);
+        app.state.grid.set(&CellAddr::Main { row: 0, col: 0 }, "just text".into());
+        app.cursor = SheetCursor { row: HEADER_ROWS, col: MARGIN_COLS };
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL)).unwrap();
+        assert_eq!(app.status, "No hyperlink at A1");
+        // Nothing spawned: the recorder stays empty.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let logged = std::fs::read_to_string(&record).unwrap_or_default();
+        assert!(logged.trim().is_empty(), "non-link must not spawn the opener");
+        restore_opener(guard, prev);
+    }
+
+    #[test]
+    fn drive_edit_follow_link() {
+        let (guard, prev, record) = record_opener();
+        let mut app = App::new(None);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "https://example.com/docs".into());
+        app.cursor = SheetCursor { row: HEADER_ROWS, col: MARGIN_COLS };
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::ALT)).unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::empty())).unwrap(); // Edit ▸ Follow link
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(app.status, "Opened https://example.com/docs");
+        wait_recorded(&record, "https://example.com/docs");
+        restore_opener(guard, prev);
+    }
+
+    #[test]
+    fn drive_file_new_resets_to_blank_workbook() {
+        // CORRO_TEMPLATE would change what "blank" means; pin it absent.
+        let prev_template = std::env::var("CORRO_TEMPLATE").ok();
+        std::env::remove_var("CORRO_TEMPLATE");
+        let mut app = App::new(None);
+        // Dirty the doc: content, history, cursor off A1.
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "old".into());
+        app.op_history.push(Op::SetCell {
+            addr: CellAddr::Main { row: 0, col: 0 },
+            value: "old".into(),
+        });
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS + 2,
+            col: MARGIN_COLS + 1,
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT)).unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::empty())).unwrap(); // File ▸ New
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(app.status, "New workbook");
+        // Blank seeded workbook: old content gone, cursor home, detached.
+        assert_eq!(
+            app.state.grid.get(&CellAddr::Main { row: 0, col: 0 }),
+            None,
+            "old content must not survive New"
+        );
+        assert_eq!(
+            app.cursor,
+            SheetCursor {
+                row: HEADER_ROWS,
+                col: MARGIN_COLS
+            }
+        );
+        assert!(app.op_history.is_empty());
+        assert!(app.path.is_none());
+        match prev_template {
+            Some(v) => std::env::set_var("CORRO_TEMPLATE", v),
+            None => std::env::remove_var("CORRO_TEMPLATE"),
+        }
+    }
+
+    #[test]
+    fn hyperlink_cells_render_blue_and_underlined() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use ratatui::style::{Color, Modifier};
+
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(2, 2);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "https://example.com".into());
+        app.state.grid.set(&CellAddr::Main { row: 0, col: 1 }, "plain".into());
+        // Cursor off the link (cursor highlight wins over link style).
+        app.cursor = SheetCursor {
+            row: HEADER_ROWS + 1,
+            col: MARGIN_COLS,
+        };
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        // Structural: the URL's visible symbols are blue + underlined…
+        let mut link_symbols = String::new();
+        let mut link_cells = 0u32;
+        let mut other_blue_underline = 0u32;
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                let cell = &buffer[(x, y)];
+                let is_link_style =
+                    cell.fg == Color::Blue && cell.modifier.contains(Modifier::UNDERLINED);
+                if cell.symbol() != " " && is_link_style {
+                    link_symbols.push_str(cell.symbol());
+                    link_cells += 1;
+                } else if is_link_style {
+                    other_blue_underline += 1;
+                }
+            }
+        }
+        assert!(
+            link_cells > 5,
+            "expected the URL rendered blue+underlined, got {link_symbols:?}"
+        );
+        assert!(
+            "https://example.com".starts_with(link_symbols.trim_end_matches('…')),
+            "link-styled text must be the URL, got {link_symbols:?}"
+        );
+        assert_eq!(
+            other_blue_underline, 0,
+            "link style must not leak onto padding/other cells"
+        );
+        // …and the plain neighbor cell (same visual row, later columns)
+        // is unstyled: only the URL's own columns carry link style.
+        let mut plain_saw_blue = false;
+        for y in 0..buffer.area.height {
+            let line = (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>();
+            if let Some(start) = line.find("plain") {
+                // Char index → cell x (all ASCII here, so 1:1).
+                for x in start..start + "plain".len() {
+                    let cell = &buffer[(x as u16, y)];
+                    if cell.fg == Color::Blue {
+                        plain_saw_blue = true;
+                    }
+                }
+            }
+        }
+        assert!(!plain_saw_blue, "plain cell must not be link-styled");
+    }
+
+    #[test]
+    fn hyperlink_style_yields_to_cursor_and_selection() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use ratatui::style::{Color, Modifier};
+
+        let mut app = App::new(None);
+        app.state.grid.set_main_size(2, 2);
+        app.state
+            .grid
+            .set(&CellAddr::Main { row: 0, col: 0 }, "https://example.com".into());
+        // Cursor ON the link: cursor background wins, no blue foreground.
+        app.cursor = SheetCursor { row: HEADER_ROWS, col: MARGIN_COLS };
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut cursor_link_bg = false;
+        let mut cursor_link_blue_fg = false;
+        for y in 0..buffer.area.height {
+            let line = (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>();
+            if line.contains("https") {
+                for x in 0..buffer.area.width {
+                    let cell = &buffer[(x, y)];
+                    if cell.symbol() != " " && cell.symbol() != "│" {
+                        if cell.bg == Color::DarkGray {
+                            cursor_link_bg = true;
+                        }
+                        if cell.fg == Color::Blue
+                            && cell.modifier.contains(Modifier::UNDERLINED)
+                        {
+                            cursor_link_blue_fg = true;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(cursor_link_bg, "cursor cell keeps its highlight background");
+        assert!(
+            !cursor_link_blue_fg,
+            "cursor highlight wins over the blue link foreground"
+        );
     }
 
     #[test]
@@ -17718,6 +18306,69 @@ mod tests {
     }
 
     #[test]
+    fn total_of_totals_sums_complex_row_totals() {
+        // =Sqrt(-1) evaluates to complex by design (SQRT has a complex
+        // fallback, and complex values participate in SUM as Numbers).
+        // The TOTAL-of-TOTALs corner used to re-parse row-total *display
+        // strings* as f64, so a complex row total ("5+1i") was skipped
+        // exactly like a text row — blanking the corner whenever nothing
+        // real remained. It now parses the evaluator's complex displays
+        // back and sums them complex-aware (same shape column totals use).
+        let mut state = SheetState::new(3, 5);
+        state.grid.set(
+            &CellAddr::Header {
+                row: 0,
+                col: ColumnAddr::Main(2),
+            },
+            "=TOTAL".into(),
+        );
+        state.grid.set(&CellAddr::Main { row: 0, col: 0 }, "=Sqrt(-1)".into());
+        state.grid.set(&CellAddr::Main { row: 0, col: 1 }, "5".into());
+        state.grid.set(&CellAddr::Main { row: 1, col: 0 }, "1".into());
+        state.grid.set(&CellAddr::Main { row: 1, col: 1 }, "2".into());
+
+        // The complex cell and its row SUM are real computed values.
+        assert_eq!(
+            cell_effective_display(&state.grid, &CellAddr::Main { row: 0, col: 0 }),
+            "0+1i"
+        );
+        let row0: String = crate::agg::compute_aggregate(
+            &state.grid,
+            &crate::ops::AggregateDef {
+                func: AggFunc::Sum,
+                source: crate::grid::MainRange {
+                    row_start: 0,
+                    row_end: 1,
+                    col_start: 0,
+                    col_end: 2,
+                },
+            },
+        );
+        assert_eq!(row0, "5+1i");
+        assert!(row0.trim().parse::<f64>().is_err());
+
+        // …and the corner sums them instead of dropping them: (5+i)+3.
+        assert_eq!(
+            footer_special_col_aggregate(&state.grid, AggFunc::Sum, MARGIN_COLS + 2, 2, 5),
+            Some("8+1i".into())
+        );
+        // A lone complex row is no longer blank either.
+        let mut solo = SheetState::new(1, 1);
+        solo.grid.set(
+            &CellAddr::Header {
+                row: 0,
+                col: ColumnAddr::Main(0),
+            },
+            "=TOTAL".into(),
+        );
+        solo.grid.set(&CellAddr::Main { row: 0, col: 0 }, "=Sqrt(-1)".into());
+        assert_eq!(
+            footer_special_col_aggregate(&solo.grid, AggFunc::Sum, MARGIN_COLS, 1, 1),
+            Some("0+1i".into())
+        );
+    }
+
+    #[test]
     fn page_up_page_down_step_by_grid_viewport_row_count() {
         let mut app = App::new(None);
         app.state.grid.set_main_size(20, 1);
@@ -17883,8 +18534,9 @@ mod tests {
         app.mode = Mode::Menu {
             stack: vec![
                 MenuLevel {
+                    // Export is File item 3 (New sits at 0).
                     section: MenuSection::File,
-                    item: 2,
+                    item: 3,
                 },
                 MenuLevel {
                     section: MenuSection::Export,
@@ -18811,6 +19463,15 @@ mod tests {
     fn file_menu_includes_replay() {
         let items = menu_items(MenuSection::File);
         assert!(items.iter().any(|item| item.label == "Replay"));
+    }
+
+    #[test]
+    fn file_menu_new_first_exit_last() {
+        // File menu order: New at the top, Exit at the bottom.
+        let items = menu_items(MenuSection::File);
+        assert_eq!(items.first().map(|item| item.label), Some("New"));
+        assert_eq!(items.last().map(|item| item.label), Some("Exit"));
+        assert_eq!(items.first().map(|item| item.shortcut), Some('N'));
     }
 
     #[test]
@@ -22110,6 +22771,54 @@ mod tests {
         );
     }
 
+    /// Two App instances on one file model two gcorro windows: a cell
+    /// committed in A (which appends to the log immediately when a path is
+    /// bound -- no save step) must appear in B after B polls. The GUI
+    /// backend polls the CoreApp twin of this logic on every keystroke
+    /// (parity with the TUI loop).
+    #[test]
+    fn second_window_tails_first_windows_committed_cell() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shared.corro");
+        let mut a = App::new(None);
+        a.save_to_path(&path).unwrap();
+        assert!(a.path.is_some(), "A must bind the file on save");
+
+        let mut b = App::new(Some(path.clone()));
+        b.load_initial().unwrap();
+        assert_eq!(b.path, Some(path.clone()));
+
+        a.apply_single_op(crate::ops::Op::SetCell {
+            addr: crate::grid::CellAddr::Main { row: 0, col: 0 },
+            value: "MIRROR".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            a.state
+                .grid
+                .get(&crate::grid::CellAddr::Main { row: 0, col: 0 })
+                .as_deref(),
+            Some("MIRROR")
+        );
+        // B is stale until it polls ...
+        assert_ne!(
+            b.state
+                .grid
+                .get(&crate::grid::CellAddr::Main { row: 0, col: 0 })
+                .as_deref(),
+            Some("MIRROR")
+        );
+        // ... then the tail applies A's commit.
+        assert!(b.sync_external().unwrap(), "B should observe A's commit");
+        assert_eq!(
+            b.state
+                .grid
+                .get(&crate::grid::CellAddr::Main { row: 0, col: 0 })
+                .as_deref(),
+            Some("MIRROR")
+        );
+    }
+
     #[test]
     fn sync_external_rebuilds_when_linked_csv_changes() {
         let dir = tempfile::tempdir().unwrap();
@@ -22344,8 +23053,9 @@ mod tests {
         let mut app = App::new(None);
         app.mode = Mode::Menu {
             stack: vec![MenuLevel {
+                // Export is File item 3 (New sits at 0).
                 section: MenuSection::File,
-                item: 2,
+                item: 3,
             }],
         };
 
@@ -22364,8 +23074,9 @@ mod tests {
 
         app.mode = Mode::Menu {
             stack: vec![MenuLevel {
+                // Width is File item 4 (New sits at 0).
                 section: MenuSection::File,
-                item: 3,
+                item: 4,
             }],
         };
 
@@ -22387,7 +23098,7 @@ mod tests {
         app.mode = Mode::Menu {
             stack: vec![MenuLevel { section: MenuSection::File, item: 0 }],
         };
-        // Up on the first item wraps to the last File item (index 7 = Replay).
+        // Up on the first item wraps to the last File item (Exit).
         app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::empty())).unwrap();
         match &app.mode {
             Mode::Menu { stack } => assert_eq!(stack[0].item, FILE_MENU_ITEMS.len() - 1,

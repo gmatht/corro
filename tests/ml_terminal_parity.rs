@@ -264,9 +264,10 @@ fn overflow_renders_cell_text() {
 /// Replay — whose status message proves the selection wrapped around.
 #[test]
 fn menu_up_wraps_to_last_item() {
-    let pane = run_in_tmux("--pancurses docs/tests/overflow.corro", &["Escape", "f", "Up", "Enter"], 2200);
+    // Up on New (first) wraps to Exit (last); a second Up reaches Replay.
+    let pane = run_in_tmux("--pancurses docs/tests/overflow.corro", &["Escape", "f", "Up", "Up", "Enter"], 2200);
     assert!(pane.contains("Replayed"),
-        "Up on the first item should wrap to the last (Replay) and Enter fire it\n{}",
+        "Up on the first item should wrap to the last (Exit), then to Replay, and Enter fire it\n{}",
         safe_slice(&pane, 1500));
 }
 
@@ -578,7 +579,7 @@ fn walk_menu_items(sm: usize, labels: &[&str]) -> String {
 #[test]
 fn menu_file_items() {
     let s = walk_menu_items(0, &[
-        "Open file", "Save as", "Export", "Width", "Sort view", "Persist sort", "Exit", "Replay",
+        "New", "Open file", "Save as", "Export", "Width", "Sort view", "Persist sort", "Replay", "Exit",
     ]);
     tmux::kill_session(&s);
 }
@@ -587,6 +588,7 @@ fn menu_file_items() {
 fn menu_edit_items() {
     let s = walk_menu_items(1, &[
         "Cut", "Copy", "Paste", "Find", "Replace", "Duplicate", "Extrapolate",
+        "Edit in Text Editor", "Workbook (External)", "Follow link",
     ]);
     tmux::kill_session(&s);
 }
@@ -747,8 +749,9 @@ fn menu_item_activation_smoke() {
     activate_menu_item(3, 3, "Reset", "Format reset", false);
     activate_menu_item(1, 0, "Cut", "Selection cut", false);
     activate_menu_item(4, 2, "New sheet", "New sheet created", false);
-    // Quit must actually terminate the app.
-    activate_menu_item(0, 6, "Exit", "", true);
+    activate_menu_item(0, 0, "New", "New workbook", false);
+    // Quit must actually terminate the app (Exit is last in File now).
+    activate_menu_item(0, 8, "Exit", "", true);
 }
 #[test]
 fn menu_export_tsv_writes_file() {
@@ -763,9 +766,9 @@ fn menu_export_tsv_writes_file() {
     std::thread::sleep(Duration::from_millis(120));
     tmux::send_keys(&session, "f");
     std::thread::sleep(Duration::from_millis(400));
-    // File -> Export -> TSV: Down to Export (idx 2), Right to enter the
-    // submenu, then Enter on TSV (idx 0).
-    for _ in 0..2 {
+    // File -> Export -> TSV: Down to Export (idx 3, New sits at 0),
+    // Right to enter the submenu, then Enter on TSV (idx 0).
+    for _ in 0..3 {
         tmux::send_keys(&session, "Down");
         std::thread::sleep(Duration::from_millis(120));
     }
@@ -797,16 +800,15 @@ fn menu_export_tsv_writes_file() {
 
 #[test]
 fn menu_open_loads_file() {
-    // Build a loadable WORKBOOK snapshot from the fixture, then open it via the
+    // Build a loadable CORRO_LOG from the fixture, then open it via the
     // File -> Open menu (typing the path into the TUI prompt). This verifies the
     // Open action genuinely loads a file, not just records a status.
     let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs/tests/overflow.corro");
     let mut app = corro::ui::App::new(Some(src));
     app.load_initial().unwrap();
-    let snap = corro::ops::WorkbookSnapshot::from_workbook(&app.workbook);
     let snap_id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let snap_path = std::env::temp_dir().join(format!("corro-open-snap-{}-{}.corro", std::process::id(), snap_id));
-    corro::io::save_workbook(&snap_path, &snap).unwrap();
+    corro::io::write_workbook_log(&snap_path, &app.workbook, &Default::default()).unwrap();
 
     let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let session = format!("corro-act-{}", id);
@@ -817,7 +819,9 @@ fn menu_open_loads_file() {
     std::thread::sleep(Duration::from_millis(120));
     tmux::send_keys(&session, "f");
     std::thread::sleep(Duration::from_millis(400));
-    // Open is the first item (idx 0) — already highlighted.
+    // Open is item idx 1 (New sits at 0) — Down once, then Enter.
+    tmux::send_keys(&session, "Down");
+    std::thread::sleep(Duration::from_millis(120));
     std::thread::sleep(Duration::from_millis(200));
     tmux::send_keys(&session, "Enter"); // opens the Open-file prompt
     std::thread::sleep(Duration::from_millis(500));

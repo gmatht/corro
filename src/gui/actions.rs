@@ -214,6 +214,15 @@ pub fn menu_action_needs_prompt(name: &str) -> Option<&'static str> {
     })
 }
 
+/// Actions that spawn a child process needing the real terminal (external
+/// editor): terminal backends must suspend around dispatch and resume
+/// after (see the pancurses suspend_terminal/resume_terminal pair). Native
+/// GUI backends ignore this (no terminal state to suspend). Mirrors the
+/// [`menu_action_needs_prompt`] pattern.
+pub fn menu_action_needs_terminal_suspend(name: &str) -> bool {
+    matches!(name, "edit_external" | "edit_workbook_external")
+}
+
 /// Result of [`dispatch_menu_action`]. The backend performs the backend-
 /// specific part (text prompt, OSC 52 clipboard, dialog rendering, formula-bar
 /// update); the corro operation itself is already applied to `app`.
@@ -260,8 +269,12 @@ pub fn dispatch_menu_action(
     match name {
         "save" => {
             if let Some(ref p) = app.core.path.clone() {
-                let snap = crate::ops::WorkbookSnapshot::from_workbook(&app.core.workbook);
-                match crate::io::save_workbook(p, &snap) {
+                // Canonical CORRO_LOG, same writer the TUI uses.
+                match crate::io::write_workbook_log(
+                    p,
+                    &app.core.workbook,
+                    &app.core.persisted_view_sort_cols,
+                ) {
                     Ok(()) => MenuDispatch::Status("Saved".into()),
                     Err(e) => MenuDispatch::Status(format!("Save error: {e}")),
                 }
@@ -387,6 +400,60 @@ pub fn dispatch_menu_action(
             commit_cell(app, addr.clone(), String::new());
             MenuDispatch::Status(format!("Cleared {}", main_addr_label(main_row, main_col)))
         }
+        "follow_hyperlink" => {
+            // Shared follow logic (same status texts as ratatui's Ctrl+O /
+            // Edit ▸ Follow link): opens the cursor cell's hyperlink in the
+            // default browser. Pure corro logic — every GUI backend routes
+            // here, so the behavior can never drift per backend.
+            let grid = &app.core.workbook.active_sheet().grid;
+            let status = crate::ui_core::follow_hyperlink(grid, app.core.cursor);
+            MenuDispatch::Status(status)
+        }
+        "edit_external" => {
+            // Blocking and modal-like: the backend waits while the editor
+            // runs. Terminal backends suspend around dispatch (see
+            // menu_action_needs_terminal_suspend); the native GUI inherits
+            // the console (or lack thereof) as-is.
+            let initial = app
+                .core
+                .workbook
+                .active_sheet()
+                .grid
+                .get(&addr)
+                .unwrap_or_default();
+            match crate::editor::edit_text_externally(&initial) {
+                Ok(Some(text)) => {
+                    commit_cell(app, addr, text);
+                    MenuDispatch::Status("External edit applied".into())
+                }
+                Ok(None) => MenuDispatch::Status("Unchanged".into()),
+                Err(e) => MenuDispatch::Status(format!("Editor error: {e}")),
+            }
+        }
+        "edit_workbook_external" => {
+            // Edit ▸ Workbook (External): open the append-only log itself in
+            // $EDITOR. Blocking/modal-like, like edit_external. The file is
+            // the source of truth, so afterwards the workbook is reloaded
+            // from it (anchored on the unchanged prefix: appends tail-apply,
+            // a rewrite falls back to a full reload — same paths as another
+            // window's Save).
+            let Some(path) = app.core.path.clone() else {
+                return MenuDispatch::Status(
+                    "Save the workbook first (File ▸ Save as), then edit it externally".into(),
+                );
+            };
+            match crate::editor::edit_workbook_externally(&path) {
+                Ok(true) => match app.core.poll_log_tail() {
+                    Ok(_) => MenuDispatch::Status(format!(
+                        "Reloaded {} after external edit",
+                        path.display()
+                    )),
+                    Err(e) => MenuDispatch::Status(format!("Reload error: {e}")),
+                },
+                Ok(false) => MenuDispatch::Status("Unchanged".into()),
+                Err(e) => MenuDispatch::Status(format!("Editor error: {e}")),
+            }
+        }
         "select_all" => {
             let (mr, mc) = {
                 let sheet = app.core.workbook.active_sheet();
@@ -400,6 +467,45 @@ pub fn dispatch_menu_action(
                 };
             }
             MenuDispatch::Status("Selected all".into())
+        }
+        "new_file" => {
+            // Shared blank-document logic (same content and status texts as
+            // ratatui's File ▸ New): template-or-seeded workbook, detached
+            // from any file, histories/caches/watchers reset. Pure corro
+            // logic — every GUI backend routes here, so the behavior can
+            // never drift per backend. Backends refresh their viewport after
+            // dispatch (workbook dims may change).
+            let (workbook, note) = crate::ui_core::fresh_blank_workbook();
+            app.core.workbook = workbook;
+            app.core.workbook.ensure_active_sheet();
+            app.core.view_sheet_id = app.core.workbook.sheet_id(app.core.workbook.active_sheet);
+            if let Some(idx) = app.core.workbook.sheet_index_by_id(app.core.view_sheet_id) {
+                app.core.workbook.active_sheet = idx;
+                app.core.state = app.core.workbook.sheets[idx].state.clone();
+            }
+            app.core.path = None;
+            app.core.source_path = None;
+            app.core.import_source = None;
+            app.core.offset = 0;
+            app.core.ops_applied = 0;
+            app.core.persisted_view_sort_cols.clear();
+            app.core.revision_limit = None;
+            app.core.revision_browse = false;
+            app.core.revision_browse_limit = 0;
+            app.core.watcher = None;
+            app.core.op_history.clear();
+            app.core.redo_history.clear();
+            app.core.cursor = SheetCursor { row: hr, col: lm };
+            app.core.anchor = None;
+            app.core.unsaved_file = None;
+            app.core.linked_source_mtimes.clear();
+            app.core.edit_target_addr = None;
+            app.core.edit_range_addrs = None;
+            app.core.pending_lost_edit = None;
+            app.core.pending_fit_to_content_on_commit = false;
+            app.extrapolate = None;
+            app.special_picker = None;
+            MenuDispatch::Status(note.unwrap_or_else(|| "New workbook".into()))
         }
         "new_sheet" => {
             let id = app.core.workbook.next_sheet_id;
@@ -558,9 +664,9 @@ pub fn run_prompt_action(app: &mut App, action: &str, text: &str) {
     match action {
         "open" => {
             if !path.is_empty() {
-                match crate::io::load_workbook_snapshot(std::path::Path::new(&path)) {
-                    Ok(snap) => {
-                        app.core.workbook = crate::ops::WorkbookState::from_snapshot(&snap);
+                match crate::io::load_workbook_file(std::path::Path::new(&path)) {
+                    Ok(workbook) => {
+                        app.core.workbook = workbook;
                         app.core.offset = 0;
                         app.core.ops_applied = 0;
                         app.core.path = Some(std::path::PathBuf::from(path.clone()));
@@ -578,8 +684,11 @@ pub fn run_prompt_action(app: &mut App, action: &str, text: &str) {
                 // its own Save arm via `to_corro_path`).
                 let final_path =
                     crate::ui_core::force_extension(std::path::Path::new(&path), "corro");
-                let snap = crate::ops::WorkbookSnapshot::from_workbook(&app.core.workbook);
-                match crate::io::save_workbook(&final_path, &snap) {
+                match crate::io::write_workbook_log(
+                    &final_path,
+                    &app.core.workbook,
+                    &app.core.persisted_view_sort_cols,
+                ) {
                     Ok(()) => {
                         app.core.path = Some(final_path.clone());
                         app.core.status = format!("Saved to {}", final_path.display());
@@ -851,14 +960,34 @@ pub fn run_prompt_action(app: &mut App, action: &str, text: &str) {
                 };
                 let id = app.core.workbook.sheets[idx].id;
                 let wbo = WorkbookOp::DeleteSheet { id };
-                if let Some(ref p) = app.core.path.clone() {
-                    let mut active_sheet = app.core.workbook.sheet_id(app.core.workbook.active_sheet);
-                    let _ = crate::io::commit_workbook_op(p, &mut app.core.offset, &mut app.core.workbook, &mut active_sheet, &wbo);
-                    app.core.ops_applied = app.core.ops_applied.saturating_add(1);
-                }
-                app.core.workbook.sheets.remove(idx);
-                if app.core.workbook.active_sheet >= idx {
-                    app.core.workbook.active_sheet = app.core.workbook.active_sheet.saturating_sub(1);
+                let mut active_sheet = app.core.workbook.sheet_id(app.core.workbook.active_sheet);
+                // Apply the deletion exactly once. `commit_workbook_op` ends
+                // with `tail_apply_workbook`, which replays the appended line
+                // into the workbook — so the sheet is already gone. The old
+                // code *also* did `sheets.remove(idx)` here, which deleted a
+                // second sheet and could empty the workbook entirely (then
+                // any later `active_sheet()` panicked).
+                match app.core.path.clone() {
+                    Some(p) => {
+                        let _ = crate::io::commit_workbook_op(
+                            p.as_path(),
+                            &mut app.core.offset,
+                            &mut app.core.workbook,
+                            &mut active_sheet,
+                            &wbo,
+                        );
+                        app.core.ops_applied = app.core.ops_applied.saturating_add(1);
+                    }
+                    // No file: apply the op directly (same arm the commit
+                    // path replays: removes, fixes active_sheet, and keeps at
+                    // least one sheet via ensure_active_sheet).
+                    None => {
+                        let _ = crate::ops::apply_workbook_op(
+                            &mut app.core.workbook,
+                            &mut active_sheet,
+                            wbo,
+                        );
+                    }
                 }
                 app.core.status = if path.is_empty() { "Deleted active sheet".into() } else { format!("Deleted sheet {path}") };
             } else {
