@@ -220,57 +220,79 @@ impl Window {
                 type Iteration = unsafe extern "C" fn(*mut std::ffi::c_void, i32) -> i32;
                 if let Ok(iter_fn) = unsafe { glib_lib.get::<Iteration>(b"g_main_context_iteration") } {
                     let iter = *iter_fn;
+                    // `g_main_context_pending` lets the blocking phases stop
+                    // as soon as the queue drains. Without it a blocking
+                    // iteration on an idle window never returns, so
+                    // present() hangs and NOTHING after it runs (the startup
+                    // edit selection, focus setup, etc.).
+                    type Pending = unsafe extern "C" fn(*mut std::ffi::c_void) -> i32;
+                    let pending: Option<Pending> =
+                        unsafe { glib_lib.get::<Pending>(b"g_main_context_pending") }
+                            .ok()
+                            .map(|f| *f);
+                    // Hard wall-clock ceiling per phase. Even if events keep
+                    // arriving (or a virtual compositor never acknowledges),
+                    // present() must return so the caller's setup continues.
+                    fn budget(ms: u128) -> std::time::Instant {
+                        std::time::Instant::now() + std::time::Duration::from_millis(ms as u64)
+                    }
+                    /// Pump until the queue is empty or `deadline` passes.
+                    /// Only blocks while something is pending, so an idle
+                    /// window costs one non-blocking check.
+                    unsafe fn drain_until(
+                        iter: Iteration,
+                        pending: Option<Pending>,
+                        deadline: std::time::Instant,
+                    ) {
+                        // Always make at least one non-blocking pass so
+                        // already-queued work is dispatched.
+                        iter(std::ptr::null_mut(), 0);
+                        while std::time::Instant::now() < deadline {
+                            let more = match pending {
+                                Some(p) => p(std::ptr::null_mut()) > 0,
+                                None => true,
+                            };
+                            if !more {
+                                break;
+                            }
+                            iter(std::ptr::null_mut(), 1);
+                        }
+                    }
                     let get_aw = loader.symbols.gtk_widget_get_allocated_width;
                     let get_mapped = loader.symbols.gtk_widget_get_mapped;
                     unsafe {
-                        // Phase 1: pump blocking iterations until the window
-                        // is both allocated and mapped.  On Wayland (including
-                        // WSLg) the configure/acknowledge round-trip is
-                        // asynchronous — the compositor sends width/height in
-                        // a configure event that must be processed by the main
-                        // context.  Without sufficient pumping here the window
-                        // never becomes receptive to grab_focus().
-                        //
-                        // 500 iterations is generous: each blocking iteration
-                        // waits for and dispatches one source.  WSLg virtual
-                        // compositors can be slow to respond, so we err on
-                        // the side of over-pumping rather than under-pumping.
-                        for _ in 0..500 {
+                        // Phase 1: pump until the window is both allocated and
+                        // mapped.  On Wayland (including WSLg) the
+                        // configure/acknowledge round-trip is asynchronous —
+                        // the compositor sends width/height in a configure
+                        // event that must be processed by the main context.
+                        // Without this the window never becomes receptive to
+                        // grab_focus().
+                        let deadline = budget(2000);
+                        while std::time::Instant::now() < deadline {
                             let allocated = get_aw.map_or(1, |f| f(self.inner));
                             let mapped = get_mapped.map_or(1, |f| f(self.inner));
                             if allocated > 0 && mapped != 0 { break; }
                             iter(std::ptr::null_mut(), 1);
                         }
-                        // Phase 2: all blocking iterations.  On virtual displays
-                        // (WSLg, Xvfb) the frame clock timer sources are only
-                        // dispatched during blocking waits.  Non-blocking
-                        // iterations return immediately and skip timer sources,
-                        // so the draw callback never fires.  500 blocking
-                        // iterations = ~8s max wait at 16ms/tick, covering
-                        // even the slowest virtual compositors.
-                        for _ in 0..500 {
-                            iter(std::ptr::null_mut(), 1);
-                        }
-                        // Force a redraw on the window to ensure the canvas
-                        // draw callback runs at least once.  On X11 this
-                        // schedules an idle handler that calls snapshot() on
-                        // the widget tree, which invokes our draw function.
+                        // Phase 2: drain any events queued by the mapping
+                        // round-trip (draw, configure, frame clock).
+                        drain_until(iter, pending, budget(2000));
+                        // Force a redraw so the canvas draw callback runs at
+                        // least once.  On X11 this schedules an idle handler
+                        // that snapshots the widget tree, invoking our draw
+                        // function.
                         if let Some(qd) = loader.symbols.gtk_widget_queue_draw {
                             qd(self.inner);
                         }
-                        // Phase 3: all blocking iterations for the queued
-                        // redraw to be processed (allocation idle, frame
-                        // clock tick dispatch).
-                        for _ in 0..500 {
-                            iter(std::ptr::null_mut(), 1);
-                        }
-                        // Phase 4: Force a frame clock cycle via
+                        // Phase 3: process the queued redraw.
+                        drain_until(iter, pending, budget(2000));
+                        // Phase 4: force a frame clock cycle via
                         // gdk_frame_clock_request_phase (GTK4).  On virtual
-                        // displays (WSLg, Xvfb) the frame clock timer may
-                        // not tick automatically, so the draw function
-                        // registered by set_draw_func never fires.  By
-                        // explicitly requesting a PAINT phase we force the
-                        // frame clock to process the pending redraw.
+                        // displays (WSLg, Xvfb) the frame clock timer may not
+                        // tick automatically, so the draw function registered
+                        // by set_draw_func never fires.  Requesting a PAINT
+                        // phase forces the pending redraw through.
                         if let (Some(get_fc), Some(request_phase)) = (
                             loader.symbols.gtk_widget_get_frame_clock,
                             loader.symbols.gdk_frame_clock_request_phase,
@@ -281,13 +303,7 @@ impl Window {
                                 // the snapshot/paint cycle which calls the
                                 // DrawingArea draw function.
                                 request_phase(clock, 16);
-                                // All blocking iterations to let the frame
-                                // clock process the requested phase.  On
-                                // virtual displays only blocking iterations
-                                // dispatch timer sources.
-                                for _ in 0..500 {
-                                    iter(std::ptr::null_mut(), 1);
-                                }
+                                drain_until(iter, pending, budget(1000));
                             }
                         }
                         // Sync with the display server (X11: XFlush; Wayland:
@@ -760,6 +776,90 @@ impl Drop for Grid { fn drop(&mut self) { unsafe { crate::wrappers::unref_widget
 }
 
 // Overlay wrapper
+/// Absolute-positioning container (`GtkFixed`): places a child at an exact
+/// pixel rectangle, honouring the child's size request (which `GtkOverlay`
+/// does not do for overlay children).
+pub struct Fixed {
+    inner: *mut c_void,
+    loader: Arc<Loader>,
+    _not_send: PhantomData<Rc<()>>,
+}
+
+impl Fixed {
+    pub fn new(loader: Arc<Loader>) -> Result<Self, Error> {
+        let ctor = loader
+            .symbols
+            .gtk_fixed_new
+            .ok_or(Error::MissingSymbol("gtk_fixed_new".into()))?;
+        let inner = unsafe { ctor() };
+        if inner.is_null() {
+            return Err(Error::Other("gtk_fixed_new returned null".into()));
+        }
+        unsafe { take_ownership(&loader.symbols, &loader.version, inner); }
+        Ok(Fixed { inner, loader, _not_send: PhantomData })
+    }
+
+    pub fn put(&self, child: *mut c_void, x: i32, y: i32) {
+        guard_widget!(self, "Fixed", "put");
+        if child.is_null() {
+            return;
+        }
+        if let Some(f) = self.loader.symbols.gtk_fixed_put {
+            unsafe { f(self.inner, child, x, y); }
+        }
+    }
+
+    pub fn set_size_request(&self, w: i32, h: i32) {
+        guard_widget!(self, "Fixed", "set_size_request");
+        if let Some(sr) = self.loader.symbols.gtk_widget_set_size_request {
+            unsafe { sr(self.inner, w, h); }
+        }
+    }
+
+    pub fn set_hexpand(&self, expand: bool) {
+        guard_widget!(self, "Fixed", "set_hexpand");
+        if let Some(f) = self.loader.symbols.gtk_widget_set_hexpand {
+            unsafe { f(self.inner, if expand { 1 } else { 0 }); }
+        }
+    }
+
+    pub fn set_vexpand(&self, expand: bool) {
+        guard_widget!(self, "Fixed", "set_vexpand");
+        if let Some(f) = self.loader.symbols.gtk_widget_set_vexpand {
+            unsafe { f(self.inner, if expand { 1 } else { 0 }); }
+        }
+    }
+
+    /// GTK3 requires an explicit show for a freshly added child of an
+    /// already-visible container; without it the child stays unmapped.
+    pub fn show_child(&self, child: *mut c_void) {
+        if child.is_null() {
+            return;
+        }
+        if let Some(f) = self.loader.symbols.gtk_widget_show {
+            unsafe { f(child); }
+        }
+    }
+
+    pub fn move_child(&self, child: *mut c_void, x: i32, y: i32) {
+        guard_widget!(self, "Fixed", "move");
+        if child.is_null() {
+            return;
+        }
+        if let Some(f) = self.loader.symbols.gtk_fixed_move {
+            unsafe { f(self.inner, child, x, y); }
+        }
+    }
+}
+
+impl AsRef<*mut c_void> for Fixed { fn as_ref(&self) -> &*mut c_void { &self.inner } }
+
+impl Clone for Fixed {
+    fn clone(&self) -> Self {
+        Fixed { inner: self.inner, loader: self.loader.clone(), _not_send: PhantomData }
+    }
+}
+
 pub struct Overlay {
     inner: *mut c_void,
     loader: Arc<Loader>,
@@ -1562,6 +1662,15 @@ impl Entry {
         if let Some(f) = self.loader.symbols.gtk_editable_set_position { unsafe { f(self.inner, position); } }
     }
 
+    /// Caret position as a character index; `None` when unavailable.
+    pub fn get_position(&self) -> Option<i32> {
+        guard_widget_or!(self, "Entry", "get_position", None);
+        self.loader
+            .symbols
+            .gtk_editable_get_position
+            .map(|f| unsafe { f(self.inner) })
+    }
+
     pub fn set_width_chars(&self, n: i32) {
         guard_widget!(self, "Entry", "set_width_chars");
         if let Some(w) = self.loader.symbols.gtk_entry_set_width_chars { unsafe { w(self.inner, n); } }
@@ -1603,11 +1712,41 @@ impl Entry {
 
     pub fn connect_button_press<F: FnMut() + 'static>(&self, f: F) -> Result<u64, Error> {
         guard_widget_or!(self, "Entry", "connect_button_press", Err(Error::Other("entry dropped".into())));
-        let boxed: Box<dyn FnMut()> = Box::new(f);
-        let res = unsafe { crate::signals::connect_signal(&self.loader.symbols, self.inner, "button-press-event", boxed, 3) };
+        // GTK4: a GtkGestureClick controller is the delivery mechanism (same
+        // as the canvas). Added before the GTK3 fallback because
+        // `gtk_widget_add_controller` does not exist on GTK3.
+        if self.loader.symbols.gtk_widget_add_controller.is_some() {
+            if let Ok(gesture) = GestureClick::new(self.loader.clone()) {
+                {
+                let mut cb = f;
+                let _ = gesture.connect_pressed(Box::new(move |_n: i32, _x: f64, _y: f64| {
+                    cb();
+                }));
+                gesture.add_to_widget(self);
+                // gtk_widget_add_controller sinks the controller into the
+                // widget; forgetting ours avoids an unbalanced unref.
+                std::mem::forget(gesture);
+                return Ok(0);
+                }
+            }
+        }
+        // GTK3: `button-press-event` needs BOTH the press mask on the widget
+        // and a handler that returns a real gboolean. The plain
+        // `connect_signal` (void return) left the return value undefined and
+        // the callback was never delivered — use the same
+        // `widget_connect_signal_bool` pattern the canvas relies on.
+        const GDK_BUTTON_PRESS_MASK: i32 = 1 << 8;
+        unsafe { widget_add_events(&self.loader, self.inner, GDK_BUTTON_PRESS_MASK); }
+        let mut cb = f;
+        let res = unsafe {
+            widget_connect_signal_bool(&self.loader, self.inner, "button-press-event", Box::new(move |_ev: *mut c_void| -> i32 {
+                cb();
+                1 // handled (GDK_EVENT_STOP): the press is ours
+            }))
+        };
         match res {
             Ok(id) => Ok(id),
-            Err(e) => Err(Error::Other(e)),
+            Err(e) => Err(Error::Other(format!("{}", e))),
         }
     }
 
@@ -2871,6 +3010,22 @@ impl Dialog {
         Ok(Dialog { inner, loader, _not_send: PhantomData, dropped: std::cell::Cell::new(false) })
     }
 
+    /// Attach to a parent window so the WM places it as a child dialog
+    /// (centred on the parent) instead of leaving it wherever an unparented
+    /// window lands. Also requests centre-on-parent placement.
+    pub fn set_transient_for(&self, parent: *mut c_void) {
+        guard_widget!(self, "Dialog", "set_transient_for");
+        if parent.is_null() {
+            return;
+        }
+        if let Some(f) = self.loader.symbols.gtk_window_set_transient_for {
+            unsafe { f(self.inner, parent) };
+        }
+        if let Some(f) = self.loader.symbols.gtk_window_set_position {
+            unsafe { f(self.inner, 1) };
+        }
+    }
+
     pub fn set_title(&self, title: &str) {
         guard_widget!(self, "Dialog", "set_title");
         if let Some(set_title) = self.loader.symbols.gtk_window_set_title {
@@ -3117,6 +3272,82 @@ impl DropDown {
             // GtkComboBoxText "changed" has 2 args: (widget, user_data)
             let res = unsafe { crate::signals::connect_signal(&self.loader.symbols, self.inner, "changed", boxed, 2) };
             match res { Ok(id) => Ok(id), Err(e) => Err(Error::Other(e)) }
+        }
+    }
+
+    pub fn is_gtk4(&self) -> bool { self.string_list.is_some() }
+
+    /// Whether the size-request symbol is actually resolved at runtime.
+    pub fn has_size_request_symbol(&self) -> bool {
+        self.loader.symbols.gtk_widget_set_size_request.is_some()
+    }
+
+    /// (visible, mapped, allocated_w, allocated_h, parent_is_overlay)
+    /// diagnostic for the in-grid placement path.
+    pub fn diagnostics(&self) -> (bool, bool, i32, i32, bool) {
+        let vis = self
+            .loader
+            .symbols
+            .gtk_widget_get_visible
+            .map(|f| unsafe { f(self.inner) != 0 })
+            .unwrap_or(false);
+        let mapped = self
+            .loader
+            .symbols
+            .gtk_widget_get_mapped
+            .map(|f| unsafe { f(self.inner) != 0 })
+            .unwrap_or(false);
+        let aw = self
+            .loader
+            .symbols
+            .gtk_widget_get_allocated_width
+            .map(|f| unsafe { f(self.inner) })
+            .unwrap_or(-1);
+        let ah = self
+            .loader
+            .symbols
+            .gtk_widget_get_allocated_height
+            .map(|f| unsafe { f(self.inner) })
+            .unwrap_or(-1);
+        let has_parent = self
+            .loader
+            .symbols
+            .gtk_widget_get_parent
+            .map(|f| unsafe { !f(self.inner).is_null() })
+            .unwrap_or(false);
+        (vis, mapped, aw, ah, has_parent)
+    }
+
+    pub fn grab_focus(&self) {
+        guard_widget!(self, "DropDown", "grab_focus");
+        if let Some(f) = self.loader.symbols.gtk_widget_grab_focus {
+            unsafe { f(self.inner); }
+        }
+    }
+
+    pub fn set_margin_start(&self, margin: i32) {
+        guard_widget!(self, "DropDown", "set_margin_start");
+        if let Some(f) = self.loader.symbols.gtk_widget_set_margin_start {
+            unsafe { f(self.inner, margin); }
+        }
+    }
+
+    pub fn set_margin_top(&self, margin: i32) {
+        guard_widget!(self, "DropDown", "set_margin_top");
+        if let Some(f) = self.loader.symbols.gtk_widget_set_margin_top {
+            unsafe { f(self.inner, margin); }
+        }
+    }
+
+    /// `GTK_ALIGN_START` (0) pins the widget to its start edge so margins act
+    /// as an absolute offset rather than centring it.
+    pub fn set_align_start(&self) {
+        guard_widget!(self, "DropDown", "set_align_start");
+        if let Some(f) = self.loader.symbols.gtk_widget_set_halign {
+            unsafe { f(self.inner, 0); }
+        }
+        if let Some(f) = self.loader.symbols.gtk_widget_set_valign {
+            unsafe { f(self.inner, 0); }
         }
     }
 

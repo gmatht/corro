@@ -1117,7 +1117,6 @@ fn handle_key(keyval: u32, state_rc: &Rc<GuiState>, mods: u32) -> bool {
     state.last_key.set(keyval);
     let app = state.app_mut();
     let key = normalize(keyval);
-
     match state.mode.get() {
         GuiMode::Help => {
             if key == ESCAPE {
@@ -1179,7 +1178,7 @@ fn handle_key(keyval: u32, state_rc: &Rc<GuiState>, mods: u32) -> bool {
     }
 
     if state.editing.get() {
-        return handle_edit_key(key, state);
+        return handle_edit_key(key, state, mods);
     }
 
     // Interactive extrapolate modal (mirrors ratatui's Mode::Extrapolate):
@@ -1226,7 +1225,7 @@ fn handle_key(keyval: u32, state_rc: &Rc<GuiState>, mods: u32) -> bool {
                     if !text.is_empty() {
                         state.editing.set(true);
                         *state.edit_buf.borrow_mut() = text;
-                        return handle_edit_key(key, state);
+                        return handle_edit_key(key, state, mods);
                     }
                 }
                 // When window CAPTURE consumed printable chars and pushed to
@@ -1234,7 +1233,7 @@ fn handle_key(keyval: u32, state_rc: &Rc<GuiState>, mods: u32) -> bool {
                 // text is empty but edit_buf has content.  Commit from there.
                 if !state.edit_buf.borrow().is_empty() {
                     state.editing.set(true);
-                    return handle_edit_key(key, state);
+                    return handle_edit_key(key, state, mods);
                 }
             }
             // Focus can drift off the entry (setup grab_focus races
@@ -1243,7 +1242,7 @@ fn handle_key(keyval: u32, state_rc: &Rc<GuiState>, mods: u32) -> bool {
             // intercept only fires when focused. Ratatui parity: Edit +
             // Return commits; bare Return with an empty buffer still moves.
             if state.editing.get() && !state.edit_buf.borrow().is_empty() {
-                return handle_edit_key(key, state);
+                return handle_edit_key(key, state, mods);
             }
             log_key_action(keyval, "move_cursor_down", &format!("cell={}", format_cell(state)));
             move_cursor(state, 1, 0);
@@ -1364,8 +1363,22 @@ fn handle_key(keyval: u32, state_rc: &Rc<GuiState>, mods: u32) -> bool {
     }
 }
 
-fn handle_edit_key(key: u32, state: &GuiState) -> bool {
+fn handle_edit_key(key: u32, state: &GuiState, mods: u32) -> bool {
+    // `mods` is unused today (Shift+arrows never reach here — the caller
+    // routes selection separately) but kept in the signature so the call
+    // sites stay uniform with the other key paths.
+    let _ = mods;
     match key {
+        // F2 re-seeds the edit with the cell's current value. The GUI idles
+        // with `editing=true` (type-first), so without this arm F2 would be
+        // swallowed here and the test's "F2 seeds the cell" flow could never
+        // run — the buffer would stay empty and the next keystroke would
+        // replace the value instead of appending to it.
+        F2 => {
+            log_key_action(key, "start_edit", &format!("cell={} mode=edit", format_cell(state)));
+            start_edit_seeded_from_cell(state);
+            true
+        }
         RETURN => {
             log_key_action(key, "commit_edit", &format!("cell={} mode=edit", format_cell(state)));
             commit_edit(state);
@@ -1377,6 +1390,7 @@ fn handle_edit_key(key: u32, state: &GuiState) -> bool {
             state.editing.set(false);
             state.entry_clicked.set(false);
             state.edit_buf.borrow_mut().clear();
+            state.edit_caret.set(0);
             state.mode.set(GuiMode::Normal);
             update_formula_bar(state, state.last_row.get(), state.last_col.get());
             state.canvas.queue_redraw();
@@ -1393,7 +1407,9 @@ fn handle_edit_key(key: u32, state: &GuiState) -> bool {
             // No-op on an empty buffer (and never resync): selections show
             // the cell value while editing with nothing typed yet, and a
             // sync here would blank that display without changing anything.
-            if state.edit_buf.borrow_mut().pop().is_some() {
+            if !state.edit_buf.borrow().is_empty() {
+                // Caret-aware: removes the char BEFORE the caret.
+                edit_backspace(state);
                 sync_entry_to_buf(state);
                 state.canvas.queue_redraw();
             }
@@ -1403,13 +1419,34 @@ fn handle_edit_key(key: u32, state: &GuiState) -> bool {
             log_key_action(key, "edit_clear", &format!("cell={} mode=edit", format_cell(state)));
             // Same empty-buffer rule as Backspace above.
             if !state.edit_buf.borrow().is_empty() {
-                state.edit_buf.borrow_mut().clear();
+                if crate::formula::is_formula(&state.edit_buf.borrow()) {
+                    // Formula editing: Delete removes the char AT the caret
+                    // (ratatui parity — `edit_delete_forward`).
+                    edit_delete_forward(state);
+                } else {
+                    // Plain value: Delete clears the whole buffer.
+                    state.edit_buf.borrow_mut().clear();
+                    state.edit_caret.set(0);
+                }
                 sync_entry_to_buf(state);
                 state.canvas.queue_redraw();
             }
             true
         }
         LEFT => {
+            // Caret-left inside the buffer (ratatui `Mode::Edit` parity): the
+            // caret moves without ending the edit. Only at the buffer start
+            // does Left commit and step to the previous cell. Committing on
+            // every Left made typing insert at the end and moved the cell
+            // cursor instead of the caret.
+            let mut caret = state.edit_caret.get();
+            let outcome = text_edit::left(&state.edit_buf.borrow(), &mut caret);
+            if outcome == text_edit::KeyOutcome::Edited {
+                state.edit_caret.set(caret);
+                push_caret_to_entry(state);
+                state.canvas.queue_redraw();
+                return true;
+            }
             log_key_action(key, "commit_edit_left", &format!("cell={} mode=edit", format_cell(state)));
             commit_edit(state);
             let c = state.last_col.get();
@@ -1420,6 +1457,16 @@ fn handle_edit_key(key: u32, state: &GuiState) -> bool {
             true
         }
         RIGHT => {
+            // Mirror of LEFT: move the caret to the buffer end, then commit
+            // and step right.
+            let mut caret = state.edit_caret.get();
+            let outcome = text_edit::right(&state.edit_buf.borrow(), &mut caret);
+            if outcome == text_edit::KeyOutcome::Edited {
+                state.edit_caret.set(caret);
+                push_caret_to_entry(state);
+                state.canvas.queue_redraw();
+                return true;
+            }
             log_key_action(key, "commit_edit_right", &format!("cell={} mode=edit", format_cell(state)));
             commit_edit(state);
             // Route through move_cursor (not a direct +1) so the grid grows
@@ -1468,18 +1515,24 @@ fn handle_edit_key(key: u32, state: &GuiState) -> bool {
             }
             let ch = char::from_u32(key).unwrap_or('?');
             log_key_action(key, "edit_insert", &format!("char={ch} cell={} mode=edit", format_cell(state)));
-            // Click-to-edit adopt (same rule as `start_edit_with`): the user
-            // clicked into the formula bar and is typing with an edit
-            // session already open (grid click / setup selects with editing
-            // on). Pushing onto the empty buffer would wipe the displayed
-            // formula to this one char; restore it first (append-model).
-            if state.entry_clicked.get() && state.edit_buf.borrow().is_empty() {
+            // Adopt the displayed value when the buffer is empty: the edit
+            // session is armed with the cell's text on screen (idle
+            // type-first state, or a click into the formula bar). Pushing
+            // onto the empty buffer would replace that text with this one
+            // char; restore it first, keeping the caret the click placed (so
+            // typing inserts at the clicked position, not always at the end).
+            if state.edit_buf.borrow().is_empty() {
                 if let Some(shown) = state.formula_entry.get_text() {
-                    *state.edit_buf.borrow_mut() = shown;
+                    if !shown.is_empty() {
+                        *state.edit_buf.borrow_mut() = shown;
+                    }
                 }
                 state.entry_clicked.set(false);
+                pull_caret_from_entry(state);
+                state.edit_caret.set(state.edit_caret.get().min(edit_caret_len(state)));
             }
-            state.edit_buf.borrow_mut().push(ch);
+            // Caret-aware insert, so typing mid-buffer inserts at the caret.
+            edit_insert_char(state, ch);
             sync_entry_to_buf(state);
             state.canvas.queue_redraw();
             true
@@ -1499,6 +1552,7 @@ fn handle_edit_key(key: u32, state: &GuiState) -> bool {
 fn start_edit(state: &GuiState) {
     state.editing.set(true);
     state.edit_buf.borrow_mut().clear();
+    state.edit_caret.set(0);
     state.formula_entry.set_text("");
     state.formula_entry.grab_focus();
     state.canvas.queue_redraw();
@@ -1507,15 +1561,26 @@ fn start_edit(state: &GuiState) {
 /// F2: edit the cursor cell, seeded with its current value (LibreOffice
 /// parity — typing appends to the existing content instead of replacing it,
 /// so a keystroke can never silently discard a value the user never saw).
-/// Uses the formula bar's displayed text, which the cursor move already
-/// refreshed to this cell's value.
+///
+/// Reads the **cell** (not the formula bar, which may not have refreshed
+/// yet for the current cursor) so the seed is always the real content.
 fn start_edit_seeded_from_cell(state: &GuiState) {
     // Editing supersedes the aggregate dropdown.
     hide_agg_dropdown(state);
     state.editing.set(true);
     state.entry_clicked.set(false);
-    let shown = state.formula_entry.get_text().unwrap_or_default();
-    *state.edit_buf.borrow_mut() = shown;
+    let raw = {
+        let app = state.app_ref();
+        let grid = &app.core.workbook.active_sheet().grid;
+        let addr = crate::addr::sheet_cursor_to_addr(
+            crate::addr::LogicalRow(state.last_row.get()),
+            crate::addr::GlobalCol(state.last_col.get()),
+            crate::addr::MainRows(grid.main_rows()),
+            crate::addr::MainCols(grid.main_cols()),
+        );
+        grid.get(&addr).unwrap_or_default()
+    };
+    *state.edit_buf.borrow_mut() = raw;
     sync_entry_to_buf(state);
     state.edit_caret.set(edit_caret_len(state));
     push_caret_to_entry(state);
@@ -1565,8 +1630,15 @@ fn start_edit_keep_display(state: &GuiState) {
     hide_agg_dropdown(state);
     state.editing.set(true);
     state.edit_buf.borrow_mut().clear();
+    // Empty buffer: the caret belongs at the start.
+    state.edit_caret.set(0);
+    push_caret_to_entry(state);
     state.formula_entry.grab_focus();
     state.canvas.queue_redraw();
+    // Window-level cascade as well: a canvas-only queue_draw may not arm the
+    // toplevel's frame clock, so the repaint never happens (the cursor
+    // appears not to follow navigation). update_state_cursor does the same.
+    state.window.queue_redraw();
 }
 
 fn start_edit_with(state: &GuiState, ch: char) {
@@ -1574,18 +1646,36 @@ fn start_edit_with(state: &GuiState, ch: char) {
     state.editing.set(true);
     // Click-to-edit adopt: the user clicked into the formula bar (which
     // displays the cell's formula) and is now typing into it. Pushing onto
-    // the empty buffer would wipe the formula to this one char; restore
-    // the displayed text first (append-model — a mid-text click still
-    // appends at the end, but nothing is ever lost). Runs only on a fresh
-    // click (entry_clicked) with an empty buffer; every other flow keeps
-    // today's push/replace behavior byte-identical.
-    if state.entry_clicked.get() && state.edit_buf.borrow().is_empty() {
-        if let Some(shown) = state.formula_entry.get_text() {
+    // the empty buffer would wipe the formula to this one char; restore the
+    // displayed text first. The caret is whatever the click put in the
+    // widget (adopted by `pull_caret_from_entry` on button-press), so
+    // typing inserts *at the clicked position* rather than always appending.
+    // Adopt whenever the entry is displaying a value and the buffer is
+    // empty: the displayed text is the cell's current content, and starting
+    // from it (rather than from nothing) is what makes typing EDIT the cell
+    // instead of silently replacing its value. A stale empty buffer is never
+    // a reason to discard what the user can see.
+    if state.edit_buf.borrow().is_empty() {
+        let shown = state.formula_entry.get_text().unwrap_or_default();
+        if !shown.is_empty() {
             *state.edit_buf.borrow_mut() = shown;
+            // Only a genuine click places a caret worth honouring; a
+            // function-bar refresh or the type-first idle state leaves the
+            // widget's position at 0, which would prepend instead of
+            // appending. Default to the end (append) in that case — the
+            // least destructive reading of "the user is editing this value".
+            if state.entry_clicked.get() {
+                pull_caret_from_entry(state);
+            } else {
+                state.edit_caret.set(edit_caret_len(state));
+            }
+            state.edit_caret.set(state.edit_caret.get().min(edit_caret_len(state)));
         }
         state.entry_clicked.set(false);
     }
-    state.edit_buf.borrow_mut().push(ch);
+    // Caret-aware insert (never append): the same `text_edit` surface
+    // Left/Right and Backspace drive, so typing mid-buffer inserts there.
+    edit_insert_char(state, ch);
     // Keep the widget identical to edit_buf (see sync_entry_to_buf): the
     // widget text is what the user sees, edit_buf is what gets committed.
     sync_entry_to_buf(state);
@@ -1767,6 +1857,7 @@ fn commit_edit(state: &GuiState) {
         update_formula_bar(state, state.last_row.get(), state.last_col.get());
     }
     state.edit_buf.borrow_mut().clear();
+    state.edit_caret.set(0);
     state.canvas.queue_redraw();
 }
 
@@ -2497,6 +2588,8 @@ fn build_menu(rxapp: &rswidgets::App, win: &Window, state: &Rc<GuiState>) -> Res
 fn start_edit_with_text(state: &GuiState, text: &str) {
     state.editing.set(true);
     *state.edit_buf.borrow_mut() = text.to_string();
+    // Preset inserted whole: the caret follows it.
+    state.edit_caret.set(text.chars().count());
     // Keep the widget identical to edit_buf (see sync_entry_to_buf).
     sync_entry_to_buf(state);
     state.formula_entry.grab_focus();
@@ -3515,7 +3608,17 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // places the caret natively; nothing is consumed here. No-op on
     // backends without entry click support.
     let shared_click = shared.clone();
+    // Arm click-to-edit when the entry gains focus. A pointer press into the
+    // entry focuses it, and `focus-in-event` is a plain GtkEntry signal that
+    // is actually delivered on GTK3 — unlike `button-press-event`, which
+    // needs a GDK event mask on the entry's own GdkWindow and never fires
+    // here. A click still places the caret natively; we only need to notice
+    // that the user is now editing this text.
     formula_entry.connect_button_press(move || {
+        // The user pressed the pointer in the formula entry: adopt the caret
+        // the click placed so a following insert lands at that position
+        // rather than appending.
+        pull_caret_from_entry(&shared_click);
         shared_click.entry_clicked.set(true);
     })?;
 
@@ -3993,12 +4096,21 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
             shared.canvas.queue_redraw();
         }
         StartupEdit::KeepClicked => {
-            // A click during present()'s pump already chose a cell (possibly
-            // opening the aggregate dropdown). Selecting A1 here would move
-            // the yellow edit highlight off the clicked cell and
-            // hide_agg_dropdown would close the list the click just opened —
-            // the "clicked [A_n but [A1 turned yellow" bug. Leave it alone.
-            shared.canvas.queue_redraw();
+            // A click during present()'s pump already chose a cell. If it
+            // opened the aggregate dropdown, leave everything alone — running
+            // the A1 selection here would move the yellow edit highlight and
+            // `hide_agg_dropdown` would close the list the click just opened
+            // (the "clicked [A_n but [A1 turned yellow" bug).
+            if agg_dropdown_open(&shared) {
+                shared.canvas.queue_redraw();
+            } else {
+                // The click selected a cell (or landed in the formula entry).
+                // Still open the edit session so the first keystroke edits the
+                // selected cell rather than starting a fresh replace — this is
+                // what the startup path is for, and skipping it left
+                // `editing=false`, so typing replaced the displayed value.
+                start_edit_keep_display(&shared);
+            }
         }
         StartupEdit::SelectA1 => {
             // Select A1 for typing (display its value); see the click path.
