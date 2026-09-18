@@ -144,6 +144,12 @@ name = "gui-save-check"
 path = "src/bin/gui_save_check.rs"
 required-features = ["ratatui"]
 
+[[bin]]
+name = "save-roundtrip-render"
+path = "src/bin/save_roundtrip_render.rs"
+required-features = ["ratatui"]
+
+
 [[example]]
 name = "dump-render"
 path = "examples/dump_render.rs"

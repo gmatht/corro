@@ -1,7 +1,7 @@
 //! Dump the GTK accessibility (AT-SPI2) tree of a running corro instance.
 //!
 //! Usage:
-//!   cargo run --bin gtk_a11y_dump --features gui
+//!   cargo run --bin gtk-a11y-dump --features gui
 //!
 //! This tool launches corro with GTK accessibility enabled, then uses a
 //! Python helper script to walk the AT-SPI2 tree and print all accessible

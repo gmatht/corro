@@ -14,7 +14,7 @@
 //!   bench    wall_ms    count    rate(/s)    detail…
 //!
 //! The TSV format is designed to play well with pipes:
-//!   cargo run --release --bin pgo_mix_benchmark -- --bench eval | tee results.tsv
+//!   cargo run --release --bin pgo-mix-benchmark -- --bench eval | tee results.tsv
 
 use corro::agg::compute_aggregate;
 use corro::export::{export_csv, export_tsv};
@@ -237,7 +237,7 @@ fn bench_replay(duration: Duration, scan_root: PathBuf) {
     let mut corpus = CorpusCursor::new(corpus_files);
 
     if corpus.files.is_empty() {
-        eprintln!("pgo_mix_benchmark[replay]: no .corro files under {}", scan_root.display());
+        eprintln!("pgo-mix-benchmark[replay]: no .corro files under {}", scan_root.display());
         std::process::exit(2);
     }
 
@@ -303,7 +303,7 @@ fn bench_startup(duration: Duration, scan_root: PathBuf) {
     paths.sort();
 
     if paths.is_empty() {
-        eprintln!("pgo_mix_benchmark[startup]: no .corro files under {}", scan_root.display());
+        eprintln!("pgo-mix-benchmark[startup]: no .corro files under {}", scan_root.display());
         std::process::exit(2);
     }
     let n_files = paths.len() as u64;
@@ -379,7 +379,7 @@ fn run_mix(duration: Duration, scan_root: PathBuf) {
     let mut corpus = CorpusCursor::new(corpus_files);
 
     if corpus.files.is_empty() {
-        eprintln!("pgo_mix_benchmark: no .corro files under {}", scan_root.display());
+        eprintln!("pgo-mix-benchmark: no .corro files under {}", scan_root.display());
         std::process::exit(2);
     }
 
@@ -455,7 +455,7 @@ fn run_mix(duration: Duration, scan_root: PathBuf) {
 
 fn usage() -> ! {
     eprintln!(
-"Usage: pgo_mix_benchmark [OPTIONS]
+"Usage: pgo-mix-benchmark [OPTIONS]
 
 Modes (--bench MODE):
   mix      Original PGO mixed workload (default)

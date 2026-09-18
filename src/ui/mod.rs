@@ -7480,6 +7480,8 @@ impl App {
 
     /// Ensure there's an on-disk untitled `.corro` file for this App instance and
     /// bind it to `self.path`. Returns the created path.
+    pub fn debug_ensure_unsaved_file(&mut self) -> Result<PathBuf, RunError> { self.ensure_unsaved_file() }
+
     fn ensure_unsaved_file(&mut self) -> Result<PathBuf, RunError> {
         if let Some(ref p) = self.path.clone() {
             return Ok(p.clone());
