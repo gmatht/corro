@@ -21855,8 +21855,52 @@ mod tests {
         }
     }
 
+    /// The user-visible half of the long-ignored
+    /// `s_column_date_truncation_respects_max_col_width`: the fixture's S
+    /// column must render its `2001/01/01` date in full at the default max
+    /// column width, and truncate it once the max width is lowered.
+    ///
+    /// The old test drove `fit_visible_columns_capped`/`trim_visible_cols_to_width`
+    /// directly and asserted on slice offsets; the fixture has since grown
+    /// (duplicate columns) so its internal column list is all width-1 and that
+    /// assertion no longer describes the render. This drives the real draw.
     #[test]
-#[ignore = "pre-existing crate::ui failure, lib-independent; see GOALS.md"]
+    fn s_column_date_renders_whole_at_default_width() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use std::path::PathBuf;
+
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs/tests/extrapolate.corro");
+        let mut app = App::new(Some(path));
+        app.load_initial().unwrap();
+
+        let render = |app: &mut App| -> Vec<String> {
+            let mut terminal = Terminal::new(TestBackend::new(200, 30)).unwrap();
+            terminal.draw(|f| app.draw(f)).unwrap();
+            let buf = terminal.backend().buffer();
+            (0..buf.area.height)
+                .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect())
+                .collect()
+        };
+
+        let rows = render(&mut app);
+        assert!(
+            rows.iter().any(|l| l.contains("2001/01/01")),
+            "S column must show the full date at the default max width"
+        );
+
+        // Lowering the max width must truncate it (the other half of the
+        // original intent): the date can no longer appear whole anywhere.
+        app.state.grid.set_max_col_width(4);
+        let rows = render(&mut app);
+        assert!(
+            !rows.iter().any(|l| l.contains("2001/01/01")),
+            "date must truncate once max_col_width is 4"
+        );
+    }
+
+    #[test]
+#[ignore = "internal-helper assertion, not a render regression; superseded by s_column_date_renders_whole_at_default_width"]
     fn s_column_date_truncation_respects_max_col_width() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
@@ -23491,8 +23535,7 @@ mod tests {
     }
 
     #[test]
-#[ignore = "pre-existing corro GUI failure; see GOALS.md"]
-    fn linked_tsv_edits_persist_on_save() {
+fn linked_tsv_edits_persist_on_save() {
         use tempfile::tempdir;
         use std::fs;
 
@@ -23702,7 +23745,7 @@ mod tests {
     /// Run (release recommended):
     /// `cargo test --release tui_up_arrow_latency_harness -- --ignored --nocapture`
     #[test]
-    #[ignore]
+    #[ignore = "timing harness (prints latency); run with --ignored, not a pass/fail gate"]
     fn tui_up_arrow_latency_harness() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
@@ -24100,7 +24143,6 @@ fn unsaved_header_and_op_committed_on_first_edit() {
 }
 
 #[test]
-#[ignore = "pre-existing crate::ui failure, lib-independent; see GOALS.md"]
 fn ensure_unsaved_file_uses_default_dir_not_cwd() {
     use tempfile::tempdir;
 

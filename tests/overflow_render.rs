@@ -7,7 +7,6 @@ use ratatui::Terminal;
 use std::path::Path;
 
 #[test]
-#[ignore = "pre-existing corro GUI overflow-render bug; see GOALS.md"]
 fn render_overflow_sample() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/tests/overflow.corro");
     assert!(path.exists(), "overflow sample missing: {}", path.display());
@@ -32,8 +31,21 @@ fn render_overflow_sample() {
     assert!(whole.contains("This Text is really long and should overflow."), "render does not contain expected text");
 
     // Count occurrences of the long phrase to ensure each seeded cell rendered.
+    //
+    // The fixture sets the phrase in A1, B2 and C3, but a later `SET A1
+    // Hello World!` overwrites A1, so exactly two cells still hold it. The
+    // old `>= 3` was written before that overwrite was added and had been
+    // failing as a stale expectation (not an overflow-render bug).
     let occurrences = whole.matches("This Text is really long and should overflow.").count();
-    assert!(occurrences >= 3, "expected at least 3 occurrences of the long text, found {}", occurrences);
+    assert_eq!(
+        occurrences, 2,
+        "expected the phrase in the two surviving cells (B2, C3), found {occurrences}"
+    );
+    // And the overwriting value must render too, so the cell is not blank.
+    assert!(
+        whole.contains("Hello World!"),
+        "A1's overwriting value must still render"
+    );
 
     // ── fg/bg color assertions ──────────────────────────────────────────
 

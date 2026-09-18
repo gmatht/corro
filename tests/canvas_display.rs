@@ -1,13 +1,43 @@
+//! Canvas/plumbing tests for the runtime-dlopen GTK backend.
+//!
+//! These exercise `gtk_drawing_area_set_draw_func`, which exists in GTK4
+//! only. The loader defaults to GTK3 (`GTK_DLOPEN_PREFER_GTK3`), so on a
+//! default run the symbol is absent and the call returns
+//! `MissingSymbol("gtk_drawing_area_set_draw_func")`. That was previously
+//! recorded as an intermittent "GTK floating-ref segfault"; it is neither
+//! intermittent nor a segfault, it is a GTK-major mismatch. They now skip
+//! loudly unless GTK4 is actually loaded, and can be run with:
+//!
+//!     GTK_DLOPEN_PREFER_GTK3=0 xvfb-run -a cargo test --features gui \
+//!         --test canvas_display
 #[cfg(all(feature = "gui", target_os = "linux"))]
 mod canvas_tests {
     use std::cell::Cell;
     use std::ffi::c_void;
     use std::sync::Arc;
 
+    /// True when the loader would pick GTK4 for this process.
+    fn gtk4_available() -> bool {
+        std::env::var_os("GTK_DLOPEN_PREFER_GTK3").is_some_and(|v| v == "0")
+            && gtk_dynamic_loader::Loader::new().is_ok()
+    }
+
+    macro_rules! require_gtk4 {
+        () => {
+            if !gtk4_available() {
+                eprintln!(
+                    "SKIP {}: needs GTK4 (set GTK_DLOPEN_PREFER_GTK3=0;                      gtk_drawing_area_set_draw_func is GTK4-only)",
+                    module_path!()
+                );
+                return;
+            }
+        };
+    }
+
     // ---- API-level test ----
     #[test]
-#[ignore = "pre-existing GTK floating-ref segfault (intermittent); see GOALS.md"]
     fn canvas_set_draw_callback_api() {
+        require_gtk4!();
         let loader = gtk_dynamic_loader::Loader::new().expect("Loader::new failed");
         let da = gtk_dynamic_loader::DrawingArea::new(loader.clone())
             .expect("DrawingArea::new failed");
@@ -27,8 +57,8 @@ mod canvas_tests {
 
     // ---- Full rendering test (requires DISPLAY) ----
     #[test]
-#[ignore = "pre-existing GTK floating-ref segfault (intermittent); see GOALS.md"]
     fn canvas_draw_callback_fires() {
+        require_gtk4!();
         let loader = gtk_dynamic_loader::Loader::new().expect("Loader::new failed");
 
         // Shared flag to verify the draw callback was invoked
