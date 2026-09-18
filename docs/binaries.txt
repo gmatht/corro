@@ -42,7 +42,17 @@ Not shipped in v0.7.0
   Microsoft's unicows redistributable. Inner names: corro.exe (pancurses
   TUI, console subsystem) and gcorro.exe (GUI, selected by argv[0]
   dispatch).
-- MSIX packages (corro-0.7.0.0-{x64,x86,arm64}.msix). scripts/package-msix.py
-  can build them and tests/msix_conformance.rs validates the structure, but
-  no workflow produces them yet, so they are not on the release page. Build
-  locally before claiming MSIX support for a release.
+- MSIX packages (corro-0.7.0.0-{x64,x86}.msix) are built by
+  scripts/package-msix.py and validated by tests/msix_conformance.rs, but
+  no workflow produces them: they are not on the release page and must be
+  built and uploaded by hand (Partner Center takes them unsigned).
+  - x64/x86 build anywhere with the gnullvm/gnu targets plus
+    `RUSTFLAGS=-C link-arg=-mwindows` (the MSIX payload must be
+    GUI-subsystem, unlike the .zip assets which stay console-subsystem).
+  - arm64 is NOT built here: the aarch64-pc-windows-gnullvm link needs an
+    aarch64 Windows unwinder (_Unwind_Resume, _GCC_specific_handler) which
+    zig's bundled CRT does not ship and this environment cannot supply.
+    tools/make-armstubs.sh covers the msvcrt/synchronization/
+    windows.0.52.0 import stubs but not libunwind, so the link fails with
+    undefined _Unwind_* symbols. Build arm64 on a machine with an
+    aarch64-w64-mingw32 GCC (or a prebuilt libunwind for that target).
