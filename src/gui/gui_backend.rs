@@ -1158,6 +1158,22 @@ fn handle_key(keyval: u32, state_rc: &Rc<GuiState>, mods: u32) -> bool {
                 agg_dropdown_step(state, 1);
                 return true;
             }
+            // Digit hotkeys commit the numbered row directly (ratatui
+            // parity: `1`..=`7`). `1`..=`9` are exactly the digit keyvals.
+            k if (49..=57).contains(&k) => {
+                let ch = char::from_u32(k).unwrap_or('0');
+                if let Some(idx) = crate::ui_core::agg_choice_index_for_digit(ch) {
+                    log_key_action(keyval, "agg_drop_digit", &format!("digit={ch} idx={idx}"));
+                    // The dropdown's own `sel` is what commit reads.
+                    if let Some(d) = state.agg_drop.borrow_mut().as_mut() {
+                        d.sel = idx;
+                    }
+                    super::agg_picker::set(state.app_mut(), idx);
+                    agg_dropdown_commit(state);
+                }
+                state.canvas.queue_redraw();
+                return true;
+            }
             _ => {}
         }
     }
@@ -1182,7 +1198,7 @@ fn handle_key(keyval: u32, state_rc: &Rc<GuiState>, mods: u32) -> bool {
         }
         F2 => {
             log_key_action(keyval, "start_edit", &format!("cell={}", format_cell(state)));
-            start_edit(state);
+            start_edit_seeded_from_cell(state);
             true
         }
         F3 => {
@@ -1476,14 +1492,33 @@ fn handle_edit_key(key: u32, state: &GuiState) -> bool {
 // Edit operations
 // ---------------------------------------------------------------------------
 
-/// Fresh empty edit (F2). Kept for the pre-seed F2 caller; the selecting
-/// paths use [`start_edit_keep_display`] below. Allowed dead while the
-/// F2-seed work lands (it removes this function's last caller).
+/// Fresh empty edit (F2). Retained for callers that want a blank buffer;
+/// the interactive F2 path uses [`start_edit_with_text`] so the cell's
+/// current value is seeded rather than discarded.
 #[allow(dead_code)]
 fn start_edit(state: &GuiState) {
     state.editing.set(true);
     state.edit_buf.borrow_mut().clear();
     state.formula_entry.set_text("");
+    state.formula_entry.grab_focus();
+    state.canvas.queue_redraw();
+}
+
+/// F2: edit the cursor cell, seeded with its current value (LibreOffice
+/// parity — typing appends to the existing content instead of replacing it,
+/// so a keystroke can never silently discard a value the user never saw).
+/// Uses the formula bar's displayed text, which the cursor move already
+/// refreshed to this cell's value.
+fn start_edit_seeded_from_cell(state: &GuiState) {
+    // Editing supersedes the aggregate dropdown.
+    hide_agg_dropdown(state);
+    state.editing.set(true);
+    state.entry_clicked.set(false);
+    let shown = state.formula_entry.get_text().unwrap_or_default();
+    *state.edit_buf.borrow_mut() = shown;
+    sync_entry_to_buf(state);
+    state.edit_caret.set(edit_caret_len(state));
+    push_caret_to_entry(state);
     state.formula_entry.grab_focus();
     state.canvas.queue_redraw();
 }
@@ -4811,7 +4846,8 @@ mod agg_drop_tests {
         assert_eq!(row_h, ROW_H);
         assert_eq!(y, 24.0 + ROW_H, "opens downward from the cell");
         assert!(w >= 150.0, "at least wide enough to read a label");
-        assert_eq!(h, 6.0 * ROW_H + 2.0, "one row per choice plus the border");
+        let rows = crate::ui_core::AGG_CHOICES.len() as f64;
+        assert_eq!(h, rows * ROW_H + 2.0, "one row per choice plus the border");
         assert_eq!(x, 158.0);
 
         // Near the right edge the box is pulled back inside the canvas.

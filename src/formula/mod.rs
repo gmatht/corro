@@ -4938,3 +4938,46 @@ mod right_margin_key_header_tests {
         assert_eq!(cell_effective_display(&g, &b1), "6");
     }
 }
+
+/// The canned template the aggregate dropdown offers as its last row
+/// (`=A*B -- AB`) must work end-to-end when committed into a margin header:
+/// the `]A` column computes `A*B` per row. This is the exact text the
+/// picker writes (see `ui_core::AGG_CHOICES`).
+#[cfg(test)]
+mod template_choice_end_to_end {
+    use super::*;
+    use crate::grid::ColumnAddr;
+
+    #[test]
+    fn the_picker_template_choice_computes_in_the_right_margin_column() {
+        // The literal directive the dropdown commits.
+        let directive = crate::ui_core::AGG_CHOICES
+            .iter()
+            .map(|(_, d)| *d)
+            .find(|d| crate::ui_core::is_template_choice_directive(d))
+            .expect("the picker offers a template entry");
+        assert_eq!(directive, "=A*B -- AB");
+
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(3, 3));
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "3".into());
+        g.set(&CellAddr::Main { row: 0, col: 1 }, "4".into());
+        g.set(&CellAddr::Main { row: 1, col: 0 }, "5".into());
+        g.set(&CellAddr::Main { row: 1, col: 1 }, "6".into());
+        let right_a_hdr = CellAddr::Header {
+            row: (HEADER_ROWS - 1) as u32,
+            col: ColumnAddr::Right(0),
+        };
+        g.set(&right_a_hdr, directive.into());
+
+        assert_eq!(
+            cell_effective_display(&g, &CellAddr::Right { col: 0, row: 0 }),
+            "12"
+        );
+        assert_eq!(
+            cell_effective_display(&g, &CellAddr::Right { col: 0, row: 1 }),
+            "30"
+        );
+        // The header shows the label half of the template.
+        assert_eq!(cell_effective_display(&g, &right_a_hdr), "AB");
+    }
+}

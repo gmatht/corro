@@ -301,15 +301,20 @@ pub fn special_labelled_choices() -> [String; 10] {
 /// (see `ops::margin_key_agg_func`): it aggregates while staying distinct
 /// from spreadsheet formulas like `=MIN(A1)`.
 ///
+/// The last entry is a canned column template rather than an aggregate: it
+/// writes the literal control formula `=A*B -- AB`, which the margin header
+/// turns into a per-row template (see `formula::templated_formula`).
+///
 /// Order is the navigation contract (Down*n lands on the nth row) — never
 /// reorder without updating every backend's picker and the parity tests.
-pub const AGG_CHOICES: [(&str, &str); 6] = [
+pub const AGG_CHOICES: [(&str, &str); 7] = [
     ("TOTAL", "==TOTAL"),
     ("MAX", "==MAX"),
     ("MIN", "==MIN"),
     ("AVERAGE", "==AVERAGE"),
     ("COUNT", "==COUNT"),
     ("MEDIAN", "==MEDIAN"),
+    ("=A*B -- AB", "=A*B -- AB"),
 ];
 
 /// Directive text for choice `idx` (what the picker writes into the cell).
@@ -328,6 +333,15 @@ pub fn agg_choice_row(idx: usize) -> Option<String> {
     Some(format!("{}: {label}", idx + 1))
 }
 
+/// Whether a picker directive is the canned column **template** rather than
+/// an aggregate. Exactly one entry (the trailing `=A*B -- AB`) is a template:
+/// it is written verbatim and interpreted by
+/// [`crate::formula::templated_formula`], so it must not be expected to parse
+/// as a margin aggregate.
+pub fn is_template_choice_directive(directive: &str) -> bool {
+    !directive.starts_with("==") && directive.trim_start().starts_with('=')
+}
+
 /// All picker rows in navigation order.
 pub fn agg_labelled_choices() -> Vec<String> {
     (0..AGG_CHOICES.len())
@@ -335,7 +349,7 @@ pub fn agg_labelled_choices() -> Vec<String> {
         .collect()
 }
 
-/// Digit hotkey → choice index (`1`..=`6` → 0..=5).
+/// Digit hotkey → choice index (`1`..=`7` → 0..=6, bounded by the list).
 pub fn agg_choice_index_for_digit(digit: char) -> Option<usize> {
     match digit {
         '1'..='9' => {
@@ -498,17 +512,28 @@ mod agg_choice_tests {
     fn digits_and_steps_clamp_to_the_choice_range() {
         assert_eq!(agg_choice_index_for_digit('1'), Some(0));
         assert_eq!(agg_choice_index_for_digit('6'), Some(5));
-        assert_eq!(agg_choice_index_for_digit('7'), None);
+        assert_eq!(agg_choice_index_for_digit('7'), Some(6));
+        assert_eq!(agg_choice_index_for_digit('8'), None);
         assert_eq!(agg_choice_index_for_digit('0'), None);
         assert_eq!(agg_step_index(0, -5), 0);
         assert_eq!(agg_step_index(0, 99), AGG_CHOICES.len() - 1);
     }
 
-    /// Every directive the picker writes is accepted by the margin parser
-    /// (the single source of truth for what a margin key means).
+    /// Every *aggregate* directive the picker writes is accepted by the
+    /// margin parser (the single source of truth for what a margin key
+    /// means), and uses the `==` prefix that keeps it distinct from a
+    /// spreadsheet formula. The canned column template (`=A*B -- AB`) is
+    /// deliberately not an aggregate, so it is exempt.
     #[test]
     fn every_directive_is_a_recognised_margin_key() {
         for (label, directive) in AGG_CHOICES {
+            if crate::ui_core::is_template_choice_directive(directive) {
+                assert!(
+                    crate::ops::margin_key_agg_func(directive).is_none(),
+                    "{label}: the template must not parse as an aggregate"
+                );
+                continue;
+            }
             assert!(
                 crate::ops::margin_key_agg_func(directive).is_some(),
                 "{label}: {directive} must parse as an aggregate directive"

@@ -140,6 +140,7 @@ fn shared_down_n_enter(downs: usize) -> Option<String> {
                 corro::gui::actions::MenuDispatch::About { .. } => "About",
                 corro::gui::actions::MenuDispatch::HelpFull { .. } => "HelpFull",
                 corro::gui::actions::MenuDispatch::HelpKeybinds { .. } => "HelpKeybinds",
+                corro::gui::actions::MenuDispatch::AggregatePicker => "AggregatePicker",
             }
         ),
     }

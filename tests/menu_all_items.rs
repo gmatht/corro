@@ -133,6 +133,7 @@ fn dispatch_hint(d: &MenuDispatch) -> &'static str {
         MenuDispatch::About { .. } => "About",
         MenuDispatch::HelpFull { .. } => "HelpFull",
         MenuDispatch::HelpKeybinds { .. } => "HelpKeybinds",
+        MenuDispatch::AggregatePicker => "AggregatePicker",
     }
 }
 
