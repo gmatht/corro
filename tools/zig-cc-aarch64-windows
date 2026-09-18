@@ -1,0 +1,21 @@
+#!/bin/sh
+# zig-cc wrapper: link Rust binaries for Windows ARM64 (mingw flavor).
+# Mirrors tools/zig-cc-gnu217. Use with:
+#   CARGO_TARGET_AARCH64_PC_WINDOWS_GNULLVM_LINKER=/path/to/zig-cc-aarch64-windows \
+#       cargo build --target aarch64-pc-windows-gnullvm
+# Needs: rustup target add aarch64-pc-windows-gnullvm
+#
+# Appends sincos-aarch64-windows.o (sibling of this script): a mingwex-
+# compatible sincos() shim. num-complex references the GNU `sincos`
+# extension, which real MinGW-w64 supplies via libmingwex but zig's bundled
+# CRT does not. Skipped automatically for compile-only invocations.
+HERE=$(dirname "$0")
+EXTRA=""
+case " $* " in
+  *" -c "*) ;;
+  *) [ -f "$HERE/sincos-aarch64-windows.o" ] && EXTRA="$HERE/sincos-aarch64-windows.o"
+     # zig cc ignores GNU `-mwindows`; this is the lld-link equivalent:
+     # link GUI-subsystem (no console window) for the Store build.
+     EXTRA="$EXTRA -Wl,--subsystem,windows" ;;
+esac
+exec zig cc -target aarch64-windows-gnu "$@" $EXTRA
