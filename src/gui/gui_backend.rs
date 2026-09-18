@@ -248,6 +248,14 @@ struct GuiState {
     data_cols: Cell<usize>,
     last_key: Cell<u32>,
     key_counter: Cell<u64>,
+    /// Set when any pointer click has been handled. `present()` pumps the
+    /// GTK main loop for several hundred iterations before the real main
+    /// loop starts, so a click can arrive while `run_gui`'s setup is still
+    /// running. The post-`present` `start_edit_keep_display` would then
+    /// clobber that selection (moving the yellow edit highlight to the
+    /// startup cursor and hiding any dropdown the click opened). Setup
+    /// checks this flag and leaves the user's click alone.
+    clicked: Cell<bool>,
     entry_processed_key: Cell<bool>,
     last_alt_keyval: Cell<u32>,
     // Tracks whether the entry widget's key handler has ever fired. Gates the
@@ -1480,6 +1488,38 @@ fn start_edit(state: &GuiState) {
     state.canvas.queue_redraw();
 }
 
+/// What run_gui's setup should do after `present()` returns, chosen from
+/// state that may already have been changed by events delivered *during*
+/// `present()`'s main-loop pump. Pure so the race is unit-testable without
+/// widgets.
+///
+/// `present()` pumps the GTK main loop for hundreds of iterations before the
+/// real loop runs, and the canvas click/key handlers are registered before
+/// it. A click arriving in that window has already selected its cell and may
+/// have opened the aggregate dropdown; running the default "select A1" step
+/// afterwards would (a) move the yellow edit highlight to A1 and (b)
+/// `hide_agg_dropdown`, closing the list the click just opened. Hence a
+/// click wins over the default selection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StartupEdit {
+    /// An edit with typed content is already in flight: keep it, just focus.
+    KeepInFlight,
+    /// A click already chose the cell: do not clobber it with A1.
+    KeepClicked,
+    /// Fresh start: select A1 for typing.
+    SelectA1,
+}
+
+fn startup_edit_action(editing_with_content: bool, clicked: bool) -> StartupEdit {
+    if editing_with_content {
+        StartupEdit::KeepInFlight
+    } else if clicked {
+        StartupEdit::KeepClicked
+    } else {
+        StartupEdit::SelectA1
+    }
+}
+
 /// Keeps the formula bar showing the cell's value
 /// (grid clicks and setup select; they must display, not blank). The buffer
 /// is still cleared, so typing replaces (ratatui parity) and committing an
@@ -2241,6 +2281,10 @@ fn sync_chrome_labels(state: &GuiState) {
 
 fn handle_click(x: f64, y: f64, state_rc: &Rc<GuiState>) {
     let state: &GuiState = &**state_rc;
+    // Mark that the user has clicked: clicks can arrive during `present()`'s
+    // startup pump (see `GuiState::clicked`), and run_gui's post-present
+    // selection must not clobber them.
+    state.clicked.set(true);
     // Padlock hits first: padlocks live in the gutter chrome that plain
     // clicks ignore, and toggling a pin must not move the cursor, collapse
     // the selection, or start editing.
@@ -3333,6 +3377,7 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         data_cols: Cell::new(data_cols),
         last_key: Cell::new(0),
         key_counter: Cell::new(0),
+        clicked: Cell::new(false),
         entry_processed_key: Cell::new(false),
         last_alt_keyval: Cell::new(0),
         entry_seen: Cell::new(true),
@@ -3904,12 +3949,26 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // OUTPUT_EXISTS=false when a subsequent RETURN commits an empty
     // buffer.  Guard the call: if editing is already in progress with
     // content, just grab focus and redraw without clearing.
-    if shared.editing.get() && !shared.edit_buf.borrow().is_empty() {
-        shared.formula_entry.grab_focus();
-        shared.canvas.queue_redraw();
-    } else {
-        // Select A1 for typing (display its value); see the click path.
-        start_edit_keep_display(&shared);
+    match startup_edit_action(
+        shared.editing.get() && !shared.edit_buf.borrow().is_empty(),
+        shared.clicked.get(),
+    ) {
+        StartupEdit::KeepInFlight => {
+            shared.formula_entry.grab_focus();
+            shared.canvas.queue_redraw();
+        }
+        StartupEdit::KeepClicked => {
+            // A click during present()'s pump already chose a cell (possibly
+            // opening the aggregate dropdown). Selecting A1 here would move
+            // the yellow edit highlight off the clicked cell and
+            // hide_agg_dropdown would close the list the click just opened —
+            // the "clicked [A_n but [A1 turned yellow" bug. Leave it alone.
+            shared.canvas.queue_redraw();
+        }
+        StartupEdit::SelectA1 => {
+            // Select A1 for typing (display its value); see the click path.
+            start_edit_keep_display(&shared);
+        }
     }
 
     // Pump events after start_edit() to ensure the frame clock processes
@@ -4854,5 +4913,43 @@ mod agg_drop_tests {
             crate::addr::MainCols(mc),
         );
         assert_eq!(back, addr, "display rect must round-trip to the same key");
+    }
+}
+
+#[cfg(test)]
+mod startup_race_tests {
+    use super::*;
+
+    /// REPRO: clicking a footer key `[A_n` during present()'s event pump
+    /// selected the wrong cell and turned it yellow (edit state) instead of
+    /// leaving the clicked cell blue with its dropdown open. The click sets
+    /// `clicked`, and setup must then refuse to reselect A1.
+    #[test]
+    fn a_click_during_startup_pump_wins_over_selecting_a1() {
+        assert_eq!(
+            startup_edit_action(false, true),
+            StartupEdit::KeepClicked,
+            "a click during present() must not be clobbered by the A1 selection"
+        );
+    }
+
+    /// With no interaction the default still selects A1 (unchanged behaviour).
+    #[test]
+    fn no_interaction_still_selects_a1() {
+        assert_eq!(startup_edit_action(false, false), StartupEdit::SelectA1);
+    }
+
+    /// An in-flight edit with typed content outranks even a click: the
+    /// replayer may have typed before present() returned.
+    #[test]
+    fn in_flight_edit_outranks_a_click() {
+        assert_eq!(
+            startup_edit_action(true, true),
+            StartupEdit::KeepInFlight
+        );
+        assert_eq!(
+            startup_edit_action(true, false),
+            StartupEdit::KeepInFlight
+        );
     }
 }
