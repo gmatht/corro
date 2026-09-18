@@ -1,4 +1,4 @@
-0.7.0 (unreleased)
+0.7.0 Windows 95 support (WIP); new release artifacts
       - Saving an unsaved document no longer drops the auto-added TOTALs.
         The untitled log (which Save renames verbatim onto the destination)
         was written as a bare header, so the in-memory margin seeds — which
