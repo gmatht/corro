@@ -408,3 +408,50 @@ mod tests {
         );
     }
 }
+
+/// Regression: a control formula in the right-margin key header (`]A~1`)
+/// must render in the **`]A` column**, not the last main column. Reported:
+/// typing `=A*B -- AB` in `]A~1` displayed `A*B` (its value) in the last
+/// data column instead of in `]A`.
+#[cfg(test)]
+mod right_margin_display_tests {
+    use super::*;
+
+    #[test]
+    fn right_margin_header_template_renders_in_the_right_margin_column() {
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(3, 3));
+        let hr = crate::grid::HEADER_ROWS;
+        let lm = crate::grid::MARGIN_COLS;
+        let mr = g.main_rows();
+        let mc = g.main_cols();
+
+        // A1 = 3, B1 = 4; the header of ]A holds the template.
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "3".into());
+        g.set(&CellAddr::Main { row: 0, col: 1 }, "4".into());
+        let right_a_hdr = CellAddr::Header { row: (hr - 1) as u32, col: ColumnAddr::Right(0) };
+        g.set(&right_a_hdr, "=A*B -- AB".into());
+
+        let row0 = hr;                    // first data row
+        let last_main_col = lm + mc - 1;  // C
+        let right_a_col = lm + mc;        // ]A
+
+        // ]A shows the computed value A1*B1 = 12.
+        assert_eq!(
+            cell_display_at(&g, row0, hr, mr, right_a_col, lm, mc),
+            "12",
+            "]A must display its own header template's value"
+        );
+        // The last main column stays empty -- no leak.
+        assert_eq!(
+            cell_display_at(&g, row0, hr, mr, last_main_col, lm, mc),
+            "",
+            "the ]A header must not render in the last data column"
+        );
+        // The ]A header cell itself shows its label (looked up by its true
+        // address; the header band renders row 0 as the visible header).
+        assert_eq!(
+            crate::formula::cell_effective_display(&g, &right_a_hdr),
+            "AB"
+        );
+    }
+}

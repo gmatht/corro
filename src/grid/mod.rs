@@ -1151,8 +1151,10 @@ impl Grid {
         if range.is_empty() {
             return false;
         }
-        // Mirrors the three template sources in `templated_formula`:
-        // a column header, its right-margin mirror, and the row's key cell.
+        // Mirrors the template sources in `templated_formula`: a main
+        // column's own header, and the row's key cell. Right-margin headers
+        // template their own right-margin column (a `MainRange` never spans
+        // the margins), so they cannot contribute a template here.
         fn raw_templates(raw: Option<&String>) -> bool {
             let Some(raw) = raw else {
                 return false;
@@ -1176,14 +1178,6 @@ impl Grid {
                 && raw_templates(self.header.get(&(header_row, ColumnAddr::Main(c))))
             {
                 return true;
-            }
-            // Right-margin mirror header for this column (see `templated_formula`).
-            if (c as usize) < mc && mc > 0 {
-                let rmi = mc.saturating_sub(1).saturating_sub(c as usize);
-                let mirror = ColumnAddr::from_global(MARGIN_COLS + mc + rmi, mc);
-                if raw_templates(self.header.get(&(header_row, mirror))) {
-                    return true;
-                }
             }
         }
         // Left key-column cells template their row (no agg-key exclusion on

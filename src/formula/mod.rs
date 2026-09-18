@@ -1533,6 +1533,32 @@ fn control_formula_label(grid: &Grid, addr: &CellAddr) -> Option<String> {
 }
 
 fn templated_formula(grid: &Grid, addr: &CellAddr) -> Option<String> {
+    // The right-margin key column (`]A`, `]B`, ...) is a stable, real column
+    // address (Principles.txt: it is always the column immediately right of
+    // the main block), with its own data rows. A control formula in its
+    // header (`]A~1`) is therefore *that column's* per-row template — the
+    // same relationship a main column's header has to its main column.
+    //
+    // It must NOT be mirrored onto the last main column: doing so made a
+    // formula typed in `]A~1` display in the last data column while `]A`
+    // itself stayed blank.
+    if let CellAddr::Right { row, col } = addr {
+        let header_addr = CellAddr::Header {
+            row: (HEADER_ROWS - 1) as u32,
+            col: ColumnAddr::Right(*col),
+        };
+        // Aggregate keys (`=TOTAL`, `==MAX`) keep their aggregate semantics.
+        if let Some(raw) = grid.get(&header_addr) {
+            if crate::ops::margin_key_agg_func(&raw).is_none() {
+                if let Some(expr) = control_formula_expr(grid, &header_addr) {
+                    return Some(format!("={}", rewrite_header_template(&expr, *row)));
+                }
+            }
+        }
+        // A row-key template in the left margin does not apply out here.
+        return None;
+    }
+
     let CellAddr::Main { row, col } = addr else {
         return None;
     };
@@ -1548,32 +1574,6 @@ fn templated_formula(grid: &Grid, addr: &CellAddr) -> Option<String> {
         if crate::ops::margin_key_agg_func(&raw).is_none() {
             if let Some(expr) = control_formula_expr(grid, &header_addr) {
                 return Some(format!("={}", rewrite_header_template(&expr, *row)));
-            }
-        }
-    }
-
-    // Also support header templates placed in the right margin. A right-margin
-    // header cell immediately to the right of the main block (]A) maps to the
-    // last main column, the next (]B) to the second-last, etc. This lets users
-    // put a control formula like `=B` in a right-margin header (e.g. `]A~1`) and
-    // have it act as a per-row template for the corresponding main column.
-    let mc = grid.main_cols() as u32;
-    if mc > 0 {
-        // col is the 0-based main-column index; compute the right-margin index
-        // that sits adjacent to that main column.
-        if *col <= mc.saturating_sub(1) {
-            let rmi = mc.saturating_sub(1).saturating_sub(*col);
-            let right_header_col = (MARGIN_COLS as u32) + mc + rmi;
-            let right_header_addr = CellAddr::Header {
-                row: (HEADER_ROWS - 1) as u32,
-                col: ColumnAddr::from_global(right_header_col as usize, grid.main_cols()),
-            };
-            if let Some(raw) = grid.get(&right_header_addr) {
-                if crate::ops::margin_key_agg_func(&raw).is_none() {
-                    if let Some(expr) = control_formula_expr(grid, &right_header_addr) {
-                        return Some(format!("={}", rewrite_header_template(&expr, *row)));
-                    }
-                }
             }
         }
     }
@@ -3624,7 +3624,7 @@ mod tests {
     }
 
     #[test]
-    fn right_margin_header_template_applies_to_adjacent_main_col() {
+    fn right_margin_header_template_applies_to_its_own_right_margin_column() {
         // Create a grid with multiple main columns so right-margin headers exist.
         let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(2, 3));
         let mc = g.main_cols();
@@ -3635,25 +3635,36 @@ mod tests {
         };
         g.set(&header_addr_a, "=B".into());
 
-        // The ]A header maps to the last main column (mc-1). For main row 0,
-        // the templated formula should become "=B1".
-        let main_addr = CellAddr::Main {
+        // `]A` is a real column: its header templates the `]A` data cells,
+        // per row. It must NOT be mirrored onto the last main column.
+        let right_row0 = CellAddr::Right { col: 0, row: 0 };
+        assert_eq!(templated_formula(&g, &right_row0), Some("=B1".into()));
+        let right_row1 = CellAddr::Right { col: 0, row: 1 };
+        assert_eq!(templated_formula(&g, &right_row1), Some("=B2".into()));
+
+        let last_main = CellAddr::Main {
             row: 0,
             col: (mc - 1) as u32,
         };
-        assert_eq!(templated_formula(&g, &main_addr), Some("=B1".into()));
+        assert_eq!(
+            templated_formula(&g, &last_main),
+            None,
+            "a ]A header must not leak into the last main column"
+        );
 
-        // ]B (next right-margin) maps to second-last main column.
+        // ]B (next right-margin) templates the ]B column, not a main column.
         let header_addr_b = CellAddr::Header {
             row: (HEADER_ROWS - 1) as u32,
             col: ColumnAddr::from_global(MARGIN_COLS + mc + 1, g.main_cols()),
         };
         g.set(&header_addr_b, "=C".into());
-        let main_addr_b = CellAddr::Main {
+        let right_b = CellAddr::Right { col: 1, row: 0 };
+        assert_eq!(templated_formula(&g, &right_b), Some("=C1".into()));
+        let second_last_main = CellAddr::Main {
             row: 0,
             col: (mc - 2) as u32,
         };
-        assert_eq!(templated_formula(&g, &main_addr_b), Some("=C1".into()));
+        assert_eq!(templated_formula(&g, &second_last_main), None);
     }
 
     #[test]
@@ -4844,5 +4855,86 @@ mod tests {
             ),
             "TAX"
         );
+    }
+
+}
+
+/// Regression: a formula typed in the right-margin key column's header
+/// (`]A~1`) must drive the **`]A` column**, not leak into the last main
+/// column. `]A` is a stable, real column address (Principles.txt: it is
+/// always the column immediately right of the main block), with its own
+/// data rows, so a header control formula there is the `]A` column's
+/// template -- the same relationship a main column's header has to that
+/// main column.
+#[cfg(test)]
+mod right_margin_key_header_tests {
+    use super::*;
+    use crate::grid::ColumnAddr;
+
+    /// Global column of the right-margin column at margin index `rmi`
+    /// (0 = `]A`, the column adjacent to the main block).
+    fn right_global(rmi: usize, g: &crate::grid::GridBox) -> usize {
+        MARGIN_COLS + g.main_cols() + rmi
+    }
+
+    fn right_header(rmi: usize, g: &crate::grid::GridBox) -> CellAddr {
+        CellAddr::Header {
+            row: (HEADER_ROWS - 1) as u32,
+            col: ColumnAddr::from_global(right_global(rmi, g), g.main_cols()),
+        }
+    }
+
+    /// `=A*B -- AB` in `]A~1` is the `]A` column's per-row template: the
+    /// `]A` data cells evaluate it, and the last main column is untouched.
+    #[test]
+    fn right_margin_key_header_template_drives_the_right_margin_column() {
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(3, 3));
+        // A1 = 3, B1 = 4  =>  A*B = 12 at every ]A row.
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "3".into());
+        g.set(&CellAddr::Main { row: 0, col: 1 }, "4".into());
+        // Row 2: A2 = 5, B2 = 6  =>  30.
+        g.set(&CellAddr::Main { row: 1, col: 0 }, "5".into());
+        g.set(&CellAddr::Main { row: 1, col: 1 }, "6".into());
+        g.set(&right_header(0, &g), "=A*B -- AB".into());
+
+        // The ]A column evaluates the template, per row.
+        let right_row0 = CellAddr::Right { col: 0, row: 0 };
+        let right_row1 = CellAddr::Right { col: 0, row: 1 };
+        assert_eq!(
+            templated_formula(&g, &right_row0),
+            Some("=A1*B1".to_string()),
+            "]A~1 must template the ]A column's own data cell"
+        );
+        assert_eq!(cell_effective_display(&g, &right_row0), "12");
+        assert_eq!(cell_effective_display(&g, &right_row1), "30");
+
+        // The last main column must NOT pick up the ]A header template.
+        let last = CellAddr::Main { row: 0, col: 2 };
+        assert_eq!(
+            templated_formula(&g, &last),
+            None,
+            "]A~1 must not leak into the last main column"
+        );
+        assert_eq!(cell_effective_display(&g, &last), "");
+
+        // The header cell itself keeps showing its label.
+        assert_eq!(cell_effective_display(&g, &right_header(0, &g)), "AB");
+    }
+
+    /// A main-column header template still drives that main column (the
+    /// behaviour the right-margin fix must not regress).
+    #[test]
+    fn main_column_header_template_still_drives_its_own_column() {
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(3, 3));
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "3".into());
+        g.set(&CellAddr::Main { row: 0, col: 1 }, "4".into());
+        let b_header = CellAddr::Header {
+            row: (HEADER_ROWS - 1) as u32,
+            col: ColumnAddr::from_global(MARGIN_COLS + 1, g.main_cols()),
+        };
+        g.set(&b_header, "=A*2 -- DOUBLE".into());
+        let b1 = CellAddr::Main { row: 0, col: 1 };
+        assert_eq!(templated_formula(&g, &b1), Some("=A1*2".to_string()));
+        assert_eq!(cell_effective_display(&g, &b1), "6");
     }
 }
