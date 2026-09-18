@@ -1,4 +1,9 @@
 0.7.1 (unreleased)
+      - Saving an unsaved document no longer drops the auto-added TOTALs.
+        The untitled log (which Save renames verbatim onto the destination)
+        was written as a bare header, so the in-memory margin seeds — which
+        have no committed edit op — vanished on reopen. It is now a complete
+        serialization (all regions, seeds and LINKs included).
       - Windows release exes build with the GUI feature so Explorer
         double-clicks open the NWG window. The exe stays console-subsystem
         (so cmd/PowerShell wait for the TUI until Ctrl+Q); a throwaway

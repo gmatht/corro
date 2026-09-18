@@ -479,6 +479,8 @@ pub(crate) enum MenuAction {
     InsertMitosisCol,
     InsertCols,
     InsertSpecialChars,
+    /// Margin aggregate picker (TOTAL/MAX/MIN/AVERAGE/COUNT/MEDIAN).
+    InsertAggregate,
     InsertDate,
     InsertTime,
     InsertHyperlink,
@@ -706,7 +708,7 @@ const SHEET_MENU_ITEMS: [MenuItem; 8] = [
     },
 ];
 
-const INSERT_ROOT_MENU_ITEMS: [MenuItem; 8] = [
+const INSERT_ROOT_MENU_ITEMS: [MenuItem; 9] = [
     MenuItem {
         shortcut: 'R',
         label: "Rows",
@@ -731,6 +733,11 @@ const INSERT_ROOT_MENU_ITEMS: [MenuItem; 8] = [
         shortcut: 'S',
         label: "Special Char",
         target: MenuTarget::Action(MenuAction::InsertSpecialChars),
+    },
+    MenuItem {
+        shortcut: 'G',
+        label: "Aggregate",
+        target: MenuTarget::Action(MenuAction::InsertAggregate),
     },
     MenuItem {
         shortcut: ';',
@@ -1251,6 +1258,51 @@ impl App {
         self.special_picker = Some(0);
     }
 
+    /// Open the margin-aggregate picker for the cursor.
+    ///
+    /// Resolution lives in [`crate::ui_core::resolve_margin_agg_key`] so all
+    /// backends share one rule (on a key cell → that cell; on a data cell →
+    /// the governing right-margin key).
+    fn open_agg_picker(&mut self) -> bool {
+        let Some((key_addr, func)) =
+            crate::ui_core::resolve_margin_agg_key(&self.state.grid, &self.cursor)
+        else {
+            self.status = "Aggregate: no margin TOTAL/MAX/… key for this cell".into();
+            return false;
+        };
+        self.agg_picker = Some(crate::ui_core::agg_choice_index_for_func(func));
+        self.agg_picker_target = Some(key_addr);
+        self.status = "Choose an aggregate; Enter applies, Esc cancels".into();
+        true
+    }
+
+    /// Commit the highlighted aggregate to the cursor cell as a
+    /// `==KEYWORD` directive (an ordinary cell op: it commits, saves, and
+    /// undoes like typing it).
+    fn commit_agg_choice(&mut self, idx: usize) -> Result<(), RunError> {
+        let Some(directive) = crate::ui_core::agg_choice_directive(idx) else {
+            self.agg_picker = None;
+            self.agg_picker_target = None;
+            return Ok(());
+        };
+        // Commit to the resolved key (the cursor may sit on a data cell).
+        let addr = self
+            .agg_picker_target
+            .take()
+            .unwrap_or_else(|| self.cursor.to_addr(&self.state.grid));
+        self.agg_picker = None;
+        self.apply_single_op(Op::SetCell {
+            addr: addr.clone(),
+            value: directive.to_string(),
+        })?;
+        self.status = format!(
+            "{} = {}",
+            crate::addr::cell_ref_text(&addr, self.state.grid.main_cols()),
+            cell_display(&self.state.grid, &addr)
+        );
+        Ok(())
+    }
+
     fn commit_special_choice(&mut self, idx: usize) {
         let choice = SPECIAL_VALUE_CHOICES[idx];
         self.pending_menu_edit = None;
@@ -1548,6 +1600,12 @@ impl App {
             MenuAction::InsertSpecialChars => {
                 self.open_special_picker();
                 self.mode.clone()
+            }
+            MenuAction::InsertAggregate => {
+                // Reuse the F3 route so the menu and the key cannot drift;
+                // off a key it explains in the status line.
+                let _ = self.open_agg_picker();
+                Mode::Normal
             }
             MenuAction::InsertDate => self.start_edit_mode(
                 crate::ui_core::today_string(),
@@ -2567,6 +2625,13 @@ fn read_clipboard() -> Result<String, String> {
     pending_workbook_edit: Option<std::path::PathBuf>,
     /// Text and caret when opening the special-character picker (`formula_cursor` restores `=`-ref picks).
     special_insert_snap: Option<(String, usize, Option<SheetCursor>, Option<usize>)>,
+    /// Margin aggregate picker selection (`Some(idx)` = open). Opened with
+    /// F3 on a margin aggregate key; committing writes the canonical
+    /// `==KEYWORD` directive to the cursor cell. Rows/navigation come from
+    /// `ui_core::AGG_CHOICES`, shared with the GUI/pancurses pickers.
+    agg_picker: Option<usize>,
+    /// Margin key cell the picker edits (the cursor may be on a data cell).
+    agg_picker_target: Option<CellAddr>,
     pending_format_target: Option<FormatTarget>,
     view_sheet_id: u32,
     persisted_view_sort_cols: HashMap<u32, Vec<SortSpec>>,
@@ -2788,6 +2853,8 @@ impl App {
             pending_external_edit: None,
             pending_workbook_edit: None,
             special_insert_snap: None,
+            agg_picker: None,
+            agg_picker_target: None,
             pending_format_target: None,
             view_sheet_id,
             persisted_view_sort_cols: HashMap::new(),
@@ -2822,7 +2889,7 @@ impl App {
     /// Apply one `.corro` log line to the workbook and sync UI sheet state (`view_sheet_id` /
     /// [`Self::sync_active_sheet_cache`]).
     ///
-    /// Used by the `pgo_mix_benchmark` workload and profiling without a real terminal.
+    /// Used by the `pgo-mix-benchmark` workload and profiling without a real terminal.
     pub fn bench_apply_corro_log_line(&mut self, line: &str) -> std::io::Result<()> {
         let mut active_sheet = self.view_sheet_id;
         crate::ops::apply_log_line_to_workbook(line, &mut self.workbook, &mut active_sheet)?;
@@ -7389,6 +7456,20 @@ impl App {
         }
     }
 
+    /// Full initial log text for a freshly created unsaved file.
+    ///
+    /// The unsaved log is the authoritative on-disk state and `save_to_path`
+    /// may rename it verbatim onto the user's destination, so it must be a
+    /// *complete* serialization — including in-memory margin seeds (the
+    /// built-in `TOTAL` cells) and linked-sheet LINK entries — not just a
+    /// header plus LINKs. Writing only a header here dropped every seed that
+    /// had no corresponding committed edit, so reopening a saved document
+    /// lost its auto-added TOTALs.
+    fn initial_unsaved_log_text(&mut self) -> String {
+        self.commit_active_sheet_cache();
+        crate::io::serialize_workbook_log(&self.workbook, &self.persisted_view_sort_cols)
+    }
+
     /// Ensure there's an on-disk untitled `.corro` file for this App instance and
     /// bind it to `self.path`. Returns the created path.
     fn ensure_unsaved_file(&mut self) -> Result<PathBuf, RunError> {
@@ -7435,34 +7516,20 @@ impl App {
                             eprintln!("{}", msg);
                         }
 
-                        // When creating an untitled on-disk .corro from a linked
-                        // external source, record the log header and LINK entries
-                        // so a full reload of the file reconstructs the linked
-                        // relationship and base state. Write the header + any
-                        // per-sheet LINK lines now so later tail/reload paths
-                        // won't discard the external base when replaying only
-                        // the on-disk log.
-                        let mut initial = String::new();
-                        initial.push_str(&format!(
-                            "{} {}\n",
-                            crate::ops::LOG_HEADER_PREFIX,
-                            crate::ops::LOG_VERSION
-                        ));
-                        for sheet in &self.workbook.sheets {
-                            if let Some(source) = &sheet.linked_source {
-                                let wbo = crate::ops::WorkbookOp::LinkSheet {
-                                    id: sheet.id,
-                                    source: source.clone(),
-                                };
-                                initial.push_str(&wbo.to_log_line(sheet.state.grid.main_cols()));
-                                initial.push('\n');
-                            }
-                        }
+                        // The unsaved log is the authoritative on-disk state,
+                        // and `save_to_path` may rename it verbatim onto the
+                        // user's destination. So it must be a *complete*
+                        // serialization — header, NEW_SHEET/LINK entries, and
+                        // every stored cell including in-memory margin seeds
+                        // (the built-in `TOTAL` cells) — not just a header.
+                        // Writing a bare header here dropped the seeds, so a
+                        // saved-then-reopened document lost its TOTALs.
+                        let initial = self.initial_unsaved_log_text();
                         std::fs::write(&cand, initial.as_bytes())
                             .map_err(|e| RunError::Io(crate::io::IoError::Io(e)))?;
                         #[cfg(debug_assertions)]
                         {
-                            let msg = format!("DEBUG ensure_unsaved_file: wrote header to {:?}", cand);
+                            let msg = format!("DEBUG ensure_unsaved_file: wrote initial log to {:?}", cand);
                             crate::debug_log::log(&msg);
                             eprintln!("{}", msg);
                         }
@@ -7544,34 +7611,12 @@ impl App {
                         crate::debug_log::log(&msg);
                         eprintln!("{}", msg);
                     }
-                    // When creating an untitled on-disk .corro from a linked
-                    // external source, record the log header and LINK entries
-                    // so a full reload of the file reconstructs the linked
-                    // relationship and base state. Write the header + any
-                    // per-sheet LINK lines now so later tail/reload paths
-                    // won't discard the external base when replaying only
-                    // the on-disk log.
-                    let mut initial = String::new();
-                    initial.push_str(&format!("{} {}\n", crate::ops::LOG_HEADER_PREFIX, crate::ops::LOG_VERSION));
-                    for sheet in &self.workbook.sheets {
-                        if let Some(source) = &sheet.linked_source {
-                            // Ensure the LINK we write to the initial unsaved
-                            // file includes any corrotitle the in-memory LinkedSource
-                            // may hold (keeps initial header consistent with later
-                            // compact saves).
-                            let wbo = crate::ops::WorkbookOp::LinkSheet {
-                                id: sheet.id,
-                                source: source.clone(),
-                            };
-                            // to_log_line doesn't meaningfully depend on the
-                            // main_cols for LINK entries, but the method
-                            // requires a usize parameter.
-                            initial.push_str(&wbo.to_log_line(sheet.state.grid.main_cols()));
-                            initial.push('\n');
-                        }
-                    }
-                    // Write header + LINK lines to the newly-created file and
-                    // bind to app state so subsequent commit flows use this path.
+                    // Complete serialization, exactly like the primary
+                    // candidate path above: the unsaved log may be renamed
+                    // verbatim on save, so a bare header would drop the
+                    // in-memory margin seeds (the built-in TOTAL cells).
+                    let initial = self.initial_unsaved_log_text();
+                    // Bind to app state so subsequent commit flows use this path.
                     std::fs::write(&cand, initial.as_bytes())
                         .map_err(|e| RunError::Io(crate::io::IoError::Io(e)))?;
                     #[cfg(debug_assertions)]
@@ -9146,6 +9191,7 @@ impl App {
     pub(crate) fn draw_visual(&mut self, f: &mut Frame) {
         f.render_widget(Clear, f.area());
         let special_picker = self.special_picker;
+        let agg_picker = self.agg_picker;
         let has_tabs = self.workbook.sheet_count() > 1;
         let constraints = vec![
             Constraint::Length(1),
@@ -9978,6 +10024,26 @@ impl App {
             }
         }
 
+        if let Some(selected) = agg_picker {
+            let items: Vec<ListItem> = crate::ui_core::agg_labelled_choices()
+                .into_iter()
+                .map(ListItem::new)
+                .collect();
+            let mut state = ListState::default();
+            state.select(Some(selected));
+            let picker = List::new(items)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Plain)
+                        .title(" Aggregate "),
+                )
+                .highlight_symbol("▸ ");
+            let area = centered_rect(40, 40, f.area());
+            f.render_widget(Clear, area);
+            f.render_stateful_widget(picker, area, &mut state);
+        }
+
         if let Some(selected) = special_picker {
             let items: Vec<ListItem> = SPECIAL_VALUE_CHOICES
                 .iter()
@@ -10545,6 +10611,37 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
             }
         }
 
+        if let Some(selected) = self.agg_picker {
+            match key.code {
+                KeyCode::Esc => {
+                    self.agg_picker = None;
+                    self.agg_picker_target = None;
+                    return Ok(false);
+                }
+                KeyCode::Enter => {
+                    self.commit_agg_choice(selected)?;
+                    return Ok(false);
+                }
+                KeyCode::Left | KeyCode::Up => {
+                    self.agg_picker =
+                        Some(crate::ui_core::agg_step_index(selected, -1));
+                    return Ok(false);
+                }
+                KeyCode::Right | KeyCode::Down => {
+                    self.agg_picker =
+                        Some(crate::ui_core::agg_step_index(selected, 1));
+                    return Ok(false);
+                }
+                KeyCode::Char(c) if c.is_ascii_digit() => {
+                    if let Some(idx) = crate::ui_core::agg_choice_index_for_digit(c) {
+                        self.commit_agg_choice(idx)?;
+                        return Ok(false);
+                    }
+                }
+                _ => {}
+            }
+        }
+
         if let Some(selected) = self.special_picker {
             match key.code {
                 KeyCode::Esc => {
@@ -10621,6 +10718,12 @@ Alt+B·label|data {b}   Alt+X·clipboard   ↑/↓/k/j   PgUp/PgDn   path or emp
                 }
                 KeyCode::F(2) => {
                     self.mode = self.start_edit_current_cell();
+                    return Ok(false);
+                }
+                KeyCode::F(3) => {
+                    // Margin aggregate picker (GUI parity: F3 there, click on
+                    // the key cell). No-op off an aggregate key.
+                    self.open_agg_picker();
                     return Ok(false);
                 }
                 _ => {}
@@ -13540,6 +13643,232 @@ mod drive_feature_tests {
             press(app, KeyCode::Char(c), KeyModifiers::empty());
         }
     }
+
+    /// Move the cursor onto `addr` (the inverse of `to_addr`), so picker
+    /// tests can target the seeded margin keys by address.
+    fn cursor_to_addr(app: &mut App, addr: &CellAddr) -> SheetCursor {
+        let (lr, gc) = crate::addr::addr_to_sheet_cursor(
+            addr,
+            crate::addr::MainRows(app.state.grid.main_rows()),
+            crate::addr::MainCols(app.state.grid.main_cols()),
+        );
+        app.cursor = SheetCursor {
+            row: lr.0,
+            col: gc.0,
+        };
+        app.cursor
+    }
+
+    /// The picker must actually be *drawn*: F3 opens it and the frame
+    /// contains every choice label. (The earlier tests only asserted the
+    /// state flag, which is why a missing render went unnoticed.)
+    #[test]
+    fn f3_picker_is_rendered_in_the_frame() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(None);
+        let addr = CellAddr::Header {
+            row: (crate::grid::HEADER_ROWS - 1) as u32,
+            col: ColumnAddr::Right(0),
+        };
+        cursor_to_addr(&mut app, &addr);
+        press(&mut app, KeyCode::F(3), KeyModifiers::empty());
+        assert_eq!(app.agg_picker, Some(0), "picker state must be open");
+
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            let _guard = app.prepare_eval_context_and_spills();
+            app.draw_visual(f);
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let screen: String = buf.content().iter().map(|c| c.symbol().to_string()).collect();
+        for label in ["TOTAL", "MAX", "MIN", "AVERAGE", "COUNT", "MEDIAN"] {
+            assert!(
+                screen.contains(label),
+                "frame must show the picker row {label}; screen:\n{screen}"
+            );
+        }
+    }
+
+    /// F3 on a margin aggregate key opens the picker; Enter writes the
+    /// chosen `==KEYWORD` directive.
+    #[test]
+    fn f3_opens_agg_picker_and_enter_writes_directive() {
+        let mut app = App::new(None);
+        // Cursor on the seeded `]A~1` right-margin TOTAL key.
+        let addr = CellAddr::Header {
+            row: (crate::grid::HEADER_ROWS - 1) as u32,
+            col: ColumnAddr::Right(0),
+        };
+        cursor_to_addr(&mut app, &addr);
+        assert_eq!(
+            cell_effective_display(&app.state.grid, &addr),
+            "TOTAL",
+            "precondition: cursor sits on the seeded TOTAL key"
+        );
+
+        press(&mut app, KeyCode::F(3), KeyModifiers::empty());
+        assert_eq!(app.agg_picker, Some(0), "F3 opens on the current function");
+
+        // Down selects MAX (row 2), Enter commits it.
+        press(&mut app, KeyCode::Down, KeyModifiers::empty());
+        assert_eq!(app.agg_picker, Some(1));
+        press(&mut app, KeyCode::Enter, KeyModifiers::empty());
+        assert_eq!(app.agg_picker, None, "Enter closes the picker");
+        assert_eq!(
+            app.state.grid.get(&addr).as_deref(),
+            Some("==MAX"),
+            "commit writes the canonical directive"
+        );
+    }
+
+    /// F3 on a data cell resolves the margin key governing it, so the
+    /// picker is reachable without hunting for the key cell. On a sheet
+    /// whose right margin carries the seeded TOTAL column, a data cell
+    /// targets that key.
+    #[test]
+    fn f3_on_a_data_cell_resolves_the_governing_margin_key() {
+        let mut app = App::new(None);
+        let data = CellAddr::Main { row: 0, col: 0 };
+        cursor_to_addr(&mut app, &data);
+        app.state.grid.set(&data, "42".into());
+        // Not itself a key...
+        assert!(crate::ui_core::margin_agg_func_at(
+            &app.state.grid,
+            &app.cursor.to_addr(&app.state.grid)
+        )
+        .is_none());
+        // ...but the seeded `]A~1` governs its column, so F3 opens and
+        // targets that key rather than the data cell.
+        press(&mut app, KeyCode::F(3), KeyModifiers::empty());
+        assert_eq!(app.agg_picker, Some(0), "picker opens from a data cell");
+        press(&mut app, KeyCode::Enter, KeyModifiers::empty());
+        assert_eq!(
+            app.state
+                .grid
+                .get(&CellAddr::Header {
+                    row: (crate::grid::HEADER_ROWS - 1) as u32,
+                    col: ColumnAddr::Right(0),
+                })
+                .as_deref(),
+            Some("==TOTAL"),
+            "commit lands on the resolved margin key, not the data cell"
+        );
+        assert_eq!(
+            app.state.grid.get(&data).as_deref(),
+            Some("42"),
+            "the data cell must be untouched"
+        );
+    }
+
+    /// Regression: a sheet whose only aggregate key is a *non-first*
+    /// right-margin column (`]B~1`) must still offer the picker. The
+    /// resolver previously looked only at the first right-margin column.
+    #[test]
+    fn f3_resolves_a_non_first_right_margin_key() {
+        let mut app = App::new(None);
+        // Clear the seeded `]A~1` key and put the directive on `]B~1`
+        // instead, so `Right(0)` has nothing and `Right(1)` has TOTAL.
+        app.state.grid.set(
+            &CellAddr::Header {
+                row: (crate::grid::HEADER_ROWS - 1) as u32,
+                col: ColumnAddr::Right(0),
+            },
+            String::new(),
+        );
+        let b_key = CellAddr::Header {
+            row: (crate::grid::HEADER_ROWS - 1) as u32,
+            col: ColumnAddr::Right(1),
+        };
+        app.state.grid.set(&b_key, "TOTAL".into());
+
+        let data = CellAddr::Main { row: 0, col: 0 };
+        cursor_to_addr(&mut app, &data);
+        press(&mut app, KeyCode::F(3), KeyModifiers::empty());
+        assert_eq!(app.agg_picker, Some(0), "F3 must find the ]B~1 key");
+
+        press(&mut app, KeyCode::Down, KeyModifiers::empty());
+        press(&mut app, KeyCode::Enter, KeyModifiers::empty());
+        assert_eq!(
+            app.state.grid.get(&b_key).as_deref(),
+            Some("==MAX"),
+            "commit must land on ]B~1, the key that actually exists"
+        );
+    }
+
+    /// On a sheet with no aggregate key at all, F3 explains instead of
+    /// opening an empty picker.
+    #[test]
+    fn f3_on_a_blank_key_still_opens_defaulting_to_total() {
+        // Per the design, the key cells (`]?~1`, `[A_1`) ALWAYS offer the
+        // picker — blank or not. A blank key is a valid "no aggregate chosen
+        // yet" state, not a dead cell, so this must open rather than refuse.
+        let mut app = App::new(None);
+        let right_key = CellAddr::Header {
+            row: (crate::grid::HEADER_ROWS - 1) as u32,
+            col: ColumnAddr::Right(0),
+        };
+        // Blank every seeded key.
+        app.state.grid.set(&right_key, String::new());
+        app.state.grid.set(
+            &CellAddr::Footer {
+                row: 0,
+                col: ColumnAddr::Left(MARGIN_COLS - 1),
+            },
+            String::new(),
+        );
+        let data = CellAddr::Main { row: 0, col: 0 };
+        cursor_to_addr(&mut app, &data);
+        press(&mut app, KeyCode::F(3), KeyModifiers::empty());
+        assert_eq!(
+            app.agg_picker,
+            Some(0),
+            "a blank key must still open, defaulting to TOTAL"
+        );
+
+        // And committing writes the directive to that blank key.
+        press(&mut app, KeyCode::Enter, KeyModifiers::empty());
+        assert_eq!(
+            app.state.grid.get(&right_key).as_deref(),
+            Some("==TOTAL"),
+            "committing on a blank key writes the default directive"
+        );
+    }
+
+    /// Esc closes the picker and writes nothing.
+    #[test]
+    fn f3_picker_escape_writes_nothing() {
+        let mut app = App::new(None);
+        let addr = CellAddr::Header {
+            row: (crate::grid::HEADER_ROWS - 1) as u32,
+            col: ColumnAddr::Right(0),
+        };
+        cursor_to_addr(&mut app, &addr);
+        let before = app.state.grid.get(&addr);
+        press(&mut app, KeyCode::F(3), KeyModifiers::empty());
+        press(&mut app, KeyCode::Down, KeyModifiers::empty());
+        press(&mut app, KeyCode::Esc, KeyModifiers::empty());
+        assert_eq!(app.agg_picker, None);
+        assert_eq!(app.state.grid.get(&addr), before, "Esc must not write");
+    }
+
+    /// Digit hotkeys commit directly (`4` = AVERAGE, fourth row).
+    #[test]
+    fn f3_picker_digit_commits_directly() {
+        let mut app = App::new(None);
+        let addr = CellAddr::Header {
+            row: (crate::grid::HEADER_ROWS - 1) as u32,
+            col: ColumnAddr::Right(0),
+        };
+        cursor_to_addr(&mut app, &addr);
+        press(&mut app, KeyCode::F(3), KeyModifiers::empty());
+        press(&mut app, KeyCode::Char('4'), KeyModifiers::empty());
+        assert_eq!(app.agg_picker, None);
+        assert_eq!(app.state.grid.get(&addr).as_deref(), Some("==AVERAGE"));
+    }
     fn open_menu(app: &mut App, section_alt: char) {
         press(app, KeyCode::Char(section_alt), KeyModifiers::ALT);
     }
@@ -14580,6 +14909,69 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::path::PathBuf;
 
+    /// Regression: an untitled unsaved log must be written as a *complete*
+    /// serialization, because `save_to_path` renames it verbatim onto the
+    /// user's destination. Writing a bare header dropped the in-memory margin
+    /// TOTAL seeds (they have no committed edit op), so reopening the saved
+    /// document lost its TOTALs. This exercises the writer contract the save
+    /// fast-path relies on, plus the append/edit flow after it.
+    #[test]
+    fn initial_unsaved_log_text_round_trips_seed_totals() {
+        use tempfile::NamedTempFile;
+
+        let footer = CellAddr::Footer {
+            row: 0,
+            col: ColumnAddr::Left(MARGIN_COLS - 1),
+        };
+        let header = CellAddr::Header {
+            row: (HEADER_ROWS - 1) as u32,
+            col: ColumnAddr::Right(0),
+        };
+
+        let mut app = App::new(None);
+        let text = app.initial_unsaved_log_text();
+        assert!(
+            text.contains("TOTAL"),
+            "initial unsaved log must serialize the seed TOTALs, got:\n{text}"
+        );
+
+        // The unsaved log is appended to on later edits, then renamed on save.
+        let tmp = NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), text.as_bytes()).unwrap();
+        let mut offset = std::fs::metadata(tmp.path()).unwrap().len();
+        let mut active_sheet = app.workbook.sheet_id(app.workbook.active_sheet);
+        let sheet_id = active_sheet;
+        crate::io::commit_workbook_op(
+            tmp.path(),
+            &mut offset,
+            &mut app.workbook,
+            &mut active_sheet,
+            &crate::ops::WorkbookOp::SheetOp {
+                sheet_id,
+                op: Op::SetCell {
+                    addr: CellAddr::Main { row: 0, col: 0 },
+                    value: "5".into(),
+                },
+            },
+        )
+        .unwrap();
+
+        // Reopen the saved document: seeds and the edit must both survive.
+        let loaded = crate::io::load_workbook_file(tmp.path()).unwrap();
+        let g = &loaded.sheets[0].state.grid;
+        assert_eq!(
+            g.get(&footer).as_deref(),
+            Some("TOTAL"),
+            "footer TOTAL seed lost; log was:\n{}",
+            std::fs::read_to_string(tmp.path()).unwrap()
+        );
+        assert_eq!(g.get(&header).as_deref(), Some("TOTAL"), "header TOTAL seed lost");
+        assert_eq!(
+            g.get(&CellAddr::Main { row: 0, col: 0 }).as_deref(),
+            Some("5")
+        );
+    }
+
     #[test]
     fn fresh_hints_line_matches_shared_normal_hints() {
         // The Mode::Normal arm must stay a pure delegation: if this fails,
@@ -14901,14 +15293,12 @@ mod tests {
         // by a few Right key presses.
         std::fs::write(&tsv, "a\tb\tc\td\n1\t2\t3\t4\n").unwrap();
 
-        let mut app = App::new(Some(tsv.clone()));
         // Create an on-disk unsaved file for this test so commit_workbook_op
         // is exercised and we can capture the append/serialization debug
-        // traces. Use a temp dir to avoid polluting global state.
-        let _ = std::env::set_var(
-            "CORRO_UNSAVED_TEST_DIR",
-            tmpdir.path().to_string_lossy().as_ref(),
-        );
+        // traces. Guarded like the other unsaved-file tests: these variables
+        // are process-global, so an unguarded writer races them.
+        let _env = UnsavedEnv::unsaved_env(tmpdir.path());
+        let mut app = App::new(Some(tsv.clone()));
         app.unsaved_auto_create = true;
         app.load_initial().unwrap();
 
@@ -18509,6 +18899,55 @@ mod tests {
         );
     }
 
+    /// Regression for the reported "TOTAL of TOTALs is 0" sheet: a row whose
+    /// right-margin total is `2 + 10^-99` must not display as a 100-digit
+    /// fraction. That giant string then fails to re-parse as a number when the
+    /// corner sums the row totals, silently dropping it and leaving the corner
+    /// at `1 + (-1) = 0`.
+    #[test]
+    fn total_of_totals_reads_row_total_with_tiny_exact_addend() {
+        let mut state = SheetState::new(3, 3);
+        // Right-margin `]A` header marks column 0 of the right margin as a
+        // per-row TOTAL column (same layout the reported sheet used).
+        state.grid.set(
+            &CellAddr::Header { row: 0, col: ColumnAddr::Right(0) },
+            "TOTAL".into(),
+        );
+        state.grid.set(&CellAddr::Main { row: 0, col: 0 }, ":q".into());
+        state.grid.set(&CellAddr::Main { row: 0, col: 2 }, "1".into());
+        state.grid.set(&CellAddr::Main { row: 1, col: 1 }, "2".into());
+        state.grid.set(&CellAddr::Main { row: 1, col: 2 }, "=10^-99".into());
+        state.grid.set(&CellAddr::Main { row: 2, col: 2 }, "-1".into());
+
+        let right_global = MARGIN_COLS + 3; // first right-margin column
+        // Row 1's total (as the right margin renders it) reads as the
+        // human-scale 2, not a 100-digit fraction.
+        let row1_total = crate::agg::compute_aggregate(
+            &state.grid,
+            &crate::ops::AggregateDef {
+                func: AggFunc::Sum,
+                source: crate::grid::MainRange {
+                    row_start: 1,
+                    row_end: 2,
+                    col_start: 0,
+                    col_end: 3,
+                },
+            },
+        );
+        assert_eq!(row1_total, "2", "row total must render readably");
+        assert!(!row1_total.contains('/'), "{row1_total}");
+
+        // The corner (TOTAL of TOTALs) sums the three row totals: 1 + 2 - 1.
+        let corner = footer_special_col_aggregate(
+            &state.grid,
+            AggFunc::Sum,
+            right_global,
+            3,
+            3,
+        );
+        assert_eq!(corner, Some("2".into()), "corner must include the 2 row, not drop it");
+    }
+
     #[test]
     fn page_up_page_down_step_by_grid_viewport_row_count() {
         let mut app = App::new(None);
@@ -21108,7 +21547,9 @@ mod tests {
             !shown.to_ascii_lowercase().contains("nan"),
             "{shown}"
         );
-        assert!(shown.contains('.'), "{shown}");
+        // `1e-9`, not a padded `1.000000000e-9` (mantissa zeros trimmed).
+        assert!(shown.contains('e'), "{shown}");
+        assert!(!shown.contains("000000000"), "{shown}");
         assert!(shown.ends_with('i'), "{shown}");
     }
 
@@ -23018,10 +23459,10 @@ mod tests {
         );
     }
 
+
     #[test]
     fn linked_tsv_not_removed_on_edit() {
         use tempfile::tempdir;
-        use std::env;
         use std::fs;
 
         // Create a temporary dir and a linked TSV file inside it.
@@ -23032,11 +23473,7 @@ mod tests {
         fs::write(&tsv, data).unwrap();
 
         // Isolate unsaved-file creation to this tempdir.
-        let prev_test_dir = env::var_os("CORRO_UNSAVED_TEST_DIR");
-        let prev_auto = env::var_os("CORRO_AUTO_UNSAVED_TEST");
-        let expected_dir = tmp_path.join("corro/unsaved");
-        env::set_var("CORRO_UNSAVED_TEST_DIR", expected_dir.to_string_lossy().to_string());
-        env::set_var("CORRO_AUTO_UNSAVED_TEST", "1");
+        let _env = UnsavedEnv::new(&tmp_path.join("corro/unsaved"));
 
         let mut app = App::new(Some(tsv.clone()));
         app.load_initial().unwrap();
@@ -23056,24 +23493,13 @@ mod tests {
         let on_disk = fs::read_to_string(&tsv).unwrap();
         assert_eq!(on_disk, data);
 
-        // Restore environment
-        if let Some(v) = prev_test_dir {
-            env::set_var("CORRO_UNSAVED_TEST_DIR", v);
-        } else {
-            env::remove_var("CORRO_UNSAVED_TEST_DIR");
-        }
-        if let Some(v) = prev_auto {
-            env::set_var("CORRO_AUTO_UNSAVED_TEST", v);
-        } else {
-            env::remove_var("CORRO_AUTO_UNSAVED_TEST");
-        }
+        // `_env` restores the environment (and releases the lock) on drop.
     }
 
     #[test]
 #[ignore = "pre-existing corro GUI failure; see GOALS.md"]
     fn linked_tsv_edits_persist_on_save() {
         use tempfile::tempdir;
-        use std::env;
         use std::fs;
 
         // Create a temporary dir and a linked TSV file inside it.
@@ -23084,11 +23510,7 @@ mod tests {
         fs::write(&tsv, data).unwrap();
 
         // Isolate unsaved-file creation to this tempdir.
-        let prev_test_dir = env::var_os("CORRO_UNSAVED_TEST_DIR");
-        let prev_auto = env::var_os("CORRO_AUTO_UNSAVED_TEST");
-        let expected_dir = tmp.path().join("corro/unsaved");
-        env::set_var("CORRO_UNSAVED_TEST_DIR", expected_dir.to_string_lossy().to_string());
-        env::set_var("CORRO_AUTO_UNSAVED_TEST", "1");
+        let _env = UnsavedEnv::new(&tmp.path().join("corro/unsaved"));
 
         let mut app = App::new(Some(tsv.clone()));
         app.load_initial().unwrap();
@@ -23111,17 +23533,7 @@ mod tests {
             on_disk
         );
 
-        // Restore environment
-        if let Some(v) = prev_test_dir {
-            env::set_var("CORRO_UNSAVED_TEST_DIR", v);
-        } else {
-            env::remove_var("CORRO_UNSAVED_TEST_DIR");
-        }
-        if let Some(v) = prev_auto {
-            env::set_var("CORRO_AUTO_UNSAVED_TEST", v);
-        } else {
-            env::remove_var("CORRO_AUTO_UNSAVED_TEST");
-        }
+        // `_env` restores the environment (and releases the lock) on drop.
     }
 
     #[test]
@@ -23413,6 +23825,58 @@ mod tests {
     }
 }
 
+/// Serializes the unsaved-file tests. They configure process-global
+/// environment variables (`CORRO_UNSAVED_TEST_DIR`,
+/// `CORRO_AUTO_UNSAVED_TEST`), so running two of them concurrently let
+/// one test read the other's directory — an intermittent failure that
+/// looked like a product bug. Every test that touches those variables
+/// holds this lock for its whole body.
+static UNSAVED_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Install the unsaved-file test environment for a scope, restoring the
+/// previous values on drop. Held together with [`UNSAVED_ENV_LOCK`].
+struct UnsavedEnv {
+    _guard: std::sync::MutexGuard<'static, ()>,
+    prev_test_dir: Option<std::ffi::OsString>,
+    prev_auto: Option<std::ffi::OsString>,
+    prev_state_home: Option<std::ffi::OsString>,
+}
+
+impl UnsavedEnv {
+    /// Point the unsaved-file directory at `dir` and enable auto-create.
+    /// Also isolates `XDG_STATE_HOME` so nothing lands in the real home.
+    #[allow(dead_code)] // used by tests in the `tests` submodule
+    pub(crate) fn unsaved_env(dir: &std::path::Path) -> UnsavedEnv {
+        UnsavedEnv::new(dir)
+    }
+
+    fn new(dir: &std::path::Path) -> Self {
+        let _guard = UNSAVED_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_test_dir = std::env::var_os("CORRO_UNSAVED_TEST_DIR");
+        let prev_auto = std::env::var_os("CORRO_AUTO_UNSAVED_TEST");
+        let prev_state_home = std::env::var_os("XDG_STATE_HOME");
+        std::env::set_var("CORRO_UNSAVED_TEST_DIR", dir.to_string_lossy().to_string());
+        std::env::set_var("CORRO_AUTO_UNSAVED_TEST", "1");
+        std::env::set_var("XDG_STATE_HOME", dir.to_string_lossy().to_string());
+        UnsavedEnv { _guard, prev_test_dir, prev_auto, prev_state_home }
+    }
+}
+
+impl Drop for UnsavedEnv {
+    fn drop(&mut self) {
+        fn restore(key: &str, prev: &Option<std::ffi::OsString>) {
+            match prev {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+        restore("CORRO_UNSAVED_TEST_DIR", &self.prev_test_dir);
+        restore("CORRO_AUTO_UNSAVED_TEST", &self.prev_auto);
+        restore("XDG_STATE_HOME", &self.prev_state_home);
+    }
+}
+
+
 // ── Display helpers ───────────────────────────────────────────────────────────
 
 fn addr_label(addr: &CellAddr, main_cols: usize) -> String {
@@ -23540,18 +24004,13 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 #[test]
     fn unsaved_file_created_on_first_edit() {
     use tempfile::tempdir;
-    use std::env;
 
     // Prepare a temporary directory and point XDG_STATE_HOME to it so
     // the unsaved file is created in an isolated location.
     let tmp = tempdir().unwrap();
     let tmp_path = tmp.path().to_path_buf();
 
-    let prev_test_dir = env::var_os("CORRO_UNSAVED_TEST_DIR");
-    let prev_auto = env::var_os("CORRO_AUTO_UNSAVED_TEST");
-    let expected_dir = tmp_path.join("corro/unsaved");
-    env::set_var("CORRO_UNSAVED_TEST_DIR", expected_dir.to_string_lossy().to_string());
-    env::set_var("CORRO_AUTO_UNSAVED_TEST", "1");
+        let _env = UnsavedEnv::new(&tmp_path.join("corro/unsaved"));
 
     // Build an App and force auto-create on this instance to avoid other
     // global test interactions.
@@ -23567,23 +24026,12 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
     let expected_dir = tmp_path.join("corro/unsaved");
     assert!(p.ancestors().any(|a| a == expected_dir.as_path()), "unsaved file should be in tmpdir: {}", p.display());
 
-    // Restore environment
-    if let Some(v) = prev_test_dir {
-        env::set_var("CORRO_UNSAVED_TEST_DIR", v);
-    } else {
-        env::remove_var("CORRO_UNSAVED_TEST_DIR");
-    }
-    if let Some(v) = prev_auto {
-        env::set_var("CORRO_AUTO_UNSAVED_TEST", v);
-    } else {
-        env::remove_var("CORRO_AUTO_UNSAVED_TEST");
-    }
+        // `_env` restores the environment (and releases the lock) on drop.
 }
 
 #[test]
 fn ensure_unsaved_file_writes_header_and_link_lines() {
     use tempfile::tempdir;
-    use std::env;
     use std::fs;
 
     // Prepare a temporary directory to house the linked TSV and the
@@ -23597,11 +24045,7 @@ fn ensure_unsaved_file_writes_header_and_link_lines() {
     fs::write(&tsv, data).unwrap();
 
     // Ensure ensure_unsaved_file writes into our isolated unsaved dir.
-    let prev_test_dir = env::var_os("CORRO_UNSAVED_TEST_DIR");
-    let prev_auto = env::var_os("CORRO_AUTO_UNSAVED_TEST");
-    let expected_dir = tmp_path.join("corro/unsaved");
-    env::set_var("CORRO_UNSAVED_TEST_DIR", expected_dir.to_string_lossy().to_string());
-    env::set_var("CORRO_AUTO_UNSAVED_TEST", "1");
+        let _env = UnsavedEnv::new(&tmp_path.join("corro/unsaved"));
 
     let mut app = App::new(Some(tsv.clone()));
     app.load_initial().unwrap();
@@ -23614,34 +24058,19 @@ fn ensure_unsaved_file_writes_header_and_link_lines() {
     // referencing that TSV path in the created .corro.
     assert!(contents.contains("LINK TSV"));
 
-    // Restore environment
-    if let Some(v) = prev_test_dir {
-        env::set_var("CORRO_UNSAVED_TEST_DIR", v);
-    } else {
-        env::remove_var("CORRO_UNSAVED_TEST_DIR");
-    }
-    if let Some(v) = prev_auto {
-        env::set_var("CORRO_AUTO_UNSAVED_TEST", v);
-    } else {
-        env::remove_var("CORRO_AUTO_UNSAVED_TEST");
-    }
+        // `_env` restores the environment (and releases the lock) on drop.
 }
 
 #[test]
 fn unsaved_header_and_op_committed_on_first_edit() {
     use tempfile::tempdir;
-    use std::env;
     use std::fs;
 
     // Isolate XDG_STATE_HOME so the unsaved file lands in a tempdir.
     let tmp = tempdir().unwrap();
     let tmp_path = tmp.path().to_path_buf();
 
-    let prev_test_dir = env::var_os("CORRO_UNSAVED_TEST_DIR");
-    let prev_auto = env::var_os("CORRO_AUTO_UNSAVED_TEST");
-    let expected_dir = tmp_path.join("corro/unsaved");
-    env::set_var("CORRO_UNSAVED_TEST_DIR", expected_dir.to_string_lossy().to_string());
-    env::set_var("CORRO_AUTO_UNSAVED_TEST", "1");
+        let _env = UnsavedEnv::new(&tmp_path.join("corro/unsaved"));
 
     let mut app = App::new(None);
     app.unsaved_auto_create = true;
@@ -23673,34 +24102,18 @@ fn unsaved_header_and_op_committed_on_first_edit() {
         written
     );
 
-    // Restore environment
-    if let Some(v) = prev_test_dir {
-        env::set_var("CORRO_UNSAVED_TEST_DIR", v);
-    } else {
-        env::remove_var("CORRO_UNSAVED_TEST_DIR");
-    }
-    if let Some(v) = prev_auto {
-        env::set_var("CORRO_AUTO_UNSAVED_TEST", v);
-    } else {
-        env::remove_var("CORRO_AUTO_UNSAVED_TEST");
-    }
+        // `_env` restores the environment (and releases the lock) on drop.
 }
 
 #[test]
 #[ignore = "pre-existing crate::ui failure, lib-independent; see GOALS.md"]
 fn ensure_unsaved_file_uses_default_dir_not_cwd() {
     use tempfile::tempdir;
-    use std::env;
-
-    // Ensure no test override is set so the App picks the real default dir.
-    let prev_test_dir = env::var_os("CORRO_UNSAVED_TEST_DIR");
-    let prev_auto = env::var_os("CORRO_AUTO_UNSAVED_TEST");
 
     let tmp = tempdir().unwrap();
     let tmp_path = tmp.path().to_path_buf();
     let expected_dir = tmp_path.join("corro/unsaved");
-    env::set_var("CORRO_UNSAVED_TEST_DIR", expected_dir.to_string_lossy().to_string());
-    env::set_var("CORRO_AUTO_UNSAVED_TEST", "1");
+    let _env = UnsavedEnv::new(&expected_dir);
 
     let mut app = App::new(None);
     app.unsaved_auto_create = true;
@@ -23710,33 +24123,18 @@ fn ensure_unsaved_file_uses_default_dir_not_cwd() {
     assert!(p.ancestors().any(|a| a == expected_dir.as_path()),
             "unsaved file should be in tmpdir: {}", p.display());
 
-    // Restore environment
-    if let Some(v) = prev_test_dir {
-        env::set_var("CORRO_UNSAVED_TEST_DIR", v);
-    } else {
-        env::remove_var("CORRO_UNSAVED_TEST_DIR");
-    }
-    if let Some(v) = prev_auto {
-        env::set_var("CORRO_AUTO_UNSAVED_TEST", v);
-    } else {
-        env::remove_var("CORRO_AUTO_UNSAVED_TEST");
-    }
+        // `_env` restores the environment (and releases the lock) on drop.
 }
 
 #[test]
 fn quick_quit_esc_exits_with_unsaved_auto_file() {
     use tempfile::tempdir;
-    use std::env;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     let tmp = tempdir().unwrap();
     let tmp_path = tmp.path().to_path_buf();
 
-    let prev_test_dir = env::var_os("CORRO_UNSAVED_TEST_DIR");
-    let prev_auto = env::var_os("CORRO_AUTO_UNSAVED_TEST");
-    let expected_dir = tmp_path.join("corro/unsaved");
-    env::set_var("CORRO_UNSAVED_TEST_DIR", expected_dir.to_string_lossy().to_string());
-    env::set_var("CORRO_AUTO_UNSAVED_TEST", "1");
+        let _env = UnsavedEnv::new(&tmp_path.join("corro/unsaved"));
 
     let mut app = App::new(None);
     app.unsaved_auto_create = true;
@@ -23754,33 +24152,18 @@ fn quick_quit_esc_exits_with_unsaved_auto_file() {
     let second = app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty())).unwrap();
     assert!(second, "second Esc should exit immediately");
 
-    // Restore env
-    if let Some(v) = prev_test_dir {
-        env::set_var("CORRO_UNSAVED_TEST_DIR", v);
-    } else {
-        env::remove_var("CORRO_UNSAVED_TEST_DIR");
-    }
-    if let Some(v) = prev_auto {
-        env::set_var("CORRO_AUTO_UNSAVED_TEST", v);
-    } else {
-        env::remove_var("CORRO_AUTO_UNSAVED_TEST");
-    }
+    // `_env` restores the environment (and releases the lock) on drop.
 }
 
 #[test]
 fn unsaved_app_path_set_and_file_nonempty_after_commit() {
     use tempfile::tempdir;
-    use std::env;
     use std::fs;
 
     let tmp = tempdir().unwrap();
     let tmp_path = tmp.path().to_path_buf();
 
-    let prev_test_dir = env::var_os("CORRO_UNSAVED_TEST_DIR");
-    let prev_auto = env::var_os("CORRO_AUTO_UNSAVED_TEST");
-    let expected_dir = tmp_path.join("corro/unsaved");
-    env::set_var("CORRO_UNSAVED_TEST_DIR", expected_dir.to_string_lossy().to_string());
-    env::set_var("CORRO_AUTO_UNSAVED_TEST", "1");
+        let _env = UnsavedEnv::new(&tmp_path.join("corro/unsaved"));
 
     let mut app = App::new(None);
     app.unsaved_auto_create = true;
@@ -23805,17 +24188,7 @@ fn unsaved_app_path_set_and_file_nonempty_after_commit() {
     // File size should advance after commit (header + op lines written).
     assert!(fs::metadata(&p).unwrap().len() > 0);
 
-    // Restore environment
-    if let Some(v) = prev_test_dir {
-        env::set_var("CORRO_UNSAVED_TEST_DIR", v);
-    } else {
-        env::remove_var("CORRO_UNSAVED_TEST_DIR");
-    }
-    if let Some(v) = prev_auto {
-        env::set_var("CORRO_AUTO_UNSAVED_TEST", v);
-    } else {
-        env::remove_var("CORRO_AUTO_UNSAVED_TEST");
-    }
+        // `_env` restores the environment (and releases the lock) on drop.
 }
 
 #[test]
@@ -23826,4 +24199,3 @@ fn quit_import_prompt_removed_from_source() {
     let msg = format!("the QuitImport{} variant should have been removed", "Prompt");
     assert!(!source.contains(&needle), "{}", msg);
 }
-
