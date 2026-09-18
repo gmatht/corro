@@ -1,5 +1,12 @@
 # Old-Windows status (Win95 / ReactOS) — 2026-09-15
 
+**WIP: not shipped in v0.7.0.** Win95 support is parked and is *not* a
+release artifact for 0.7.0 (see CHANGELOG.txt and docs/binaries.txt):
+the rust9x + VC6 + zig-Msvc586 toolchain is local-only, so CI cannot
+build or gate it, and the GUI is blocked on a hard GPF (§2). The
+sections below describe the state of the investigation when it was
+parked, not a supported configuration.
+
 This file tracks the Win95 + ReactOS bring-up. **Current priority is
 Win10/11**: the GUI grid renders blank there too (see §4), so modern
 Windows is being fixed first; the notes below are the state of the
@@ -27,7 +34,7 @@ legacy investigation when it was parked.
   (skipped), blocking `GetMessageW` spuriously returns `WM_QUIT`
   (replaced with `PeekMessageW` + `MsgWaitForMultipleObjects` poll).
 
-## 2. Win95 GUI: blocked on a GPF (deferred to 0.7.1)
+## 2. Win95 GUI: blocked on a GPF (unresolved; blocked 0.7.0 shipping too)
 
 - `GCORRO.EXE` opens its window (poll loop works, `v-gui9.png`) but
   GPFs on the **3rd** message dispatched through the ANSI

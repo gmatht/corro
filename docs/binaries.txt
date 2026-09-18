@@ -1,25 +1,48 @@
 v0.7.0 Release Artifacts
 
-| Artifact         | Platform         | Profile  | PGO |
-|------------------|------------------|----------|-----|
-| corro.gz         | Linux x86_64     | release  | yes |
-| corro-no-gui.gz  | Linux x86_64     | release  | no  |
-| gcorro.gz        | Linux x86_64     | release  | no  |
-| corro-tiny.gz    | Linux x86_64     | tiny     | no  |
-| corro-arm.gz     | Linux armv7hf    | release  | no  |
-| corro-aarch64.gz | Linux aarch64    | release  | yes |
-| corro.exe.zip    | Windows x86_64   | release  | no  |
-| corro-x86.exe.zip| Windows x86      | release  | no  |
-| corro-osx.gz     | macOS aarch64    | release  | yes |
-| corro-no-gui-win95.exe.zip | Windows 95 (i586) | win95/pancurses TUI | no |
-| gcorro-win95.exe.zip      | Windows 95 (i586) | win95/nwg GUI       | no |
+Published by .github/workflows/pgo-release.yml on a `v*` tag push.
+
+| Artifact          | Platform         | Profile  | PGO | glibc floor |
+|-------------------|------------------|----------|-----|-------------|
+| corro.gz          | Linux x86_64     | release  | yes | runner      |
+| corro-no-gui.gz   | Linux x86_64     | release  | no  | 2.17        |
+| gcorro.gz         | Linux x86_64     | release  | no  | 2.17        |
+| corro-tiny.gz     | Linux x86_64     | tiny     | no  | runner      |
+| corro-arm.gz      | Linux armv7hf    | release  | no  | n/a         |
+| corro-aarch64.gz  | Linux aarch64    | release  | yes | n/a         |
+| corro.exe.zip     | Windows x86_64   | release  | no  | n/a         |
+| corro-x86.exe.zip | Windows x86      | release  | no  | n/a         |
+| corro-osx.gz      | macOS aarch64    | release  | yes | n/a         |
 
 Notes
-- corro-no-gui.gz is the default-feature terminal build (same binary as
-  corro.gz, kept under both names for continuity); gcorro.gz adds the GTK
-  GUI backend (GTK itself is runtime-dlopen, never linked).
-- The Win95 zips are built locally (rust9x toolchain + VC6 libs + zig are
-  not available on CI runners); see scripts/package-win95-release.sh.
-  Inner names: corro.exe (pancurses TUI) and gcorro.exe (GUI, selected by
-  argv[0] dispatch). unicows.dll is NOT bundled (licensing); the zips
-  carry a README95.txt pointing at Microsoft's unicows redistributable.
+- corro-no-gui.gz is the default-feature terminal build; gcorro.gz adds the
+  GTK GUI backend (GTK itself is runtime-dlopen, never linked), and
+  corro.gz is the PGO-tuned terminal build.
+- corro-no-gui.gz and gcorro.gz are linked through tools/zig-cc-gnu217 so
+  the same assets run on old distros incl. CentOS 7 (glibc 2.17). Both CI
+  jobs verify this with tools/check-glibc-floor.sh. The other Linux assets
+  are linked against the runner's glibc and are not covered by that
+  guarantee.
+- corro.exe.zip / corro-x86.exe.zip are built with the GUI feature so a
+  double-click opens the nwg window; the binaries stay console-subsystem on
+  purpose (see src/main.rs).
+- Windows builds are published as .zip only. The MSIX packages under
+  scripts/package-msix.py are not produced by CI; see "Not shipped" below.
+
+Not shipped in v0.7.0
+
+- Windows 95 (i586-rust9x). The pancurses TUI backend and the native nwg
+  GUI both build and run on Win95, but the toolchain (rust9x + VC6 libs +
+  zig Msvc586) is local-only, so CI cannot build or gate them and the
+  artifacts are not reproducible from a clean checkout. No
+  corro-no-gui-win95.exe.zip / gcorro-win95.exe.zip is published for 0.7.0.
+  Treat the i586-rust9x targets as experimental. When it does ship, the
+  exes need unicows.dll next to the exe (or in C:\WINDOWS\SYSTEM); it is
+  NOT bundled (licensing), and the zips carry a README95.txt pointing at
+  Microsoft's unicows redistributable. Inner names: corro.exe (pancurses
+  TUI, console subsystem) and gcorro.exe (GUI, selected by argv[0]
+  dispatch).
+- MSIX packages (corro-0.7.0.0-{x64,x86,arm64}.msix). scripts/package-msix.py
+  can build them and tests/msix_conformance.rs validates the structure, but
+  no workflow produces them yet, so they are not on the release page. Build
+  locally before claiming MSIX support for a release.
