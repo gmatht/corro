@@ -90,35 +90,68 @@ gdk-pixbuf-sys = { path = "/root/tmp/gtk4-rs/generated/gdk-pixbuf-sys-dlopen" }
 graphene-sys = { path = "/root/tmp/gtk4-rs/generated/graphene-sys-dlopen" }
 
 [[bin]]
-name = "render_ref"
+name = "render-ref"
+path = "src/bin/render_ref.rs"
 required-features = ["ratatui"]
 
 [[bin]]
-name = "pgo_mix_benchmark"
+name = "pgo-mix-benchmark"
+path = "src/bin/pgo_mix_benchmark.rs"
 required-features = ["ratatui"]
 
 [[bin]]
-name = "repro_tmp_move"
+name = "repro-tmp-move"
+path = "src/bin/repro_tmp_move.rs"
 required-features = ["ratatui"]
 
 [[bin]]
-name = "test_render"
+name = "test-render"
+path = "src/bin/test_render.rs"
 required-features = ["ratatui"]
 
 [[bin]]
-name = "gtk_a11y_dump"
+name = "gtk-a11y-dump"
+path = "src/bin/gtk_a11y_dump.rs"
 required-features = ["gui"]
 
-[[example]]
-name = "dump_render"
+[[bin]]
+name = "debug-export-rows"
+path = "src/bin/debug_export_rows.rs"
+required-features = ["ratatui"]
+
+[[bin]]
+name = "inspect-cols"
+path = "src/bin/inspect_cols.rs"
+required-features = ["ratatui"]
+
+[[bin]]
+name = "inspect-export"
+path = "src/bin/inspect_export.rs"
+required-features = ["ratatui"]
+
+[[bin]]
+name = "repro-subtotal"
+path = "src/bin/repro_subtotal.rs"
+required-features = ["ratatui"]
+
+[[bin]]
+name = "save-roundtrip"
+path = "src/bin/save_roundtrip.rs"
 required-features = ["ratatui"]
 
 [[example]]
-name = "render_date"
+name = "dump-render"
+path = "examples/dump_render.rs"
 required-features = ["ratatui"]
 
 [[example]]
-name = "test_ref"
+name = "render-date"
+path = "examples/render_date.rs"
+required-features = ["ratatui"]
+
+[[example]]
+name = "test-ref"
+path = "examples/test_ref.rs"
 required-features = ["ratatui"]
 
 [profile.release]

@@ -6993,6 +6993,14 @@ impl App {
             .unwrap_or_default()
     }
 
+    /// Public save entry point for harnesses (`src/bin/*`, integration tests)
+    /// that need to exercise the real TUI save path rather than reimplement
+    /// it: the unsaved-file fast path, watcher/offset upkeep and the
+    /// `serialize_workbook_log` fallback all live behind this call.
+    pub fn save_current_to_path(&mut self, path: &Path) -> Result<(), RunError> {
+        self.save_to_path(path)
+    }
+
     fn save_to_path(&mut self, path: &Path) -> Result<(), RunError> {
 
         self.commit_active_sheet_cache();
