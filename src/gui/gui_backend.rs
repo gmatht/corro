@@ -28,7 +28,7 @@ use super::compute::{self, CellDisplayStyle};
 use super::dialogs;
 use super::render::{self, CellSink};
 
-use rswidgets::core::key::{normalize, RETURN, ESCAPE, BACKSPACE, DELETE, LEFT, UP, RIGHT, DOWN, TAB, HOME, END, PAGE_UP, PAGE_DOWN, F1, F2, ALT_L, ALT_R};
+use rswidgets::core::key::{normalize, RETURN, ESCAPE, BACKSPACE, DELETE, LEFT, UP, RIGHT, DOWN, TAB, HOME, END, PAGE_UP, PAGE_DOWN, F1, F2, F3, ALT_L, ALT_R};
 
 const KEYLOG_PATH: &str = "/tmp/corro_keylog.txt";
 /// Modifier bit for Shift in key-event state masks. Shared by GDK
@@ -217,6 +217,18 @@ struct GuiState {
     formula_status: Label,
     editing: Cell<bool>,
     edit_buf: RefCell<String>,
+    /// Caret position within `edit_buf`, as a **character** index. The native
+    /// Entry exposes no caret API, so the host owns the caret the same way
+    /// ratatui's `Mode::Edit` does: typed chars insert here, Backspace/Delete
+    /// act here, and Left/Right move here (committing and moving the *cell*
+    /// cursor only at the buffer edges).
+    edit_caret: Cell<usize>,
+    /// In-grid aggregate dropdown state (painted on the canvas, not a native
+    /// widget — see `AggDrop`).
+    agg_drop: RefCell<Option<AggDrop>>,
+    /// Last canvas size seen by the draw callback, for hit-testing the
+    /// canvas-painted dropdown.
+    canvas_size: Cell<(i32, i32)>,
     /// Formula text displayed in the entry the last time the formula bar
     /// was refreshed (the adopt source for click-to-edit repair). Refreshed
     /// on every bar update, so it can never go stale.
@@ -1112,6 +1124,36 @@ fn handle_key(keyval: u32, state_rc: &Rc<GuiState>, mods: u32) -> bool {
         _ => {}
     }
 
+    // The in-grid aggregate dropdown owns the keyboard while open (it is
+    // painted on the canvas, so there is no native widget to route to).
+    if agg_dropdown_open(state) {
+        match key {
+            ESCAPE => {
+                log_key_action(keyval, "agg_drop_cancel", "");
+                hide_agg_dropdown(state);
+                super::agg_picker::close(state.app_mut());
+                state.canvas.queue_redraw();
+                return true;
+            }
+            RETURN => {
+                log_key_action(keyval, "agg_drop_commit", "");
+                agg_dropdown_commit(state);
+                return true;
+            }
+            UP | LEFT => {
+                log_key_action(keyval, "agg_drop_step_up", "");
+                agg_dropdown_step(state, -1);
+                return true;
+            }
+            DOWN | RIGHT | TAB => {
+                log_key_action(keyval, "agg_drop_step_down", "");
+                agg_dropdown_step(state, 1);
+                return true;
+            }
+            _ => {}
+        }
+    }
+
     if state.editing.get() {
         return handle_edit_key(key, state);
     }
@@ -1133,6 +1175,21 @@ fn handle_key(keyval: u32, state_rc: &Rc<GuiState>, mods: u32) -> bool {
         F2 => {
             log_key_action(keyval, "start_edit", &format!("cell={}", format_cell(state)));
             start_edit(state);
+            true
+        }
+        F3 => {
+            // Keyboard route to the margin-aggregate picker. Resolves a key
+            // from *any* cursor position (on a key cell -> that cell; on a
+            // data cell -> the margin key governing it) so the picker is
+            // reachable without hunting for the key cell.
+            if open_agg_picker_inline(state_rc) {
+                log_key_action(keyval, "agg_picker", &format!("cell={}", format_cell(state)));
+            } else {
+                log_key_action(keyval, "agg_picker_noop", &format!("cell={}", format_cell(state)));
+                state.app_mut().core.status =
+                    "Aggregate: no margin TOTAL/MAX/… key for this cell".into();
+                state.canvas.queue_redraw();
+            }
             true
         }
         RETURN => {
@@ -1429,6 +1486,8 @@ fn start_edit(state: &GuiState) {
 /// untouched selection stays a quiet no-op via the empty check in
 /// [`commit_edit`]. F2 seeds via [`start_edit_with_text`] instead.
 fn start_edit_keep_display(state: &GuiState) {
+    // Typing into the cell supersedes the aggregate dropdown.
+    hide_agg_dropdown(state);
     state.editing.set(true);
     state.edit_buf.borrow_mut().clear();
     state.formula_entry.grab_focus();
@@ -1467,11 +1526,123 @@ fn start_edit_with(state: &GuiState, ch: char) {
 /// never sees Backspace/Delete (handle_key consumes those), leaving stale
 /// text on screen. Syncing here covers every key path (window + entry, all
 /// GUI backends); on_formula_entry_changed accepts identical text as a no-op.
+/// Caret-aware text editing for the formula buffer.
+///
+/// The native Entry exposes no caret API, so the host owns the caret exactly
+/// as ratatui's `Mode::Edit` does. Pure `(buffer, caret)` operations so the
+/// semantics are unit-testable without a window.
+mod text_edit {
+    /// What an edit-mode key did, so the caller knows whether the edit
+    /// continues or the cell cursor should move.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum KeyOutcome {
+        Edited,
+        CommitAndMoveCell,
+    }
+
+    /// Insert `ch` at the caret and advance it.
+    pub fn insert_char(buf: &mut String, caret: &mut usize, ch: char) {
+        let mut chars: Vec<char> = buf.chars().collect();
+        let pos = (*caret).min(chars.len());
+        chars.insert(pos, ch);
+        *buf = chars.into_iter().collect();
+        *caret = pos + 1;
+    }
+
+    /// Remove the char before the caret (no-op at position 0).
+    pub fn backspace(buf: &mut String, caret: &mut usize) {
+        let mut chars: Vec<char> = buf.chars().collect();
+        let pos = (*caret).min(chars.len());
+        if pos > 0 {
+            chars.remove(pos - 1);
+            *buf = chars.into_iter().collect();
+            *caret = pos - 1;
+        }
+    }
+
+    /// Remove the char *at* the caret (no-op at end).
+    pub fn delete_forward(buf: &mut String, caret: &mut usize) {
+        let mut chars: Vec<char> = buf.chars().collect();
+        let pos = (*caret).min(chars.len());
+        if pos < chars.len() {
+            chars.remove(pos);
+            *buf = chars.into_iter().collect();
+        }
+    }
+
+    /// Caret within `buf` in characters.
+    pub fn caret_len(buf: &str) -> usize {
+        buf.chars().count()
+    }
+
+    /// Move the caret left, or report commit-and-move-cell at the start.
+    pub fn left(buf: &str, caret: &mut usize) -> KeyOutcome {
+        if *caret > 0 {
+            *caret -= 1;
+            KeyOutcome::Edited
+        } else {
+            let _ = buf;
+            KeyOutcome::CommitAndMoveCell
+        }
+    }
+
+    /// Mirror of [`left`] at the end of the buffer.
+    pub fn right(buf: &str, caret: &mut usize) -> KeyOutcome {
+        if *caret < caret_len(buf) {
+            *caret += 1;
+            KeyOutcome::Edited
+        } else {
+            KeyOutcome::CommitAndMoveCell
+        }
+    }
+}
+
+/// Push the app's caret into the widget so the visible cursor matches what
+/// the next edit will use (a `set_text` otherwise resets it to the end).
+fn push_caret_to_entry(state: &GuiState) {
+    state.formula_entry.set_position(state.edit_caret.get());
+}
+
+/// Pull the widget's caret into the app before an edit: the widget owns the
+/// authoritative cursor once the user has clicked or arrowed inside it.
+fn pull_caret_from_entry(state: &GuiState) {
+    if let Some(pos) = state.formula_entry.get_position() {
+        state.edit_caret.set(pos);
+    }
+}
+
+/// Insert `ch` at the caret (never appended).
+fn edit_insert_char(state: &GuiState, ch: char) {
+    let mut caret = state.edit_caret.get();
+    text_edit::insert_char(&mut state.edit_buf.borrow_mut(), &mut caret, ch);
+    state.edit_caret.set(caret);
+}
+
+/// Backspace at the caret (no-op at position 0).
+fn edit_backspace(state: &GuiState) {
+    let mut caret = state.edit_caret.get();
+    text_edit::backspace(&mut state.edit_buf.borrow_mut(), &mut caret);
+    state.edit_caret.set(caret);
+}
+
+/// Delete the char at the caret (no-op at end).
+fn edit_delete_forward(state: &GuiState) {
+    let mut caret = state.edit_caret.get();
+    text_edit::delete_forward(&mut state.edit_buf.borrow_mut(), &mut caret);
+    state.edit_caret.set(caret);
+}
+
+/// Caret length of the buffer in characters.
+fn edit_caret_len(state: &GuiState) -> usize {
+    text_edit::caret_len(&state.edit_buf.borrow())
+}
+
 fn sync_entry_to_buf(state: &GuiState) {
     let buf = state.edit_buf.borrow().clone();
     if state.formula_entry.get_text().as_deref() != Some(buf.as_str()) {
         state.formula_entry.set_text(&buf);
     }
+    push_caret_to_entry(state);
 }
 
 fn commit_edit(state: &GuiState) {
@@ -1652,6 +1823,11 @@ fn row_nonblank_extremes(state: &GuiState, row: usize) -> Option<(usize, usize)>
 }
 
 fn move_cursor(state: &GuiState, dr: isize, dc: isize) {
+    // Genuine navigation dismisses the in-grid dropdown: it is anchored to
+    // one cell, and leaving it floating while the cursor moves would put it
+    // over an unrelated cell. (Done here, not in `update_state_cursor`,
+    // which also runs from scroll callbacks.)
+    hide_agg_dropdown(state);
     let hr = HEADER_ROWS;
     let lm = MARGIN_COLS;
     let (mut row, mut col) = (state.last_row.get(), state.last_col.get());
@@ -1838,6 +2014,11 @@ fn grow_blank_past_cursor(state: &GuiState) {
 }
 
 fn update_state_cursor(state: &GuiState, row: usize, col: usize) {
+    // NOTE: this is a *state sync* helper, also reached from scroll callbacks
+    // (e.g. `canvas.grab_focus()` synchronously scrolls to the cursor). It
+    // deliberately does NOT dismiss the in-grid dropdown: doing so made
+    // opening the dropdown hide it again via that re-entrant path. Genuine
+    // navigation dismisses it explicitly in `move_cursor`.
     state.last_row.set(row);
     state.last_col.set(col);
     let app = state.app_mut();
@@ -2074,6 +2255,27 @@ fn handle_click(x: f64, y: f64, state_rc: &Rc<GuiState>) {
         state.canvas.queue_redraw();
         return;
     }
+    // While the in-grid dropdown is open it owns pointer input: a click on a
+    // row commits it, a click anywhere else dismisses it (standard dropdown
+    // behaviour) and the click is consumed.
+    if agg_dropdown_open(state) {
+        let (cw, ch) = state.canvas_size.get();
+        match agg_drop_row_at(state, x, y, cw as f64, ch as f64) {
+            Some(row) => {
+                if let Some(d) = state.agg_drop.borrow_mut().as_mut() {
+                    d.sel = row;
+                }
+                agg_dropdown_commit(state);
+            }
+            None => {
+                hide_agg_dropdown(state);
+                super::agg_picker::close(state.app_mut());
+            }
+        }
+        state.canvas.queue_redraw();
+        return;
+    }
+
     let app = state.app_mut();
     if x < ROW_LABEL_W || y < HEADER_H {
         return;
@@ -2112,6 +2314,28 @@ fn handle_click(x: f64, y: f64, state_rc: &Rc<GuiState>) {
                 state.last_col.set(c);
                 app.core.cursor.row = logical_row;
                 app.core.cursor.col = c;
+                // Clicking a margin aggregate key (the seeded TOTAL in `]A~1`
+                // / `[A_1`, or any `==MAX` directive) offers the function
+                // picker as an in-grid dropdown anchored to that cell: the
+                // click both selects the cell and opens the list, so choosing
+                // MAX/AVERAGE/… never requires knowing the vocabulary.
+                // Ordinary margin text is not a key and clicks normally.
+                {
+                    let grid = &app.core.workbook.active_sheet().grid;
+                    let hit = crate::addr::sheet_cursor_to_addr(
+                        crate::addr::LogicalRow(logical_row),
+                        crate::addr::GlobalCol(c),
+                        crate::addr::MainRows(grid.main_rows()),
+                        crate::addr::MainCols(grid.main_cols()),
+                    );
+                    if crate::gui::agg_picker::is_agg_key_cell(app, &hit)
+                        && crate::gui::agg_picker::open_for(app, &hit)
+                    {
+                        app.core.anchor = None;
+                        show_agg_dropdown(state_rc, &hit);
+                        return;
+                    }
+                }
                 // Plain click collapses any selection (fresh single-cell focus).
                 app.core.anchor = None;
                 // Clicking the trailing blank opens one more beyond it
@@ -2233,6 +2457,262 @@ fn refresh_after_dialog(state: &Rc<GuiState>) {
 /// that should commit it) is dropped, so the picker looks like a no-op.
 /// Deferring past teardown on GTK fixes it; backends with modeless dialogs
 /// grab immediately.
+/// The in-grid aggregate dropdown: drawn **into the grid canvas** rather
+/// than a native child widget.
+///
+/// A native combo proved unusable: on GTK3 a child added to an overlay is
+/// allocated 1x1 regardless of its size request (verified with
+/// `gtk_widget_get_allocated_width`), so it was placed correctly but painted
+/// nothing. Painting it on the canvas works identically on every backend
+/// (GTK, Win32, any canvas), needs no reparenting, and can never desync from
+/// the cell it is anchored to.
+struct AggDrop {
+    /// Cell the picker edits; committed on selection.
+    target: crate::grid::CellAddr,
+    /// True while the list is shown.
+    open: bool,
+    /// Highlighted row.
+    sel: usize,
+}
+
+/// Rows the dropdown offers (shared vocabulary with the other backends).
+fn agg_drop_rows() -> Vec<String> {
+    crate::ui_core::agg_labelled_choices()
+}
+
+/// Pixel rectangle of the clicked margin-key cell, in **canvas-local**
+/// coordinates, or `None` when it is scrolled out of view (the list must not
+/// float over an unrelated cell).
+/// Map an aggregate-key address to its `(display_row, global_col)`, the
+/// inverse of the click mapping in [`handle_click`]. Pure so it is unit
+/// testable without a live window (`GuiState` needs real widgets).
+///
+/// Every arm matters: `show_agg_dropdown` bails when this returns `None`, so
+/// a missing variant silently kills the dropdown for that whole key class.
+/// In particular **footer** keys (`[A_1`, `[A_2`, `[A_3`, … — the `[A_n`
+/// aggregate key column, see `docs/tests/subtotal.corro`) live at
+/// `HEADER_ROWS + main_rows + footer_row`; omitting them made `[A_2`/`[A_3`
+/// resolve as keys but never pop the list.
+fn agg_key_display_rc(
+    addr: &crate::grid::CellAddr,
+    main_cols: usize,
+    main_rows: usize,
+) -> Option<(usize, usize)> {
+    use crate::grid::CellAddr;
+    let rc = match addr {
+        CellAddr::Header { row, col } => (*row as usize, col.to_global(main_cols)),
+        CellAddr::Footer { row, col } => (
+            HEADER_ROWS + main_rows + *row as usize,
+            col.to_global(main_cols),
+        ),
+        CellAddr::Main { row, col } => (
+            HEADER_ROWS + *row as usize,
+            MARGIN_COLS + *col as usize,
+        ),
+        CellAddr::Left { row, col } => (
+            HEADER_ROWS + *row as usize,
+            *col,
+        ),
+        CellAddr::Right { row, col } => (
+            HEADER_ROWS + *row as usize,
+            MARGIN_COLS + main_cols + col,
+        ),
+    };
+    Some(rc)
+}
+
+fn cell_rect(state: &GuiState, addr: &crate::grid::CellAddr) -> Option<(i32, i32, i32, i32)> {
+    let app = state.app_ref();
+    let grid = &app.core.workbook.active_sheet().grid;
+    let mc = grid.main_cols();
+
+    let (target_row, target_col) = agg_key_display_rc(addr, mc, grid.main_rows())?;
+
+    let display_rows = displayed_rows(state);
+    let ri = display_rows.iter().position(|&r| r == target_row)?;
+    let col_ixs = displayed_cols(state);
+    let ci = col_ixs.iter().position(|&c| c == target_col)?;
+
+    let mut x = ROW_LABEL_W;
+    for &c in &col_ixs[..ci] {
+        x += display_col_width(&app.core.workbook.active_sheet(), c, mc) as f64 * CHAR_W;
+    }
+    let w = display_col_width(&app.core.workbook.active_sheet(), target_col, mc) as f64 * CHAR_W;
+    let y = HEADER_H + ri as f64 * ROW_H;
+    Some((x as i32, y as i32, w as i32, ROW_H as i32))
+}
+
+/// Geometry of the open dropdown: `(box_x, box_y, box_w, box_h, row_h)`,
+/// anchored under the cell and clamped into the canvas.
+fn agg_drop_layout(
+    state: &GuiState,
+    target: &crate::grid::CellAddr,
+    canvas_w: f64,
+    canvas_h: f64,
+) -> Option<(f64, f64, f64, f64, f64)> {
+    let (cx, cy, cw, _ch) = cell_rect(state, target)?;
+    Some(agg_drop_layout_for_cell(cx, cy, cw, canvas_w, canvas_h))
+}
+
+/// Pure placement math for the dropdown panel, given the anchored cell's
+/// canvas-local rectangle. Split out so the geometry is testable without a
+/// live window (a `GuiState` needs real widgets).
+fn agg_drop_layout_for_cell(
+    cx: i32,
+    cy: i32,
+    cw: i32,
+    canvas_w: f64,
+    canvas_h: f64,
+) -> (f64, f64, f64, f64, f64) {
+    let row_h = ROW_H;
+    let rows = agg_drop_rows().len() as f64;
+    let list_w = (cw as f64).max(150.0);
+    let list_h = rows * row_h + 2.0;
+    // Open downward from the cell; flip above it when that would overflow,
+    // then clamp the whole box inside the canvas so it is never partly
+    // off-screen (a tall list on a short canvas scrolls less than it shows).
+    let mut y = (cy as f64) + ROW_H;
+    if y + list_h > canvas_h {
+        y = (cy as f64) - list_h;
+    }
+    let max_y = (canvas_h - list_h).max(0.0);
+    let y = y.clamp(0.0, max_y);
+    let max_x = (canvas_w - list_w).max(0.0);
+    let x = (cx as f64).clamp(0.0, max_x);
+    (x, y, list_w, list_h, row_h)
+}
+
+/// The row under a canvas-local point, while the dropdown is open.
+fn agg_drop_row_at(state: &GuiState, x: f64, y: f64, canvas_w: f64, canvas_h: f64) -> Option<usize> {
+    let target = {
+        let slot = state.agg_drop.borrow();
+        match slot.as_ref() {
+            Some(d) if d.open => d.target.clone(),
+            _ => return None,
+        }
+    };
+    let (bx, by, bw, bh, row_h) = agg_drop_layout(state, &target, canvas_w, canvas_h)?;
+    if x < bx || x >= bx + bw || y < by || y >= by + bh {
+        return None;
+    }
+    let idx = ((y - by) / row_h) as usize;
+    (idx < agg_drop_rows().len()).then_some(idx)
+}
+
+/// Show the in-grid dropdown over `addr`. Returns false when the cell is not
+/// currently visible (caller falls back to the dialog so the picker stays
+/// reachable either way).
+fn show_agg_dropdown(state: &Rc<GuiState>, addr: &crate::grid::CellAddr) -> bool {
+    if cell_rect(state, addr).is_none() {
+        return false;
+    }
+    let sel = super::agg_picker::index(state.app_ref()).unwrap_or(0);
+    *state.agg_drop.borrow_mut() = Some(AggDrop {
+        target: addr.clone(),
+        open: true,
+        sel,
+    });
+    state.canvas.queue_redraw();
+    // The grid paints the list, so keyboard focus belongs to the canvas for
+    // arrow/Enter handling.
+    state.canvas.grab_focus();
+    true
+}
+
+/// Hide the in-grid dropdown without committing.
+fn hide_agg_dropdown(state: &GuiState) {
+    if let Some(d) = state.agg_drop.borrow_mut().as_mut() {
+        d.open = false;
+    }
+    state.canvas.queue_redraw();
+}
+
+/// Whether the in-grid dropdown is currently shown.
+fn agg_dropdown_open(state: &GuiState) -> bool {
+    state.agg_drop.borrow().as_ref().is_some_and(|d| d.open)
+}
+
+/// Move the dropdown highlight by `delta`, clamped to the row range.
+fn agg_dropdown_step(state: &GuiState, delta: i32) {
+    if let Some(d) = state.agg_drop.borrow_mut().as_mut() {
+        if d.open {
+            d.sel = crate::ui_core::agg_step_index(d.sel, delta);
+        }
+    }
+    state.canvas.queue_redraw();
+}
+
+/// Commit the dropdown's highlighted row to its target cell and hide.
+fn agg_dropdown_commit(state: &GuiState) {
+    let (target, idx) = {
+        let slot = state.agg_drop.borrow();
+        let Some(d) = slot.as_ref() else { return };
+        if !d.open {
+            return;
+        }
+        (d.target.clone(), d.sel)
+    };
+    if let Some(directive) = crate::ui_core::agg_choice_directive(idx) {
+        let app = state.app_mut();
+        super::actions::commit_cell(app, target.clone(), directive.to_string());
+        app.core.status = format!(
+            "{} = {}",
+            crate::addr::cell_ref_text(&target, app.core.workbook.active_sheet().grid.main_cols()),
+            crate::agg::cell_display(&app.core.workbook.active_sheet().grid, &target)
+        );
+    }
+    hide_agg_dropdown(state);
+    super::agg_picker::close(state.app_mut());
+    state.canvas.grab_focus();
+}
+
+/// Open the shared aggregate-picker state for the cursor and show it as the
+/// in-grid dropdown. Returns false when nothing governs the cursor.
+fn open_agg_picker_inline(state: &Rc<GuiState>) -> bool {
+    let opened = {
+        let app = state.app_mut();
+        let cursor = app.core.cursor;
+        super::agg_picker::open_for_cursor(app, &cursor)
+    };
+    if !opened {
+        return false;
+    }
+    let target = state.app_ref().agg_picker_target.clone();
+    match target {
+        Some(addr) => show_agg_dropdown(state, &addr),
+        None => false,
+    }
+}
+
+/// Paint the open dropdown over the grid. Called at the end of
+/// [`render_grid`] so it always sits above the cells.
+fn render_agg_dropdown(dc: &mut dyn DrawContext, state: &GuiState, w: i32, h: i32) {
+    let (target, sel) = {
+        let slot = state.agg_drop.borrow();
+        match slot.as_ref() {
+            Some(d) if d.open => (d.target.clone(), d.sel),
+            _ => return,
+        }
+    };
+    let Some((bx, by, bw, bh, row_h)) = agg_drop_layout(state, &target, w as f64, h as f64) else {
+        return;
+    };
+
+    // Panel: white fill, dark border, accent line along the top edge.
+    dc.fill_rect(bx, by, bw, bh, 1.0, 1.0, 1.0, 1.0);
+    dc.stroke_rect(bx, by, bw, bh, 0.25, 0.25, 0.3, 1.0, 1.0);
+    dc.fill_rect(bx, by, bw, 1.0, 0.25, 0.25, 0.3, 1.0);
+
+    for (i, row) in agg_drop_rows().iter().enumerate() {
+        let ry = by + 1.0 + i as f64 * row_h;
+        if i == sel {
+            // Highlight the active row so it reads as the current choice.
+            dc.fill_rect(bx + 1.0, ry, bw - 2.0, row_h, 0.82, 0.89, 0.98, 1.0);
+        }
+        dc.draw_text(bx + 6.0, ry + 3.0, row, "monospace", FONT_SIZE, 0.05, 0.05, 0.1, 1.0);
+    }
+}
+
 fn restore_editor_focus(state: &Rc<GuiState>) {
     #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs")))]
     {
@@ -2335,6 +2815,19 @@ fn delegate_shared_action(name: &str, state: &Rc<GuiState>) {
         }
         MenuDispatch::SpecialPicker => {
             open_special_char_picker(state);
+        }
+        MenuDispatch::AggregatePicker => {
+            // The menu action already resolved and opened the picker state;
+            // show it as the in-grid dropdown over the resolved key.
+            let target = state.app_ref().agg_picker_target.clone();
+            match target {
+                Some(addr) if show_agg_dropdown(state, &addr) => {}
+                _ => {
+                    super::agg_picker::close(state.app_mut());
+                    state.app_mut().core.status =
+                        "Aggregate: the key is not visible; scroll to it first".into();
+                }
+            }
         }
         MenuDispatch::About { status } => {
             state.app_mut().core.status = status;
@@ -2827,6 +3320,9 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         formula_status: formula_status.clone(),
         editing: Cell::new(false),
         edit_buf: RefCell::new(String::new()),
+        edit_caret: Cell::new(0),
+        agg_drop: RefCell::new(None),
+        canvas_size: Cell::new((0, 0)),
         entry_snapshot: RefCell::new(String::new()),
         entry_clicked: Cell::new(false),
         entry_shown: Cell::new((usize::MAX, usize::MAX)),
@@ -3301,7 +3797,11 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
             // growth here too).
             sync_scrollbars(&shared_draw);
         }
+        shared_draw.canvas_size.set((w, h));
         render_grid(dc, &shared_draw, w, h);
+        // The in-grid aggregate dropdown paints last so it sits above the
+        // cells (and above the header/margin chrome).
+        render_agg_dropdown(dc, &shared_draw, w, h);
         // Test marker: 8x8 square of 0xFEEDBE at top-left, drawn AFTER render_grid
         // so it appears on top of the grid background and is visible in screenshots.
         dc.fill_rect(0.0, 0.0, 8.0, 8.0, 254.0/255.0, 237.0/255.0, 190.0/255.0, 1.0);
@@ -4114,5 +4614,245 @@ mod fill_tests {
             "viewport must cover 1220px on A1 (dim={dim}, cols={}, used~{used_px})",
             cols.len()
         );
+    }
+}
+
+#[cfg(test)]
+mod text_edit_tests {
+    use super::text_edit::{self, KeyOutcome};
+
+    /// A minimal model of the formula edit session: the buffer and the caret
+    /// the host owns — the same `text_edit` surface `handle_edit_key` drives,
+    /// so these test production logic rather than a paraphrase.
+    struct Session {
+        buf: String,
+        caret: usize,
+    }
+    impl Session {
+        fn type_char(&mut self, ch: char) {
+            text_edit::insert_char(&mut self.buf, &mut self.caret, ch);
+        }
+        fn backspace(&mut self) {
+            text_edit::backspace(&mut self.buf, &mut self.caret);
+        }
+        fn delete(&mut self) -> bool {
+            if self.caret < text_edit::caret_len(&self.buf) {
+                text_edit::delete_forward(&mut self.buf, &mut self.caret);
+                true
+            } else {
+                false
+            }
+        }
+        fn left(&mut self) -> KeyOutcome {
+            text_edit::left(&self.buf, &mut self.caret)
+        }
+        fn right(&mut self) -> KeyOutcome {
+            text_edit::right(&self.buf, &mut self.caret)
+        }
+    }
+    fn session(seed: &str, caret: usize) -> Session {
+        Session { buf: seed.to_string(), caret }
+    }
+
+    /// Regression (gcorro.exe): typing must insert at the caret, not always
+    /// append. "=1+2" with the caret on '+' plus '9' is "=19+2", not "=1+29".
+    #[test]
+    fn typing_inserts_at_caret_not_at_end() {
+        let mut s = session("=1+2", 2);
+        assert_eq!(s.buf.chars().nth(s.caret), Some('+'));
+        s.type_char('9');
+        assert_eq!(s.buf, "=19+2", "must insert at the caret, not append");
+        assert_ne!(s.buf, "=1+29", "regression: appended to the end");
+        assert_eq!(s.caret, 3);
+    }
+
+    #[test]
+    fn type_left_type_inserts_in_the_middle() {
+        let mut s = session("", 0);
+        for ch in "=1+2".chars() {
+            s.type_char(ch);
+        }
+        assert_eq!(s.left(), KeyOutcome::Edited);
+        assert_eq!(s.left(), KeyOutcome::Edited);
+        assert_eq!(s.caret, 2);
+        s.type_char('9');
+        assert_eq!(s.buf, "=19+2");
+    }
+
+    #[test]
+    fn arrows_move_caret_and_only_commit_at_edges() {
+        let mut s = session("ABCD", 2);
+        assert_eq!(s.left(), KeyOutcome::Edited);
+        assert_eq!(s.left(), KeyOutcome::Edited);
+        assert_eq!(s.caret, 0);
+        assert_eq!(s.left(), KeyOutcome::CommitAndMoveCell);
+        assert_eq!(s.caret, 0, "edge Left must not underflow");
+
+        let mut s = session("ABCD", 2);
+        assert_eq!(s.right(), KeyOutcome::Edited);
+        assert_eq!(s.right(), KeyOutcome::Edited);
+        assert_eq!(s.caret, 4);
+        assert_eq!(s.right(), KeyOutcome::CommitAndMoveCell);
+        assert_eq!(s.caret, 4, "edge Right must not run past the buffer");
+    }
+
+    #[test]
+    fn backspace_and_delete_act_at_the_caret() {
+        let mut s = session("ABC", 2);
+        s.backspace();
+        assert_eq!(s.buf, "AC");
+        assert_eq!(s.caret, 1);
+
+        let mut s = session("AC", 0);
+        s.backspace();
+        assert_eq!(s.buf, "AC", "no-op at position 0");
+
+        let mut s = session("ABC", 1);
+        assert!(s.delete());
+        assert_eq!(s.buf, "AC");
+        assert_eq!(s.caret, 1);
+
+        let mut s = session("AC", 2);
+        assert!(!s.delete(), "no-op at end");
+    }
+
+    /// The caret is a char index, so multibyte input can never split a
+    /// codepoint.
+    #[test]
+    fn multibyte_insert_and_delete_are_char_safe() {
+        let mut s = session("aé", 1);
+        s.type_char('ß');
+        assert_eq!(s.buf, "aßé");
+        s.backspace();
+        assert_eq!(s.buf, "aé");
+        s.delete();
+        assert_eq!(s.buf, "a");
+    }
+}
+
+#[cfg(test)]
+mod agg_drop_tests {
+    use super::*;
+
+    /// The dropdown's rows are the shared vocabulary, in navigation order —
+    /// the same list every other backend offers.
+    #[test]
+    fn rows_match_the_shared_vocabulary() {
+        let rows = agg_drop_rows();
+        assert_eq!(rows, crate::ui_core::agg_labelled_choices());
+        assert_eq!(rows[0], "1: TOTAL");
+        assert_eq!(rows[5], "6: MEDIAN");
+    }
+
+    /// The list hangs under the anchored cell, is at least readable width,
+    /// and flips above the cell when it would overflow the canvas bottom.
+    #[test]
+    fn layout_hangs_under_the_cell_and_flips_on_overflow() {
+        let (x, y, w, h, row_h) = agg_drop_layout_for_cell(158, 24, 50, 1200.0, 800.0);
+        assert_eq!(row_h, ROW_H);
+        assert_eq!(y, 24.0 + ROW_H, "opens downward from the cell");
+        assert!(w >= 150.0, "at least wide enough to read a label");
+        assert_eq!(h, 6.0 * ROW_H + 2.0, "one row per choice plus the border");
+        assert_eq!(x, 158.0);
+
+        // Near the right edge the box is pulled back inside the canvas.
+        let (x_edge, _, w_edge, _, _) =
+            agg_drop_layout_for_cell(1180, 24, 50, 1200.0, 800.0);
+        assert!(
+            x_edge + w_edge <= 1200.0,
+            "must not spill past the right edge (x={x_edge}, w={w_edge})"
+        );
+
+        // A canvas taller than the cell but shorter than the list: the box
+        // flips above the cell and stays pinned to the top edge (it cannot
+        // fit, but it must not start off-screen).
+        let (_, y_flip, _, _, _) = agg_drop_layout_for_cell(158, 400, 50, 1200.0, 500.0);
+        assert!(
+            y_flip < 400.0,
+            "must flip above the cell when it would overflow (y={y_flip})"
+        );
+        // A very short canvas pins the box to the top instead of going
+        // negative (the remaining rows are simply clipped by the canvas).
+        let (_, y_small, _, _, _) = agg_drop_layout_for_cell(158, 24, 50, 1200.0, 60.0);
+        assert!(y_small >= 0.0, "must never start above the canvas");
+    }
+
+    /// Every row's band maps to that row; points outside the box hit nothing.
+    #[test]
+    fn row_bands_are_contiguous_and_bounded() {
+        let (bx, by, _bw, _bh, row_h) = agg_drop_layout_for_cell(158, 24, 50, 1200.0, 800.0);
+        let rows = agg_drop_rows().len();
+        for i in 0..rows {
+            let top = by + 1.0 + i as f64 * row_h;
+            let mid = top + row_h / 2.0;
+            let idx = ((mid - by) / row_h) as usize;
+            assert_eq!(idx, i, "row {i} band must map to itself");
+        }
+        // The band below the last row is out of range.
+        let below = by + 1.0 + rows as f64 * row_h + row_h / 2.0;
+        assert!(((below - by) / row_h) as usize >= rows);
+    }
+
+    /// The highlight clamps to the choice range at both ends.
+    #[test]
+    fn step_clamps_within_the_choice_range() {
+        assert_eq!(crate::ui_core::agg_step_index(0, -1), 0);
+        assert_eq!(
+            crate::ui_core::agg_step_index(0, 99),
+            crate::ui_core::AGG_CHOICES.len() - 1
+        );
+    }
+
+    /// REPRO/fix: the address → display `(row, col)` mapping must resolve
+    /// **every** key class, especially the `[A_n` footer key column
+    /// (`[A_1`, `[A_2`, `[A_3`, …). A `None` here makes `cell_rect` return
+    /// `None`, which makes `show_agg_dropdown` bail — so clicking such a key
+    /// silently does nothing (no dropdown). This is the bug where only
+    /// `[A_1`-style keys popped the list.
+    #[test]
+    fn footer_keys_have_a_display_rect_like_every_other_key() {
+        use crate::grid::{CellAddr, ColumnAddr};
+        let mc = 3;
+        let mr = 4;
+
+        // The `[A_n` key column: left margin, last left column, **every**
+        // footer row. All must map to a footer display row past the body.
+        for footer_row in 0..4u32 {
+            let addr = CellAddr::Footer { row: footer_row, col: ColumnAddr::Left(MARGIN_COLS - 1) };
+            let (r, c) = agg_key_display_rc(&addr, mc, mr)
+                .unwrap_or_else(|| panic!("[A_{} must have a display rect", footer_row + 1));
+            assert_eq!(r, HEADER_ROWS + mr + footer_row as usize, "footer row past the body");
+            assert_eq!(c, MARGIN_COLS - 1, "left-margin key column");
+        }
+
+        // Regression guard: the classes that already worked keep working.
+        assert!(agg_key_display_rc(
+            &CellAddr::Header { row: 0, col: ColumnAddr::Right(0) }, mc, mr
+        )
+        .is_some());
+        assert!(agg_key_display_rc(
+            &CellAddr::Right { row: 0, col: 0 }, mc, mr
+        )
+        .is_some());
+        assert!(agg_key_display_rc(
+            &CellAddr::Main { row: 0, col: 0 }, mc, mr
+        )
+        .is_some());
+        assert!(agg_key_display_rc(
+            &CellAddr::Left { row: 0, col: 0 }, mc, mr
+        )
+        .is_some());
+
+        // The footer key and its inverse (click mapping) must agree, or the
+        // list anchors on a different row than the one the user clicked.
+        let addr = CellAddr::Footer { row: 2, col: ColumnAddr::Left(MARGIN_COLS - 1) };
+        let (r, c) = agg_key_display_rc(&addr, mc, mr).unwrap();
+        let back = crate::addr::sheet_cursor_to_addr(
+            crate::addr::LogicalRow(r),
+            crate::addr::GlobalCol(c),
+            crate::addr::MainRows(mr),
+            crate::addr::MainCols(mc),
+        );
+        assert_eq!(back, addr, "display rect must round-trip to the same key");
     }
 }

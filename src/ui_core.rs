@@ -293,8 +293,293 @@ pub fn special_labelled_choices() -> [String; 10] {
 }
 
 // ---------------------------------------------------------------------------
+// Margin aggregate picker (clicking a TOTAL/MAX/… key offers the function list)
+// ---------------------------------------------------------------------------
+
+/// Canonical margin-aggregate choices, in navigation order, paired with the
+/// directive text the picker writes. Preferred on-sheet form is `==KEYWORD`
+/// (see `ops::margin_key_agg_func`): it aggregates while staying distinct
+/// from spreadsheet formulas like `=MIN(A1)`.
+///
+/// Order is the navigation contract (Down*n lands on the nth row) — never
+/// reorder without updating every backend's picker and the parity tests.
+pub const AGG_CHOICES: [(&str, &str); 6] = [
+    ("TOTAL", "==TOTAL"),
+    ("MAX", "==MAX"),
+    ("MIN", "==MIN"),
+    ("AVERAGE", "==AVERAGE"),
+    ("COUNT", "==COUNT"),
+    ("MEDIAN", "==MEDIAN"),
+];
+
+/// Directive text for choice `idx` (what the picker writes into the cell).
+pub fn agg_choice_directive(idx: usize) -> Option<&'static str> {
+    AGG_CHOICES.get(idx).map(|(_, directive)| *directive)
+}
+
+/// Display label for choice `idx` (the function word, without the `==`).
+pub fn agg_choice_label(idx: usize) -> Option<&'static str> {
+    AGG_CHOICES.get(idx).map(|(label, _)| *label)
+}
+
+/// Picker row `idx` as `"1: TOTAL"` … — every backend renders these rows.
+pub fn agg_choice_row(idx: usize) -> Option<String> {
+    let (label, _) = AGG_CHOICES.get(idx)?;
+    Some(format!("{}: {label}", idx + 1))
+}
+
+/// All picker rows in navigation order.
+pub fn agg_labelled_choices() -> Vec<String> {
+    (0..AGG_CHOICES.len())
+        .filter_map(agg_choice_row)
+        .collect()
+}
+
+/// Digit hotkey → choice index (`1`..=`6` → 0..=5).
+pub fn agg_choice_index_for_digit(digit: char) -> Option<usize> {
+    match digit {
+        '1'..='9' => {
+            let idx = (digit as u8 - b'1') as usize;
+            (idx < AGG_CHOICES.len()).then_some(idx)
+        }
+        _ => None,
+    }
+}
+
+/// One clamped navigation step from `idx` (`delta` is +1/-1 for Down/Up).
+pub fn agg_step_index(idx: usize, delta: i32) -> usize {
+    let next = idx as i32 + delta;
+    next.clamp(0, AGG_CHOICES.len() as i32 - 1) as usize
+}
+
+/// Whether `addr` is a cell where a margin aggregate directive is
+/// meaningful: the key column of the left/footer margins and the key row of
+/// the header/right margins. These are exactly the cells
+/// `ops::margin_key_agg_func` reads as directives.
+pub fn addr_is_margin_agg_key(addr: &CellAddr) -> bool {
+    match addr {
+        // Left-margin key column (row keys: `[A1`, `[A2`, … and the `[A_1`
+        // corner). This is exactly what `agg::helpers::left_margin_agg_func`
+        // reads.
+        CellAddr::Left { col, .. } => *col == MARGIN_COLS - 1,
+        // Footer key column (under the left margin: `[A_1`). Mirrors
+        // `ods::footer_row_agg_func`.
+        CellAddr::Footer { col, .. } => matches!(
+            col,
+            crate::grid::ColumnAddr::Left(c) if *c == MARGIN_COLS - 1
+        ),
+        // Right-margin key column header (`]A~1`, `]B~1`, …). Only the
+        // RIGHT margin qualifies: a main column's header (`A~1`) is a column
+        // label, not an aggregate key, and `right_col_agg_func` only ever
+        // consults right-margin header cells.
+        CellAddr::Header { col, .. } => matches!(col, crate::grid::ColumnAddr::Right(_)),
+        // A right-margin *body* cell (`]A1`) holds the computed per-row total
+        // — a value, not a key. Never a picker target.
+        CellAddr::Right { .. } => false,
+        CellAddr::Main { .. } => false,
+    }
+}
+
+/// Current aggregate function of the margin key at `addr`, if it is one.
+pub fn margin_agg_func_at(grid: &Grid, addr: &CellAddr) -> Option<AggFunc> {
+    if !addr_is_margin_agg_key(addr) {
+        return None;
+    }
+    crate::ops::margin_key_agg_func(&grid.text(addr))
+}
+
+/// Resolve the margin aggregate key that governs `cursor`, returning the
+/// key's address and its current function.
+///
+/// * On a key cell (`]A~1` seeded `TOTAL`, `[A_1`, any `==MAX`): that cell.
+/// * On a data cell: the first right-margin header key (`]A~1`, `]B~1`, …)
+///   that carries a directive — these mark a margin column as per-row
+///   totals. Any of them may be the one in use, so all are considered; a
+///   sheet whose only key is `]B~1` must still resolve.
+///
+/// `None` when neither applies, so callers can explain instead of showing
+/// an empty picker. Single source of truth for every backend.
+pub fn resolve_margin_agg_key(grid: &Grid, cursor: &SheetCursor) -> Option<(CellAddr, AggFunc)> {
+    let addr = cursor.to_addr(grid);
+    // On a key cell: that cell. A blank design key (`]?~1`, `[A_1`) is still
+    // a key and defaults to TOTAL.
+    if let Some(func) = margin_agg_func_at(grid, &addr) {
+        return Some((addr, func));
+    }
+    if addr_is_always_agg_key(&addr) {
+        return Some((addr, AggFunc::Sum));
+    }
+    if !matches!(addr, CellAddr::Main { .. }) {
+        return None;
+    }
+    // On a data cell: the right-margin key column that governs it. Prefer a
+    // column that carries a directive; otherwise fall back to the first
+    // right-margin column (the design's `]A` totals column), so the picker
+    // is reachable even on a sheet whose keys are all still blank.
+    let mc = grid.main_cols();
+    let mut fallback: Option<(CellAddr, AggFunc)> = None;
+    for col in 0..MARGIN_COLS {
+        let global_col = MARGIN_COLS + mc + col;
+        let key_addr = CellAddr::Header {
+            row: (HEADER_ROWS - 1) as u32,
+            col: crate::grid::ColumnAddr::Right(col),
+        };
+        if let Some(func) = right_col_agg_func(grid, global_col) {
+            return Some((key_addr, func));
+        }
+        if fallback.is_none() && col == 0 {
+            fallback = Some((key_addr, AggFunc::Sum));
+        }
+    }
+    fallback
+}
+
+/// Whether `addr` is one of the design's always-offered aggregate key cells
+/// (blank or not): the `]?~1` right-margin header band and the `[A_1` footer
+/// corner. Mirrors `gui::agg_picker::is_always_agg_key_cell`; kept here so
+/// the shared resolver stays backend-agnostic.
+pub fn addr_is_always_agg_key(addr: &CellAddr) -> bool {
+    match addr {
+        CellAddr::Header { col, .. } => matches!(col, crate::grid::ColumnAddr::Right(_)),
+        // The whole `[A_n` footer column is the aggregate **key column**:
+        // `_1` may hold a label ("Grand"), `_2`/`_3`/`_4` hold TOTAL/MAX/MIN
+        // (see docs/tests/subtotal.corro). Every row of it is a key, blank or
+        // not — `ods::footer_row_agg_func` reads a directive from any footer
+        // row in this column.
+        CellAddr::Footer { col, .. } => matches!(
+            col,
+            crate::grid::ColumnAddr::Left(c) if *c == MARGIN_COLS - 1
+        ),
+        _ => false,
+    }
+}
+
+/// Picker index matching the cell's current directive, so opening on a
+/// `==MAX` cell highlights MAX. Falls back to 0 (TOTAL) for bare/legacy
+/// labels and non-aggregate text.
+pub fn agg_choice_index_for_func(func: AggFunc) -> usize {
+    match func {
+        AggFunc::Sum => 0,
+        AggFunc::Max => 1,
+        AggFunc::Min => 2,
+        AggFunc::Mean => 3,
+        AggFunc::Count => 4,
+        AggFunc::Median => 5,
+    }
+}
+
+
+// ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod agg_choice_tests {
+    use super::*;
+    use crate::grid::{CellAddr, ColumnAddr, HEADER_ROWS, MARGIN_COLS};
+
+    #[test]
+    fn choices_and_rows_are_consistent() {
+        let rows = agg_labelled_choices();
+        assert_eq!(rows.len(), AGG_CHOICES.len());
+        assert_eq!(rows[0], "1: TOTAL");
+        assert_eq!(rows[5], "6: MEDIAN");
+        for (idx, row) in rows.iter().enumerate() {
+            assert_eq!(row, &agg_choice_row(idx).unwrap());
+            let label = agg_choice_label(idx).unwrap();
+            assert!(row.ends_with(label), "{row} must end with {label}");
+        }
+        assert_eq!(agg_choice_row(AGG_CHOICES.len()), None);
+        assert_eq!(agg_choice_label(AGG_CHOICES.len()), None);
+        assert_eq!(agg_choice_directive(AGG_CHOICES.len()), None);
+    }
+
+    #[test]
+    fn digits_and_steps_clamp_to_the_choice_range() {
+        assert_eq!(agg_choice_index_for_digit('1'), Some(0));
+        assert_eq!(agg_choice_index_for_digit('6'), Some(5));
+        assert_eq!(agg_choice_index_for_digit('7'), None);
+        assert_eq!(agg_choice_index_for_digit('0'), None);
+        assert_eq!(agg_step_index(0, -5), 0);
+        assert_eq!(agg_step_index(0, 99), AGG_CHOICES.len() - 1);
+    }
+
+    /// Every directive the picker writes is accepted by the margin parser
+    /// (the single source of truth for what a margin key means).
+    #[test]
+    fn every_directive_is_a_recognised_margin_key() {
+        for (label, directive) in AGG_CHOICES {
+            assert!(
+                crate::ops::margin_key_agg_func(directive).is_some(),
+                "{label}: {directive} must parse as an aggregate directive"
+            );
+            // The `==` prefix keeps it distinct from a spreadsheet formula.
+            assert!(directive.starts_with("=="), "{directive} must use `==`");
+        }
+    }
+
+    #[test]
+    fn key_predicate_matches_only_the_margin_key_bands() {
+        let key_col = MARGIN_COLS - 1;
+        assert!(addr_is_margin_agg_key(&CellAddr::Left {
+            col: key_col,
+            row: 2
+        }));
+        assert!(addr_is_margin_agg_key(&CellAddr::Footer {
+            row: 0,
+            col: ColumnAddr::Left(key_col)
+        }));
+        assert!(addr_is_margin_agg_key(&CellAddr::Header {
+            row: (HEADER_ROWS - 1) as u32,
+            col: ColumnAddr::Right(0)
+        }));
+        // The right-margin *key* is its header corner, not its body cells.
+        assert!(addr_is_margin_agg_key(&CellAddr::Header {
+            row: (HEADER_ROWS - 1) as u32,
+            col: ColumnAddr::Right(0)
+        }));
+        assert!(
+            !addr_is_margin_agg_key(&CellAddr::Right { col: 0, row: 0 }),
+            "a right-margin body cell holds the computed total, not a key"
+        );
+        // A MAIN column's header (`A~1`) is a column label, not a key:
+        // accepting it made the picker open on any header cell whose text
+        // happened to read TOTAL/MAX.
+        assert!(
+            !addr_is_margin_agg_key(&CellAddr::Header {
+                row: (HEADER_ROWS - 1) as u32,
+                col: ColumnAddr::Main(0)
+            }),
+            "main-column headers are never aggregate keys"
+        );
+        // Likewise a footer under a main column is a value, not the `[A_1` key.
+        assert!(
+            !addr_is_margin_agg_key(&CellAddr::Footer {
+                row: 0,
+                col: ColumnAddr::Main(0)
+            }),
+            "only the left-margin footer column is the key"
+        );
+        assert!(
+            !addr_is_margin_agg_key(&CellAddr::Footer {
+                row: 0,
+                col: ColumnAddr::Left(0)
+            }),
+            "only the last left-margin column is the key"
+        );
+        // Main body and non-key margin columns are not keys.
+        assert!(!addr_is_margin_agg_key(&CellAddr::Main { row: 0, col: 0 }));
+        assert!(!addr_is_margin_agg_key(&CellAddr::Left { col: 0, row: 0 }));
+    }
+
+    #[test]
+    fn func_index_matches_the_choice_order() {
+        assert_eq!(agg_choice_index_for_func(AggFunc::Sum), 0);
+        assert_eq!(agg_choice_index_for_func(AggFunc::Max), 1);
+        assert_eq!(agg_choice_index_for_func(AggFunc::Mean), 3);
+        assert_eq!(agg_choice_index_for_func(AggFunc::Median), 5);
+    }
+}
 
 /// Number of blank (non-content) footer rows to show below the last content row.
 pub const NAV_BLANK_ROWS: usize = 2;
@@ -1764,5 +2049,84 @@ mod tests {
             ("rec".to_string(), vec!["https://example.com".to_string()])
         );
         std::env::remove_var("CORRO_URL_OPENER");
+    }
+}
+
+#[cfg(test)]
+mod resolve_tests {
+    use super::*;
+    use crate::grid::{ColumnAddr, HEADER_ROWS, MARGIN_COLS};
+    use crate::ops::AggFunc;
+
+    /// A main column's header carrying `TOTAL` must NOT be treated as a key:
+    /// only the right-margin header corner (`]A~1`) is. This was the reported
+    /// bug — any header cell whose text read TOTAL/MAX opened the picker.
+    #[test]
+    fn main_header_reading_total_is_not_a_key() {
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(1, 2));
+        g.set(
+            &CellAddr::Header { row: (HEADER_ROWS - 1) as u32, col: ColumnAddr::Main(1) },
+            "TOTAL".into(),
+        );
+        let addr = CellAddr::Header { row: (HEADER_ROWS - 1) as u32, col: ColumnAddr::Main(1) };
+        assert!(
+            margin_agg_func_at(&g, &addr).is_none(),
+            "a main-column header must never be a picker target"
+        );
+        assert!(!addr_is_margin_agg_key(&addr));
+
+        // The cursor sitting there must not resolve to any key either.
+        let (lr, gc) = crate::addr::addr_to_sheet_cursor(
+            &addr,
+            crate::addr::MainRows(1),
+            crate::addr::MainCols(2),
+        );
+        let cursor = SheetCursor { row: lr.0, col: gc.0 };
+        assert!(
+            resolve_margin_agg_key(&g, &cursor).is_none(),
+            "no key governs a main-column header"
+        );
+    }
+
+    /// A right-margin *body* cell (`]A1`, a computed per-row total) is a
+    /// value, not a key.
+    #[test]
+    fn right_margin_body_cell_is_not_a_key() {
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(1, 1));
+        g.set(&CellAddr::Right { col: 0, row: 0 }, "TOTAL".into());
+        assert!(
+            margin_agg_func_at(&g, &CellAddr::Right { col: 0, row: 0 }).is_none(),
+            "right-margin body cells hold totals, they are not keys"
+        );
+    }
+
+    /// The real keys still resolve: the `]A~1` corner for a data cell, and
+    /// `[A1` (left-margin key column) when the cursor is on it.
+    #[test]
+    fn the_designed_keys_still_resolve() {
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(2, 1));
+        g.set(
+            &CellAddr::Header { row: (HEADER_ROWS - 1) as u32, col: ColumnAddr::Right(0) },
+            "TOTAL".into(),
+        );
+        // From a data cell, the governing key is the right-margin header.
+        let cursor = SheetCursor { row: HEADER_ROWS, col: MARGIN_COLS };
+        let (key, func) = resolve_margin_agg_key(&g, &cursor).expect("]A~1 governs column A");
+        assert_eq!(key, CellAddr::Header { row: (HEADER_ROWS - 1) as u32, col: ColumnAddr::Right(0) });
+        assert_eq!(func, AggFunc::Sum);
+
+        // A left-margin per-row key resolves to itself.
+        let mut g2 = crate::grid::GridBox::from(crate::grid::Grid::new(2, 1));
+        let left_key = CellAddr::Left { col: MARGIN_COLS - 1, row: 1 };
+        g2.set(&left_key, "==MAX".into());
+        let (lr, gc) = crate::addr::addr_to_sheet_cursor(
+            &left_key,
+            crate::addr::MainRows(2),
+            crate::addr::MainCols(1),
+        );
+        let c2 = SheetCursor { row: lr.0, col: gc.0 };
+        let (key2, func2) = resolve_margin_agg_key(&g2, &c2).expect("left key resolves");
+        assert_eq!(key2, left_key);
+        assert_eq!(func2, AggFunc::Max);
     }
 }
