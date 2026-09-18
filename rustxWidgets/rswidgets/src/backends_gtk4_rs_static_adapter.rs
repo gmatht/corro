@@ -131,6 +131,11 @@ impl Entry {
     pub fn new() -> Self { Entry(gtk4_static::Entry::new(), new_controllers()) }
     pub fn set_text(&self, t: &str) { self.0.set_text(t); }
     pub fn get_text(&self) -> Option<String> { Some(self.0.text().to_string()) }
+    pub fn get_position(&self) -> Option<usize> {
+        let p = self.0.position();
+        if p < 0 { None } else { Some(p as usize) }
+    }
+    pub fn set_position(&self, pos: usize) { self.0.set_position(pos as i32); }
     pub fn grab_focus(&self) { self.0.grab_focus(); }
     pub fn set_hexpand(&self, e: bool) { self.0.set_hexpand(e); }
     pub fn set_vexpand(&self, e: bool) { self.0.set_vexpand(e); }

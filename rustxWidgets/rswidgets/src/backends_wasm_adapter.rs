@@ -648,6 +648,9 @@ impl AsElement for BoxWidget {
         pub fn grab_focus(&self) {
             let _ = self.elem.focus();
         }
+        /// WASM entries report no caret: callers keep their own.
+        pub fn get_position(&self) -> Option<usize> { None }
+        pub fn set_position(&self, _pos: usize) {}
 
         pub fn on_key_raw(&self, cb: Box<dyn FnMut(u32, u32) -> bool>) {
             *self.key_cb.borrow_mut() = Some(cb);

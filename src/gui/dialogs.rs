@@ -431,76 +431,87 @@ pub fn special_char_dialog<F: FnOnce(Option<usize>) + 'static>(
     initial: usize,
     on_result: F,
 ) {
+    choice_dialog(SPECIAL_CHAR_DIALOG_TITLE, SPECIAL_CHAR_DIALOG_OK, items, initial, on_result)
+}
+
+/// Generic single-column radio-choice dialog. Shared by the special-char and
+/// margin-aggregate pickers so their geometry, keyboard behaviour, and
+/// close-then-report sequencing can never drift; only the title and the
+/// confirm-button label differ.
+pub fn choice_dialog<F: FnOnce(Option<usize>) + 'static>(
+    title: &'static str,
+    ok_label: &'static str,
+    items: &[String],
+    initial: usize,
+    on_result: F,
+) {
+    choice_dialog_parented(title, ok_label, items, initial, std::ptr::null_mut(), on_result)
+}
+
+/// As [`choice_dialog`], but parented to `parent` so the window manager
+/// places it as a child dialog (centred on the main window) rather than
+/// wherever an unparented window happens to land (often a screen corner).
+pub fn choice_dialog_parented<F: FnOnce(Option<usize>) + 'static>(
+    title: &'static str,
+    ok_label: &'static str,
+    items: &[String],
+    initial: usize,
+    parent: *mut std::os::raw::c_void,
+    on_result: F,
+) {
     #[cfg(feature = "gui")]
     {
         // Combined-gui flips the root prelude to pancurses-adapter types;
-        // these dialog widgets are always native: prefer the platform
-        // adapter, falling back to the prelude elsewhere (unchanged).
+        // these dialog widgets are always native (same shadowing as
+        // `sort_dialog`).
         #[cfg(target_os = "linux")]
-        use rswidgets::backends_gtk_adapter::RadioButton;
+        use rswidgets::backends_gtk_adapter::DropDown;
         #[cfg(windows)]
-        use rswidgets::backends_nwg_adapter::RadioButton;
+        use rswidgets::backends_nwg_adapter::DropDown;
         #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-        use rswidgets::prelude::RadioButton;
+        use rswidgets::prelude::DropDown;
         use rswidgets::common::Orientation;
         if let Ok(rxapp) = rswidgets::App::init() {
-            if let (Ok(dialog), Ok(vbox)) =
-                (rxapp.new_dialog(), rxapp.new_box(Orientation::Vertical, 4))
+            let refs: Vec<&str> = items.iter().map(String::as_str).collect();
+            if let (Ok(dialog), Ok(dropdown)) =
+                (rxapp.new_dialog(), rxapp.create_dropdown(&refs))
             {
-                dialog.set_title(SPECIAL_CHAR_DIALOG_TITLE);
-                dialog.set_default_size(300, 340);
-                // One radio group in choice order: the first stands alone,
-                // each next joins the previous (native mutual exclusion +
-                // arrow navigation in creation order, so Down*n lands on
-                // the nth choice on every backend). Single column (see doc
-                // above for why a grid would break the contract).
-                let mut radios: Vec<RadioButton> = Vec::new();
-                let mut built_ok = !items.is_empty();
-                for item in items {
-                    let group = radios.last();
-                    match rxapp.create_radiobutton(group, item) {
-                        Ok(rb) => {
-                            rb.set_hexpand(true);
-                            vbox.append(&rb);
-                            radios.push(rb);
-                        }
-                        Err(_) => {
-                            built_ok = false;
-                            break;
-                        }
-                    }
+                dialog.set_title(title);
+                // A dropdown needs only one row: a compact box, not the
+                // tall radio list (the "huge dialog" report). Width follows
+                // the longest item so nothing is clipped.
+                let widest = items.iter().map(|i| i.chars().count()).max().unwrap_or(12);
+                let w = ((widest as i32 + 8) * 8).clamp(180, 420);
+                dialog.set_default_size(w, 110);
+                // Place as a child of the main window when we have it: an
+                // unparented dialog is left at a screen corner by the WM.
+                if !parent.is_null() {
+                    dialog.set_transient_for(parent);
                 }
-                if !built_ok {
-                    on_result(None);
-                    return;
-                }
-                let sel = initial.min(radios.len() - 1);
-                radios[sel].set_active(true);
-                dialog.append_content_area(&vbox);
+                dropdown.set_hexpand(true);
+                dropdown.set_active(Some(initial as u32));
+                dialog.append_content_area(&dropdown);
                 dialog.add_button("Cancel", 0);
-                dialog.add_button(SPECIAL_CHAR_DIALOG_OK, 1);
-                // Enter anywhere unhandled confirms (Insert): GTK natively,
-                // NWG via dialog-level raw routing. Both inners expose the
-                // same method, so no per-platform branching here.
+                dialog.add_button(ok_label, 1);
+                // Enter confirms (the dropdown's own popup handles Enter
+                // while it is open, so this only fires once it is closed).
                 dialog.inner.set_default_response(1);
-                let rb_ptr = Box::into_raw(Box::new(radios)) as usize;
+                let dd_ptr = Box::into_raw(Box::new(dropdown)) as usize;
                 let mut on_result = Some(on_result);
                 let callback_called = std::cell::RefCell::new(false);
-                // Close FIRST, then report: teardown restores focus
-                // synchronously, so the callee's entry grab (splice path)
-                // lands instead of racing the destroy. The wrapper's own
-                // post-response close becomes a harmless no-op.
+                // Close FIRST, then report (same sequencing as the radio
+                // version): teardown restores focus synchronously, so a
+                // callee's focus grab lands instead of racing the destroy.
                 let dlg_close = dialog.clone();
                 dialog.connect_response(move |response_id| {
                     let mut called = callback_called.borrow_mut();
                     if !*called {
                         *called = true;
                         if let Some(f) = on_result.take() {
-                            let rbs: &Vec<RadioButton> =
-                                unsafe { &*(rb_ptr as *const Vec<RadioButton>) };
+                            let dd: &DropDown = unsafe { &*(dd_ptr as *const DropDown) };
                             let result = if response_id == 1 {
-                                let idx = rbs.iter().position(|r| r.is_active()).unwrap_or(0);
-                                Some(idx)
+                                let idx = dd.get_active();
+                                if idx < 0 { Some(initial) } else { Some(idx as usize) }
                             } else {
                                 None
                             };
@@ -510,9 +521,8 @@ pub fn special_char_dialog<F: FnOnce(Option<usize>) + 'static>(
                     }
                 }).ok();
                 dialog.present();
-                // Arrows navigate from the focused radio.
-                let rbs: &Vec<RadioButton> = unsafe { &*(rb_ptr as *const Vec<RadioButton>) };
-                rbs[sel].grab_focus();
+                let dd: &DropDown = unsafe { &*(dd_ptr as *const DropDown) };
+                dd.grab_focus();
                 let _ = Box::into_raw(Box::new(dialog));
                 return;
             }

@@ -3,6 +3,7 @@
 mod gtk_adapter {
     use std::os::raw::c_void;
     use std::cell::RefCell;
+
     use std::rc::Rc;
     use crate::core::{Error, Widget};
     use gtk_dynamic_loader::{Window as GWindow, Button as GButton, Label as GLabel, BoxWidget as GBox, Grid as GGrid, Entry as GEntry, Dialog as GDialog, DropDown as GDropDown, CheckButton as GCheckButton, RadioButton as GRadioButton, TextView as GTextView, ScrolledWindow as GScrolledWindow};
@@ -327,6 +328,12 @@ mod gtk_adapter {
     impl Entry {
         pub fn set_text(&self, text: &str) { self.inner.set_text(text); }
         pub fn get_text(&self) -> Option<String> { self.inner.get_text() }
+        pub fn get_position(&self) -> Option<usize> {
+            self.inner.get_position().and_then(|p| if p < 0 { None } else { Some(p as usize) })
+        }
+        pub fn set_position(&self, pos: usize) {
+            self.inner.set_position(pos as i32);
+        }
         pub fn set_width_chars(&self, n: i32) { self.inner.set_width_chars(n); }
         pub fn set_size_request(&self, w: i32, h: i32) { self.inner.set_size_request(w, h); }
         pub fn connect_changed(&self, f: impl FnMut() + 'static) -> Result<u64, Error> { self.inner.connect_changed(f).map_err(|e| Error::Backend(format!("{}", e))) }
@@ -553,6 +560,7 @@ mod gtk_adapter {
 
     impl Dialog {
         pub fn set_title(&self, title: &str) { self.0.set_title(title); }
+        pub fn set_transient_for(&self, parent: *mut c_void) { self.0.set_transient_for(parent); }
         pub fn set_default_size(&self, w: i32, h: i32) { self.0.set_default_size(w, h); }
         pub fn add_button(&self, text: &str, response_id: i32) { self.0.add_button(text, response_id); }
         pub fn set_default_response(&self, response_id: i32) { self.0.set_default_response(response_id); }
@@ -583,6 +591,12 @@ mod gtk_adapter {
         pub fn set_active(&self, index: Option<u32>) {
             if let Some(idx) = index { self.0.set_active(idx); }
         }
+        pub fn grab_focus(&self) { self.0.grab_focus(); }
+        /// (visible, mapped, alloc_w, alloc_h, has_parent) diagnostic.
+        pub fn diagnostics(&self) -> (bool, bool, i32, i32, bool) { self.0.diagnostics() }
+        /// True when the GTK4 DropDown backend is in use (vs GTK3 combo).
+        pub fn is_gtk4(&self) -> bool { self.0.is_gtk4() }
+        pub fn has_size_request_symbol(&self) -> bool { self.0.has_size_request_symbol() }
         pub fn get_active(&self) -> i32 { self.0.get_active() }
         pub fn connect_changed<F: FnMut() + 'static>(&self, f: F) -> Result<u64, Error> {
             self.0.connect_changed(f).map_err(|e| Error::Backend(format!("{}", e)))
@@ -591,6 +605,12 @@ mod gtk_adapter {
         pub fn set_hexpand(&self, expand: bool) { self.0.set_hexpand(expand); }
         pub fn set_vexpand(&self, expand: bool) { self.0.set_vexpand(expand); }
         pub fn set_size_request(&self, w: i32, h: i32) { self.0.set_size_request(w, h); }
+        /// Offset within an overlay parent, in widget pixels.
+        pub fn set_offset(&self, x: i32, y: i32) {
+            self.0.set_align_start();
+            self.0.set_margin_start(x);
+            self.0.set_margin_top(y);
+        }
     }
 
     pub fn create_dropdown(items: &[&str]) -> Result<DropDown, Error> {
@@ -1162,8 +1182,31 @@ mod gtk_adapter {
         pub fn set_child(&self, child: &impl AsRef<*mut c_void>) {
             self.0.set_child(child);
         }
+        /// Add an overlay child. The child is wrapped in a `GtkFixed` so it
+        /// can be positioned absolutely **and** gets the size it requests —
+        /// a bare overlay child is allocated its minimum (observed 1x1),
+        /// which made the in-grid dropdown invisible.
         pub fn add_overlay(&self, child: &impl AsRef<*mut c_void>) {
-            self.0.add_overlay(child);
+            match gtk_dynamic_loader::Fixed::new(
+                crate::backends::gtk::loader().expect("gtk loader"),
+            ) {
+                Ok(fixed) => {
+                    fixed.set_size_request(1, 1);
+                    fixed.put(*child.as_ref(), 0, 0);
+                    // GTK3: a child added to an already-visible container
+                    // must be shown explicitly, or it stays unmapped (1x1).
+                    fixed.show_child(*child.as_ref());
+                    self.0.add_overlay(&fixed);
+                    // Keep the Fixed alive: GTK owns it once added, but the
+                    // wrapper must not drop its Rust bookkeeping early.
+                    std::mem::forget(fixed);
+                }
+                Err(_) => {
+                    // No GtkFixed available: fall back to a plain overlay
+                    // child (positioning then degrades to stacked layout).
+                    self.0.add_overlay(child);
+                }
+            }
         }
         pub fn set_overlay_pass_through(&self, child: &impl AsRef<*mut c_void>, pass: bool) {
             self.0.set_overlay_pass_through(child, pass);
@@ -1177,6 +1220,37 @@ mod gtk_adapter {
         pub fn set_size_request(&self, w: i32, h: i32) { self.0.set_size_request(w, h); }
         pub fn set_hexpand(&self, expand: bool) { self.0.set_hexpand(expand); }
         pub fn set_vexpand(&self, expand: bool) { self.0.set_vexpand(expand); }
+    }
+
+    // ---- Fixed (absolute positioning) ----
+
+    #[repr(transparent)]
+    pub struct Fixed(pub gtk_dynamic_loader::Fixed);
+
+    impl Clone for Fixed { fn clone(&self) -> Self { Fixed(self.0.clone()) } }
+    impl AsRef<*mut c_void> for Fixed { fn as_ref(&self) -> &*mut c_void { self.0.as_ref() } }
+    impl Widget for Fixed { fn raw_handle(&self) -> *mut c_void { *self.0.as_ref() } }
+
+    impl Fixed {
+        /// Place `child` at `(x, y)` with the given size. `GtkFixed` honours
+        /// the child's size request, so an absolutely-positioned child (the
+        /// in-grid dropdown) gets the rectangle it asked for.
+        pub fn put(&self, child: &impl AsRef<*mut c_void>, x: i32, y: i32) {
+            self.0.put(*child.as_ref(), x, y);
+        }
+        pub fn set_size_request(&self, w: i32, h: i32) { self.0.set_size_request(w, h); }
+        pub fn set_hexpand(&self, e: bool) { self.0.set_hexpand(e); }
+        pub fn set_vexpand(&self, e: bool) { self.0.set_vexpand(e); }
+        pub fn show_all(&self) {}
+    }
+
+    /// Creates a new GTK Fixed container.
+    pub fn create_fixed() -> Result<Fixed, Error> {
+        let loader = crate::backends::gtk::loader()
+            .ok_or_else(|| Error::Backend("GTK loader not initialized".into()))?;
+        let f = gtk_dynamic_loader::Fixed::new(loader.clone())
+            .map_err(|e| Error::Backend(format!("{}", e)))?;
+        Ok(Fixed(f))
     }
 
     /// Creates a new GTK Overlay widget.

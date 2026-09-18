@@ -694,6 +694,13 @@ mod pancurses_backend {
         ArrowLeft,
         ArrowRight,
         Char(char),
+        /// F2: hosts start in-cell editing (LibreOffice parity). Reported
+        /// separately from `Other` so hosts can observe it; the widget
+        /// itself never consumes it.
+        F2,
+        /// F3: hosts open the margin-aggregate picker on an aggregate key.
+        /// Reported separately from `Other` (same contract as `F2`).
+        F3,
         Other,
     }
 
@@ -706,6 +713,8 @@ mod pancurses_backend {
             Some(Input::KeyDown) => Some(KeyInput::ArrowDown),
             Some(Input::KeyLeft) => Some(KeyInput::ArrowLeft),
             Some(Input::KeyRight) => Some(KeyInput::ArrowRight),
+            Some(Input::KeyF2) => Some(KeyInput::F2),
+            Some(Input::KeyF3) => Some(KeyInput::F3),
             Some(Input::Character(c)) => Some(KeyInput::Char(*c)),
             Some(_) => Some(KeyInput::Other),
             None => None,

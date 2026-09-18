@@ -5,7 +5,7 @@
 `src/bin/pgo_mix_benchmark.rs` — a multi-mode harness producing TSV output for piping into analysis tools.
 
 ```bash
-cargo run --release --bin pgo_mix_benchmark -- --bench eval --duration 10
+cargo run --release --bin pgo-mix-benchmark -- --bench eval --duration 10
 ```
 
 ### Modes
@@ -24,7 +24,7 @@ cargo run --release --bin pgo_mix_benchmark -- --bench eval --duration 10
 All output is TSV: `bench<TAB>wall_ms<TAB>count<TAB>rate<TAB>meta`. Pipe-friendly:
 
 ```bash
-cargo run --release --bin pgo_mix_benchmark -- --bench eval --duration 10 |
+cargo run --release --bin pgo-mix-benchmark -- --bench eval --duration 10 |
   column -t -s $'\t'
 ```
 

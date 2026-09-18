@@ -2742,6 +2742,58 @@ fn type_first_1_enter_2_enter_parity() {
     );
 }
 
+/// F2 starts editing the cursor cell (LibreOffice parity): the edit
+/// buffer is seeded with the cell's display text, caret at end; typing
+/// appends and Enter commits. Expected everywhere: F2,!,Enter on
+/// A1="hello" commits `SET A1 hello!` and leaves the cursor on A2.
+#[test]
+fn f2_edits_cursor_cell_parity() {
+    use crossterm::event::KeyCode;
+    let keys = ["F2", "!", "Enter"];
+    let codes = [KeyCode::F(2), KeyCode::Char('!'), KeyCode::Enter];
+    let mk = |prefix: &str| {
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dst = std::env::temp_dir().join(format!(
+            "corro-f2-{}-{}-{}.corro", prefix, std::process::id(), id
+        ));
+        std::fs::write(&dst, "CORRO_LOG 1\nSET A1 hello\n").expect("write f2 fixture");
+        dst.to_string_lossy().to_string()
+    };
+
+    // ── ratatui reference: mid-edit bar shows the seeded buffer ──
+    let fix_rt_mid = mk("rt-mid");
+    let (rt_mid_bar, _, _) = drive_ratatui(&fix_rt_mid, &[KeyCode::F(2)]);
+    assert!(
+        rt_mid_bar.contains("A1") && rt_mid_bar.contains("hello"),
+        "ratatui F2 must seed the bar with A1/hello\n{rt_mid_bar:?}"
+    );
+    // ── ratatui reference: full flow commits ──
+    let fix_rt = mk("rt");
+    let (rt_bar, _, rt_path) = drive_ratatui(&fix_rt, &codes);
+    assert!(rt_bar.contains("A2"), "ratatui formula should show A2\n{rt_bar:?}");
+    assert_eq!(
+        file_set_tail(&rt_path, 2),
+        vec!["SET A1 hello".to_string(), "SET A1 hello!".to_string()],
+        "ratatui must commit hello!@A1"
+    );
+
+    // ── pancurses must match: mid-edit bar, then the commit ──
+    let fix_pnc_mid = mk("pnc-mid");
+    let (pnc_mid_bar, _) = drive_pnc_full(&fix_pnc_mid, &["F2"], 1);
+    assert!(
+        pnc_mid_bar.contains("A1") && pnc_mid_bar.contains("hello"),
+        "pancurses F2 must seed the bar with A1/hello\n{pnc_mid_bar:?}"
+    );
+    let fix_pnc = mk("pnc");
+    let (pnc_bar, _) = drive_pnc_full(&fix_pnc, &keys, 2);
+    assert!(pnc_bar.contains("A2"), "pancurses formula should show A2\n{pnc_bar:?}");
+    assert_eq!(
+        file_set_tail(&fix_pnc, 2),
+        vec!["SET A1 hello".to_string(), "SET A1 hello!".to_string()],
+        "pancurses must commit hello!@A1"
+    );
+}
+
 /// Marker-paced pancurses drive returning (formula-bar line, esc pane).
 /// Each key is sent only after the previous key's redraw lands (idle
 /// marker), then commits are awaited in the file before capturing — so the

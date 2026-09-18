@@ -7,16 +7,13 @@ use crate::ops::{AggFunc, AggregateDef};
 pub mod helpers;
 
 /// Formatting for margin aggregates when only an [`f64`] is available (`Number::Approx` path).
+///
+/// Uses [`formula::format_decimal_generic`] (10 significant digits, scientific
+/// notation for extreme magnitudes) rather than fixed decimal places: the old
+/// `{:.10}` rendered `1e-99` as `0`, so a column like `1 + 10^-99 - 1` summed to
+/// a display of `0` even though the value was not zero.
 fn format_aggregate_approx(value: f64) -> String {
-    if !value.is_finite() {
-        return value.to_string();
-    }
-    let s = format!("{value:.10}");
-    if s.contains('.') {
-        s.trim_end_matches('0').trim_end_matches('.').to_string()
-    } else {
-        s
-    }
+    formula::format_decimal_generic(value)
 }
 
 /// Preserve [`Number::Exact`] without a `float` round-trip; match cell-style rational display.
@@ -287,6 +284,42 @@ mod tests {
         };
         let gb = GridBox::from(g);
         assert_eq!(compute_aggregate(&gb, &def), "5");
+    }
+
+    /// Regression: a SUM whose value is an extreme exact decimal (here
+    /// `1 + 10^-99 - 1` = `10^-99`) must display in scientific notation, not
+    /// as `0`. The old fixed-decimal aggregate formatter (`{:.10}`) rounded it
+    /// to zero, so the column total looked empty/zero.
+    #[test]
+    fn sum_extreme_exact_decimal_displays_scientific_not_zero() {
+        let mut g = Grid::new(3, 1);
+        g.set(&CellAddr::Main { row: 0, col: 0 }, "1".into());
+        g.set(&CellAddr::Main { row: 1, col: 0 }, "=10^-99".into());
+        g.set(&CellAddr::Main { row: 2, col: 0 }, "-1".into());
+        let gb = GridBox::from(g);
+        let def = AggregateDef {
+            func: AggFunc::Sum,
+            source: MainRange {
+                row_start: 0,
+                row_end: 3,
+                col_start: 0,
+                col_end: 1,
+            },
+        };
+        let shown = compute_aggregate(&gb, &def);
+        assert_eq!(shown, "1e-99", "extreme exact sum must not display as 0");
+    }
+
+    /// The same value via the approximate (f64) path must also stay
+    /// scientific: `Number::Approx(1e-99)` rather than a rounded `0`.
+    #[test]
+    fn approx_extreme_magnitude_formats_scientific() {
+        assert_eq!(format_aggregate_approx(1e-99), "1e-99");
+        assert_eq!(format_aggregate_approx(1.5e-99), "1.5e-99");
+        assert_eq!(format_aggregate_approx(1e100), "1e100");
+        // Human-scale values keep their familiar form.
+        assert_eq!(format_aggregate_approx(5.0), "5");
+        assert_eq!(format_aggregate_approx(1.5), "1.5");
     }
 
     #[test]

@@ -255,7 +255,7 @@ pub fn extract_words_from_buffer(buffer: &Buffer) -> BTreeSet<String> {
 
 /// Baseline set of words extracted from the GTK4 backend source code.
 ///
-/// This is the starting yardstick.  Run the `gtk_a11y_dump` tool against a
+/// This is the starting yardstick.  Run the `gtk-a11y-dump` tool against a
 /// running corro GTK instance to generate the actual AT-SPI query result.
 /// Update this constant from that output as GTK widgets are added.
 pub fn default_gtk_words() -> BTreeSet<&'static str> {

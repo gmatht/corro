@@ -245,6 +245,9 @@ mod android_adapter {
                 Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
             });
         }
+        /// Android entries report no caret: callers keep their own.
+        pub fn get_position(&self) -> Option<usize> { None }
+        pub fn set_position(&self, _pos: usize) {}
         pub fn on_key_raw(&self, _cb: Box<dyn FnMut(u32, u32) -> bool>) {}
 
         pub fn connect_changed(&self, _f: impl FnMut() + 'static) -> Result<u64, Error> {

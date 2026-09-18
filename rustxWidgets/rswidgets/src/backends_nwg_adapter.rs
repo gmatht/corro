@@ -1249,27 +1249,57 @@ mod nwg_adapter {
 
     impl Entry {
         pub fn set_text(&self, text: &str) {
+            // Preserve the user's caret across a programmatic set: read it
+            // first, then restore it (clamped to the new length). Previously
+            // this forced the caret to the end on every sync
+            // (`sync_entry_to_buf` runs per keystroke), so the formula always
+            // appended at the end no matter where the user's cursor was.
+            let prev_pos = self.get_position();
             self.inner.set_text(text);
-            // Caret to end: SetWindowText leaves the caret at position 0,
-            // so a natively-inserted char (a WM_CHAR the key handlers
-            // declined, e.g. '(') would land at the front ("(=" for
-            // "=("), fail the resync guard, and be clobbered by the next
-            // sync. Caret-at-end keeps native insertions appending, which
-            // is also what every other backend does after a programmatic
-            // set. Harmless when unfocused (caret invisible).
             if let Some(hwnd) = self.inner.handle.hwnd() {
                 unsafe {
-                    let len = winapi::um::winuser::GetWindowTextLengthW(hwnd as _);
+                    let len = winapi::um::winuser::GetWindowTextLengthW(hwnd as _) as usize;
+                    let pos = prev_pos.unwrap_or(len).min(len);
                     winapi::um::winuser::SendMessageW(
                         hwnd as _,
                         winapi::um::winuser::EM_SETSEL as u32,
-                        len as usize,
-                        len as isize,
+                        pos,
+                        pos as isize,
                     );
                 }
             }
         }
         pub fn get_text(&self) -> Option<String> { Some(self.inner.text()) }
+        /// Caret position as a character index. `EM_GETSEL` reports the
+        /// selection start/end through two out-parameters; for a collapsed
+        /// (caret-only) selection the start *is* the caret.
+        pub fn get_position(&self) -> Option<usize> {
+            let hwnd = self.inner.handle.hwnd()?;
+            unsafe {
+                let mut start: u32 = 0;
+                let mut end: u32 = 0;
+                winapi::um::winuser::SendMessageW(
+                    hwnd as _,
+                    winapi::um::winuser::EM_GETSEL as u32,
+                    &mut start as *mut u32 as usize,
+                    &mut end as *mut u32 as isize,
+                );
+                Some(start as usize)
+            }
+        }
+        /// Move the caret (character index); Windows clamps out-of-range.
+        pub fn set_position(&self, pos: usize) {
+            if let Some(hwnd) = self.inner.handle.hwnd() {
+                unsafe {
+                    winapi::um::winuser::SendMessageW(
+                        hwnd as _,
+                        winapi::um::winuser::EM_SETSEL as u32,
+                        pos,
+                        pos as isize,
+                    );
+                }
+            }
+        }
         pub fn connect_changed(&self, f: impl FnMut() + 'static) -> Result<u64, Error> {
             *self.changed_cb.borrow_mut() = Some(Box::new(f));
             Ok(0)
@@ -1609,6 +1639,17 @@ mod nwg_adapter {
         pub fn set_active(&self, index: Option<u32>) {
             self.inner.set_selection(index.map(|i| i as usize));
         }
+        /// Move keyboard focus to the combo box so arrow keys open/navigate
+        /// its list immediately after the dialog appears.
+        pub fn grab_focus(&self) {
+            let hwnd = self.inner.handle.hwnd().unwrap_or(std::ptr::null_mut());
+            if hwnd.is_null() {
+                return;
+            }
+            unsafe {
+                winapi::um::winuser::SetFocus(hwnd as _);
+            }
+        }
         pub fn active(&self) -> Option<u32> {
             self.inner.selection().map(|i| i as u32)
         }
@@ -1620,6 +1661,47 @@ mod nwg_adapter {
         }
         pub fn set_hexpand(&self, _expand: bool) {}
         pub fn set_vexpand(&self, _expand: bool) {}
+        /// Resize the combo box (Win32 controls are absolutely sized).
+        pub fn set_size_request(&self, w: i32, h: i32) {
+            let hwnd = self.inner.handle.hwnd().unwrap_or(std::ptr::null_mut());
+            if hwnd.is_null() {
+                return;
+            }
+            unsafe {
+                winapi::um::winuser::SetWindowPos(
+                    hwnd as _, std::ptr::null_mut(), 0, 0, w, h,
+                    winapi::um::winuser::SWP_NOZORDER | winapi::um::winuser::SWP_NOMOVE,
+                );
+            }
+        }
+        /// Show/hide the combo box.
+        pub fn set_visible(&self, visible: bool) {
+            let hwnd = self.inner.handle.hwnd().unwrap_or(std::ptr::null_mut());
+            if hwnd.is_null() {
+                return;
+            }
+            unsafe {
+                winapi::um::winuser::ShowWindow(
+                    hwnd as _,
+                    if visible { winapi::um::winuser::SW_SHOW } else { winapi::um::winuser::SW_HIDE },
+                );
+            }
+        }
+        /// Move the combo box within its parent (Win32 widgets are
+        /// absolutely positioned by the parent, so this is the whole
+        /// placement story on Windows).
+        pub fn set_offset(&self, x: i32, y: i32) {
+            let hwnd = self.inner.handle.hwnd().unwrap_or(std::ptr::null_mut());
+            if hwnd.is_null() {
+                return;
+            }
+            unsafe {
+                winapi::um::winuser::SetWindowPos(
+                    hwnd as _, std::ptr::null_mut(), x, y, 0, 0,
+                    winapi::um::winuser::SWP_NOZORDER | winapi::um::winuser::SWP_NOSIZE,
+                );
+            }
+        }
     }
 
     impl AsRef<*mut c_void> for DropDown {
@@ -1782,6 +1864,40 @@ mod nwg_adapter {
     impl Dialog {
         pub fn run(&self) -> i32 { 0 }
         pub fn set_title(&self, title: &str) { self.inner.set_text(title); }
+        /// Centre this dialog on `parent` (the main window). Windows has no
+        /// transient-for concept; owning/centering is the equivalent so the
+        /// dialog does not appear at an arbitrary screen position.
+        pub fn set_transient_for(&self, parent: *mut std::os::raw::c_void) {
+            if parent.is_null() {
+                return;
+            }
+            let hwnd = self.inner.handle.hwnd().unwrap_or(std::ptr::null_mut());
+            if hwnd.is_null() {
+                return;
+            }
+            unsafe {
+                use winapi::shared::windef::RECT;
+                use winapi::um::winuser::*;
+                let mut pr: RECT = std::mem::zeroed();
+                if GetWindowRect(parent as _, &mut pr) == 0 {
+                    return;
+                }
+                let mut dr: RECT = std::mem::zeroed();
+                if GetWindowRect(hwnd as _, &mut dr) == 0 {
+                    return;
+                }
+                let pw = pr.right - pr.left;
+                let ph = pr.bottom - pr.top;
+                let dw = dr.right - dr.left;
+                let dh = dr.bottom - dr.top;
+                let x = pr.left + (pw - dw) / 2;
+                let y = pr.top + (ph - dh) / 2;
+                SetWindowPos(
+                    hwnd as _, std::ptr::null_mut(), x, y, 0, 0,
+                    SWP_NOZORDER | SWP_NOSIZE,
+                );
+            }
+        }
         pub fn set_size_request(&self, _w: i32, _h: i32) {}
         pub fn set_default_size(&self, w: i32, h: i32) {
             let hwnd = self.inner.handle.hwnd().unwrap_or(std::ptr::null_mut());

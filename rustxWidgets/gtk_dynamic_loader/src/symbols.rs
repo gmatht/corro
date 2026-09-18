@@ -28,6 +28,9 @@ pub type GtkBoxPackStart = unsafe extern "C" fn(box_: *mut c_void, child: *mut c
 pub type GtkContainerAdd = unsafe extern "C" fn(container: *mut c_void, widget: *mut c_void);
 pub type GtkContainerRemove = unsafe extern "C" fn(container: *mut c_void, widget: *mut c_void);
 pub type GtkWindowSetChild = unsafe extern "C" fn(window: *mut c_void, child: *mut c_void);
+/// `void gtk_widget_show(GtkWidget*)` (GTK3; in GTK4 this is deprecated but
+/// still present as a no-op, so calling it is safe on both).
+pub type GtkWidgetShow = unsafe extern "C" fn(widget: *mut c_void);
 pub type GtkWidgetShowAll = unsafe extern "C" fn(widget: *mut c_void);
 pub type GtkWindowPresent = unsafe extern "C" fn(window: *mut c_void);
 pub type GtkInit = unsafe extern "C" fn(argc: *mut libc::c_int, argv: *mut *mut *mut libc::c_char);
@@ -118,6 +121,8 @@ pub type GtkGestureClickNew = unsafe extern "C" fn() -> *mut c_void;
 pub type GtkWidgetSetCanTarget = unsafe extern "C" fn(widget: *mut c_void, can_target: i32);
 pub type GtkWidgetSetHalign = unsafe extern "C" fn(widget: *mut c_void, align: i32);
 pub type GtkWidgetSetValign = unsafe extern "C" fn(widget: *mut c_void, align: i32);
+/// `gint gtk_widget_get_width_request(GtkWidget*)`.
+pub type GtkWidgetGetWidthRequest = unsafe extern "C" fn(widget: *mut c_void) -> i32;
 pub type GtkWidgetGetAllocatedWidth = unsafe extern "C" fn(widget: *mut c_void) -> i32;
 pub type GtkWidgetGetAllocatedHeight = unsafe extern "C" fn(widget: *mut c_void) -> i32;
 pub type GtkWidgetGetMapped = unsafe extern "C" fn(widget: *mut c_void) -> i32;
@@ -204,6 +209,8 @@ pub type GtkWidgetGetVexpand = unsafe extern "C" fn(widget: *mut c_void) -> i32;
 pub type GtkEditableGetText = unsafe extern "C" fn(editable: *mut c_void) -> *const i8;
 pub type GtkEditableSetText = unsafe extern "C" fn(editable: *mut c_void, text: *const i8);
 pub type GtkEditableSetPosition = unsafe extern "C" fn(editable: *mut c_void, position: i32);
+/// `int gtk_editable_get_position(GtkEditable*)` (GTK3/GTK4).
+pub type GtkEditableGetPosition = unsafe extern "C" fn(editable: *mut c_void) -> i32;
 
 // GtkWidget parent handling
 pub type GtkWidgetUnparent = unsafe extern "C" fn(widget: *mut c_void);
@@ -227,6 +234,10 @@ pub type GtkMenuButtonGetLabel = unsafe extern "C" fn(button: *mut c_void) -> *c
 pub type GtkMenuButtonSetActive = unsafe extern "C" fn(button: *mut c_void, active: i32);
 
 // GtkWindow default size
+/// `void gtk_window_set_transient_for(GtkWindow*, GtkWindow*)`.
+pub type GtkWindowSetTransientFor = unsafe extern "C" fn(window: *mut c_void, parent: *mut c_void);
+/// `void gtk_window_set_position(GtkWindow*, GtkWindowPosition)`.
+pub type GtkWindowSetPosition = unsafe extern "C" fn(window: *mut c_void, position: i32);
 pub type GtkWindowSetDefaultSize = unsafe extern "C" fn(window: *mut c_void, width: i32, height: i32);
 
 // Grid/Entry related
@@ -245,6 +256,12 @@ pub type GtkOverlayAddOverlay = unsafe extern "C" fn(overlay: *mut c_void, widge
 pub type GtkOverlaySetOverlayPassThrough = unsafe extern "C" fn(overlay: *mut c_void, widget: *mut c_void, pass_through: i32);
 pub type GtkOverlaySetChild = unsafe extern "C" fn(overlay: *mut c_void, child: *mut c_void);
 pub type GtkWidgetSetMarginStart = unsafe extern "C" fn(widget: *mut c_void, margin: i32);
+/// `GtkWidget* gtk_fixed_new(void)`.
+pub type GtkFixedNew = unsafe extern "C" fn() -> *mut c_void;
+/// `void gtk_fixed_put(GtkFixed*, GtkWidget*, gint x, gint y)`.
+pub type GtkFixedPut = unsafe extern "C" fn(fixed: *mut c_void, child: *mut c_void, x: i32, y: i32);
+/// `void gtk_fixed_move(GtkFixed*, GtkWidget*, gint x, gint y)`.
+pub type GtkFixedMove = unsafe extern "C" fn(fixed: *mut c_void, child: *mut c_void, x: i32, y: i32);
 pub type GtkWidgetSetMarginTop = unsafe extern "C" fn(widget: *mut c_void, margin: i32);
 pub type GtkWidgetAddEvents = unsafe extern "C" fn(widget: *mut c_void, events: i32);
 
@@ -323,6 +340,7 @@ pub struct Symbols {
     pub gtk_container_remove: Option<GtkContainerRemove>,
     pub gtk_window_set_child: Option<GtkWindowSetChild>,
     pub gtk_widget_show_all: Option<GtkWidgetShowAll>,
+    pub gtk_widget_show: Option<GtkWidgetShow>,
     pub gtk_window_present: Option<GtkWindowPresent>,
     pub gtk_window_set_application: Option<GtkWindowSetApplication>,
     pub gtk_widget_insert_action_group: Option<GtkWidgetInsertActionGroup>,
@@ -352,6 +370,9 @@ pub struct Symbols {
     pub gtk_overlay_set_overlay_pass_through: Option<GtkOverlaySetOverlayPassThrough>,
     pub gtk_overlay_set_child: Option<GtkOverlaySetChild>,
     pub gtk_widget_set_margin_start: Option<GtkWidgetSetMarginStart>,
+    pub gtk_fixed_new: Option<GtkFixedNew>,
+    pub gtk_fixed_put: Option<GtkFixedPut>,
+    pub gtk_fixed_move: Option<GtkFixedMove>,
     pub gtk_widget_set_margin_top: Option<GtkWidgetSetMarginTop>,
     pub gtk_widget_add_events: Option<GtkWidgetAddEvents>,
     pub gtk_widget_activate: Option<GtkWidgetActivate>,
@@ -432,6 +453,7 @@ pub struct Symbols {
     pub gtk_widget_set_halign: Option<GtkWidgetSetHalign>,
     pub gtk_widget_set_valign: Option<GtkWidgetSetValign>,
     pub gtk_widget_get_allocated_width: Option<GtkWidgetGetAllocatedWidth>,
+    pub gtk_widget_get_width_request: Option<GtkWidgetGetWidthRequest>,
     pub gtk_widget_get_allocated_height: Option<GtkWidgetGetAllocatedHeight>,
     pub gtk_widget_get_mapped: Option<GtkWidgetGetMapped>,
     pub gtk_widget_get_display: Option<GtkWidgetGetDisplay>,
@@ -510,6 +532,7 @@ pub struct Symbols {
     pub gtk_editable_get_text: Option<GtkEditableGetText>,
     pub gtk_editable_set_text: Option<GtkEditableSetText>,
     pub gtk_editable_set_position: Option<GtkEditableSetPosition>,
+    pub gtk_editable_get_position: Option<GtkEditableGetPosition>,
 
     // GtkWidget parent handling
     pub gtk_widget_unparent: Option<GtkWidgetUnparent>,
@@ -545,6 +568,8 @@ pub struct Symbols {
 
     // GtkWindow default size
     pub gtk_window_set_default_size: Option<GtkWindowSetDefaultSize>,
+    pub gtk_window_set_transient_for: Option<GtkWindowSetTransientFor>,
+    pub gtk_window_set_position: Option<GtkWindowSetPosition>,
 
     // DrawingArea canvas (GTK4)
     pub gtk_drawing_area_set_draw_func: Option<GtkDrawingAreaSetDrawFunc>,
@@ -624,6 +649,7 @@ impl Symbols {
         let gtk_container_remove = unsafe { sym::<GtkContainerRemove>(gtk, "gtk_container_remove") };
         let gtk_window_set_child = unsafe { sym::<GtkWindowSetChild>(gtk, "gtk_window_set_child") };
         let gtk_widget_show_all = unsafe { sym::<GtkWidgetShowAll>(gtk, "gtk_widget_show_all") };
+        let gtk_widget_show = unsafe { sym::<GtkWidgetShow>(gtk, "gtk_widget_show") };
         let gtk_window_present = unsafe { sym::<GtkWindowPresent>(gtk, "gtk_window_present") };
         let _gtk_window_set_application = unsafe { sym::<GtkWindowSetApplication>(gtk, "gtk_window_set_application") };
         let gtk_file_chooser_native_new = open_sym_try!(libs, "libgio", GtkFileChooserNativeNew, "gtk_file_chooser_native_new").or_else(|| unsafe { sym::<GtkFileChooserNativeNew>(gtk, "gtk_file_chooser_native_new") });
@@ -674,6 +700,9 @@ impl Symbols {
         let gtk_overlay_set_overlay_pass_through = unsafe { sym::<GtkOverlaySetOverlayPassThrough>(gtk, "gtk_overlay_set_overlay_pass_through") };
         let gtk_overlay_set_child = unsafe { sym::<GtkOverlaySetChild>(gtk, "gtk_overlay_set_child") };
         let gtk_widget_set_margin_start = unsafe { sym::<GtkWidgetSetMarginStart>(gtk, "gtk_widget_set_margin_start") };
+        let gtk_fixed_new = unsafe { sym::<GtkFixedNew>(gtk, "gtk_fixed_new") };
+        let gtk_fixed_put = unsafe { sym::<GtkFixedPut>(gtk, "gtk_fixed_put") };
+        let gtk_fixed_move = unsafe { sym::<GtkFixedMove>(gtk, "gtk_fixed_move") };
         let gtk_widget_set_margin_top = unsafe { sym::<GtkWidgetSetMarginTop>(gtk, "gtk_widget_set_margin_top") };
         let gtk_widget_add_events = unsafe { sym::<GtkWidgetAddEvents>(gtk, "gtk_widget_add_events") };
         let gtk_widget_activate = unsafe { sym::<GtkWidgetActivate>(gtk, "gtk_widget_activate") };
@@ -729,6 +758,7 @@ impl Symbols {
         let gtk_widget_set_halign = unsafe { sym::<GtkWidgetSetHalign>(gtk, "gtk_widget_set_halign") };
         let gtk_widget_set_valign = unsafe { sym::<GtkWidgetSetValign>(gtk, "gtk_widget_set_valign") };
         let gtk_widget_get_allocated_width = unsafe { sym::<GtkWidgetGetAllocatedWidth>(gtk, "gtk_widget_get_allocated_width") };
+        let gtk_widget_get_width_request = unsafe { sym::<GtkWidgetGetWidthRequest>(gtk, "gtk_widget_get_width_request") };
         let gtk_widget_get_allocated_height = unsafe { sym::<GtkWidgetGetAllocatedHeight>(gtk, "gtk_widget_get_allocated_height") };
         let gtk_widget_get_mapped = unsafe { sym::<GtkWidgetGetMapped>(gtk, "gtk_widget_get_mapped") };
         let gtk_widget_get_display = unsafe { sym::<GtkWidgetGetDisplay>(gtk, "gtk_widget_get_display") };
@@ -833,6 +863,7 @@ impl Symbols {
         let gtk_editable_get_text = unsafe { sym::<GtkEditableGetText>(gtk, "gtk_editable_get_text") };
         let gtk_editable_set_text = unsafe { sym::<GtkEditableSetText>(gtk, "gtk_editable_set_text") };
         let gtk_editable_set_position = unsafe { sym::<GtkEditableSetPosition>(gtk, "gtk_editable_set_position") };
+        let gtk_editable_get_position = unsafe { sym::<GtkEditableGetPosition>(gtk, "gtk_editable_get_position") };
 
         // GtkWidget parent handling
         let gtk_widget_unparent = unsafe { sym::<GtkWidgetUnparent>(gtk, "gtk_widget_unparent") };
@@ -869,13 +900,15 @@ impl Symbols {
 
         // GtkWindow default size
         let gtk_window_set_default_size = unsafe { sym::<GtkWindowSetDefaultSize>(gtk, "gtk_window_set_default_size") };
+        let gtk_window_set_transient_for = unsafe { sym::<GtkWindowSetTransientFor>(gtk, "gtk_window_set_transient_for") };
+        let gtk_window_set_position = unsafe { sym::<GtkWindowSetPosition>(gtk, "gtk_window_set_position") };
 
         Ok(Symbols {
             g_main_loop_new, g_main_loop_run, g_main_loop_quit,
             g_object_ref, g_object_unref, g_object_ref_sink, g_signal_connect_data, g_signal_connect,
             gtk_window_new, gtk_window_set_title, gtk_button_new_with_label, gtk_label_new, gtk_label_set_text,
             gtk_box_new, gtk_box_append, gtk_box_pack_start, gtk_container_add, gtk_container_remove, gtk_window_set_child,
-            gtk_widget_show_all, gtk_window_present,
+            gtk_widget_show_all, gtk_widget_show, gtk_window_present,
             gtk_grid_new, gtk_grid_attach, gtk_entry_new, gtk_entry_set_text, gtk_entry_get_text,
             gtk_entry_set_width_chars, gtk_widget_set_size_request, gtk_entry_set_has_frame,
             gtk_label_set_markup, gtk_widget_set_visible, gtk_widget_grab_focus, gtk_widget_has_focus,
@@ -883,6 +916,7 @@ impl Symbols {
             gtk_css_provider_new, gtk_css_provider_load_from_data, gtk_style_context_add_provider,
             gtk_overlay_new, gtk_overlay_add_overlay, gtk_overlay_set_overlay_pass_through, gtk_overlay_set_child,
             gtk_widget_set_margin_start, gtk_widget_set_margin_top, gtk_widget_add_events,
+            gtk_fixed_new, gtk_fixed_put, gtk_fixed_move,
             gtk_widget_activate, gtk_widget_get_visible, gtk_widget_activate_action,
             gtk_init,
             g_signal_emit_by_name,
@@ -905,7 +939,7 @@ impl Symbols {
             gtk_event_controller_set_propagation_phase,
             gtk_widget_set_halign,
             gtk_widget_set_valign,
-            gtk_widget_get_allocated_width,
+            gtk_widget_get_allocated_width, gtk_widget_get_width_request,
             gtk_widget_get_allocated_height,
             gtk_widget_get_mapped,
             gtk_widget_get_display,
@@ -930,6 +964,7 @@ impl Symbols {
             gtk_widget_set_hexpand, gtk_widget_set_vexpand,
             gtk_widget_get_hexpand, gtk_widget_get_vexpand,
             gtk_editable_get_text, gtk_editable_set_text, gtk_editable_set_position,
+            gtk_editable_get_position,
             gtk_widget_unparent, gtk_widget_get_parent,
             gtk_widget_get_first_child, gtk_widget_get_next_sibling,
             gtk_popover_menu_bar_item_get_popover, gtk_popover_get_child, gtk_popover_new, gtk_popover_set_child,
@@ -940,6 +975,7 @@ impl Symbols {
             gtk_menu_button_get_popover, gtk_widget_set_can_target,
             gtk_popover_menu_new_from_model,
             gtk_window_set_default_size,
+            gtk_window_set_transient_for, gtk_window_set_position,
             gtk_drawing_area_set_draw_func, gtk_drawing_area_set_content_width, gtk_drawing_area_set_content_height,
             gtk_native_get_surface, gdk_surface_create_cairo_context, gdk_surface_get_width, gdk_surface_get_height,
             gdk_surface_begin_draw_frame, gdk_surface_end_draw_frame, gdk_draw_context_get_cairo_context,

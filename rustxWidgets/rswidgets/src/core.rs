@@ -20,6 +20,7 @@ pub mod key {
         pub const PAGE_DOWN: u32 = 0xFF56;
         pub const F1: u32 = 0xFFBE;
         pub const F2: u32 = 0xFFBF;
+        pub const F3: u32 = 0xFFC0;
         pub const ALT_L: u32 = 0xFFE9;
         pub const ALT_R: u32 = 0xFFEA;
     }
@@ -41,6 +42,7 @@ pub mod key {
         pub const PAGE_DOWN: u32 = 0x22;
         pub const F1: u32 = 0x70;
         pub const F2: u32 = 0x71;
+        pub const F3: u32 = 0x72;
         pub const ALT_L: u32 = 0x12;
         pub const ALT_R: u32 = 0x12;
     }
@@ -62,6 +64,7 @@ pub mod key {
         pub const PAGE_DOWN: u32 = 0x22;
         pub const F1: u32 = 0x70;
         pub const F2: u32 = 0x71;
+        pub const F3: u32 = 0x72;
         pub const ALT_L: u32 = 0x12;
         pub const ALT_R: u32 = 0x12;
     }

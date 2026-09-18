@@ -7040,15 +7040,7 @@ impl App {
                 }
                 Err(e) => {
                     if e.raw_os_error() == Some(libc::EXDEV) {
-                        let pid = std::process::id();
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_nanos())
-                            .unwrap_or(0);
-                        let tmp = path
-                            .parent()
-                            .unwrap_or_else(|| Path::new("."))
-                            .join(format!(".corro_save_tmp_{}_{}.corro", pid, now));
+                        let tmp = crate::io::temp_sibling_path(path.parent(), &path);
                         std::fs::copy(&cur, &tmp)
                             .map_err(|e| RunError::Io(crate::io::IoError::Io(e)))?;
                         if path.exists() {
@@ -7087,15 +7079,7 @@ impl App {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| RunError::Io(crate::io::IoError::Io(e)))?;
         }
-        let pid = std::process::id();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let tmp = path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join(format!(".corro_save_tmp_{}_{}.corro", pid, now));
+        let tmp = crate::io::temp_sibling_path(path.parent(), &path);
         #[cfg(debug_assertions)]
         {
             let msg = format!(

@@ -243,6 +243,9 @@ mod pancurses_adapter {
         pub fn add_class(&self, _class_name: &str) {}
         pub fn remove_class(&self, _class_name: &str) {}
         pub fn grab_focus(&self) {}
+        /// Terminal entries report no caret: callers keep their own.
+        pub fn get_position(&self) -> Option<usize> { None }
+        pub fn set_position(&self, _pos: usize) {}
         /// Terminal entries never take GTK-style focus: report false so
         /// callers keep today's push behavior.
         pub fn has_focus(&self) -> bool {
@@ -461,6 +464,8 @@ mod pancurses_adapter {
             crate::backends::pancurses::set_window_title(self.id, title);
         }
         pub fn set_default_size(&self, _w: i32, _h: i32) {}
+        /// Terminal dialogs have no window parenting; no-op.
+        pub fn set_transient_for(&self, _parent: *mut c_void) {}
         pub fn append_content_area(&self, child: &impl AsRef<*mut c_void>) {
             let child_ptr = *child.as_ref();
             let child_id = child_ptr as usize;
@@ -495,6 +500,10 @@ mod pancurses_adapter {
     }
 
     impl DropDown {
+        /// Terminal dropdowns take no GTK-style focus; no-op.
+        pub fn grab_focus(&self) {}
+        /// Terminal dropdowns are not pixel-positioned; no-op.
+        pub fn set_offset(&self, _x: i32, _y: i32) {}
         pub fn set_items(&self, items: &[&str]) {
             crate::backends::pancurses::set_dropdown_items(self.id, items);
         }

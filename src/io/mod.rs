@@ -458,20 +458,34 @@ pub fn write_workbook_log(
     if let Some(parent) = parent {
         fs::create_dir_all(parent)?;
     }
-    let pid = std::process::id();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let tmp = parent
-        .unwrap_or_else(|| Path::new("."))
-        .join(format!(".corro_save_tmp_{pid}_{now}.corro"));
+    let tmp = temp_sibling_path(parent, path);
     fs::write(&tmp, text.as_bytes())?;
     if path.exists() {
         fs::remove_file(path)?;
     }
     fs::rename(&tmp, path)?;
     Ok(())
+}
+
+/// Unique temp-file path beside `dest` for atomic-replace saves.
+///
+/// The suffix pairs the process id with a monotonic per-process counter, not
+/// a wall-clock timestamp: two saves in the same process within one clock
+/// tick (e.g. tests running in parallel threads) otherwise collide on the
+/// temp name, and the loser's `rename` fails with ENOENT after the winner
+/// has already renamed the file away.
+pub(crate) fn temp_sibling_path(parent: Option<&Path>, dest: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
+    let pid = std::process::id();
+    let seq = SAVE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let stem = dest
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("corro");
+    parent
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!(".{stem}.save_tmp_{pid}_{seq}"))
 }
 
 /// Load a `.corro` file written by *either* backend.
@@ -1492,6 +1506,56 @@ addr: CellAddr::Header {
         let written = fs::read_to_string(path.path()).unwrap();
         assert!(written.contains("SET A1 first"), "{written}");
         assert!(written.contains("CONTINUE_LINE second"), "{written}");
+    }
+
+    #[test]
+    fn concurrent_saves_do_not_collide_on_the_temp_name() {
+        // Regression: the temp name used to be pid + wall-clock nanos, so two
+        // saves in the same process within one clock tick picked the same
+        // path; the loser's rename then failed ENOENT after the winner had
+        // already renamed it away. Serial saves from parallel threads must
+        // all succeed and each destination must hold its own workbook.
+        use std::sync::{Arc, Barrier};
+
+        let dir = std::env::temp_dir().join(format!("corro-save-race-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        const N: usize = 16;
+        let barrier = Arc::new(Barrier::new(N));
+        let mut handles = Vec::new();
+        for i in 0..N {
+            let dir = dir.clone();
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                let mut wb = WorkbookState::new_seeded();
+                wb.active_sheet_mut()
+                    .grid
+                    .set(&CellAddr::Main { row: 0, col: 0 }, i.to_string());
+                let dest = dir.join(format!("out{i}.corro"));
+                barrier.wait();
+                write_workbook_log(&dest, &wb, &Default::default())
+                    .unwrap_or_else(|e| panic!("save {i} failed: {e}"));
+                let back = load_workbook_file(&dest).unwrap();
+                let got = back
+                    .active_sheet()
+                    .grid
+                    .get(&CellAddr::Main { row: 0, col: 0 });
+                assert_eq!(got.as_deref(), Some(i.to_string().as_str()));
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        // No temp files may be left behind.
+        let leftovers: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("save_tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files leaked: {leftovers:?}");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

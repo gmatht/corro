@@ -91,7 +91,7 @@ opt-level = 2
 - All existing `use crate::formula`, `use crate::grid`, etc. in remaining modules continue to work via re-export
 
 **Phase 3 — Profile & verify**:
-- Run `pgo_mix_benchmark --bench eval` before and after — throughput should be identical or better
+- Run `pgo-mix-benchmark --bench eval` before and after — throughput should be identical or better
 - Run `cargo test` — all existing tests pass unchanged
 - Build size comparison
 

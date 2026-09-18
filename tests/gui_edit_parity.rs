@@ -95,6 +95,18 @@ impl Drop for KillOnDrop {
     }
 }
 
+/// Window origin (root coords). Under Xvfb with no WM client coords equal
+/// root coords, so this is what `mousemove` needs.
+fn win_xy(id: &str) -> (i32, i32) {
+    let g = xdotool(&["getwindowgeometry", "--shell", id]);
+    let (mut x, mut y) = (-1, -1);
+    for l in g.lines() {
+        if let Some(v) = l.strip_prefix("X=") { x = v.trim().parse().unwrap_or(-1); }
+        if let Some(v) = l.strip_prefix("Y=") { y = v.trim().parse().unwrap_or(-1); }
+    }
+    (x, y)
+}
+
 fn spawn_gui(path: &PathBuf) -> KillOnDrop {
     let bin = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/corro");
     KillOnDrop(
@@ -393,7 +405,234 @@ fn gui_1_enter_2_enter_commits_a1_then_a2() {
     );
 }
 
-/// Type HELLO, Backspace, Enter in A1: repeated chars must all land (no
+/// F2 on A1="hello", then `!`, Return: the GUI must seed the edit with
+/// the cell content (LibreOffice parity) and commit `SET A1 hello!`.
+#[test]
+fn gui_f2_edits_cursor_cell() {
+    let _guard = GUI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    assert!(
+        std::env::var("DISPLAY").is_ok(),
+        "requires X server (run under xvfb-run -a)"
+    );
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let path = std::env::temp_dir().join(format!("corro-gui-f2-{}-{}.corro", std::process::id(), id));
+    let _ = std::fs::remove_file(&path);
+    std::fs::write(&path, "CORRO_LOG 1\nSET A1 hello\n").expect("write fixture");
+
+    let mut child = spawn_gui(&path);
+    let wid = find_corro_window(child.id(), Instant::now() + Duration::from_secs(25));
+    xdotool(&["windowactivate", "--sync", &wid]);
+    std::thread::sleep(Duration::from_millis(400));
+    xdotool(&["key", "--window", &wid, "F2"]);
+    std::thread::sleep(Duration::from_millis(400));
+    xdotool(&["type", "--window", &wid, "!"]);
+    std::thread::sleep(Duration::from_millis(400));
+    xdotool(&["key", "--window", &wid, "Return"]);
+    let lines = wait_file_pred(&path, Instant::now() + Duration::from_secs(10), "f2 commit", |ls| {
+        ls.iter().any(|l| l == "SET A1 hello!")
+    });
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let sets: Vec<&String> = lines.iter().filter(|l| l.starts_with("SET ")).collect();
+    assert_eq!(
+        sets,
+        vec!["SET A1 hello", "SET A1 hello!"],
+        "expected the seeded commit after F2, got: {lines:?}"
+    );
+}
+
+/// The reported gcorro.exe failure: **text always lands at the end of the
+/// formula no matter where the caret is**.
+///
+/// Scenario: A1 holds `=1+2`. Start an edit (F2 seeds the buffer with the
+/// cell's formula), press `Left` twice so the caret sits on the `+`, then
+/// type `9`. A caret-aware editor inserts there -> `=19+2`; the bug appends
+/// to the end -> `=1+29`.
+///
+/// Requires: Linux, an X server **with a window manager** (focus via
+/// xdotool windowactivate), xdotool. Run with:
+///   xvfb-run -a sh -c 'fluxbox & sleep 2; cargo test --features gui --test gui_edit_parity'
+#[test]
+fn gui_typing_inserts_at_formula_caret_not_end() {
+    let _guard = GUI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    assert!(
+        std::env::var("DISPLAY").is_ok(),
+        "requires X server (run under xvfb-run -a)"
+    );
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let path =
+        std::env::temp_dir().join(format!("corro-gui-caret-{}-{}.corro", std::process::id(), id));
+    let _ = std::fs::remove_file(&path);
+    std::fs::write(&path, "CORRO_LOG 1\nSET A1 =1+2\n").expect("write fixture");
+
+    let mut child = spawn_gui(&path);
+    let wid = find_corro_window(child.id(), Instant::now() + Duration::from_secs(25));
+    xdotool(&["windowactivate", "--sync", &wid]);
+    std::thread::sleep(Duration::from_millis(400));
+    // Drain present()'s event pump before sending keys: on virtual displays
+    // its blocking iterations stall the frame clock, and keys sent during
+    // the stall are never observed. Down/Up is a net-zero cursor poke that
+    // keeps events flowing (same pattern as the status-bar/formula suites),
+    // so the F2 seed lands on A1 and not a just-moved cell.
+    xdotool(&["key", "--window", &wid, "Down"]);
+    std::thread::sleep(Duration::from_millis(500));
+    xdotool(&["key", "--window", &wid, "Up"]);
+    std::thread::sleep(Duration::from_millis(500));
+
+    // The pump drain above is necessary but not always sufficient on a
+    // cold Xvfb: an early key can still be swallowed, leaving no commit.
+    // Drive the sequence and, if nothing lands, retry — bounded, so a real
+    // logic failure still fails fast. A logic failure produces a *wrong*
+    // commit (caught below), so retrying only papers over dropped input.
+    let drive = |wid: &str| {
+        xdotool(&["key", "--window", wid, "F2"]);
+        std::thread::sleep(Duration::from_millis(500));
+        xdotool(&["key", "--window", wid, "Left"]);
+        std::thread::sleep(Duration::from_millis(300));
+        xdotool(&["key", "--window", wid, "Left"]);
+        std::thread::sleep(Duration::from_millis(300));
+        xdotool(&["type", "--window", wid, "9"]);
+        std::thread::sleep(Duration::from_millis(500));
+        xdotool(&["key", "--window", wid, "Return"]);
+    };
+
+    let mut lines = Vec::new();
+    let overall = Instant::now() + Duration::from_secs(12);
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        drive(&wid);
+        // Give the commit a moment to reach the log before deciding.
+        let settle = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < settle {
+            lines = std::fs::read_to_string(&path)
+                .map(|c| c.lines().map(str::to_string).collect())
+                .unwrap_or_default();
+            if lines.iter().any(|l| l.starts_with("SET ") && !l.ends_with("=1+2")) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let committed = lines
+            .iter()
+            .any(|l| l.starts_with("SET ") && !l.ends_with("=1+2"));
+        if committed || Instant::now() > overall || attempts >= 3 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+
+    // The committed op must be A1 = the caret-inserted formula.
+    assert!(
+        lines.iter().any(|l| l == "SET A1 =19+2"),
+        "typing must insert at the caret, not append to the end \
+         (buggy gcorro.exe committed `SET A1 =1+29`, or misrouted the commit \
+         because Left moved the cell cursor); log: {lines:?}"
+    );
+    // And nothing may have gone to another cell (the pre-fix Left/RIGHT
+    // committed and walked the cell cursor out of A1).
+    let sets: Vec<&String> = lines.iter().filter(|l| l.starts_with("SET ")).collect();
+    assert_eq!(
+        sets,
+        vec!["SET A1 =1+2", "SET A1 =19+2"],
+        "expected only the seed and the caret-insert commit, got: {lines:?}"
+    );
+}
+
+/// The reported gcorro.exe failure, driven the way a user hits it: **click
+/// into the formula bar, then type — the text must land at the clicked
+/// caret, and the formula must survive.**
+///
+/// Before the fix the typed char always landed at the *end* of the formula
+/// (and a click could wipe it entirely): the app owned `edit_buf` but never
+/// read the widget's real caret, and `set_text` reset that caret to the end
+/// on every sync.
+///
+/// Fixture A1 `=123456789`; click near the left of the formula text; type
+/// `9`; Return must commit `=123456789` with the `9` inserted at the caret
+/// (i.e. *not* appended as `=1234567899`).
+///
+/// Requires: Linux, an X server **with a window manager**, xdotool. Run with:
+///   xvfb-run -a sh -c 'fluxbox & sleep 2; cargo test --features gui --test gui_edit_parity'
+#[test]
+fn gui_formula_click_then_type_inserts_at_caret_not_end() {
+    let _guard = GUI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    assert!(
+        std::env::var("DISPLAY").is_ok(),
+        "requires X server (run under xvfb-run -a)"
+    );
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let path =
+        std::env::temp_dir().join(format!("corro-gui-clickcaret-{}-{}.corro", std::process::id(), id));
+    let _ = std::fs::remove_file(&path);
+    std::fs::write(&path, "CORRO_LOG 1\nSET A1 =123456789\n").expect("write fixture");
+
+    let mut child = spawn_gui(&path);
+    let wid = find_corro_window(child.id(), Instant::now() + Duration::from_secs(25));
+    xdotool(&["windowactivate", "--sync", &wid]);
+    std::thread::sleep(Duration::from_millis(400));
+    // Drain the present() pump before interacting (see the caret test above).
+    xdotool(&["key", "--window", &wid, "Down"]);
+    std::thread::sleep(Duration::from_millis(500));
+    xdotool(&["key", "--window", &wid, "Up"]);
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Click into the formula entry, just past the `fx` label so the caret
+    // lands early in the text (`=123456789`), then type.
+    let geo = xdotool(&["getwindowgeometry", "--shell", &wid]);
+    let (mut wx, mut wy) = (-1, -1);
+    for l in geo.lines() {
+        if let Some(v) = l.strip_prefix("X=") { wx = v.trim().parse().unwrap_or(-1); }
+        if let Some(v) = l.strip_prefix("Y=") { wy = v.trim().parse().unwrap_or(-1); }
+    }
+    assert!(wx >= 0 && wy >= 0, "no window position for {wid}");
+    // The formula row sits just below the menu bar; y + 45 is the entry line
+    // (measured on this layout), x + 300 is inside the entry, past the label.
+    xdotool(&[
+        "mousemove",
+        &format!("{}", wx + 300),
+        &format!("{}", wy + 45),
+        "click",
+        "1",
+    ]);
+    std::thread::sleep(Duration::from_millis(600));
+    xdotool(&["type", "--window", &wid, "9"]);
+    std::thread::sleep(Duration::from_millis(500));
+    xdotool(&["key", "--window", &wid, "Return"]);
+
+    // The commit is the *second* SET A1 (the fixture write is the first).
+    let lines = wait_file_pred(
+        &path,
+        Instant::now() + Duration::from_secs(10),
+        "click-then-type commit",
+        |ls| ls.iter().filter(|l| l.starts_with("SET A1 ")).count() >= 2,
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let committed = lines
+        .iter()
+        .filter(|l| l.starts_with("SET A1 "))
+        .next_back()
+        .cloned()
+        .unwrap_or_default();
+    // The reported bug: the char always landed at the end -> `=1234567899`.
+    assert_ne!(
+        committed, "SET A1 =1234567899",
+        "typed text appended to the END of the formula (the reported bug); log: {lines:?}"
+    );
+    // Correct: the char inserted at the clicked caret and the formula
+    // survived. With the click near the start of the text the caret sits
+    // before the `=`/digits, so expect the `9` at the front.
+    assert_eq!(
+        committed, "SET A1 9=123456789",
+        "typed text must insert at the clicked caret, not replace or append; log: {lines:?}"
+    );
+}
+
 /// press/release-dedup drops) and Backspace must pop exactly once.
 /// Regression: the GUI backend lost the second L and double-popped,
 /// committing "HLO" instead of "HELL".
@@ -988,19 +1227,22 @@ fn gui_cut_paste_roundtrip_via_menu() {
     // Move back up to A1 (Enter advanced to A2); Cut/Paste target A1.
     xdotool(&["key", "--window", &wid, "Up"]);
     std::thread::sleep(Duration::from_millis(300));
-    // Edit menu (Alt+E), Cut is row 1 of 7. Cut has no keyboard mnemonic
+    // Edit menu (Alt+E), Cut is row 1 of 11. Cut has no keyboard mnemonic
     // (its documented shortcut X appears nowhere in "Cut"), so activate by
-    // click like the menu-key tests: clears A1.
+    // click like the menu-key tests: clears A1. The divisor must be the real
+    // Edit-menu item count (see menu::menu_bar) or the click lands on the
+    // wrong row.
+    const EDIT_MENU_ITEMS: f64 = 11.0;
     xdotool(&["key", "--window", &wid, "alt+e"]);
     std::thread::sleep(Duration::from_millis(500));
-    click_popup_fraction(child.id(), &wid, 0.5 / 7.0);
+    click_popup_fraction(child.id(), &wid, 0.5 / EDIT_MENU_ITEMS);
     wait_file_pred(&path, Instant::now() + Duration::from_secs(10), "cut clear", |ls| {
         ls.iter().any(|l| l.starts_with("SET A1") && l != "SET A1 A")
     });
-    // Edit menu, Paste is row 3 of 7: restores "A" from the menu clipboard.
+    // Edit menu, Paste is row 3 of 11: restores "A" from the menu clipboard.
     xdotool(&["key", "--window", &wid, "alt+e"]);
     std::thread::sleep(Duration::from_millis(500));
-    click_popup_fraction(child.id(), &wid, 2.5 / 7.0);
+    click_popup_fraction(child.id(), &wid, 2.5 / EDIT_MENU_ITEMS);
     let lines = wait_file_pred(&path, Instant::now() + Duration::from_secs(10), "paste restore", |ls| {
         ls.iter().filter(|l| *l == "SET A1 A").count() >= 2
     });

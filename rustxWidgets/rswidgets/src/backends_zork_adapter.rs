@@ -225,6 +225,10 @@ impl Entry {
     pub fn remove_class(&self, _class_name: &str) {}
     pub fn grab_focus(&self) {}
 
+    /// Zork entries report no caret: callers keep their own.
+    pub fn get_position(&self) -> Option<usize> { None }
+    pub fn set_position(&self, _pos: usize) {}
+
     /// No focus query on zork entries: report false (unchanged behavior).
     pub fn has_focus(&self) -> bool {
         false

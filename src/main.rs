@@ -108,13 +108,13 @@ fn argv0_ui(program: &str) -> Option<UiKind> {
         .strip_suffix(".exe")
         .or_else(|| base.strip_suffix(".EXE"))
         .unwrap_or(base);
-    let lower = base.to_ascii_lowercase();
+    let _lower = base.to_ascii_lowercase();
     #[cfg(feature = "pancurses")]
-    if lower.starts_with("pcorro") {
+    if _lower.starts_with("pcorro") {
         return Some(UiKind::Pancurses);
     }
     #[cfg(feature = "gui")]
-    if lower.starts_with("gcorro") {
+    if _lower.starts_with("gcorro") {
         return Some(UiKind::Gui);
     }
     None

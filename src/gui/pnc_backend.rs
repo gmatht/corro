@@ -591,6 +591,17 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
             MenuDispatch::Prompt(label, action) => {
                 rswidgets::backends::pancurses::set_prompt(label, action);
             }
+            MenuDispatch::AggregatePicker => {
+                // Margin aggregate picker: shared selection state (already
+                // opened with a resolved target by the shared action), the
+                // toolkit list popup for display, and the key hook below for
+                // arrows/digits/Enter/Esc. Committing writes the directive
+                // to the target margin key through the cell-op path.
+                let rows = super::agg_picker::items();
+                let sel = super::agg_picker::index(app).unwrap_or(0);
+                rswidgets::backends::pancurses::show_list_picker(" Aggregate ", &rows, sel);
+                rswidgets::backends::pancurses::request_redraw();
+            }
             MenuDispatch::SpecialPicker => {
                 // 10-choice picker (ratatui parity): shared selection state,
                 // toolkit list popup for display, key hook below for arrows
@@ -640,7 +651,51 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     rswidgets::backends::pancurses::set_key_input_hook(Some(Box::new(move |key: &Option<rswidgets::backends::pancurses::KeyInput>| {
         let app = app_from_raw(app_ptr);
         use rswidgets::backends::pancurses::KeyInput;
-        if app.special_picker.is_some() {
+        if app.agg_picker.is_some() {
+            let step_agg = |app: &mut super::App, delta: i32| {
+                super::agg_picker::step(app, delta);
+                let idx = super::agg_picker::index(app).unwrap_or(0);
+                rswidgets::backends::pancurses::set_list_picker_selection(idx);
+                rswidgets::backends::pancurses::request_redraw();
+            };
+            let commit_agg = |app: &mut super::App| {
+                if let Some((addr, directive)) = super::agg_picker::take(app) {
+                    // Same op path as typing the directive: commits to the
+                    // live log and undoes identically.
+                    super::actions::commit_cell(app, addr, directive);
+                }
+                rswidgets::backends::pancurses::close_list_picker();
+                rswidgets::backends::pancurses::request_redraw();
+            };
+            match key {
+                Some(KeyInput::ArrowDown) | Some(KeyInput::ArrowRight) => {
+                    step_agg(app, 1);
+                    true
+                }
+                Some(KeyInput::ArrowUp) | Some(KeyInput::ArrowLeft) => {
+                    step_agg(app, -1);
+                    true
+                }
+                Some(KeyInput::Enter) => {
+                    commit_agg(app);
+                    true
+                }
+                Some(KeyInput::Escape) => {
+                    super::agg_picker::close(app);
+                    rswidgets::backends::pancurses::close_list_picker();
+                    rswidgets::backends::pancurses::request_redraw();
+                    true
+                }
+                Some(KeyInput::Char(c)) if c.is_ascii_digit() => {
+                    if let Some(idx) = super::agg_picker::index_for_digit(*c) {
+                        super::agg_picker::set(app, idx);
+                        commit_agg(app);
+                    }
+                    true
+                }
+                _ => false,
+            }
+        } else if app.special_picker.is_some() {
             let step_sel = |app: &mut super::App, delta: i32| {
                 super::special_picker::step(app, delta);
                 let idx = super::special_picker::index(app).unwrap_or(0);
@@ -703,7 +758,53 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
             _ => false,
         }
         } else {
-            false
+            // Normal mode: F2 starts editing the cursor cell (LibreOffice
+            // parity — ratatui's start_edit_current_cell, the GUI's
+            // start_edit). Snapshot the display text with the caret at the
+            // end; the user commits with Enter. While already editing the
+            // key falls through to the widget untouched.
+            match key {
+                Some(KeyInput::F2) => {
+                    let (editing, _, _) = extrap_ss.edit_state();
+                    if !editing {
+                        let grid = &app.core.workbook.active_sheet().grid;
+                        let value =
+                            crate::agg::cell_display(grid, &app.core.cursor.to_addr(grid));
+                        extrap_ss.set_editing(true, &value, value.len());
+                        rswidgets::backends::pancurses::request_redraw();
+                        true
+                    } else {
+                        false
+                    }
+                }
+                Some(KeyInput::F3) => {
+                    // Margin aggregate picker (GUI/TUI parity). Resolves a
+                    // key from *any* cursor position: on a key cell it
+                    // targets that cell, on a data cell the margin key
+                    // governing it, so the picker is reachable without
+                    // hunting for the key cell.
+                    let (editing, _, _) = extrap_ss.edit_state();
+                    if editing {
+                        return false;
+                    }
+                    let cursor = app.core.cursor;
+                    if super::agg_picker::open_for_cursor(app, &cursor) {
+                        let rows = super::agg_picker::items();
+                        let sel = super::agg_picker::index(app).unwrap_or(0);
+                        rswidgets::backends::pancurses::show_list_picker(
+                            " Aggregate ", &rows, sel,
+                        );
+                        rswidgets::backends::pancurses::request_redraw();
+                        true
+                    } else {
+                        app.core.status =
+                            "Aggregate: no margin TOTAL/MAX/… key for this cell".into();
+                        rswidgets::backends::pancurses::request_redraw();
+                        true
+                    }
+                }
+                _ => false,
+            }
         }
     })));
 

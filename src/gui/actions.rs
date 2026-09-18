@@ -235,6 +235,11 @@ pub enum MenuDispatch {
     /// shared [`super::special_picker`] state (same items, order, arrows,
     /// digits, Enter, Esc as the ratatui reference).
     SpecialPicker,
+    /// Backend should open the Insert > Aggregate picker over shared
+    /// [`super::agg_picker`] state (TOTAL/MAX/MIN/AVERAGE/COUNT/MEDIAN).
+    /// Unlike `SpecialPicker` this one edits a margin key cell, so the
+    /// backend writes the chosen directive through the cell-op path.
+    AggregatePicker,
     /// Backend should enter edit mode on the cursor cell with `value` as the
     /// in-progress buffer (matching ratatui's start_edit_mode actions such as
     /// Insert Date / Insert Time).
@@ -305,6 +310,20 @@ pub fn dispatch_menu_action(
             // its 10-choice dialog/popup over shared picker state.
             super::special_picker::open(app);
             MenuDispatch::SpecialPicker
+        }
+        "insert_aggregate" => {
+            // Margin aggregate picker. Unlike Special Char this one needs a
+            // target cell, so open on the key governing the cursor and let
+            // the backend render it; if there is no such key the backend
+            // reports why instead of showing an empty popup.
+            let cursor = app.core.cursor;
+            if super::agg_picker::open_for_cursor(app, &cursor) {
+                MenuDispatch::AggregatePicker
+            } else {
+                MenuDispatch::Status(
+                    "Aggregate: put the cursor on a margin TOTAL/MAX/… key".into(),
+                )
+            }
         }
         "insert_mitosis_row" => {
             // Mitosis COPIES the cursor's main row into a new row below it

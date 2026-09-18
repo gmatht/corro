@@ -3,7 +3,7 @@
 // Platform-specific type re-exports using cfg
 macro_rules! platform_module {
     ($backend:path, $Orientation:ident) => {
-        pub use $backend::{Window, BoxWidget, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, DropDown, CheckButton, RadioButton, TextView, ScrolledWindow, Orientation as $Orientation};
+        pub use $backend::{Window, BoxWidget, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, DropDown, CheckButton, RadioButton, TextView, ScrolledWindow, Overlay, Orientation as $Orientation};
         pub type PlatformWindow = Window;
         pub type PlatformWidgetBox = BoxWidget;
         pub type PlatformLabel = Label;
@@ -16,6 +16,7 @@ macro_rules! platform_module {
         pub type PlatformScrolledWindow = ScrolledWindow;
         #[allow(dead_code)] // not referenced by common_types_mod! on every backend
         pub type PlatformDropDown = DropDown;
+        pub type PlatformOverlay = Overlay;
         #[allow(dead_code)]
         pub type PlatformCheckButton = CheckButton;
         #[allow(dead_code)]
@@ -116,6 +117,13 @@ macro_rules! common_types_mod {
         impl Entry {
             pub fn set_text(&self, text: &str) { self.inner.set_text(text); }
             pub fn get_text(&self) -> Option<String> { self.inner.get_text() }
+            /// Caret position as a character index, or `None` when the
+            /// backend cannot report one (callers then keep the caret they
+            /// track themselves).
+            pub fn get_position(&self) -> Option<usize> { self.inner.get_position() }
+            /// Move the caret (character index). Backends without caret
+            /// support ignore this.
+            pub fn set_position(&self, pos: usize) { self.inner.set_position(pos); }
             pub fn grab_focus(&self) { self.inner.grab_focus(); }
             pub fn set_hexpand(&self, expand: bool) { self.inner.set_hexpand(expand); }
             pub fn set_vexpand(&self, expand: bool) { self.inner.set_vexpand(expand); }
@@ -220,6 +228,10 @@ macro_rules! common_types_mod {
         impl Dialog {
             pub fn set_title(&self, title: &str) { self.inner.set_title(title); }
             pub fn set_default_size(&self, w: i32, h: i32) { self.inner.set_default_size(w, h); }
+            /// Parent this dialog to `parent` so the WM places it as a child
+            /// (centred on it) instead of an unparented window. No-op on
+            /// backends without window parenting.
+            pub fn set_transient_for(&self, parent: *mut std::os::raw::c_void) { self.inner.set_transient_for(parent); }
             pub fn append_content_area(&self, child: &impl AsRef<*mut std::os::raw::c_void>) { self.inner.append_content_area(child); }
             pub fn add_button(&self, text: &str, response_id: i32) { self.inner.add_button(text, response_id); }
             pub fn present(&self) { self.inner.present(); }

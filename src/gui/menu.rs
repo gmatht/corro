@@ -45,6 +45,9 @@ pub enum MenuActionKind {
     InsertMitosisCol,
     InsertCols,
     InsertSpecialChars,
+    /// Margin aggregate picker (TOTAL/MAX/MIN/AVERAGE/COUNT/MEDIAN). Lives in
+    /// the Insert menu beside Special Char: both are "choose a value" pickers.
+    InsertAggregate,
     InsertDate,
     InsertTime,
     InsertHyperlink,
@@ -130,6 +133,7 @@ pub fn action_kind_to_name(kind: MenuActionKind) -> &'static str {
         MenuActionKind::InsertMitosisCol => "insert_mitosis_col",
         MenuActionKind::InsertCols => "insert_cols",
         MenuActionKind::InsertSpecialChars => "insert_special_chars",
+        MenuActionKind::InsertAggregate => "insert_aggregate",
         MenuActionKind::InsertDate => "insert_date",
         MenuActionKind::InsertTime => "insert_time",
         MenuActionKind::InsertHyperlink => "insert_hyperlink",
@@ -348,6 +352,7 @@ pub fn menu_bar() -> Vec<MenuAction> {
         "Mitosis (Col)" => InsertMitosisCol ("O"),
         "Cols"          => InsertCols ("C"),
         "Special Char"  => InsertSpecialChars ("S"),
+        "Aggregate"     => InsertAggregate ("G"),
         "Date"          => InsertDate (";"),
         "Time"          => InsertTime (":"),
         "Hyperlink"     => InsertHyperlink ("H"),

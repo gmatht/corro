@@ -249,6 +249,16 @@ impl Number {
         match self {
             Number::Exact(r) => {
                 if prefer_scientific_exact(r) {
+                    // The exact fraction is unreadable (extreme magnitude, or a
+                    // terminating decimal needing ~100 places like `2 + 10^-99`).
+                    // Prefer the approximate value, which is human-scale when the
+                    // value is (`2`) and scientifically notated when not
+                    // (`1.000000000e-99`) — but only when the f64 keeps the
+                    // magnitude; values below f64's subnormal range (e.g.
+                    // `10^-999`) underflow to 0 and must stay exact-scientific.
+                    if let Some(f) = r.to_f64().filter(|v| v.is_finite() && *v != 0.0) {
+                        return format_approx(f);
+                    }
                     if let Some(s) = exact_decimal_generic_scientific(&Number::Exact(r.clone())) {
                         return s;
                     }
@@ -274,6 +284,14 @@ fn prefer_scientific_f64_abs(abs: f64) -> bool {
 fn prefer_scientific_exact(r: &BigRational) -> bool {
     if r.is_zero() {
         return false;
+    }
+    // A terminating decimal that needs more than a few places to write out
+    // exactly (e.g. `2 + 10^-99`, whose exact form is a 100-digit fraction)
+    // is far clearer in scientific notation than as its raw numerator and
+    // denominator. Non-terminating values like `1/3` have no exact decimal
+    // at all and stay as canonical fractions.
+    if is_denominator_powers_of_2_and_5(r.denom()) && decimal_string_fixed(r, 20).is_none() {
+        return true;
     }
     let Some(f) = r.to_f64().filter(|v| v.is_finite()) else {
         return true;
@@ -776,6 +794,50 @@ mod tests {
             }
             other => panic!("expected complex, got {other:?}"),
         }
+    }
+
+    /// A terminating decimal that needs ~100 places to write out exactly
+    /// (`2 + 10^-99`, the row total of `2` and `=10^-99`) must not display as
+    /// its raw 100-digit numerator/denominator: it renders as the human-scale
+    /// approximate value `2`.
+    #[test]
+    fn exact_terminating_decimal_too_long_renders_approx_not_rational() {
+        use num_bigint::BigInt;
+        let r = BigRational::new(
+            BigInt::parse_bytes(
+                b"2000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001",
+                10,
+            )
+            .unwrap(),
+            BigInt::parse_bytes(
+                b"1000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+                10,
+            )
+            .unwrap(),
+        );
+        let shown = Number::Exact(r.clone()).format_eval_display(crate::formula::format_significant_10);
+        assert_eq!(shown, "2", "terminating-but-huge decimal must not print as a fraction");
+        assert!(!shown.contains('/'), "{shown}");
+        // The exact value is preserved internally (only the *display* changed).
+        assert_eq!(r.to_f64(), Some(2.0));
+    }
+
+    /// Extreme exact magnitudes still use scientific notation (not the f64
+    /// `0` underflow, not the raw fraction).
+    #[test]
+    fn exact_extreme_magnitude_renders_scientific() {
+        let tiny = Number::Exact(BigRational::new(BigInt::one(), BigInt::from(10u32).pow(999)));
+        let shown = tiny.format_eval_display(crate::formula::format_significant_10);
+        assert!(shown.contains("e-999"), "{shown}");
+        assert!(!shown.contains('/'), "{shown}");
+    }
+
+    /// A non-terminating exact rational (`1/3`) has no exact decimal and must
+    /// stay a canonical fraction.
+    #[test]
+    fn non_terminating_exact_rational_stays_fraction() {
+        let third = Number::Exact(BigRational::new(BigInt::one(), BigInt::from(3u8)));
+        assert_eq!(third.format_eval_display(crate::formula::format_significant_10), "1/3");
     }
 
     #[test]

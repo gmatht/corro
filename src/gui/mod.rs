@@ -8,6 +8,7 @@ use crate::ops::WorkbookState;
 use std::path::PathBuf;
 
 pub mod actions;
+pub mod agg_picker;
 pub mod clipboard;
 pub mod viewport;
 pub mod compute;
@@ -44,6 +45,14 @@ pub struct App {
     /// [`special_picker::items`] and drive it via that module's
     /// open/step/set/close/take functions.
     pub special_picker: Option<usize>,
+    /// Margin aggregate picker selection (shared by all GUI backends):
+    /// `Some(idx)` while the picker is open on [`Self::agg_picker_target`].
+    /// Backends render [`agg_picker::items`] and drive it via that module's
+    /// open/step/set/close/take functions. Opened by clicking a margin
+    /// aggregate key (e.g. the seeded `TOTAL`).
+    pub agg_picker: Option<usize>,
+    /// Cell the aggregate picker edits; committed directive is written here.
+    pub agg_picker_target: Option<crate::grid::CellAddr>,
 }
 
 impl App {
@@ -105,6 +114,8 @@ impl App {
             backend: None,
             extrapolate: None,
             special_picker: None,
+            agg_picker: None,
+            agg_picker_target: None,
         }
     }
 
