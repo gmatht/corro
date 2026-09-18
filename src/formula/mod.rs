@@ -2985,9 +2985,37 @@ fn ast_references_all_empty(ast: &Ast, grid: &Grid, saw_ref: &mut bool) -> bool 
 }
 
 fn cell_reference_is_empty(grid: &Grid, addr: &CellAddr) -> bool {
-    grid.get(addr)
+    // A cell is "empty" for the blank-zero-template rule when it stores no
+    // text, has no spill value, and — if it is itself a margin/header template
+    // — is itself hidden as blank. Template cells have no stored text yet can
+    // visibly hold a number; ignoring that made a template like `=A*B` blank
+    // its zero result even though A and B visibly held values, while still
+    // needing genuinely empty template chains to stay blank.
+    if grid
+        .get(addr)
         .as_deref()
-        .map_or(true, |value| value.trim().is_empty())
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return false;
+    }
+    if grid.spill_followers().into_iter().any(|(a, _)| &a == addr) {
+        return false;
+    }
+    if let Some(formula) = templated_formula(grid, addr) {
+        // Hidden blank iff the template evaluates to a blank-ish zero AND its
+        // own referenced cells are themselves all effectively empty.
+        if !formula_references_all_empty(grid, &formula) {
+            return false;
+        }
+        let mut visiting = Vec::new();
+        let mut budget = DEFAULT_BUDGET;
+        return match eval_cell(grid, addr, &mut visiting, &mut budget) {
+            EvalResult::Number(n) => n.is_zeroish(),
+            EvalResult::Text(s) => s.trim().is_empty(),
+            _ => false,
+        };
+    }
+    true
 }
 
 /// Display string for a cell: evaluated formula result, or raw text.
@@ -3066,7 +3094,21 @@ fn format_significant_10(n: f64) -> String {
             s
         }
     } else {
-        format!("{n:.9e}")
+        // Scientific notation for extreme magnitudes. `{:.9e}` pads the
+        // mantissa to 9 places, so trim the trailing zeros: `1.000000000e-99`
+        // reads far better as `1e-99`.
+        let s = format!("{n:.9e}");
+        match s.split_once('e') {
+            Some((mantissa, exp)) => {
+                let mantissa = if mantissa.contains('.') {
+                    mantissa.trim_end_matches('0').trim_end_matches('.')
+                } else {
+                    mantissa
+                };
+                format!("{mantissa}e{exp}")
+            }
+            None => s,
+        }
     }
 }
 
@@ -3423,6 +3465,19 @@ mod tests {
     fn numeric_display_trims_fractional_trailing_zeroes() {
         assert_eq!(format_significant_10(0.4040000), "0.404");
         assert_eq!(format_significant_10(100.0), "100");
+    }
+
+    /// Extreme magnitudes use scientific notation with a trimmed mantissa:
+    /// `1e-99`, not the padded `1.000000000e-99`.
+    #[test]
+    fn numeric_display_trims_scientific_mantissa_zeroes() {
+        assert_eq!(format_significant_10(1e-99), "1e-99");
+        assert_eq!(format_significant_10(1.5e-99), "1.5e-99");
+        assert_eq!(format_significant_10(-1.5e-99), "-1.5e-99");
+        assert_eq!(format_significant_10(1e100), "1e100");
+        // Non-integer mantissas keep exactly the digits needed.
+        assert!(!format_significant_10(1e-99).contains('.'));
+        assert!(format_significant_10(1.25e-99).contains('.'));
     }
 
     #[test]
@@ -4721,6 +4776,44 @@ mod tests {
         assert_eq!(
             cell_effective_display(&g, &CellAddr::Main { row: 1, col: 1 }),
             "0"
+        );
+    }
+
+    #[test]
+    fn header_template_zero_from_template_references_displays_zero() {
+        // Regression: `=A*B` in a header template blanks its zero result only
+        // when the referenced cells are *effectively* empty. A and B here are
+        // themselves template-provided (no stored text), yet they visibly hold
+        // numbers, so the product 0 must render as "0", not "".
+        let mut g = crate::grid::GridBox::from(crate::grid::Grid::new(4, 5));
+        let hdr = |col: usize, g: &crate::grid::GridBox| CellAddr::Header {
+            row: (HEADER_ROWS - 1) as u32,
+            col: ColumnAddr::from_global(MARGIN_COLS + col, g.main_cols()),
+        };
+        // A = E, B = D, C = A*B (all header templates).
+        g.set(&hdr(0, &g), "=E -- ACOPY".into());
+        g.set(&hdr(1, &g), "=D -- BCOPY".into());
+        g.set(&hdr(2, &g), "=A*B -- AB".into());
+        g.set(&CellAddr::Main { row: 0, col: 3 }, "5".into()); // D1
+        g.set(&CellAddr::Main { row: 0, col: 4 }, "0".into()); // E1 -> A1 = 0
+
+        assert_eq!(
+            cell_effective_display(&g, &CellAddr::Main { row: 0, col: 0 }),
+            "0"
+        );
+        assert_eq!(
+            cell_effective_display(&g, &CellAddr::Main { row: 0, col: 1 }),
+            "5"
+        );
+        assert_eq!(
+            cell_effective_display(&g, &CellAddr::Main { row: 0, col: 2 }),
+            "0"
+        );
+
+        // Truly empty references still keep the zero hidden.
+        assert_eq!(
+            cell_effective_display(&g, &CellAddr::Main { row: 1, col: 2 }),
+            ""
         );
     }
 
