@@ -242,44 +242,6 @@ jobs:
         with:
           files: corro-no-gui.gz
 
-  # ── Linux x86_64 GUI (GTK backend): release (no PGO) ──────────────────
-  # gcorro.gz is the --features gtk build, renamed so argv[0] dispatch
-  # selects the GUI. GTK itself is never linked (runtime dlopen via
-  # gtk_dynamic_loader), so no system GTK dev packages are needed to build.
-  build-linux-gcorro:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Install zig
-        run: |
-          ZIG_VERSION=0.15.1
-          curl -sL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz
-          tar -xf /tmp/zig.tar.xz -C /tmp
-          echo "/tmp/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
-
-      - name: Build (zig-linked for glibc 2.17; GTK stays runtime-dlopen)
-        run: |
-          export ZIG=zig
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$PWD/tools/zig-cc-gnu217" \
-            cargo build --release --features gtk
-          # same floor guarantee as corro-no-gui.gz, same check
-          tools/check-glibc-floor.sh target/release/corro 2.17
-
-      - name: Strip and compress
-        run: |
-          strip target/release/corro
-          cp target/release/corro gcorro
-          7z a -mx=9 -tgzip gcorro.gz gcorro
-          rm -f gcorro
-
-      - name: Upload release asset
-        uses: softprops/action-gh-release@v2
-        with:
-          files: gcorro.gz
-
   # ── Windows x86_64: release (no PGO) ─────────────────────────────────
   #
   # Built with the GUI feature so Explorer double-clicks have a window to

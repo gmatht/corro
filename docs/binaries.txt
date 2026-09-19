@@ -6,7 +6,6 @@ Published by .github/workflows/pgo-release.yml on a `v*` tag push.
 |-------------------|------------------|----------|-----|-------------|
 | corro.gz          | Linux x86_64     | release  | yes | runner      |
 | corro-no-gui.gz   | Linux x86_64     | release  | no  | 2.17        |
-| gcorro.gz         | Linux x86_64     | release  | no  | 2.17        |
 | corro-tiny.gz     | Linux x86_64     | tiny     | no  | runner      |
 | corro-arm.gz      | Linux armv7hf    | release  | no  | n/a         |
 | corro-aarch64.gz  | Linux aarch64    | release  | yes | n/a         |
@@ -15,13 +14,14 @@ Published by .github/workflows/pgo-release.yml on a `v*` tag push.
 | corro-osx.gz      | macOS aarch64    | release  | yes | n/a         |
 
 Notes
-- corro-no-gui.gz is the default-feature terminal build; gcorro.gz adds the
-  GTK GUI backend (GTK itself is runtime-dlopen, never linked), and
-  corro.gz is the PGO-tuned terminal build.
-- corro-no-gui.gz and gcorro.gz are linked through tools/zig-cc-gnu217 so
-  the same assets run on old distros incl. CentOS 7 (glibc 2.17). Both CI
-  jobs verify this with tools/check-glibc-floor.sh. The other Linux assets
-  are linked against the runner's glibc and are not covered by that
+- corro-no-gui.gz is the default-feature terminal build; corro.gz is the
+  PGO-tuned terminal build. (The GTK GUI build, gcorro.gz, was dropped:
+  the GUI must be compiled in and no shipped flow needs a separate
+  GUI-only asset.)
+- corro-no-gui.gz is linked through tools/zig-cc-gnu217 so the same asset
+  runs on old distros incl. CentOS 7 (glibc 2.17). Its CI job verifies
+  this with tools/check-glibc-floor.sh. The other Linux assets are
+  linked against the runner's glibc and are not covered by that
   guarantee.
 - corro.exe.zip / corro-x86.exe.zip are built with the GUI feature so a
   double-click opens the nwg window; the binaries stay console-subsystem on
