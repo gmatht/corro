@@ -14,12 +14,6 @@ gtk_dynamic_loader = { path = "../gtk_dynamic_loader", optional = true }
 ratatui = { version = "0.29", optional = true }
 crossterm = { version = "0.28", optional = true }
 unicode-width = "0.2"
-gtk4 = { path = "/root/tmp/gtk4-rs/gtk4", package = "gtk4", optional = true, features = ["v4_14"] }
-glib-sys = { path = "/root/tmp/gtk4-rs/generated/glib-sys-dlopen", optional = true }
-gio-sys = { path = "/root/tmp/gtk4-rs/generated/gio-sys-dlopen", optional = true }
-gtk4-sys = { path = "/root/tmp/gtk4-rs/generated/gtk4-sys-dlopen", optional = true }
-gdk4-sys = { path = "/root/tmp/gtk4-rs/generated/gdk4-sys-dlopen", optional = true }
-cairo-sys-rs = { path = "/root/tmp/gtk4-rs/generated/cairo-sys-rs-dlopen", optional = true }
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
@@ -58,17 +52,11 @@ pancurses = { version = "0.17", optional = true }
 pdcurses-sys = { path = "../../vendor/pdcurses-sys", optional = true }
 
 [target.'cfg(unix)'.dependencies]
-gtk4 = { path = "/root/tmp/gtk4-rs/gtk4", package = "gtk4", optional = true, features = ["v4_14"] }
-# TRUE gtk3-rs / gtk4-rs backends for DEBUGGING: the official crates, statically
-# linked (no unsafe dlopen).  These are the safe reference implementations used
-# to debug the production gtk_dynamic_loader backend.
+# TRUE gtk3-rs backend for DEBUGGING: the official crate, statically
+# linked (no unsafe dlopen). This is the safe reference implementation
+# used to debug the production gtk_dynamic_loader backend.
 gtk3 = { package = "gtk", version = "0.18", optional = true }
 gtk4-static = { package = "gtk4", version = "0.9", optional = true }
-glib-sys = { path = "/root/tmp/gtk4-rs/generated/glib-sys-dlopen", optional = true }
-gio-sys = { path = "/root/tmp/gtk4-rs/generated/gio-sys-dlopen", optional = true }
-gtk4-sys = { path = "/root/tmp/gtk4-rs/generated/gtk4-sys-dlopen", optional = true }
-gdk4-sys = { path = "/root/tmp/gtk4-rs/generated/gdk4-sys-dlopen", optional = true }
-cairo-sys-rs = { path = "/root/tmp/gtk4-rs/generated/cairo-sys-rs-dlopen", optional = true }
 libc = "0.2"
 
 [features]
@@ -76,9 +64,10 @@ default = ["gtk"]
 gtk = ["dep:gtk_dynamic_loader"]
 pancurses = ["dep:pancurses", "dep:pdcurses-sys"]
 zork = ["dep:rustyline", "dep:serde", "dep:serde_json"]
-gtk4-rs = ["dep:gtk4", "dep:glib-sys", "dep:gio-sys", "dep:gtk4-sys", "dep:gdk4-sys", "dep:cairo-sys-rs", "dep:gtk_dynamic_loader"]
 # TRUE official-crate backends (statically linked, safe) for debugging the
-# dlopen-based production backends.  Not the default.
+# dlopen-based production backends. Not the default. The local-path gtk4-rs
+# dlopen stack was removed: it pointed at an unshipped /root/tmp checkout
+# and broke every CI build (cargo metadata resolves all optional path deps).
 gtk3-rs = ["dep:gtk3"]
 gtk4-rs-static = ["dep:gtk4-static"]
 ratatui = ["dep:ratatui", "dep:crossterm"]
