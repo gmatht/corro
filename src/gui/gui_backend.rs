@@ -3366,8 +3366,6 @@ unsafe fn probe95(hwnd: *mut std::os::raw::c_void, tag: [u8; 5]) {
 }
 
 pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Error>> {
-    #[cfg(target_os = "android")]
-    super::android_backend::logcat("run_gui: enter");
     rswidgets::core::install_debug_crash_handlers();
     // TEMPORARY Win95 diagnosis: startup progression (see mark95 below).
     #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
@@ -3376,8 +3374,6 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     }
     let rxapp = rswidgets::App::init()
         .map_err(|e| format!("GUI init failed: {e}"))?;
-    #[cfg(target_os = "android")]
-    super::android_backend::logcat("run_gui: App::init ok");
     #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
     unsafe {
         mark95(b"nwgpost\n");
@@ -3404,8 +3400,6 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
     unsafe { mark95(b"m-size\n"); }
     let vbox = rxapp.new_box(Orientation::Vertical, 0)?;
-    #[cfg(target_os = "android")]
-    super::android_backend::logcat("run_gui: window+vbox ok");
     // TEMPORARY ReactOS diagnosis.
     #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
     unsafe { mark95(b"m-box\n"); }
@@ -3457,8 +3451,6 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
     unsafe { mark95(b"m-entry\n"); }
     formula_bar.append(&formula_status);
-    #[cfg(target_os = "android")]
-    super::android_backend::logcat("run_gui: formula bar ok");
 
     // Canvas inside native scrollbars: the thumb tracks the viewport and
     // scrollbar interaction moves the cursor (selection), so the selected
@@ -3487,8 +3479,6 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     let tabbar = rxapp.new_canvas()?;
     tabbar.set_size_request(1, TAB_H as i32);
     tabbar.set_visible(false);
-    #[cfg(target_os = "android")]
-    super::android_backend::logcat("run_gui: canvas+tabbar ok");
 
     let shared = Rc::new(GuiState {
         app: corro_app as *mut super::App,
@@ -3542,8 +3532,6 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
 
     // A fresh load still opens with a clickable trailing blank data row/col.
     maintain_extent(&shared, false);
-    #[cfg(target_os = "android")]
-    super::android_backend::logcat("run_gui: extent ok");
 
     // Scrollbar interaction moves the cursor (selection); the per-frame
     // viewport recompute then keeps it visible. Reentrancy-safe: syncs
@@ -3563,8 +3551,6 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     let _ = shared.menubar.set(menubar.clone());
     let menubar_cb = menubar.clone();
     vbox.append(&menubar);
-    #[cfg(target_os = "android")]
-    super::android_backend::logcat("run_gui: menu ok");
 
     // Keyboard: canvas.on_key_raw, win.on_event_key, etc.
     let shared_key = shared.clone();
@@ -3611,8 +3597,6 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     tabbar.on_click(Box::new(move |x: f64, _y: f64| {
         handle_tab_click(x, &shared_tabclick);
     }));
-    #[cfg(target_os = "android")]
-    super::android_backend::logcat("run_gui: callbacks ok");
 
     // Formula entry change
     let shared_entry = shared.clone();
@@ -4007,8 +3991,6 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     }));
     eprintln!("PHASE: after_set_draw_callback");
     let _ = std::fs::write("/tmp/gui_setup_phase2.txt", "after_set_draw_callback\n");
-    #[cfg(target_os = "android")]
-    super::android_backend::logcat("run_gui: draw callback ok");
 
     log_ui_action("gui_started", &format!("title={}", env!("CARGO_PKG_VERSION")));
 
@@ -4069,12 +4051,8 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     update_formula_bar(&shared, shared.last_row.get(), shared.last_col.get());
     sync_tabbar(&shared);
     formula_entry.grab_focus();
-    #[cfg(target_os = "android")]
-    super::android_backend::logcat("run_gui: about_to_present");
     eprintln!("PHASE: about_to_present");
     win.present();
-    #[cfg(target_os = "android")]
-    super::android_backend::logcat("run_gui: after_present");
     // TEMPORARY Win95 diagnosis: probe each known window (parent/class/
     // rect/visible) to find where the controls really live.
     #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
@@ -4187,8 +4165,6 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
     unsafe { mark95(b"pre-run\n"); }
     rxapp.run()?;
-    #[cfg(target_os = "android")]
-    super::android_backend::logcat("run_gui: rxapp.run returned");
     // TEMPORARY Win95 diagnosis (unreachable if run() loops until quit).
     #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
     unsafe { mark95(b"post-run\n"); }

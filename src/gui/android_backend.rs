@@ -68,11 +68,8 @@ pub fn android_main(
 ) -> Result<(), String> {
     // NOTE: logcat needs JAVA_VM, which is only set after init_with_layout,
     // so the first line below cannot log yet (it is swallowed silently).
-    logcat("android_main: enter");
     rswidgets::backends::android::init_with_layout(env, activity, root_layout)
         .map_err(|e| format!("corro backend init failed: {e}"))?;
-    logcat("android_main: backend init ok");
     run_android_default().map_err(|e| format!("corro run failed: {e}"))?;
-    logcat("android_main: run returned");
     Ok(())
 }

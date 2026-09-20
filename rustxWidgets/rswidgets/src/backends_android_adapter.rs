@@ -17,6 +17,7 @@
 mod android_adapter {
     use crate::core::{DrawContext, Error, Widget};
     use jni::objects::JString;
+    use std::cell::RefCell;
     use std::collections::HashMap;
     use std::os::raw::c_void;
     use std::sync::Mutex;
@@ -304,16 +305,59 @@ mod android_adapter {
             let _ = crate::backends::android::with_env_and_activity(|env, _activity| {
                 let layout = unsafe { jni::objects::JObject::from_raw(self.0 as jni::sys::jobject) };
                 let child_obj = unsafe { jni::objects::JObject::from_raw(child_ptr as jni::sys::jobject) };
-                // LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT, weight):
-                // canvases (SheetView) grow (weight 1), chrome wraps.
+                // Axis that grows depends on the parent's orientation, which
+                // the child cannot know — query it from the layout.
                 let is_canvas = crate::backends::android::is_canvas_view(child_ptr);
-                let weight = if is_canvas { 1.0f32 } else { 0.0f32 };
-                let height = if is_canvas { 0i32 } else { -2i32 }; // 0dp+weight vs WRAP_CONTENT
+                let expands = crate::backends::android::is_view_expanding(child_ptr);
+                let vertical_parent = env
+                    .call_method(&layout, "getOrientation", "()I", &[])
+                    .ok()
+                    .and_then(|o| o.i().ok())
+                    .map(|o| o == 1)
+                    .unwrap_or(true);
+                let weight = if is_canvas || expands { 1.0f32 } else { 0.0f32 };
+                let (child_w, child_h) = if is_canvas {
+                    // The sheet fills whatever the parent gives it.
+                    (-1i32, 0i32)
+                } else if expands {
+                    if vertical_parent { (-1i32, 0i32) } else { (0i32, -1i32) }
+                } else {
+                    (-2i32, -2i32)
+                };
                 let params = env.new_object(
                     "android/widget/LinearLayout$LayoutParams",
                     "(IIF)V",
-                    &[(-1i32).into(), height.into(), weight.into()],
+                    &[child_w.into(), child_h.into(), weight.into()],
                 )?;
+                // An empty EditText measures to zero width; give it a floor
+                // in px (density-independent ≈ 9px per character at mdpi).
+                let min_chars = {
+                    let n = crate::backends::android::view_min_chars(child_ptr);
+                    // Expanding children (the formula entry) default to a
+                    // usable width even when nothing set one explicitly.
+                    if n > 0 { n } else if expands { 12 } else { 0 }
+                };
+                if min_chars > 0 {
+                    let density = env
+                        .call_method(&layout, "getResources", "()Landroid/content/res/Resources;", &[])
+                        .ok()
+                        .and_then(|r| r.l().ok())
+                        .and_then(|res| {
+                            env.call_method(&res, "getDisplayMetrics", "()Landroid/util/DisplayMetrics;", &[])
+                                .ok()
+                                .and_then(|m| m.l().ok())
+                        })
+                        .and_then(|metrics| env.get_field(&metrics, "density", "F").ok())
+                        .and_then(|f| f.f().ok())
+                        .unwrap_or(1.0);
+                    let min_px = (min_chars as f32 * 9.0 * density) as i32;
+                    let _ = env.call_method(
+                        &child_obj,
+                        "setMinimumWidth",
+                        "(I)V",
+                        &[min_px.into()],
+                    );
+                }
                 env.call_method(
                     &layout,
                     "addView",
@@ -349,6 +393,21 @@ mod android_adapter {
     }
 
     impl Entry {
+        /// Android laid out the entry at zero width (off-screen) because
+        /// the box gave every non-canvas child WRAP_CONTENT and an empty
+        /// EditText measures 0. Expand flags are no-ops here, so record
+        /// the request and let `BoxWidget::append` weight it.
+        pub fn set_hexpand(&self, expand: bool) {
+            crate::backends::android::set_view_expanding(self.0, expand);
+        }
+
+        pub fn set_vexpand(&self, expand: bool) {
+            crate::backends::android::set_view_expanding(self.0, expand);
+        }
+
+        pub fn set_width_chars(&self, n: i32) {
+            crate::backends::android::set_view_min_chars(self.0, n);
+        }
         pub fn set_text(&self, text: &str) {
             let _ = crate::backends::android::with_env_and_activity(|env, _activity| {
                 let edit = unsafe { jni::objects::JObject::from_raw(self.0 as jni::sys::jobject) };
@@ -376,12 +435,8 @@ mod android_adapter {
             result.ok()
         }
 
-        pub fn set_width_chars(&self, _n: i32) {}
-
         pub fn set_size_request(&self, _w: i32, _h: i32) {}
 
-        pub fn set_hexpand(&self, _expand: bool) {}
-        pub fn set_vexpand(&self, _expand: bool) {}
         pub fn set_visible(&self, _v: bool) {}
         pub fn add_class(&self, _class_name: &str) {}
         pub fn remove_class(&self, _class_name: &str) {}
@@ -392,8 +447,17 @@ mod android_adapter {
 
         pub fn connect_activate<F: FnMut(*mut c_void) + 'static>(
             &self,
-            _f: F,
+            f: F,
         ) -> Result<u64, Error> {
+            // RETURN from the soft keyboard: the Java side calls
+            // `nativeEntryActivate(entryPtr)` from an OnEditorActionListener.
+            let mut map = ENTRY_ACTIVATE.lock().unwrap();
+            let mut f = f;
+            map.insert(
+                self.0 as usize,
+                SendEntryActivate(Box::into_raw(Box::new(move |p| f(p)))),
+            );
+            crate::backends::android::attach_editor_action(self.0);
             Ok(0)
         }
 
@@ -425,9 +489,17 @@ mod android_adapter {
         pub fn set_position(&self, _pos: usize) {}
         pub fn on_key_raw(&self, _cb: Box<dyn FnMut(u32, u32) -> bool>) {}
 
-        pub fn connect_changed(&self, _f: impl FnMut() + 'static) -> Result<u64, Error> {
-            Ok(0)
-        }
+    pub fn connect_changed(&self, f: impl FnMut() + 'static) -> Result<u64, Error> {
+        // Fire `f` on every text change. The Java side calls
+        // `nativeEntryChanged(entryPtr)` from a TextWatcher (installed by
+        // `attach_text_watcher`); the callback is keyed by the entry's
+        // GlobalRef pointer, exactly like the canvas registries.
+        let mut map = TEXT_CHANGED.lock().unwrap();
+        let mut f = f;
+        map.insert(self.0 as usize, SendTextChanged(Box::into_raw(Box::new(move || f()))));
+        crate::backends::android::attach_text_watcher(self.0);
+        Ok(0)
+    }
 
         /// No focus query on android entries: report false (unchanged).
         pub fn has_focus(&self) -> bool {
@@ -443,6 +515,38 @@ mod android_adapter {
     impl Clone for Entry {
         fn clone(&self) -> Self {
             Entry(self.0)
+        }
+    }
+
+    /// Text-change callbacks keyed by entry view pointer.
+    static TEXT_CHANGED: Lazy<Mutex<HashMap<usize, SendTextChanged>>> =
+        Lazy::new(|| Mutex::new(HashMap::new()));
+    /// RETURN (editor action) callbacks keyed by entry view pointer.
+    static ENTRY_ACTIVATE: Lazy<Mutex<HashMap<usize, SendEntryActivate>>> =
+        Lazy::new(|| Mutex::new(HashMap::new()));
+
+    struct SendTextChanged(*mut dyn FnMut());
+    // SAFETY: guarded by the registry mutex; same pattern as the canvas maps.
+    unsafe impl Send for SendTextChanged {}
+    struct SendEntryActivate(*mut dyn FnMut(*mut c_void));
+    // SAFETY: guarded by the registry mutex; same pattern as the canvas maps.
+    unsafe impl Send for SendEntryActivate {}
+
+    /// Called from the Java TextWatcher: run the registered change callback.
+    pub fn dispatch_text_changed(entry_ptr: *mut c_void) {
+        let mut map = TEXT_CHANGED.lock().unwrap();
+        if let Some(SendTextChanged(ptr)) = map.get_mut(&(entry_ptr as usize)) {
+            let cb: &mut dyn FnMut() = unsafe { &mut **ptr };
+            cb();
+        }
+    }
+
+    /// Called from the Java OnEditorActionListener (IME "Done"/Enter).
+    pub fn dispatch_entry_activate(entry_ptr: *mut c_void) {
+        let mut map = ENTRY_ACTIVATE.lock().unwrap();
+        if let Some(SendEntryActivate(ptr)) = map.get_mut(&(entry_ptr as usize)) {
+            let cb: &mut dyn FnMut(*mut c_void) = unsafe { &mut **ptr };
+            cb(entry_ptr);
         }
     }
 
@@ -694,7 +798,12 @@ mod android_adapter {
     /// One instance serves a single `onDraw`: paints are created up front
     /// (fill, stroke, text) and reused across primitives.
     pub struct JniDrawContext<'a, 'b> {
-        env: &'a mut jni::JNIEnv<'b>,
+        // Interior mutability: `DrawContext::text_extents_styled` only gets
+        // `&self`, but every JNI call needs `&mut JNIEnv`. The context is
+        // driven exclusively from the UI thread inside `onDraw`, so the
+        // cell never contends; every use goes through `try_borrow_mut` and
+        // degrades gracefully instead of panicking.
+        env: RefCell<&'a mut jni::JNIEnv<'b>>,
         canvas: jni::objects::GlobalRef,
         fill_paint: jni::objects::GlobalRef,
         stroke_paint: jni::objects::GlobalRef,
@@ -717,7 +826,7 @@ mod android_adapter {
                 "(Z)V",
                 &[true.into()],
             );
-            Some(JniDrawContext { env, canvas, fill_paint, stroke_paint, text_paint })
+            Some(JniDrawContext { env: RefCell::new(env), canvas, fill_paint, stroke_paint, text_paint })
         }
 
         fn make_paint(
@@ -793,12 +902,53 @@ mod android_adapter {
                 &[skew.into()],
             );
         }
+
+        /// Real text measurement via `Paint.measureText` (+ ascent/descent
+        /// for the height), honouring the same size/weight the draw path
+        /// uses. Returns the `(x_bearing, y_bearing, width, height)` tuple
+        /// the trait promises: bearings are 0 (left/top origin, matching
+        /// the monospace estimate callers already assume).
+        fn measure_text(
+            env: &mut jni::JNIEnv<'_>,
+            paint: &jni::objects::GlobalRef,
+            text: &str,
+            size: f64,
+            weight: i32,
+        ) -> Option<(f64, f64, f64, f64)> {
+            if text.is_empty() {
+                return Some((0.0, 0.0, 0.0, 0.0));
+            }
+            Self::set_text_size(env, paint, size, weight);
+            let jtext = env.new_string(text).ok()?;
+            let w = env
+                .call_method(
+                    paint.as_obj(),
+                    "measureText",
+                    "(Ljava/lang/String;)F",
+                    &[(&jtext).into()],
+                )
+                .ok()?
+                .f()
+                .ok()? as f64;
+            let ascent = env
+                .call_method(paint.as_obj(), "ascent", "()F", &[])
+                .ok()?
+                .f()
+                .ok()? as f64;
+            let descent = env
+                .call_method(paint.as_obj(), "descent", "()F", &[])
+                .ok()?
+                .f()
+                .ok()? as f64;
+            Some((0.0, 0.0, w.max(0.0), (descent - ascent).max(0.0)))
+        }
     }
 
     impl<'a, 'b> DrawContext for JniDrawContext<'a, 'b> {
         fn fill_rect(&mut self, x: f64, y: f64, w: f64, h: f64, r: f64, g: f64, b: f64, a: f64) {
-            Self::set_paint_color(self.env, &self.fill_paint, a, r, g, b);
-            let (env, canvas, paint) = (&mut *self.env, &self.canvas, &self.fill_paint);
+            let Ok(mut env) = self.env.try_borrow_mut() else { return; };
+            Self::set_paint_color(&mut env, &self.fill_paint, a, r, g, b);
+            let (env, canvas, paint) = (&mut *env, &self.canvas, &self.fill_paint);
             let _ = env.call_method(
                 canvas.as_obj(),
                 "drawRect",
@@ -819,8 +969,9 @@ mod android_adapter {
             a: f64,
             lw: f64,
         ) {
-            Self::set_paint_color(self.env, &self.stroke_paint, a, r, g, b);
-            let (env, canvas, paint) = (&mut *self.env, &self.canvas, &self.stroke_paint);
+            let Ok(mut env) = self.env.try_borrow_mut() else { return; };
+            Self::set_paint_color(&mut env, &self.stroke_paint, a, r, g, b);
+            let (env, canvas, paint) = (&mut *env, &self.canvas, &self.stroke_paint);
             let _ = env.call_method(
                 paint.as_obj(),
                 "setStrokeWidth",
@@ -852,9 +1003,10 @@ mod android_adapter {
             if text.is_empty() {
                 return;
             }
-            Self::set_paint_color(self.env, &self.text_paint, a, r, g, b);
-            Self::set_text_size(self.env, &self.text_paint, size, weight);
-            let (env, canvas, paint) = (&mut *self.env, &self.canvas, &self.text_paint);
+            let Ok(mut env) = self.env.try_borrow_mut() else { return; };
+            Self::set_paint_color(&mut env, &self.text_paint, a, r, g, b);
+            Self::set_text_size(&mut env, &self.text_paint, size, weight);
+            let (env, canvas, paint) = (&mut *env, &self.canvas, &self.text_paint);
             let Ok(jtext) = env.new_string(text) else {
                 return;
             };
@@ -880,14 +1032,21 @@ mod android_adapter {
             _slant: i32,
             weight: i32,
         ) -> (f64, f64, f64, f64) {
-            // `&self` cannot drive JNI mutably; fall back to the monospace
-            // estimate (same values layout code already assumes).
-            let _ = (text, size, weight);
-            estimate_extents(text, size, weight)
+            // Real measurement via Paint.measureText. `&self` is enough:
+            // the JNIEnv lives behind a RefCell (UI thread only, so the
+            // borrow cannot contend). Any failure degrades to the monospace
+            // estimate so layout never divides by zero.
+            let Ok(mut env) = self.env.try_borrow_mut() else {
+                return estimate_extents(text, size, weight);
+            };
+            let measured = Self::measure_text(&mut env, &self.text_paint, text, size, weight);
+            drop(env);
+            measured.unwrap_or_else(|| estimate_extents(text, size, weight))
         }
 
         fn clear(&mut self, r: f64, g: f64, b: f64, a: f64) {
-            let (env, canvas) = (&mut *self.env, &self.canvas);
+            let Ok(mut env) = self.env.try_borrow_mut() else { return; };
+            let (env, canvas) = (&mut *env, &self.canvas);
             let _ = env.call_method(
                 canvas.as_obj(),
                 "drawColor",
@@ -897,17 +1056,20 @@ mod android_adapter {
         }
 
         fn save(&mut self) {
-            let (env, canvas) = (&mut *self.env, &self.canvas);
+            let Ok(mut env) = self.env.try_borrow_mut() else { return; };
+            let (env, canvas) = (&mut *env, &self.canvas);
             let _ = env.call_method(canvas.as_obj(), "save", "()I", &[]);
         }
 
         fn restore(&mut self) {
-            let (env, canvas) = (&mut *self.env, &self.canvas);
+            let Ok(mut env) = self.env.try_borrow_mut() else { return; };
+            let (env, canvas) = (&mut *env, &self.canvas);
             let _ = env.call_method(canvas.as_obj(), "restore", "()V", &[]);
         }
 
         fn clip(&mut self, x: f64, y: f64, w: f64, h: f64) {
-            let (env, canvas) = (&mut *self.env, &self.canvas);
+            let Ok(mut env) = self.env.try_borrow_mut() else { return; };
+            let (env, canvas) = (&mut *env, &self.canvas);
             let _ = env.call_method(
                 canvas.as_obj(),
                 "clipRect",

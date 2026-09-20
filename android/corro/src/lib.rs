@@ -54,3 +54,25 @@ pub extern "system" fn Java_com_corro_SheetView_nativeOnTouch(
     // (queue_redraw already invalidates; this is belt-and-braces for the
     // tab strip, whose canvas has no Java view of its own... no-op here.)
 }
+
+/// Called from `CorroTextWatcher.afterTextChanged`: runs corro's formula
+/// entry change handler, which syncs `edit_buf` from the widget text.
+#[no_mangle]
+pub extern "system" fn Java_com_corro_CorroTextWatcher_nativeEntryChanged(
+    _env: JNIEnv,
+    _class: JClass,
+    view_ptr: i64,
+) {
+    rswidgets::backends_android_adapter::dispatch_text_changed(view_ptr as usize as *mut _);
+}
+
+/// Called from `CorroEditorAction.onEditorAction` (IME Done/Enter): commits
+/// the edit and moves down, exactly like a hardware Return.
+#[no_mangle]
+pub extern "system" fn Java_com_corro_CorroEditorAction_nativeEntryActivate(
+    _env: JNIEnv,
+    _class: JClass,
+    view_ptr: i64,
+) {
+    rswidgets::backends_android_adapter::dispatch_entry_activate(view_ptr as usize as *mut _);
+}

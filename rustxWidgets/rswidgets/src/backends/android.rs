@@ -11,6 +11,11 @@ mod android_backend {
     static JAVA_VM: OnceCell<jni::JavaVM> = OnceCell::new();
     static ACTIVITY: OnceCell<GlobalRef> = OnceCell::new();
     static ROOT_LAYOUT: OnceCell<GlobalRef> = OnceCell::new();
+    /// The app's ClassLoader, captured while we are still on the Activity's
+    /// thread. `JNIEnv::find_class` on a JNI-attached thread resolves through
+    /// the *system* loader and cannot see APK classes (`com.corro.*`), so the
+    /// app loader is cached here and used by `load_app_class`.
+    static APP_CLASS_LOADER: OnceCell<GlobalRef> = OnceCell::new();
 
     /// Keeps GlobalRefs alive so raw jobject pointers remain valid.
     static KEEP_ALIVE: Lazy<Mutex<Vec<GlobalRef>>> = Lazy::new(|| Mutex::new(Vec::new()));
@@ -55,11 +60,44 @@ mod android_backend {
         let activity_ref = env.new_global_ref(activity)?;
         let root_ref = env.new_global_ref(layout)?;
 
+        // Capture the APK's ClassLoader now, while this thread's context
+        // loader is the app's (we are inside MainActivity.onCreate).
+        if let Ok(loader) = env
+            .call_method(activity, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])
+            .and_then(|l| l.l())
+            .and_then(|obj| env.new_global_ref(&obj))
+        {
+            let _ = APP_CLASS_LOADER.set(loader);
+        }
+
         JAVA_VM.set(vm).map_err(|_| "JAVA_VM already initialized")?;
         ACTIVITY.set(activity_ref).map_err(|_| "ACTIVITY already initialized")?;
         ROOT_LAYOUT.set(root_ref).map_err(|_| "ROOT_LAYOUT already initialized")?;
 
         Ok(())
+    }
+
+    /// Resolve an app (APK) class by binary name (`com.corro.Foo`) through
+    /// the cached app ClassLoader. Falls back to `JNIEnv::find_class` when
+    /// no loader was captured (e.g. framework classes still resolve).
+    pub fn load_app_class<'a>(
+        env: &mut JNIEnv<'a>,
+        class_name: &str,
+    ) -> Result<jni::objects::JClass<'a>, Box<dyn StdError + Send + Sync>> {
+        if let Some(loader) = APP_CLASS_LOADER.get() {
+            let jname = env.new_string(class_name.replace('/', "."))?;
+            let cls = env.call_method(
+                loader.as_obj(),
+                "loadClass",
+                "(Ljava/lang/String;)Ljava/lang/Class;",
+                &[(&jname).into()],
+            )?;
+            let obj = cls.l()?;
+            // Class<...> is a JClass in jni's type model.
+            let cls: jni::objects::JClass = jni::objects::JClass::from(obj);
+            return Ok(cls);
+        }
+        Ok(env.find_class(class_name)?)
     }
 
     pub fn root_layout() -> Result<&'static GlobalRef, Box<dyn StdError + Send + Sync>> {
@@ -137,7 +175,7 @@ mod android_backend {
         env: &mut JNIEnv<'a>,
         callback_id: u64,
     ) -> Result<Option<JObject<'a>>, Box<dyn StdError + Send + Sync>> {
-        let cls = match env.find_class("com/example/RustCallback") {
+        let cls = match load_app_class(env, "com/example/RustCallback") {
             Ok(c) => c,
             Err(_) => {
                 let _ = env.exception_clear();
@@ -434,18 +472,21 @@ mod android_backend {
             // View takes (Context). Try the two-arg form first, fall back.
             if class != "android/view/View" {
                 let canvas_id = NEXT_CANVAS_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                match env.new_object(
-                    &class,
-                    "(Landroid/content/Context;J)V",
-                    &[(&ctx).into(), (canvas_id as i64).into()],
-                ) {
-                    Ok(v) => {
-                        let raw = make_global_ref(env, &v)?;
-                        register_canvas_view(raw, canvas_id);
-                        return Ok((raw, canvas_id));
-                    }
-                    Err(_) => {
-                        let _ = env.exception_clear();
+                let resolved = load_app_class(env, &class).ok();
+                if let Some(resolved) = resolved {
+                    match env.new_object(
+                        &resolved,
+                        "(Landroid/content/Context;J)V",
+                        &[(&ctx).into(), (canvas_id as i64).into()],
+                    ) {
+                        Ok(v) => {
+                            let raw = make_global_ref(env, &v)?;
+                            register_canvas_view(raw, canvas_id);
+                            return Ok((raw, canvas_id));
+                        }
+                        Err(_) => {
+                            let _ = env.exception_clear();
+                        }
                     }
                 }
             }
@@ -468,6 +509,39 @@ mod android_backend {
     /// the Rust `Canvas` handle is the view pointer).
     static CANVAS_IDS: Lazy<Mutex<HashMap<usize, u64>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
+    /// Views that asked to expand (`set_hexpand`). Android has no expand
+    /// flag: the request is recorded here and honoured by
+    /// `BoxWidget::append` as `LinearLayout` weight 1, so the formula entry
+    /// grows instead of measuring to zero width.
+    static EXPANDING: Lazy<Mutex<std::collections::HashSet<usize>>> =
+        Lazy::new(|| Mutex::new(std::collections::HashSet::new()));
+
+    /// Minimum content width in characters (GTK `set_width_chars`), kept so
+    /// an empty EditText still gets a usable box.
+    static MIN_CHARS: Lazy<Mutex<HashMap<usize, i32>>> =
+        Lazy::new(|| Mutex::new(HashMap::new()));
+
+    pub fn set_view_expanding(view_ptr: *mut std::os::raw::c_void, expand: bool) {
+        let mut set = EXPANDING.lock().unwrap();
+        if expand {
+            set.insert(view_ptr as usize);
+        } else {
+            set.remove(&(view_ptr as usize));
+        }
+    }
+
+    pub fn is_view_expanding(view_ptr: *mut std::os::raw::c_void) -> bool {
+        EXPANDING.lock().unwrap().contains(&(view_ptr as usize))
+    }
+
+    pub fn set_view_min_chars(view_ptr: *mut std::os::raw::c_void, n: i32) {
+        MIN_CHARS.lock().unwrap().insert(view_ptr as usize, n);
+    }
+
+    pub fn view_min_chars(view_ptr: *mut std::os::raw::c_void) -> i32 {
+        MIN_CHARS.lock().unwrap().get(&(view_ptr as usize)).copied().unwrap_or(0)
+    }
+
     fn register_canvas_view(view_raw: jni::sys::jobject, canvas_id: u64) {
         CANVAS_IDS.lock().unwrap().insert(view_raw as usize, canvas_id);
     }
@@ -489,6 +563,84 @@ mod android_backend {
     /// when unset or when instantiation fails.
     pub fn set_sheet_view_class(class: &str) {
         let _ = SHEET_VIEW_CLASS.set(class.to_string());
+    }
+
+    /// Install the shared `TextWatcher`/`OnEditorActionListener` on an
+    /// EditText so text changes and IME "Done" reach Rust. The listeners are
+    /// `com.corro.CorroTextWatcher` / `com.corro.CorroEditorAction` when
+    /// present; absent classes make this a no-op (backend still works, just
+    /// without the typing path).
+    pub fn attach_text_watcher(entry_ptr: *mut std::os::raw::c_void) {
+        let class_name = match ENTRY_LISTENER_CLASSES.get() {
+            Some((watcher, _)) => watcher.clone(),
+            None => "com/corro/CorroTextWatcher".to_string(),
+        };
+        attach_entry_listener(entry_ptr, "addTextChangedListener", &class_name);
+    }
+
+    /// See [`attach_text_watcher`]; wires `setOnEditorActionListener`.
+    pub fn attach_editor_action(entry_ptr: *mut std::os::raw::c_void) {
+        if entry_ptr.is_null() {
+            return;
+        }
+        let (class_name, sig) = match ENTRY_LISTENER_CLASSES.get() {
+            Some((_, editor)) => (editor.clone(), "(J)V".to_string()),
+            None => ("com/corro/CorroEditorAction".to_string(), "(J)V".to_string()),
+        };
+        let _ = with_env_and_activity(|env, _activity| {
+            let entry = unsafe { jni::objects::JObject::from_raw(entry_ptr as jni::sys::jobject) };
+            let cls = match load_app_class(env, &class_name) {
+                Ok(c) => c,
+                Err(_) => {
+                    let _ = env.exception_clear();
+                    return Ok::<_, Box<dyn StdError + Send + Sync>>(());
+                }
+            };
+            let listener = env.new_object(&cls, &sig, &[(entry_ptr as i64).into()])?;
+            env.call_method(
+                &entry,
+                "setOnEditorActionListener",
+                "(Landroid/widget/TextView$OnEditorActionListener;)V",
+                &[(&listener).into()],
+            )?;
+            Ok::<_, Box<dyn StdError + Send + Sync>>(())
+        });
+    }
+
+    fn attach_entry_listener(
+        entry_ptr: *mut std::os::raw::c_void,
+        method: &str,
+        class_name: &str,
+    ) {
+        if entry_ptr.is_null() {
+            return;
+        }
+        let _ = with_env_and_activity(|env, _activity| {
+            let entry = unsafe { jni::objects::JObject::from_raw(entry_ptr as jni::sys::jobject) };
+            let cls = match load_app_class(env, class_name) {
+                Ok(c) => c,
+                Err(_) => {
+                    let _ = env.exception_clear();
+                    return Ok::<_, Box<dyn StdError + Send + Sync>>(());
+                }
+            };
+            let listener = env.new_object(&cls, "(J)V", &[(entry_ptr as i64).into()])?;
+            env.call_method(
+                &entry,
+                method,
+                "(Landroid/text/TextWatcher;)V",
+                &[(&listener).into()],
+            )?;
+            Ok::<_, Box<dyn StdError + Send + Sync>>(())
+        });
+    }
+
+    /// Override the entry listener class names (tests/alternative apps):
+    /// (text-watcher class, editor-action class).
+    static ENTRY_LISTENER_CLASSES: OnceCell<(String, String)> = OnceCell::new();
+
+    pub fn set_entry_listener_classes(watcher: &str, editor_action: &str) {
+        let _ = ENTRY_LISTENER_CLASSES.set((watcher.to_string(), editor_action.to_string()));
     }
 
     /// `View.invalidate()` on a canvas handle: schedules `onDraw`, which
