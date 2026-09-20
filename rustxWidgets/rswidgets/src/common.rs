@@ -335,7 +335,7 @@ mod common_types {
         pub fn on_key(&self, cb: Box<dyn FnMut(u32) -> bool>) { self.inner.on_key(cb); }
     }
     impl ScrolledWindow {
-        pub fn set_child(&self, _child: &impl AsRef<*mut std::os::raw::c_void>) {}
+        pub fn set_child(&self, child: &crate::common::Canvas) { self.inner.attach_canvas(&child.inner); }
         pub fn set_policy(&self, _hscroll: u32, _vscroll: u32) {}
         pub fn set_vexpand(&self, _expand: bool) {}
         pub fn scroll_to(&self, _hval: f64, _hupper: f64, _hpage: f64, _vval: f64, _vupper: f64, _vpage: f64) {}

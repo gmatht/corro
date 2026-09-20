@@ -1,0 +1,17 @@
+[package]
+name = "corro_android"
+version = "0.7.0"
+edition = "2021"
+
+# Standalone crate (NOT in the corro workspace): it builds against the
+# Android NDK target with its own feature set, mirroring
+# rustxWidgets/examples/android.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+corro = { path = "../..", features = ["gui"] }
+rswidgets = { path = "../../rustxWidgets/rswidgets", default-features = false }
+jni = { version = "0.21", default-features = false }

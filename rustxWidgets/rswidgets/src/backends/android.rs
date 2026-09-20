@@ -85,6 +85,23 @@ mod android_backend {
         JAVA_VM.get().is_some()
     }
 
+    /// Write a debug line to logcat under the `rswidgets` tag. Best-effort:
+    /// silently dropped when the backend is not initialised yet.
+    pub fn logcat_rs(msg: &str) {
+        let _ = with_env_and_activity(|env, _activity| {
+            let log_cls = env.find_class("android/util/Log")?;
+            let tag = env.new_string("rswidgets")?;
+            let jmsg = env.new_string(msg)?;
+            env.call_static_method(
+                &log_cls,
+                "d",
+                "(Ljava/lang/String;Ljava/lang/String;)I",
+                &[(&tag).into(), (&jmsg).into()],
+            )?;
+            Ok::<_, Box<dyn StdError + Send + Sync>>(())
+        });
+    }
+
     // ---- Callback registry ----
 
     static CALLBACKS: Lazy<Mutex<HashMap<u64, Box<dyn FnMut() + Send>>>> = Lazy::new(|| Mutex::new(HashMap::new()));
@@ -402,6 +419,124 @@ mod android_backend {
                 &[3i32.into()],
             )?;
             make_global_ref(env, &tv)
+        })
+    }
+
+    /// Plain `android.view.View` backing a [`crate::backends_android_adapter::Canvas`].
+    /// A custom `SheetView` (with `onDraw` funneling `DrawContext` calls back
+    /// into Rust) replaces this once the Java side lands; until then a plain
+    /// view keeps the widget tree valid so appends never see bogus handles.
+    pub fn create_canvas_view() -> Result<(jni::sys::jobject, u64), Box<dyn StdError + Send + Sync>> {
+        let class = SHEET_VIEW_CLASS.get().cloned().unwrap_or_else(|| "android/view/View".to_string());
+        with_env_and_activity(|env, activity| {
+            let ctx = activity.as_obj();
+            // Custom SheetViews take (Context, long canvasId); the platform
+            // View takes (Context). Try the two-arg form first, fall back.
+            if class != "android/view/View" {
+                let canvas_id = NEXT_CANVAS_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                match env.new_object(
+                    &class,
+                    "(Landroid/content/Context;J)V",
+                    &[(&ctx).into(), (canvas_id as i64).into()],
+                ) {
+                    Ok(v) => {
+                        let raw = make_global_ref(env, &v)?;
+                        register_canvas_view(raw, canvas_id);
+                        return Ok((raw, canvas_id));
+                    }
+                    Err(_) => {
+                        let _ = env.exception_clear();
+                    }
+                }
+            }
+            let canvas_id = NEXT_CANVAS_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let view = env.new_object(
+                "android/view/View",
+                "(Landroid/content/Context;)V",
+                &[(&ctx).into()],
+            )?;
+            let raw = make_global_ref(env, &view)?;
+            register_canvas_view(raw, canvas_id);
+            Ok((raw, canvas_id))
+        })
+    }
+
+    static SHEET_VIEW_CLASS: OnceCell<String> = OnceCell::new();
+    static NEXT_CANVAS_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+    /// View-pointer -> canvas-id map (the draw registry keys on canvas id;
+    /// the Rust `Canvas` handle is the view pointer).
+    static CANVAS_IDS: Lazy<Mutex<HashMap<usize, u64>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+    fn register_canvas_view(view_raw: jni::sys::jobject, canvas_id: u64) {
+        CANVAS_IDS.lock().unwrap().insert(view_raw as usize, canvas_id);
+    }
+
+    /// Canvas id for a view pointer (0 = unknown).
+    pub fn canvas_id_for_view(view_ptr: *mut std::os::raw::c_void) -> u64 {
+        CANVAS_IDS.lock().unwrap().get(&(view_ptr as usize)).copied().unwrap_or(0)
+    }
+
+    /// True when `view_ptr` is a canvas view (SheetView or plain canvas):
+    /// used for layout weighting (canvases grow, chrome wraps).
+    pub fn is_canvas_view(view_ptr: *mut std::os::raw::c_void) -> bool {
+        canvas_id_for_view(view_ptr) != 0
+    }
+
+    /// Register the fully-qualified custom View class used for canvases
+    /// (e.g. `com.corro.SheetView`). Must have a `(Context, long)` ctor
+    /// taking the Rust canvas id. Falls back to a plain View per canvas
+    /// when unset or when instantiation fails.
+    pub fn set_sheet_view_class(class: &str) {
+        let _ = SHEET_VIEW_CLASS.set(class.to_string());
+    }
+
+    /// `View.invalidate()` on a canvas handle: schedules `onDraw`, which
+    /// funnels back into the registered Rust draw closure. Best-effort.
+    pub fn invalidate_view(view_ptr: *mut std::os::raw::c_void) {
+        if view_ptr.is_null() {
+            return;
+        }
+        let _ = with_env_and_activity(|env, _activity| {
+            let view = unsafe { jni::objects::JObject::from_raw(view_ptr as jni::sys::jobject) };
+            env.call_method(&view, "invalidate", "()V", &[])?;
+            Ok::<_, Box<dyn StdError + Send + Sync>>(())
+        });
+    }
+
+    /// Attach `child` to a container view (`FrameLayout` scrolled windows,
+    /// overlays): `addView(child)`. Best-effort; ignores null handles.
+    pub fn attach_child(container_ptr: *mut std::os::raw::c_void, child_ptr: *mut std::os::raw::c_void) {
+        if container_ptr.is_null() || child_ptr.is_null() {
+            return;
+        }
+        let _ = with_env_and_activity(|env, _activity| {
+            let container =
+                unsafe { jni::objects::JObject::from_raw(container_ptr as jni::sys::jobject) };
+            let child =
+                unsafe { jni::objects::JObject::from_raw(child_ptr as jni::sys::jobject) };
+            env.call_method(
+                &container,
+                "addView",
+                "(Landroid/view/View;)V",
+                &[(&child).into()],
+            )?;
+            Ok::<_, Box<dyn StdError + Send + Sync>>(())
+        });
+    }
+
+    /// Inert `FrameLayout` container backing a scrolled window. Corro drives
+    /// its own viewport, so this never scrolls natively — it only keeps the
+    /// shared GUI layout code compiling unchanged with valid handles.
+    pub fn create_scrolled_view() -> Result<jni::sys::jobject, Box<dyn StdError + Send + Sync>> {
+        with_env_and_activity(|env, activity| {
+            let ctx = activity.as_obj();
+            let layout = env.new_object(
+                "android/widget/FrameLayout",
+                "(Landroid/content/Context;)V",
+                &[(&ctx).into()],
+            )?;
+            make_global_ref(env, &layout)
         })
     }
 }

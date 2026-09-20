@@ -24,7 +24,7 @@ pub mod special_picker;
 #[cfg(any(feature = "gui", all(feature = "wasm", target_arch = "wasm32")))]
 mod gui_backend;
 #[cfg(all(feature = "gui", target_os = "android"))]
-mod android_backend;
+pub mod android_backend;
 #[cfg(feature = "pancurses")]
 mod pnc_backend;
 

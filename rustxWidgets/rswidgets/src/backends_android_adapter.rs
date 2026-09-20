@@ -292,6 +292,10 @@ mod android_adapter {
     }
 
     impl BoxWidget {
+        /// Attach `child` with parent-appropriate `LayoutParams`: children
+        /// of a vertical `LinearLayout` fill the width and share leftover
+        /// height by weight (weight=1 only for sheet canvases, which must
+        /// grow; chrome keeps wrap-content).
         pub fn append(&self, child: &impl AsRef<*mut c_void>) {
             let child_ptr = *child.as_ref();
             if child_ptr.is_null() {
@@ -300,11 +304,21 @@ mod android_adapter {
             let _ = crate::backends::android::with_env_and_activity(|env, _activity| {
                 let layout = unsafe { jni::objects::JObject::from_raw(self.0 as jni::sys::jobject) };
                 let child_obj = unsafe { jni::objects::JObject::from_raw(child_ptr as jni::sys::jobject) };
+                // LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT, weight):
+                // canvases (SheetView) grow (weight 1), chrome wraps.
+                let is_canvas = crate::backends::android::is_canvas_view(child_ptr);
+                let weight = if is_canvas { 1.0f32 } else { 0.0f32 };
+                let height = if is_canvas { 0i32 } else { -2i32 }; // 0dp+weight vs WRAP_CONTENT
+                let params = env.new_object(
+                    "android/widget/LinearLayout$LayoutParams",
+                    "(IIF)V",
+                    &[(-1i32).into(), height.into(), weight.into()],
+                )?;
                 env.call_method(
                     &layout,
                     "addView",
-                    "(Landroid/view/View;)V",
-                    &[(&child_obj).into()],
+                    "(Landroid/view/View;Landroid/view/ViewGroup$LayoutParams;)V",
+                    &[(&child_obj).into(), (&params).into()],
                 )?;
                 Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
             });
@@ -516,36 +530,44 @@ mod android_adapter {
     }
 
     impl Canvas {
+        /// Canvas id for this view (0 = unknown; registry lookups miss).
+        fn canvas_id(&self) -> u64 {
+            crate::backends::android::canvas_id_for_view(self.0)
+        }
+
         pub fn set_draw_callback(
             &self,
             cb: Box<dyn FnMut(&mut dyn DrawContext, i32, i32)>,
         ) {
-            // Stash the closure under our handle id; the Java SheetView
+            // Stash the closure under our canvas id; the Java SheetView
             // dispatches to it by id from onDraw.
-            let mut map = DRAW_CALLBACKS.lock().unwrap();
-            map.insert(
-                self.0 as usize,
-                SendDrawCallback(Box::into_raw(cb)),
-            );
+            {
+                let mut map = DRAW_CALLBACKS.lock().unwrap();
+                map.insert(
+                    self.canvas_id(),
+                    SendDrawCallback(Box::into_raw(cb)),
+                );
+            }
             self.queue_redraw();
         }
 
         pub fn queue_redraw(&self) {
-            // Run the stored closure immediately against the estimating
-            // context so headless/test callers observe draws without Java.
-            // On-device the Java SheetView invalidates and replays this
-            // same closure with a JNI-backed context.
+            // Schedule a real onDraw through the Java view (which replays
+            // the closure with a JNI-backed context at the live size), and
+            // also run it immediately against the estimating context so
+            // headless/test callers observe draws without Java.
+            crate::backends::android::invalidate_view(self.0);
             let mut map = DRAW_CALLBACKS.lock().unwrap();
-            if let Some(SendDrawCallback(ptr)) = map.get_mut(&(self.0 as usize)) {
+            if let Some(SendDrawCallback(ptr)) = map.get_mut(&self.canvas_id()) {
                 let cb: &mut dyn FnMut(&mut dyn DrawContext, i32, i32) = unsafe { &mut **ptr };
                 let mut dc = AndroidDrawContext;
-                let (w, h) = CANVAS_SIZE.lock().unwrap().get(&(self.0 as usize)).copied().unwrap_or((800, 600));
+                let (w, h) = CANVAS_SIZE.lock().unwrap().get(&self.canvas_id()).copied().unwrap_or((800, 600));
                 cb(&mut dc, w, h);
             }
         }
 
         pub fn set_size_request(&self, w: i32, h: i32) {
-            CANVAS_SIZE.lock().unwrap().insert(self.0 as usize, (w.max(1), h.max(1)));
+            CANVAS_SIZE.lock().unwrap().insert(self.canvas_id(), (w.max(1), h.max(1)));
         }
 
         pub fn set_content_size(&self, w: i32, h: i32) {
@@ -559,7 +581,7 @@ mod android_adapter {
 
         pub fn on_click(&self, cb: Box<dyn FnMut(f64, f64)>) {
             let mut map = CLICK_CALLBACKS.lock().unwrap();
-            map.insert(self.0 as usize, SendClickCallback(Box::into_raw(cb)));
+            map.insert(self.canvas_id(), SendClickCallback(Box::into_raw(cb)));
         }
 
         pub fn on_key(&self, cb: Box<dyn FnMut(u32) -> bool>) {
@@ -569,20 +591,21 @@ mod android_adapter {
 
         pub fn on_key_raw(&self, cb: Box<dyn FnMut(u32, u32) -> bool>) {
             let mut map = KEY_CALLBACKS.lock().unwrap();
-            map.insert(self.0 as usize, SendKeyCallback(Box::into_raw(cb)));
+            map.insert(self.canvas_id(), SendKeyCallback(Box::into_raw(cb)));
         }
 
-        /// Force an immediate draw. No surface exists yet on Android, so
-        /// this replays the closure like [`Canvas::queue_redraw`].
+        /// Force an immediate draw. Replays the closure like
+        /// [`Canvas::queue_redraw`] (plus a view invalidate).
         pub fn force_draw(&self, _window_ptr: *mut c_void, fallback_w: i32, fallback_h: i32) {
+            crate::backends::android::invalidate_view(self.0);
             let mut map = DRAW_CALLBACKS.lock().unwrap();
-            if let Some(SendDrawCallback(ptr)) = map.get_mut(&(self.0 as usize)) {
+            if let Some(SendDrawCallback(ptr)) = map.get_mut(&self.canvas_id()) {
                 let cb: &mut dyn FnMut(&mut dyn DrawContext, i32, i32) = unsafe { &mut **ptr };
                 let mut dc = AndroidDrawContext;
                 let (w, h) = CANVAS_SIZE
                     .lock()
                     .unwrap()
-                    .get(&(self.0 as usize))
+                    .get(&self.canvas_id())
                     .copied()
                     .unwrap_or((fallback_w.max(1), fallback_h.max(1)));
                 cb(&mut dc, w, h);
@@ -590,13 +613,13 @@ mod android_adapter {
         }
     }
 
-    static DRAW_CALLBACKS: Lazy<Mutex<HashMap<usize, SendDrawCallback>>> =
+    static DRAW_CALLBACKS: Lazy<Mutex<HashMap<u64, SendDrawCallback>>> =
         Lazy::new(|| Mutex::new(HashMap::new()));
-    static CLICK_CALLBACKS: Lazy<Mutex<HashMap<usize, SendClickCallback>>> =
+    static CLICK_CALLBACKS: Lazy<Mutex<HashMap<u64, SendClickCallback>>> =
         Lazy::new(|| Mutex::new(HashMap::new()));
-    static KEY_CALLBACKS: Lazy<Mutex<HashMap<usize, SendKeyCallback>>> =
+    static KEY_CALLBACKS: Lazy<Mutex<HashMap<u64, SendKeyCallback>>> =
         Lazy::new(|| Mutex::new(HashMap::new()));
-    static CANVAS_SIZE: Lazy<Mutex<HashMap<usize, (i32, i32)>>> =
+    static CANVAS_SIZE: Lazy<Mutex<HashMap<u64, (i32, i32)>>> =
         Lazy::new(|| Mutex::new(HashMap::new()));
 
     struct SendDrawCallback(*mut dyn FnMut(&mut dyn DrawContext, i32, i32));
@@ -610,7 +633,7 @@ mod android_adapter {
     unsafe impl Send for SendKeyCallback {}
 
     /// Dispatch a tap from Java `SheetView` to the registered click closure.
-    pub fn dispatch_canvas_click(canvas_id: usize, x: f64, y: f64) {
+    pub fn dispatch_canvas_click(canvas_id: u64, x: f64, y: f64) {
         let mut map = CLICK_CALLBACKS.lock().unwrap();
         if let Some(SendClickCallback(ptr)) = map.get_mut(&canvas_id) {
             let cb: &mut dyn FnMut(f64, f64) = unsafe { &mut **ptr };
@@ -619,13 +642,278 @@ mod android_adapter {
     }
 
     /// Dispatch a key from Java to the registered key closure.
-    pub fn dispatch_canvas_key(canvas_id: usize, keyval: u32, mods: u32) -> bool {
+    pub fn dispatch_canvas_key(canvas_id: u64, keyval: u32, mods: u32) -> bool {
         let mut map = KEY_CALLBACKS.lock().unwrap();
         if let Some(SendKeyCallback(ptr)) = map.get_mut(&canvas_id) {
             let cb: &mut dyn FnMut(u32, u32) -> bool = unsafe { &mut **ptr };
             cb(keyval, mods)
         } else {
             false
+        }
+    }
+
+    /// Replay the registered draw closure for `canvas_id` against a live
+    /// Java `android.graphics.Canvas`. Called from the cdylib's
+    /// `SheetView_nativeOnDraw` export (which runs on the UI thread inside
+    /// `View.onDraw`). `w`/`h` are the view's pixel size.
+    pub fn dispatch_draw<'a, 'b, 'c>(
+        canvas_id: u64,
+        canvas_obj: jni::objects::JObject<'c>,
+        env: &'a mut jni::JNIEnv<'b>,
+        w: i32,
+        h: i32,
+    ) {
+        CANVAS_SIZE.lock().unwrap().insert(canvas_id, (w.max(1), h.max(1)));
+        // NLL-friendly: resolve the raw callback pointer first, release the
+        // registry lock, then build the JNI context and invoke. Holding the
+        // lock across JNI calls risks re-entrant deadlock (queue_redraw
+        // from inside the closure would block on it).
+        let raw = {
+            let map = DRAW_CALLBACKS.lock().unwrap();
+            map.get(&canvas_id).map(|s| s.0)
+        };
+        let Some(raw) = raw else {
+            return;
+        };
+        match JniDrawContext::new(env, &canvas_obj) {
+            Some(mut ctx) => {
+                let cb: &mut dyn FnMut(&mut dyn DrawContext, i32, i32) =
+                    unsafe { &mut *raw };
+                cb(&mut ctx, w, h);
+            }
+            None => {
+                let mut est = AndroidDrawContext;
+                let cb: &mut dyn FnMut(&mut dyn DrawContext, i32, i32) =
+                    unsafe { &mut *raw };
+                cb(&mut est, w, h);
+            }
+        }
+    }
+
+    /// `DrawContext` backed by a live `android.graphics.Canvas` via JNI.
+    /// One instance serves a single `onDraw`: paints are created up front
+    /// (fill, stroke, text) and reused across primitives.
+    pub struct JniDrawContext<'a, 'b> {
+        env: &'a mut jni::JNIEnv<'b>,
+        canvas: jni::objects::GlobalRef,
+        fill_paint: jni::objects::GlobalRef,
+        stroke_paint: jni::objects::GlobalRef,
+        text_paint: jni::objects::GlobalRef,
+    }
+
+    impl<'a, 'b> JniDrawContext<'a, 'b> {
+        pub fn new(
+            env: &'a mut jni::JNIEnv<'b>,
+            canvas: &jni::objects::JObject<'_>,
+        ) -> Option<Self> {
+            let canvas = env.new_global_ref(canvas).ok()?;
+            let fill_paint = Self::make_paint(env, 0 /* FILL */)?;
+            let stroke_paint = Self::make_paint(env, 1 /* STROKE */)?;
+            let text_paint = Self::make_paint(env, 0 /* FILL */)?;
+            // Text draws anti-aliased; shapes stay crisp.
+            let _ = env.call_method(
+                text_paint.as_obj(),
+                "setAntiAlias",
+                "(Z)V",
+                &[true.into()],
+            );
+            Some(JniDrawContext { env, canvas, fill_paint, stroke_paint, text_paint })
+        }
+
+        fn make_paint(
+            env: &mut jni::JNIEnv<'_>,
+            style: i32,
+        ) -> Option<jni::objects::GlobalRef> {
+            // 0 = Paint.Style.FILL, 1 = STROKE (ordinal into Style.values()).
+            let paint = env
+                .new_object("android/graphics/Paint", "()V", &[])
+                .ok()?;
+            let styles = env
+                .call_static_method(
+                    "android/graphics/Paint$Style",
+                    "values",
+                    "()[Landroid/graphics/Paint$Style;",
+                    &[],
+                )
+                .ok()?
+                .l()
+                .ok()?;
+            let styles: jni::objects::JObjectArray =
+                jni::objects::JObjectArray::from(styles);
+            let style_obj = env.get_object_array_element(&styles, style).ok()?;
+            env.call_method(&paint, "setStyle", "(Landroid/graphics/Paint$Style;)V", &[(&style_obj).into()])
+                .ok()?;
+            env.new_global_ref(&paint).ok()
+        }
+
+        fn argb(a: f64, r: f64, g: f64, b: f64) -> i32 {
+            let clamp = |v: f64| (v.clamp(0.0, 1.0) * 255.0) as i32;
+            (clamp(a) << 24) | (clamp(r) << 16) | (clamp(g) << 8) | clamp(b)
+        }
+
+        fn set_paint_color(
+            env: &mut jni::JNIEnv<'_>,
+            paint: &jni::objects::GlobalRef,
+            a: f64,
+            r: f64,
+            g: f64,
+            b: f64,
+        ) {
+            let _ = env.call_method(
+                paint.as_obj(),
+                "setColor",
+                "(I)V",
+                &[Self::argb(a, r, g, b).into()],
+            );
+        }
+
+        fn set_text_size(
+            env: &mut jni::JNIEnv<'_>,
+            paint: &jni::objects::GlobalRef,
+            size: f64,
+            weight: i32,
+        ) {
+            let _ = env.call_method(
+                paint.as_obj(),
+                "setTextSize",
+                "(F)V",
+                &[(size.max(1.0) as f32).into()],
+            );
+            let _ = env.call_method(
+                paint.as_obj(),
+                "setFakeBoldText",
+                "(Z)V",
+                &[(weight != 0).into()],
+            );
+            let skew = if weight != 0 { 0.0f32 } else { 0.0f32 };
+            let _ = env.call_method(
+                paint.as_obj(),
+                "setTextSkewX",
+                "(F)V",
+                &[skew.into()],
+            );
+        }
+    }
+
+    impl<'a, 'b> DrawContext for JniDrawContext<'a, 'b> {
+        fn fill_rect(&mut self, x: f64, y: f64, w: f64, h: f64, r: f64, g: f64, b: f64, a: f64) {
+            Self::set_paint_color(self.env, &self.fill_paint, a, r, g, b);
+            let (env, canvas, paint) = (&mut *self.env, &self.canvas, &self.fill_paint);
+            let _ = env.call_method(
+                canvas.as_obj(),
+                "drawRect",
+                "(FFFFLandroid/graphics/Paint;)V",
+                &[(x as f32).into(), (y as f32).into(), ((x + w) as f32).into(), ((y + h) as f32).into(), (&paint.as_obj()).into()],
+            );
+        }
+
+        fn stroke_rect(
+            &mut self,
+            x: f64,
+            y: f64,
+            w: f64,
+            h: f64,
+            r: f64,
+            g: f64,
+            b: f64,
+            a: f64,
+            lw: f64,
+        ) {
+            Self::set_paint_color(self.env, &self.stroke_paint, a, r, g, b);
+            let (env, canvas, paint) = (&mut *self.env, &self.canvas, &self.stroke_paint);
+            let _ = env.call_method(
+                paint.as_obj(),
+                "setStrokeWidth",
+                "(F)V",
+                &[(lw.max(0.5) as f32).into()],
+            );
+            let _ = env.call_method(
+                canvas.as_obj(),
+                "drawRect",
+                "(FFFFLandroid/graphics/Paint;)V",
+                &[(x as f32).into(), (y as f32).into(), ((x + w) as f32).into(), ((y + h) as f32).into(), (&paint.as_obj()).into()],
+            );
+        }
+
+        fn draw_text_styled(
+            &mut self,
+            x: f64,
+            y: f64,
+            text: &str,
+            _font: &str,
+            size: f64,
+            r: f64,
+            g: f64,
+            b: f64,
+            a: f64,
+            _slant: i32,
+            weight: i32,
+        ) {
+            if text.is_empty() {
+                return;
+            }
+            Self::set_paint_color(self.env, &self.text_paint, a, r, g, b);
+            Self::set_text_size(self.env, &self.text_paint, size, weight);
+            let (env, canvas, paint) = (&mut *self.env, &self.canvas, &self.text_paint);
+            let Ok(jtext) = env.new_string(text) else {
+                return;
+            };
+            // drawText draws with the baseline at y; offset by ascent so
+            // callers' top-left convention matches other backends.
+            let ascent: f64 = env
+                .call_method(paint.as_obj(), "ascent", "()F", &[])
+                .map(|v| v.f().unwrap_or(0.0) as f64)
+                .unwrap_or(0.0);
+            let _ = env.call_method(
+                canvas.as_obj(),
+                "drawText",
+                "(Ljava/lang/String;FFLandroid/graphics/Paint;)V",
+                &[(&jtext).into(), (x as f32).into(), ((y - ascent) as f32).into(), (&paint.as_obj()).into()],
+            );
+        }
+
+        fn text_extents_styled(
+            &self,
+            text: &str,
+            _font: &str,
+            size: f64,
+            _slant: i32,
+            weight: i32,
+        ) -> (f64, f64, f64, f64) {
+            // `&self` cannot drive JNI mutably; fall back to the monospace
+            // estimate (same values layout code already assumes).
+            let _ = (text, size, weight);
+            estimate_extents(text, size, weight)
+        }
+
+        fn clear(&mut self, r: f64, g: f64, b: f64, a: f64) {
+            let (env, canvas) = (&mut *self.env, &self.canvas);
+            let _ = env.call_method(
+                canvas.as_obj(),
+                "drawColor",
+                "(I)V",
+                &[Self::argb(a, r, g, b).into()],
+            );
+        }
+
+        fn save(&mut self) {
+            let (env, canvas) = (&mut *self.env, &self.canvas);
+            let _ = env.call_method(canvas.as_obj(), "save", "()I", &[]);
+        }
+
+        fn restore(&mut self) {
+            let (env, canvas) = (&mut *self.env, &self.canvas);
+            let _ = env.call_method(canvas.as_obj(), "restore", "()V", &[]);
+        }
+
+        fn clip(&mut self, x: f64, y: f64, w: f64, h: f64) {
+            let (env, canvas) = (&mut *self.env, &self.canvas);
+            let _ = env.call_method(
+                canvas.as_obj(),
+                "clipRect",
+                "(FFFF)Z",
+                &[(x as f32).into(), (y as f32).into(), ((x + w) as f32).into(), ((y + h) as f32).into()],
+            );
         }
     }
 
@@ -1161,6 +1449,14 @@ mod android_adapter {
         }
     }
 
+    impl ScrolledWindow {
+        /// Attach the sheet canvas to this container (the one real
+        /// parent-child edge Android needs: scrolled window -> canvas).
+        pub fn attach_canvas(&self, canvas: &Canvas) {
+            crate::backends::android::attach_child(self.0, canvas.0);
+        }
+    }
+
     impl AsRef<*mut c_void> for ScrolledWindow {
         fn as_ref(&self) -> &*mut c_void {
             &self.0
@@ -1281,20 +1577,24 @@ mod android_adapter {
     }
 
     pub fn create_canvas() -> Result<Canvas, Error> {
-        // No Java view yet: use a unique non-null id so per-canvas callback
-        // registries stay distinct. The Java SheetView replaces this when
-        // `create_canvas_view` lands.
-        static NEXT_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
-        let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(Canvas(id as *mut c_void))
+        // Real Java view (custom SheetView once registered, else a plain
+        // View) so the widget tree never holds a bogus handle. Callback
+        // registries key on the canvas id (see backend CANVAS_IDS map).
+        let (ptr, _canvas_id) = crate::backends::android::create_canvas_view()
+            .map_err(|e| Error::Backend(format!("{e}")))?;
+        Ok(Canvas(ptr as *mut c_void))
     }
 
     pub fn create_overlay() -> Result<Overlay, Error> {
-        Ok(Overlay(std::ptr::null_mut()))
+        let ptr = crate::backends::android::create_scrolled_view()
+            .map_err(|e| Error::Backend(format!("{e}")))?;
+        Ok(Overlay(ptr as *mut c_void))
     }
 
     pub fn create_scrolled_window() -> Result<ScrolledWindow, Error> {
-        Ok(ScrolledWindow(std::ptr::null_mut()))
+        let ptr = crate::backends::android::create_scrolled_view()
+            .map_err(|e| Error::Backend(format!("{e}")))?;
+        Ok(ScrolledWindow(ptr as *mut c_void))
     }
 
     pub fn create_dropdown(items: &[&str]) -> Result<DropDown, Error> {
