@@ -1,5 +1,20 @@
 # 0.7.0 – Windows 95 support (WIP); new release artifacts
 
+## Demo mode on the GUI backends
+- **`--movie` now works on the GUI backends**, not just the ratatui terminal.
+  The workbook parsing and op application are shared (`src/gui/movie.rs`), so a
+  movie reads identically whichever UI replays it; only the frame-painting half
+  is backend-specific (`src/gui/gui_movie.rs` for the widget backends,
+  `run_pancurses_movie` for pancurses).
+- **`--movie-frames DIR`** replays a movie through the GUI renderer and writes
+  one lossless image per frame, with no display server involved. Together with
+  the new `scripts/gui_movie.py` (which drives the run and encodes with ffmpeg)
+  this makes the demo video reproducible from a checkout; a recording is
+  checked in at `dist/corro-gui-movie.mp4`.
+- Movie pacing flags (`--movie-typing-cps`, `--movie-confirm-ms`,
+  `--movie-menu-hold-ms`) now parse on the CLI for every backend rather than
+  only being honored by the ratatui path.
+
 ## Changes
 - **Saving an unsaved document** no longer drops the auto‑added TOTALs. The untitled log (which Save renames verbatim onto the destination) was written as a bare header, so the in‑memory margin seeds — which have no committed edit op — vanished on reopen. It is now a complete serialization (all regions, seeds and LINKs included).
 - **Windows release exes** build with the GUI feature so Explorer double‑clicks open the NWG window. The exe stays console‑subsystem (so cmd/PowerShell wait for the TUI until \`Ctrl+Q\`); a throwaway Explorer console is detected (only our process attached) and hidden/freed at startup. Previously every modern Windows exe was console‑subsystem with no GUI to fall back to, or (briefly) linked GUI‑subsystem, which made the shell return to its prompt immediately while the TUI kept drawing into the same console.

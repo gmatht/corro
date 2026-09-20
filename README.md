@@ -12,6 +12,37 @@ There is now a working prototype release: [`0.0.1`](https://github.com/gmatht/co
 
 Replay locally at 4x with `asciinema play -s 4 docs/corro.cast`.
 
+## Demo mode (`--movie`)
+
+`--movie` replays a `.corro` log line by line — moving the cursor to each
+operation's cell, applying it, and holding the intermediate states long enough
+to watch. It works on every UI backend:
+
+```bash
+corro --movie docs/tests/subtotal.corro          # ratatui terminal
+corro --pancurses --movie docs/tests/subtotal.corro
+corro --gui --movie docs/tests/subtotal.corro    # native GUI
+```
+
+The GUI backends replay through the same renderer the interactive window uses,
+so the demo shows exactly what the app shows. Pacing is shared across
+backends: `--movie-typing-cps`, `--movie-confirm-ms`, `--movie-menu-hold-ms`.
+
+### Recording a video
+
+Because the GUI movie path paints into a raster surface, a video can be
+recorded with no display server and no screen-capture tooling:
+
+```bash
+cargo build --features gui
+scripts/gui_movie.py docs/tests/subtotal.corro -o dist/corro-gui-movie.mp4
+```
+
+`corro --gui --movie --movie-frames DIR FILE.corro` writes one lossless image
+per frame into `DIR`; `scripts/gui_movie.py` drives that run and encodes the
+frames with ffmpeg. A pre-built recording of the subtotal and multi-sheet
+workbooks is checked in at `dist/corro-gui-movie.mp4`.
+
 ## Current limitations
 
 This is still a rough prototype and has important limitations:

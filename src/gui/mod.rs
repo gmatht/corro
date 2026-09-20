@@ -1,7 +1,6 @@
 use crate::core::state::CoreApp;
 mod app_alias;
-use crate::grid::{CellAddr, SheetCursor, HEADER_ROWS, MARGIN_COLS};
-use crate::io::load_workbook_revisions_partial;
+use crate::grid::{CellAddr, SheetCursor, HEADER_ROWS, MARGIN_COLS};use crate::io::load_workbook_revisions_partial;
 use crate::io::PartialReplay;
 use std::path::Path;
 use crate::ops::WorkbookState;
@@ -17,12 +16,25 @@ pub mod edit;
 pub mod extrapolate;
 pub mod keymap;
 pub mod menu;
+pub mod movie;
 pub mod render;
 pub mod sheet;
 pub mod special_picker;
 
 #[cfg(any(feature = "gui", all(feature = "wasm", target_arch = "wasm32")))]
 mod gui_backend;
+#[cfg(any(feature = "gui", all(feature = "wasm", target_arch = "wasm32")))]
+pub mod gui_movie;
+/// Android backend: the JNI entry point + run loop the `corro_android`
+/// cdylib calls (see `android/corro/src/lib.rs`).
+///
+/// The widget tree itself is the shared [`gui_backend`] one; this module
+/// only roots it in the Activity's content view
+/// (`rswidgets::backends::android::init_with_layout`) instead of a desktop
+/// toplevel, and leaks the [`App`] because Android drives the event loop
+/// after the JNI call returns. `examples/android_ui.rs` builds the same
+/// tree on the host, and `rswidgets::android_generator` writes the Android
+/// resources the tree needs (`android/corro/build.rs`).
 #[cfg(all(feature = "gui", target_os = "android"))]
 pub mod android_backend;
 #[cfg(feature = "pancurses")]
@@ -257,6 +269,56 @@ impl App {
         &self.core.workbook
     }
 
+    /// A detached copy of this app's workbook state, for callers that need a
+    /// mutable `App` (the viewport controller trims column widths) without
+    /// mutating the app they are rendering.
+    ///
+    /// `--movie` uses it to compute each frame's layout: replaying a movie must
+    /// not perturb the workbook it is replaying, but the viewport math needs
+    /// `&mut App`. The clone is read-only from the caller's perspective —
+    /// nothing done to it is ever copied back.
+    #[cfg(any(feature = "gui", feature = "pancurses"))]
+    pub(crate) fn copy_for_layout(&self) -> App {
+        App {
+            core: CoreApp {
+                path: self.core.path.clone(),
+                import_source: self.core.import_source.clone(),
+                source_path: self.core.source_path.clone(),
+                revision_limit: self.core.revision_limit,
+                revision_browse: self.core.revision_browse,
+                revision_browse_limit: self.core.revision_browse_limit,
+                offset: self.core.offset,
+                state: self.core.state.clone(),
+                workbook: self.core.workbook.clone(),
+                cursor: self.core.cursor,
+                anchor: self.core.anchor,
+                watcher: None,
+                status: self.core.status.clone(),
+                ops_applied: self.core.ops_applied,
+                op_history: Vec::new(),
+                redo_history: Vec::new(),
+                view_sheet_id: self.core.view_sheet_id,
+                persisted_view_sort_cols: self.core.persisted_view_sort_cols.clone(),
+                linked_source_mtimes: Default::default(),
+                unsaved_file: None,
+                unsaved_auto_create: false,
+                exit_message: None,
+                clipboard_snapshot: None,
+                edit_target_addr: None,
+                edit_range_addrs: None,
+                pending_lost_edit: None,
+                pending_fit_to_content_on_commit: false,
+            },
+            rev_limit: self.rev_limit,
+            rev_browse: self.rev_browse,
+            backend: None,
+            extrapolate: None,
+            special_picker: None,
+            agg_picker: None,
+            agg_picker_target: None,
+        }
+    }
+
     pub fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(any(feature = "gui", all(feature = "wasm", target_arch = "wasm32")))]
         if self.backend.as_ref().map_or(true, |b| matches!(b, Backend::Gui)) {
@@ -267,6 +329,70 @@ impl App {
             return pnc_backend::run_pancurses(self);
         }
         Err("Unknown backend".into())
+    }
+
+    /// `--movie` on a GUI backend: replay the workbook line by line instead of
+    /// running interactively.
+    ///
+    /// The TUI has its own terminal-driving replayer; the GUI's lives in the
+    /// backend module because only the backend knows how to get a frame onto
+    /// the screen (a widget tree for `gui`, a pancurses window for
+    /// `pancurses`). The workbook parsing and op application are shared
+    /// ([`movie::GuiMovie`]) so both read identically.
+    #[cfg(any(feature = "gui", feature = "pancurses"))]
+    pub fn run_movie(
+        &mut self,
+        options: movie::GuiMovieOptions,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let path = self.movie_input_path()?;
+        let movie = movie::GuiMovie::new(&path)?;
+        match self.backend {
+            Some(Backend::Pancurses) => {
+                #[cfg(feature = "pancurses")]
+                {
+                    return pnc_backend::run_pancurses_movie(self, movie, options);
+                }
+                #[cfg(not(feature = "pancurses"))]
+                {
+                    return Err("pancurses UI not compiled in".into());
+                }
+            }
+            _ => {}
+        }
+        #[cfg(any(feature = "gui", all(feature = "wasm", target_arch = "wasm32")))]
+        {
+            return gui_movie::run_gui_movie(self, movie, options);
+        }
+        #[cfg(not(any(feature = "gui", all(feature = "wasm", target_arch = "wasm32"))))]
+        {
+            let _ = (movie, options);
+            Err("--movie needs a GUI backend (build with --features gui)".into())
+        }
+    }
+
+    /// Resolve and validate the `--movie` input path: the bound file, which
+    /// must exist and be a `.corro` log.
+    #[cfg(any(feature = "gui", feature = "pancurses"))]
+    fn movie_input_path(&self) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+        let Some(path) = self.core.path.clone().or(self.core.source_path.clone()) else {
+            return Err("--movie requires a .corro file path".into());
+        };
+        if !path.exists() {
+            return Err(format!("movie input does not exist: {}", path.display()).into());
+        }
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if ext != "corro" {
+            return Err(format!(
+                "--movie only supports .corro input (got {})",
+                if ext.is_empty() { "<none>" } else { ext.as_str() }
+            )
+            .into());
+        }
+        Ok(path)
     }
 
     pub fn take_final_exit_hint(&mut self) -> Option<String> {

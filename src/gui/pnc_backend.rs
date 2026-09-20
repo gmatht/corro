@@ -1225,3 +1225,167 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
 
 
 
+
+// ---------------------------------------------------------------------------
+// `--movie` replay (pancurses)
+// ---------------------------------------------------------------------------
+
+/// Replay a `.corro` movie in the pancurses backend.
+///
+/// The widget tree is the same one `run_pancurses` builds (menu bar, formula
+/// bar, sheet, hints) but built once for the whole replay: the movie driver
+/// then only pushes new workbook state into it per step and asks the backend
+/// to repaint. The backend's event loop runs on the main thread inside
+/// `rxapp.run()`; a frame hook drives one replay step per iteration, which
+/// keeps the repaint and the state change on the same thread (pancurses is
+/// not thread-safe) and lets the user still quit with `q`/Esc.
+pub fn run_pancurses_movie(
+    app: &mut super::App,
+    movie: super::movie::GuiMovie,
+    options: super::movie::GuiMovieOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    let _backend = rswidgets::backends::pancurses::init()
+        .map_err(|e| format!("pancurses init failed: {e}"))?;
+
+    let win = create_window()?;
+    win.set_title("corro");
+
+    // Geometry: reuse the same derivation as the interactive loop so a movie
+    // frame is laid out identically to a live session.
+    let (term_cols, term_rows) = {
+        let env_cols: Option<usize> = std::env::var("CORRO_TERM_COLS").ok().and_then(|s| s.parse().ok());
+        let env_rows: Option<usize> = std::env::var("CORRO_TERM_ROWS").ok().and_then(|s| s.parse().ok());
+        match (env_cols, env_rows) {
+            (Some(c), Some(r)) => (c, r),
+            _ => (std::env::var("COLUMNS").ok().and_then(|s| s.parse().ok()).unwrap_or(80), 50usize),
+        }
+    };
+    let data_width = term_cols
+        .saturating_sub(2)
+        .saturating_sub(ui_core::ROW_LABEL_CHARS)
+        .max(1);
+    let data_cols = data_width.checked_div(2).unwrap_or(1).max(1);
+    let data_rows = term_rows.saturating_sub(6).max(1);
+    let hr = HEADER_ROWS;
+
+    app.core.cursor.row = HEADER_ROWS;
+    app.core.cursor.col = MARGIN_COLS;
+    app.core.anchor = None;
+
+    let sheet_rec = app.core.workbook.active_sheet().clone();
+    let (display_rows, _) = ui_core::visible_row_indices(&sheet_rec, app.core.cursor, data_rows, 0);
+    let (mut col_ixs, _) = ui_core::visible_col_indices(&sheet_rec, app.core.cursor, data_cols, 0);
+    {
+        let sht = app.core.workbook.active_sheet_mut();
+        ui_core::trim_visible_cols_to_width(&mut sht.grid, &mut col_ixs, app.core.cursor.col, data_width);
+    }
+    let sheet_rec = app.core.workbook.active_sheet().clone();
+    let g = &sheet_rec.grid;
+    let mr = g.main_rows();
+    let mc = g.main_cols();
+    let lm = MARGIN_COLS;
+    let row_agg_func = compute::compute_row_agg_func(g, &display_rows, hr, mr);
+
+    let total_rows = display_rows.len() as u32;
+    let total_cols = col_ixs.len() as u32;
+    let spreadsheet = create_spreadsheet(total_rows, total_cols)?;
+    spreadsheet.set_row_labels(
+        display_rows
+            .iter()
+            .enumerate()
+            .map(|(idx, &r)| (idx as u32, crate::addr::ui_row_label(r, mr)))
+            .collect(),
+    );
+    spreadsheet.set_column_layout(
+        col_ixs
+            .iter()
+            .map(|&c| (c as u32, g.col_width(c).max(1) as u32, crate::addr::ui_column_fragment(c, mc)))
+            .collect(),
+    );
+    spreadsheet.set_grid_config(lm as u32, mc as u32);
+    spreadsheet.set_row_counts(hr as u32, mr as u32);
+    spreadsheet.set_menu_text(" [File]   Edit    Insert    Format    Sheet    Help");
+
+    win.set_child(&spreadsheet);
+    rswidgets::backends::pancurses::set_focus(spreadsheet.id());
+    win.present();
+
+    // The replay cursor: advanced by the frame hook, one step per tick.
+    let cursor: Rc<RefCell<usize>> = Rc::new(RefCell::new(0));
+    let next_at: Rc<RefCell<std::time::Instant>> =
+        Rc::new(RefCell::new(std::time::Instant::now()));
+    let movie = Rc::new(RefCell::new(movie));
+    let finished = Rc::new(RefCell::new(false));
+
+    let sheet_cb = spreadsheet.clone();
+    let app_ptr: *mut super::App = app;
+    let step_delay = options.confirm_delay().max(std::time::Duration::from_millis(60));
+
+    rswidgets::backends::pancurses::set_frame_hook(Some(Box::new(move || {
+        if *finished.borrow() {
+            return;
+        }
+        if std::time::Instant::now() < *next_at.borrow() {
+            return;
+        }
+        *next_at.borrow_mut() = std::time::Instant::now() + step_delay;
+
+        let i = *cursor.borrow();
+        let app = app_from_raw(app_ptr);
+        let mut movie_ref = movie.borrow_mut();
+        if i >= movie_ref.len() {
+            *finished.borrow_mut() = true;
+            app.core.status = format!("Movie complete: {} lines", movie_ref.applied);
+            sheet_cb.set_formula_bar_trailing(&format!("   ·  {}", app.core.status));
+            rswidgets::backends::pancurses::request_redraw();
+            return;
+        }
+        let step = match movie_ref.apply_step(
+            &mut app.core.workbook,
+            &mut app.core.view_sheet_id,
+            i,
+        ) {
+            Ok(frame) => frame,
+            Err(e) => {
+                *finished.borrow_mut() = true;
+                app.core.status = format!("Movie error: {e}");
+                sheet_cb.set_formula_bar_trailing(&format!("   ·  {}", app.core.status));
+                rswidgets::backends::pancurses::request_redraw();
+                return;
+            }
+        };
+        *cursor.borrow_mut() = i + 1;
+        app.core.state = app.core.workbook.active_sheet().clone();
+        app.core.ops_applied = movie_ref.applied;
+        if let Some(addr) = step.cursor.as_ref() {
+            app.core.cursor = super::movie::cursor_of(addr, &app.core.workbook);
+            let grid = &app.core.workbook.active_sheet().grid;
+            app.core.cursor.clamp(grid);
+        }
+        // Repaint from the replayed state (same viewport math as the live loop).
+        refresh_viewport_after_action(
+            app,
+            &sheet_cb,
+            sheet_cb.id(),
+            &Rc::new(RefCell::new(Vec::new())),
+            data_rows,
+            data_cols,
+            data_width,
+            hr,
+        );
+        let caption = if let Some((section, item)) = step.menu.as_ref() {
+            format!("{}/{}  {} ▸ {}  ·  {}", step.progress.0, step.progress.1, section, item, step.status)
+        } else {
+            format!("{}/{}  {}", step.progress.0, step.progress.1, step.status)
+        };
+        sheet_cb.set_formula_bar_trailing(&format!("   ·  {caption}"));
+        rswidgets::backends::pancurses::request_redraw();
+    })));
+
+    let res = run_pancurses(app);
+    rswidgets::backends::pancurses::set_frame_hook(None);
+    res
+}

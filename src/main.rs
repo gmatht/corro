@@ -43,6 +43,10 @@ struct Args {
     movie_typing_cps: f64,
     movie_confirm_ms: u64,
     movie_menu_hold_ms: u64,
+    /// GUI movie capture directory (`--movie-frames`): replay `--movie`
+    /// through the GUI renderer and write one image per frame, so a video can
+    /// be encoded without a display server.
+    movie_frames: Option<PathBuf>,
     show_help: bool,
     show_version: bool,
     debug_no_number: bool,
@@ -337,9 +341,10 @@ fn parse_args() -> Result<Args, String> {
     let mut revision = None;
     let mut export = None;
     let mut movie = false;
-    let movie_typing_cps = 22.0f64;
-    let movie_confirm_ms = 120u64;
-    let movie_menu_hold_ms = 1200u64;
+    let mut movie_typing_cps = 22.0f64;
+    let mut movie_confirm_ms = 120u64;
+    let mut movie_menu_hold_ms = 1200u64;
+    let mut movie_frames: Option<PathBuf> = None;
     let mut show_help = false;
     let mut show_version = false;
     let debug_no_number = false;
@@ -396,6 +401,36 @@ fn parse_args() -> Result<Args, String> {
             }
             "--movie" => {
                 movie = true;
+            }
+            "--movie-frames" => {
+                let Some(path) = it.next() else {
+                    return Err("--movie-frames requires a directory path".into());
+                };
+                movie_frames = Some(PathBuf::from(path));
+            }
+            "--movie-typing-cps" => {
+                let Some(v) = it.next() else {
+                    return Err("--movie-typing-cps requires a number".into());
+                };
+                movie_typing_cps = v
+                    .parse::<f64>()
+                    .map_err(|_| format!("--movie-typing-cps: not a number: {v}"))?;
+            }
+            "--movie-confirm-ms" => {
+                let Some(v) = it.next() else {
+                    return Err("--movie-confirm-ms requires a number".into());
+                };
+                movie_confirm_ms = v
+                    .parse::<u64>()
+                    .map_err(|_| format!("--movie-confirm-ms: not a number: {v}"))?;
+            }
+            "--movie-menu-hold-ms" => {
+                let Some(v) = it.next() else {
+                    return Err("--movie-menu-hold-ms requires a number".into());
+                };
+                movie_menu_hold_ms = v
+                    .parse::<u64>()
+                    .map_err(|_| format!("--movie-menu-hold-ms: not a number: {v}"))?;
             }
             "--ratatui" => {
                 #[cfg(any(all(target_os = "windows", not(target_family = "rust9x")), all(target_family = "unix", not(target_arch = "wasm32"))))]
@@ -508,6 +543,7 @@ fn parse_args() -> Result<Args, String> {
         movie_typing_cps,
         movie_confirm_ms,
         movie_menu_hold_ms,
+        movie_frames,
         show_help,
         show_version,
         debug_no_number,
@@ -946,6 +982,27 @@ fn try_main() -> (Result<(), Box<dyn std::error::Error>>, Option<String>) {
                 None,
             );
         }
+        if args.movie_frames.is_some() && !args.movie {
+            return (
+                Err("--movie-frames requires --movie".into()),
+                None,
+            );
+        }
+        // GUI movie capture is driven from the GUI branch below; make the
+        // requirement explicit rather than silently ignoring the directory.
+        #[cfg(feature = "gui")]
+        if args.movie_frames.is_some() && !matches!(args.ui, UiKind::Gui) {
+            return (
+                Err("--movie-frames needs the GUI backend (add --gui)".into()),
+                None,
+            );
+        }
+        // Publish the capture directory to the backend before it starts: the
+        // GUI movie runner reads CORRO_MOVIE_FRAMES, so the CLI stays the one
+        // place that knows the flag's spelling.
+        if let Some(dir) = args.movie_frames.as_ref() {
+            let _ = std::env::set_var("CORRO_MOVIE_FRAMES", dir);
+        }
     let (res, exit_msg) = match args.ui {
         #[cfg(feature = "ratatui")]
         UiKind::Ratatui => {
@@ -989,9 +1046,20 @@ fn try_main() -> (Result<(), Box<dyn std::error::Error>>, Option<String>) {
                 }
             };
             app.set_backend(corro::gui::Backend::Gui);
-            let res = match app.load_initial() {
-                Ok(()) => app.run(),
-                Err(e) => Err(e),
+            let res = if args.movie {
+                match app.load_initial() {
+                    Ok(()) => app.run_movie(corro::gui::movie::GuiMovieOptions {
+                        typing_cps: args.movie_typing_cps,
+                        confirm_delay_ms: args.movie_confirm_ms,
+                        menu_hold_ms: args.movie_menu_hold_ms,
+                    }),
+                    Err(e) => Err(e),
+                }
+            } else {
+                match app.load_initial() {
+                    Ok(()) => app.run(),
+                    Err(e) => Err(e),
+                }
             };
             let exit_msg = app.take_final_exit_hint();
             (res, exit_msg)
@@ -1007,9 +1075,20 @@ fn try_main() -> (Result<(), Box<dyn std::error::Error>>, Option<String>) {
             };
             #[cfg(feature = "pancurses")]
             app.set_backend(corro::gui::Backend::Pancurses);
-            let res = match app.load_initial() {
-                Ok(()) => app.run(),
-                Err(e) => Err(e),
+            let res = if args.movie {
+                match app.load_initial() {
+                    Ok(()) => app.run_movie(corro::gui::movie::GuiMovieOptions {
+                        typing_cps: args.movie_typing_cps,
+                        confirm_delay_ms: args.movie_confirm_ms,
+                        menu_hold_ms: args.movie_menu_hold_ms,
+                    }),
+                    Err(e) => Err(e),
+                }
+            } else {
+                match app.load_initial() {
+                    Ok(()) => app.run(),
+                    Err(e) => Err(e),
+                }
             };
             let exit_msg = app.take_final_exit_hint();
             (res, exit_msg)
@@ -1054,6 +1133,8 @@ OPTIONS:\n\
   --movie-typing-cps <N>    Movie typing speed in chars/sec (default: 22)\n\
   --movie-confirm-ms <N>    Delay before Enter/confirm per line (default: 120)\n\
   --movie-menu-hold-ms <N>  Hold menu/dialog moments in movie mode (default: 1200)\n\
+  --movie-frames <DIR>      GUI movie: write one image per frame to DIR\n\
+                            (encode with scripts/gui_movie.py; needs --gui)\n\
 {}",
         env!("CARGO_PKG_VERSION"),
         ui_opts,
@@ -1350,6 +1431,7 @@ mod tests {
         let mut movie_typing_cps = 22.0f64;
         let mut movie_confirm_ms = 120u64;
         let mut movie_menu_hold_ms = 1200u64;
+        let mut movie_frames: Option<PathBuf> = None;
         let mut show_help = false;
         let mut show_version = false;
         let mut positional = Vec::new();
@@ -1411,6 +1493,10 @@ mod tests {
                     let next = next.into().to_string_lossy().into_owned();
                     movie_menu_hold_ms = next.parse::<u64>().expect("valid movie menu hold delay");
                 }
+                "--movie-frames" => {
+                    let next = rest.next().expect("movie frames dir");
+                    movie_frames = Some(PathBuf::from(next.into().to_string_lossy().into_owned()));
+                }
                 _ if arg.starts_with('-') => panic!("unexpected option"),
                 _ => positional.push(arg),
             }
@@ -1426,6 +1512,7 @@ mod tests {
             movie_typing_cps,
             movie_confirm_ms,
             movie_menu_hold_ms,
+            movie_frames,
             show_help,
             show_version,
             debug_no_number: false,
