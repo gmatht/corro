@@ -48,6 +48,12 @@ pub mod backends_nwg_adapter;
 pub mod backends_wasm_adapter;
 #[cfg(all(target_os = "android", not(feature = "zork")))]
 pub mod backends_android_adapter;
+/// Android resource generation for downstream app crates: a `build.rs` can
+/// call [`android_generator::run`] to materialise a Material 3 theme, the
+/// palette it references, an adaptive launcher icon and a manifest when the
+/// app has not provided its own. Additive by design (never overwrites).
+/// See `docs/ANDROID_GUIDELINES.md`.
+pub mod android_generator;
 #[cfg(feature = "pancurses")]
 pub mod backends_pancurses_adapter;
 #[cfg(feature = "pancurses")]

@@ -3272,6 +3272,35 @@ fn handle_menu_action(name: &str, state: &Rc<GuiState>) {
 // ---------------------------------------------------------------------------
 
 fn on_formula_entry_changed(state: &GuiState) {
+    // Android has no key-event path for soft-keyboard typing: the
+    // TextWatcher is the ONLY signal that the user typed. Desktop sets
+    // `editing` from its key handlers before the entry text changes, so a
+    // non-editing change there is always programmatic (formula refresh)
+    // and must be ignored. On Android, entry text that differs from the
+    // committed cell value can only be user input, so adopt it as a fresh
+    // edit (mirrors start_edit_with on first keystroke).
+    #[cfg(target_os = "android")]
+    if !state.editing.get() {
+        if let Some(text) = state.formula_entry.get_text() {
+            let app = state.app_ref();
+            let grid = &app.core.workbook.active_sheet().grid;
+            let addr = crate::addr::sheet_cursor_to_addr(
+                crate::addr::LogicalRow(state.last_row.get()),
+                crate::addr::GlobalCol(state.last_col.get()),
+                crate::addr::MainRows(grid.main_rows()),
+                crate::addr::MainCols(grid.main_cols()),
+            );
+            let committed = grid.get(&addr).unwrap_or_default();
+            if !text.is_empty() && text != committed {
+                state.editing.set(true);
+            } else {
+                return;
+            }
+        } else {
+            return;
+        }
+    }
+    #[cfg(not(target_os = "android"))]
     if !state.editing.get() {
         return;
     }

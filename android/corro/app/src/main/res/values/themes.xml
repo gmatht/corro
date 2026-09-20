@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">corro</string>
+
+    <!-- Brand palette: spreadsheet green, Material 3 tonal roles. -->
+    <color name="brand_seed">#2E7D32</color>
+    <color name="brand_surface_light">#F7FAF4</color>
+    <color name="brand_surface_dark">#101510</color>
+
+    <style name="Theme.Corro" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="colorPrimary">@color/brand_seed</item>
+        <item name="android:windowBackground">@color/brand_surface_light</item>
+        <item name="android:statusBarColor">?attr/colorSurface</item>
+        <item name="android:navigationBarColor">?attr/colorSurface</item>
+    </style>
+</resources>

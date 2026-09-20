@@ -68,6 +68,9 @@ mod android_backend {
             .and_then(|obj| env.new_global_ref(&obj))
         {
             let _ = APP_CLASS_LOADER.set(loader);
+            logcat_rs("APP_CLASS_LOADER captured");
+        } else {
+            logcat_rs("APP_CLASS_LOADER capture FAILED");
         }
 
         JAVA_VM.set(vm).map_err(|_| "JAVA_VM already initialized")?;
@@ -597,12 +600,36 @@ mod android_backend {
                 }
             };
             let listener = env.new_object(&cls, &sig, &[(entry_ptr as i64).into()])?;
+            crate::backends::android::logcat_rs("editor-action listener created");
             env.call_method(
                 &entry,
                 "setOnEditorActionListener",
                 "(Landroid/widget/TextView$OnEditorActionListener;)V",
                 &[(&listener).into()],
             )?;
+            // Hardware/adb-injected Enter arrives as a raw key event, never
+            // as an editor action: attach the key fallback too. Same class
+            // loader, same native callback.
+            let key_cls = load_app_class(env, "com/corro/CorroKeyListener").ok();
+            if let Some(key_cls) = key_cls {
+                crate::backends::android::logcat_rs("key-listener class resolved");
+                if let Ok(key_listener) =
+                    env.new_object(&key_cls, "(J)V", &[(entry_ptr as i64).into()])
+                {
+                    let _ = env.call_method(
+                        &entry,
+                        "setOnKeyListener",
+                        "(Landroid/view/View$OnKeyListener;)V",
+                        &[(&key_listener).into()],
+                    );
+                    crate::backends::android::logcat_rs("key-listener attached");
+                } else {
+                    let _ = env.exception_clear();
+                    crate::backends::android::logcat_rs("key-listener new_object FAILED");
+                }
+            } else {
+                crate::backends::android::logcat_rs("key-listener class NOT FOUND");
+            }
             Ok::<_, Box<dyn StdError + Send + Sync>>(())
         });
     }

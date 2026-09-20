@@ -76,3 +76,14 @@ pub extern "system" fn Java_com_corro_CorroEditorAction_nativeEntryActivate(
 ) {
     rswidgets::backends_android_adapter::dispatch_entry_activate(view_ptr as usize as *mut _);
 }
+
+/// Called from `CorroKeyListener.onKey` (hardware/adb Enter): same commit
+/// path as the IME action above.
+#[no_mangle]
+pub extern "system" fn Java_com_corro_CorroKeyListener_nativeEntryActivate(
+    _env: JNIEnv,
+    _class: JClass,
+    view_ptr: i64,
+) {
+    rswidgets::backends_android_adapter::dispatch_entry_activate(view_ptr as usize as *mut _);
+}

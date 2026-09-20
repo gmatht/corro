@@ -534,6 +534,7 @@ mod android_adapter {
 
     /// Called from the Java TextWatcher: run the registered change callback.
     pub fn dispatch_text_changed(entry_ptr: *mut c_void) {
+        crate::backends::android::logcat_rs("dispatch_text_changed fired");
         let mut map = TEXT_CHANGED.lock().unwrap();
         if let Some(SendTextChanged(ptr)) = map.get_mut(&(entry_ptr as usize)) {
             let cb: &mut dyn FnMut() = unsafe { &mut **ptr };
@@ -543,6 +544,7 @@ mod android_adapter {
 
     /// Called from the Java OnEditorActionListener (IME "Done"/Enter).
     pub fn dispatch_entry_activate(entry_ptr: *mut c_void) {
+        crate::backends::android::logcat_rs("dispatch_entry_activate fired");
         let mut map = ENTRY_ACTIVATE.lock().unwrap();
         if let Some(SendEntryActivate(ptr)) = map.get_mut(&(entry_ptr as usize)) {
             let cb: &mut dyn FnMut(*mut c_void) = unsafe { &mut **ptr };
