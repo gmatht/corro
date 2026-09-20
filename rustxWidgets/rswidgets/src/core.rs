@@ -420,7 +420,7 @@ use std::rc::Rc;
 /// to stderr, then re-raise with the default handler.
 /// On non-Unix platforms this is a no-op.
 pub fn install_debug_crash_handlers() {
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "android")))]
     unsafe {
         extern "C" fn sigabrt_handler(_sig: i32) {
             unsafe {
@@ -441,7 +441,9 @@ pub fn install_debug_crash_handlers() {
         libc::signal(libc::SIGABRT, sigabrt_handler as *const () as usize);
         libc::signal(libc::SIGSEGV, sigsegv_handler as *const () as usize);
     }
-    #[cfg(not(unix))]
+    // Android's libc has no `backtrace()`; crash reporting goes through
+    // logcat instead, so there is nothing to install here.
+    #[cfg(any(not(unix), target_os = "android"))]
     {
         let _ = ();
     }
@@ -452,7 +454,7 @@ unsafe fn write_stderr(msg: &[u8]) {
     libc::write(libc::STDERR_FILENO, msg.as_ptr() as *const libc::c_void, msg.len());
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "android")))]
 unsafe fn write_backtrace_to_stderr() {
     const SIZE: usize = 128;
     let mut buf: [*mut libc::c_void; SIZE] = std::mem::zeroed();
@@ -1174,6 +1176,46 @@ pub fn create_label(&self, text: &str) -> Result<crate::backends_android_adapter
 }
 
 #[cfg(all(target_os = "android", not(feature = "zork")))]
+pub fn create_box(&self, orientation: crate::backends_android_adapter::Orientation, spacing: i32) -> Result<crate::backends_android_adapter::BoxWidget, Error> {
+    crate::backends_android_adapter::create_box(orientation, spacing)
+}
+
+#[cfg(all(target_os = "android", not(feature = "zork")))]
+pub fn create_entry(&self) -> Result<crate::backends_android_adapter::Entry, Error> {
+    crate::backends_android_adapter::create_entry()
+}
+
+#[cfg(all(target_os = "android", not(feature = "zork")))]
+pub fn create_menu(&self) -> Result<crate::backends_android_adapter::Menu, Error> {
+    crate::backends_android_adapter::create_menu()
+}
+
+#[cfg(all(target_os = "android", not(feature = "zork")))]
+pub fn create_menubar(&self, model: &crate::backends_android_adapter::Menu, action_group: *mut c_void) -> Result<crate::backends_android_adapter::MenuBar, Error> {
+    crate::backends_android_adapter::create_menubar(model, action_group)
+}
+
+#[cfg(all(target_os = "android", not(feature = "zork")))]
+pub fn create_simple_action(&self, name: &str) -> Result<crate::backends_android_adapter::SimpleAction, Error> {
+    crate::backends_android_adapter::create_simple_action(name)
+}
+
+#[cfg(all(target_os = "android", not(feature = "zork")))]
+pub fn create_canvas(&self) -> Result<crate::backends_android_adapter::Canvas, Error> {
+    crate::backends_android_adapter::create_canvas()
+}
+
+#[cfg(all(target_os = "android", not(feature = "zork")))]
+pub fn create_overlay(&self) -> Result<crate::backends_android_adapter::Overlay, Error> {
+    crate::backends_android_adapter::create_overlay()
+}
+
+#[cfg(all(target_os = "android", not(feature = "zork")))]
+pub fn create_scrolled_window(&self) -> Result<crate::backends_android_adapter::ScrolledWindow, Error> {
+    crate::backends_android_adapter::create_scrolled_window()
+}
+
+#[cfg(all(target_os = "android", not(feature = "zork")))]
 pub fn create_grid(&self) -> Result<crate::backends_android_adapter::Grid, Error> {
     crate::backends_android_adapter::create_grid()
 }
@@ -1230,6 +1272,11 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
             let inner = crate::backends_wasm_adapter::create_window()?;
             Ok(crate::common::Window { inner })
         }
+        #[cfg(all(target_os = "android", not(feature = "zork")))]
+        {
+            let inner = crate::backends_android_adapter::create_window()?;
+            Ok(crate::common::Window { inner })
+        }
     }
 
     /// Create a new layout Box.
@@ -1263,6 +1310,15 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
             let inner = crate::backends_wasm_adapter::create_box(orientation, spacing)?;
             Ok(crate::common::WidgetBox { inner })
         }
+        #[cfg(all(target_os = "android", not(feature = "zork")))]
+        {
+            let android_orient = match orientation {
+                crate::common::Orientation::Horizontal => crate::backends_android_adapter::Orientation::Horizontal,
+                crate::common::Orientation::Vertical => crate::backends_android_adapter::Orientation::Vertical,
+            };
+            let inner = crate::backends_android_adapter::create_box(android_orient, spacing)?;
+            Ok(crate::common::WidgetBox { inner })
+        }
     }
 
     /// Create a new Label with the given text.
@@ -1287,6 +1343,11 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
         #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
         {
             let inner = crate::backends_wasm_adapter::create_label(text)?;
+            Ok(crate::common::Label { inner })
+        }
+        #[cfg(all(target_os = "android", not(feature = "zork")))]
+        {
+            let inner = crate::backends_android_adapter::create_label(text)?;
             Ok(crate::common::Label { inner })
         }
     }
@@ -1314,6 +1375,11 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
             let inner = crate::backends_wasm_adapter::create_entry()?;
             Ok(crate::common::Entry { inner })
         }
+        #[cfg(all(target_os = "android", not(feature = "zork")))]
+        {
+            let inner = crate::backends_android_adapter::create_entry()?;
+            Ok(crate::common::Entry { inner })
+        }
     }
 
     /// Create a new Canvas (custom drawing surface).
@@ -1337,6 +1403,11 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
         #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
         {
             let inner = crate::backends_wasm_adapter::create_canvas()?;
+            Ok(crate::common::Canvas { inner })
+        }
+        #[cfg(all(target_os = "android", not(feature = "zork")))]
+        {
+            let inner = crate::backends_android_adapter::create_canvas()?;
             Ok(crate::common::Canvas { inner })
         }
     }
@@ -1391,6 +1462,11 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
             let inner = crate::backends_wasm_adapter::create_menu()?;
             Ok(crate::common::Menu { inner })
         }
+        #[cfg(all(target_os = "android", not(feature = "zork")))]
+        {
+            let inner = crate::backends_android_adapter::create_menu()?;
+            Ok(crate::common::Menu { inner })
+        }
     }
 
     /// Create a new SimpleAction that will dispatch to the given name.
@@ -1414,6 +1490,11 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
         #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
         {
             let inner = crate::backends_wasm_adapter::create_simple_action(name)?;
+            Ok(crate::common::SimpleAction { inner })
+        }
+        #[cfg(all(target_os = "android", not(feature = "zork")))]
+        {
+            let inner = crate::backends_android_adapter::create_simple_action(name)?;
             Ok(crate::common::SimpleAction { inner })
         }
     }
@@ -1441,6 +1522,11 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
         #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
         {
             let inner = crate::backends_wasm_adapter::create_menubar(&model.inner, action_group)?;
+            Ok(crate::common::MenuBar { inner })
+        }
+        #[cfg(all(target_os = "android", not(feature = "zork")))]
+        {
+            let inner = crate::backends_android_adapter::create_menubar(&model.inner, _action_group)?;
             Ok(crate::common::MenuBar { inner })
         }
     }
@@ -1489,6 +1575,11 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
         #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
         {
             let inner = crate::backends_wasm_adapter::create_dialog()?;
+            Ok(crate::common::Dialog { inner })
+        }
+        #[cfg(all(target_os = "android", not(feature = "zork")))]
+        {
+            let inner = crate::backends_android_adapter::create_dialog()?;
             Ok(crate::common::Dialog { inner })
         }
     }

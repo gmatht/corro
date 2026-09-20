@@ -16,7 +16,9 @@ pub use crate::common::{Window, WidgetBox, Label, Entry, Canvas, Menu, MenuBar, 
 #[cfg(all(target_arch = "wasm32", not(feature = "pancurses"), not(feature = "zork")))]
 pub use crate::backends_wasm_adapter::{Button, Grid, DropDown, CheckButton, RadioButton, TextView, Overlay, ScrolledWindow};
 #[cfg(all(target_os = "android", not(feature = "zork")))]
-pub use crate::backends_android_adapter::{Window, Button, Label, Grid, DropDown, CheckButton, RadioButton, Dialog, TextView};
+pub use crate::common::{Window, WidgetBox, Label, Entry, Canvas, Menu, MenuBar, SimpleAction, Dialog, Orientation};
+#[cfg(all(target_os = "android", not(feature = "zork")))]
+pub use crate::backends_android_adapter::{Button, Grid, DropDown, CheckButton, RadioButton, Dialog as AndroidDialog, TextView, Overlay, ScrolledWindow};
 #[cfg(feature = "pancurses")]
 pub use crate::backends_pancurses_adapter::{Window, Button, Label, BoxWidget, Grid, Entry, Menu, MenuBar, SimpleAction, Dialog, DropDown, CheckButton, RadioButton, TextView, Orientation, Spreadsheet};
 #[cfg(feature = "pancurses")]
