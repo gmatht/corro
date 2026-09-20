@@ -887,6 +887,10 @@ mod android_adapter {
         pub fn connect_changed(&self, _f: impl FnMut() + 'static) -> Result<u64, Error> {
             Ok(0) // TODO: OnItemSelectedListener via JNI trampoline
         }
+
+        pub fn set_hexpand(&self, _expand: bool) {}
+        pub fn set_vexpand(&self, _expand: bool) {}
+        pub fn grab_focus(&self) {}
     }
 
     impl Clone for DropDown {
@@ -1069,6 +1073,9 @@ mod android_adapter {
         pub fn connect_response(&self, _f: impl FnMut(i32) + 'static) -> Result<u64, Error> {
             Ok(0) // TODO: DialogInterface.OnClickListener via JNI trampoline
         }
+
+        /// Default focused button. No-op until response trampolines land.
+        pub fn set_default_response(&self, _response_id: i32) {}
 
         pub fn close(&self) {}
     }

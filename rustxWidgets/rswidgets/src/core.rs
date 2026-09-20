@@ -1216,6 +1216,23 @@ pub fn create_scrolled_window(&self) -> Result<crate::backends_android_adapter::
 }
 
 #[cfg(all(target_os = "android", not(feature = "zork")))]
+pub fn open_file(&self, _title: &str) -> Result<Option<String>, Error> {
+    Ok(None) // File dialogs not available on Android (content URIs instead)
+}
+#[cfg(all(target_os = "android", not(feature = "zork")))]
+pub fn open_file_filtered(&self, _title: &str, _filters: &[(&str, &[&str])]) -> Result<Option<String>, Error> {
+    Ok(None) // File dialogs not available on Android (content URIs instead)
+}
+#[cfg(all(target_os = "android", not(feature = "zork")))]
+pub fn save_file(&self, _title: &str) -> Result<Option<String>, Error> {
+    Ok(None) // File dialogs not available on Android (content URIs instead)
+}
+#[cfg(all(target_os = "android", not(feature = "zork")))]
+pub fn save_file_filtered(&self, _title: &str, _filters: &[(&str, &[&str])], _current_name: &str) -> Result<Option<String>, Error> {
+    Ok(None) // File dialogs not available on Android (content URIs instead)
+}
+
+#[cfg(all(target_os = "android", not(feature = "zork")))]
 pub fn create_grid(&self) -> Result<crate::backends_android_adapter::Grid, Error> {
     crate::backends_android_adapter::create_grid()
 }
