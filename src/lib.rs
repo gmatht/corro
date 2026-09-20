@@ -27,6 +27,15 @@ pub use ui_core::format_cell_display;
 
 #[cfg(feature = "ratatui")]
 pub mod ui;
+/// The rswidgets GUI backends: `gui_backend` holds the shared widget tree
+/// (menus, formula bar, sheet canvas, tabs) and is the reference fork every
+/// other backend follows.
+///
+/// Enabled by `gui` (desktop GTK, and the base for pancurses / wasm) and by
+/// `pancurses`. On `target_os = "android"` the `gui` feature additionally
+/// exposes [`gui::android_backend`], which drives the same tree from the
+/// Activity's content view via JNI (see `android/corro`). `examples/
+/// android_ui.rs` builds that tree standalone for inspection.
 #[cfg(any(feature = "gui", feature = "pancurses", target_arch = "wasm32"))]
 pub mod gui;
 #[cfg(feature = "rswidgets-term")]

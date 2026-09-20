@@ -22,10 +22,13 @@ CORRO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BUILD_DIR="/tmp/corro_apk_build"
 rm -rf "$BUILD_DIR" && mkdir -p "$BUILD_DIR"/{classes,dex,staging}
 
-# 1. Build Rust .so (corro cdylib + spreadsheet pipeline, gui feature)
+# 1. Build Rust .so (corro cdylib + spreadsheet pipeline, gui feature).
+# `generate-android-resources` runs rswidgets::android_generator from build.rs
+# (additive: existing resources are never overwritten) so the APK's icon,
+# theme, palette, strings and manifest stay reproducible.
 echo "==> Building Rust .so for $TRIPLE..."
 cd "$CORRO_ROOT/android/corro"
-cargo ndk -t "$TARGET" build --release 2>&1 | tail -1
+cargo ndk -t "$TARGET" build --release --features generate-android-resources 2>&1 | tail -1
 
 # 2. Compile Java sources
 echo "==> Compiling Java..."

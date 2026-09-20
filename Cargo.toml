@@ -33,6 +33,18 @@ version = "0.7.0"
 edition = "2021"
 default-run = "corro"
 
+# ratatui =  terminal UI (default)
+# gui      =  rswidgets desktop GUI (GTK on Linux/Windows), and the base for
+#             the other rswidgets hosts: the pancurses, combined-gui and
+#             wasm builds below, plus the Android backend.
+#
+# Android uses the `gui` feature too: the corro_android cdylib
+# (android/corro) builds about-corro with `features = ["gui"]` for the
+# Android target triple against the NDK, and on `target_os = "android"`
+# src/gui/android_backend.rs roots the same widget tree in the Activity's
+# content view rather than a desktop toplevel. See
+# rustxWidgets/docs/ANDROID_GUIDELINES.md and `cargo run --example android-ui
+# --features gui` for the tree itself.
 [features]
 default = ["ratatui"]
 nightly = []
@@ -156,6 +168,17 @@ required-features = ["ratatui"]
 name = "test-ref"
 path = "examples/test_ref.rs"
 required-features = ["ratatui"]
+
+# Builds the rswidgets widget tree the Android GUI path builds (same
+# children, same order), standing in for the Activity's root layout so the
+# UI structure can be inspected on a desktop. Needs the GUI feature; on
+# Android the tree is rooted at the Activity content view instead (see
+# src/gui/android_backend.rs and android/corro). Android resources for that
+# tree come from rswidgets::android_generator via android/corro/build.rs.
+[[example]]
+name = "android-ui"
+path = "examples/android_ui.rs"
+required-features = ["gui"]
 
 [profile.release]
 opt-level = "z"

@@ -24,6 +24,21 @@ Two ways to run it:
   `rswidgets::android_generator::run()` from the crate that owns the
   Android project. It reads `RSWIDGETS_ANDROID_PROJECT` (default
   `../android/corro` relative to that crate) and never fails the build.
+  `android/corro/build.rs` is the worked example: because a build script
+  cannot depend on the crate whose `src/` it lives in, it
+  `#[path]`-includes `rustxWidgets/rswidgets/src/android_generator.rs`
+  directly (the same source rswidgets' own `build.rs` includes), so it
+  needs no `[build-dependencies]` entry at all. It sets
+  `RSWIDGETS_ANDROID_PROJECT` to its own manifest directory (the root
+  *containing* `app/`) unless the caller exported one, and is enabled by
+  `--features generate-android-resources` (which `build_apk.sh` passes).
+
+  Do **not** add rswidgets as a `[build-dependencies]` entry of a crate
+  that also depends on it as a library: cargo then hands the library unit
+  the build dependency's feature set (`default-features = false`, i.e. no
+  `gtk`) while resolving its build-script output from the library edge,
+  and the host crate fails on `crate::backends::init`. Reproduced with
+  cargo 1.100.0-nightly and `cargo -vv`; including the source avoids it.
 * **Manually / CI**: `AndroidProject::new(root).generate()` returns the
   paths it created, so a release script can report or verify them.
 
@@ -43,7 +58,28 @@ keeps them untouched. Delete a generated file to have it recreated.
 * It does not generate the Java/Kotlin side. The app supplies
   `MainActivity` and the shims named in §3.
 
-## 2. The Java/Kotlin side the backend calls into
+## 2. Building the tree without Android
+
+The Android path builds the *same* widget tree as every other rswidgets
+host — only the root differs (the Activity's content view instead of a
+toplevel). To inspect that tree on a desktop, build it against the normal
+backend and skip the event loop; `corro/examples/android_ui.rs` does this
+for corro:
+
+```text
+cargo run --example android-ui --features gui
+```
+
+It creates the menu bar from the shared menu definition, the formula bar
+(address label + `fx` label + expanding entry + status label), the sheet
+canvas, the tab strip and the status line — in the order
+`gui_backend::run_gui` appends them — then presents and returns. Nothing
+Android-specific is compiled, so this runs anywhere the GUI feature builds
+(use `xvfb-run` on a headless machine). Useful for checking that a
+layout/order change is what you meant before rebuilding the APK, where the
+edit-build-install cycle is far slower.
+
+## 3. The Java/Kotlin side the backend calls into
 
 | Class | Contract |
 |---|---|
@@ -60,7 +96,7 @@ Every `native*` declaration needs its own `#[no_mangle]` export in the
 cdylib — including when two shims share one Rust dispatch. A missing export
 only shows up at runtime as `UnsatisfiedLinkError`.
 
-## 3. Threading
+## 4. Threading
 
 * Everything runs on the Android UI thread: `onDraw`, touch, text watchers,
   editor actions, and every Rust closure they call.
@@ -72,7 +108,7 @@ only shows up at runtime as `UnsatisfiedLinkError`.
   registry mutex plus single-threaded dispatch. Never invoke them from
   another thread.
 
-## 4. Handles and registries
+## 5. Handles and registries
 
 * Widgets are `#[repr(transparent)]` over a raw `jobject` kept alive by a
   `GlobalRef` in `KEEP_ALIVE`. Never store a local ref; reconstruct
@@ -86,7 +122,7 @@ only shows up at runtime as `UnsatisfiedLinkError`.
   (`load_app_class`). `JNIEnv::find_class` on an attached thread uses the
   system loader and cannot see app classes.
 
-## 5. Layout and text
+## 6. Layout and text
 
 * Android has no expand flags: `set_hexpand` / `set_vexpand` /
   `set_width_chars` are recorded and honoured by `BoxWidget::append` as
@@ -100,7 +136,7 @@ only shows up at runtime as `UnsatisfiedLinkError`.
 * `drawText` takes a baseline: offset by `ascent` to keep the shared
   top-left convention.
 
-## 6. Input paths differ
+## 7. Input paths differ
 
 * Soft-keyboard typing arrives only via the `TextWatcher`.
 * IME Done/Enter arrives via `OnEditorActionListener`.
@@ -111,7 +147,7 @@ only shows up at runtime as `UnsatisfiedLinkError`.
   that differs from the committed cell value starts an edit; programmatic
   formula refreshes set entry == cell and are ignored.
 
-## 7. Debugging
+## 8. Debugging
 
 `logcat_rs` (tag `rswidgets`) and the host app's own logcat helper are
 best-effort and silently dropped before init. Keep permanent call sites to

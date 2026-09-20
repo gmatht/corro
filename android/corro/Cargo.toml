@@ -2,6 +2,13 @@
 name = "corro_android"
 version = "0.7.0"
 edition = "2021"
+# The Android resource generator (icon, Material 3 theme, palette, strings,
+# manifest) runs from this crate's build.rs. It is dependency-free: the
+# script `#[path]`-includes `rswidgets/src/android_generator.rs` from this
+# checkout, the same pattern rswidgets' own build.rs uses — see the note in
+# build.rs and rustxWidgets/docs/ANDROID_GUIDELINES.md §1. Additive: it only
+# writes files the app does not already ship, and never fails the build.
+build = "build.rs"
 
 # Standalone crate (NOT in the corro workspace): it builds against the
 # Android NDK target with its own feature set, mirroring
@@ -11,7 +18,23 @@ edition = "2021"
 [lib]
 crate-type = ["cdylib"]
 
+[features]
+# Generate the Android resources into this crate's project root. Off by
+# default; `build_apk.sh` enables it. (The generator also runs whenever
+# RSWIDGETS_ANDROID_PROJECT is exported, feature or not.)
+generate-android-resources = []
+
 [dependencies]
 corro = { path = "../..", features = ["gui"] }
 rswidgets = { path = "../../rustxWidgets/rswidgets", default-features = false }
 jni = { version = "0.21", default-features = false }
+
+# NOTE: rswidgets is deliberately NOT also a [build-dependencies] entry here.
+# Doing so (optional or not) makes cargo hand the rswidgets *lib* unit that
+# corro links the build-dependency's feature set — default-features = false,
+# i.e. no `gtk` — while still resolving that unit's build-script output from
+# the lib-dependency edge, so corro fails with "cannot find function `init`
+# in module `crate::backends`". Reproduced with `cargo -vv` on this cargo
+# (1.100.0-nightly): the lib unit carries `--cfg feature="headless"` only,
+# yet its OUT_DIR points at the build-script run of the `gtk,headless` unit.
+# Including the generator source (build.rs) needs no dependency at all.
