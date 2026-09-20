@@ -1,0 +1,19 @@
+# 0.7.0 – Windows 95 support (WIP); new release artifacts
+
+## Changes
+- **Saving an unsaved document** no longer drops the auto‑added TOTALs. The untitled log (which Save renames verbatim onto the destination) was written as a bare header, so the in‑memory margin seeds — which have no committed edit op — vanished on reopen. It is now a complete serialization (all regions, seeds and LINKs included).
+- **Windows release exes** build with the GUI feature so Explorer double‑clicks open the NWG window. The exe stays console‑subsystem (so cmd/PowerShell wait for the TUI until \`Ctrl+Q\`); a throwaway Explorer console is detected (only our process attached) and hidden/freed at startup. Previously every modern Windows exe was console‑subsystem with no GUI to fall back to, or (briefly) linked GUI‑subsystem, which made the shell return to its prompt immediately while the TUI kept drawing into the same console.
+- **Windows now redirects stderr** to the debug log (like the existing Unix `dup2`), so debug/instrumentation traces can never overwrite the TUI; `%LOCALAPPDATA%\corro\debug.log` is used when no `CORRO_DEBUG_LOG`/`XDG_STATE_HOME`/`HOME` is set.
+- **pancurses+ratatui+gui** now combine on Linux and Windows (triple combo builds and runs every UI). `rswidgets` resolves its default backend native‑first as documented (`pancurses` stays reachable via `backends::pancurses::init()`); the NWG adapter stack is available alongside pancurses on Windows, and corro's native GUI code names the platform adapter + common wrappers explicitly instead of the flipping root prelude. Previously the combo failed to compile (17 errors Linux, 19 Windows) and Linux `--gui` died with “loader not initialized”.
+
+### Release artifacts for this version
+- **Linux**: `gcorro.gz` (GTK GUI, runtime‑dlopen) and `corro-no-gui.gz` (terminal UI), both linked for glibc 2.17, alongside `corro.gz`.
+
+#### WIP / not shipped
+- **Windows 95 support**. The pancurses TUI backend renders and takes input on Win95 (PDCurses win32 console flavour, ANSI APIs; wait‑based input poll; key‑code mapping for non‑WIDE PDCurses), and the native NWG GUI builds for Win95 (`/SUBSYSTEM:WINDOWS`, `WinMain` entry). This is **NOT** part of the 0.7.0 release: it cannot be built on CI (rust9x toolchain + VC6 libs are local‑only) and is not gated by the test suite, so no `corro-no-gui-win95.exe.zip` / `gcorro-win95.exe.zip` is published for 0.7.0. Treat the `i586‑rust9x` targets as experimental.
+- **Busybox‑style argv[0] dispatch** (`gcorro*` prefers the GUI, `pcorro*` the pancurses UI; explicit flags always win) works on the platforms built above, but the Win95 exes that motivated it are WIP.
+- **Win95 runtime note** (for when it does ship): rust9x exes need `unicows.dll` next to the exe (or in `C:\WINDOWS\SYSTEM`); it is not bundled (see `README95`).
+
+---
+
+*Generated from the project’s changelog.*
