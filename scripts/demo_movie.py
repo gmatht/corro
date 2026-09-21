@@ -229,7 +229,6 @@ def main() -> int:
                 [
                     sys.executable, "scripts/gui_movie.py", path,
                     "--frames-dir", str(d),
-                    "--keep-frames",
                     "--cps", str(args.cps),
                     "--confirm-ms", str(args.confirm_ms),
                     "--menu-hold-ms", str(args.menu_hold_ms),
@@ -243,6 +242,10 @@ def main() -> int:
             if not captured:
                 sys.exit(f"error: no frames captured for {path}")
             add_frames(d / "frame-%05d.ppm", len(captured), None, args.fps)
+            # The capture is 1-3 GB of raw PPM; it is only needed until this
+            # segment is encoded. Keeping every segment's frames until the end
+            # of the run exhausts the disk.
+            shutil.rmtree(d, ignore_errors=True)
 
         for pair, title, desc, note in TWO_WINDOW:
             c = work / f"two-{pair}.png"
@@ -259,7 +262,6 @@ def main() -> int:
                     # halve in speed along with everything else.
                     "--tempo", str(args.tempo),
                     "--frames-dir", str(d),
-                    "--keep-frames",
                     "-o", str(work / f"two-{pair}.mp4"),
                 ],
                 check=True,
@@ -274,6 +276,7 @@ def main() -> int:
                 d / "frame-%05d.ppm", len(captured),
                 f"scale={WIDTH}:trunc(ih/2)*2", args.fps,
             )
+            shutil.rmtree(d, ignore_errors=True)
 
         c = work / "end.png"
         card(
