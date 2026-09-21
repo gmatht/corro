@@ -1,0 +1,131 @@
+name: iOS
+
+# Builds and boots corro's iOS app on a hosted macOS runner.
+#
+# Why this exists: the iOS half of the port cannot be built on Linux (it needs
+# Xcode and an Apple SDK — see rustxWidgets/docs/IOS_GUIDELINES.md §8b), and a
+# *rented Mac* is the one option that removes that blocker without owning one.
+# Real-device farms (LambdaTest App Live and friends) cannot help here: they
+# install a signed .ipa, so they need a build before they can do anything.
+#
+# What this workflow gives you that a device farm does not:
+#   * the Objective-C actually compiles (every shim, every delegate);
+#   * `xcrun simctl` boots the app, so the first frame is real pixels;
+#   * screenshots of the paths §9 lists as unverified (first frame, a tap,
+#     typing in the formula bar).
+#
+# Simulator builds need no signing identity, so no secrets are required.
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "ios/**"
+      - "rustxWidgets/rswidgets/src/backends/ios.rs"
+      - "rustxWidgets/rswidgets/src/backends_ios_adapter.rs"
+      - "src/gui/ios_backend.rs"
+      - ".github/workflows/ios.yml"
+  pull_request:
+    paths:
+      - "ios/**"
+      - "rustxWidgets/rswidgets/src/backends/ios.rs"
+      - "rustxWidgets/rswidgets/src/backends_ios_adapter.rs"
+      - "src/gui/ios_backend.rs"
+
+env:
+  CARGO_TERM_COLORS: false
+
+jobs:
+  # ── The cheap half: the Rust iOS cfg paths, on Linux ────────────────
+  # Runs first because it is fast and needs no macOS minutes. It is the same
+  # check the repo script does, so a failure here means the port itself broke
+  # rather than the Xcode plumbing.
+  rust-ios-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+      - name: iOS cfg checks (simulator, arm64 device, 32-bit armv7s)
+        run: ios/corro/scripts/check_rswidgets_ios.sh && ios/corro/scripts/check_corro_ios.sh
+
+  # ── The real half: build + boot the app on a Mac ────────────────────
+  build-and-boot:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      # The build needs nightly for -Zbuild-std (iOS targets have no prebuilt
+      # std: armv7s is tier-3, and the 64-bit ones are not installed by
+      # default). rust-src comes with it; build_ios.sh also self-checks this.
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+
+      # macos-14 runners are Apple silicon; the default Xcode covers
+      # iphonesimulator arm64. Pin the deployment target to what current Xcode
+      # accepts — the iOS 7.1.2 path needs an archived SDK no runner has
+      # (IOS_GUIDELINES.md §0/§9).
+      - name: Show toolchain versions
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphonesimulator --show-sdk-version
+          cargo --version
+
+      - name: Build the app for the simulator
+        env:
+          IOS_DEPLOYMENT_TARGET: "12.0"
+        run: ios/corro/build_ios.sh sim
+
+      # `simctl` is where this stops being a compile check and starts being a
+      # test: boot a device, install, launch, and let the shims run for real.
+      # One UDID lookup for every later step ($GITHUB_ENV is inherited), rather
+      # than repeating the same fragile parse four times.
+      - name: Pick and boot a simulator
+        run: |
+          UDID="$(xcrun simctl list devices available -j \
+            | python3 -c 'import json,sys; d=json.load(sys.stdin)["devices"];
+                         print(next(x["udid"] for v in d.values() for x in v
+                                    if "iPhone" in x["name"]))')"
+          echo "using simulator $UDID"
+          echo "SIM_UDID=$UDID" >> "$GITHUB_ENV"
+          xcrun simctl boot "$UDID" || true          # already-booted is fine
+          xcrun simctl bootstatus "$UDID" -b
+
+      - name: Install and launch corro
+        run: |
+          xcrun simctl install "$SIM_UDID" /tmp/corro_ios_build/iphonesimulator/corro.app
+          # Launch detached, then let the first frame land (Core Graphics draw
+          # plus the CorroIosText shim). --console-pty would block the step.
+          xcrun simctl launch "$SIM_UDID" com.corro.corro
+          sleep 20
+
+      - name: Screenshot the first frame
+        run: xcrun simctl io "$SIM_UDID" screenshot ios-first-frame.png
+
+      - name: Check the app is still alive (did not crash on launch)
+        run: |
+          if ! xcrun simctl spawn "$SIM_UDID" launchctl list | grep -qi corro; then
+            echo "corro is not running — an objc_msgSend signature mismatch is"
+            echo "the usual cause; the log dump below is where it shows up."
+            exit 1
+          fi
+          echo "corro is running"
+
+      # Rust-side logging goes to NSLog (IOS_GUIDELINES.md §9). A crash on an
+      # objc_msgSend signature mismatch shows up here, not in a backtrace.
+      - name: Dump the Rust log lines
+        if: always()
+        run: |
+          xcrun simctl spawn "$SIM_UDID" log show --last 3m --style compact \
+            --predicate 'eventMessage CONTAINS "rswidgets" OR eventMessage CONTAINS "corro"' \
+            | tail -50
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ios-simulator-screenshots
+          path: ios-*.png
+          if-no-files-found: warn

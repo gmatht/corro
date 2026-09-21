@@ -94,6 +94,31 @@ are there pixels. `IOS_GUIDELINES.md` §9 has the details, including the
 `objc_msgSend`-signature crash that is the one iOS-specific failure mode worth
 knowing by heart.
 
+Testing in the cloud (no Mac of your own)
+----------------------------------------
+
+Four different things get called "an online simulator"; only one of them
+removes the macOS requirement, and it is not the device farm:
+
+| Kind | Takes | Can build? |
+|---|---|---|
+| Real-device farm (LambdaTest App Live, BrowserStack, AWS Device Farm) | a **signed** `.ipa` | no |
+| Cloud app streaming (Appetize.io) | an **unsigned simulator `.app`** | no |
+| **Cloud macOS CI (GitHub Actions `macos-14`, Codemagic, Bitrise)** | the repo | **yes** |
+| Virtualised iOS (Corellium) | either | n/a |
+
+`.github/workflows/ios.yml` is the third row, checked in: it builds the app on
+a hosted Mac, boots a simulator, launches corro, screenshots the first frame,
+verifies the process survived launch (an `objc_msgSend` signature error crashes
+without a usable backtrace, so "is it still alive" is the assertion that
+matters), and uploads the `rswidgets`/`corro` log lines. Simulator builds need
+no signing, so no secrets are required — just run the workflow.
+
+That is also the fastest way to get the screenshots `docs/ios/README.md`
+describes as missing: the workflow uploads them as a build artifact.
+
+It still cannot cover iOS 7.1.2 — no hosted runner has the archived SDK.
+
 Testing on a device farm
 ------------------------
 

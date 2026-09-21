@@ -25,7 +25,13 @@ than taken on trust.
 
 ## How to get the real ones
 
-On a macOS host, once `./build_ios.sh sim --run` works:
+**Without a Mac of your own:** run `.github/workflows/ios.yml`. It builds on a
+hosted `macos-14` runner, boots a simulator, launches the app, screenshots the
+first frame and uploads the PNG as a build artifact. (A real-device farm cannot
+do this — LambdaTest App Live wants a signed `.ipa`, so it needs a build
+first. See the guidelines' table of the four kinds of "online simulator".)
+
+**On a macOS host**, once `./build_ios.sh sim --run` works:
 
 ```sh
 xcrun simctl io booted screenshot ios-12-sheet.png     # the sheet

@@ -240,8 +240,26 @@ pixels.
   code already accounts for: `UIAlertView` instead of `UIAlertController`
   (§3), the `CorroIosStackView` fallback for pre-iOS-9 `UIStackView` (§3),
   and the `sizeWithFont:` text path (§5).
-* **Testing on a device farm.** LambdaTest App Live can install a **signed
-  arm64 IPA** and is good for a real-device smoke test; it cannot run a
-  simulator build, its fleet has no iOS 7 devices, and its live sessions are
-  interactive (scripted runs need App Automation + API credentials). Fast
-  iteration belongs in `simctl` locally.
+* **Testing elsewhere: the four kinds of "online simulator".** They are not
+  interchangeable, and only one of them solves "I have no Mac":
+
+  | Kind | Examples | Takes | Can it build? | Useful here? |
+  |---|---|---|---|---|
+  | Real-device farm | LambdaTest App Live, BrowserStack App Live, AWS Device Farm | a **signed** `.ipa` | no | yes, as a *smoke test* after a build exists; no iOS 7 devices remain, and live sessions are interactive (scripted runs need App Automation + credentials) |
+  | Cloud app streaming | Appetize.io | an **unsigned simulator `.app` zip** | no | yes in principle — the only category needing no Apple developer account — but it still needs a Mac to produce the binary |
+  | Cloud macOS CI | GitHub Actions `macos-14`, Codemagic, Bitrise | the repo | **yes** (Xcode + `xcodebuild` + `simctl`) | **this is the answer**: it compiles the ObjC, boots the simulator and screenshots it |
+  | Virtualised iOS on ARM | Corellium | either | n/a | rarely the right tool (cost, availability, legal posture) |
+
+  The gate for all of them is the same: *something* must produce a build first.
+  A farm or a streaming simulator cannot; only a Mac (or a rented one) can.
+
+* **`.github/workflows/ios.yml` does exactly that.** It builds the app on
+  `macos-14`, boots a simulator, launches corro, screenshots the first frame,
+  asserts the process is still alive (catching an `objc_msgSend` signature
+  crash, which is the one iOS-specific failure mode that gives no backtrace),
+  and uploads the log lines under the `rswidgets`/`corro` tags. Simulator
+  builds need no signing identity, so the workflow needs no secrets. Its
+  companion `rust-ios-check` job runs the Linux cfg checks first, so a failure
+  points at the port rather than the Xcode plumbing.
+
+  It cannot cover iOS 7.1.2: no hosted runner carries the archived SDK (§0).

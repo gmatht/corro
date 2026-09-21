@@ -65,6 +65,27 @@ esac
 
 echo "==> Building corro_ios for $RUST_TARGET (deployment target $IOS_DEPLOYMENT_TARGET)"
 cd "$SCRIPT_DIR"
+
+# -Zbuild-std needs the target's `core`/`std` SOURCES, not a prebuilt target:
+# the iOS targets are either tier-3 (armv7s) or have no std installed. On a
+# fresh machine — a hosted macOS runner, a new laptop — `rust-src` is missing
+# and the build fails deep inside cargo with a confusing message, so check
+# first and say what to run. (`rustup` may legitimately be absent when the
+# toolchain came from a system package or a vendored copy; in that case the
+# component is expected to be present already, and cargo will say so.)
+if command -v rustup >/dev/null 2>&1; then
+  if ! rustup component list --installed 2>/dev/null | grep -q '^rust-src'; then
+    echo "    rust-src component missing; installing it (needed by -Zbuild-std)"
+    rustup component add rust-src --toolchain nightly || {
+      echo "could not install rust-src; run: rustup component add rust-src --toolchain nightly" >&2
+      exit 1
+    }
+  fi
+fi
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "cargo not found in PATH" >&2
+  exit 1
+fi
 # -Zbuild-std: the iOS targets have no prebuilt std in this toolchain. Metadata
 # alone would not do — this has to produce a real staticlib for the link step —
 # so an Xcode install is genuinely required from here on, unlike the host-side
