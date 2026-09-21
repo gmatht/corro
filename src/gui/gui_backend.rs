@@ -2271,8 +2271,22 @@ fn maintain_extent(state: &GuiState, allow_shrink: bool) {
     } else {
         mc
     };
-    let target_r = (content_r + 1).max(floor_r).max(2);
-    let target_c = (content_c + 1).max(floor_c).max(2);
+    let mut target_r = (content_r + 1).max(floor_r).max(2);
+    let mut target_c = (content_c + 1).max(floor_c).max(2);
+    // Android: a phone screen shows ~38 rows and ~17 columns at once, but the
+    // minimal 2x2 body above leaves all the rest as header/footer rows that
+    // render as margin grey - a blank-looking sheet with two usable cells. The
+    // desktop rule (start small, grow as you type) assumes a pointer and a
+    // large screen; on a touch device the body should fill what the user can
+    // actually see. Growth only, and capped by the viewport, so it cannot run
+    // away or shrink a stored extent.
+    #[cfg(target_os = "android")]
+    {
+        let visible_rows = state.data_rows.get().max(1);
+        let visible_cols = state.data_cols.get().max(1);
+        target_r = target_r.max(visible_rows.min(MAX_RENDER_ROWS));
+        target_c = target_c.max(visible_cols.min(MAX_RENDER_COLS));
+    }
     // Grow toward target (covers the minimal 2x2 body on empty sheets and
     // any cursor floor above current extent).
     while grid.main_rows() < target_r {
