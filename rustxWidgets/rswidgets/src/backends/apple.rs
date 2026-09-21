@@ -82,15 +82,6 @@ unsafe extern "C" {
     fn objc_retain(obj: *mut std::os::raw::c_void) -> *mut std::os::raw::c_void;
 }
 
-/// C string literal helper for an owned NUL-terminated byte literal
-/// (usable where a `*const c_char` is expected, including a variadic
-/// call, without the temporary being dropped first).
-macro_rules! cstr {
-    ($s:literal) => {
-        concat!($s, "\0").as_bytes()
-    };
-}
-
 /// Look up a class by name (`UIView`, `NSWindow`, ...). Returns null when
 /// the class does not exist in this SDK.
 pub fn cls(name: &str) -> *mut std::os::raw::c_void {
@@ -481,9 +472,24 @@ pub fn log_apple(msg: &str) {
     if !is_initialized() {
         return;
     }
-    // A fixed `"%s"` format is used deliberately: passing user text as
-    // the format string would make a literal '%' a format specifier (and
-    // reading a variadic arg that was never passed is undefined).
+    // A fixed `"%s"` format is used deliberately: passing user text as the
+    // format string would make a literal '%' a format specifier, and reading a
+    // variadic argument that was never passed is undefined behaviour.
+    //
+    // BOTH strings are owned `Vec<u8>`s held in named locals. That is not
+    // style: `NSLog` is variadic, and the first version passed
+    // `concat!("%s", "\0").as_bytes()` — a temporary slice that is dropped at
+    // the end of the statement, so the variadic call received a dangling
+    // pointer. On an arm64 simulator that surfaced as
+    //
+    //     EXC_BAD_ACCESS (SIGSEGV), "possible pointer authentication failure"
+    //     ... objc_msgSend / _CFLogvEx3 / _NSLogv / NSLog
+    //     ... rswidgets::backends::ios::ios_backend::log_ios
+    //     ... corro_ios_root_ready / -[CorroViewController viewDidLoad]
+    //
+    // i.e. the very first log line killed the app at launch.
+    let mut fmt: Vec<u8> = Vec::with_capacity(3);
+    fmt.extend_from_slice(b"%s ");
     let mut buf: Vec<u8> = Vec::with_capacity(msg.len() + 1);
     buf.extend_from_slice(msg.as_bytes());
     buf.push(0);
@@ -492,7 +498,7 @@ pub fn log_apple(msg: &str) {
             fn NSLog(format: *const std::os::raw::c_char, ...);
         }
         NSLog(
-            cstr!("%s").as_ptr() as *const std::os::raw::c_char,
+            fmt.as_ptr() as *const std::os::raw::c_char,
             buf.as_ptr() as *const std::os::raw::c_char,
         );
     }
