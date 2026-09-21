@@ -1,0 +1,25 @@
+[package]
+name = "corro_ios"
+version = "0.7.0"
+edition = "2021"
+# Standalone crate (NOT in the corro workspace): it builds for Apple targets
+# with its own feature set, mirroring android/corro.
+[workspace]
+
+[lib]
+crate-type = ["staticlib", "cdylib"]
+
+[dependencies]
+# `gui-mobile` is the shared GUI pipeline without the GTK half: exactly the
+# feature set the iOS backend needs. See Cargo.toml at the repo root.
+corro = { path = "../..", default-features = false, features = ["gui-mobile"] }
+# rswidgets is depended on directly (not only through corro) so the cdylib can
+# name `backends::ios` for the exported entry points. default-features = false
+# keeps the GTK adapter out of the iOS link entirely.
+rswidgets = { path = "../../rustxWidgets/rswidgets", default-features = false, features = ["ios"] }
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = "symbols"

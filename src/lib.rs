@@ -36,7 +36,7 @@ pub mod ui;
 /// exposes [`gui::android_backend`], which drives the same tree from the
 /// Activity's content view via JNI (see `android/corro`). `examples/
 /// android_ui.rs` builds that tree standalone for inspection.
-#[cfg(any(feature = "gui", feature = "pancurses", target_arch = "wasm32"))]
+#[cfg(any(feature = "gui", feature = "gui-mobile", feature = "pancurses", target_arch = "wasm32"))]
 pub mod gui;
 #[cfg(feature = "rswidgets-term")]
 pub mod rswidgets_term;

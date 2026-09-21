@@ -49,7 +49,36 @@ default-run = "corro"
 default = ["ratatui"]
 nightly = []
 ratatui = ["dep:ratatui", "dep:crossterm", "dep:unicode-truncate", "dep:unicode-segmentation"]
+# The `gtk` feature chain is a Linux/Windows dependency; iOS (and Android)
+# take the same `gui` feature but must not compile the GTK adapter at all, so
+# the rswidgets/gtk + gtk_dynamic_loader halves are target-gated below the
+# feature list via `[target.'cfg(...)'.dependencies]`-style arms in the
+# rswidgets manifest. Enabling `rswidgets/gtk` on iOS would be harmless
+# (rswidgets gates the adapter on `target_os = "linux"`), but
+# `gtk_dynamic_loader` would then be linked into the app for nothing.
+#
+# Android/iOS host crates do NOT use this feature: they depend on corro with
+# `features = ["gui-mobile"]` (below), which selects the same shared GUI
+# pipeline without the GTK half. See ios/corro and android/corro.
 gui = ["dep:rswidgets", "rswidgets/gtk", "rswidgets/headless", "dep:gtk_dynamic_loader"]
+# iOS/Android: the shared GUI pipeline without the GTK half. This is what the
+# mobile host crates (ios/corro, android/corro) enable;
+# `src/gui/ios_backend.rs` / `src/gui/android_backend.rs` are gated on
+# `target_os` on top of it.
+#
+# `rswidgets/ios` is enabled unconditionally here (it is a no-op unless
+# `target_os = "ios"`, where it is what selects the UIKit backend); the GTK
+# half is simply absent, which is the whole point on those targets.
+#
+# For host-side checks on a desktop (`cargo check --features gui-mobile`, and
+# `--example ios-ui`) a non-mobile backend is still needed, or rswidgets has
+# no `backends::init` at all. Those live in the target-gated table below, so
+# a real iOS/Android build never sees them.
+gui-mobile = ["dep:rswidgets", "rswidgets/ios", "rswidgets/headless"]
+# Desktop stand-in for the mobile GUI: `gui-mobile` plus the Linux/Windows
+# backend, so `--example ios-ui` / `--example android-ui` build and run on a
+# workstation. Never used by the app bundles.
+gui-mobile-host = ["gui-mobile", "gui"]
 wasm = ["dep:rswidgets"]
 pancurses = ["rswidgets/pancurses"]
 gtk = ["gui"]
@@ -70,6 +99,9 @@ unicode-truncate = { version = "1", optional = true }
 crossterm = { version = "0.28", optional = true }
 unicode-segmentation = { version = "1", optional = true }
 rswidgets = { path = "rustxWidgets/rswidgets", optional = true, default-features = false }
+# GTK loader: desktop only. On iOS/Android the `gui` feature is still used
+# (it selects the shared gui_backend pipeline), but this crate must not even
+# resolve the GTK loader symbol there.
 gtk_dynamic_loader = { path = "rustxWidgets/gtk_dynamic_loader", optional = true }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
@@ -88,6 +120,9 @@ libc = "0.2"
 wasm-bindgen = "=0.2.122"
 [target.'cfg(target_os = "android")'.dependencies]
 jni = { version = "0.21", default-features = false }
+# Android resource generation / Java shims live in android/corro, which
+# depends on rswidgets directly; rswidgets' own `android` module is selected
+# by `target_os` there, not by a feature.
 
 [dev-dependencies]
 tempfile = "3"
@@ -179,6 +214,16 @@ required-features = ["ratatui"]
 name = "android-ui"
 path = "examples/android_ui.rs"
 required-features = ["gui"]
+
+# Builds the same widget tree the iOS GUI path builds, standing in for the
+# app's root UIView so the UI structure can be inspected on a desktop. Needs
+# the GUI feature; on iOS the tree is rooted at the view controller's view
+# instead (see src/gui/ios_backend.rs and ios/corro). The iOS menu *model*
+# the host renders is printed too.
+[[example]]
+name = "ios-ui"
+path = "examples/ios_ui.rs"
+required-features = ["gui-mobile-host"]
 
 [profile.release]
 opt-level = "z"

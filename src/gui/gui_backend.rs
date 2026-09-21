@@ -2380,6 +2380,14 @@ fn maintain_extent(state: &GuiState, allow_shrink: bool) {
         target_r = target_r.max(visible_rows.min(MAX_RENDER_ROWS));
         target_c = target_c.max(visible_cols.min(MAX_RENDER_COLS));
     }
+    // TEMP PROBE
+    #[cfg(target_os = "android")]
+    {
+        let msg = format!("extent mr={} mc={} target_r={} target_c={} data_rows={} data_cols={}",
+            grid.main_rows(), grid.main_cols(), target_r, target_c,
+            state.data_rows.get(), state.data_cols.get());
+        super::android_backend::logcat(&msg);
+    }
     // Grow toward target (covers the minimal 2x2 body on empty sheets and
     // any cursor floor above current extent).
     while grid.main_rows() < target_r {
@@ -2388,11 +2396,24 @@ fn maintain_extent(state: &GuiState, allow_shrink: bool) {
     while grid.main_cols() < target_c {
         grid.grow_main_col_at_right();
     }
+    // TEMP PROBE (post-growth)
+    #[cfg(target_os = "android")]
+    {
+        let msg = format!("extent-after mr={} mc={} allow_shrink={}",
+            grid.main_rows(), grid.main_cols(), allow_shrink);
+        super::android_backend::logcat(&msg);
+    }
     if !allow_shrink {
         return;
     }
     grid.set_min_extent(target_r as u32, target_c as u32);
     grid.shrink_to_content();
+    // TEMP PROBE (post-shrink)
+    #[cfg(target_os = "android")]
+    {
+        let msg = format!("extent-shrunk mr={} mc={}", grid.main_rows(), grid.main_cols());
+        super::android_backend::logcat(&msg);
+    }
 }
 
 /// Open one blank body row/column beyond the cursor when it sits exactly

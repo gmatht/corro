@@ -1,7 +1,12 @@
-# iOS support for corro + rswidgets — findings
+# iOS support for corro + rswidgets — findings and status
 
-Status: **plan only, no code written.** Written 2026-09-21 after reading the
-tree. Two claims in the earlier chat answer were wrong and are corrected here.
+Status: **implemented** (arm64 + simulator verified by type-check on this Linux
+host; the Xcode/ObjC half needs macOS to build — see §5). The findings below
+were written before the code; §5 records what was actually built and how each
+piece is verified.
+
+Two claims in the obvious-but-wrong answer this file started from are corrected
+here, because both are still the first thing people assume:
 
 ## 0. Corrections to the obvious-but-wrong answer
 
@@ -155,10 +160,80 @@ no two-finger scroll or pinch on Android either. If iOS is to be better, add a
   + VNC setup in `android/corro/README.md`), and use Lambdatest App Live only
   for the real-device smoke test of a signed build.
 
-## 5. Suggested order of work
+## 5. What was actually built (status)
+
+Everything below is in the tree and verified as described. **No macOS/Xcode is
+needed to check the Rust half**; producing a runnable `.app` does need it.
+
+### rswidgets (`rustxWidgets/rswidgets/`)
+
+| File | What it is |
+|---|---|
+| `src/backends/ios.rs` (≈780 lines) | ObjC runtime wrappers (typed `objc_msgSend` per ABI shape, `objc_getClass`, `sel_registerName`, `objc_retain`, `NSString` marshal/unmarshal), handle `KEEP_ALIVE`, callback registry, `WidgetMeta` registry, `display_scale()`, `log_ios()`, `IosApp`/`init_backend`. |
+| `src/backends_ios_adapter.rs` (≈2300 lines) | The widget surface: `Window`, `BoxWidget` (UIStackView), `Label`, `Button`, `Entry`, `Canvas` + CoreGraphics `CgDrawContext`, `Grid`, `DropDown`, `CheckButton` (UISwitch), `RadioButton`, `Dialog`, `TextView`, `ScrolledWindow`, `Overlay`, `Menu`, `MenuBar`, `SimpleAction`, every `create_*` factory, `display_density()`. Plus `dispatch_draw`/`dispatch_canvas_click`/`dispatch_canvas_key`/`dispatch_text_changed`/`dispatch_entry_activate`/`dispatch_focus`. |
+| `src/lib.rs`, `src/backends/mod.rs` | `#[cfg(target_os = "ios")]` module + `init` re-export arms (priority: native backend wins over pancurses, like Android). |
+| `src/common.rs`, `src/core.rs` | `platform_module!`/`common_types_mod!`/`App::new_*` arms for iOS, `IosOrientation`, and `App::quit()` documented as a deliberate no-op. |
+| `Cargo.toml` | `ios` feature. **No new dependencies at all** — see the comment there for why (the armv7s/old-SDK path is exactly where a heavy ObjC binding stack breaks). |
+| `docs/IOS_GUIDELINES.md` | The host contract, mirroring `ANDROID_GUIDELINES.md`. |
+
+### corro (`src/`, `examples/`, `Cargo.toml`)
+
+| File | What it is |
+|---|---|
+| `src/gui/ios_backend.rs` | `ios_main(root, vc)`, `run_ios_default()` (leaks the `App`, like Android), `menu_model()`, `run_menu_action_by_name`, `install_menu_model`, `log_ios`. |
+| `src/gui/gui_backend.rs` | iOS arms for `metrics_scale()` (`UIScreen.scale`), the padlock hit target, `maintain_extent` viewport fill, and soft-keyboard text-changed adoption; the Android menu-state machinery generalised to `MOBILE_MENU_STATE`/`dispatch_mobile_menu_action` shared by both platforms. |
+| `src/gui/mod.rs`, `src/lib.rs` | `gui::ios_backend` exposed under `gui-mobile`. |
+| `src/io/mod.rs` | `notify` compiled out for iOS; `LogWatcher` falls back to the wasm size-poll (recorded in the iOS guidelines §6). |
+| `Cargo.toml` | `gui-mobile` (shared GUI pipeline, no GTK) + `gui-mobile-host` (plus a desktop backend, for the examples). `ios-ui` example registered. |
+| `examples/ios_ui.rs` | Builds the same tree on a desktop and prints the menu model. |
+
+### ios/corro (the host)
+
+| File | What it is |
+|---|---|
+| `src/lib.rs` | 9 `extern "C"` exports: root-ready, canvas draw/click/key, entry changed/activate/focus, generic callback, menu action + a three-call menu-model walk. |
+| `app/CorroBridge.h` | The matching header, so a shim cannot drift from an export silently. |
+| `app/CorroIosShims.m` | `SheetView` (drawRect/touchesBegan/pressesBegan with the modifier mask), `CorroIosTarget` (callback trampoline), `CorroIosText` (iOS 7+ / iOS 6 text API branching), `CorroIosAlert` + a `UIViewController` category (UIAlertController / UIAlertView). |
+| `app/AppDelegate.{h,m}`, `app/SceneDelegate.{h,m}` | Scene (iOS 13+) and legacy (≤12) window paths, lifecycle forwarding. |
+| `app/CorroViewController.{h,m}` | Bootstraps Rust, installs the text-field delegate, and builds the `UIMenu` from the model (with a pre-iOS-14 action-sheet fallback). |
+| `app/Info.plist`, `app/LaunchScreen.storyboard` | Launch storyboard (prevents letterboxing), scene manifest, orientations, document sharing. |
+| `build_ios.sh` | `cargo -Zbuild-std` staticlib → `xcodebuild`; `sim`/`device`, `--ipa`, `--run`. |
+| `gen_xcodeproj.sh` | Generates `app/Corro.xcodeproj` (deterministic 24-hex ids) when missing; the result is checked in. |
+| `README.md` | How to build, debug, and test on LambdaTest. |
+
+### How each claim is verified
+
+| Claim | Verified by | Result |
+|---|---|---|
+| The iOS backend compiles (arm64 simulator) | `cargo check --target aarch64-apple-ios-sim -Zbuild-std` | passes |
+| It compiles for devices (arm64) | `cargo check --target aarch64-apple-ios …` | passes |
+| It compiles for 32-bit iOS 7.1.2 devices | `cargo check --target armv7s-apple-ios …` | passes (this is also what exercises the `CGFloat = f32` code path) |
+| corro's iOS paths compile | same three targets via a scratch crate with `features = ["gui-mobile"]` | passes |
+| The host cdylib compiles | `cargo check` in `ios/corro` for `aarch64-apple-ios-sim` | passes |
+| No new clippy findings | `cargo clippy` on the iOS targets vs. the desktop baseline | no iOS-specific findings |
+| Desktop is untouched | `cargo check` (TUI), `--features gui`, `-p rswidgets`, `cargo test` | 663 + 29 tests pass |
+| The widget tree and menu model are right | `cargo run --example ios-ui --features gui-mobile-host` | prints the tree + 6 menus / 64 items |
+| The Xcode project is well-formed | the generator's output is ID-complete and all ids are 24 hex chars | checked |
+| **The ObjC/Swift compiles and the app runs** | **needs macOS + Xcode** | **not checked here** |
+
+### What remains (step #7, deferred)
+
+1. Build the app on macOS: `./build_ios.sh sim --run`, then fix whatever the
+   ObjC compiler finds (there is no way to type-check ObjC without an SDK).
+2. Confirm the first frame renders (SheetView + `CorroIosText`) and that the
+   formula entry round-trips: type → `corro_ios_entry_changed` → commit.
+3. iOS 7.1.2 specifically: pin a toolchain with `rust-src`, obtain an Xcode
+   that accepts `-mios-version-min=7.1.2` plus the archived iOS 7.1 SDK. Until
+   then the 32-bit claim is "compiles", not "runs".
+4. Optional: a signed arm64 IPA + LambdaTest App Live smoke test.
+
+
+## 6. The order the work was done in
 
 1. Decide **arm64 / iOS 12+** vs **armv7+arm64 / iOS 7.1.2** (this determines
-   toolchain + Xcode + SDK, i.e. everything). ← blocking question
+   toolchain + Xcode + SDK). Answered by building *both* Rust paths and
+   documenting the SDK blocker, so no decision blocks the code: the same
+   source serves both and only the toolchain differs.
 2. `rswidgets`: `cfg(target_os = "ios")` arms + `ios` feature; `backends_ios_adapter.rs`
    with just `Window`/`Box`/`Label`/`Button`/`Entry`/`Canvas` and CG draw;
    `docs/IOS_GUIDELINES.md` mirroring the Android one.

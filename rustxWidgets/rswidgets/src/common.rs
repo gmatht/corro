@@ -16,6 +16,7 @@ macro_rules! platform_module {
         pub type PlatformScrolledWindow = ScrolledWindow;
         #[allow(dead_code)] // not referenced by common_types_mod! on every backend
         pub type PlatformDropDown = DropDown;
+        #[allow(dead_code)] // ditto: the mobile backends keep the overlay in the model
         pub type PlatformOverlay = Overlay;
         #[allow(dead_code)]
         pub type PlatformCheckButton = CheckButton;

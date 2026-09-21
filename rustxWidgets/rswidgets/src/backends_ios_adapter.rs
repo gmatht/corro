@@ -297,7 +297,10 @@ mod ios_adapter {
                 core_ios::log_ios("ios: CorroIosTarget shim missing; button inert");
                 return;
             }
-            let target = msg1i(shim, "targetWithCallbackId:", id as isize);
+            // SAFETY: `shim` is the CorroIosTarget class object and
+            // `targetWithCallbackId:` is its declared factory selector, so
+            // the id-returning signature below is the real one.
+            let target = unsafe { msg1i(shim, "targetWithCallbackId:", id as isize) };
             if target.is_null() {
                 return;
             }
@@ -1366,49 +1369,48 @@ mod ios_adapter {
         if ns_text.is_null() || ns_font.is_null() {
             return;
         }
-        unsafe {
-            // The shim draws via `NSString`/`UIFont`/CoreText for the
-            // deployment target's SDK. `ctx` is the live `CGContextRef` from
-            // `drawRect:`; `font` is the family name (the shim resolves a
-            // `UIFont` and falls back to the system font). Signature, after
-            // the implicit (id, SEL) pair:
-            //   (NSString*, CGContextRef, NSString*, CGFloat, CGFloat,
-            //    CGFloat, CGFloat, CGFloat, CGFloat, CGFloat, CGFloat,
-            //    NSInteger slant, NSInteger weight) -> void
-            raw_send!(
-                shim,
-                "drawText:ctx:font:x:y:size:r:g:b:a:slant:weight:",
-                unsafe extern "C" fn(
-                    *mut c_void, // id        (self)
-                    *mut c_void, // SEL
-                    *mut c_void, // NSString* text
-                    *mut c_void, // CGContextRef
-                    *mut c_void, // NSString* font
-                    f64,         // CGFloat x
-                    f64,         // CGFloat y
-                    f64,         // CGFloat size
-                    f64,         // CGFloat r
-                    f64,         // CGFloat g
-                    f64,         // CGFloat b
-                    f64,         // CGFloat a
-                    i32,         // NSInteger slant
-                    i32,         // NSInteger weight
-                ) -> (),
-                (
-                    ns_text,
-                    ctx,
-                    ns_font,
-                    x,
-                    y,
-                    size,
-                    r,
-                    g,
-                    b,
-                    a,
-                    slant,
-                    weight
-                )
-            );
+        // The shim draws via `NSString`/`UIFont`/CoreText for the deployment
+        // target's SDK. `ctx` is the live `CGContextRef` from `drawRect:`;
+        // `font` is the family name (the shim resolves a `UIFont` and falls
+        // back to the system font). Signature, after the implicit (id, SEL)
+        // pair:
+        //   (NSString*, CGContextRef, NSString*, CGFloat x, CGFloat y,
+        //    CGFloat size, CGFloat r, CGFloat g, CGFloat b, CGFloat a,
+        //    NSInteger slant, NSInteger weight) -> void
+        raw_send!(
+            shim,
+            "drawText:ctx:font:x:y:size:r:g:b:a:slant:weight:",
+            unsafe extern "C" fn(
+                *mut c_void, // id        (self)
+                *mut c_void, // SEL
+                *mut c_void, // NSString* text
+                *mut c_void, // CGContextRef
+                *mut c_void, // NSString* font
+                f64,         // CGFloat x
+                f64,         // CGFloat y
+                f64,         // CGFloat size
+                f64,         // CGFloat r
+                f64,         // CGFloat g
+                f64,         // CGFloat b
+                f64,         // CGFloat a
+                i32,         // NSInteger slant
+                i32,         // NSInteger weight
+            ) -> (),
+            (
+                ns_text,
+                ctx,
+                ns_font,
+                x,
+                y,
+                size,
+                r,
+                g,
+                b,
+                a,
+                slant,
+                weight
+            )
+        );
     }
 
     // `CorroIosText` returns a buffer allocated with `malloc` (the host's

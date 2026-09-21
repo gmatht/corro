@@ -21,9 +21,9 @@ pub mod render;
 pub mod sheet;
 pub mod special_picker;
 
-#[cfg(any(feature = "gui", all(feature = "wasm", target_arch = "wasm32")))]
+#[cfg(any(feature = "gui", feature = "gui-mobile", all(feature = "wasm", target_arch = "wasm32")))]
 mod gui_backend;
-#[cfg(any(feature = "gui", all(feature = "wasm", target_arch = "wasm32")))]
+#[cfg(any(feature = "gui", feature = "gui-mobile", all(feature = "wasm", target_arch = "wasm32")))]
 pub mod gui_movie;
 /// Android backend: the JNI entry point + run loop the `corro_android`
 /// cdylib calls (see `android/corro/src/lib.rs`).
@@ -35,8 +35,24 @@ pub mod gui_movie;
 /// after the JNI call returns. `examples/android_ui.rs` builds the same
 /// tree on the host, and `rswidgets::android_generator` writes the Android
 /// resources the tree needs (`android/corro/build.rs`).
-#[cfg(all(feature = "gui", target_os = "android"))]
+#[cfg(all(any(feature = "gui", feature = "gui-mobile"), target_os = "android"))]
 pub mod android_backend;
+/// iOS backend: the `extern "C"` entry point + bootstrap the `corro_ios`
+/// cdylib calls (see `ios/corro/src/lib.rs`).
+///
+/// Like the Android backend, the widget tree itself is the shared
+/// [`gui_backend`] one; this module only roots it in the app's root `UIView`
+/// (`rswidgets::backends::ios::init_with_root`) instead of a desktop
+/// toplevel, and leaks the [`App`] because UIKit drives the event loop after
+/// the call returns. `examples/ios_ui.rs` builds the same tree on the host,
+/// and `rustxWidgets/docs/IOS_GUIDELINES.md` records the host contract.
+// NOTE: not target-gated. The *bootstrap* (`ios_main`) is iOS-only, but the
+// menu model and the action dispatcher are plain data derived from the shared
+// menu definition — `examples/ios_ui.rs` prints that model on a desktop, and
+// `--features gui-mobile` is checked on Linux CI, so compiling the module
+// everywhere is what keeps those honest.
+#[cfg(any(feature = "gui", feature = "gui-mobile"))]
+pub mod ios_backend;
 #[cfg(feature = "pancurses")]
 mod pnc_backend;
 
@@ -277,7 +293,7 @@ impl App {
     /// not perturb the workbook it is replaying, but the viewport math needs
     /// `&mut App`. The clone is read-only from the caller's perspective —
     /// nothing done to it is ever copied back.
-    #[cfg(any(feature = "gui", feature = "pancurses"))]
+    #[cfg(any(feature = "gui", feature = "gui-mobile", feature = "pancurses"))]
     pub(crate) fn copy_for_layout(&self) -> App {
         App {
             core: CoreApp {

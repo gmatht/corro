@@ -57,6 +57,10 @@ pub mod backends_ios_adapter;
 /// palette it references, an adaptive launcher icon and a manifest when the
 /// app has not provided its own. Additive by design (never overwrites).
 /// See `docs/ANDROID_GUIDELINES.md`.
+///
+/// There is deliberately no iOS counterpart: an iOS app is defined by its
+/// Xcode project, `Info.plist` and asset catalog, which the Rust side cannot
+/// sensibly synthesise. See `docs/IOS_GUIDELINES.md` §1.
 pub mod android_generator;
 #[cfg(feature = "pancurses")]
 pub mod backends_pancurses_adapter;

@@ -5,12 +5,17 @@ use crate::ops::{
     append_line, apply_line, apply_log_line_to_workbook, apply_workbook_op, Op, SheetState,
     WorkbookOp, WorkbookSnapshot, WorkbookState, LOG_HEADER_PREFIX, LOG_VERSION,
 };
-#[cfg(not(target_arch = "wasm32"))]
+// iOS: no `notify`. There is no inotify/kqueue FSEvents user-space watcher to
+// use in a sandboxed app (the app only sees its own container, and a file
+// arrives through the document picker, not a path we watch), so the watcher
+// falls back to the same size-poll the wasm build uses. See
+// IOS_GUIDELINES.md §6 and the `#[cfg(target_arch = "wasm32")]` LogWatcher.
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))]
 use notify::{RecursiveMode, Watcher};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))]
 use std::sync::mpsc::Receiver;
 use thiserror::Error;
 
@@ -18,7 +23,7 @@ use thiserror::Error;
 pub enum IoError {
     #[error("I/O: {0}")]
     Io(#[from] std::io::Error),
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))]
     #[error("Notify: {0}")]
     Notify(#[from] notify::Error),
 }
@@ -1037,14 +1042,14 @@ fn parse_csv_line(line: &str) -> Vec<String> {
 }
 
 /// Watches `path` for changes; poll [`LogWatcher::poll_dirty`].
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))]
 pub struct LogWatcher {
     _watcher: notify::RecommendedWatcher,
     pub path: PathBuf,
     rx: Receiver<notify::Result<notify::Event>>,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))]
 impl LogWatcher {
     pub fn new(path: PathBuf) -> Result<Self, IoError> {
         let (tx, rx) = std::sync::mpsc::channel();
@@ -1072,14 +1077,17 @@ impl LogWatcher {
     }
 }
 
-/// WASM fallback: polls file size instead of using notify.
-#[cfg(target_arch = "wasm32")]
+/// WASM and iOS fallback: polls file size instead of using notify. iOS has no
+/// user-space recursive watcher available to a sandboxed app, and the file it
+/// cares about is inside the app container, so a size poll is both simpler and
+/// sufficient (the same reasoning as wasm).
+#[cfg(any(target_arch = "wasm32", target_os = "ios"))]
 pub struct LogWatcher {
     pub path: PathBuf,
     offset: u64,
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", target_os = "ios"))]
 impl LogWatcher {
     pub fn new(path: PathBuf) -> Result<Self, IoError> {
         let offset = if path.exists() {

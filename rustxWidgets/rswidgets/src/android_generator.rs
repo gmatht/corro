@@ -35,6 +35,9 @@ pub const DEFAULT_NAMESPACE: &str = "com.corro";
 /// Java class rswidgets instantiates for canvases (see
 /// [`crate::backends::android::set_sheet_view_class`]). Must expose a
 /// `(Context, long)` constructor taking the canvas id.
+// Not used on iOS (which has no resource generator — see
+// docs/IOS_GUIDELINES.md §1), so allow it to be unread there.
+#[allow(dead_code)]
 pub const DEFAULT_SHEET_VIEW_CLASS: &str = "com.corro.SheetView";
 
 /// Material Components version the generated theme parents against.
