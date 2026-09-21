@@ -790,6 +790,40 @@ mod android_backend {
         });
     }
 
+    /// Insert `child` at index 0 of `container` with a pinned layout:
+    /// `WRAP_CONTENT` height and zero weight, so a `LinearLayout` sibling that
+    /// carries weight 1 (the sheet) expands *below* it instead of competing
+    /// with it. Without the explicit params the child inherits default
+    /// `LayoutParams`, which lets the weighted sheet squeeze the strip.
+    /// Best-effort; ignores null handles.
+    pub fn pin_child_at_top(
+        container_ptr: *mut std::os::raw::c_void,
+        child_ptr: *mut std::os::raw::c_void,
+    ) {
+        if container_ptr.is_null() || child_ptr.is_null() {
+            return;
+        }
+        let _ = with_env_and_activity(|env, _activity| {
+            let container =
+                unsafe { jni::objects::JObject::from_raw(container_ptr as jni::sys::jobject) };
+            let child =
+                unsafe { jni::objects::JObject::from_raw(child_ptr as jni::sys::jobject) };
+            // MATCH_PARENT width (-1), WRAP_CONTENT height (-2), weight 0.
+            let params = env.new_object(
+                "android/widget/LinearLayout$LayoutParams",
+                "(IIF)V",
+                &[(-1i32).into(), (-2i32).into(), 0.0f32.into()],
+            )?;
+            env.call_method(
+                &container,
+                "addView",
+                "(Landroid/view/View;ILandroid/view/ViewGroup$LayoutParams;)V",
+                &[(&child).into(), 0i32.into(), (&params).into()],
+            )?;
+            Ok::<_, Box<dyn StdError + Send + Sync>>(())
+        });
+    }
+
     pub fn attach_child(container_ptr: *mut std::os::raw::c_void, child_ptr: *mut std::os::raw::c_void) {
         if container_ptr.is_null() || child_ptr.is_null() {
             return;

@@ -76,11 +76,17 @@ pub fn install_menu_strip(
     // (opaque, full-height) children paint over it - the strip existed in the
     // hierarchy but never showed a pixel. addView(view, 0) places it at the
     // top, matching the desktop menubar's position.
+    //
+    // The strip must also be *pinned*: it is a sibling of the sheet inside a
+    // vertical LinearLayout, and the sheet carries weight 1, so nothing stops
+    // the strip being squeezed or scrolled out of view. WRAP_CONTENT height
+    // with zero weight keeps it a fixed band at the top that the sheet
+    // expands beneath; the sheet's own scrolling moves grid content only, so
+    // the menu stays visible for the whole session.
     let root = rswidgets::backends::android::root_layout()?;
-    rswidgets::backends::android::insert_child_at(
+    rswidgets::backends::android::pin_child_at_top(
         root.as_obj().as_raw() as *mut std::os::raw::c_void,
         strip_ptr as *mut std::os::raw::c_void,
-        0,
     );
     // Keep the strip alive for the process lifetime (the layout holds a
     // global ref; the Rust handle is only needed for the calls above).
@@ -110,6 +116,37 @@ fn collect_menu_pairs(items: &[crate::gui::menu::MenuAction], out: &mut Vec<Stri
 #[cfg(target_os = "android")]
 pub fn run_menu_action_by_name(name: &str) {
     super::gui_backend::dispatch_android_menu_action(name);
+}
+
+/// Scroll the sheet viewport by a whole number of rows/columns.
+///
+/// Called from `SheetView` on a touch drag: Android has no native scrolling
+/// for the sheet (the `ScrolledWindow` there is an inert `FrameLayout`), so
+/// the grid is moved by driving the same cursor/viewport machinery the
+/// scrollbars use. Positive `d_rows` moves the viewport down (later rows),
+/// positive `d_cols` moves it right. Returns the remaining pixel delta the
+/// caller should carry into the next drag event: deltas smaller than one
+/// row/column are accumulated by the Java side, which is why this takes a
+/// whole-cell count and the caller keeps the sub-cell remainder.
+#[cfg(target_os = "android")]
+pub fn scroll_viewport(d_rows: i32, d_cols: i32) {
+    super::gui_backend::scroll_viewport_by_cells(d_rows, d_cols);
+}
+
+/// Report the row/column height in device pixels, so `SheetView` can convert
+/// a touch drag in pixels into the whole-cell counts [`scroll_viewport`]
+/// takes.
+///
+/// The Java side needs the same numbers Rust renders with — a hardcoded
+/// constant there would drift from `row_h()`/`col_w()` as soon as the
+/// density or metrics change, and touch scrolling would feel wrong by
+/// exactly that factor.
+#[cfg(target_os = "android")]
+pub fn touch_cell_size() -> (f64, f64) {
+    (
+        super::gui_backend::touch_row_h(),
+        super::gui_backend::touch_col_w(),
+    )
 }
 
 /// Write a line to logcat (`log -t corro` shows these). Best-effort: the

@@ -55,6 +55,42 @@ pub extern "system" fn Java_com_corro_SheetView_nativeOnTouch(
     // tab strip, whose canvas has no Java view of its own... no-op here.)
 }
 
+/// Called from `SheetView.onTouchEvent` (ACTION_MOVE) during a drag: scrolls
+/// the sheet by whole rows/columns.
+///
+/// Android has no native scrolling for the sheet, so the Java side accumulates
+/// the drag in pixels and converts it to cell counts using
+/// `nativeCellSize()`; this entry point applies the result. `d_rows > 0`
+/// scrolls towards later rows (content moves up under the finger), matching
+/// the natural drag direction.
+#[no_mangle]
+pub extern "system" fn Java_com_corro_SheetView_nativeScrollBy(
+    _env: JNIEnv,
+    _class: JClass,
+    d_rows: i32,
+    d_cols: i32,
+) {
+    corro::gui::android_backend::scroll_viewport(d_rows, d_cols);
+}
+
+/// Called from `SheetView` to learn the grid's row height and default column
+/// width in device pixels, so a pixel drag converts to whole cells with the
+/// same metrics Rust renders with. Returns `[row_h, col_w]`.
+#[no_mangle]
+pub extern "system" fn Java_com_corro_SheetView_nativeCellSize(
+    env: JNIEnv,
+    _class: JClass,
+) -> jni::sys::jfloatArray {
+    let (row_h, col_w) = corro::gui::android_backend::touch_cell_size();
+    match env.new_float_array(2) {
+        Ok(arr) => {
+            let _ = env.set_float_array_region(&arr, 0, &[row_h as f32, col_w as f32]);
+            arr.into_raw()
+        }
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
 /// Called from `CorroTextWatcher.afterTextChanged`: runs corro's formula
 /// entry change handler, which syncs `edit_buf` from the widget text.
 #[no_mangle]

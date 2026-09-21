@@ -680,19 +680,23 @@ mod android_adapter {
         }
 
         /// Size to replay the draw closure at: the real laid-out size once
-        /// `onDraw` has reported one, else the requested size (Android has
-        /// not measured the view yet), else a conservative default.
+        /// `onDraw` has reported one, else a conservative default.
+        ///
+        /// Deliberately NOT the `set_size_request` value: that is a
+        /// placeholder (corro asks for 1x1 because Android measures children
+        /// itself). Replaying at 1x1 makes the draw closure compute a
+        /// one-row viewport, and since the closure caches `data_rows` from
+        /// the height it is given, the next *real* `onDraw` renders that
+        /// single row stretched over the whole canvas — the grid shows one
+        /// enormous empty row instead of a sheet. A plausible default keeps
+        /// the pre-layout replay harmless; the real size arrives with the
+        /// first `onDraw` and takes over from `CANVAS_SIZE`.
         fn replay_size(&self) -> (i32, i32) {
             let id = self.canvas_id();
             if let Some(&(w, h)) = CANVAS_SIZE.lock().unwrap().get(&id) {
                 return (w, h);
             }
-            CANVAS_SIZE_REQUEST
-                .lock()
-                .unwrap()
-                .get(&id)
-                .copied()
-                .unwrap_or((800, 600))
+            (800, 600)
         }
 
         pub fn set_content_size(&self, w: i32, h: i32) {
@@ -913,6 +917,16 @@ mod android_adapter {
             size: f64,
             weight: i32,
         ) {
+            // NOTE: `size` is corro's logical pixel size (already density-
+            // scaled by `metrics_scale`). `Paint.setTextSize` is documented as
+            // taking scaled pixels, but on a `Canvas` that is *not* scale-
+            // transformed the units are plain device pixels, and the density
+            // factor is applied by the `Paint` only through `sp` conversion in
+            // `setTextSize` when the value is interpreted as sp — which is not
+            // what happens here (this Paint is never given a scaled density).
+            // Empirically the glyphs render at exactly this pixel height, which
+            // is what the grid geometry (row_h/char_w, also density-scaled)
+            // expects, so pass it through unchanged.
             let _ = env.call_method(
                 paint.as_obj(),
                 "setTextSize",

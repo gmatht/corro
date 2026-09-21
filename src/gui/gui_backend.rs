@@ -159,6 +159,20 @@ pub(crate) fn header_h() -> f64 { HEADER_H_BASE * metrics_scale() }
 pub(crate) fn row_label_w() -> f64 { ROW_LABEL_W_BASE * metrics_scale() }
 pub(crate) fn char_w() -> f64 { CHAR_W_BASE * metrics_scale() }
 
+/// Grid metrics for the Android touch-scroll path.
+///
+/// `SheetView` converts a pixel drag into whole rows/columns, so it needs the
+/// same numbers the renderer used — a constant hardcoded in Java would drift
+/// from `row_h()`/`char_w()` as soon as the density or font metrics change,
+/// and scrolling would scale wrong by exactly that factor.
+#[cfg(target_os = "android")]
+pub(crate) fn touch_row_h() -> f64 { row_h() }
+
+/// Default column advance in pixels (the width of one character cell; a grid
+/// column is a whole number of these). See [`touch_row_h`].
+#[cfg(target_os = "android")]
+pub(crate) fn touch_col_w() -> f64 { char_w() }
+
 const MAX_RENDER_ROWS: usize = 500;
 const MAX_RENDER_COLS: usize = 50;
 
@@ -3278,7 +3292,7 @@ fn prompt_chrome(action: &str, current_sheet_title: &str) -> (String, String, St
     }
 }
 
-/// Run a menu action by its registered `app.<name>` string.
+/// The live GUI state, reachable from an `app.<name>` string.
 ///
 /// The Android menu strip and the iOS menu bar both dispatch action names
 /// across an FFI boundary (neither platform can hand a Rust closure to a
@@ -3286,6 +3300,7 @@ fn prompt_chrome(action: &str, current_sheet_title: &str) -> (String, String, St
 /// `run_gui` publishes its `Rc<GuiState>` here once the state exists; the
 /// menu UI is only built after that, and both platforms drive the UI on one
 /// thread, so a process-wide slot is sufficient.
+///
 // thread_local, not a static Mutex: GuiState holds Rc/Cell/RefCell and is
 // deliberately !Send (the whole GUI runs on one thread), so a global would
 // need an unsafe Send impl. The platform's UI thread is the only caller.
@@ -3329,6 +3344,59 @@ pub(crate) fn publish_android_menu_state(state: &Rc<GuiState>) {
 #[cfg(target_os = "android")]
 pub(crate) fn dispatch_android_menu_action(action: &str) {
     dispatch_mobile_menu_action(action);
+}
+
+/// Scroll the sheet viewport by whole rows/columns (touch drag on mobile).
+///
+/// There is no independent scroll offset in this GUI: `displayed_rows` /
+/// `displayed_cols` derive the viewport purely from `app.core.cursor`
+/// (`prev_start` is always 0), so the cursor *is* the viewport origin. A
+/// touch drag therefore moves the cursor, exactly as a scrollbar drag does
+/// through [`scroll_to_cursor`] — one code path for "viewport moved", and
+/// the selected cell stays visible for free.
+///
+/// `d_rows`/`d_cols` are whole-cell counts; the caller accumulates the
+/// sub-cell remainder so a slow drag still scrolls. Movement is clamped into
+/// the same domain the scrollbars address, so a drag can never fling the
+/// cursor past the end of the sheet. `grow_blank_past_cursor` is
+/// deliberately NOT called: dragging is navigation over existing content,
+/// and growing the grid on every drag frame would extend the sheet without
+/// bound (the scrollbar path grows only on an explicit thumb drag).
+pub(crate) fn scroll_viewport_by_cells(d_rows: i32, d_cols: i32) {
+    let state = match MOBILE_MENU_STATE.with(|s| s.borrow().clone()) {
+        Some(state) => state,
+        None => {
+            eprintln!("mobile scroll before state published");
+            return;
+        }
+    };
+    if d_rows == 0 && d_cols == 0 {
+        return;
+    }
+    // An in-progress cell edit owns the selection; scrolling under it would
+    // move the cursor away from the edit target. Commit first (the guard
+    // every other navigation path uses) so a drag behaves like any other
+    // navigation that interrupts typing.
+    if state.editing.get() {
+        commit_edit(&state);
+    }
+    let (ru, cu) = scroll_domain(&state);
+    let row0 = state.last_row.get();
+    let col0 = state.last_col.get();
+    let mut row = row0;
+    let mut col = col0;
+    if d_rows != 0 {
+        let max_row = HEADER_ROWS + ru.saturating_sub(1);
+        row = (row0 as i64 + d_rows as i64).clamp(HEADER_ROWS as i64, max_row as i64) as usize;
+    }
+    if d_cols != 0 {
+        let max_col = MARGIN_COLS + cu.saturating_sub(1);
+        col = (col0 as i64 + d_cols as i64).clamp(MARGIN_COLS as i64, max_col as i64) as usize;
+    }
+    if row == row0 && col == col0 {
+        return; // already at the edge: no redraw churn per drag event
+    }
+    update_state_cursor(&state, row, col);
 }
 
 fn handle_menu_action(name: &str, state: &Rc<GuiState>) {

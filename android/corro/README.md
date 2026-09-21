@@ -13,6 +13,7 @@ Emulator:  AVD corro_avd (Android 13, x86_64, port 5554)
 Logs:      adb logcat -s corro rswidgets
 Screenshot: adb exec-out screencap -p > shot.png
 Taps:      adb shell input tap X Y
+Scroll:    adb shell input swipe 540 1800 540 500 500   (slow drag = more rows)
 
 Mirroring the emulator
 ----------------------
@@ -48,6 +49,49 @@ This crate is NOT in the corro workspace: it targets the Android NDK with
 its own feature set, so build it from here (or via the script), not with a
 workspace-wide `cargo build`. It only compiles for an Android target — the
 JNI exports and `corro::gui::android_backend` are android-gated.
+
+Touch interaction
+-----------------
+Android has no native scrolling for the sheet: the grid is drawn by Rust
+into a plain `Canvas`, and the adapter's `ScrolledWindow` is an inert
+`FrameLayout`. `SheetView.onTouchEvent` therefore classifies the gesture
+itself and hands whole-cell counts to Rust:
+
+* **tap** (`ACTION_UP` without exceeding touch slop) — moves the cursor to
+  the tapped cell;
+* **drag** — scrolls the viewport.
+
+The drag path accumulates the pixel delta from where the gesture *started*
+(not from where touch slop was exceeded — discarding the pre-slop travel
+loses the first row of every gesture), converts it to rows/columns using
+`nativeCellSize()`, and carries the sub-cell remainder into the next event
+so a slow drag still scrolls smoothly. `nativeCellSize()` exists so the
+conversion uses the very metrics Rust rendered with; a constant hardcoded
+in Java would drift with density or font changes.
+
+`scroll_viewport_by_cells` in `gui_backend.rs` moves the *cursor*, because
+this GUI has no independent scroll offset: `displayed_rows`/`displayed_cols`
+derive the viewport from `app.core.cursor` (`prev_start` is always 0), so
+the cursor is the viewport origin. That keeps one code path for "viewport
+moved" and keeps the selected cell visible for free.
+
+Layout notes
+------------
+* The **menu strip is pinned** to the top: it is inserted at index 0 of the
+  root `LinearLayout` with `WRAP_CONTENT` height and zero weight
+  (`pin_child_at_top`), so the weighted sheet expands beneath it instead of
+  squeezing it. Grid scrolling moves only grid content, so the menu stays
+  visible for the whole session.
+* Row height is `ROW_H_BASE × metrics_scale()`, where `metrics_scale` is the
+  display density (2.625 on a 420dpi device). Grid geometry (`row_h`,
+  `char_w`) and the glyphs drawn through `Paint.setTextSize` are therefore in
+  the same unit and agree — text fills its row instead of clipping.
+* `Canvas::replay_size` deliberately ignores `set_size_request`'s
+  placeholder. corro asks for 1x1 (Android measures children itself), and
+  replaying the draw closure at 1x1 makes it cache a **one-row** viewport,
+  which the next real `onDraw` then renders as a single enormous row filling
+  the canvas — a grid that looks empty. Replaying at a plausible default
+  instead keeps the pre-layout draw harmless.
 
 Android resources
 -----------------
