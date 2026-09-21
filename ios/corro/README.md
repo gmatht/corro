@@ -32,6 +32,7 @@ The individual pieces:
     scripts/check_rswidgets_ios.sh   # rswidgets iOS cfg, sim + arm64 + armv7s
     scripts/check_corro_ios.sh       # corro iOS cfg, same three targets
     scripts/check_host_ios.sh        # this crate's cdylib
+    scripts/probe_zig_ios.sh         # why Zig cannot replace Xcode (and what it can do)
 
 They use `-Zbuild-std` (metadata only — no link, so no iOS SDK) and therefore
 prove the *Rust* compiles for all three targets, including the 32-bit armv7s
@@ -121,3 +122,7 @@ What is not here
   container, and documents arrive through the picker.
 * **No cross-compilation from Linux.** `cargo check` for the iOS cfg paths
   works anywhere (see `IOS_GUIDELINES.md` §9); producing an app needs macOS.
+  Zig does not change this — it has no Apple SDK — but `scripts/probe_zig_ios.sh`
+  demonstrates exactly where it stops, and `IOS_GUIDELINES.md` §8b explains
+  both that and the one thing that genuinely works without an SDK (building the
+  Rust side as an rlib, no linker involved).
