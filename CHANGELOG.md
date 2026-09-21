@@ -35,6 +35,18 @@
   target address first (`movie_move_cursor_to_addr`) and then types, which is
   what puts the preview on the right cell; the driver now does the same, so the
   margin cell fills in alongside the formula bar.
+- **The GUI movie opens on a blank sheet and types into the right cell.** Two
+  problems, both fixed. The driver was armed before the window was mapped, so
+  the first steps were applied while the window was still being built and a
+  recording opened on a sheet that already had content; there is now a one
+  second lead-in showing the untouched (genuinely empty) sheet. And the cursor
+  was parked on the *previous* step's cell while a value was typed, because the
+  cursor only moved when a step was applied — the typing is drawn on the cursor
+  cell, so the value appeared to be entered somewhere else and only jumped home
+  at the commit. The cursor now moves onto the target cell one tick before the
+  first character. The margin-cell case needed `step_cursor` to resolve
+  `SetCellRef` the same way the step itself does; hand-resolving it conflated
+  the margin cell `[A1` with main `A1`.
 - **Recording speed is now real.** Both capture scripts used an `xwd` +
   `convert` loop, and at 2400x820 each takes ~500ms, so the loop delivered
   about **1 fps** however high a rate was requested — a 32-second session

@@ -1,9 +1,14 @@
 // Combined-gui builds flip the rswidgets root prelude to pancurses-adapter
 // types; the native backend always needs the common wrappers, so on Linux
 // it names them explicitly. Other platforms keep the prelude (unchanged).
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "ios", target_os = "android")))]
 use rswidgets::prelude::*;
 #[cfg(target_os = "linux")]
+use rswidgets::common::{Canvas, Entry, Label, MenuBar, Orientation, Window};
+// iOS and Android name the common wrappers explicitly for the same reason
+// Windows does: their prelude is the platform adapter's, and mixing the two
+// would silently rebind `Window`/`Canvas`/... to adapter-local handles.
+#[cfg(any(target_os = "ios", target_os = "android"))]
 use rswidgets::common::{Canvas, Entry, Label, MenuBar, Orientation, Window};
 // Windows uses the same common wrappers explicitly: under pancurses the
 // root prelude flips to pancurses-adapter types, so the glob alone would
@@ -128,7 +133,22 @@ pub(crate) fn metrics_scale() -> f64 {
     })
 }
 
-#[cfg(not(target_os = "android"))]
+/// iOS: `UIScreen.scale` (1.0 non-Retina, 2.0 Retina, 3.0 Plus/X era). Same
+/// purpose as the Android density above — a phone needs bigger pixels than a
+/// desktop monitor for the same number to be legible — and resolved once
+/// (it cannot change while the app runs).
+#[cfg(target_os = "ios")]
+pub(crate) fn metrics_scale() -> f64 {
+    use std::sync::OnceLock;
+    static SCALE: OnceLock<f64> = OnceLock::new();
+    *SCALE.get_or_init(|| {
+        rswidgets::backends_ios_adapter::display_density()
+            .unwrap_or(1.0)
+            .max(1.0)
+    })
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub(crate) fn metrics_scale() -> f64 {
     1.0
 }
@@ -709,7 +729,7 @@ struct GutterPadlock {
 /// inside the cell the padlock belongs to.
 fn padlock_hit_rect(h: &GutterPadlock) -> (f64, f64, f64, f64) {
     let (mut w, mut hh) = (h.w, h.h);
-    if cfg!(target_os = "android") {
+    if cfg!(any(target_os = "android", target_os = "ios")) {
         let target = PADLOCK_HIT_DP * metrics_scale();
         w = w.max(target);
         hh = hh.max(target);
@@ -2339,7 +2359,7 @@ fn maintain_extent(state: &GuiState, allow_shrink: bool) {
     // large screen; on a touch device the body should fill what the user can
     // actually see. Growth only, and capped by the viewport, so it cannot run
     // away or shrink a stored extent.
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_os = "ios"))]
     {
         let visible_rows = state.data_rows.get().max(1);
         let visible_cols = state.data_cols.get().max(1);
@@ -3260,39 +3280,55 @@ fn prompt_chrome(action: &str, current_sheet_title: &str) -> (String, String, St
 
 /// Run a menu action by its registered `app.<name>` string.
 ///
-/// The Android menu strip dispatches action names across JNI (there is no
-/// Rust closure it could hold), so the live state has to be reachable from
-/// a plain function. `run_gui` publishes its `Rc<GuiState>` here once the
-/// state exists; the strip is only built after that, and Android drives the
-/// UI on one thread, so a process-wide slot is sufficient.
+/// The Android menu strip and the iOS menu bar both dispatch action names
+/// across an FFI boundary (neither platform can hand a Rust closure to a
+/// native menu), so the live state has to be reachable from a plain function.
+/// `run_gui` publishes its `Rc<GuiState>` here once the state exists; the
+/// menu UI is only built after that, and both platforms drive the UI on one
+/// thread, so a process-wide slot is sufficient.
 // thread_local, not a static Mutex: GuiState holds Rc/Cell/RefCell and is
 // deliberately !Send (the whole GUI runs on one thread), so a global would
-// need an unsafe Send impl. The Android UI thread is the only caller.
-#[cfg(target_os = "android")]
+// need an unsafe Send impl. The platform's UI thread is the only caller.
+// Compiled on every backend: the mobile platform paths are the only callers,
+// but a desktop build also compiles `gui::ios_backend` (the menu *model* is
+// plain data — see the note there), and keeping one definition avoids a
+// second cfg-gated copy of the dispatch table.
 thread_local! {
-    static ANDROID_MENU_STATE: std::cell::RefCell<Option<std::rc::Rc<GuiState>>> =
+    static MOBILE_MENU_STATE: std::cell::RefCell<Option<std::rc::Rc<GuiState>>> =
         const { std::cell::RefCell::new(None) };
 }
 
-/// Publish the live state for [`dispatch_android_menu_action`]. Called once
+/// Publish the live state for [`dispatch_mobile_menu_action`]. Called once
 /// per `run_gui`; a second call (a second window) replaces the first, which
-/// matches the single-activity Android model.
-#[cfg(target_os = "android")]
-pub(crate) fn publish_android_menu_state(state: &Rc<GuiState>) {
-    ANDROID_MENU_STATE.with(|s| *s.borrow_mut() = Some(state.clone()));
+/// matches the single-activity/single-scene model on both platforms.
+pub(crate) fn publish_mobile_menu_state(state: &Rc<GuiState>) {
+    MOBILE_MENU_STATE.with(|s| *s.borrow_mut() = Some(state.clone()));
 }
 
-/// Dispatch an `app.<name>` action from the Android menu strip. Unknown
-/// names are ignored (the strip may be built from a newer menu tree than
-/// the running handler knows).
-#[cfg(target_os = "android")]
-pub(crate) fn dispatch_android_menu_action(action: &str) {
+/// Dispatch an `app.<name>` action from the platform's menu UI. Unknown
+/// names are ignored (the menu may be built from a newer menu tree than the
+/// running handler knows).
+pub(crate) fn dispatch_mobile_menu_action(action: &str) {
     let name = action.strip_prefix("app.").unwrap_or(action);
-    let state = ANDROID_MENU_STATE.with(|s| s.borrow().clone());
+    let state = MOBILE_MENU_STATE.with(|s| s.borrow().clone());
     match state {
         Some(state) => handle_menu_action(name, &state),
-        None => eprintln!("android menu action before state published: {name}"),
+        None => eprintln!("mobile menu action before state published: {name}"),
     }
+}
+
+/// Android-facing alias, kept because `src/gui/android_backend.rs` and the
+/// Android cdylib call it by this name (and because the name appears in
+/// ANDROID_GUIDELINES.md). The implementation is the shared one above.
+#[cfg(target_os = "android")]
+pub(crate) fn publish_android_menu_state(state: &Rc<GuiState>) {
+    publish_mobile_menu_state(state);
+}
+
+/// Android-facing alias for [`dispatch_mobile_menu_action`] (see above).
+#[cfg(target_os = "android")]
+pub(crate) fn dispatch_android_menu_action(action: &str) {
+    dispatch_mobile_menu_action(action);
 }
 
 fn handle_menu_action(name: &str, state: &Rc<GuiState>) {
@@ -3521,14 +3557,15 @@ fn handle_menu_action(name: &str, state: &Rc<GuiState>) {
 // ---------------------------------------------------------------------------
 
 fn on_formula_entry_changed(state: &GuiState) {
-    // Android has no key-event path for soft-keyboard typing: the
-    // TextWatcher is the ONLY signal that the user typed. Desktop sets
+    // Android (TextWatcher) and iOS (UITextField `editingChanged`) have no
+    // key-event path for soft-keyboard typing: the text-changed shim is the
+    // ONLY signal that the user typed. Desktop sets
     // `editing` from its key handlers before the entry text changes, so a
     // non-editing change there is always programmatic (formula refresh)
     // and must be ignored. On Android, entry text that differs from the
     // committed cell value can only be user input, so adopt it as a fresh
     // edit (mirrors start_edit_with on first keystroke).
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_os = "ios"))]
     if !state.editing.get() {
         if let Some(text) = state.formula_entry.get_text() {
             let app = state.app_ref();
@@ -3549,7 +3586,7 @@ fn on_formula_entry_changed(state: &GuiState) {
             return;
         }
     }
-    #[cfg(not(target_os = "android"))]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     if !state.editing.get() {
         return;
     }
@@ -3850,11 +3887,21 @@ pub fn run_gui_with_movie(
     {
         // Publish the state before building the strip: the strip's buttons
         // dispatch back into handle_menu_action by name.
-        publish_android_menu_state(&shared);
+        publish_mobile_menu_state(&shared);
         // A missing/mismatched MenuStrip class must not take the whole UI
         // down: the sheet is still usable without menus.
         if let Err(e) = super::android_backend::install_menu_strip(&rxapp, &shared) {
             eprintln!("android menu strip unavailable: {e}");
+        }
+    }
+    // iOS: same story with UIKit spelling — publish the state, then let the
+    // host's menu bar (a `UIBarButtonItem`/`UIMenu` the Swift side builds
+    // from this model) dispatch the same `app.*` names back.
+    #[cfg(target_os = "ios")]
+    {
+        publish_mobile_menu_state(&shared);
+        if let Err(e) = super::ios_backend::install_menu_model(&rxapp, &shared) {
+            eprintln!("ios menu model unavailable: {e}");
         }
     }
     vbox.append(&menubar);
@@ -4562,6 +4609,13 @@ fn arm_movie_driver(state: &Rc<GuiState>, movie: super::movie::GuiMovie) {
     let char_ms = options.char_delay_ms().max(1.0);
     let tick_ms = char_ms.round().max(1.0) as u32;
     let hold_ticks = ((options.confirm_delay_ms as f64 / char_ms).round() as u32).max(1);
+    // Ticks to show the *empty* sheet before the first line replays. The driver
+    // is armed before the window is mapped, so without a lead-in the first
+    // steps are applied while the window is still being built and the recording
+    // opens on a sheet that already has content — indistinguishable from the
+    // replay skipping its first lines. One second of blank sheet is enough for a
+    // viewer to read "this is an empty spreadsheet" before the typing starts.
+    let lead_in_ticks = (1000.0 / char_ms).round() as u32;
 
     // What the current step is doing: `Typing` reveals `value` one character at
     // a time; `Holding` shows the completed step. The edit itself is applied at
@@ -4569,11 +4623,13 @@ fn arm_movie_driver(state: &Rc<GuiState>, movie: super::movie::GuiMovie) {
     // last character lands (matching what a user typing the value would see).
     #[derive(Clone)]
     enum Phase {
+        LeadIn(u32),
         Idle,
+        Moving { step: usize, value: String, hold: u32 },
         Typing { step: usize, typed: usize, value: String, hold: u32 },
         Holding { step: usize, hold: u32 },
     }
-    let phase = std::cell::RefCell::new(Phase::Idle);
+    let phase = std::cell::RefCell::new(Phase::LeadIn(lead_in_ticks.max(1)));
 
     let tick = move || -> bool {
         if finished.get() {
@@ -4581,6 +4637,20 @@ fn arm_movie_driver(state: &Rc<GuiState>, movie: super::movie::GuiMovie) {
         }
         let mut current = phase.borrow_mut();
         match current.clone() {
+            Phase::LeadIn(remaining) => {
+                // Show the untouched sheet. The workbook starts empty (the
+                // replay file is a log, not preloaded content), so painting it
+                // here is all that is needed — no step has run yet.
+                sync_chrome_labels(&state_for_tick);
+                state_for_tick.canvas.queue_redraw();
+                state_for_tick.window.queue_redraw();
+                if remaining > 1 {
+                    *current = Phase::LeadIn(remaining - 1);
+                } else {
+                    *current = Phase::Idle;
+                }
+                true
+            }
             Phase::Idle => {
                 let i = index.get();
                 let mut movie = movie.borrow_mut();
@@ -4617,12 +4687,17 @@ fn arm_movie_driver(state: &Rc<GuiState>, movie: super::movie::GuiMovie) {
                 }
                 match typed {
                     Some(value) => {
-                        // Move the cursor onto the cell *before* typing, the way
-                        // the TUI does. The grid's edit overlay paints the
-                        // in-progress buffer on the cursor cell, so without this
-                        // the growing text would appear in the bar while the
-                        // cell under the cursor showed the previous step's
-                        // value (or nothing).
+                        // Park the cursor on the cell this step writes, before a
+                        // single character appears. The grid paints its edit
+                        // preview on the cursor cell, so a cursor left over from
+                        // the previous step would show the typing happening in
+                        // the wrong cell — the value would then "jump" to its
+                        // real home only at the commit.
+                        //
+                        // `step_cursor` resolves the step's address the same way
+                        // the step itself does, which matters for the margin
+                        // cells: `[A1` and main `A1` are different cells that a
+                        // hand-rolled `row + HEADER_ROWS` mapping conflates.
                         if let Some(cursor) = movie.step_cursor(i) {
                             let app = state_for_tick.app_mut();
                             app.core.cursor = cursor;
@@ -4632,7 +4707,10 @@ fn arm_movie_driver(state: &Rc<GuiState>, movie: super::movie::GuiMovie) {
                             let col = app.core.cursor.col;
                             update_state_cursor(&state_for_tick, row, col);
                         }
-                        *current = Phase::Typing { step: i, typed: 0, value, hold: hold_ticks };
+                        // The cursor move is its own frame: it must be on screen
+                        // before the first character lands, otherwise the first
+                        // keystroke appears on the old cell.
+                        *current = Phase::Moving { step: i, value, hold: hold_ticks };
                         true
                     }
                     None => {
@@ -4641,6 +4719,12 @@ fn arm_movie_driver(state: &Rc<GuiState>, movie: super::movie::GuiMovie) {
                         true
                     }
                 }
+            }
+            Phase::Moving { step, value, hold } => {
+                // The cursor landed on the previous tick; start revealing the
+                // characters from here.
+                *current = Phase::Typing { step, typed: 0, value, hold };
+                true
             }
             Phase::Typing { step, typed, value, hold } => {
                 let chars: Vec<char> = value.chars().collect();

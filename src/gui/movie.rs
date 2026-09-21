@@ -253,15 +253,11 @@ impl GuiMovie {
             WorkbookOp::SheetOp { op, .. } => op,
             _ => return None,
         };
-        match op {
-            Op::SetCell { addr, .. } | Op::SetCellFormat { addr, .. } => {
-                // `cell_ref_text` needs the sheet's main-column count only for
-                // right-margin labels; 0 is exact for every other region and
-                // this is a status-line label.
-                Some(addr::cell_ref_text(addr, 0))
-            }
-            _ => None,
-        }
+        // Resolved like the step itself, so `[A1`/`]A~1` label as margin cells
+        // instead of collapsing to main A1. `cell_ref_text` needs the sheet's
+        // main-column count to tell the two A-columns apart.
+        let addr = cursor_for_op(op, &ops::WorkbookState::new())?;
+        Some(addr::cell_ref_text(&addr, 0))
     }
 
     /// The cursor position a step moves to before it does anything.
@@ -277,11 +273,24 @@ impl GuiMovie {
             WorkbookOp::SheetOp { op, .. } => op,
             _ => return None,
         };
-        let addr = match op {
-            Op::SetCell { addr, .. } | Op::SetCellFormat { addr, .. } => addr,
-            _ => return None,
-        };
-        Some(cursor_of(addr, &ops::WorkbookState::new()))
+        // Same resolution the step itself uses (`cursor_for_op`), so the cell
+        // the driver moves to is exactly the cell the step writes. Resolving
+        // `SetCellRef` by hand here got `[A1` (a margin cell) wrong: the ref
+        // needs the sheet's main-column count to become a grid address, and the
+        // `Data`/`Left` distinction is what separates main A1 from margin `[A1`.
+        let addr = cursor_for_op(op, &ops::WorkbookState::new())?;
+        Some(cursor_of(&addr, &ops::WorkbookState::new()))
+    }
+
+    /// The value a step types into its cell, and the position it types into.
+    ///
+    /// Returned together because the driver needs both before it starts: it
+    /// moves the cursor first, then reveals the characters. `None` for steps
+    /// that are not a plain value (sheets, moves, formats, fills).
+    pub fn step_typed_cell(&self, index: usize) -> Option<(SheetCursor, String)> {
+        let value = self.step_typed_text(index)?;
+        let cursor = self.step_cursor(index)?;
+        Some((cursor, value))
     }
 
     /// Reset to a freshly-parsed state (a rewind for a second pass).
