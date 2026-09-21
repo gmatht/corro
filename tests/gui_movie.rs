@@ -13,6 +13,10 @@ use corro::gui::movie::{GuiMovie, GuiMovieOptions};
 use corro::grid::CellAddr;
 use std::path::{Path, PathBuf};
 
+/// `run_movie` reads the capture directory from the process environment, so
+/// the tests that exercise it must not overlap.
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// A movie fixture written into a temp dir, so tests never touch the repo.
 fn movie_file(tag: &str, text: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!(
@@ -50,7 +54,7 @@ impl FramePainter for CaptionLog {
         &mut self,
         _app: &corro::gui::App,
         frame: &MovieFrameView,
-        n: usize,
+        _n: usize,
     ) -> Result<(), String> {
         self.captions.push(frame.status.clone());
         if let Some((section, item)) = frame.menu.as_ref() {
@@ -154,6 +158,7 @@ fn gui_movie_rejects_a_non_corro_input() {
 
 #[test]
 fn gui_movie_frames_are_written_when_a_directory_is_configured() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // The capture path is what makes the video possible: with
     // CORRO_MOVIE_FRAMES set, the GUI movie run must leave one image per
     // painted frame behind.
@@ -193,6 +198,74 @@ fn gui_movie_null_painter_still_counts_frames() {
     assert_eq!(painter.painted, frames);
     assert!(frames >= 2);
     let _ = std::fs::remove_file(path);
+}
+
+/// Regression: the movie used to pass a *column count* where the viewport
+/// wants a *character width*, which trimmed the sheet down to the margin
+/// columns and left most of the frame blank — the "huge empty spaces" the
+/// interactive window had before it sized its viewport from the live canvas.
+#[test]
+fn gui_movie_sheet_fills_the_frame_width() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = movie_file("fill", "SET $1:A1 1\nSET $1:B1 2\n");
+    let dir = std::env::temp_dir().join(format!("corro-movie-fill-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::env::set_var("CORRO_MOVIE_FRAMES", &dir);
+
+    let mut app = corro::gui::App::new_with_paths(vec![path.clone()]);
+    app.run_movie(fast()).expect("capture run");
+
+    // The last painted frame is a complete sheet: find the rightmost column
+    // separator and require the grid to reach near the frame edge.
+    let frames: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "ppm"))
+        .collect();
+    let mut sorted = frames.clone();
+    sorted.sort();
+    let bytes = std::fs::read(sorted.last().unwrap()).unwrap();
+    let (w, _h, pixels) = parse_ppm(&bytes);
+    // Scan a band through the grid body for the rightmost non-background,
+    // non-white-literal pixel (a gridline).
+    let y = 300usize;
+    let mut rightmost = 0usize;
+    for x in 0..w {
+        let i = (y * w + x) * 3;
+        let (r, g, b) = (pixels[i], pixels[i + 1], pixels[i + 2]);
+        let is_gridline = (195..=205).contains(&r) && (195..=205).contains(&g) && (195..=205).contains(&b);
+        if is_gridline {
+            rightmost = x;
+        }
+    }
+    assert!(
+        rightmost > w * 3 / 4,
+        "grid must span the frame: rightmost gridline at {rightmost} of {w}"
+    );
+
+    std::env::remove_var("CORRO_MOVIE_FRAMES");
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_file(path);
+}
+
+/// Parse a binary PPM (P6) into `(width, height, rgb bytes)`.
+fn parse_ppm(bytes: &[u8]) -> (usize, usize, Vec<u8>) {
+    assert_eq!(&bytes[..2], b"P6", "expected a binary PPM");
+    let mut fields = Vec::new();
+    let mut i = 2usize;
+    while fields.len() < 3 {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let start = i;
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        fields.push(std::str::from_utf8(&bytes[start..i]).unwrap().parse::<usize>().unwrap());
+    }
+    i += 1; // single whitespace after the maxval
+    (fields[0], fields[1], bytes[i..].to_vec())
 }
 
 #[test]

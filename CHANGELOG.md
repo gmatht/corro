@@ -14,6 +14,13 @@
 - Movie pacing flags (`--movie-typing-cps`, `--movie-confirm-ms`,
   `--movie-menu-hold-ms`) now parse on the CLI for every backend rather than
   only being honored by the ratatui path.
+- Fixed two frame-rendering defects in the GUI movie painter: the sheet was
+  sized with a *column count* where the viewport expects a *character width*,
+  which trimmed it down to the margin columns and left most of the frame blank
+  (the "huge empty spaces" the window itself had before it sized its viewport
+  from the live canvas); and glyphs were drawn at the 7.2px cell-layout pitch,
+  which made 2x text overlap into an unreadable smear. Columns are now
+  stretched to span the frame and text uses its own advance.
 
 ## Changes
 - **Saving an unsaved document** no longer drops the auto‑added TOTALs. The untitled log (which Save renames verbatim onto the destination) was written as a bare header, so the in‑memory margin seeds — which have no committed edit op — vanished on reopen. It is now a complete serialization (all regions, seeds and LINKs included).

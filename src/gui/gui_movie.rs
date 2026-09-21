@@ -24,6 +24,7 @@
 
 use super::movie::{GuiMovie, GuiMovieOptions};
 use crate::grid::{HEADER_ROWS, MARGIN_COLS};
+use std::collections::HashMap;
 
 /// Canvas geometry used to render movie frames, matching the interactive
 /// GUI's pixel contract (see `gui_backend`: `FONT_SIZE`, `ROW_H`, ...).
@@ -38,6 +39,8 @@ const HEADER_H: f64 = 24.0;
 const ROW_H: f64 = 20.0;
 const ROW_LABEL_W: f64 = 50.0;
 const CHAR_W: f64 = 7.2;
+/// Height of the status band painted over the bottom of a frame.
+const STATUS_H: f64 = 30.0;
 
 /// A raster surface a movie frame can be painted into.
 pub trait FramePainter {
@@ -357,8 +360,11 @@ fn paint_sheet(
     // Sizing follows the interactive canvas: rows/columns derived from the
     // pixel extent so the movie frame is framed like the window.
     let data_rows = rows_for_height(h);
-    let data_cols = cols_for_width(w);
-    let data_width = cols_for_width(w);
+    // `data_cols` bounds the viewport search; `data_width` is the character
+    // budget that decides how much of it survives trimming. Both are derived
+    // from the frame size the way the live canvas derives them.
+    let data_width = data_width_for(w);
+    let data_cols = data_width / 2;
     // `Viewport::recompute` takes `&mut App` because trimming column widths
     // adjusts the grid; the movie must not mutate the workbook it is
     // replaying, so the viewport is computed against a private copy of the
@@ -379,7 +385,15 @@ fn paint_sheet(
     let sheet = app.core.workbook.active_sheet();
     let grid = &sheet.grid;
     let mr = grid.main_rows();
-    let _mc = grid.main_cols();
+    let mc = grid.main_cols();
+
+    // Stretch the visible columns across the frame, the way the window does
+    // when the sheet is narrower than the canvas. Without this a small
+    // workbook renders as a narrow ribbon with an empty right half — the
+    // "huge empty spaces" the window had before it sized the viewport from
+    // its live canvas size.
+    let stretched = stretch_columns_to_width(&vp, w);
+    let col_widths = if stretched.is_empty() { vp.col_widths.clone() } else { stretched };
 
     // Window chrome: menu bar, then formula bar (address + value), matching
     // the interactive window's layout (see `run_gui`: vbox = menu, formula
@@ -389,7 +403,7 @@ fn paint_sheet(
 
     // Row gutter, column header strip and the cell body.
     paint_gutter(dc, &vp.display_rows, mr);
-    paint_headers(dc, &vp.column_layout);
+    paint_headers(dc, &vp.column_layout, &col_widths);
     let mut sink = MovieSink::new();
     vp.refill(
         &mut sink,
@@ -400,7 +414,7 @@ fn paint_sheet(
         cursor.row,
         cursor.col,
     );
-    paint_cells(dc, &sink, &vp, cursor.row, cursor.col);
+    paint_cells(dc, &sink, &vp, &col_widths, cursor.row, cursor.col);
 
     // Status band: the movie caption (what is being replayed right now).
     let caption = format!(
@@ -410,17 +424,65 @@ fn paint_sheet(
     paint_status(dc, &caption, frame, w, h);
 }
 
+/// Rows needed to cover a canvas `h` pixels tall. Mirrors the live canvas
+/// (`gui_backend::rows_to_fill_px`): the grid starts below the chrome and the
+/// column strip, and the status band sits over the bottom of the frame.
 fn rows_for_height(h: i32) -> usize {
-    // Chrome (menu + formula bar) + column strip + status band leave the rest
-    // of the height at one row per 20px.
-    let used = CHROME_H + HEADER_H + 30.0;
-    (((h as f64 - used).max(ROW_H)) / ROW_H) as usize
+    let usable = h as f64 - CHROME_H - HEADER_H - STATUS_H;
+    ((usable / ROW_H + 1.0).max(1.0)) as usize
 }
 
-fn cols_for_width(w: i32) -> usize {
-    // Row gutter, then one column per 8 characters of cell width.
-    let usable = (w as f64 - ROW_LABEL_W).max(CHAR_W);
-    (usable / (8.0 * CHAR_W)).max(1.0) as usize
+/// Widen the visible columns so the sheet spans the frame.
+///
+/// The window sizes its viewport from the live canvas and lets columns use the
+/// whole width; a movie frame must do the same or a small workbook renders as
+/// a narrow ribbon with a blank right half (the "huge empty spaces" bug).
+/// Only the *main* columns are stretched — margin columns keep their natural
+/// width, since they are chrome, not data.
+fn stretch_columns_to_width(
+    vp: &crate::gui::viewport::Viewport,
+    w: i32,
+) -> HashMap<usize, usize> {
+    let mut widths: HashMap<usize, usize> = vp.col_widths.clone();
+    let main: Vec<usize> = vp
+        .col_ixs
+        .iter()
+        .copied()
+        .filter(|c| *c >= MARGIN_COLS && *c < MARGIN_COLS + vp.mc)
+        .collect();
+    if main.is_empty() {
+        return widths;
+    }
+    let total_px: f64 = vp
+        .col_ixs
+        .iter()
+        .map(|c| col_px(*widths.get(c).unwrap_or(&4)))
+        .sum();
+    let spare = (w as f64 - ROW_LABEL_W) - total_px;
+    if spare <= 0.0 {
+        return widths;
+    }
+    // Spread the spare width evenly, in whole characters so text still aligns
+    // to the grid.
+    let per_col_chars = (spare / (main.len() as f64 * CHAR_W)).floor().max(0.0) as usize;
+    if per_col_chars == 0 {
+        return widths;
+    }
+    for c in main {
+        let cur = *widths.get(&c).unwrap_or(&4);
+        widths.insert(c, cur + per_col_chars);
+    }
+    widths
+}
+
+/// Character width available to the sheet (row gutter + right margin
+/// reserved), the unit `ui_core::trim_visible_cols_to_width` expects. This is
+/// a *character* count, not a column count — passing a column count here
+/// trims the sheet down to the margin columns and leaves the rest of the
+/// frame blank.
+fn data_width_for(w: i32) -> usize {
+    let usable = w as f64 - ROW_LABEL_W;
+    (usable / CHAR_W).max(1.0) as usize
 }
 
 /// Menu bar strip: the same labels `crate::gui::menu::menu_bar_text()` renders
@@ -454,14 +516,14 @@ fn paint_formula_bar(
 
     dc.draw_text(8.0, 35.0, &label, FONT_SIZE, 0.15, 0.15, 0.18, 1.0);
     dc.draw_text(70.0, 35.0, "fx", FONT_SIZE, 0.45, 0.45, 0.5, 1.0);
-    let shown: String = value.chars().take(90).collect();
+    let shown: String = value.chars().take(80).collect();
     dc.draw_text(92.0, 35.0, &shown, FONT_SIZE, 0.0, 0.0, 0.0, 1.0);
 
     // Status suffix (the movie caption) on the right of the formula row, the
     // same place the window puts its `· status` label.
     let caption = format!("· {}", frame.status);
-    let caption: String = caption.chars().take(70).collect();
-    let cx = (w as f64 - 8.0 - caption.chars().count() as f64 * CHAR_W).max(200.0);
+    let caption: String = caption.chars().take(60).collect();
+    let cx = (w as f64 - 8.0 - caption.chars().count() as f64 * glyph_advance(2.0)).max(200.0);
     dc.draw_text(cx, 35.0, &caption, FONT_SIZE, 0.3, 0.3, 0.45, 1.0);
 }
 
@@ -476,12 +538,10 @@ fn paint_gutter(dc: &mut RasterDrawContext, display_rows: &[usize], mr: usize) {
     }
 }
 
-fn paint_headers(dc: &mut RasterDrawContext, layout: &[(u32, u32, String)]) {
-    const ROW_LABEL_W: f64 = 50.0;
-    const CHAR_W: f64 = 7.2;
+fn paint_headers(dc: &mut RasterDrawContext, layout: &[(u32, u32, String)], col_widths: &HashMap<usize, usize>) {
     let mut x = ROW_LABEL_W;
-    for (_, width, label) in layout {
-        let cw = *width as f64 * CHAR_W;
+    for (c, width, label) in layout {
+        let cw = col_px(*col_widths.get(&(*c as usize)).unwrap_or(&(*width as usize)));
         dc.fill_rect(x, CHROME_H, cw, HEADER_H, 0.9, 0.9, 0.9, 1.0);
         dc.draw_text(x + 2.0, CHROME_H + 5.0, label, FONT_SIZE, 0.3, 0.3, 0.3, 1.0);
         x += cw;
@@ -492,17 +552,15 @@ fn paint_cells(
     dc: &mut RasterDrawContext,
     sink: &MovieSink,
     vp: &crate::gui::viewport::Viewport,
+    col_widths: &HashMap<usize, usize>,
     cursor_row: usize,
     cursor_col: usize,
 ) {
-    const ROW_H: f64 = 20.0;
-    const ROW_LABEL_W: f64 = 50.0;
-    const CHAR_W: f64 = 7.2;
     for (ri, &logical_row) in vp.display_rows.iter().enumerate() {
         let y = CHROME_H + HEADER_H + ri as f64 * ROW_H;
         let mut x = ROW_LABEL_W;
         for &c in vp.col_ixs.iter() {
-            let cw = *vp.col_widths.get(&c).unwrap_or(&8) as f64 * CHAR_W;
+            let cw = col_px(*col_widths.get(&c).unwrap_or(&8));
             let is_cursor = logical_row == cursor_row && c == cursor_col;
             let key = (ri as u32, c as u32);
             let text = sink.cells.get(&key).cloned().unwrap_or_default();
@@ -512,24 +570,41 @@ fn paint_cells(
                 (1.0, 1.0, 1.0, 1.0)
             };
             dc.fill_rect(x, y, cw, ROW_H, bg.0, bg.1, bg.2, bg.3);
-            dc.stroke_rect(x, y, cw, ROW_H, 0.8, 0.8, 0.8, 1.0, 0.5);
+            dc.stroke_rect(x, y, cw, ROW_H, 0.78, 0.78, 0.78, 1.0, 1.0);
             if !text.trim().is_empty() {
-                dc.draw_text(x + 2.0, y + 3.0, &text, FONT_SIZE, 0.0, 0.0, 0.0, 1.0);
+                // Cells hold at most `col_width` characters (that is what the
+                // grid guarantees and what the live canvas relies on); drawing
+                // the whole string would run it across the neighbouring cells.
+                let shown: String = text.chars().take(cols_in(cw)).collect();
+                dc.draw_text(x + 2.0, y + 3.0, &shown, FONT_SIZE, 0.0, 0.0, 0.0, 1.0);
             }
             x += cw;
         }
     }
 }
 
+/// Pixel width of a grid column. One layout character (`CHAR_W`) per character
+/// plus a small gutter, so a column that holds N characters is wide enough to
+/// draw them with the bitmap font's advance.
+fn col_px(width_chars: usize) -> f64 {
+    (width_chars as f64 * CHAR_W) + 4.0
+}
+
+/// How many characters fit in a column of `px` pixels (the inverse of
+/// [`col_px`], using the text advance rather than the layout metric).
+fn cols_in(px: f64) -> usize {
+    (((px - 4.0) / glyph_advance(2.0)).floor() as usize).max(1)
+}
+
 fn paint_status(dc: &mut RasterDrawContext, caption: &str, frame: &MovieFrameView, w: i32, h: i32) {
-    let y = h as f64 - 26.0;
-    dc.fill_rect(0.0, y, w as f64, 26.0, 0.12, 0.14, 0.18, 1.0);
+    let y = h as f64 - STATUS_H;
+    dc.fill_rect(0.0, y, w as f64, STATUS_H, 0.12, 0.14, 0.18, 1.0);
     dc.draw_text(8.0, y + 7.0, caption, FONT_SIZE, 1.0, 1.0, 1.0, 1.0);
     // Progress bar: replay position as a fraction of the movie.
     if frame.total > 0 {
         let frac = frame.step as f64 / frame.total as f64;
         let bar_w = (w as f64 - 16.0) * frac;
-        dc.fill_rect(8.0, y + 22.0, bar_w, 3.0, 0.25, 0.6, 0.95, 1.0);
+        dc.fill_rect(8.0, y + STATUS_H - 5.0, bar_w, 3.0, 0.25, 0.6, 0.95, 1.0);
     }
     if let Some((section, item)) = frame.menu.as_ref() {
         // Menu flash: a small popup under the top-left corner, like an open
@@ -643,6 +718,10 @@ impl RasterDrawContext {
 
     /// Draw single-line text with a fixed monospace advance. Uses the built-in
     /// 5x7 bitmap font so the capture path needs no font library.
+    ///
+    /// The advance is the glyph width plus a gap — `CHAR_W` (7.2px) is the
+    /// *layout* metric that decides how many characters fit in a column, but
+    /// drawing at that pitch makes 2x glyphs overlap into an unreadable smear.
     pub fn draw_text(
         &mut self,
         x: f64,
@@ -654,11 +733,8 @@ impl RasterDrawContext {
         b: f64,
         a: f64,
     ) {
-        // A 5x7 glyph at 2x covers 10x14px; the advance is 7.2px per character
-        // like the canvas layout, so the glyphs are drawn at the cell origin
-        // and may touch — the same trade-off the interactive canvas makes.
         let scale = if size >= 11.0 { 2.0 } else { 1.0 };
-        let advance = CHAR_W;
+        let advance = glyph_advance(scale);
         let mut cx = x;
         for ch in text.chars() {
             if ch != ' ' {
@@ -708,6 +784,12 @@ impl RasterDrawContext {
 
 fn chan(v: f64) -> u8 {
     (v.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
+/// Horizontal pitch for one bitmap character at `scale`: the 5px glyph plus a
+/// 2px gap, so neighbouring glyphs stay distinct.
+fn glyph_advance(scale: f64) -> f64 {
+    (5.0 + 2.0) * scale
 }
 
 /// 5x7 bitmap glyphs for the characters a movie frame needs (ASCII subset).
