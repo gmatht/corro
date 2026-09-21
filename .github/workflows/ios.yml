@@ -111,12 +111,25 @@ jobs:
           xcrun simctl bootstatus "$UDID" -b
 
       - name: Install and launch corro
+        # The build directory lives in /tmp, which is fine across steps within a
+        # job (same runner), but the SIMULATOR can be reset between them - the
+        # failure mode was 'simctl install ... No such file or directory' with
+        # the bundle verifiably present on disk. Assert both ends before
+        # installing so a future occurrence is unambiguous.
         env:
           # Symbolised panic frames: the .ips only carries offsets into the
           # (symbol-stripped) static library.
           RUST_BACKTRACE: "full"
         run: |
-          xcrun simctl install "$SIM_UDID" /tmp/corro_ios_build/iphonesimulator/corro.app
+          APP=/tmp/corro_ios_build/iphonesimulator/corro.app
+          echo "--- app bundle ---"
+          ls -ld "$APP" "$APP/corro" 2>&1 || true
+          file "$APP/corro" 2>&1 || true
+          echo "--- simulator state ---"
+          xcrun simctl list devices | grep -i "$SIM_UDID" || true
+          xcrun simctl bootstatus "$SIM_UDID" -b || true
+          echo "--- installing ---"
+          xcrun simctl install "$SIM_UDID" "$APP"
           # Launch in the background so this step can report the PID and then
           # let the first frame land. `--console-pty` would hold the terminal
           # open for the app's lifetime, so stdout/stderr are captured via the
