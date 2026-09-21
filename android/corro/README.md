@@ -1,7 +1,7 @@
 corro on Android — live view
 ============================
-A VNC server serves display :99, where scrcpy mirrors the Android emulator
-showing corro running.
+A VNC server serves display :99, where a live view of the Android emulator
+shows corro running.
 
 Connect:   <host-ip>:5999   (no password: -SecurityTypes None)
   host ip: 172.25.38.120  (container eth0; from the docker host, forward/map port 5999)
@@ -13,6 +13,28 @@ Emulator:  AVD corro_avd (Android 13, x86_64, port 5554)
 Logs:      adb logcat -s corro rswidgets
 Screenshot: adb exec-out screencap -p > shot.png
 Taps:      adb shell input tap X Y
+
+Mirroring the emulator
+----------------------
+    ./mirror.sh          # then connect a VNC viewer to <host>:5999
+
+`mirror.sh` launches the app, then loops: `adb exec-out screencap` -> a PNG
+-> an `feh --reload` window on `:99`, which the VNC server mirrors.
+
+Do NOT use scrcpy here. The emulator's MediaCodec encoder dies after a while
+("Encoding error: IllegalStateException"); the scrcpy client process stays
+alive but stops receiving frames, so the VNC viewer sits on a stale frame
+forever and the app *looks* frozen when only the mirror is. `mirror.sh`
+avoids the device encoder entirely, so the view stays live.
+
+If the window looks frozen, the check that distinguishes the two cases is:
+
+    # device side: does a tap change anything on the device?
+    adb exec-out screencap -p > a.png; adb shell input tap 540 1200; sleep 3
+    adb exec-out screencap -p > b.png; cmp -s a.png b.png || echo "device is live"
+
+    # mirror side: does the VNC-visible window change too?
+    tail -3 /tmp/live_loop.log      # frame counter must keep advancing
 
 Building
 --------
