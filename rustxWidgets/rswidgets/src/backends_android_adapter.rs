@@ -723,6 +723,7 @@ mod android_adapter {
         Lazy::new(|| Mutex::new(HashMap::new()));
     static CLICK_CALLBACKS: Lazy<Mutex<HashMap<u64, SendClickCallback>>> =
         Lazy::new(|| Mutex::new(HashMap::new()));
+
     static KEY_CALLBACKS: Lazy<Mutex<HashMap<u64, SendKeyCallback>>> =
         Lazy::new(|| Mutex::new(HashMap::new()));
     static CANVAS_SIZE: Lazy<Mutex<HashMap<u64, (i32, i32)>>> =
@@ -1793,6 +1794,30 @@ mod android_adapter {
         let ptr = crate::backends::android::create_textview()
             .map_err(|e| Error::Backend(format!("{e}")))?;
         Ok(TextView(ptr as *mut c_void))
+    }
+
+    /// The display's density factor (`DisplayMetrics.density`): 1.0 at mdpi,
+    /// 2.625 on a 420dpi phone, and so on.
+    ///
+    /// Hosts need this to size things in *pixels* while thinking in
+    /// density-independent units: a hardcoded 12px font is 12dp on a desktop
+    /// monitor but only ~4.6dp on a 420dpi phone, i.e. about a third of
+    /// Android's 14sp body-text floor. Returns `None` before the backend is
+    /// initialised (or if the JNI call fails), so callers can fall back to
+    /// 1.0 and still render.
+    pub fn display_density() -> Option<f64> {
+        crate::backends::android::with_env_and_activity(|env, activity| {
+            let res = env
+                .call_method(activity.as_obj(), "getResources", "()Landroid/content/res/Resources;", &[])?
+                .l()?;
+            let metrics = env
+                .call_method(&res, "getDisplayMetrics", "()Landroid/util/DisplayMetrics;", &[])?
+                .l()?;
+            let density = env.get_field(&metrics, "density", "F")?.f()?;
+            Ok::<f64, Box<dyn std::error::Error + Send + Sync>>(density as f64)
+        })
+        .ok()
+        .filter(|d| d.is_finite() && *d > 0.0)
     }
 }
 

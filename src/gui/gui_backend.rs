@@ -90,15 +90,57 @@ fn log_key_action(keyval: u32, action: &str, detail: &str) {
 
 // ---------------------------------------------------------------------------
 // Constants
+//
+// These are *desktop* pixel metrics: 12px text on a 20px row. That is the
+// right size on a monitor at 96dpi, but the Android backend draws into raw
+// device pixels, where a 420dpi phone renders 12px at ~4.6dp — about a third
+// of Android's 14sp body-text floor, with rows far under the 48dp touch
+// target.
+//
+// `metrics_scale()` therefore multiplies every metric by the host's density
+// factor on Android (2.625x on a 420dpi device, giving ~31px text and ~52px
+// rows) and is exactly 1.0 everywhere else, so desktop GTK/nwg/pancurses and
+// the movie capture are untouched. The metrics are functions rather than
+// consts so there is a single place to apply that scale.
 // ---------------------------------------------------------------------------
 
-pub(crate) const FONT_SIZE: f64 = 12.0;
-pub(crate) const ROW_H: f64 = 20.0;
-pub(crate) const HEADER_H: f64 = 24.0;
-pub(crate) const ROW_LABEL_W: f64 = 50.0;
+/// Base (desktop) metrics, before any host density scaling.
+pub(crate) const FONT_SIZE_BASE: f64 = 12.0;
+pub(crate) const ROW_H_BASE: f64 = 20.0;
+pub(crate) const HEADER_H_BASE: f64 = 24.0;
+pub(crate) const ROW_LABEL_W_BASE: f64 = 50.0;
+pub(crate) const CHAR_W_BASE: f64 = 7.2;
+
+/// Density multiplier for the pixel metrics.
+///
+/// 1.0 on every desktop backend. On Android it is the display density
+/// (`DisplayMetrics.density`), so the grid is legible on a phone without
+/// changing a single desktop call site. Resolved once and cached: it is read
+/// on every frame and cannot change while the app runs.
+#[cfg(target_os = "android")]
+pub(crate) fn metrics_scale() -> f64 {
+    use std::sync::OnceLock;
+    static SCALE: OnceLock<f64> = OnceLock::new();
+    *SCALE.get_or_init(|| {
+        rswidgets::backends_android_adapter::display_density()
+            .unwrap_or(1.0)
+            .max(1.0)
+    })
+}
+
+#[cfg(not(target_os = "android"))]
+pub(crate) fn metrics_scale() -> f64 {
+    1.0
+}
+
+pub(crate) fn font_size() -> f64 { FONT_SIZE_BASE * metrics_scale() }
+pub(crate) fn row_h() -> f64 { ROW_H_BASE * metrics_scale() }
+pub(crate) fn header_h() -> f64 { HEADER_H_BASE * metrics_scale() }
+pub(crate) fn row_label_w() -> f64 { ROW_LABEL_W_BASE * metrics_scale() }
+pub(crate) fn char_w() -> f64 { CHAR_W_BASE * metrics_scale() }
+
 const MAX_RENDER_ROWS: usize = 500;
 const MAX_RENDER_COLS: usize = 50;
-pub(crate) const CHAR_W: f64 = 7.2;
 
 // ---------------------------------------------------------------------------
 // Mode
@@ -410,11 +452,11 @@ fn render_to(
         (r1, r2, c1, c2)
     });
     for (ri, &logical_row) in display_rows.iter().enumerate().take(MAX_RENDER_ROWS) {
-        let ry = HEADER_H + ri as f64 * ROW_H;
+        let ry = header_h() + ri as f64 * row_h();
 
         for (ci, &c) in col_ixs.iter().enumerate().take(MAX_RENDER_COLS) {
-            let cw = *col_widths.get(&c).unwrap_or(&8) as f64 * CHAR_W;
-            let cx = ROW_LABEL_W + col_ixs.iter().take(ci).map(|&pc| *col_widths.get(&pc).unwrap_or(&8) as f64 * CHAR_W).sum::<f64>();
+            let cw = *col_widths.get(&c).unwrap_or(&8) as f64 * char_w();
+            let cx = row_label_w() + col_ixs.iter().take(ci).map(|&pc| *col_widths.get(&pc).unwrap_or(&8) as f64 * char_w()).sum::<f64>();
 
             let key = (ri as u32, c as u32);
             let raw_text = cells.get(&key).map(|s| s.as_str()).unwrap_or("");
@@ -439,38 +481,38 @@ fn render_to(
                 (1.0, 1.0, 1.0, 1.0)
             };
 
-            dc.fill_rect(cx, ry, cw, ROW_H, bg.0, bg.1, bg.2, bg.3);
+            dc.fill_rect(cx, ry, cw, row_h(), bg.0, bg.1, bg.2, bg.3);
 
             // Selection highlight
             if is_current && !is_editing {
-                dc.stroke_rect(cx, ry, cw, ROW_H, 0.0, 0.4, 0.8, 1.0, 2.0);
+                dc.stroke_rect(cx, ry, cw, row_h(), 0.0, 0.4, 0.8, 1.0, 2.0);
             }
 
             // Grid lines
-            dc.stroke_rect(cx, ry, cw, ROW_H, 0.8, 0.8, 0.8, 1.0, 0.5);
+            dc.stroke_rect(cx, ry, cw, row_h(), 0.8, 0.8, 0.8, 1.0, 0.5);
 
             if !raw_text.is_empty() {
                 match style {
                     CellDisplayStyle::Default => {
-                        dc.draw_text(cx + 2.0, ry + 2.0, raw_text, "monospace", FONT_SIZE, 0.0, 0.0, 0.0, 1.0);
+                        dc.draw_text(cx + 2.0, ry + 2.0, raw_text, "monospace", font_size(), 0.0, 0.0, 0.0, 1.0);
                     }
                     CellDisplayStyle::Cursor | CellDisplayStyle::Selected => {
-                        dc.draw_text(cx + 2.0, ry + 2.0, raw_text, "monospace", FONT_SIZE, 0.0, 0.0, 0.0, 1.0);
+                        dc.draw_text(cx + 2.0, ry + 2.0, raw_text, "monospace", font_size(), 0.0, 0.0, 0.0, 1.0);
                     }
                     CellDisplayStyle::Aggregate | CellDisplayStyle::FooterAggregate => {
-                        dc.draw_text(cx + 2.0, ry + 2.0, raw_text, "monospace", FONT_SIZE, 0.5, 0.5, 0.5, 1.0);
+                        dc.draw_text(cx + 2.0, ry + 2.0, raw_text, "monospace", font_size(), 0.5, 0.5, 0.5, 1.0);
                     }
                     CellDisplayStyle::ActiveHeader | CellDisplayStyle::InactiveHeader => {
-                        dc.draw_text(cx + 2.0, ry + 2.0, raw_text, "monospace", FONT_SIZE, 0.3, 0.3, 0.3, 1.0);
+                        dc.draw_text(cx + 2.0, ry + 2.0, raw_text, "monospace", font_size(), 0.3, 0.3, 0.3, 1.0);
                     }
                     CellDisplayStyle::Hyperlink => {
                         // Hyperlinks render blue and underlined by default
                         // (same rule as the terminal backends); cursor and
                         // selection paints above already won for this cell.
-                        dc.draw_text(cx + 2.0, ry + 2.0, raw_text, "monospace", FONT_SIZE, 0.0, 0.0, 0.9, 1.0);
-                        let (tw, _, _, _) = dc.text_extents(raw_text, "monospace", FONT_SIZE);
+                        dc.draw_text(cx + 2.0, ry + 2.0, raw_text, "monospace", font_size(), 0.0, 0.0, 0.9, 1.0);
+                        let (tw, _, _, _) = dc.text_extents(raw_text, "monospace", font_size());
                         if tw > 0.0 {
-                            dc.fill_rect(cx + 2.0, ry + 2.0 + FONT_SIZE + 1.0, tw, 1.0, 0.0, 0.0, 0.9, 1.0);
+                            dc.fill_rect(cx + 2.0, ry + 2.0 + font_size() + 1.0, tw, 1.0, 0.0, 0.0, 0.9, 1.0);
                         }
                     }
                 }
@@ -481,12 +523,12 @@ fn render_to(
     // Edit overlay on cursor cell
     if is_editing && !edit_text.is_empty() {
         if let Some(pos) = col_ixs.iter().position(|&c| c == cursor_col) {
-            let cw = *col_widths.get(&cursor_col).unwrap_or(&8) as f64 * CHAR_W;
-            let cx = ROW_LABEL_W + col_ixs.iter().take(pos).map(|&pc| *col_widths.get(&pc).unwrap_or(&8) as f64 * CHAR_W).sum::<f64>();
+            let cw = *col_widths.get(&cursor_col).unwrap_or(&8) as f64 * char_w();
+            let cx = row_label_w() + col_ixs.iter().take(pos).map(|&pc| *col_widths.get(&pc).unwrap_or(&8) as f64 * char_w()).sum::<f64>();
             if let Some(pos_r) = display_rows.iter().position(|&r| r == cursor_row) {
-                let ry = HEADER_H + pos_r as f64 * ROW_H;
-                dc.fill_rect(cx, ry, cw, ROW_H, 1.0, 1.0, 0.8, 1.0);
-                dc.draw_text(cx + 2.0, ry + 2.0, edit_text, "monospace", FONT_SIZE, 0.0, 0.0, 0.0, 1.0);
+                let ry = header_h() + pos_r as f64 * row_h();
+                dc.fill_rect(cx, ry, cw, row_h(), 1.0, 1.0, 0.8, 1.0);
+                dc.draw_text(cx + 2.0, ry + 2.0, edit_text, "monospace", font_size(), 0.0, 0.0, 0.0, 1.0);
             }
         }
     }
@@ -508,7 +550,7 @@ fn cols_to_fill_px(app: &super::App, cursor: SheetCursor, avail_px: i32) -> usiz
         let (cols, _) = ui_core::visible_col_indices(sheet, cursor, dim, 0);
         let used: f64 = cols
             .iter()
-            .map(|&c| display_col_width(sheet, c, mc) as f64 * CHAR_W)
+            .map(|&c| display_col_width(sheet, c, mc) as f64 * char_w())
             .sum();
         // Exit when covered, capped, or exhausted. Never exit on
         // `cols.len() < dim`: visible_col_indices may legitimately return
@@ -526,7 +568,7 @@ fn cols_to_fill_px(app: &super::App, cursor: SheetCursor, avail_px: i32) -> usiz
 /// 20px in-canvas status strip (drawn over the bottom) so the last row —
 /// often the cursor — stays fully visible instead of sliding underneath it.
 fn rows_to_fill_px(h: i32) -> usize {
-    (((h as f64 - HEADER_H - 20.0) / ROW_H + 1.0).max(1.0)) as usize
+    (((h as f64 - header_h() - 20.0) / row_h() + 1.0).max(1.0)) as usize
 }
 
 /// Paint the row-label gutter. Labels render bold (weight 1), matching the
@@ -542,23 +584,23 @@ fn paint_row_headers(
     hl_rows: Option<(usize, usize)>,
 ) {
     for (ri, &logical_row) in display_rows.iter().enumerate().take(MAX_RENDER_ROWS) {
-        let ry = HEADER_H + ri as f64 * ROW_H;
+        let ry = header_h() + ri as f64 * row_h();
         let label = crate::addr::ui_row_label(logical_row, mr);
-        let (_, _, tw, _) = dc.text_extents_styled(&label, "monospace", FONT_SIZE, 0, 1);
+        let (_, _, tw, _) = dc.text_extents_styled(&label, "monospace", font_size(), 0, 1);
         // Covered rows (anchor↔cursor selection) use the body selection
         // fill so the gutter mirrors the selected band; plain rows keep the
         // neutral header gray. With no selection nothing changes.
         let hl = hl_rows.is_some_and(|(r0, r1)| logical_row >= r0 && logical_row <= r1);
         let fill = if hl { (0.9, 0.95, 1.0, 1.0) } else { (0.9, 0.9, 0.9, 1.0) };
-        dc.fill_rect(0.0, ry, ROW_LABEL_W, ROW_H, fill.0, fill.1, fill.2, fill.3);
+        dc.fill_rect(0.0, ry, row_label_w(), row_h(), fill.0, fill.1, fill.2, fill.3);
         // Row numbers sit 6px off the gutter's right gridline so glyphs
         // never touch it.
-        dc.draw_text_styled(ROW_LABEL_W - tw - 6.0, ry + 2.0, &label, "monospace", FONT_SIZE, 0.3, 0.3, 0.3, 1.0, 0, 1);
+        dc.draw_text_styled(row_label_w() - tw - 6.0, ry + 2.0, &label, "monospace", font_size(), 0.3, 0.3, 0.3, 1.0, 0, 1);
         // Padlock at the gutter's left edge (short labels only): the label
         // is right-aligned, so the left side always has room.
         if wants_padlock(&label) {
             let locked = pinned.contains(&logical_row);
-            let (px, py) = (2.0, ry + (ROW_H - PADLOCK_H) / 2.0);
+            let (px, py) = (2.0, ry + (row_h() - PADLOCK_H) / 2.0);
             paint_padlock(dc, px, py, locked);
             out_padlocks.push(GutterPadlock {
                 x: px,
@@ -586,14 +628,14 @@ fn paint_col_headers(
     hl_cols: Option<(usize, usize)>,
 ) {
     for (ci, &c) in col_ixs.iter().enumerate().take(MAX_RENDER_COLS) {
-        let cw = *col_widths.get(&c).unwrap_or(&8) as f64 * CHAR_W;
-        let cx = ROW_LABEL_W + col_ixs.iter().take(ci).map(|&pc| *col_widths.get(&pc).unwrap_or(&8) as f64 * CHAR_W).sum::<f64>();
+        let cw = *col_widths.get(&c).unwrap_or(&8) as f64 * char_w();
+        let cx = row_label_w() + col_ixs.iter().take(ci).map(|&pc| *col_widths.get(&pc).unwrap_or(&8) as f64 * char_w()).sum::<f64>();
         let col_name = crate::addr::ui_column_fragment(c, mc);
         // Same selection fill as covered row headers (see paint_row_headers).
         let hl = hl_cols.is_some_and(|(c0, c1)| c >= c0 && c <= c1);
         let fill = if hl { (0.9, 0.95, 1.0, 1.0) } else { (0.9, 0.9, 0.9, 1.0) };
-        dc.fill_rect(cx, 0.0, cw, HEADER_H, fill.0, fill.1, fill.2, fill.3);
-        let (_, _, tw, _) = dc.text_extents_styled(&col_name, "monospace", FONT_SIZE, 0, 1);
+        dc.fill_rect(cx, 0.0, cw, header_h(), fill.0, fill.1, fill.2, fill.3);
+        let (_, _, tw, _) = dc.text_extents_styled(&col_name, "monospace", font_size(), 0, 1);
         // Label and padlock center as a unit, so the icon fits inside its
         // own column instead of dangling past the gridline: the column is
         // one character wider than recorded (see display_col_width)
@@ -601,13 +643,13 @@ fn paint_col_headers(
         let lock = wants_padlock(&col_name);
         let group = tw + if lock { 2.0 + PADLOCK_W } else { 0.0 };
         let tx = cx + (cw - group) / 2.0;
-        dc.draw_text_styled(tx, (HEADER_H - FONT_SIZE * 1.2) / 2.0, &col_name, "monospace", FONT_SIZE, 0.3, 0.3, 0.3, 1.0, 0, 1);
+        dc.draw_text_styled(tx, (header_h() - font_size() * 1.2) / 2.0, &col_name, "monospace", font_size(), 0.3, 0.3, 0.3, 1.0, 0, 1);
         // Padlock right after the centered text, inside its own column: the
         // column is one character wider than recorded (see display_col_width)
         // precisely so this icon fits without spilling over the neighbor.
         if lock {
             let locked = pinned.contains(&c);
-            let (px, py) = (tx + tw + 2.0, (HEADER_H - PADLOCK_H) / 2.0);
+            let (px, py) = (tx + tw + 2.0, (header_h() - PADLOCK_H) / 2.0);
             paint_padlock(dc, px, py, locked);
             out_padlocks.push(GutterPadlock {
                 x: px,
@@ -863,7 +905,7 @@ fn render_tabbar(dc: &mut dyn DrawContext, state: &GuiState, w: i32, h: i32) {
     dc.clip(0.0, 0.0, w as f64, h as f64);
     let hits = {
         let measure = |t: &str, weight: i32| {
-            dc.text_extents_styled(t, "monospace", FONT_SIZE, 0, weight).2
+            dc.text_extents_styled(t, "monospace", font_size(), 0, weight).2
         };
         tab_layout(&titles, active, &measure)
     };
@@ -877,10 +919,10 @@ fn render_tabbar(dc: &mut dyn DrawContext, state: &GuiState, w: i32, h: i32) {
         let weight = if is_active { 1 } else { 0 };
         dc.draw_text_styled(
             hit.x0 + TAB_PAD_X,
-            (TAB_H - FONT_SIZE * 1.2) / 2.0,
+            (TAB_H - font_size() * 1.2) / 2.0,
             &titles[hit.index],
             "monospace",
-            FONT_SIZE,
+            font_size(),
             tr,
             tg,
             tb,
@@ -1114,7 +1156,7 @@ fn render_grid_body_inner(
     );
 
     // Status line at the bottom of the body.
-    if h as f64 > HEADER_H + 20.0 {
+    if h as f64 > header_h() + 20.0 {
         dc.fill_rect(0.0, h as f64 - 20.0, w as f64, 20.0, 0.9, 0.9, 0.9, 1.0);
     }
 
@@ -2534,16 +2576,16 @@ fn handle_click(x: f64, y: f64, state_rc: &Rc<GuiState>) {
     }
 
     let app = state.app_mut();
-    if x < ROW_LABEL_W || y < HEADER_H {
+    if x < row_label_w() || y < header_h() {
         return;
     }
     let col_ixs: Vec<usize> = displayed_cols(state);
     let mc = app.core.workbook.active_sheet().grid.main_cols();
-    let mut cx = ROW_LABEL_W;
+    let mut cx = row_label_w();
     for &c in &col_ixs {
-        let cw = display_col_width(&app.core.workbook.active_sheet(), c, mc) as f64 * CHAR_W;
+        let cw = display_col_width(&app.core.workbook.active_sheet(), c, mc) as f64 * char_w();
         if x >= cx && x < cx + cw {
-            let ri = ((y - HEADER_H) / ROW_H) as usize;
+            let ri = ((y - header_h()) / row_h()) as usize;
             // Same pinned-first display set the renderer uses, or clicks
             // land on the wrong rows once pins are active.
             let display_rows: Vec<usize> = displayed_rows(state);
@@ -2792,13 +2834,13 @@ fn cell_rect(state: &GuiState, addr: &crate::grid::CellAddr) -> Option<(i32, i32
     let col_ixs = displayed_cols(state);
     let ci = col_ixs.iter().position(|&c| c == target_col)?;
 
-    let mut x = ROW_LABEL_W;
+    let mut x = row_label_w();
     for &c in &col_ixs[..ci] {
-        x += display_col_width(&app.core.workbook.active_sheet(), c, mc) as f64 * CHAR_W;
+        x += display_col_width(&app.core.workbook.active_sheet(), c, mc) as f64 * char_w();
     }
-    let w = display_col_width(&app.core.workbook.active_sheet(), target_col, mc) as f64 * CHAR_W;
-    let y = HEADER_H + ri as f64 * ROW_H;
-    Some((x as i32, y as i32, w as i32, ROW_H as i32))
+    let w = display_col_width(&app.core.workbook.active_sheet(), target_col, mc) as f64 * char_w();
+    let y = header_h() + ri as f64 * row_h();
+    Some((x as i32, y as i32, w as i32, row_h() as i32))
 }
 
 /// Geometry of the open dropdown: `(box_x, box_y, box_w, box_h, row_h)`,
@@ -2823,14 +2865,14 @@ fn agg_drop_layout_for_cell(
     canvas_w: f64,
     canvas_h: f64,
 ) -> (f64, f64, f64, f64, f64) {
-    let row_h = ROW_H;
+    let rh = row_h();
     let rows = agg_drop_rows().len() as f64;
     let list_w = (cw as f64).max(150.0);
-    let list_h = rows * row_h + 2.0;
+    let list_h = rows * rh + 2.0;
     // Open downward from the cell; flip above it when that would overflow,
     // then clamp the whole box inside the canvas so it is never partly
     // off-screen (a tall list on a short canvas scrolls less than it shows).
-    let mut y = (cy as f64) + ROW_H;
+    let mut y = (cy as f64) + rh;
     if y + list_h > canvas_h {
         y = (cy as f64) - list_h;
     }
@@ -2838,7 +2880,7 @@ fn agg_drop_layout_for_cell(
     let y = y.clamp(0.0, max_y);
     let max_x = (canvas_w - list_w).max(0.0);
     let x = (cx as f64).clamp(0.0, max_x);
-    (x, y, list_w, list_h, row_h)
+    (x, y, list_w, list_h, rh)
 }
 
 /// The row under a canvas-local point, while the dropdown is open.
@@ -2968,7 +3010,7 @@ fn render_agg_dropdown(dc: &mut dyn DrawContext, state: &GuiState, w: i32, h: i3
             // Highlight the active row so it reads as the current choice.
             dc.fill_rect(bx + 1.0, ry, bw - 2.0, row_h, 0.82, 0.89, 0.98, 1.0);
         }
-        dc.draw_text(bx + 6.0, ry + 3.0, row, "monospace", FONT_SIZE, 0.05, 0.05, 0.1, 1.0);
+        dc.draw_text(bx + 6.0, ry + 3.0, row, "monospace", font_size(), 0.05, 0.05, 0.1, 1.0);
     }
 }
 
@@ -4089,7 +4131,7 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
             shared_draw.data_cols.set(cols_to_fill_px(
                 app,
                 app.core.cursor,
-                (w as f64 - ROW_LABEL_W).max(0.0) as i32,
+                (w as f64 - row_label_w()).max(0.0) as i32,
             ));
             shared_draw.data_rows.set(rows_to_fill_px(h));
             // Keep the scrollbar thumb on the viewport (ranges track grid
@@ -4326,7 +4368,7 @@ mod gutter_tests {
             .iter()
             .filter_map(|op| match op {
                 DrawOp::FillRect { x, w, rgba, .. }
-                    if *x == 0.0 && *w == ROW_LABEL_W =>
+                    if *x == 0.0 && *w == row_label_w() =>
                 {
                     Some(*rgba)
                 }
@@ -4372,7 +4414,7 @@ mod gutter_tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(xs, vec![ROW_LABEL_W - 8.0 - 6.0], "row number x, got {xs:?}");
+        assert_eq!(xs, vec![row_label_w() - 8.0 - 6.0], "row number x, got {xs:?}");
     }
 
     /// Column gutter labels must paint bold (weight 1), with the column name.
@@ -4399,7 +4441,7 @@ mod gutter_tests {
             .iter()
             .filter_map(|op| match op {
                 DrawOp::FillRect { y, h, rgba, .. }
-                    if *y == 0.0 && *h == HEADER_H =>
+                    if *y == 0.0 && *h == header_h() =>
                 {
                     Some(*rgba)
                 }
@@ -4678,7 +4720,7 @@ mod brightness_tests {
         let mut bgs: Vec<((f64, f64), (f64, f64, f64, f64))> = dc
             .fill_rects()
             .into_iter()
-            .filter(|r| r.y >= HEADER_H - 0.5 && r.y < HEADER_H + ROW_H)
+            .filter(|r| r.y >= header_h() - 0.5 && r.y < header_h() + row_h())
             .map(|r| ((r.x, r.w), r.rgba))
             .collect();
         bgs.sort_by(|a, b| a.0 .0.partial_cmp(&b.0 .0).unwrap());
@@ -4855,7 +4897,7 @@ mod fill_tests {
                 .iter()
                 .map(|&c| display_col_width(sheet, c, mc))
                 .sum::<usize>()
-                * CHAR_W as usize;
+                * char_w() as usize;
             assert!(
                 used_px >= 1220,
                 "viewport must cover 1220px at margin depth {depth} (dim={dim}, cols={}, used~{used_px})",
@@ -4912,10 +4954,10 @@ mod fill_tests {
         assert!(!hits.is_empty(), "expected padlock columns in the A1 view");
         // Replay the paint's x-accumulation; each padlock's right edge must
         // not pass its own column's right edge.
-        let mut cx = ROW_LABEL_W;
+        let mut cx = row_label_w();
         let mut hi = 0usize;
         for &c in &cols {
-            let cw = *widths.get(&c).unwrap() as f64 * CHAR_W;
+            let cw = *widths.get(&c).unwrap() as f64 * char_w();
             if wants_padlock(&crate::addr::ui_column_fragment(c, mc)) {
                 let h = &hits[hi];
                 hi += 1;
@@ -4946,7 +4988,7 @@ mod fill_tests {
             .iter()
             .map(|&c| display_col_width(sheet, c, mc))
             .sum::<usize>()
-            * CHAR_W as usize;
+            * char_w() as usize;
         assert!(
             used_px >= 1220,
             "viewport must cover 1220px on A1 (dim={dim}, cols={}, used~{used_px})",
@@ -5086,12 +5128,12 @@ mod agg_drop_tests {
     /// and flips above the cell when it would overflow the canvas bottom.
     #[test]
     fn layout_hangs_under_the_cell_and_flips_on_overflow() {
-        let (x, y, w, h, row_h) = agg_drop_layout_for_cell(158, 24, 50, 1200.0, 800.0);
-        assert_eq!(row_h, ROW_H);
-        assert_eq!(y, 24.0 + ROW_H, "opens downward from the cell");
+        let (x, y, w, h, rh) = agg_drop_layout_for_cell(158, 24, 50, 1200.0, 800.0);
+        assert_eq!(rh, row_h());
+        assert_eq!(y, 24.0 + row_h(), "opens downward from the cell");
         assert!(w >= 150.0, "at least wide enough to read a label");
         let rows = crate::ui_core::AGG_CHOICES.len() as f64;
-        assert_eq!(h, rows * ROW_H + 2.0, "one row per choice plus the border");
+        assert_eq!(h, rows * row_h() + 2.0, "one row per choice plus the border");
         assert_eq!(x, 158.0);
 
         // Near the right edge the box is pulled back inside the canvas.
