@@ -1,0 +1,17 @@
+name: sdk probe4
+on:
+  push:
+    paths: ['.github/workflows/sdk_probe4.yml']
+jobs:
+  p:
+    runs-on: macos-14
+    steps:
+      - run: |
+          SDK="$(xcrun --sdk iphonesimulator --show-sdk-path)"
+          H="$SDK/System/Library/Frameworks/UIKit.framework/Headers/UIKeyConstants.h"
+          echo "=== constants this SDK actually defines (grep for the ones we used):"
+          for n in KeyboardReturnOrEnter KeypadEnter KeyboardEscape KeyboardTab KeyboardBackspace KeyboardDeleteForward KeyboardLeftArrow KeyboardUpArrow KeyboardRightArrow KeyboardDownArrow KeyboardHome KeyboardEnd; do
+            if grep -q "UIKeyboardHIDUsage$n " "$H" 2>/dev/null; then echo "  OK    UIKeyboardHIDUsage$n"; else echo "  MISS  UIKeyboardHIDUsage$n"; fi
+          done
+          echo "=== names containing Backspace/Delete/Return:"
+          grep -oE 'UIKeyboardHIDUsage[A-Za-z]+' "$H" | sort -u | grep -iE "back|delete|return|escape|tab|arrow|home|end"
