@@ -1,5 +1,9 @@
 name: SDK probe
-on: workflow_dispatch
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/sdk_probe.yml'
 jobs:
   probe:
     runs-on: macos-14
