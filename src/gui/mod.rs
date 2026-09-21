@@ -161,6 +161,37 @@ impl App {
         app
     }
 
+    /// Reset to the blank workbook a movie replay must start from.
+    ///
+    /// `load_initial` replays the whole `.corro` into the workbook, which is
+    /// right for opening a document and wrong for `--movie`: the driver then
+    /// replays the same lines a second time, on top of a sheet that already
+    /// contains the finished result, so the recording never shows a blank sheet
+    /// (and typing appears to land on pre-existing values). The TUI clears the
+    /// workbook before a replay (`ui::App::reset_workbook_for_movie`); this is
+    /// the same idea, and keeps the movie input path attached so the replay can
+    /// still name its source.
+    pub fn reset_workbook_for_movie(&mut self, path: &std::path::Path) {
+        self.core.workbook = crate::ops::WorkbookState::new();
+        self.core.state = self.core.workbook.active_sheet().clone();
+        self.core.offset = 0;
+        self.core.ops_applied = 0;
+        self.core.op_history.clear();
+        self.core.redo_history.clear();
+        self.core.anchor = None;
+        self.core.cursor = crate::grid::SheetCursor {
+            row: crate::grid::HEADER_ROWS,
+            col: crate::grid::MARGIN_COLS,
+        };
+        self.core.source_path = Some(path.to_path_buf());
+        // Replay must stay detached from the on-disk log and its watcher:
+        // a commit during the replay would otherwise rehydrate the workbook
+        // from the file and undo this reset.
+        self.core.path = None;
+        self.core.watcher = None;
+        self.core.status = "Movie".to_string();
+    }
+
     pub fn load_initial(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let path = self.core.path.clone();
         if let Some(p) = &path {

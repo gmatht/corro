@@ -1005,6 +1005,9 @@ fn try_main() -> (Result<(), Box<dyn std::error::Error>>, Option<String>) {
         }
         #[cfg(feature = "gui")]
         UiKind::Gui => {
+            // Kept for the movie reset below: `args.files` is moved into the
+            // `App` constructor.
+            let movie_input = args.files.first().cloned();
             let mut app = match args.revision {
                 None => GuiApp::new_with_paths(args.files),
                 Some(RevisionMode::Browse) => GuiApp::new_with_revision_browser(args.files.first().cloned()),
@@ -1014,14 +1017,19 @@ fn try_main() -> (Result<(), Box<dyn std::error::Error>>, Option<String>) {
             };
             app.set_backend(corro::gui::Backend::Gui);
             let res = if args.movie {
-                match app.load_initial() {
-                    Ok(()) => app.run_movie(corro::gui::movie::GuiMovieOptions {
-                        typing_cps: args.movie_typing_cps,
-                        confirm_delay_ms: args.movie_confirm_ms,
-                        menu_hold_ms: args.movie_menu_hold_ms,
-                    }),
-                    Err(e) => Err(e),
+                // A replay starts from a blank workbook. Calling `load_initial`
+                // here would apply the whole `.corro` first and the driver would
+                // then replay it on top of its own finished result, so the
+                // recording would never show an empty sheet. The TUI branch
+                // above does not load for a movie either.
+                if let Some(p) = movie_input.as_ref() {
+                    app.reset_workbook_for_movie(p);
                 }
+                app.run_movie(corro::gui::movie::GuiMovieOptions {
+                    typing_cps: args.movie_typing_cps,
+                    confirm_delay_ms: args.movie_confirm_ms,
+                    menu_hold_ms: args.movie_menu_hold_ms,
+                })
             } else {
                 match app.load_initial() {
                     Ok(()) => app.run(),
@@ -1043,14 +1051,19 @@ fn try_main() -> (Result<(), Box<dyn std::error::Error>>, Option<String>) {
             #[cfg(feature = "pancurses")]
             app.set_backend(corro::gui::Backend::Pancurses);
             let res = if args.movie {
-                match app.load_initial() {
-                    Ok(()) => app.run_movie(corro::gui::movie::GuiMovieOptions {
-                        typing_cps: args.movie_typing_cps,
-                        confirm_delay_ms: args.movie_confirm_ms,
-                        menu_hold_ms: args.movie_menu_hold_ms,
-                    }),
-                    Err(e) => Err(e),
+                // A replay starts from a blank workbook. Calling `load_initial`
+                // here would apply the whole `.corro` first and the driver would
+                // then replay it on top of its own finished result, so the
+                // recording would never show an empty sheet. The TUI branch
+                // above does not load for a movie either.
+                if let Some(p) = movie_input.as_ref() {
+                    app.reset_workbook_for_movie(p);
                 }
+                app.run_movie(corro::gui::movie::GuiMovieOptions {
+                    typing_cps: args.movie_typing_cps,
+                    confirm_delay_ms: args.movie_confirm_ms,
+                    menu_hold_ms: args.movie_menu_hold_ms,
+                })
             } else {
                 match app.load_initial() {
                     Ok(()) => app.run(),
