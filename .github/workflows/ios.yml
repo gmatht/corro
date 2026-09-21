@@ -154,10 +154,18 @@ jobs:
           # our stdout, so a short-lived second launch is what actually shows
           # the startup lines.
           echo "--- app output (second launch, console attached) ---"
-          timeout 25 xcrun simctl terminate "$SIM_UDID" com.corro.corro 2>/dev/null || true
+          # `timeout` does not exist on macOS runners (found by a failed run),
+          # so the bounded wait is done by backgrounding the launch and killing
+          # it after a fixed sleep. --console stays attached to the app for its
+          # lifetime, hence the kill.
+          xcrun simctl terminate "$SIM_UDID" com.corro.corro 2>/dev/null || true
           : > /tmp/corro-console.log
-          timeout 25 xcrun simctl launch --console "$SIM_UDID" com.corro.corro \
-            > /tmp/corro-console.log 2>&1 || true
+          xcrun simctl launch --console "$SIM_UDID" com.corro.corro \
+            > /tmp/corro-console.log 2>&1 &
+          CONSOLE_PID=$!
+          sleep 20
+          kill "$CONSOLE_PID" 2>/dev/null || true
+          wait "$CONSOLE_PID" 2>/dev/null || true
           tr -d '\000' < /tmp/corro-console.log | head -40 || echo "(no output)"
           echo "--- is the app process alive? ---"
           # `ps -ax` inside the simulator DOES list app processes; `pgrep` there
