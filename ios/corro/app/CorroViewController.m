@@ -35,8 +35,28 @@
 
 @implementation CorroEntryDelegate
 
-// Soft-keyboard typing has no key event: this is the only signal.
-- (void)textFieldDidChangeSelection:(UITextField *)textField {
+// Soft-keyboard typing has no key event: a delegate callback is the only
+// signal. Two different callbacks cover the deployment range:
+//
+//   editingChanged (UIControl event, iOS 2.0+)  -> registered in
+//       `installEntryDelegate`, because it is a control event rather than a
+//       delegate method and so is NOT covered by which method we implement;
+//   textFieldDidChangeSelection: (iOS 13.0+)    -> the modern delegate hook,
+//       kept for selection moves that `editingChanged` does not report
+//       (caret moves without typing).
+//
+// Implementing only the iOS 13+ method - as this file first did - means the
+// app compiles against a 12.0 target but silently receives NO text callbacks
+// on iOS 12. Found by checking each API against the deployment target rather
+// than one CI error at a time.
+- (void)textFieldDidChangeSelection:(UITextField *)textField API_AVAILABLE(ios(13.0)) {
+    (void)textField;
+    corro_ios_entry_changed(self.corroHandle);
+}
+
+// UIControlEventEditingChanged handler: the deployment-safe "text changed"
+// signal (iOS 2.0+), used by the target/action wired in `installEntryDelegate`.
+- (void)entryTextChanged:(UITextField *)textField {
     (void)textField;
     corro_ios_entry_changed(self.corroHandle);
 }
@@ -128,6 +148,14 @@
     delegate.corroHandle = (uint64_t)(uintptr_t)(__bridge void *)field;
     field.delegate = delegate;
     self.entryDelegate = delegate; // strong: UITextField's is weak
+
+    // The iOS 2.0+ signal for "the text changed", and the one that keeps soft
+    // typing working below iOS 13 (see textFieldDidChangeSelection: above).
+    // A control event, so it fires regardless of which delegate method the
+    // running system knows about.
+    [field addTarget:delegate
+              action:@selector(entryTextChanged:)
+    forControlEvents:UIControlEventEditingChanged];
 }
 
 - (UITextField *)firstTextFieldInView:(UIView *)view {
