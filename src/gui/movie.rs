@@ -264,6 +264,26 @@ impl GuiMovie {
         }
     }
 
+    /// The cursor position a step moves to before it does anything.
+    ///
+    /// The TUI moves the cursor to the target address *before* typing, so the
+    /// cell being edited is the one under the cursor and the renderer's
+    /// edit-preview paints the growing text into it. A driver that only moves
+    /// the cursor when the step is applied shows the typing on the wrong cell.
+    pub fn step_cursor(&self, index: usize) -> Option<SheetCursor> {
+        let step = self.steps.get(index)?;
+        let op = ops::parse_workbook_line(&step.line).ok()?;
+        let op = match &op {
+            WorkbookOp::SheetOp { op, .. } => op,
+            _ => return None,
+        };
+        let addr = match op {
+            Op::SetCell { addr, .. } | Op::SetCellFormat { addr, .. } => addr,
+            _ => return None,
+        };
+        Some(cursor_of(addr, &ops::WorkbookState::new()))
+    }
+
     /// Reset to a freshly-parsed state (a rewind for a second pass).
     pub fn rewind(&mut self) {
         self.cursor = None;

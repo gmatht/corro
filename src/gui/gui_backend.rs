@@ -4617,6 +4617,21 @@ fn arm_movie_driver(state: &Rc<GuiState>, movie: super::movie::GuiMovie) {
                 }
                 match typed {
                     Some(value) => {
+                        // Move the cursor onto the cell *before* typing, the way
+                        // the TUI does. The grid's edit overlay paints the
+                        // in-progress buffer on the cursor cell, so without this
+                        // the growing text would appear in the bar while the
+                        // cell under the cursor showed the previous step's
+                        // value (or nothing).
+                        if let Some(cursor) = movie.step_cursor(i) {
+                            let app = state_for_tick.app_mut();
+                            app.core.cursor = cursor;
+                            let grid = &app.core.workbook.active_sheet().grid;
+                            app.core.cursor.clamp(grid);
+                            let row = app.core.cursor.row;
+                            let col = app.core.cursor.col;
+                            update_state_cursor(&state_for_tick, row, col);
+                        }
                         *current = Phase::Typing { step: i, typed: 0, value, hold: hold_ticks };
                         true
                     }

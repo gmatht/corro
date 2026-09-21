@@ -29,6 +29,12 @@
   partial buffer each character) and applying the edit when the last character
   lands. The partial buffer is dropped at the commit so the bar shows the
   committed cell value rather than the last typed run.
+- **The GUI movie moves the cursor before it types.** The cursor only moved when
+  a step was applied, so the grid's edit overlay painted the growing text on the
+  *previous* step's cell instead of the cell being typed. The TUI moves to the
+  target address first (`movie_move_cursor_to_addr`) and then types, which is
+  what puts the preview on the right cell; the driver now does the same, so the
+  margin cell fills in alongside the formula bar.
 - **Recording speed is now real.** Both capture scripts used an `xwd` +
   `convert` loop, and at 2400x820 each takes ~500ms, so the loop delivered
   about **1 fps** however high a rate was requested — a 32-second session
