@@ -65,7 +65,19 @@
 // Hardware keys are funnelled the same way touches are. `keyCommands` would be
 // the modern route but only handles a fixed set; `pressesBegan:` covers a
 // physical keyboard and the iPad keyboard accessory bar.
+//
+// `UIPress.key` and the whole `UIKey` class only exist on iOS 13.4+, while this
+// app deploys to 12.0 — so the whole body is behind an availability check and
+// the method degrades to UIKit's default handling on older systems. (Found by
+// CI: clang rejected an unguarded use with -Wunguarded-availability-new.)
 - (void)pressesBegan:(NSSet<UIPress *> *)presses withEvent:(UIPressesEvent *)event {
+    if (@available(iOS 13.4, *)) {
+        [self corroHandlePresses:presses];
+    }
+    [super pressesBegan:presses withEvent:event];
+}
+
+- (void)corroHandlePresses:(NSSet<UIPress *> *)presses {
     for (UIPress *press in presses) {
         UIKey *key = press.key;
         if (key == nil) {
@@ -103,10 +115,11 @@
         if ((key.modifierFlags & UIKeyModifierControl) != 0) mods |= 4;
         if ((key.modifierFlags & UIKeyModifierAlternate) != 0) mods |= 8;
         if (corro_ios_canvas_key(self.corroCanvasId, keyval, mods)) {
-            return; // consumed: do not let UIKit beep
+            // Consumed: handled. (The caller has already forwarded to super,
+            // so returning here simply stops inspecting further presses.)
+            return;
         }
     }
-    [super pressesBegan:presses withEvent:event];
 }
 
 @end
