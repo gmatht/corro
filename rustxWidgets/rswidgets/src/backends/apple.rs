@@ -469,26 +469,29 @@ pub fn own(obj: *mut std::os::raw::c_void) -> *mut std::os::raw::c_void {
 /// spawn booted log stream`; macOS: Console.app / `log stream`) — the
 /// equivalent of Android's `logcat -s rswidgets`.
 pub fn log_apple(msg: &str) {
-    if !is_initialized() {
-        return;
-    }
-    // Logging goes to stderr, NOT through NSLog's variadic interface.
+    // NOTE: deliberately NOT gated on `is_initialized()`.
     //
-    // Three attempts died here, each a different way:
-    //   1. a pointer passed as the FORMAT (`NSLog(fmt, msg)` with a runtime
-    //      char*) segfaults on arm64 macOS/Simulator;
-    //   2. a format string built from `concat!(...).as_bytes()` was a temporary
-    //      dropped before the call, so the variadic received a dangling
-    //      pointer;
-    //   3. even with a literal format and an NSString argument, the variadic
-    //      call still crashed inside objc_msgSend/_CFLogvEx3 — Rust's variadic
-    //      FFI does not apply the argument marshalling Clang does for `%@`, so
-    //      hand-rolled variadic Foundation calls are simply not safe from Rust.
+    // It used to be, on the theory that logging before the backend is up has
+    // nowhere to go. In practice that discarded exactly the messages worth
+    // having: the host logs "ios_main: init_with_root" BEFORE initialising, so
+    // the guard swallowed it, and a startup failure then produced a silent
+    // abort with no indication of how far it got. stderr exists from process
+    // start, so there is always somewhere to go.
     //
-    // stderr is what the simulator's console already captures (and what
-    // `simctl launch --console-pty` shows), so nothing is lost, and the line is
-    // tagged with the same prefixes the docs tell people to grep for.
-    let mut line = String::with_capacity(msg.len() + 10);
+    // Three earlier attempts at this call also died here, each differently, so
+    // the mechanism is spelled out rather than left obvious-looking:
+    //   1. a runtime `char*` as the FORMAT (`NSLog(fmt, msg)`) segfaults on
+    //      arm64 macOS/Simulator;
+    //   2. a format built from `concat!(...).as_bytes()` was a temporary
+    //      dropped before the variadic call - a dangling pointer;
+    //   3. even `NSLog(@"%@", nsstring)` aborted inside
+    //      objc_msgSend/_CFLogvEx3: Rust's variadic FFI does not marshall
+    //      object arguments the way Clang does, so Foundation's printf-style
+    //      functions are not safely callable from Rust at all.
+    //
+    // Hence a direct write(2), tagged like the Android backend's logcat so the
+    // documented greps still work.
+    let mut line = String::with_capacity(msg.len() + 12);
     line.push_str("[rswidgets] ");
     line.push_str(msg);
     line.push('\n');
