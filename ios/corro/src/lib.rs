@@ -34,8 +34,36 @@ pub unsafe extern "C" fn corro_ios_root_ready(root: *mut c_void, view_controller
     // `drawRect:` and touches back into Rust. The backend falls back to a
     // plain UIView (tree builds, nothing draws) if it is missing.
     rswidgets::backends::ios::set_sheet_view_class("SheetView");
-    if let Err(e) = corro::gui::ios_backend::ios_main(root, view_controller) {
-        corro::gui::ios_backend::log_ios(&format!("corro_ios_root_ready failed: {e}"));
+
+    // A panic inside an `extern "C"` frame cannot unwind: Rust aborts, the
+    // original message is replaced by "panic in a function that cannot
+    // unwind", and everything about *what* went wrong is lost. That cost
+    // several CI runs while bringing the app up, so catch it at the boundary
+    // and report the real panic instead. `catch_unwind` needs the closure to
+    // be UnwindSafe, and the raw pointers are plainly not, so they are passed
+    // through `AssertUnwindSafe` with the justification that this function
+    // owns nothing and never mutates through them.
+    // SAFETY: this function's contract (both pointers live for the process
+    // lifetime, called on the main thread). The whole `catch_unwind` is inside
+    // the unsafe block for that reason.
+    let result = unsafe {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            corro::gui::ios_backend::ios_main(root, view_controller)
+        }))
+    };
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            corro::gui::ios_backend::log_ios(&format!("corro_ios_root_ready failed: {e}"));
+        }
+        Err(payload) => {
+            let msg = payload
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_owned())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "<non-string panic payload>".to_owned());
+            corro::gui::ios_backend::log_ios(&format!("corro_ios_root_ready PANICKED: {msg}"));
+        }
     }
 }
 
