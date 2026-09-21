@@ -1375,6 +1375,83 @@ pub fn visible_row_indices(
     (display_rows[start..start + dim].to_vec(), start)
 }
 
+/// The cursor's index within the row display list, in the same units as
+/// `visible_row_indices`'s `prev_start`.
+///
+/// Callers that want to *aim* the viewport (centring a clicked cell) need the
+/// cursor's position in the list, which the windowed return value does not
+/// expose: that window is trimmed to `dim` with pinned rows merged in, so its
+/// offsets are not anchor offsets. Asking `visible_row_indices` with
+/// `prev_start = 0` is not enough either — it only scrolls when the cursor
+/// falls outside the window, so it reports 0 whenever the cursor sits in the
+/// first screenful.
+///
+/// Builds the same display list `visible_row_indices` does, then locates the
+/// cursor in it. The list is header rows, then main rows in sorted order,
+/// then footer rows; a main row's address is `HEADER_ROWS + index`, so the
+/// position must be computed against that composition — returning the raw row
+/// address (a `HEADER_ROWS`-offset value near 1e9) would produce an anchor
+/// that scrolls the viewport millions of rows away.
+pub fn cursor_display_row_index(state: &SheetState, cursor: SheetCursor) -> usize {
+    let g = &state.grid;
+    let hr = HEADER_ROWS;
+    let mr = g.main_rows();
+    let main_order = g.sorted_main_rows();
+    let summary = g.content_summary();
+    let mut headers: Vec<usize> = summary.header_rows.iter().map(|&r| r as usize).collect();
+    headers.sort_unstable();
+    headers.dedup();
+    let n_headers = headers.len();
+
+    if cursor.row < hr {
+        // Header row: its own position among the sorted header rows.
+        return headers.iter().position(|&r| r == cursor.row).unwrap_or(0);
+    }
+    if cursor.row < hr + mr {
+        // Body row: after the header block, at its index in the sorted order.
+        let idx = main_order
+            .iter()
+            .position(|&r| hr + r == cursor.row)
+            .unwrap_or(0);
+        return n_headers + idx;
+    }
+    // Footer row: after headers and the whole body.
+    n_headers + main_order.len()
+}
+
+/// The cursor's index within the column list `visible_col_indices` anchors
+/// against, in the same units as its `prev_start`.
+///
+/// That function's `prev_start` indexes `filtered` — every column except the
+/// reserved set — which spans the whole sheet. Callers aiming the viewport
+/// (centring a clicked cell) need this position, and neither the returned
+/// window nor `displayed_cols` can supply it: the window is trimmed to `dim`
+/// with reserved columns re-added, so its offsets are not anchor offsets.
+/// Reconstructing the value elsewhere is what produced an anchor hundreds of
+/// columns out, so it is computed here, next to the code it mirrors.
+pub fn cursor_display_col_index(state: &SheetState, cursor: SheetCursor) -> usize {
+    let g = &state.grid;
+    let lm = MARGIN_COLS;
+    let mc = g.main_cols();
+    let total = lm + mc + MARGIN_COLS;
+    let cur = cursor.col.min(total.saturating_sub(1));
+
+    // The reserved set visible_col_indices protects (see its comment): the
+    // content window from the body origin through main_hi, plus the
+    // left-margin border.
+    let (_, main_hi) = main_col_window(state, cursor);
+    let mut reserved: Vec<usize> = (0..=main_hi).map(|ci| lm + ci as usize).collect();
+    if lm > 0 {
+        reserved.push(lm - 1);
+    }
+    reserved.sort_unstable();
+    reserved.dedup();
+
+    // Same count `binary_search` over `filtered` would yield, without
+    // materialising the list.
+    (0..cur).filter(|c| !reserved.binary_search(c).is_ok()).count()
+}
+
 pub fn visible_col_indices(
     state: &SheetState,
     cursor: SheetCursor,

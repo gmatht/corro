@@ -378,6 +378,15 @@ pub(crate) struct GuiState {
     // and a push mid-drag snaps a user-moved thumb back to the stale
     // cursor-implied position. -1 forces the first push.
     sb_push: Cell<(f64, f64, f64, f64, f64, f64)>,
+    /// Viewport scroll offset (rows, cols) as a *display index*, not a cell
+    /// address. `visible_row_indices`/`visible_col_indices` take it as
+    /// `prev_start` and keep it unless the cursor would fall outside the
+    /// window, so persisting it lets the viewport stay put during ordinary
+    /// navigation and lets a click re-centre deliberately.
+    ///
+    /// `None` means "no anchor yet": the viewport is derived from the cursor
+    /// alone, which is the original behaviour.
+    viewport_anchor: Cell<Option<(usize, usize)>>,
     // Press/release dedup trackers. GTK4-only (feature = "gtk4"): only there
     // can release events arrive as same-keyval callbacks. Everywhere else
     // (GTK3 presses-only, nwg WM_KEYDOWN-only, wasm keydown-only) every key
@@ -842,10 +851,15 @@ fn pinned_sets(state: &GuiState) -> (Vec<usize>, Vec<usize>) {
 /// Display rows with pins merged in (frozen first), for rendering and click
 /// mapping alike — both must agree or clicks land on the wrong cells.
 fn displayed_rows(state: &GuiState) -> Vec<usize> {
-    let (display, _) = {
+    // `prev_start` keeps the viewport where it is while the cursor moves
+    // inside it; the helper only re-anchors when the cursor would fall
+    // outside. Passing the remembered anchor is what lets a click choose the
+    // position (see `centre_on_cursor`); 0 is the "derive from cursor" default.
+    let prev = state.viewport_anchor.get().map(|(r, _)| r).unwrap_or(0);
+    let (display, start) = {
         let app = state.app_ref();
         let sheet = app.core.workbook.active_sheet();
-        ui_core::visible_row_indices(sheet, app.core.cursor, state.data_rows.get(), 0)
+        ui_core::visible_row_indices(sheet, app.core.cursor, state.data_rows.get(), prev)
     };
     let (pinned, _) = pinned_sets(state);
     union_pinned(&display, &pinned)
@@ -853,10 +867,11 @@ fn displayed_rows(state: &GuiState) -> Vec<usize> {
 
 /// Display columns with pins merged in (frozen first). See [`displayed_rows`].
 fn displayed_cols(state: &GuiState) -> Vec<usize> {
+    let prev = state.viewport_anchor.get().map(|(_, c)| c).unwrap_or(0);
     let (col_ixs, _) = {
         let app = state.app_ref();
         let sheet = app.core.workbook.active_sheet();
-        ui_core::visible_col_indices(sheet, app.core.cursor, state.data_cols.get(), 0)
+        ui_core::visible_col_indices(sheet, app.core.cursor, state.data_cols.get(), prev)
     };
     let (_, pinned) = pinned_sets(state);
     union_pinned(&col_ixs, &pinned)
@@ -2161,8 +2176,14 @@ fn recompute_viewport(state: &GuiState) {
     let cursor_row = state.last_row.get();
     let cursor_col = state.last_col.get();
     let sheet = app.core.workbook.active_sheet();
-    let (display_rows, _) = ui_core::visible_row_indices(sheet, app.core.cursor, state.data_rows.get(), 0);
-    let (col_ixs, _) = ui_core::visible_col_indices(sheet, app.core.cursor, state.data_cols.get(), 0);
+    // Use the same anchor the renderer uses. Computing with `prev_start = 0`
+    // here disagreed with `displayed_rows`/`displayed_cols` whenever an anchor
+    // was set: the zero-anchored window need not contain the cursor, so this
+    // "corrected" the cursor on the next frame and undid the centring a click
+    // had just performed.
+    let (prev_r, prev_c) = state.viewport_anchor.get().unwrap_or((0, 0));
+    let (display_rows, _) = ui_core::visible_row_indices(sheet, app.core.cursor, state.data_rows.get(), prev_r);
+    let (col_ixs, _) = ui_core::visible_col_indices(sheet, app.core.cursor, state.data_cols.get(), prev_c);
     if !display_rows.contains(&cursor_row) || !col_ixs.contains(&cursor_col) {
         let new_row = if cursor_row > display_rows.last().copied().unwrap_or(hr) {
             display_rows.first().copied().unwrap_or(hr)
@@ -2647,6 +2668,73 @@ fn sync_chrome_labels(state: &GuiState) {
 // Click handling
 // ---------------------------------------------------------------------------
 
+/// Centre the viewport on the current cursor.
+///
+/// The viewport is otherwise cursor-derived but *sticky*: `visible_*_indices`
+/// keeps its `prev_start` unless the cursor would leave the window, so a click
+/// near an edge leaves the cell sitting at that edge. Selecting a cell should
+/// instead put it in the middle of the screen.
+///
+/// `prev_start` is an index into the *full* display list, while
+/// `displayed_rows`/`displayed_cols` return only the current window — so the
+/// cursor's absolute position has to come from the full list, computed here
+/// with the same helper the viewport uses (pass `prev_start = 0` and read the
+/// returned offset). Only an anchor is stored; the clamping that keeps a
+/// cursor near the sheet's start or end inside the window lives in
+/// `visible_*_indices`, so it does not need duplicating here.
+fn centre_on_cursor(state: &GuiState, app: &super::App) {
+    let sheet = app.core.workbook.active_sheet();
+    let cursor = app.core.cursor;
+    let dim_r = state.data_rows.get().max(1);
+    let dim_c = state.data_cols.get().max(1);
+
+    // Rows. `visible_row_indices` returns the window AND the index it started
+    // at. Asking with `prev_start = 0` makes it anchor the window on the
+    // cursor whenever it has to scroll, so the returned `start` *is* the
+    // cursor's absolute index in the display list — the unit `prev_start`
+    // is expressed in. (Reading the position out of the returned window
+    // instead would be wrong: that list is already trimmed to `dim`, and it
+    // has pinned rows merged in, so its offsets are not the anchor's.)
+    let row_pos = ui_core::cursor_display_row_index(sheet, cursor);
+    let centred_r = row_pos.saturating_sub(dim_r / 2);
+
+    let centred_c = centre_col_anchor(state, sheet, cursor, dim_c);
+
+    state.viewport_anchor.set(Some((centred_r, centred_c)));
+}
+
+/// Column anchor (`prev_start` for `visible_col_indices`) that centres the
+/// cursor.
+///
+/// The cursor's position comes from `ui_core::cursor_display_col_index` rather
+/// than being recomputed here: a column's `prev_start` indexes that function's
+/// internal `filtered` list (every column except the reserved ones), which
+/// spans the whole sheet — not the ~17-wide window `displayed_cols` returns.
+/// Deriving it locally put the anchor hundreds of columns off and scrolled the
+/// body off-screen, so the one canonical computation lives next to the code it
+/// has to agree with.
+fn centre_col_anchor(
+    state: &GuiState,
+    sheet: &crate::ops::SheetState,
+    cursor: SheetCursor,
+    dim: usize,
+) -> usize {
+    let lm = MARGIN_COLS;
+    let pos = ui_core::cursor_display_col_index(sheet, cursor);
+
+    // Never anchor before the body: centring pulls the window `dim / 2`
+    // columns left of the cursor, and for a cursor near the body's left edge
+    // that lands among the left-margin columns, pushing the body off the right
+    // of the screen and filling the viewport with margin grey.
+    let body_origin_pos = if state.last_col.get() < lm {
+        0
+    } else {
+        // Columns before the body, minus those the helper treats as reserved.
+        ui_core::cursor_display_col_index(sheet, SheetCursor { col: lm, ..cursor })
+    };
+    pos.saturating_sub(dim / 2).max(body_origin_pos)
+}
+
 fn handle_click(x: f64, y: f64, state_rc: &Rc<GuiState>) {
     let state: &GuiState = &**state_rc;
     // Mark that the user has clicked: clicks can arrive during `present()`'s
@@ -2766,6 +2854,11 @@ fn handle_click(x: f64, y: f64, state_rc: &Rc<GuiState>) {
                 maintain_extent(state, true);
                 grow_blank_past_cursor(state);
                 update_formula_bar(state, logical_row, c);
+                // Bring the clicked cell to the middle of the viewport. Done
+                // after `maintain_extent`/`grow_blank_past_cursor` because
+                // those can change the display lists the centring indexes
+                // into.
+                centre_on_cursor(state, app);
                 // Select (display the value), don't blank: typing replaces
                 // via the cleared buffer, and an untouched commit stays
                 // quiet (see `start_edit_keep_display`).
@@ -3930,6 +4023,7 @@ pub fn run_gui_with_movie(
         scrolled: scrolled.clone(),
         syncing_scroll: Cell::new(false),
         sb_push: Cell::new((-1.0, -1.0, -1.0, -1.0, -1.0, -1.0)),
+        viewport_anchor: Cell::new(None),
     });
 
     // A fresh load still opens with a clickable trailing blank data row/col.
@@ -5572,6 +5666,29 @@ mod fill_tests {
         );
     }
 
+
+    /// `cursor_display_row_index` must return a position in the display list,
+    /// not the row's address.
+    ///
+    /// Regression (Android): the first version returned `cursor.row` for body
+    /// rows. Body addresses are `HEADER_ROWS + index` and `HEADER_ROWS` is
+    /// 999_999_999, so the "position" came back as ~1e9. Used as a viewport
+    /// anchor that scrolled the sheet millions of rows past the cursor, which
+    /// then rendered nowhere — a tap appeared to select nothing at all.
+    #[test]
+    fn cursor_display_row_index_is_a_list_position_not_a_row_address() {
+        let app = overflow_app();
+        let sheet = app.core.workbook.active_sheet();
+        let hr = HEADER_ROWS;
+        // The first body row is a legitimate, common cursor position.
+        let cursor = SheetCursor { row: hr, col: MARGIN_COLS };
+        let idx = ui_core::cursor_display_row_index(sheet, cursor);
+        assert!(
+            idx < 10_000,
+            "index {idx} looks like a row address, not a list position \
+             (HEADER_ROWS is {hr})"
+        );
+    }
 }
 
 #[cfg(test)]
