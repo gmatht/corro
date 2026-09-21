@@ -104,7 +104,10 @@
                 case UIKeyboardHIDUsageKeypadEnter: keyval = 0xFF0D; break;
                 case UIKeyboardHIDUsageKeyboardEscape: keyval = 0xFF1B; break;
                 case UIKeyboardHIDUsageKeyboardTab: keyval = 0xFF09; break;
-                case UIKeyboardHIDUsageKeyboardBackspace: keyval = 0xFF08; break;
+                // NB: the SDK name is DeleteOrBackspace, not "Backspace" (the
+                // wrong spelling is a compile error, not a fallback - found by
+                // probing UIKeyConstants.h on a real SDK).
+                case UIKeyboardHIDUsageKeyboardDeleteOrBackspace: keyval = 0xFF08; break;
                 case UIKeyboardHIDUsageKeyboardDeleteForward: keyval = 0xFFFF; break;
                 case UIKeyboardHIDUsageKeyboardLeftArrow: keyval = 0xFF51; break;
                 case UIKeyboardHIDUsageKeyboardUpArrow: keyval = 0xFF52; break;
