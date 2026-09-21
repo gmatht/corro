@@ -2377,16 +2377,14 @@ fn maintain_extent(state: &GuiState, allow_shrink: bool) {
     {
         let visible_rows = state.data_rows.get().max(1);
         let visible_cols = state.data_cols.get().max(1);
+        // The viewport spends a column on the left margin border and one on
+        // the right, so a body sized to exactly `visible_cols` still leaves
+        // the far edge showing margin grey — on a phone an empty sheet then
+        // read as a white patch in a grey field. Ask for the border's worth
+        // extra so the body spans what the user can see.
+        const MARGIN_BORDER_COLS: usize = 2;
         target_r = target_r.max(visible_rows.min(MAX_RENDER_ROWS));
-        target_c = target_c.max(visible_cols.min(MAX_RENDER_COLS));
-    }
-    // TEMP PROBE
-    #[cfg(target_os = "android")]
-    {
-        let msg = format!("extent mr={} mc={} target_r={} target_c={} data_rows={} data_cols={}",
-            grid.main_rows(), grid.main_cols(), target_r, target_c,
-            state.data_rows.get(), state.data_cols.get());
-        super::android_backend::logcat(&msg);
+        target_c = target_c.max((visible_cols + MARGIN_BORDER_COLS).min(MAX_RENDER_COLS));
     }
     // Grow toward target (covers the minimal 2x2 body on empty sheets and
     // any cursor floor above current extent).
@@ -2396,24 +2394,11 @@ fn maintain_extent(state: &GuiState, allow_shrink: bool) {
     while grid.main_cols() < target_c {
         grid.grow_main_col_at_right();
     }
-    // TEMP PROBE (post-growth)
-    #[cfg(target_os = "android")]
-    {
-        let msg = format!("extent-after mr={} mc={} allow_shrink={}",
-            grid.main_rows(), grid.main_cols(), allow_shrink);
-        super::android_backend::logcat(&msg);
-    }
     if !allow_shrink {
         return;
     }
     grid.set_min_extent(target_r as u32, target_c as u32);
     grid.shrink_to_content();
-    // TEMP PROBE (post-shrink)
-    #[cfg(target_os = "android")]
-    {
-        let msg = format!("extent-shrunk mr={} mc={}", grid.main_rows(), grid.main_cols());
-        super::android_backend::logcat(&msg);
-    }
 }
 
 /// Open one blank body row/column beyond the cursor when it sits exactly
@@ -4727,9 +4712,9 @@ fn arm_movie_driver(state: &Rc<GuiState>, movie: super::movie::GuiMovie) {
         let mut current = phase.borrow_mut();
         match current.clone() {
             Phase::LeadIn(remaining) => {
-                // Show the untouched sheet. The workbook starts empty (the
-                // replay file is a log, not preloaded content), so painting it
-                // here is all that is needed — no step has run yet.
+                // Show the untouched sheet. `App::reset_workbook_for_movie`
+                // cleared the workbook, so nothing has to be undone to paint
+                // the blank state — no step has run yet.
                 sync_chrome_labels(&state_for_tick);
                 state_for_tick.canvas.queue_redraw();
                 state_for_tick.window.queue_redraw();
@@ -5586,6 +5571,7 @@ mod fill_tests {
             cols.len()
         );
     }
+
 }
 
 #[cfg(test)]

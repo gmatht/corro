@@ -92,6 +92,12 @@ Layout notes
   which the next real `onDraw` then renders as a single enormous row filling
   the canvas — a grid that looks empty. Replaying at a plausible default
   instead keeps the pre-layout draw harmless.
+* On mobile the body is grown to fill the viewport (`maintain_extent`), plus
+  one extra column for each side's margin border. Without that the body keeps
+  its minimal size while the viewport still spends its first columns on the
+  left margin, so an empty sheet renders as a small white patch in a field of
+  margin grey. The result is a white body framed by a one-cell margin border
+  on all four sides, which is what an empty sheet should look like.
 
 Android resources
 -----------------
