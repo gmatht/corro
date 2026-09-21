@@ -45,6 +45,14 @@ scripts/demo_movie.py                                                       # th
 `demo_movie.py` builds the shipped demo: title card, a replay of each featured
 workbook, closing card. `--cps` sets the typing speed (characters per second).
 
+The test workbooks deliberately contain broken formulas, so a recording shows
+real evaluator output (`#NAME`, `#PARSE`, `#CIRC`, ...) in those cells. To list
+them with the log line that produced each one:
+
+```bash
+scripts/movie_errors.py docs/tests/main.corro
+```
+
 A pre-built recording is checked in at `dist/corro-gui-movie.mp4`. Recording
 the live window (rather than rendering frames through a parallel code path)
 means the video cannot drift from the application.

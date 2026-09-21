@@ -16,6 +16,9 @@ Usage:
     scripts/gui_movie.py FILE.corro --video-only --cps 18
 
 Requires: an X server binary (Xvfb), xwd, ImageMagick `convert`, ffmpeg.
+
+To see which cells a recording will show as formula errors (#NAME, #PARSE, ...)
+and which log line produced each one, use `scripts/movie_errors.py`.
 """
 
 from __future__ import annotations
