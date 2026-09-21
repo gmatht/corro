@@ -19,13 +19,16 @@
   file bound, so each recording appended its steps to the fixture — the demo
   workbooks grew on every run. The replay now detaches the file (as the TUI
   replayer already did) while keeping it as the display source.
-- **The GUI movie animates typing.** It advanced one whole *step* per tick, so
-  every value appeared instantly and then sat motionless for the entire hold —
-  a long margin label like `--- Belmont ---` occupied the formula bar for ten
-  seconds with nothing happening. `--movie-typing-cps` was parsed and published
-  but never used by the driver (`char_delay` had no callers). The driver now
-  reveals a value one character per tick and applies the edit when the last
-  character lands, matching the TUI replayer.
+- **The GUI movie animates typing, visibly.** It advanced one whole *step* per
+  tick, so every value appeared instantly and then sat motionless for the entire
+  hold — a long margin label like `--- Belmont ---` occupied the formula bar for
+  ten seconds with nothing happening. `--movie-typing-cps` was parsed and
+  published but never used by the driver (`char_delay` had no callers). The
+  driver now reveals a value one character per tick, writing the growing text
+  into the formula entry (as the TUI does by re-entering edit mode with the
+  partial buffer each character) and applying the edit when the last character
+  lands. The partial buffer is dropped at the commit so the bar shows the
+  committed cell value rather than the last typed run.
 - **Recording speed is now real.** Both capture scripts used an `xwd` +
   `convert` loop, and at 2400x820 each takes ~500ms, so the loop delivered
   about **1 fps** however high a rate was requested — a 32-second session

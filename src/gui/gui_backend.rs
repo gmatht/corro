@@ -4633,11 +4633,19 @@ fn arm_movie_driver(state: &Rc<GuiState>, movie: super::movie::GuiMovie) {
                 let shown: String = chars[..next].iter().collect();
                 let done = next >= chars.len();
                 {
+                    // Put the partial value in the formula entry so the bar
+                    // shows the text growing, exactly as the TUI does by
+                    // re-entering edit mode with the partial buffer each
+                    // character. Without this the animation was invisible: the
+                    // status line counted up while the bar stayed empty, and the
+                    // value only appeared at the commit.
+                    state_for_tick.editing.set(true);
+                    *state_for_tick.edit_buf.borrow_mut() = shown.clone();
+                    sync_entry_to_buf(&state_for_tick);
                     let app = state_for_tick.app_mut();
                     app.core.status = format!(
-                        "Movie {}/{}  {} = {shown}",
-                        step + 1, movie.borrow().len(),
-                        movie.borrow().step_addr_label(step).unwrap_or_default()
+                        "Movie {}/{}  typing: {shown}",
+                        step + 1, movie.borrow().len()
                     );
                     sync_chrome_labels(&state_for_tick);
                     state_for_tick.canvas.queue_redraw();
@@ -4695,6 +4703,11 @@ fn apply_movie_step(
                 let grid = &app.core.workbook.active_sheet().grid;
                 app.core.cursor.clamp(grid);
             }
+            // The typing animation left a partial buffer in the entry; drop it
+            // before the chrome refresh so the bar shows the freshly committed
+            // *cell* value rather than the last typed character run.
+            state.editing.set(false);
+            state.edit_buf.borrow_mut().clear();
             // The same chrome refresh a keypress performs.
             update_state_cursor(state, app.core.cursor.row, app.core.cursor.col);
             let caption = match frame.menu.as_ref() {
