@@ -132,31 +132,42 @@ echo "    SDKROOT=$SDKROOT"
 #      rustc already emits `-target arm64-apple-ios14.0.0-simulator` and clang
 #      merely warns before honouring the triple, silently discarding the flag.
 #      IPHONEOS_DEPLOYMENT_TARGET is what makes the triple carry the version.
-# `-Z link-native-libraries=no` is the load-bearing flag, and finding it took
-# three CI runs. rustc's iOS target spec emits `-lCoreGraphics`, which cannot
-# resolve on any SDK (see above). Merely ADDING `-framework CoreGraphics` does
-# not help: both flags end up on the command line and the linker still fails on
-# the `-l` form. Measured on the runner:
+# The CoreGraphics problem, in full, because four CI runs went into it:
 #
-#     -framework CoreGraphics -lCoreGraphics   -> ld: library not found
+# rustc's iOS target spec links CoreGraphics as `-lCoreGraphics`. The SDK has
+# only a FRAMEWORK for it (System/Library/Frameworks/CoreGraphics.framework,
+# with its own CoreGraphics.tbd) and no usr/lib/libCoreGraphics.tbd, so the
+# `-l` form can never resolve. Verified on the runner:
+#
 #     -lCoreGraphics                           -> ld: library not found
 #     -framework CoreGraphics                  -> ok
+#     -framework CoreGraphics -lCoreGraphics   -> ld: library not found
 #
-# So rustc's own library list has to be suppressed, and the libraries that are
-# genuinely needed re-added by hand. Per the SDK probe, those are:
+# That last line rules out the obvious fix (just add the framework flag) and
+# rules out anything that leaves rustc's `-l` on the command line. Nor is
+# `-Zlink-native-libraries=no` usable: it drops the whole native library list
+# and the flag is absent from some toolchains (it failed as `unknown -Z flag`
+# on the runner, though it exists here).
 #
-#     -framework CoreGraphics   (framework only)
-#     -lobjc -liconv -lSystem   (real .tbd libs in the SDK)
-#
-# `-lSystem` (and the -lc/-lm rustc bundled with it) are subsumed by libSystem,
-# which is what -lSystem resolves to.
+# So instead we make `-lCoreGraphics` resolvable: a shim directory holding the
+# framework's own .tbd under the name the linker looks for. This leaves rustc's
+# link line alone, needs no unstable flags, and works on any Xcode. The probe
+# that established it printed "-> ok" for `-L<shim> -lCoreGraphics`.
+SHIM_DIR="$SCRIPT_DIR/target/ios-sdk-shim"
+rm -rf "$SHIM_DIR" && mkdir -p "$SHIM_DIR"
+CG_TBD="$SDKROOT/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics.tbd"
+if [ ! -f "$CG_TBD" ]; then
+  echo "CoreGraphics.tbd not found in $SDKROOT" >&2
+  exit 1
+fi
+cp "$CG_TBD" "$SHIM_DIR/libCoreGraphics.tbd"
+
 IPHONEOS_DEPLOYMENT_TARGET="$IOS_DEPLOYMENT_TARGET" \
 SDKROOT="$SDKROOT" \
   cargo +nightly build --release \
     --target "$RUST_TARGET" \
     -Zbuild-std=std,panic_abort \
-    -Zlink-native-libraries=no \
-    --config "build.rustflags=[\"-C\",\"link-arg=-isysroot\",\"-C\",\"link-arg=$SDKROOT\",\"-C\",\"link-arg=-framework\",\"-C\",\"link-arg=CoreGraphics\",\"-C\",\"link-arg=-lobjc\",\"-C\",\"link-arg=-liconv\",\"-C\",\"link-arg=-lSystem\"]"
+    --config "build.rustflags=[\"-C\",\"link-arg=-isysroot\",\"-C\",\"link-arg=$SDKROOT\",\"-C\",\"link-arg=-L$SHIM_DIR\"]"
 
 RLIB="$SCRIPT_DIR/target/$RUST_TARGET/release/libcorro_ios.a"
 if [ ! -f "$RLIB" ]; then
