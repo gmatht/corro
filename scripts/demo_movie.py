@@ -167,19 +167,45 @@ def main() -> int:
             sys.exit(f"error: {tool} not found on PATH")
 
     work = Path(tempfile.mkdtemp(prefix="corro-demo-"))
-    frames = work / "frames"
-    frames.mkdir()
-    n = 0
+    # Each segment is encoded to its own file as soon as it is recorded, then
+    # the pieces are concatenated. Copying every captured frame into one
+    # directory (the obvious approach) needs a second copy of 1-3 GB of raw
+    # frames per replay, which ran the disk out of space mid-record.
+    segments: list[Path] = []
+    cards = work / "cards"
+    cards.mkdir()
 
-    def emit(im: Image.Image) -> None:
-        nonlocal n
-        im.save(frames / f"frame-{n:05d}.ppm")
-        n += 1
+    def add_card(im: Image.Image, secs: float, tag: str) -> None:
+        """Encode a still card as a `secs`-long segment."""
+        png = cards / f"{tag}.png"
+        im.save(png)
+        out = work / f"seg-{len(segments):02d}.mp4"
+        subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error",
+             "-loop", "1", "-framerate", str(args.fps), "-i", str(png),
+             "-t", str(secs),
+             "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+             "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", str(args.crf),
+             str(out)],
+            check=True,
+        )
+        segments.append(out)
 
-    def hold(im: Image.Image, secs: float) -> None:
-        # A card is a still; repeat it so the encoded video shows it for `secs`.
-        for _ in range(max(1, int(args.fps * secs))):
-            emit(im)
+    def add_frames(pattern: Path, count: int, scale: str | None, fps: int) -> None:
+        """Encode a captured frame sequence as a segment."""
+        if count == 0:
+            return
+        out = work / f"seg-{len(segments):02d}.mp4"
+        vf = scale or "scale=trunc(iw/2)*2:trunc(ih/2)*2"
+        subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error",
+             "-framerate", str(fps), "-i", str(pattern),
+             "-vf", vf,
+             "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", str(args.crf),
+             str(out)],
+            check=True,
+        )
+        segments.append(out)
 
     try:
         c = work / "title.png"
@@ -189,12 +215,12 @@ def main() -> int:
             "line by line, exactly as the app renders it - cards and replay in one video.",
             c,
         )
-        hold(Image.open(c), args.title_secs)
+        add_card(Image.open(c), args.title_secs, f"card-{len(segments)}")
 
         for path, title, desc, note in FEATURES:
             c = work / (Path(path).stem + ".png")
             card(title, desc, c, note)
-            hold(Image.open(c), args.title_secs)
+            add_card(Image.open(c), args.title_secs, f"card-{len(segments)}")
 
             # Replay through the real window and take the frames it produced.
             d = work / (Path(path).stem + "-frames")
@@ -216,14 +242,12 @@ def main() -> int:
             captured = sorted(d.glob("frame-*.ppm"))
             if not captured:
                 sys.exit(f"error: no frames captured for {path}")
-            for f in captured:
-                emit(Image.open(f))
-            shutil.rmtree(d, ignore_errors=True)
+            add_frames(d / "frame-%05d.ppm", len(captured), None, args.fps)
 
         for pair, title, desc, note in TWO_WINDOW:
             c = work / f"two-{pair}.png"
             card(title, desc, c, note)
-            hold(Image.open(c), args.title_secs)
+            add_card(Image.open(c), args.title_secs, f"card-{len(segments)}")
 
             d = work / f"two-{pair}-frames"
             d.mkdir()
@@ -245,11 +269,11 @@ def main() -> int:
             if not captured:
                 sys.exit(f"error: no frames captured for {pair}")
             # The capture is two windows side by side on a 2400px screen; scale
-            # to the video's 1200px width so the whole demo stays one size.
-            for f in captured:
-                im = Image.open(f)
-                emit(im.resize((WIDTH, int(im.height * WIDTH / im.width)), Image.LANCZOS))
-            shutil.rmtree(d, ignore_errors=True)
+            # to the video's width so the whole demo stays one shape.
+            add_frames(
+                d / "frame-%05d.ppm", len(captured),
+                f"scale={WIDTH}:trunc(ih/2)*2", args.fps,
+            )
 
         c = work / "end.png"
         card(
@@ -257,27 +281,27 @@ def main() -> int:
             "cargo build --features gui  &&  scripts/demo_movie.py",
             c,
         )
-        hold(Image.open(c), args.title_secs)
+        add_card(Image.open(c), args.title_secs, f"card-{len(segments)}")
 
+        if not segments:
+            sys.exit("error: nothing was recorded")
         args.out.parent.mkdir(parents=True, exist_ok=True)
-        cmd = [
-            "ffmpeg", "-y", "-loglevel", "error",
-            "-framerate", str(args.fps),
-            "-i", str(frames / "frame-%05d.ppm"),
-            "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
-            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", str(args.crf),
-            "-movflags", "+faststart", str(args.out),
-        ]
-        print(f"[demo_movie] encoding {n} frames -> {args.out}")
-        subprocess.run(cmd, check=True)
+        listing = work / "segments.txt"
+        listing.write_text("".join(f"file '{p.name}'" + chr(10) for p in segments))
+        print(f"[demo_movie] concatenating {len(segments)} segments -> {args.out}")
+        subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error",
+             "-f", "concat", "-safe", "0", "-i", str(listing),
+             "-c", "copy", "-movflags", "+faststart", str(args.out)],
+            check=True,
+        )
         print(
             f"[demo_movie] wrote {args.out} "
-            f"({args.out.stat().st_size / 1024:.0f} KiB, {n} frames, {n / args.fps:.1f}s "
-            f"@ {args.cps} chars/sec)"
+            f"({args.out.stat().st_size / 1024:.0f} KiB) @ {args.cps} chars/sec"
         )
     finally:
         if args.keep_frames:
-            print(f"[demo_movie] frames kept in {frames}")
+            print(f"[demo_movie] work kept in {work}")
         else:
             shutil.rmtree(work, ignore_errors=True)
     return 0
