@@ -253,7 +253,9 @@ pixels.
   The gate for all of them is the same: *something* must produce a build first.
   A farm or a streaming simulator cannot; only a Mac (or a rented one) can.
 
-* **`.github/workflows/ios.yml` does exactly that.** It builds the app on
+* **`.github/workflows/ios.yml` is written for exactly that** — but note the
+  caveat: **it has never been executed.** It is a first draft, reviewed on a
+  host with no Xcode, no simulator and no GitHub access. It builds the app on
   `macos-14`, boots a simulator, launches corro, screenshots the first frame,
   asserts the process is still alive (catching an `objc_msgSend` signature
   crash, which is the one iOS-specific failure mode that gives no backtrace),
@@ -261,5 +263,11 @@ pixels.
   builds need no signing identity, so the workflow needs no secrets. Its
   companion `rust-ios-check` job runs the Linux cfg checks first, so a failure
   points at the port rather than the Xcode plumbing.
+
+  What *is* verified about it: the YAML parses and every `run` step passes
+  `bash -n` (`ios/corro/scripts/verify_all.sh` checks both). What is not: that
+  the steps actually succeed on a runner. Expect to iterate on the toolchain
+  steps at first run, since `ios/corro` is a standalone workspace and the
+  cache/component setup is the likeliest place to need adjusting.
 
   It cannot cover iOS 7.1.2: no hosted runner carries the archived SDK (§0).

@@ -114,8 +114,15 @@ without a usable backtrace, so "is it still alive" is the assertion that
 matters), and uploads the `rswidgets`/`corro` log lines. Simulator builds need
 no signing, so no secrets are required — just run the workflow.
 
-That is also the fastest way to get the screenshots `docs/ios/README.md`
+That should also be the fastest way to get the screenshots `docs/ios/README.md`
 describes as missing: the workflow uploads them as a build artifact.
+
+**Caveat: it has never been run.** It was written on a host with no Xcode, no
+simulator and no GitHub access, so only its syntax is verified (the YAML parses
+and each `run` step passes `bash -n`, via `scripts/verify_all.sh`). That it
+builds, boots and screenshots is untested; expect a round of fixes on the
+toolchain steps the first time it runs. The Rust half is verified separately by
+the Linux cfg checks, which do pass.
 
 It still cannot cover iOS 7.1.2 — no hosted runner has the archived SDK.
 
