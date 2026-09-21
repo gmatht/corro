@@ -49,8 +49,12 @@ _DISPLAY = ":92"
 # Edits alternate between the windows. `--tempo` scales these: 1.0 is the
 # values below, 2.0 runs them at half speed (used for the shipped demo).
 EDIT_TEMPO = 1.0
-_BASE_LEFT = "2000:A5=111,10000:A7=333,18000:A9=555"
-_BASE_RIGHT = "6000:A6=222,14000:A8=444,22000:A10=666"
+# Values long enough to read as *typed* at the capture rate. The recorder runs
+# at 8 fps, so a three-character value is gone between two frames and the
+# recording looks like the value simply appeared; these take long enough that
+# the per-character animation is visible in the video.
+_BASE_LEFT = "2000:A5=1111,10000:A7=33333,18000:A9=555555"
+_BASE_RIGHT = "6000:A6=2222,14000:A8=44444,22000:A10=666666"
 
 
 def scale_edits(script: str, tempo: float) -> str:
@@ -183,6 +187,10 @@ def main() -> int:
                     help="which two front-ends to show (default: gui-gui)")
     ap.add_argument("--fps", type=int, default=12, help="output frame rate")
     ap.add_argument("--capture-fps", type=float, default=8.0, help="screenshot rate")
+    # Characters per second while a window types into a cell. The capture runs
+    # at 8 fps, so much above ~8 cps the animation is invisible in the video.
+    ap.add_argument("--typing-cps", type=float, default=6.0,
+                    help="characters per second when a window types")
     ap.add_argument("--crf", type=int, default=20, help="x264 quality")
     ap.add_argument("--keep-frames", action="store_true")
     ap.add_argument("--frames-dir", type=Path, help="write frames here (implies --keep-frames)")
@@ -237,8 +245,10 @@ def main() -> int:
 
         left_env = _x_env()
         left_env["CORRO_EDIT_SCRIPT"] = left_script
+        left_env["CORRO_MOVIE_TYPING_CPS"] = str(args.typing_cps)
         right_env = _x_env()
         right_env["CORRO_EDIT_SCRIPT"] = right_script
+        right_env["CORRO_MOVIE_TYPING_CPS"] = str(args.typing_cps)
 
         left = subprocess.Popen([str(binary), "--gui", str(shared)], env=left_env,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)

@@ -261,6 +261,9 @@ def main() -> int:
                     # Match the replay pacing: the collaboration segments
                     # halve in speed along with everything else.
                     "--tempo", str(args.tempo),
+                    # Match the replay's typing rate so both kinds of segment
+                    # read the same way in the finished video.
+                    "--typing-cps", str(args.cps),
                     "--frames-dir", str(d),
                     "-o", str(work / f"two-{pair}.mp4"),
                 ],
@@ -270,11 +273,15 @@ def main() -> int:
             captured = sorted(d.glob("frame-*.ppm"))
             if not captured:
                 sys.exit(f"error: no frames captured for {pair}")
-            # The capture is two windows side by side on a 2400px screen; scale
-            # to the video's width so the whole demo stays one shape.
+            # Two windows sit side by side on a 2400px screen. Scaling that to
+            # the video's 1200px width halves the height too (2400x820 ->
+            # 1200x410), which squashes both windows into a letterbox strip.
+            # Halve *both* dimensions instead: each window keeps its true
+            # aspect and the pair still fits the 1200x800 frame.
             add_frames(
                 d / "frame-%05d.ppm", len(captured),
-                f"scale={WIDTH}:trunc(ih/2)*2", args.fps,
+                f"scale={WIDTH // 2}:trunc(ih/2)*2,pad={WIDTH}:{HEIGHT}:(ow-iw)/2:(oh-ih)/2:color=0x12161e",
+                args.fps,
             )
             shutil.rmtree(d, ignore_errors=True)
 

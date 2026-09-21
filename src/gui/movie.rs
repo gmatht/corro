@@ -246,7 +246,7 @@ impl GuiMovie {
     }
 
     /// The cell label a step writes (`A5`, `[A1`), for the status line.
-    pub fn step_addr_label(&self, index: usize) -> Option<String> {
+    pub fn step_addr_label(&self, index: usize, workbook: &ops::WorkbookState) -> Option<String> {
         let step = self.steps.get(index)?;
         let op = ops::parse_workbook_line(&step.line).ok()?;
         let op = match &op {
@@ -256,8 +256,8 @@ impl GuiMovie {
         // Resolved like the step itself, so `[A1`/`]A~1` label as margin cells
         // instead of collapsing to main A1. `cell_ref_text` needs the sheet's
         // main-column count to tell the two A-columns apart.
-        let addr = cursor_for_op(op, &ops::WorkbookState::new())?;
-        Some(addr::cell_ref_text(&addr, 0))
+        let addr = cursor_for_op(op, workbook)?;
+        Some(addr::cell_ref_text(&addr, workbook.active_sheet().grid.main_cols()))
     }
 
     /// The cursor position a step moves to before it does anything.
@@ -266,20 +266,24 @@ impl GuiMovie {
     /// cell being edited is the one under the cursor and the renderer's
     /// edit-preview paints the growing text into it. A driver that only moves
     /// the cursor when the step is applied shows the typing on the wrong cell.
-    pub fn step_cursor(&self, index: usize) -> Option<SheetCursor> {
+    pub fn step_cursor(&self, index: usize, workbook: &ops::WorkbookState) -> Option<SheetCursor> {
         let step = self.steps.get(index)?;
         let op = ops::parse_workbook_line(&step.line).ok()?;
         let op = match &op {
             WorkbookOp::SheetOp { op, .. } => op,
             _ => return None,
         };
-        // Same resolution the step itself uses (`cursor_for_op`), so the cell
-        // the driver moves to is exactly the cell the step writes. Resolving
-        // `SetCellRef` by hand here got `[A1` (a margin cell) wrong: the ref
-        // needs the sheet's main-column count to become a grid address, and the
-        // `Data`/`Left` distinction is what separates main A1 from margin `[A1`.
-        let addr = cursor_for_op(op, &ops::WorkbookState::new())?;
-        Some(cursor_of(&addr, &ops::WorkbookState::new()))
+        // Resolve against the *live* workbook, not a fresh one. A `SetCellRef`
+        // becomes a grid address through the sheet's current `main_rows` /
+        // `main_cols`, and those grow as the replay runs: the `_N` and `~1`
+        // forms (`[A_2`, `]A~1`) are relative to the sheet's extent, so a fresh
+        // workbook (1x1) resolves them to a different row or column than the
+        // one the step actually writes. Passing the live workbook is also what
+        // `apply_step` uses internally, so the cursor and the value can never
+        // disagree. Resolving by hand earlier conflated the margin cell `[A1`
+        // with main `A1`, which is the same class of mistake.
+        let addr = cursor_for_op(op, workbook)?;
+        Some(cursor_of(&addr, workbook))
     }
 
     /// The value a step types into its cell, and the position it types into.
@@ -287,9 +291,9 @@ impl GuiMovie {
     /// Returned together because the driver needs both before it starts: it
     /// moves the cursor first, then reveals the characters. `None` for steps
     /// that are not a plain value (sheets, moves, formats, fills).
-    pub fn step_typed_cell(&self, index: usize) -> Option<(SheetCursor, String)> {
+    pub fn step_typed_cell(&self, index: usize, workbook: &ops::WorkbookState) -> Option<(SheetCursor, String)> {
         let value = self.step_typed_text(index)?;
-        let cursor = self.step_cursor(index)?;
+        let cursor = self.step_cursor(index, workbook)?;
         Some((cursor, value))
     }
 
@@ -695,6 +699,43 @@ mod tests {
             (GuiMovie::new(&path), path)
         };
         assert!(res.is_err());
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A step's cursor must be the cell the step writes, even for the forms
+    /// that depend on the sheet's extent.
+    ///
+    /// `[A_2` / `]A~1` resolve through the live sheet's `main_rows`/`main_cols`,
+    /// which grow as a replay runs. Resolving against a fresh 1x1 workbook put
+    /// the cursor up to eight rows or a column away from the cell the value was
+    /// committed to, so typing appeared in the wrong cell.
+    #[test]
+    fn step_cursor_matches_the_cell_the_step_writes() {
+        let text = "SET $1:[A1 --- Belmont ---\n\
+                    SET $1:A2 5\n\
+                    SET $1:A3 4.04\n\
+                    SET $1:[A_2 =TOTAL\n\
+                    SET $1:]A~1 =TOTAL\n";
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("corro-movie-cursor-{}.corro", std::process::id()));
+        std::fs::write(&path, text).unwrap();
+        let mut movie = GuiMovie::new(&path).unwrap();
+
+        let mut wb = WorkbookState::new();
+        let mut active = 1u32;
+        for i in 0..movie.len() {
+            let want = movie.step_cursor(i, &wb).expect("a plain write has a cursor");
+            let frame = movie.apply_step(&mut wb, &mut active, i).unwrap();
+            let got = frame.cursor.expect("the applied step reports its cell");
+            let got = cursor_of(&got, &wb);
+            assert_eq!(
+                (want.row, want.col),
+                (got.row, got.col),
+                "step {i} cursor {:?} is not the cell it wrote {:?}",
+                (want.row, want.col),
+                (got.row, got.col)
+            );
+        }
         let _ = std::fs::remove_file(path);
     }
 

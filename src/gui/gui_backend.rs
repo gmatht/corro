@@ -861,6 +861,10 @@ fn displayed_rows(state: &GuiState) -> Vec<usize> {
         let sheet = app.core.workbook.active_sheet();
         ui_core::visible_row_indices(sheet, app.core.cursor, state.data_rows.get(), prev)
     };
+    #[cfg(target_os = "android")]
+    super::android_backend::logcat(&format!(
+        "USE prev={prev} start={start} list_len={}", display.len()));
+
     let (pinned, _) = pinned_sets(state);
     union_pinned(&display, &pinned)
 }
@@ -2404,7 +2408,16 @@ fn maintain_extent(state: &GuiState, allow_shrink: bool) {
         // read as a white patch in a grey field. Ask for the border's worth
         // extra so the body spans what the user can see.
         const MARGIN_BORDER_COLS: usize = 2;
-        target_r = target_r.max(visible_rows.min(MAX_RENDER_ROWS));
+        // A sheet grown to exactly the viewport has NO scroll range: the
+        // display list comes back the same length as the window, so
+        // `visible_row_indices` clamps `start` to 0 and the viewport can never
+        // move. That also made aiming the viewport at a tapped cell a no-op —
+        // there was nothing to scroll. A spreadsheet is expected to extend past
+        // what is on screen, so keep a screenful of headroom below the body:
+        // enough to scroll somewhere, bounded so the sheet cannot run away.
+        const SCROLL_HEADROOM_ROWS: usize = 1;
+        let headroom = visible_rows * (SCROLL_HEADROOM_ROWS + 1);
+        target_r = target_r.max(headroom.min(MAX_RENDER_ROWS));
         target_c = target_c.max((visible_cols + MARGIN_BORDER_COLS).min(MAX_RENDER_COLS));
     }
     // Grow toward target (covers the minimal 2x2 body on empty sheets and
@@ -2701,6 +2714,9 @@ fn centre_on_cursor(state: &GuiState, app: &super::App) {
     let centred_c = centre_col_anchor(state, sheet, cursor, dim_c);
 
     state.viewport_anchor.set(Some((centred_r, centred_c)));
+    #[cfg(target_os = "android")]
+    super::android_backend::logcat(&format!(
+        "AIM r={centred_r} c={centred_c} row_pos={row_pos} dim_r={dim_r}"));
 }
 
 /// Column anchor (`prev_start` for `visible_col_indices`) that centres the
@@ -4724,34 +4740,78 @@ fn arm_edit_script(state: &Rc<GuiState>) {
     let state_for_tick = state.clone();
     let idx = std::cell::Cell::new(0usize);
     let start = std::time::Instant::now();
+
+    // Reveal each value one character at a time, then commit it — the same
+    // shape the `--movie` driver uses. Committing the whole string in one tick
+    // (the earlier behaviour) made a two-window recording show values simply
+    // appearing, so neither window ever looked like it was being typed into.
+    // The per-character delay reuses `--movie-typing-cps`; the tick is fixed and
+    // the elapsed time decides when each character is due, so the animation
+    // cannot drift when a tick is late.
+    let options = super::movie::GuiMovieOptions::from_env();
+    let char_ms = options.char_delay_ms().max(1.0);
+    let tick_ms = (char_ms / 4.0).round().max(1.0) as u32;
+    eprintln!("[corro] edit-script typing {} cps ({char_ms}ms/char)", options.typing_cps);
+
     let tick = move || -> bool {
         let i = idx.get();
         let Some(step) = steps.get(i) else {
             return false;
         };
-        if start.elapsed() < std::time::Duration::from_millis(step.at_ms) {
+        let due = |at: f64| start.elapsed().as_secs_f64() * 1000.0 >= at;
+        if !due(step.at_ms as f64) {
             return true; // not due yet
         }
-        let app = state_for_tick.app_mut();
         let addr = crate::grid::CellAddr::Main { row: step.row, col: step.col };
-        // The real commit path: applies to the sheet and appends to the log,
-        // which is what makes the other window's tail pick it up.
-        super::actions::commit_cell(app, addr.clone(), step.value.clone());
-        app.core.status = format!(
-            "{} = {}",
-            crate::addr::cell_ref_text(&addr, app.core.workbook.active_sheet().grid.main_cols()),
-            step.value
-        );
-        app.core.state = app.core.workbook.active_sheet().clone();
-        update_state_cursor(&state_for_tick, app.core.cursor.row, app.core.cursor.col);
-        sync_chrome_labels(&state_for_tick);
-        state_for_tick.canvas.queue_redraw();
-        state_for_tick.window.queue_redraw();
-        idx.set(i + 1);
+        let chars: Vec<char> = step.value.chars().collect();
+        // How far the typing should have got by now. The step's own timestamp is
+        // when it starts; characters follow at the configured rate.
+        let elapsed = start.elapsed().as_secs_f64() * 1000.0 - step.at_ms as f64;
+        let shown_n = ((elapsed / char_ms).floor() as usize + 1).min(chars.len());
+        let shown: String = chars[..shown_n].iter().collect();
+
+        {
+            let app = state_for_tick.app_mut();
+            app.core.cursor = crate::grid::SheetCursor {
+                row: crate::grid::HEADER_ROWS + step.row as usize,
+                col: crate::grid::MARGIN_COLS + step.col as usize,
+            };
+            let grid = &app.core.workbook.active_sheet().grid;
+            app.core.cursor.clamp(grid);
+            app.core.status = format!(
+                "{} = {shown}",
+                crate::addr::cell_ref_text(&addr, grid.main_cols()),
+            );
+            // The in-progress text lives in the entry buffer, which is what the
+            // formula bar and the grid's edit overlay both paint from.
+            state_for_tick.editing.set(true);
+            *state_for_tick.edit_buf.borrow_mut() = shown.clone();
+            sync_entry_to_buf(&state_for_tick);
+            update_state_cursor(&state_for_tick, app.core.cursor.row, app.core.cursor.col);
+            sync_chrome_labels(&state_for_tick);
+            state_for_tick.canvas.queue_redraw();
+            state_for_tick.window.queue_redraw();
+        }
+
+        if shown_n >= chars.len() {
+            // Commit once the last character has landed. This is the real
+            // commit path: it appends to the log, which is what makes the other
+            // window's tail pick the value up.
+            let app = state_for_tick.app_mut();
+            super::actions::commit_cell(app, addr.clone(), step.value.clone());
+            app.core.state = app.core.workbook.active_sheet().clone();
+            state_for_tick.editing.set(false);
+            state_for_tick.edit_buf.borrow_mut().clear();
+            update_state_cursor(&state_for_tick, app.core.cursor.row, app.core.cursor.col);
+            sync_chrome_labels(&state_for_tick);
+            state_for_tick.canvas.queue_redraw();
+            state_for_tick.window.queue_redraw();
+            idx.set(i + 1);
+        }
         true
     };
-    match rswidgets::add_periodic_tick(&state.window, 100, Box::new(tick)) {
-        Ok(()) => eprintln!("[corro] edit script armed ({step_count} steps)"),
+    match rswidgets::add_periodic_tick(&state.window, tick_ms, Box::new(tick)) {
+        Ok(()) => eprintln!("[corro] edit script armed ({step_count} steps, {tick_ms}ms tick)"),
         Err(e) => eprintln!("[corro] edit-script timer unavailable: {e}"),
     }
 }
@@ -4862,11 +4922,20 @@ fn arm_movie_driver(state: &Rc<GuiState>, movie: super::movie::GuiMovie) {
                         // the wrong cell — the value would then "jump" to its
                         // real home only at the commit.
                         //
-                        // `step_cursor` resolves the step's address the same way
-                        // the step itself does, which matters for the margin
-                        // cells: `[A1` and main `A1` are different cells that a
-                        // hand-rolled `row + HEADER_ROWS` mapping conflates.
-                        if let Some(cursor) = movie.step_cursor(i) {
+                        // `step_cursor` resolves the step's address with the
+                        // *live* workbook, exactly as the step itself does. That
+                        // matters twice over: the margin cell `[A1` is a
+                        // different cell from main `A1`, and the `_N`/`~1` forms
+                        // (`[A_2`, `]A~1`) are relative to the sheet's current
+                        // extent, which grows as the replay runs. Resolving
+                        // against a fresh 1x1 workbook put the cursor up to
+                        // eight rows or a column away from the cell it typed
+                        // into.
+                        let cursor = {
+                            let app = state_for_tick.app_ref();
+                            movie.step_cursor(i, &app.core.workbook)
+                        };
+                        if let Some(cursor) = cursor {
                             let app = state_for_tick.app_mut();
                             app.core.cursor = cursor;
                             let grid = &app.core.workbook.active_sheet().grid;
