@@ -4552,70 +4552,170 @@ fn arm_movie_driver(state: &Rc<GuiState>, movie: super::movie::GuiMovie) {
     let movie = std::cell::RefCell::new(movie);
     let index = std::cell::Cell::new(0usize);
     let finished = std::cell::Cell::new(false);
-    let step_ms = options.confirm_delay_ms.max(1) as u32;
+
+    // The movie animates one *character* per tick while a cell is being typed,
+    // then holds the finished cell for `confirm_ms` — the same shape as the TUI
+    // replayer. Advancing a whole step per tick instead (the earlier
+    // behaviour) made every value appear instantly and then sit motionless for
+    // the whole hold, so a long margin label like `--- Belmont ---` occupied
+    // the formula bar for ten seconds with nothing happening.
+    let char_ms = options.char_delay_ms().max(1.0);
+    let tick_ms = char_ms.round().max(1.0) as u32;
+    let hold_ticks = ((options.confirm_delay_ms as f64 / char_ms).round() as u32).max(1);
+
+    // What the current step is doing: `Typing` reveals `value` one character at
+    // a time; `Holding` shows the completed step. The edit itself is applied at
+    // the END of the typing animation, so the grid changes exactly when the
+    // last character lands (matching what a user typing the value would see).
+    #[derive(Clone)]
+    enum Phase {
+        Idle,
+        Typing { step: usize, typed: usize, value: String, hold: u32 },
+        Holding { step: usize, hold: u32 },
+    }
+    let phase = std::cell::RefCell::new(Phase::Idle);
 
     let tick = move || -> bool {
         if finished.get() {
             return false;
         }
-        let i = index.get();
-        let mut movie = movie.borrow_mut();
-        if i >= movie.len() {
-            finished.set(true);
-            state_for_tick.app_mut().core.status =
-                format!("Movie complete: {} lines", movie.applied);
-            sync_chrome_labels(&state_for_tick);
-            state_for_tick.canvas.queue_redraw();
-            state_for_tick.window.queue_redraw();
-            // A movie is a script, not an interactive session: when it ends the
-            // window closes (the TUI replayer quits the same way), so a
-            // recording finishes on its own instead of leaving the app open
-            // forever. `save_before_quit` is the same path the File ▸ Quit
-            // menu takes, so the workbook is committed and the loop torn down
-            // exactly as an interactive quit would.
-            save_before_quit(&state_for_tick);
-            return false;
-        }
-        let app = state_for_tick.app_mut();
-        match movie.apply_step(&mut app.core.workbook, &mut app.core.view_sheet_id, i) {
-            Ok(frame) => {
-                app.core.state = app.core.workbook.active_sheet().clone();
-                app.core.ops_applied = movie.applied;
-                if let Some(addr) = frame.cursor.as_ref() {
-                    app.core.cursor = super::movie::cursor_of(addr, &app.core.workbook);
-                    let grid = &app.core.workbook.active_sheet().grid;
-                    app.core.cursor.clamp(grid);
+        let mut current = phase.borrow_mut();
+        match current.clone() {
+            Phase::Idle => {
+                let i = index.get();
+                let mut movie = movie.borrow_mut();
+                if i >= movie.len() {
+                    finished.set(true);
+                    state_for_tick.app_mut().core.status =
+                        format!("Movie complete: {} lines", movie.applied);
+                    sync_chrome_labels(&state_for_tick);
+                    state_for_tick.canvas.queue_redraw();
+                    state_for_tick.window.queue_redraw();
+                    // A movie is a script, not an interactive session: when it
+                    // ends the window closes (the TUI replayer quits the same
+                    // way), so a recording finishes on its own instead of
+                    // leaving the app open forever. `save_before_quit` is the
+                    // same path the File ▸ Quit menu takes.
+                    save_before_quit(&state_for_tick);
+                    return false;
                 }
-                // The same chrome refresh a keypress performs.
-                update_state_cursor(&state_for_tick, app.core.cursor.row, app.core.cursor.col);
-                let caption = match frame.menu.as_ref() {
-                    Some((section, item)) => format!(
-                        "Movie {}/{}  {} ▸ {}  ·  {}",
-                        frame.progress.0, frame.progress.1, section, item, frame.status
-                    ),
-                    None => format!(
-                        "Movie {}/{}  {}",
-                        frame.progress.0, frame.progress.1, frame.status
-                    ),
-                };
-                app.core.status = caption;
-                sync_chrome_labels(&state_for_tick);
-                state_for_tick.canvas.queue_redraw();
-                state_for_tick.window.queue_redraw();
+                // What will this step write, if it is a plain cell value?
+                let typed = movie.step_typed_text(i);
+                // Show the step's menu flash first, if it has one.
+                let menu = movie.step_menu(i);
+                if let Some((section, item)) = menu {
+                    let app = state_for_tick.app_mut();
+                    app.core.status = format!(
+                        "Movie {}/{}  {} ▸ {}",
+                        i + 1, movie.len(), section, item
+                    );
+                    sync_chrome_labels(&state_for_tick);
+                    state_for_tick.canvas.queue_redraw();
+                    state_for_tick.window.queue_redraw();
+                    *current = Phase::Holding { step: i, hold: hold_ticks };
+                    return true;
+                }
+                match typed {
+                    Some(value) => {
+                        *current = Phase::Typing { step: i, typed: 0, value, hold: hold_ticks };
+                        true
+                    }
+                    None => {
+                        apply_movie_step(&state_for_tick, &mut movie, i);
+                        *current = Phase::Holding { step: i, hold: hold_ticks };
+                        true
+                    }
+                }
             }
-            Err(e) => {
-                finished.set(true);
-                state_for_tick.app_mut().core.status = format!("Movie error: {e}");
-                sync_chrome_labels(&state_for_tick);
+            Phase::Typing { step, typed, value, hold } => {
+                let chars: Vec<char> = value.chars().collect();
+                let next = (typed + 1).min(chars.len());
+                let shown: String = chars[..next].iter().collect();
+                let done = next >= chars.len();
+                {
+                    let app = state_for_tick.app_mut();
+                    app.core.status = format!(
+                        "Movie {}/{}  {} = {shown}",
+                        step + 1, movie.borrow().len(),
+                        movie.borrow().step_addr_label(step).unwrap_or_default()
+                    );
+                    sync_chrome_labels(&state_for_tick);
+                    state_for_tick.canvas.queue_redraw();
+                    state_for_tick.window.queue_redraw();
+                }
+                if done {
+                    // Commit exactly when the last character lands, so the grid
+                    // changes with the typing rather than before it.
+                    let mut movie = movie.borrow_mut();
+                    apply_movie_step(&state_for_tick, &mut movie, step);
+                    index.set(step + 1);
+                    *current = Phase::Holding { step, hold };
+                } else {
+                    *current = Phase::Typing { step, typed: next, value, hold };
+                }
+                true
+            }
+            Phase::Holding { step, hold } => {
+                if hold > 1 {
+                    *current = Phase::Holding { step, hold: hold - 1 };
+                    return true;
+                }
+                let mut movie = movie.borrow_mut();
+                if index.get() <= step {
+                    index.set(step + 1);
+                }
+                let _ = &mut movie;
+                *current = Phase::Idle;
+                true
             }
         }
-        index.set(i + 1);
-        true
     };
 
-    match rswidgets::add_periodic_tick(&state.window, step_ms, Box::new(tick)) {
-        Ok(()) => eprintln!("[corro] movie driver armed ({step_ms}ms per step)"),
+    match rswidgets::add_periodic_tick(&state.window, tick_ms, Box::new(tick)) {
+        Ok(()) => eprintln!(
+            "[corro] movie driver armed ({tick_ms}ms/char, {hold_ticks} ticks per step hold)"
+        ),
         Err(e) => eprintln!("[corro] movie timer unavailable: {e}"),
+    }
+}
+
+/// Apply one movie step to the app and refresh the chrome.
+fn apply_movie_step(
+    state: &Rc<GuiState>,
+    movie: &mut super::movie::GuiMovie,
+    i: usize,
+) {
+    let app = state.app_mut();
+    match movie.apply_step(&mut app.core.workbook, &mut app.core.view_sheet_id, i) {
+        Ok(frame) => {
+            app.core.state = app.core.workbook.active_sheet().clone();
+            app.core.ops_applied = movie.applied;
+            if let Some(addr) = frame.cursor.as_ref() {
+                app.core.cursor = super::movie::cursor_of(addr, &app.core.workbook);
+                let grid = &app.core.workbook.active_sheet().grid;
+                app.core.cursor.clamp(grid);
+            }
+            // The same chrome refresh a keypress performs.
+            update_state_cursor(state, app.core.cursor.row, app.core.cursor.col);
+            let caption = match frame.menu.as_ref() {
+                Some((section, item)) => format!(
+                    "Movie {}/{}  {} ▸ {}  ·  {}",
+                    frame.progress.0, frame.progress.1, section, item, frame.status
+                ),
+                None => format!(
+                    "Movie {}/{}  {}",
+                    frame.progress.0, frame.progress.1, frame.status
+                ),
+            };
+            app.core.status = caption;
+            sync_chrome_labels(state);
+            state.canvas.queue_redraw();
+            state.window.queue_redraw();
+        }
+        Err(e) => {
+            state.app_mut().core.status = format!("Movie error: {e}");
+            sync_chrome_labels(state);
+        }
     }
 }
 

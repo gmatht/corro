@@ -25,6 +25,13 @@ use crate::addr;
 use crate::grid::{CellAddr, SheetCursor, HEADER_ROWS, MARGIN_COLS};
 use crate::ops::{self, Op, WorkbookOp};
 
+/// Longest value worth animating character by character. Past this the typing
+/// effect stops being legible (the frames cannot keep up, so the characters
+/// would not even be seen) and the recording balloons: a movie of
+/// deliberately-huge overflow strings otherwise costs thousands of frames for
+/// one cell. Longer values still replay — they just land in one frame.
+const MAX_TYPED_CHARS: usize = 48;
+
 /// Replay pacing, mirroring `crate::ui::MovieReplayOptions` (the CLI passes the
 /// same `--movie-*` values to both).
 #[derive(Clone, Copy, Debug)]
@@ -65,6 +72,17 @@ impl Default for GuiMovieOptions {
 
 impl GuiMovieOptions {
     /// Per-character delay for the typing animation.
+    /// Per-character delay in milliseconds (the tick interval a driver should
+    /// use while animating a typed value).
+    pub fn char_delay_ms(&self) -> f64 {
+        let cps = if self.typing_cps.is_finite() && self.typing_cps > 0.0 {
+            self.typing_cps
+        } else {
+            22.0
+        };
+        1000.0 / cps
+    }
+
     pub fn char_delay(&self) -> std::time::Duration {
         let cps = if self.typing_cps.is_finite() && self.typing_cps > 0.0 {
             self.typing_cps
@@ -189,6 +207,61 @@ impl GuiMovie {
             .or_else(|| app.core.source_path.clone());
         app.core.source_path = source;
         bound
+    }
+
+    /// The text step `index` types, if it is a plain cell write.
+    ///
+    /// Drivers animate this one character at a time; the value is only applied
+    /// when the last character lands, so the grid changes *with* the typing
+    /// instead of before it. `None` for steps that are not a simple value
+    /// (they apply in one tick).
+    pub fn step_typed_text(&self, index: usize) -> Option<String> {
+        let line = self.steps.get(index)?.line.as_str();
+        let rest = line.strip_prefix("SET ")?.trim_start();
+        let rest = match rest.find(':') {
+            Some(colon) if rest[..colon].trim_start().starts_with('$') => {
+                rest[colon + 1..].trim_start()
+            }
+            _ => rest,
+        };
+        let (addr, value) = rest.split_once(' ')?;
+        if addr.contains('=') || addr.contains("FILL") {
+            return None;
+        }
+        let value = value.trim_end();
+        // Past this length the animation stops being legible (the characters
+        // would not even be seen at the frame rate) and the recording balloons,
+        // so a long value lands in one frame instead.
+        if value.chars().count() > MAX_TYPED_CHARS {
+            return None;
+        }
+        Some(value.to_string())
+    }
+
+    /// The menu a step "uses", so a driver can flash it before the change.
+    pub fn step_menu(&self, index: usize) -> Option<(String, String)> {
+        let step = self.steps.get(index)?;
+        let op = ops::parse_workbook_line(&step.line).ok()?;
+        menu_for_workbook_op(&op)
+    }
+
+    /// The cell label a step writes (`A5`, `[A1`), for the status line.
+    pub fn step_addr_label(&self, index: usize) -> Option<String> {
+        let step = self.steps.get(index)?;
+        let op = ops::parse_workbook_line(&step.line).ok()?;
+        let op = match &op {
+            WorkbookOp::SheetOp { op, .. } => op,
+            _ => return None,
+        };
+        match op {
+            Op::SetCell { addr, .. } | Op::SetCellFormat { addr, .. } => {
+                // `cell_ref_text` needs the sheet's main-column count only for
+                // right-margin labels; 0 is exact for every other region and
+                // this is a status-line label.
+                Some(addr::cell_ref_text(addr, 0))
+            }
+            _ => None,
+        }
     }
 
     /// Reset to a freshly-parsed state (a rewind for a second pass).
