@@ -13,13 +13,12 @@ jobs:
               @autoreleasepool {
                   char *fmt = "%s";
                   char *msg = "hello from NSLog";
-                  fprintf(stderr, "before variadic\n"); fflush(stderr);
-                  // NSLog(fmt, msg);                     // the form that crashed
-                  fprintf(stderr, "skipped variadic\n"); fflush(stderr);
-                  NSLog(@"literal format %s", "literal-ok");
-                  fprintf(stderr, "after literal\n"); fflush(stderr);
-                  NSLog(@"plain literal with no args");
-                  fprintf(stderr, "after plain\n"); fflush(stderr);
+                  // The candidate replacement: a LITERAL format with the
+                  // message as a %s argument, which is the only variadic form
+                  // that survived, plus os_log for comparison.
+                  NSLog(@"%@", @"via-percent-at");
+                  NSLog(@"literal %s", "via-percent-s");
+                  fprintf(stderr, "survived both\n"); fflush(stderr);
               }
               return 0;
           }
