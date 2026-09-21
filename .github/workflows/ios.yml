@@ -111,6 +111,10 @@ jobs:
           xcrun simctl bootstatus "$UDID" -b
 
       - name: Install and launch corro
+        env:
+          # Symbolised panic frames: the .ips only carries offsets into the
+          # (symbol-stripped) static library.
+          RUST_BACKTRACE: "full"
         run: |
           xcrun simctl install "$SIM_UDID" /tmp/corro_ios_build/iphonesimulator/corro.app
           # Launch in the background so this step can report the PID and then
@@ -122,8 +126,17 @@ jobs:
           # a Rust panic and our [rswidgets] lines go) lands in a file we can
           # print. A detached launch discards it, which is why several runs
           # showed a crash with no message.
-          ( xcrun simctl launch --console-pty "$SIM_UDID" com.corro.corro \
+          # RUST_BACKTRACE makes the panic print symbolised frames, which is
+          # what identifies the panicking function (the crash report only has
+          # offsets into the stripped staticlib).
+          # SIMCTL_CHILD_* variables are how simctl passes environment into the
+          # launched app; plain env vars do NOT cross the simulator boundary.
+          ( SIMCTL_CHILD_RUST_BACKTRACE=full \
+            xcrun simctl launch --console-pty "$SIM_UDID" com.corro.corro \
               > /tmp/corro-console.log 2>&1 & )
+          # simctl passes the host environment through, but be explicit about
+          # the variables that matter for diagnosing a Rust panic.
+          true
           sleep 20
           echo "--- console (head: the panic message comes first) ---"
           head -25 /tmp/corro-console.log 2>/dev/null || echo "(no console output)"
