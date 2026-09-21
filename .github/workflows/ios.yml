@@ -101,10 +101,10 @@ jobs:
       # than repeating the same fragile parse four times.
       - name: Pick and boot a simulator
         run: |
-          UDID="$(xcrun simctl list devices available -j \
-            | python3 -c 'import json,sys; d=json.load(sys.stdin)["devices"];
-                         print(next(x["udid"] for v in d.values() for x in v
-                                    if "iPhone" in x["name"]))')"
+          # Prefer the newest available iPhone. The inline python must stay on
+          # ONE line (or be indented consistently): the multi-line form
+          # previously collapsed in the YAML and died with IndentationError.
+          UDID="$(xcrun simctl list devices available -j | python3 -c "import json,sys; ds=json.load(sys.stdin)['devices']; names=[x for v in ds.values() for x in v if 'iPhone' in x['name']]; print(names[-1]['udid'] if names else sys.exit('no iPhone simulator available'))")"
           echo "using simulator $UDID"
           echo "SIM_UDID=$UDID" >> "$GITHUB_ENV"
           xcrun simctl boot "$UDID" || true          # already-booted is fine
