@@ -113,22 +113,35 @@ jobs:
       - name: Install and launch corro
         run: |
           xcrun simctl install "$SIM_UDID" /tmp/corro_ios_build/iphonesimulator/corro.app
-          # Launch detached, then let the first frame land (Core Graphics draw
-          # plus the CorroIosText shim). --console-pty would block the step.
-          xcrun simctl launch "$SIM_UDID" com.corro.corro
+          # --console-pty streams the app's stdout/stderr (including NSLog and
+          # any Rust panic) into this step's log, which is what makes a launch
+          # failure diagnosable: the previous run only showed that the process
+          # was gone, with no reason why. The `|| true` keeps the step alive so
+          # the capture is still printed when the app dies immediately.
+          xcrun simctl launch --console-pty "$SIM_UDID" com.corro.corro > /tmp/corro-console.log 2>&1 || true
           sleep 20
+          echo "--- console output ---"
+          tail -40 /tmp/corro-console.log || true
 
       - name: Screenshot the first frame
         run: xcrun simctl io "$SIM_UDID" screenshot ios-first-frame.png
 
       - name: Check the app is still alive (did not crash on launch)
         run: |
-          if ! xcrun simctl spawn "$SIM_UDID" launchctl list | grep -qi corro; then
-            echo "corro is not running — an objc_msgSend signature mismatch is"
-            echo "the usual cause; the log dump below is where it shows up."
-            exit 1
+          if xcrun simctl spawn "$SIM_UDID" launchctl list | grep -qi corro; then
+            echo "corro is running"
+            exit 0
           fi
-          echo "corro is running"
+          echo "::error::corro is not running after launch"
+          # Diagnose rather than just fail: crash reports first (they name the
+          # signal and the faulting thread), then the console capture.
+          echo "--- crash reports ---"
+          ls -t ~/Library/Logs/DiagnosticReports/*.ips 2>/dev/null | head -3 | while read -r f; do
+            echo "== $f"; head -40 "$f"
+          done
+          echo "--- console ---"
+          tail -60 /tmp/corro-console.log 2>/dev/null || true
+          exit 1
 
       # Rust-side logging goes to NSLog (IOS_GUIDELINES.md §9). A crash on an
       # objc_msgSend signature mismatch shows up here, not in a backtrace.
