@@ -113,11 +113,21 @@ echo "    SDKROOT=$SDKROOT"
 # honouring the triple, so 12.0 would be silently discarded. Setting
 # IPHONEOS_DEPLOYMENT_TARGET is what makes rustc build the triple with the
 # requested version in the first place.
+# Two channels are needed, and the first CI attempt only used one:
+#
+#   * SDKROOT in the environment — rustc reads it for its own resolution;
+#   * `-isysroot` as an explicit link argument — `cc` does NOT inherit SDKROOT
+#     from the environment, and rustc emits no `-isysroot` of its own, so
+#     without this the linker still searches the default paths and reports
+#     `ld: library 'CoreGraphics' not found`.
+#
+# The deployment target goes through the triple (see above).
 IPHONEOS_DEPLOYMENT_TARGET="$IOS_DEPLOYMENT_TARGET" \
 SDKROOT="$SDKROOT" \
   cargo +nightly build --release \
     --target "$RUST_TARGET" \
-    -Zbuild-std=std,panic_abort
+    -Zbuild-std=std,panic_abort \
+    --config "build.rustflags=[\"-C\",\"link-arg=-isysroot\",\"-C\",\"link-arg=$SDKROOT\"]"
 
 RLIB="$SCRIPT_DIR/target/$RUST_TARGET/release/libcorro_ios.a"
 if [ ! -f "$RLIB" ]; then
