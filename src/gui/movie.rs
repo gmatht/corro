@@ -34,6 +34,25 @@ pub struct GuiMovieOptions {
     pub menu_hold_ms: u64,
 }
 
+impl GuiMovieOptions {
+    /// Pacing read from the environment, so the movie driver inside
+    /// `run_gui` observes the same values the CLI parsed.
+    pub fn from_env() -> Self {
+        let num = |key: &str, default: f64| -> f64 {
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .filter(|v| v.is_finite() && *v > 0.0)
+                .unwrap_or(default)
+        };
+        GuiMovieOptions {
+            typing_cps: num("CORRO_MOVIE_TYPING_CPS", 22.0),
+            confirm_delay_ms: num("CORRO_MOVIE_CONFIRM_MS", 120.0) as u64,
+            menu_hold_ms: num("CORRO_MOVIE_MENU_HOLD_MS", 1200.0) as u64,
+        }
+    }
+}
+
 impl Default for GuiMovieOptions {
     fn default() -> Self {
         GuiMovieOptions {
@@ -53,6 +72,14 @@ impl GuiMovieOptions {
             22.0
         };
         std::time::Duration::from_secs_f64(1.0 / cps)
+    }
+
+    /// Publish this pacing to the environment for the driver that lives in
+    /// the GUI backend (which has no access to the CLI's parsed values).
+    pub fn publish_to_env(&self) {
+        let _ = std::env::set_var("CORRO_MOVIE_TYPING_CPS", self.typing_cps.to_string());
+        let _ = std::env::set_var("CORRO_MOVIE_CONFIRM_MS", self.confirm_delay_ms.to_string());
+        let _ = std::env::set_var("CORRO_MOVIE_MENU_HOLD_MS", self.menu_hold_ms.to_string());
     }
 
     pub fn confirm_delay(&self) -> std::time::Duration {

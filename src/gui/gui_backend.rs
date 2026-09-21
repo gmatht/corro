@@ -234,10 +234,10 @@ fn save_before_quit(state: &GuiState) {
 // Shared state
 // ---------------------------------------------------------------------------
 
-struct GuiState {
+pub(crate) struct GuiState {
     app: *mut super::App,
-    rxapp: rswidgets::App,
-    window: Window,
+    pub(crate) rxapp: rswidgets::App,
+    pub(crate) window: Window,
     /// Menu bar handle: lets modal flows (e.g. the special-char picker)
     /// dismiss an open menu grab that would otherwise swallow all later
     /// keys (an open keyboard menu routes everything past the window and
@@ -600,13 +600,13 @@ fn paint_row_headers(
         // is right-aligned, so the left side always has room.
         if wants_padlock(&label) {
             let locked = pinned.contains(&logical_row);
-            let (px, py) = (2.0, ry + (row_h() - PADLOCK_H) / 2.0);
+            let (px, py) = (2.0, ry + (row_h() - padlock_h()) / 2.0);
             paint_padlock(dc, px, py, locked);
             out_padlocks.push(GutterPadlock {
                 x: px,
                 y: py,
-                w: PADLOCK_W,
-                h: PADLOCK_H,
+                w: padlock_w(),
+                h: padlock_h(),
                 is_row: true,
                 index: logical_row,
                 locked,
@@ -641,7 +641,7 @@ fn paint_col_headers(
         // one character wider than recorded (see display_col_width)
         // precisely to hold this group.
         let lock = wants_padlock(&col_name);
-        let group = tw + if lock { 2.0 + PADLOCK_W } else { 0.0 };
+        let group = tw + if lock { 2.0 + padlock_w() } else { 0.0 };
         let tx = cx + (cw - group) / 2.0;
         dc.draw_text_styled(tx, (header_h() - font_size() * 1.2) / 2.0, &col_name, "monospace", font_size(), 0.3, 0.3, 0.3, 1.0, 0, 1);
         // Padlock right after the centered text, inside its own column: the
@@ -649,13 +649,13 @@ fn paint_col_headers(
         // precisely so this icon fits without spilling over the neighbor.
         if lock {
             let locked = pinned.contains(&c);
-            let (px, py) = (tx + tw + 2.0, (header_h() - PADLOCK_H) / 2.0);
+            let (px, py) = (tx + tw + 2.0, (header_h() - padlock_h()) / 2.0);
             paint_padlock(dc, px, py, locked);
             out_padlocks.push(GutterPadlock {
                 x: px,
                 y: py,
-                w: PADLOCK_W,
-                h: PADLOCK_H,
+                w: padlock_w(),
+                h: padlock_h(),
                 is_row: false,
                 index: c,
                 locked,
@@ -664,10 +664,23 @@ fn paint_col_headers(
     }
 }
 
-/// Padlock affordance geometry (device px): small enough for 20px rows and
-/// the 24px header strip, big enough to click and to read at a glance.
-const PADLOCK_W: f64 = 10.0;
-const PADLOCK_H: f64 = 12.0;
+/// Padlock affordance geometry (base device px, scaled by the host density
+/// like the row/header metrics): small enough for a 20px row and the 24px
+/// header strip on a desktop, big enough to click and read there, and grown
+/// proportionally on a phone where 10px would be a ~4dp speck.
+const PADLOCK_W_BASE: f64 = 10.0;
+const PADLOCK_H_BASE: f64 = 12.0;
+/// Base glyph inset inside the padlock box (scaled with it).
+const PADLOCK_INSET_BASE: f64 = 1.0;
+/// Minimum hit target for a pin toggle, in dp. Android's guidance is 48dp;
+/// the padlock is drawn inside a 20dp row/column header, so the *drawn* icon
+/// stays row-sized and only the hit test is widened to this, which keeps the
+/// tap usable without the icon overlapping neighbouring headers.
+const PADLOCK_HIT_DP: f64 = 44.0;
+
+pub(crate) fn padlock_w() -> f64 { PADLOCK_W_BASE * metrics_scale() }
+pub(crate) fn padlock_h() -> f64 { PADLOCK_H_BASE * metrics_scale() }
+fn padlock_inset() -> f64 { PADLOCK_INSET_BASE * metrics_scale() }
 /// Unlocked padlock slate (115): distinct from header gray (77), grid lines
 /// (204), backgrounds (191/229/255) and cursor/selection blues.
 const PADLOCK_OPEN: (f64, f64, f64) = (0.45, 0.45, 0.45);
@@ -685,6 +698,31 @@ struct GutterPadlock {
     is_row: bool,
     index: usize,
     locked: bool,
+}
+
+/// Hit rectangle for a painted padlock: the drawn box, widened on Android to
+/// a finger-sized target centred on it.
+///
+/// The glyph must stay header-sized when drawn (a bigger icon would overlap
+/// the neighbouring header and hide its label), so only the hit test grows.
+/// Growth is clamped to half a header per axis, which keeps the target
+/// inside the cell the padlock belongs to.
+fn padlock_hit_rect(h: &GutterPadlock) -> (f64, f64, f64, f64) {
+    let (mut w, mut hh) = (h.w, h.h);
+    if cfg!(target_os = "android") {
+        let target = PADLOCK_HIT_DP * metrics_scale();
+        w = w.max(target);
+        hh = hh.max(target);
+        // Do not let the grown rect reach past the neighbouring header: at
+        // most one header's worth of extra width/height overall.
+        let max_w = if h.is_row { row_label_w() } else { char_w() * 12.0 };
+        let max_h = if h.is_row { row_h() } else { header_h() };
+        w = w.min(max_w.max(h.w));
+        hh = hh.min(max_h.max(h.h));
+    }
+    let cx = h.x + h.w / 2.0;
+    let cy = h.y + h.h / 2.0;
+    (cx - w / 2.0, cy - hh / 2.0, w, hh)
 }
 
 /// Padlock eligibility: gutter labels with short text only (dual-character
@@ -717,19 +755,36 @@ fn union_pinned(display: &[usize], pinned: &[usize]) -> Vec<usize> {
 /// The right shackle bar connects to the body when locked and floats with a
 /// gap when unlocked. Vector rects only (no font/emoji dependency), so both
 /// backends and screenshots render it identically.
+/// Paint a padlock glyph whose geometry is derived from [`padlock_w`] /
+/// [`padlock_h`], so it scales with the host density instead of staying a
+/// 10x12px speck on a phone. All offsets are fractions of the box.
 fn paint_padlock(dc: &mut dyn DrawContext, ox: f64, oy: f64, locked: bool) {
     let (r, g, b) = if locked { PADLOCK_SHUT } else { PADLOCK_OPEN };
+    let w = padlock_w();
+    let h = padlock_h();
+    let inset = padlock_inset();
+    // Body occupies the lower ~45% of the box, the shackle the upper part.
+    let body_y = oy + h * 0.5;
+    let body_h = (h * 0.5 - inset).max(1.0);
+    let body_w = (w - 2.0 * inset).max(1.0);
     if locked {
-        dc.fill_rect(ox + 1.0, oy + 6.0, 8.0, 5.0, r, g, b, 1.0);
+        dc.fill_rect(ox + inset, body_y, body_w, body_h, r, g, b, 1.0);
     } else {
-        dc.stroke_rect(ox + 1.0, oy + 6.0, 8.0, 5.0, r, g, b, 1.0, 1.0);
+        dc.stroke_rect(ox + inset, body_y, body_w, body_h, r, g, b, 1.0, 1.0);
     }
-    dc.fill_rect(ox + 2.0, oy + 1.0, 2.0, 6.0, r, g, b, 1.0);
-    dc.fill_rect(ox + 2.0, oy + 1.0, 6.0, 2.0, r, g, b, 1.0);
+    // Shackle: two uprights joined by a top bar, inside the upper half.
+    let bar_h = (h * 0.18).max(1.0);
+    let leg_w = (w * 0.2).max(1.0);
+    let leg_h = (body_y - oy - bar_h).max(1.0);
+    let left_x = ox + w * 0.22;
+    let right_x = ox + w - inset - leg_w;
+    dc.fill_rect(left_x, oy + inset, leg_w, leg_h, r, g, b, 1.0);
+    dc.fill_rect(left_x, oy + inset, (right_x + leg_w - left_x).max(1.0), bar_h, r, g, b, 1.0);
     if locked {
-        dc.fill_rect(ox + 6.0, oy + 1.0, 2.0, 6.0, r, g, b, 1.0);
+        dc.fill_rect(right_x, oy + inset, leg_w, leg_h, r, g, b, 1.0);
     } else {
-        dc.fill_rect(ox + 6.0, oy + 2.0, 2.0, 3.0, r, g, b, 1.0);
+        // Open: the right upright stops short, leaving the shackle ajar.
+        dc.fill_rect(right_x, oy + inset, leg_w, (leg_h * 0.55).max(1.0), r, g, b, 1.0);
     }
 }
 
@@ -811,9 +866,10 @@ fn toggle_pin(state: &GuiState, is_row: bool, idx: usize) -> bool {
 // Sheet tab bar
 // ---------------------------------------------------------------------------
 
-/// Height of the sheet tab strip (device px): matches the 24px column-header
-/// strip so the chrome reads as one family.
-const TAB_H: f64 = 24.0;
+/// Height of the sheet tab strip (base device px, density-scaled): matches
+/// the column-header strip so the chrome reads as one family.
+const TAB_H_BASE: f64 = 24.0;
+pub(crate) fn tab_h() -> f64 { TAB_H_BASE * metrics_scale() }
 /// Active tab fill: the terminal reference paints the active sheet tab
 /// black-on-yellow bold (ratatui `draw_visual`); the GUI uses a softer
 /// yellow that stays distinct from its blue selection/cursor language.
@@ -822,9 +878,12 @@ const TAB_ACTIVE_BG: (f64, f64, f64) = (1.0, 1.0, 0.6);
 const TAB_IDLE_BG: (f64, f64, f64) = (0.9, 0.9, 0.9);
 /// Tab divider lines.
 const TAB_DIV: (f64, f64, f64) = (0.55, 0.55, 0.55);
-/// Horizontal padding inside each tab and gap between tabs (device px).
-const TAB_PAD_X: f64 = 10.0;
-const TAB_GAP: f64 = 6.0;
+/// Horizontal padding inside each tab and gap between tabs (base device px,
+/// density-scaled).
+const TAB_PAD_X_BASE: f64 = 10.0;
+const TAB_GAP_BASE: f64 = 6.0;
+pub(crate) fn tab_pad_x() -> f64 { TAB_PAD_X_BASE * metrics_scale() }
+pub(crate) fn tab_gap() -> f64 { TAB_GAP_BASE * metrics_scale() }
 
 /// A painted sheet tab from the last frame: strip position plus which sheet
 /// index a click switches to.
@@ -836,7 +895,7 @@ struct TabHit {
 }
 
 /// Lay out sheet tabs left to right from x=2: each tab pads its measured
-/// title by TAB_PAD_X on both sides, TAB_GAP separates tabs. The active tab
+/// title by tab_pad_x() on both sides, tab_gap() separates tabs. The active tab
 /// measures bold (weight 1), like it paints. Pure apart from measuring, so
 /// unit tests drive it with a stub measure closure.
 fn tab_layout(
@@ -850,9 +909,9 @@ fn tab_layout(
         let weight = if index == active { 1 } else { 0 };
         let tw = measure(title, weight);
         let x0 = x;
-        let x1 = x0 + TAB_PAD_X + tw + TAB_PAD_X;
+        let x1 = x0 + tab_pad_x() + tw + tab_pad_x();
         hits.push(TabHit { x0, x1, index });
-        x = x1 + TAB_GAP;
+        x = x1 + tab_gap();
     }
     hits
 }
@@ -912,14 +971,14 @@ fn render_tabbar(dc: &mut dyn DrawContext, state: &GuiState, w: i32, h: i32) {
     for hit in &hits {
         let is_active = hit.index == active;
         let (r, g, b) = if is_active { TAB_ACTIVE_BG } else { TAB_IDLE_BG };
-        dc.fill_rect(hit.x0, 2.0, hit.x1 - hit.x0, TAB_H - 4.0, r, g, b, 1.0);
+        dc.fill_rect(hit.x0, 2.0, hit.x1 - hit.x0, tab_h() - 4.0, r, g, b, 1.0);
         // Divider at the tab's right edge (also the click target's edge).
-        dc.fill_rect(hit.x1, 2.0, 1.0, TAB_H - 4.0, TAB_DIV.0, TAB_DIV.1, TAB_DIV.2, 1.0);
+        dc.fill_rect(hit.x1, 2.0, 1.0, tab_h() - 4.0, TAB_DIV.0, TAB_DIV.1, TAB_DIV.2, 1.0);
         let (tr, tg, tb) = if is_active { (0.0, 0.0, 0.0) } else { (0.3, 0.3, 0.3) };
         let weight = if is_active { 1 } else { 0 };
         dc.draw_text_styled(
-            hit.x0 + TAB_PAD_X,
-            (TAB_H - font_size() * 1.2) / 2.0,
+            hit.x0 + tab_pad_x(),
+            (tab_h() - font_size() * 1.2) / 2.0,
             &titles[hit.index],
             "monospace",
             font_size(),
@@ -2557,12 +2616,22 @@ fn handle_click(x: f64, y: f64, state_rc: &Rc<GuiState>) {
     // Padlock hits first: padlocks live in the gutter chrome that plain
     // clicks ignore, and toggling a pin must not move the cursor, collapse
     // the selection, or start editing.
-    let hit = state
-        .padlocks
-        .borrow()
-        .iter()
-        .find(|h| x >= h.x && x < h.x + h.w && y >= h.y && y < h.y + h.h)
-        .copied();
+    //
+    // The drawn glyph is only as big as a row/column header (it must not
+    // overlap its neighbours), which on a phone is a small finger target. On
+    // Android the hit rect is grown to a finger-sized square centred on the
+    // glyph, clamped so it cannot spill into the next header cell and steal
+    // its clicks: at most one header's worth of padding per axis.
+    let hit = {
+        let padlocks = state.padlocks.borrow();
+        padlocks
+            .iter()
+            .find(|h| {
+                let (hx, hy, hw, hh) = padlock_hit_rect(h);
+                x >= hx && x < hx + hw && y >= hy && y < hy + hh
+            })
+            .copied()
+    };
     if let Some(hit) = hit {
         toggle_pin(state, hit.is_row, hit.index);
         state.canvas.queue_redraw();
@@ -3189,6 +3258,43 @@ fn prompt_chrome(action: &str, current_sheet_title: &str) -> (String, String, St
     }
 }
 
+/// Run a menu action by its registered `app.<name>` string.
+///
+/// The Android menu strip dispatches action names across JNI (there is no
+/// Rust closure it could hold), so the live state has to be reachable from
+/// a plain function. `run_gui` publishes its `Rc<GuiState>` here once the
+/// state exists; the strip is only built after that, and Android drives the
+/// UI on one thread, so a process-wide slot is sufficient.
+// thread_local, not a static Mutex: GuiState holds Rc/Cell/RefCell and is
+// deliberately !Send (the whole GUI runs on one thread), so a global would
+// need an unsafe Send impl. The Android UI thread is the only caller.
+#[cfg(target_os = "android")]
+thread_local! {
+    static ANDROID_MENU_STATE: std::cell::RefCell<Option<std::rc::Rc<GuiState>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Publish the live state for [`dispatch_android_menu_action`]. Called once
+/// per `run_gui`; a second call (a second window) replaces the first, which
+/// matches the single-activity Android model.
+#[cfg(target_os = "android")]
+pub(crate) fn publish_android_menu_state(state: &Rc<GuiState>) {
+    ANDROID_MENU_STATE.with(|s| *s.borrow_mut() = Some(state.clone()));
+}
+
+/// Dispatch an `app.<name>` action from the Android menu strip. Unknown
+/// names are ignored (the strip may be built from a newer menu tree than
+/// the running handler knows).
+#[cfg(target_os = "android")]
+pub(crate) fn dispatch_android_menu_action(action: &str) {
+    let name = action.strip_prefix("app.").unwrap_or(action);
+    let state = ANDROID_MENU_STATE.with(|s| s.borrow().clone());
+    match state {
+        Some(state) => handle_menu_action(name, &state),
+        None => eprintln!("android menu action before state published: {name}"),
+    }
+}
+
 fn handle_menu_action(name: &str, state: &Rc<GuiState>) {
     let app = state.app_mut();
     log_ui_action("menu_action", name);
@@ -3538,6 +3644,19 @@ unsafe fn probe95(hwnd: *mut std::os::raw::c_void, tag: [u8; 5]) {
 }
 
 pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Error>> {
+    run_gui_with_movie(corro_app, None)
+}
+
+/// Run the GUI, optionally replaying a `--movie` through the live window.
+///
+/// `--movie` is not a separate rendering path: it is this same window, same
+/// widget tree, same draw callbacks, driven by a timer that applies one movie
+/// step at a time. The only difference from an interactive session is where
+/// the state changes come from — a log instead of a keyboard.
+pub fn run_gui_with_movie(
+    corro_app: &mut super::App,
+    mut movie: Option<super::movie::GuiMovie>,
+) -> Result<(), Box<dyn std::error::Error>> {
     rswidgets::core::install_debug_crash_handlers();
     // TEMPORARY Win95 diagnosis: startup progression (see mark95 below).
     #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
@@ -3649,7 +3768,7 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     // bar, later sheets just append tabs. Fixed strip height; a vertical box
     // stretches children across the full width on every backend.
     let tabbar = rxapp.new_canvas()?;
-    tabbar.set_size_request(1, TAB_H as i32);
+    tabbar.set_size_request(1, tab_h() as i32);
     tabbar.set_visible(false);
 
     let shared = Rc::new(GuiState {
@@ -3722,6 +3841,22 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     unsafe { mark95(b"m-menu\n"); }
     let _ = shared.menubar.set(menubar.clone());
     let menubar_cb = menubar.clone();
+    // Android: the GTK menubar above is a model only (the Android adapter's
+    // create_menubar has no view), so a phone would show no menus at all.
+    // Build the real strip: a top bar with quick actions and an overflow
+    // popup carrying every top-level menu, dispatching the same `app.*`
+    // action names the desktop build registers.
+    #[cfg(target_os = "android")]
+    {
+        // Publish the state before building the strip: the strip's buttons
+        // dispatch back into handle_menu_action by name.
+        publish_android_menu_state(&shared);
+        // A missing/mismatched MenuStrip class must not take the whole UI
+        // down: the sheet is still usable without menus.
+        if let Err(e) = super::android_backend::install_menu_strip(&rxapp, &shared) {
+            eprintln!("android menu strip unavailable: {e}");
+        }
+    }
     vbox.append(&menubar);
 
     // Keyboard: canvas.on_key_raw, win.on_event_key, etc.
@@ -4234,6 +4369,15 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
         probe95(*canvas.inner.as_ref(), *b"canv ");
         probe95(*addr_label.inner.as_ref(), *b"label");
     }
+    // `--movie`: replay through this very window. The timer applies one step per
+    // tick and queues a redraw, so every frame comes from the normal draw
+    // callbacks and a recording cannot drift from the app. Armed here, before
+    // the blocking pump loops below, so replay starts as soon as the window is
+    // mapped instead of after several seconds of event pumping.
+    if let Some(movie) = movie.take() {
+        arm_movie_driver(&shared, movie);
+    }
+
     eprintln!("PHASE: after_present");
     let _ = std::fs::write("/tmp/gui_setup_phase3.txt", "after_present\n");
 
@@ -4343,6 +4487,88 @@ pub fn run_gui(corro_app: &mut super::App) -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// `--movie` driver
+// ---------------------------------------------------------------------------
+
+/// Drive a `--movie` replay through the live window.
+///
+/// One step per tick, so the window paints each intermediate state exactly as
+/// it does for a keypress. `step_ms` is derived from the movie's own pacing
+/// (`--movie-confirm-ms`), which is what sets the tempo of a recording.
+fn arm_movie_driver(state: &Rc<GuiState>, movie: super::movie::GuiMovie) {
+    let options = super::movie::GuiMovieOptions::from_env();
+    let state_for_tick = state.clone();
+    let movie = std::cell::RefCell::new(movie);
+    let index = std::cell::Cell::new(0usize);
+    let finished = std::cell::Cell::new(false);
+    let step_ms = options.confirm_delay_ms.max(1) as u32;
+
+    let tick = move || -> bool {
+        if finished.get() {
+            return false;
+        }
+        let i = index.get();
+        let mut movie = movie.borrow_mut();
+        if i >= movie.len() {
+            finished.set(true);
+            state_for_tick.app_mut().core.status =
+                format!("Movie complete: {} lines", movie.applied);
+            sync_chrome_labels(&state_for_tick);
+            state_for_tick.canvas.queue_redraw();
+            state_for_tick.window.queue_redraw();
+            // A movie is a script, not an interactive session: when it ends the
+            // window closes (the TUI replayer quits the same way), so a
+            // recording finishes on its own instead of leaving the app open
+            // forever. `save_before_quit` is the same path the File ▸ Quit
+            // menu takes, so the workbook is committed and the loop torn down
+            // exactly as an interactive quit would.
+            save_before_quit(&state_for_tick);
+            return false;
+        }
+        let app = state_for_tick.app_mut();
+        match movie.apply_step(&mut app.core.workbook, &mut app.core.view_sheet_id, i) {
+            Ok(frame) => {
+                app.core.state = app.core.workbook.active_sheet().clone();
+                app.core.ops_applied = movie.applied;
+                if let Some(addr) = frame.cursor.as_ref() {
+                    app.core.cursor = super::movie::cursor_of(addr, &app.core.workbook);
+                    let grid = &app.core.workbook.active_sheet().grid;
+                    app.core.cursor.clamp(grid);
+                }
+                // The same chrome refresh a keypress performs.
+                update_state_cursor(&state_for_tick, app.core.cursor.row, app.core.cursor.col);
+                let caption = match frame.menu.as_ref() {
+                    Some((section, item)) => format!(
+                        "Movie {}/{}  {} ▸ {}  ·  {}",
+                        frame.progress.0, frame.progress.1, section, item, frame.status
+                    ),
+                    None => format!(
+                        "Movie {}/{}  {}",
+                        frame.progress.0, frame.progress.1, frame.status
+                    ),
+                };
+                app.core.status = caption;
+                sync_chrome_labels(&state_for_tick);
+                state_for_tick.canvas.queue_redraw();
+                state_for_tick.window.queue_redraw();
+            }
+            Err(e) => {
+                finished.set(true);
+                state_for_tick.app_mut().core.status = format!("Movie error: {e}");
+                sync_chrome_labels(&state_for_tick);
+            }
+        }
+        index.set(i + 1);
+        true
+    };
+
+    match rswidgets::add_periodic_tick(&state.window, step_ms, Box::new(tick)) {
+        Ok(()) => eprintln!("[corro] movie driver armed ({step_ms}ms per step)"),
+        Err(e) => eprintln!("[corro] movie timer unavailable: {e}"),
+    }
+}
+
 #[cfg(test)]
 mod gutter_tests {
     use super::*;
@@ -4417,7 +4643,7 @@ mod gutter_tests {
         // Both labels ("1", "_1") are short: two padlock hits recorded.
         assert_eq!(hits.len(), 2, "short row labels need padlocks, got {hits:?}");
         assert!(hits.iter().all(|h| h.is_row && !h.locked));
-        assert_eq!((hits[0].x, hits[0].w), (2.0, PADLOCK_W));
+        assert_eq!((hits[0].x, hits[0].w), (2.0, padlock_w()));
         // Row numbers sit 6px off the gutter's right gridline (headless
         // measures "1" at 8px wide: 50 - 8 - 6 = 36), never touching it.
         let xs: Vec<f64> = dc
@@ -4638,8 +4864,8 @@ mod prompt_tests {
 mod tab_tests {
     use super::*;
 
-    /// Tabs lay out left to right from x=2, padded by TAB_PAD_X on both
-    /// sides with TAB_GAP between. "Sheet1" at the stub 8px/char measures
+    /// Tabs lay out left to right from x=2, padded by tab_pad_x() on both
+    /// sides with tab_gap() between. "Sheet1" at the stub 8px/char measures
     /// 48px, so tab 1 spans 2..70 and tab 2 starts at 76.
     #[test]
     fn tab_layout_pads_and_gaps_tabs() {

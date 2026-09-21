@@ -14,6 +14,15 @@
 - Movie pacing flags (`--movie-typing-cps`, `--movie-confirm-ms`,
   `--movie-menu-hold-ms`) now parse on the CLI for every backend rather than
   only being honored by the ratatui path.
+- **Movie mode is now the normal UI.** `--gui --movie` opens the same window,
+  builds the same widget tree and runs the same draw callbacks as an
+  interactive session; a periodic timer applies one movie step per tick instead
+  of waiting for a keystroke (`gui_backend::arm_movie_driver`). The window
+  closes itself when the script ends, like the TUI replayer quits. The parallel
+  raster renderer is gone — it had drifted from the window four times (blank
+  frame, overlapping glyphs, missing margin shading, missing text) because it
+  was a second implementation of rendering. `scripts/gui_movie.py` now records
+  the live window under Xvfb instead of producing frames from that renderer.
 - The GUI movie painter no longer draws its own copy of the sheet. It now
   calls the same body renderer the live canvas uses
   (`gui_backend::render_grid_body`), so margin shading, cell colours, the

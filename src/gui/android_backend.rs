@@ -38,6 +38,79 @@ pub fn run_android_default() -> Result<(), Box<dyn std::error::Error>> {
     run_android(app)
 }
 
+/// Build the Android menu strip and hand it to the layout.
+///
+/// The Android adapter's `create_menubar` has no view behind it (a phone
+/// cannot show six text menus the way the GTK build does), so without this
+/// the app shows no menus at all. The strip carries the inline quick
+/// actions plus an overflow popup holding every top-level menu, and each
+/// item dispatches the same `app.*` action name the desktop build uses.
+#[cfg(target_os = "android")]
+pub fn install_menu_strip(
+    rxapp: &rswidgets::App,
+    shared: &std::rc::Rc<super::gui_backend::GuiState>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use crate::gui::menu;
+
+    let strip_ptr = rswidgets::backends::android::create_menu_strip("corro")?;
+    let bar = menu::menu_bar();
+    for root in &bar {
+        // Alternating label/action pairs, exactly what MenuStrip.addMenu
+        // expects. Submenus are flattened one level (a popup submenu cannot
+        // nest arbitrarily on a phone); labels lose their mnemonic marker,
+        // which is meaningless on touch.
+        let mut pairs: Vec<String> = Vec::new();
+        collect_menu_pairs(root.submenu.as_deref().unwrap_or(&[]), &mut pairs);
+        let refs: Vec<&str> = pairs.iter().map(|s| s.as_str()).collect();
+        let label = root.label.replace('_', "");
+        rswidgets::backends::android::menu_strip_add_menu(
+            strip_ptr as *mut std::os::raw::c_void,
+            &label,
+            &refs,
+        );
+    }
+    // Insert the strip as the FIRST child of the root layout, ahead of the
+    // Rust-built vbox that `init_with_layout`/`attach_child` appended. Using
+    // addView() alone would put it *after* the vbox, where the vbox's own
+    // (opaque, full-height) children paint over it - the strip existed in the
+    // hierarchy but never showed a pixel. addView(view, 0) places it at the
+    // top, matching the desktop menubar's position.
+    let root = rswidgets::backends::android::root_layout()?;
+    rswidgets::backends::android::insert_child_at(
+        root.as_obj().as_raw() as *mut std::os::raw::c_void,
+        strip_ptr as *mut std::os::raw::c_void,
+        0,
+    );
+    // Keep the strip alive for the process lifetime (the layout holds a
+    // global ref; the Rust handle is only needed for the calls above).
+    let _ = rxapp;
+    Ok(())
+}
+
+/// Flatten a menu subtree into alternating `label, action` strings.
+#[cfg(target_os = "android")]
+fn collect_menu_pairs(items: &[crate::gui::menu::MenuAction], out: &mut Vec<String>) {
+    use crate::gui::menu::action_kind_to_name;
+    for item in items {
+        match item.submenu.as_deref() {
+            Some(sub) => collect_menu_pairs(sub, out),
+            None => {
+                out.push(item.label.replace('_', ""));
+                out.push(format!("app.{}", action_kind_to_name(item.action)));
+            }
+        }
+    }
+}
+
+/// Run a menu action by name (from the Android menu strip).
+///
+/// The name is the same `app.<action>` string the desktop menu registers,
+/// so this is a thin lookup rather than a second dispatch table.
+#[cfg(target_os = "android")]
+pub fn run_menu_action_by_name(name: &str) {
+    super::gui_backend::dispatch_android_menu_action(name);
+}
+
 /// Write a line to logcat (`log -t corro` shows these). Best-effort: the
 /// backend may not be initialised yet, so failures are swallowed.
 pub fn logcat(msg: &str) {

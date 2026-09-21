@@ -24,24 +24,26 @@ corro --pancurses --movie docs/tests/subtotal.corro
 corro --gui --movie docs/tests/subtotal.corro    # native GUI
 ```
 
-The GUI backends replay through the same renderer the interactive window uses,
-so the demo shows exactly what the app shows. Pacing is shared across
-backends: `--movie-typing-cps`, `--movie-confirm-ms`, `--movie-menu-hold-ms`.
+On the GUI backends `--movie` **is** the normal UI: it opens the same window,
+builds the same widget tree and runs the same draw callbacks as an interactive
+session, and a timer applies one movie step per tick instead of waiting for a
+keystroke. The demo therefore shows exactly what the app shows, and pacing is
+shared across backends: `--movie-typing-cps`, `--movie-confirm-ms`,
+`--movie-menu-hold-ms`.
 
 ### Recording a video
 
-Because the GUI movie path paints into a raster surface, a video can be
-recorded with no display server and no screen-capture tooling:
+`scripts/gui_movie.py` runs that window under a throwaway X server,
+screenshots it as it plays, and encodes the result with ffmpeg:
 
 ```bash
 cargo build --features gui
 scripts/gui_movie.py docs/tests/subtotal.corro -o dist/corro-gui-movie.mp4
 ```
 
-`corro --gui --movie --movie-frames DIR FILE.corro` writes one lossless image
-per frame into `DIR`; `scripts/gui_movie.py` drives that run and encodes the
-frames with ffmpeg. A pre-built recording of the subtotal and multi-sheet
-workbooks is checked in at `dist/corro-gui-movie.mp4`.
+A pre-built recording is checked in at `dist/corro-gui-movie.mp4`. Recording
+the live window (rather than rendering frames through a parallel code path)
+means the video cannot drift from the application.
 
 ## Current limitations
 

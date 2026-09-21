@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 """Record a GUI `--movie` replay to a video.
 
-`corro --gui --movie --movie-frames DIR FILE.corro` replays the workbook
-line-by-line through the GUI renderer and writes one lossless PPM per frame.
-This script drives that run and encodes the frames with ffmpeg, so the whole
-demo video is reproducible from the repository with no display server, no
-screen-capture tooling and no manual editing.
+`corro --gui --movie FILE.corro` replays the workbook through the *live
+window*: the same widget tree and draw callbacks as an interactive session,
+with a timer applying one step at a time. This script runs that under a
+throwaway X server, screenshots the window as it plays, and encodes the
+screenshots with ffmpeg.
+
+Recording the real window (rather than rendering frames through a parallel
+code path) is deliberate: the demo then shows exactly what the app shows, and
+cannot drift from it.
 
 Usage:
     scripts/gui_movie.py docs/tests/subtotal.corro -o dist/corro-gui-movie.mp4
-    scripts/gui_movie.py FILE.corro --keep-frames --cps 18
+    scripts/gui_movie.py FILE.corro --video-only --cps 18
 
-Options mirror the CLI's `--movie-*` pacing flags, so the video and an
-interactive replay of the same file look the same.
+Requires: an X server binary (Xvfb), xwd, ImageMagick `convert`, ffmpeg.
 """
 
 from __future__ import annotations
@@ -23,6 +26,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -44,36 +48,67 @@ def find_binary(explicit: str | None, release: bool) -> Path:
     )
 
 
+def require(tool: str) -> str:
+    path = shutil.which(tool)
+    if path is None:
+        sys.exit(f"error: {tool} not found on PATH (needed to record the window)")
+    return path
+
+
 def run_movie(binary: Path, corro_file: Path, frames_dir: Path, args: argparse.Namespace) -> None:
-    """Replay the movie, capturing one frame per painted step."""
+    """Play the movie in a real window under Xvfb, screenshotting as it runs."""
+    xvfb = require("Xvfb")
+    xwd = require("xwd")
+    convert = require("convert")
+
+    display = args.display
     env = dict(os.environ)
-    env["CORRO_MOVIE_FRAMES"] = str(frames_dir)
-    # A movie render must never depend on a display: the capture path paints
-    # into a raster surface directly.
-    env.pop("DISPLAY", None)
-    cmd = [
-        str(binary),
-        "--gui",
-        "--movie",
-        "--movie-frames",
-        str(frames_dir),
-        "--movie-typing-cps",
-        str(args.cps),
-        "--movie-confirm-ms",
-        str(args.confirm_ms),
-        "--movie-menu-hold-ms",
-        str(args.menu_hold_ms),
-        str(corro_file),
-    ]
-    print(f"[gui_movie] {' '.join(cmd)}")
-    proc = subprocess.run(cmd, env=env, capture_output=True, text=True)
-    if proc.stdout.strip():
-        print(proc.stdout.strip())
-    if proc.returncode != 0:
-        sys.exit(f"error: corro exited {proc.returncode}\n{proc.stderr.strip()}")
-    for line in proc.stderr.splitlines():
-        if line.startswith("[corro]"):
-            print(line)
+    env["DISPLAY"] = display
+
+    xvfb_proc = subprocess.Popen(
+        [xvfb, display, "-screen", "0", f"{args.width}x{args.height}x24"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        time.sleep(1.5)  # let the server come up
+        cmd = [
+            str(binary),
+            "--gui",
+            "--movie",
+            "--movie-typing-cps",
+            str(args.cps),
+            "--movie-confirm-ms",
+            str(args.confirm_ms),
+            "--movie-menu-hold-ms",
+            str(args.menu_hold_ms),
+            str(corro_file),
+        ]
+        print(f"[gui_movie] {' '.join(cmd)}")
+        corro = subprocess.Popen(
+            cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True
+        )
+        n = 0
+        while corro.poll() is None and n < args.max_frames:
+            shot = subprocess.run(
+                [xwd, "-root", "-silent"], env=env, capture_output=True
+            )
+            if shot.returncode == 0 and shot.stdout:
+                out = frames_dir / f"frame-{n:05d}.ppm"
+                subprocess.run(
+                    [convert, "xwd:-", str(out)], input=shot.stdout, capture_output=True
+                )
+                if out.exists():
+                    n += 1
+            time.sleep(1.0 / args.capture_fps)
+        corro.wait(timeout=30)
+        print(f"[gui_movie] captured {n} frames")
+    finally:
+        xvfb_proc.terminate()
+        try:
+            xvfb_proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            xvfb_proc.kill()
 
 
 def encode(frames_dir: Path, out: Path, fps: int, crf: int, scale: str | None) -> None:
@@ -121,6 +156,11 @@ def main() -> int:
     ap.add_argument("--scale", help="ffmpeg scale filter (default: even dimensions)")
     ap.add_argument("--keep-frames", action="store_true", help="keep the intermediate frames")
     ap.add_argument("--frames-dir", type=Path, help="directory for the frames (implies --keep-frames)")
+    ap.add_argument("--display", default=":78", help="X display for the throwaway server")
+    ap.add_argument("--width", type=int, default=1200, help="window width to record")
+    ap.add_argument("--height", type=int, default=800, help="window height to record")
+    ap.add_argument("--capture-fps", type=float, default=8.0, help="screenshot rate while recording")
+    ap.add_argument("--max-frames", type=int, default=6000, help="safety cap on captured frames")
     args = ap.parse_args()
 
     if not args.corro_file.exists():
