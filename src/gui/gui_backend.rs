@@ -861,9 +861,6 @@ fn displayed_rows(state: &GuiState) -> Vec<usize> {
         let sheet = app.core.workbook.active_sheet();
         ui_core::visible_row_indices(sheet, app.core.cursor, state.data_rows.get(), prev)
     };
-    #[cfg(target_os = "android")]
-    super::android_backend::logcat(&format!(
-        "USE prev={prev} start={start} list_len={}", display.len()));
 
     let (pinned, _) = pinned_sets(state);
     union_pinned(&display, &pinned)
@@ -2714,9 +2711,6 @@ fn centre_on_cursor(state: &GuiState, app: &super::App) {
     let centred_c = centre_col_anchor(state, sheet, cursor, dim_c);
 
     state.viewport_anchor.set(Some((centred_r, centred_c)));
-    #[cfg(target_os = "android")]
-    super::android_backend::logcat(&format!(
-        "AIM r={centred_r} c={centred_c} row_pos={row_pos} dim_r={dim_r}"));
 }
 
 /// Column anchor (`prev_start` for `visible_col_indices`) that centres the
@@ -4526,6 +4520,31 @@ pub fn run_gui_with_movie(
         // Test marker: 8x8 square of 0xFEEDBE at top-left, drawn AFTER render_grid
         // so it appears on top of the grid background and is visible in screenshots.
         dc.fill_rect(0.0, 0.0, 8.0, 8.0, 254.0/255.0, 237.0/255.0, 190.0/255.0, 1.0);
+        // Ensure the sheet has somewhere to scroll.
+        //
+        // `maintain_extent` sizes the body from the viewport, but at startup it
+        // runs before the canvas has been measured, so it sees the 30x12
+        // placeholder and leaves the sheet exactly as tall as the screen — the
+        // display list then comes back the same length as the window and
+        // `visible_row_indices` clamps its start to 0, so scrolling and
+        // cell-centring both do nothing. This tops the sheet up once the real
+        // size is known.
+        //
+        // Deliberately a cheap comparison rather than another
+        // `maintain_extent` call: that re-scans content and calling it here
+        // destabilised rendering twice. Growing needs only the viewport count
+        // and the current extent, and only ever appends rows.
+        {
+            let want = (shared_draw.data_rows.get().max(1) * 2)
+                .min(MAX_RENDER_ROWS);
+            let app = shared_draw.app_mut();
+            let grid = &mut app.core.workbook.active_sheet_mut().grid;
+            let mut grew = 0;
+            while grid.main_rows() < want && grew < MAX_RENDER_ROWS {
+                grid.grow_main_row_at_bottom();
+                grew += 1;
+            }
+        }
     }));
     eprintln!("PHASE: after_set_draw_callback");
     let _ = std::fs::write("/tmp/gui_setup_phase2.txt", "after_set_draw_callback\n");
