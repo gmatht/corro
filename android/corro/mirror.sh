@@ -38,7 +38,33 @@ adb shell am start -n com.corro/.MainActivity >/dev/null 2>&1
 sleep 4
 
 # feh reloads the image whenever the file changes (-R), giving a live window.
-setsid feh --reload 1 --geometry 480x1013 --title "corro on Android" "$FRAME" \
+#
+# The window must be at least as large as the frame, or feh renders NOTHING:
+# given a window smaller than the image it does not scale down, it paints a
+# flat grey rectangle. That is what made the first version of this script look
+# broken over VNC — it used a hardcoded 480x1013 window against a 1080x2280
+# screencap, so the viewer showed a solid grey box (3 distinct colours) while
+# the frame file on disk was perfectly correct. Verified: the same image gives
+# 3 distinct colours in a 400x800 window and 37 in a 1080x2280 one.
+#
+# So measure the frame instead of guessing, and let the VNC viewer do any
+# scaling the user wants (it can zoom; feh cannot).
+FRAME_W=$(python3 -c "
+import struct
+with open('$FRAME','rb') as f:
+    d = f.read(33)
+print(struct.unpack('>I', d[16:20])[0] if d[:8] == b'\x89PNG\r\n\x1a\n' else 0)
+" 2>/dev/null)
+FRAME_H=$(python3 -c "
+import struct
+with open('$FRAME','rb') as f:
+    d = f.read(33)
+print(struct.unpack('>I', d[20:24])[0] if d[:8] == b'\x89PNG\r\n\x1a\n' else 0)
+" 2>/dev/null)
+[ "${FRAME_W:-0}" -gt 0 ] 2>/dev/null || FRAME_W=1080
+[ "${FRAME_H:-0}" -gt 0 ] 2>/dev/null || FRAME_H=2280
+echo "feh window: ${FRAME_W}x${FRAME_H} (from the frame itself)" >>/tmp/live_loop.log
+setsid feh --reload 1 --geometry "${FRAME_W}x${FRAME_H}" --title "corro on Android" "$FRAME" \
   </dev/null >>/tmp/live_loop.log 2>&1 &
 sleep 3
 

@@ -22,6 +22,15 @@ Mirroring the emulator
 `mirror.sh` launches the app, then loops: `adb exec-out screencap` -> a PNG
 -> an `feh --reload` window on `:99`, which the VNC server mirrors.
 
+The `feh` window is sized from the frame itself, not a fixed geometry, and that
+matters: given a window SMALLER than the image, `feh` does not scale the image
+down — it paints a flat grey rectangle. A hardcoded 480x1013 window against a
+1080x2280 screencap therefore showed a solid grey box over VNC while the frame
+file on disk was perfectly correct. Measured on the same image: 3 distinct
+colours in a 400x800 window, 37 in a 1080x2280 one. If the VNC view is grey,
+check the window geometry against the frame size first — and note `feh` cannot
+zoom, so any scaling has to happen in the viewer.
+
 Do NOT use scrcpy here. The emulator's MediaCodec encoder dies after a while
 ("Encoding error: IllegalStateException"); the scrcpy client process stays
 alive but stops receiving frames, so the VNC viewer sits on a stale frame
@@ -36,6 +45,18 @@ If the window looks frozen, the check that distinguishes the two cases is:
 
     # mirror side: does the VNC-visible window change too?
     tail -3 /tmp/live_loop.log      # frame counter must keep advancing
+
+Three failure modes look identical from the viewer — a grey box, a frozen
+frame, and a hung app. Tells, in the order worth checking:
+
+    xwininfo -root -children | grep "corro on Android"   # window size vs frame
+    tail -1 /tmp/live_loop.log                           # counter advancing?
+    adb shell dumpsys window | grep mCurrentFocus        # app focused?
+    adb shell input keyevent 224                         # emulator screen asleep?
+
+(The last one bit hard: a locked emulator screen renders as a flat grey field
+that is indistinguishable from a blank mirror. `adb shell svc power stayon
+true` prevents it.)
 
 Building
 --------
