@@ -55,7 +55,11 @@ done
 for i in "${!HDR_NAMES[@]}"; do
   HDR_IDS+=("$(hexid "$((0x31 + i))")")
 done
-ID_BUILD_STORYBOARD="$(hexid 0x45)"
+# Build-file ids live at 0x40+ (one per source file) and the storyboard's
+# build id at 0x80, so adding a source cannot collide with it. (A first attempt
+# used 0x45 for the storyboard, which collided with the fifth source's build
+# id and made xcodebuild fail with "Unexpected duplicate tasks".)
+ID_BUILD_STORYBOARD="$(hexid 0x80)"
 
 # --- source file entries ---
 src_entries=""

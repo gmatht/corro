@@ -54,6 +54,20 @@ txt = open(wf).read()
 assert txt.index('SIM_UDID=') < txt.index('\$SIM_UDID'), 'SIM_UDID used before set'
 print('workflow ok:', list(d['jobs']))
 PY"
+run "xcodeproj definitions are unique" bash -c "python3 - <<'PY'
+import re, sys
+from collections import Counter
+p = '/tmp/iv_xp/Corro.xcodeproj/project.pbxproj'
+s = open(p).read()
+defs = re.findall(r'^\\t\\t(C0DE[0-9A-F]+) /\\* [^*]+ \\*/ = \\{isa = ([A-Za-z]+);', s, re.M)
+if not defs:
+    print('no object definitions found'); sys.exit(1)
+c = Counter(i for i, _ in defs)
+dupes = {k: v for k, v in c.items() if v > 1}
+if dupes:
+    print('duplicate object ids:', dupes); sys.exit(1)
+print('object definitions:', len(defs), 'unique')
+PY"
 run "xcodeproj ids well-formed" bash -c "python3 -c '
 import re
 s = open(\"/tmp/iv_xp/Corro.xcodeproj/project.pbxproj\").read()
