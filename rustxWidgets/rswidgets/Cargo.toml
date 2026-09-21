@@ -31,6 +31,13 @@ jni = { version = "0.21", default-features = false, features = ["invocation"] }
 ndk = "0.9"
 ndk-context = "0.1"
 
+# iOS needs NO crates: the backend reaches UIKit/Core Graphics through the
+# Objective-C runtime with a handful of typed `objc_msgSend` wrappers (see
+# backends/ios.rs). That is deliberate — the armv7s / iOS 7 build path in
+# docs/IOS_GUIDELINES.md §9 runs with an old SDK and a pinned old rustc, which
+# is exactly where a heavy ObjC binding stack (or its build script) breaks.
+# Only `objc`/`CoreGraphics` system frameworks are linked, and only for iOS.
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"
 js-sys = "0.3"
@@ -72,6 +79,12 @@ gtk3-rs = ["dep:gtk3"]
 gtk4-rs-static = ["dep:gtk4-static"]
 ratatui = ["dep:ratatui", "dep:crossterm"]
 headless = []
+# iOS: selects the UIKit backend. The backend is cfg-gated on
+# `target_os = "ios"`, so this feature exists for symmetry with `gtk` and so
+# a host crate can write the same `features = [...]` line everywhere; a host
+# that depends on rswidgets with `default-features = false` plus this feature
+# builds against UIKit and nothing else.
+ios = []
 
 [dev-dependencies]
 proptest = "1.6"

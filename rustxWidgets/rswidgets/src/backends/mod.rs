@@ -63,6 +63,14 @@ pub mod android;
 #[cfg(all(target_os = "android", not(feature = "zork")))]
 pub use self::android::init_backend as init;
 
+// iOS: same shape as android (a backend whose init does not enter a loop —
+// the host's UIApplicationMain owns the run loop), same priority position:
+// a platform-native backend wins over pancurses/ratatui.
+#[cfg(all(target_os = "ios", not(feature = "zork")))]
+pub mod ios;
+#[cfg(all(target_os = "ios", not(feature = "zork")))]
+pub use self::ios::init_backend as init;
+
 #[cfg(feature = "pancurses")]
 pub mod pancurses;
 // Native backends win the default `init` (documented priority); the

@@ -9,8 +9,6 @@ mod android_backend {
     use std::sync::Mutex;
 
     static JAVA_VM: OnceCell<jni::JavaVM> = OnceCell::new();
-    static ACTIVITY: OnceCell<GlobalRef> = OnceCell::new();
-    static ROOT_LAYOUT: OnceCell<GlobalRef> = OnceCell::new();
     /// The app's ClassLoader, captured while we are still on the Activity's
     /// thread. `JNIEnv::find_class` on a JNI-attached thread resolves through
     /// the *system* loader and cannot see APK classes (`com.corro.*`), so the
@@ -29,9 +27,6 @@ mod android_backend {
     }
 
     pub fn init(env: &mut JNIEnv, activity: &JObject<'_>) -> Result<(), Box<dyn StdError + Send + Sync>> {
-        let vm = env.get_java_vm()?;
-        let activity_ref = env.new_global_ref(activity)?;
-
         let content_id: jni::sys::jint = env.get_static_field(
             "android/R$id",
             "content",
@@ -44,24 +39,40 @@ mod android_backend {
             "(I)Landroid/view/View;",
             &[content_id.into()],
         )?;
-        let root_ref = env.new_global_ref(root_view.l()?)?;
+        let root_view = root_view.l()?;
+        init_with_layout(env, activity, &root_view)
+    }
 
-        JAVA_VM.set(vm).map_err(|_| "JAVA_VM already initialized")?;
-        ACTIVITY.set(activity_ref).map_err(|_| "ACTIVITY already initialized")?;
-        ROOT_LAYOUT.set(root_ref).map_err(|_| "ROOT_LAYOUT already initialized")?;
+    /// Mutable handle cells: a re-init (Activity recreated after rotation)
+    /// replaces them, which `OnceCell` could not do.
+    fn activity_cell() -> &'static Mutex<Option<GlobalRef>> {
+        static CELL: OnceCell<Mutex<Option<GlobalRef>>> = OnceCell::new();
+        CELL.get_or_init(|| Mutex::new(None))
+    }
 
-        Ok(())
+    fn root_layout_cell() -> &'static Mutex<Option<GlobalRef>> {
+        static CELL: OnceCell<Mutex<Option<GlobalRef>>> = OnceCell::new();
+        CELL.get_or_init(|| Mutex::new(None))
     }
 
     /// Like init() but accepts an explicitly provided root layout ViewGroup.
     /// Avoids the JNI lookup of android.R.id.content.
+    ///
+    /// Idempotent: a second call (an Activity recreated after rotation, or
+    /// the launcher re-entering a live task) re-captures the new
+    /// Activity/layout handles instead of failing on the one-shot cells.
+    /// The JVM never changes for a process, so its check is only a
+    /// consistency assertion — mismatched VMs would be a host bug.
     pub fn init_with_layout(env: &mut JNIEnv, activity: &JObject<'_>, layout: &JObject<'_>) -> Result<(), Box<dyn StdError + Send + Sync>> {
         let vm = env.get_java_vm()?;
         let activity_ref = env.new_global_ref(activity)?;
         let root_ref = env.new_global_ref(layout)?;
 
-        // Capture the APK's ClassLoader now, while this thread's context
-        // loader is the app's (we are inside MainActivity.onCreate).
+        // The JVM never changes for a process; a second call just re-captures
+        // the Activity/layout handles (see the doc note above).
+        let _ = JAVA_VM.set(vm);
+
+        // Re-capture the app's ClassLoader (first init, or after recreation).
         if let Ok(loader) = env
             .call_method(activity, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])
             .and_then(|l| l.l())
@@ -73,9 +84,11 @@ mod android_backend {
             logcat_rs("APP_CLASS_LOADER capture FAILED");
         }
 
-        JAVA_VM.set(vm).map_err(|_| "JAVA_VM already initialized")?;
-        ACTIVITY.set(activity_ref).map_err(|_| "ACTIVITY already initialized")?;
-        ROOT_LAYOUT.set(root_ref).map_err(|_| "ROOT_LAYOUT already initialized")?;
+        // OnceCell has no `replace`; a re-init must swap the handles for the
+        // new Activity. Storing the GlobalRef in a Mutex lets the second and
+        // later calls overwrite the first.
+        *activity_cell().lock().unwrap() = Some(activity_ref);
+        *root_layout_cell().lock().unwrap() = Some(root_ref);
 
         Ok(())
     }
@@ -103,12 +116,20 @@ mod android_backend {
         Ok(env.find_class(class_name)?)
     }
 
-    pub fn root_layout() -> Result<&'static GlobalRef, Box<dyn StdError + Send + Sync>> {
-        ROOT_LAYOUT.get().ok_or_else(|| "ROOT_LAYOUT not initialized (call init first)".into())
+    pub fn root_layout() -> Result<GlobalRef, Box<dyn StdError + Send + Sync>> {
+        root_layout_cell()
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| "ROOT_LAYOUT not initialized (call init first)".into())
     }
 
-    pub fn activity_ref() -> Result<&'static GlobalRef, Box<dyn StdError + Send + Sync>> {
-        ACTIVITY.get().ok_or_else(|| "ACTIVITY not initialized (call init first)".into())
+    pub fn activity_ref() -> Result<GlobalRef, Box<dyn StdError + Send + Sync>> {
+        activity_cell()
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| "ACTIVITY not initialized (call init first)".into())
     }
 
     pub fn with_env_and_activity<F, T>(f: F) -> Result<T, Box<dyn StdError + Send + Sync>>
@@ -116,10 +137,13 @@ mod android_backend {
         F: FnOnce(&mut JNIEnv<'_>, &GlobalRef) -> Result<T, Box<dyn StdError + Send + Sync>>,
     {
         let vm = JAVA_VM.get().ok_or_else(|| "JAVA_VM not initialized (call init first)")?;
-        let activity = ACTIVITY.get().ok_or_else(|| "ACTIVITY not initialized (call init first)")?;
+        // Clone the handle out of the Mutex so `f` borrows it: a re-init
+        // (Activity recreated after rotation) swaps the cell, and holding the
+        // guard across the callback would deadlock on that re-entry.
+        let activity = activity_ref()?;
 
         let mut env = vm.attach_current_thread()?;
-        f(&mut env, activity)
+        f(&mut env, &activity)
     }
 
     pub fn is_initialized() -> bool {
@@ -237,6 +261,61 @@ mod android_backend {
             )?;
             make_global_ref(env, &btn)
         })
+    }
+
+    /// Build the app's menu strip: a `com.corro.MenuStrip` holding the
+    /// title, the inline quick-action buttons and the overflow button. The
+    /// class is an app (APK) class, so it is resolved through the app
+    /// ClassLoader, and it must expose `(Context, String)`.
+    ///
+    /// Returns `None` when the class is missing, so a host that does not
+    /// ship one still gets a working (menu-less) UI rather than a crash.
+    pub fn create_menu_strip(title: &str) -> Result<jni::sys::jobject, Box<dyn StdError + Send + Sync>> {
+        with_env_and_activity(|env, activity| {
+            let ctx = activity.as_obj();
+            let class = load_app_class(env, "com.corro.MenuStrip")?;
+            let j_title = env.new_string(title)?;
+            let strip = env.new_object(
+                &class,
+                "(Landroid/content/Context;Ljava/lang/String;)V",
+                &[(&ctx).into(), (&j_title).into()],
+            )?;
+            make_global_ref(env, &strip)
+        })
+    }
+
+    /// Append one top-level menu (label plus alternating item label/action
+    /// name) to a strip built by [`create_menu_strip`].
+    pub fn menu_strip_add_menu(
+        strip_ptr: *mut std::os::raw::c_void,
+        label: &str,
+        actions: &[&str],
+    ) {
+        if strip_ptr.is_null() {
+            return;
+        }
+        let _ = with_env_and_activity(|env, _activity| {
+            let strip =
+                unsafe { jni::objects::JObject::from_raw(strip_ptr as jni::sys::jobject) };
+            let j_label = env.new_string(label)?;
+            let arr = env.new_object_array(
+                actions.len() as i32,
+                "java/lang/String",
+                jni::objects::JObject::null(),
+            )?;
+            for (i, a) in actions.iter().enumerate() {
+                let ja = env.new_string(a)?;
+                env.set_object_array_element(&arr, i as i32, &ja)?;
+            }
+            let arr_obj = jni::objects::JObject::from(arr);
+            env.call_method(
+                &strip,
+                "addMenu",
+                "(Ljava/lang/String;[Ljava/lang/String;)V",
+                &[(&j_label).into(), (&arr_obj).into()],
+            )?;
+            Ok::<_, Box<dyn StdError + Send + Sync>>(())
+        });
     }
 
     pub fn create_label(text: &str) -> Result<jni::sys::jobject, Box<dyn StdError + Send + Sync>> {
@@ -685,6 +764,32 @@ mod android_backend {
 
     /// Attach `child` to a container view (`FrameLayout` scrolled windows,
     /// overlays): `addView(child)`. Best-effort; ignores null handles.
+    /// Insert `child` at `index` in a container (`addView(child, index)`),
+    /// so a caller can put chrome above children that were added earlier.
+    /// Best-effort; ignores null handles.
+    pub fn insert_child_at(
+        container_ptr: *mut std::os::raw::c_void,
+        child_ptr: *mut std::os::raw::c_void,
+        index: i32,
+    ) {
+        if container_ptr.is_null() || child_ptr.is_null() {
+            return;
+        }
+        let _ = with_env_and_activity(|env, _activity| {
+            let container =
+                unsafe { jni::objects::JObject::from_raw(container_ptr as jni::sys::jobject) };
+            let child =
+                unsafe { jni::objects::JObject::from_raw(child_ptr as jni::sys::jobject) };
+            env.call_method(
+                &container,
+                "addView",
+                "(Landroid/view/View;I)V",
+                &[(&child).into(), index.into()],
+            )?;
+            Ok::<_, Box<dyn StdError + Send + Sync>>(())
+        });
+    }
+
     pub fn attach_child(container_ptr: *mut std::os::raw::c_void, child_ptr: *mut std::os::raw::c_void) {
         if container_ptr.is_null() || child_ptr.is_null() {
             return;

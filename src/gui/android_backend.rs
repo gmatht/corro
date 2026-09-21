@@ -63,6 +63,7 @@ pub fn install_menu_strip(
         collect_menu_pairs(root.submenu.as_deref().unwrap_or(&[]), &mut pairs);
         let refs: Vec<&str> = pairs.iter().map(|s| s.as_str()).collect();
         let label = root.label.replace('_', "");
+        logcat(&format!("menu strip: adding {label} with {} entries", refs.len()));
         rswidgets::backends::android::menu_strip_add_menu(
             strip_ptr as *mut std::os::raw::c_void,
             &label,

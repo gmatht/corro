@@ -87,3 +87,20 @@ pub extern "system" fn Java_com_corro_CorroKeyListener_nativeEntryActivate(
 ) {
     rswidgets::backends_android_adapter::dispatch_entry_activate(view_ptr as usize as *mut _);
 }
+
+/// Called from `MenuStrip.nativeMenuAction(action)`: the strip's buttons
+/// (quick actions and every overflow item) dispatch by the same `app.*`
+/// action name the desktop menu registers, so there is one dispatch table.
+#[no_mangle]
+pub extern "system" fn Java_com_corro_MenuStrip_nativeMenuAction(
+    mut env: JNIEnv,
+    _class: JClass,
+    action: JObject,
+) {
+    let jstr: &jni::objects::JString = (&action).into();
+    let Ok(action) = env.get_string(jstr) else {
+        return;
+    };
+    let action: String = action.into();
+    corro::gui::android_backend::run_menu_action_by_name(&action);
+}

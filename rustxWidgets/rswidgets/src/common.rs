@@ -42,7 +42,7 @@ mod platform {
 }
 
 
-#[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
+#[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android", target_os = "ios"))))]
 mod platform {
     platform_module!(crate::backends_pancurses_adapter, PancursesOrientation);
 }
@@ -55,6 +55,11 @@ mod platform {
 #[cfg(all(target_os = "android", not(feature = "zork")))]
 mod platform {
     platform_module!(crate::backends_android_adapter, AndroidOrientation);
+}
+
+#[cfg(all(target_os = "ios", not(feature = "zork")))]
+mod platform {
+    platform_module!(crate::backends_ios_adapter, IosOrientation);
 }
 
 #[cfg(feature = "zork")]
@@ -306,7 +311,7 @@ mod common_types {
     }
 }
 
-#[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
+#[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android", target_os = "ios"))))]
 mod common_types { common_types_mod!(); }
 
 
@@ -343,6 +348,21 @@ mod common_types {
     }
 }
 
+#[cfg(all(target_os = "ios", not(feature = "zork")))]
+mod common_types {
+    common_types_mod!();
+    impl Canvas {
+        pub fn on_key(&self, cb: Box<dyn FnMut(u32) -> bool>) { self.inner.on_key(cb); }
+    }
+    impl ScrolledWindow {
+        pub fn set_child(&self, child: &crate::common::Canvas) { self.inner.attach_canvas(&child.inner); }
+        pub fn set_policy(&self, _hscroll: u32, _vscroll: u32) {}
+        pub fn set_vexpand(&self, _expand: bool) {}
+        pub fn scroll_to(&self, _hval: f64, _hupper: f64, _hpage: f64, _vval: f64, _vupper: f64, _vpage: f64) {}
+        pub fn on_scroll(&self, _cb: Box<dyn FnMut(bool, f64)>) {}
+    }
+}
+
 #[cfg(feature = "zork")]
 mod common_types { common_types_mod!(); }
 
@@ -365,6 +385,9 @@ pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleActi
 #[cfg(all(target_os = "android", not(feature = "zork")))]
 pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, ScrolledWindow};
 
+#[cfg(all(target_os = "ios", not(feature = "zork")))]
+pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, ScrolledWindow};
+
 #[cfg(feature = "zork")]
 pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, ScrolledWindow};
 
@@ -382,6 +405,8 @@ pub use self::platform::PancursesOrientation as Orientation;
 pub use self::platform::WasmOrientation as Orientation;
 #[cfg(all(target_os = "android", not(feature = "zork")))]
 pub use self::platform::AndroidOrientation as Orientation;
+#[cfg(all(target_os = "ios", not(feature = "zork")))]
+pub use self::platform::IosOrientation as Orientation;
 #[cfg(feature = "zork")]
 pub use self::platform::ZorkOrientation as Orientation;
 

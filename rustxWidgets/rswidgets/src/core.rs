@@ -574,7 +574,10 @@ impl App {
         let _ = std::fs::write("/tmp/corro_init.txt", "App::init() called\n");
         let b = match crate::backends::init() {
             Ok(b) => b,
-            Err(e) => return Err(Error::Backend(format!("{}", e))),
+            // `{e}` (not `{}`, e): the iOS/Android `init_backend` returns
+            // `Box<dyn Error>`, which is Display but not Debug-formattable
+            // through an extra wrapper.
+            Err(e) => return Err(Error::Backend(format!("{e}"))),
         };
         #[cfg(all(windows, not(feature = "zork")))]
         {
@@ -1294,6 +1297,11 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
             let inner = crate::backends_android_adapter::create_window()?;
             Ok(crate::common::Window { inner })
         }
+        #[cfg(all(target_os = "ios", not(feature = "zork")))]
+        {
+            let inner = crate::backends_ios_adapter::create_window()?;
+            return Ok(crate::common::Window { inner });
+        }
     }
 
     /// Create a new layout Box.
@@ -1336,6 +1344,15 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
             let inner = crate::backends_android_adapter::create_box(android_orient, spacing)?;
             Ok(crate::common::WidgetBox { inner })
         }
+        #[cfg(all(target_os = "ios", not(feature = "zork")))]
+        {
+            let ios_orient = match orientation {
+                crate::common::Orientation::Horizontal => crate::backends_ios_adapter::Orientation::Horizontal,
+                crate::common::Orientation::Vertical => crate::backends_ios_adapter::Orientation::Vertical,
+            };
+            let inner = crate::backends_ios_adapter::create_box(ios_orient, spacing)?;
+            return Ok(crate::common::WidgetBox { inner });
+        }
     }
 
     /// Create a new Label with the given text.
@@ -1367,6 +1384,11 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
             let inner = crate::backends_android_adapter::create_label(text)?;
             Ok(crate::common::Label { inner })
         }
+        #[cfg(all(target_os = "ios", not(feature = "zork")))]
+        {
+            let inner = crate::backends_ios_adapter::create_label(text)?;
+            return Ok(crate::common::Label { inner });
+        }
     }
 
     /// Create a new text Entry.
@@ -1396,6 +1418,11 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
         {
             let inner = crate::backends_android_adapter::create_entry()?;
             Ok(crate::common::Entry { inner })
+        }
+        #[cfg(all(target_os = "ios", not(feature = "zork")))]
+        {
+            let inner = crate::backends_ios_adapter::create_entry()?;
+            return Ok(crate::common::Entry { inner });
         }
     }
 
@@ -1427,6 +1454,11 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
             let inner = crate::backends_android_adapter::create_canvas()?;
             Ok(crate::common::Canvas { inner })
         }
+        #[cfg(all(target_os = "ios", not(feature = "zork")))]
+        {
+            let inner = crate::backends_ios_adapter::create_canvas()?;
+            return Ok(crate::common::Canvas { inner });
+        }
     }
 
     /// Create a scrollable container for the sheet canvas (native scrollbar
@@ -1451,6 +1483,11 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
         #[cfg(all(target_os = "android", not(feature = "zork")))]
         {
             let inner = crate::backends_android_adapter::create_scrolled_window()?;
+            return Ok(crate::common::ScrolledWindow { inner });
+        }
+        #[cfg(all(target_os = "ios", not(feature = "zork")))]
+        {
+            let inner = crate::backends_ios_adapter::create_scrolled_window()?;
             return Ok(crate::common::ScrolledWindow { inner });
         }
         #[allow(unreachable_code)]
@@ -1484,6 +1521,11 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
             let inner = crate::backends_android_adapter::create_menu()?;
             Ok(crate::common::Menu { inner })
         }
+        #[cfg(all(target_os = "ios", not(feature = "zork")))]
+        {
+            let inner = crate::backends_ios_adapter::create_menu()?;
+            return Ok(crate::common::Menu { inner });
+        }
     }
 
     /// Create a new SimpleAction that will dispatch to the given name.
@@ -1513,6 +1555,11 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
         {
             let inner = crate::backends_android_adapter::create_simple_action(name)?;
             Ok(crate::common::SimpleAction { inner })
+        }
+        #[cfg(all(target_os = "ios", not(feature = "zork")))]
+        {
+            let inner = crate::backends_ios_adapter::create_simple_action(name)?;
+            return Ok(crate::common::SimpleAction { inner });
         }
     }
 
@@ -1545,6 +1592,11 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
         {
             let inner = crate::backends_android_adapter::create_menubar(&model.inner, _action_group)?;
             Ok(crate::common::MenuBar { inner })
+        }
+        #[cfg(all(target_os = "ios", not(feature = "zork")))]
+        {
+            let inner = crate::backends_ios_adapter::create_menubar(&model.inner, _action_group)?;
+            return Ok(crate::common::MenuBar { inner });
         }
     }
 
@@ -1598,6 +1650,11 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
         {
             let inner = crate::backends_android_adapter::create_dialog()?;
             Ok(crate::common::Dialog { inner })
+        }
+        #[cfg(all(target_os = "ios", not(feature = "zork")))]
+        {
+            let inner = crate::backends_ios_adapter::create_dialog()?;
+            return Ok(crate::common::Dialog { inner });
         }
     }
 
