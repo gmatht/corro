@@ -10,19 +10,21 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		C0DE00000000000000000041 /* AppDelegate.m in Sources */ = {isa = PBXBuildFile; fileRef = C0DE00000000000000000021 /* AppDelegate.m */; };
-		C0DE00000000000000000042 /* SceneDelegate.m in Sources */ = {isa = PBXBuildFile; fileRef = C0DE00000000000000000022 /* SceneDelegate.m */; };
-		C0DE00000000000000000043 /* CorroViewController.m in Sources */ = {isa = PBXBuildFile; fileRef = C0DE00000000000000000023 /* CorroViewController.m */; };
-		C0DE00000000000000000044 /* CorroIosShims.m in Sources */ = {isa = PBXBuildFile; fileRef = C0DE00000000000000000024 /* CorroIosShims.m */; };
+		C0DE00000000000000000041 /* main.m in Sources */ = {isa = PBXBuildFile; fileRef = C0DE00000000000000000021 /* main.m */; };
+		C0DE00000000000000000042 /* AppDelegate.m in Sources */ = {isa = PBXBuildFile; fileRef = C0DE00000000000000000022 /* AppDelegate.m */; };
+		C0DE00000000000000000043 /* SceneDelegate.m in Sources */ = {isa = PBXBuildFile; fileRef = C0DE00000000000000000023 /* SceneDelegate.m */; };
+		C0DE00000000000000000044 /* CorroViewController.m in Sources */ = {isa = PBXBuildFile; fileRef = C0DE00000000000000000024 /* CorroViewController.m */; };
+		C0DE00000000000000000045 /* CorroIosShims.m in Sources */ = {isa = PBXBuildFile; fileRef = C0DE00000000000000000025 /* CorroIosShims.m */; };
 		C0DE00000000000000000045 /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = C0DE00000000000000000010 /* LaunchScreen.storyboard */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		C0DE00000000000000000006 /* corro.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = corro.app; sourceTree = BUILT_PRODUCTS_DIR; };
-		C0DE00000000000000000021 /* AppDelegate.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = AppDelegate.m; sourceTree = "<group>"; };
-		C0DE00000000000000000022 /* SceneDelegate.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = SceneDelegate.m; sourceTree = "<group>"; };
-		C0DE00000000000000000023 /* CorroViewController.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = CorroViewController.m; sourceTree = "<group>"; };
-		C0DE00000000000000000024 /* CorroIosShims.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = CorroIosShims.m; sourceTree = "<group>"; };
+		C0DE00000000000000000021 /* main.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = main.m; sourceTree = "<group>"; };
+		C0DE00000000000000000022 /* AppDelegate.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = AppDelegate.m; sourceTree = "<group>"; };
+		C0DE00000000000000000023 /* SceneDelegate.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = SceneDelegate.m; sourceTree = "<group>"; };
+		C0DE00000000000000000024 /* CorroViewController.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = CorroViewController.m; sourceTree = "<group>"; };
+		C0DE00000000000000000025 /* CorroIosShims.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = CorroIosShims.m; sourceTree = "<group>"; };
 		C0DE00000000000000000031 /* AppDelegate.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = AppDelegate.h; sourceTree = "<group>"; };
 		C0DE00000000000000000032 /* SceneDelegate.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = SceneDelegate.h; sourceTree = "<group>"; };
 		C0DE00000000000000000033 /* CorroViewController.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = CorroViewController.h; sourceTree = "<group>"; };
@@ -65,10 +67,11 @@
 				C0DE00000000000000000032 /* SceneDelegate.h */,
 				C0DE00000000000000000033 /* CorroViewController.h */,
 				C0DE00000000000000000034 /* CorroBridge.h */,
-				C0DE00000000000000000021 /* AppDelegate.m */,
-				C0DE00000000000000000022 /* SceneDelegate.m */,
-				C0DE00000000000000000023 /* CorroViewController.m */,
-				C0DE00000000000000000024 /* CorroIosShims.m */,
+				C0DE00000000000000000021 /* main.m */,
+				C0DE00000000000000000022 /* AppDelegate.m */,
+				C0DE00000000000000000023 /* SceneDelegate.m */,
+				C0DE00000000000000000024 /* CorroViewController.m */,
+				C0DE00000000000000000025 /* CorroIosShims.m */,
 				C0DE00000000000000000010 /* LaunchScreen.storyboard */,
 				C0DE00000000000000000011 /* Info.plist */,
 			);
@@ -143,10 +146,11 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				C0DE00000000000000000041 /* AppDelegate.m in Sources */,
-				C0DE00000000000000000042 /* SceneDelegate.m in Sources */,
-				C0DE00000000000000000043 /* CorroViewController.m in Sources */,
-				C0DE00000000000000000044 /* CorroIosShims.m in Sources */,
+				C0DE00000000000000000041 /* main.m in Sources */,
+				C0DE00000000000000000042 /* AppDelegate.m in Sources */,
+				C0DE00000000000000000043 /* SceneDelegate.m in Sources */,
+				C0DE00000000000000000044 /* CorroViewController.m in Sources */,
+				C0DE00000000000000000045 /* CorroIosShims.m in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

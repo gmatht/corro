@@ -41,7 +41,9 @@ ID_PLIST="$(hexid 17)"
 
 # One identifier per source file, in a fixed order. File refs live at 0x20+,
 # build files at 0x40+, so the two sets can never collide.
-declare -a SRC_NAMES=("AppDelegate.m" "SceneDelegate.m" "CorroViewController.m" "CorroIosShims.m")
+# main.m first: the app needs a process entry point, or the link fails with
+# `"_main", referenced from ...` (found by CI).
+declare -a SRC_NAMES=("main.m" "AppDelegate.m" "SceneDelegate.m" "CorroViewController.m" "CorroIosShims.m")
 declare -a HDR_NAMES=("AppDelegate.h" "SceneDelegate.h" "CorroViewController.h" "CorroBridge.h")
 SRC_IDS=()
 HDR_IDS=()
