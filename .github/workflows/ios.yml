@@ -125,8 +125,10 @@ jobs:
           ( xcrun simctl launch --console-pty "$SIM_UDID" com.corro.corro \
               > /tmp/corro-console.log 2>&1 & )
           sleep 20
-          echo "--- console ---"
-          cat /tmp/corro-console.log 2>/dev/null | tail -40 || echo "(no console output)"
+          echo "--- console (head: the panic message comes first) ---"
+          head -25 /tmp/corro-console.log 2>/dev/null || echo "(no console output)"
+          echo "--- console (tail) ---"
+          tail -10 /tmp/corro-console.log 2>/dev/null || true
           echo "--- is the app process alive? ---"
           # `simctl spawn <udid> launchctl list` proved unreliable for app
           # processes (it lists the simulator's own jobs). pgrep against the
