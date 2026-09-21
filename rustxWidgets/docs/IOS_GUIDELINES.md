@@ -176,6 +176,43 @@ string but not a Rust closure.
   `drawRect:`). The placeholder must never shrink a real laid-out size, or
   the sheet viewport collapses to one row.
 
+## 8b. Can Zig replace Xcode? (no — but it is useful for one thing)
+
+Short answer: **no**. Zig 0.16 can compile C and `.m` for `-target aarch64-ios`,
+but it ships no Apple SDK, and the app needs four things only an SDK provides.
+Measured on this machine, in the order they bite:
+
+| Step | Result with Zig alone |
+|---|---|
+| `zig cc -target aarch64-ios -c foo.c` (no frameworks) | **works** — produces a Mach-O arm64 object |
+| `#include <UIKit/UIKit.h>` | **fails** — `'UIKit/UIKit.h' file not found`; zig ships no headers |
+| `.m` with `-fobjc-arc`, `#import <Foundation/Foundation.h>` | **fails** — no Foundation headers |
+| Linking the Rust `corro_ios` staticlib (`-lobjc -framework CoreGraphics -liconv`) | **fails** — `unable to find dynamic system library 'objc'`; zig bundles **only** `libSystem.tbd` |
+| A launchable `.app` (bundle layout, `Info.plist` embedding, codesign) | not something zig does at all |
+
+Two details worth knowing, because they are not obvious:
+
+* **Zig's bundled `libSystem.tbd` has no iOS slice.** Its `targets:` line is
+  `[ x86_64-macos, x86_64-maccatalyst, arm64e-macos, arm64e-maccatalyst ]`.
+  So even `-lSystem` for an iOS link is resolving against macOS stubs.
+* **`-mios-version-min` cannot be honoured through Zig.** Zig's darwin libc is
+  its own `libSystem.tbd`, so the deployment target is whatever that stub says,
+  not what the flag asks for. That is exactly the constraint this project cares
+  about most (§0), which makes Zig a poor fit for the iOS 7.1.2 path in
+  particular.
+
+If you *did* supply an SDK (`SDKROOT=/path/to/iPhoneOS.sdk`), `zig cc` becomes a
+usable clang driver for it — but at that point the SDK is doing the work Xcode
+was doing, and you have not removed the Apple dependency, only Xcode's UI.
+
+**What Zig genuinely does buy, and what this repo now does:** building the Rust
+side without a linker at all. `cargo rustc --target aarch64-apple-ios --lib
+--crate-type rlib` needs no SDK and no `cc`, because an rlib is an archive of
+objects rather than a linked image. That is the closest thing to a
+"cross-compile without Xcode" story here, and it is what
+`scripts/check_*_ios.sh` already do in `--emit=metadata` form. Anything past
+that — a `.a`, a `.dylib`, an app — needs a linker and therefore an SDK.
+
 ## 9. Debugging, and the iOS 7.1.2 path
 
 Debug in order, mirroring the Android section: shim present → dispatch fired →
