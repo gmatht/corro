@@ -1,0 +1,22 @@
+name: NSLog probe
+on:
+  push:
+    paths: ['.github/workflows/nslog_probe.yml']
+jobs:
+  p:
+    runs-on: macos-14
+    steps:
+      - run: |
+          cat > /tmp/n.m <<'OBJC'
+          #import <Foundation/Foundation.h>
+          int main(void) {
+              @autoreleasepool {
+                  char *fmt = "%s";
+                  char *msg = "hello from NSLog";
+                  NSLog(fmt, msg);                        // variadic, named locals
+                  NSLog(@"direct %s", "literal-ok");      // literal format
+              }
+              return 0;
+          }
+          OBJC
+          clang -framework Foundation /tmp/n.m -o /tmp/n && /tmp/n
