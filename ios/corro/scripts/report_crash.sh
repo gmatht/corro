@@ -46,8 +46,21 @@ else:
 print("--- raw report head ---")
 for line in open(sys.argv[1]).read().splitlines()[:1]:
     pass
-for line in open(sys.argv[1]).read().splitlines()[1:120]:
-    print("   ", line[:200])
+# Print the faulting thread raw: the exact frame list matters more than any
+# parse, and a structured extraction that silently yields nothing is worse than
+# no extraction at all.
+ft = body.get("faultingThread")
+images = body.get("usedImages") or []
+threads = body.get("threads") or []
+if isinstance(ft, int) and ft < len(threads):
+    th = threads[ft]
+    print("--- faulting thread raw ---")
+    for fr in (th.get("frames") or [])[:20]:
+        idx = fr.get("imageIndex")
+        img = images[idx].get("name") if isinstance(idx, int) and idx < len(images) else "?"
+        print("   ", img, fr.get("symbol") or fr.get("imageOffset") or fr)
+print("--- report keys ---")
+print("   ", sorted(body.keys())[:40])
 PY
 fi
 
