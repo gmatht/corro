@@ -8,7 +8,7 @@ so the video shows exactly what the application shows.
 
 Usage:
     python3 scripts/demo_movie.py                 # write dist/corro-gui-movie.mp4
-    python3 scripts/demo_movie.py --cps 7         # slower typing
+    python3 scripts/demo_movie.py --cps 1.6       # slower typing
     python3 scripts/demo_movie.py -o /tmp/x.mp4
 
 Requires the same tools as `gui_movie.py` (Xvfb, xwd, ImageMagick, ffmpeg),
@@ -140,14 +140,24 @@ def main() -> int:
     ap.add_argument(
         "--cps",
         type=float,
-        default=6.5,
-        help="typing speed in chars/sec for the replayed workbooks (default: 6.5)",
+        default=3.25,
+        help="typing speed in chars/sec for the replayed workbooks (default: 3.25; "
+             "lower is slower)",
     )
-    ap.add_argument("--confirm-ms", type=int, default=400, help="per-step hold while replaying")
-    ap.add_argument("--menu-hold-ms", type=int, default=1400, help="menu flash hold while replaying")
+    ap.add_argument("--confirm-ms", type=int, default=800, help="per-step hold while replaying")
+    ap.add_argument("--menu-hold-ms", type=int, default=2800, help="menu flash hold while replaying")
+    ap.add_argument(
+        "--tempo",
+        type=float,
+        default=2.0,
+        help="scales the two-window edit timings (2.0 = half speed, matching --cps)",
+    )
     ap.add_argument("--fps", type=int, default=12, help="output frame rate")
     ap.add_argument("--crf", type=int, default=20, help="x264 quality (lower is better)")
-    ap.add_argument("--title-secs", type=float, default=3.0, help="how long each card holds")
+    ap.add_argument("--title-secs", type=float, default=6.0, help="how long each card holds")
+    # Kept at 8/s while everything else halves: slower pacing means longer
+    # segments, and a lower capture rate would drop the frames that show the
+    # replay advancing.
     ap.add_argument("--capture-fps", type=float, default=8.0, help="screenshot rate while replaying")
     ap.add_argument("--keep-frames", action="store_true", help="keep the intermediate frames")
     args = ap.parse_args()
@@ -221,6 +231,9 @@ def main() -> int:
                 [
                     sys.executable, "scripts/two_window_movie.py",
                     "--pair", pair,
+                    # Match the replay pacing: the collaboration segments
+                    # halve in speed along with everything else.
+                    "--tempo", str(args.tempo),
                     "--frames-dir", str(d),
                     "--keep-frames",
                     "-o", str(work / f"two-{pair}.mp4"),

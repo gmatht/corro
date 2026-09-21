@@ -19,6 +19,13 @@
   file bound, so each recording appended its steps to the fixture — the demo
   workbooks grew on every run. The replay now detaches the file (as the TUI
   replayer already did) while keeping it as the display source.
+- **Recording speed is now real.** Both capture scripts used an `xwd` +
+  `convert` loop, and at 2400x820 each takes ~500ms, so the loop delivered
+  about **1 fps** however high a rate was requested — a 32-second session
+  produced ~32 frames and played back as 2.7 seconds. They now record with
+  ffmpeg's `x11grab`, which captures continuously at the requested rate. The
+  shipped demo is also half its previous speed throughout (typing, step holds,
+  card durations and the collaboration timings), and is 298s rather than 60s.
 - **Concurrent editing demos.** `scripts/two_window_movie.py` records two
   front-ends editing one file (`--pair gui-gui` or `gui-tui`), showing each
   window's commit appear in the other. Both windows are scripted via

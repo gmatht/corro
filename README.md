@@ -44,7 +44,8 @@ scripts/demo_movie.py                                                       # th
 
 `demo_movie.py` builds the shipped demo: title card, a replay of each featured
 workbook, two live-collaboration demos, closing card. `--cps` sets the typing
-speed (characters per second).
+speed (characters per second); `--tempo` scales the collaboration timings to
+match.
 
 ### Concurrent editing
 

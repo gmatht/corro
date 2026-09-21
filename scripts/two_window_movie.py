@@ -20,7 +20,7 @@ Usage:
     scripts/two_window_movie.py -o dist/corro-two-windows.mp4          # GUI + GUI
     scripts/two_window_movie.py --pair gui-tui -o dist/corro-gui-tui.mp4
 
-Requires: Xvfb, a window manager (fluxbox/openbox/...), xwd, ImageMagick, ffmpeg.
+Requires: Xvfb, a window manager (fluxbox/openbox/...), ffmpeg.
 """
 
 from __future__ import annotations
@@ -46,10 +46,27 @@ _DISPLAY = ":92"
 
 # Edits each window performs (ms after session start : cell = value). They
 # interleave so the recording alternates which window is writing.
-LEFT_EDITS = "1000:A5=111,5000:A7=333,9000:A9=555"
-RIGHT_EDITS = "3000:A6=222,7000:A8=444,11000:A10=666"
-# Covers the last edit (11s) plus time to see it land.
-SESSION_SECONDS = 16.0
+# Edits alternate between the windows. `--tempo` scales these: 1.0 is the
+# values below, 2.0 runs them at half speed (used for the shipped demo).
+EDIT_TEMPO = 1.0
+_BASE_LEFT = "2000:A5=111,10000:A7=333,18000:A9=555"
+_BASE_RIGHT = "6000:A6=222,14000:A8=444,22000:A10=666"
+
+
+def scale_edits(script: str, tempo: float) -> str:
+    """Multiply every timestamp in `MS:ADDR=VALUE,...` by `tempo`."""
+    if tempo == 1.0:
+        return script
+    out = []
+    for item in script.split(","):
+        when, _, rest = item.partition(":")
+        out.append(f"{int(int(when) * tempo)}:{rest}")
+    return ",".join(out)
+
+
+def last_edit_ms(scripts: list[str]) -> int:
+    times = [int(i.split(":")[0]) for s in scripts for i in s.split(",")]
+    return max(times, default=0)
 
 
 def require(tool: str) -> str:
@@ -109,40 +126,40 @@ def place(wid: str, x: int, y: int) -> None:
 
 
 class Recorder:
-    """Screenshots the whole display at a fixed rate while a session runs."""
+    """Records the whole display while a session runs.
 
-    def __init__(self, out_dir: Path, fps: float):
-        self.out_dir = out_dir
-        self.stop_file = out_dir / ".stop"
+    Uses ffmpeg's `x11grab`, which captures continuously at a real frame rate.
+    The obvious approach — loop `xwd` + `convert` — is far too slow to be
+    usable: at 2400x820 each of those takes ~500ms, so the loop delivers about
+    **1 fps** however high the requested rate is. That silently truncated the
+    recording: a 32-second session produced ~32 frames, which at the output
+    frame rate played back as a 2.7-second clip.
+    """
+
+    def __init__(self, out_dir: Path, fps: float, width: int, height: int):
+        self.pattern = out_dir / "frame-%05d.ppm"
         self.proc = subprocess.Popen(
-            [sys.executable, "-u", "-c", self._script(fps)],
-            stdout=subprocess.DEVNULL,
+            ["ffmpeg", "-y", "-loglevel", "error",
+             "-f", "x11grab",
+             "-framerate", str(fps),
+             "-video_size", f"{width}x{height}",
+             "-i", _DISPLAY,
+             "-pix_fmt", "rgb24",
+             str(self.pattern)],
+            env=_x_env(),
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
         )
-
-    def _script(self, fps: float) -> str:
-        return f"""
-import subprocess, time
-from pathlib import Path
-out = Path({str(self.out_dir)!r})
-stop = Path({str(self.stop_file)!r})
-env = __import__('os').environ.copy()
-env['DISPLAY'] = {_DISPLAY!r}
-n = 0
-while not stop.exists():
-    shot = subprocess.run(['xwd', '-root', '-silent'], env=env, capture_output=True)
-    if shot.returncode == 0 and shot.stdout:
-        subprocess.run(['convert', 'xwd:-', str(out / f'frame-{{n:05d}}.ppm')],
-                       input=shot.stdout, capture_output=True)
-        n += 1
-    time.sleep(1.0 / {fps!r})
-"""
 
     def wait(self, seconds: float) -> None:
         time.sleep(seconds)
 
     def finish(self) -> None:
-        self.stop_file.write_text("")
-        self.proc.wait(timeout=30)
+        # SIGINT lets ffmpeg finalize the last frame; terminate can truncate it.
+        self.proc.send_signal(signal.SIGINT)
+        try:
+            self.proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
 
 
 def build_file(path: Path) -> None:
@@ -169,9 +186,11 @@ def main() -> int:
     ap.add_argument("--crf", type=int, default=20, help="x264 quality")
     ap.add_argument("--keep-frames", action="store_true")
     ap.add_argument("--frames-dir", type=Path, help="write frames here (implies --keep-frames)")
+    ap.add_argument("--tempo", type=float, default=EDIT_TEMPO,
+                    help="scales the edit timings (2.0 = half speed, default: %(default)s)")
     args = ap.parse_args()
 
-    for tool in ("Xvfb", "xdotool", "xwd", "convert", "ffmpeg"):
+    for tool in ("Xvfb", "xdotool", "ffmpeg"):
         require(tool)
     binary = REPO_ROOT / "target" / "debug" / "corro"
     if not binary.exists():
@@ -209,14 +228,17 @@ def main() -> int:
         print("[two_window] warning: no window manager found; the windows may overlap")
 
     procs: list[subprocess.Popen] = []
-    rec = Recorder(frames, args.capture_fps)
+    rec = Recorder(frames, args.capture_fps, SCREEN_W, SCREEN_H)
     try:
         time.sleep(2.0)
 
+        left_script = scale_edits(_BASE_LEFT, args.tempo)
+        right_script = scale_edits(_BASE_RIGHT, args.tempo)
+
         left_env = _x_env()
-        left_env["CORRO_EDIT_SCRIPT"] = LEFT_EDITS
+        left_env["CORRO_EDIT_SCRIPT"] = left_script
         right_env = _x_env()
-        right_env["CORRO_EDIT_SCRIPT"] = RIGHT_EDITS
+        right_env["CORRO_EDIT_SCRIPT"] = right_script
 
         left = subprocess.Popen([str(binary), "--gui", str(shared)], env=left_env,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -240,7 +262,9 @@ def main() -> int:
         place(rw, WIN_W, 0)
         time.sleep(1.5)
 
-        rec.wait(SESSION_SECONDS)
+        # Long enough for the last edit to land and be seen in both windows.
+        hold = last_edit_ms([left_script, right_script]) / 1000.0 + 4.0
+        rec.wait(hold)
         rec.finish()
 
         captured = sorted(frames.glob("frame-*.ppm"))

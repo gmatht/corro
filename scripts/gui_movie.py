@@ -15,7 +15,7 @@ Usage:
     scripts/gui_movie.py docs/tests/subtotal.corro -o dist/corro-gui-movie.mp4
     scripts/gui_movie.py FILE.corro --video-only --cps 18
 
-Requires: an X server binary (Xvfb), xwd, ImageMagick `convert`, ffmpeg.
+Requires: ffmpeg (with x11grab) and an X server binary (Xvfb).
 
 To see which cells a recording will show as formula errors (#NAME, #PARSE, ...)
 and which log line produced each one, use `scripts/movie_errors.py`.
@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -61,8 +62,7 @@ def require(tool: str) -> str:
 def run_movie(binary: Path, corro_file: Path, frames_dir: Path, args: argparse.Namespace) -> None:
     """Play the movie in a real window under Xvfb, screenshotting as it runs."""
     xvfb = require("Xvfb")
-    xwd = require("xwd")
-    convert = require("convert")
+    require("ffmpeg")
 
     display = args.display
     env = dict(os.environ)
@@ -88,23 +88,36 @@ def run_movie(binary: Path, corro_file: Path, frames_dir: Path, args: argparse.N
             str(corro_file),
         ]
         print(f"[gui_movie] {' '.join(cmd)}")
-        corro = subprocess.Popen(
-            cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True
+        # ffmpeg's x11grab records continuously at a real frame rate. The
+        # obvious `xwd` + `convert` loop cannot: at this resolution each takes
+        # ~500ms, so it delivers ~1 fps no matter what rate is requested, and
+        # the recording silently comes out as a fraction of the session length.
+        recorder = subprocess.Popen(
+            ["ffmpeg", "-y", "-loglevel", "error",
+             "-f", "x11grab",
+             "-framerate", str(args.capture_fps),
+             "-video_size", f"{args.width}x{args.height}",
+             "-i", display,
+             "-pix_fmt", "rgb24",
+             "-frames:v", str(args.max_frames),
+             str(frames_dir / "frame-%05d.ppm")],
+            env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
         )
-        n = 0
-        while corro.poll() is None and n < args.max_frames:
-            shot = subprocess.run(
-                [xwd, "-root", "-silent"], env=env, capture_output=True
+        try:
+            corro = subprocess.Popen(
+                cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True
             )
-            if shot.returncode == 0 and shot.stdout:
-                out = frames_dir / f"frame-{n:05d}.ppm"
-                subprocess.run(
-                    [convert, "xwd:-", str(out)], input=shot.stdout, capture_output=True
-                )
-                if out.exists():
-                    n += 1
-            time.sleep(1.0 / args.capture_fps)
-        corro.wait(timeout=30)
+            corro.wait(timeout=args.timeout)
+            # A short tail so the last replayed frame is on screen when the
+            # recorder stops.
+            time.sleep(0.5)
+        finally:
+            recorder.send_signal(signal.SIGINT)
+            try:
+                recorder.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                recorder.kill()
+        n = len(list(frames_dir.glob("frame-*.ppm")))
         print(f"[gui_movie] captured {n} frames")
     finally:
         xvfb_proc.terminate()
@@ -164,6 +177,7 @@ def main() -> int:
     ap.add_argument("--height", type=int, default=800, help="window height to record")
     ap.add_argument("--capture-fps", type=float, default=8.0, help="screenshot rate while recording")
     ap.add_argument("--max-frames", type=int, default=6000, help="safety cap on captured frames")
+    ap.add_argument("--timeout", type=float, default=900, help="max seconds to let the movie play")
     args = ap.parse_args()
 
     if not args.corro_file.exists():
