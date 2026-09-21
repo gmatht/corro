@@ -1,0 +1,31 @@
+name: objc_retain probe
+on:
+  push:
+    paths: ['.github/workflows/retain_probe.yml']
+jobs:
+  p:
+    runs-on: macos-14
+    steps:
+      - run: |
+          cat > /tmp/rt.m <<'OBJC'
+          #import <Foundation/Foundation.h>
+          #import <objc/runtime.h>
+          // Mirror the Rust declaration: id objc_retain(id)
+          extern id objc_retain(id);
+          int main(void) {
+              @autoreleasepool {
+                  NSView *v = nil; (void)v;
+                  id obj = [[NSObject alloc] init];
+                  id r = objc_retain(obj);
+                  fprintf(stderr, "objc_retain ok: %s\n", r == obj ? "same pointer" : "DIFFERENT");
+                  // Also try retain on an autoreleased NSString, like nsstring does
+                  id s = objc_retain([NSString stringWithUTF8String:"retained-string"]);
+                  NSLog(@"%@", s);
+                  fprintf(stderr, "string retain ok\n");
+              }
+              return 0;
+          }
+          OBJC
+          # needs AppKit-free: use Foundation only, drop NSView
+          sed -i '' 's/NSView \*v = nil; (void)v;//' /tmp/rt.m
+          clang -framework Foundation /tmp/rt.m -o /tmp/rt && /tmp/rt 2>&1 | tail -5
