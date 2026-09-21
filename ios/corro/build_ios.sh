@@ -90,6 +90,14 @@ fi
 # alone would not do — this has to produce a real staticlib for the link step —
 # so an Xcode install is genuinely required from here on, unlike the host-side
 # `cargo check` in /tmp/corro_ios_check.sh.
+#
+# `panic_unwind`, NOT `panic_abort`. The abort build is smaller and looks like
+# the natural choice for an app, but it makes every panic terminate the process
+# on the spot: the message is replaced by "panic in a function that cannot
+# unwind" and `catch_unwind` at an FFI boundary can never catch anything. That
+# turned a diagnosable startup failure into a bare SIGABRT across several CI
+# runs. Unwinding costs some size and lets the host report what actually broke
+# (and, in principle, survive a recoverable error).
 # SDKROOT is the load-bearing line here, and it took a CI run to find out.
 #
 # rustc's iOS target spec links system libraries by NAME (`-lobjc`,
@@ -178,7 +186,7 @@ IPHONEOS_DEPLOYMENT_TARGET="$IOS_DEPLOYMENT_TARGET" \
 SDKROOT="$SDKROOT" \
   cargo +nightly build --release \
     --target "$RUST_TARGET" \
-    -Zbuild-std=std,panic_abort \
+    -Zbuild-std=std,panic_unwind \
     --config "build.rustflags=[\"-C\",\"link-arg=-isysroot\",\"-C\",\"link-arg=$SDKROOT\",\"-C\",\"link-arg=-L$SHIM_DIR\",\"-C\",\"link-arg=-lFoundation\"]"
 
 RLIB="$SCRIPT_DIR/target/$RUST_TARGET/release/libcorro_ios.a"
