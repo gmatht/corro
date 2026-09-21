@@ -118,8 +118,15 @@ jobs:
           # open for the app's lifetime, so stdout/stderr are captured via the
           # simulator's log instead (see the "Dump the Rust log lines" step,
           # which greps for the rswidgets/corro tags).
-          xcrun simctl launch "$SIM_UDID" com.corro.corro | tee /tmp/corro-launch.txt
+          # Run in the background with --console-pty so the app's stderr (where
+          # a Rust panic and our [rswidgets] lines go) lands in a file we can
+          # print. A detached launch discards it, which is why several runs
+          # showed a crash with no message.
+          ( xcrun simctl launch --console-pty "$SIM_UDID" com.corro.corro \
+              > /tmp/corro-console.log 2>&1 & )
           sleep 20
+          echo "--- console ---"
+          cat /tmp/corro-console.log 2>/dev/null | tail -40 || echo "(no console output)"
           echo "--- is the app process alive? ---"
           # `simctl spawn <udid> launchctl list` proved unreliable for app
           # processes (it lists the simulator's own jobs). pgrep against the
