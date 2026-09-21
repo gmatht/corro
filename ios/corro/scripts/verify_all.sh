@@ -28,6 +28,32 @@ run "corro tests"             bash -c "cd '$CORRO_ROOT' && cargo test --lib --qu
 run "rswidgets tests"         bash -c "cd '$CORRO_ROOT' && cargo test -p rswidgets --quiet"
 run "ios-ui example runs"     bash -c "cd '$CORRO_ROOT' && cargo run --quiet --example ios-ui --features gui-mobile-host"
 run "xcodeproj generator"     bash -c "rm -rf /tmp/iv_xp && mkdir -p /tmp/iv_xp && '$HERE/../gen_xcodeproj.sh' /tmp/iv_xp/Corro.xcodeproj"
+run "ios workflow parses and steps are bash-clean" bash -c "python3 - <<'PY'
+import subprocess, sys, tempfile, os
+try:
+    import yaml
+except ImportError:
+    print('pyyaml not installed; skipping'); sys.exit(0)
+wf = '$CORRO_ROOT/.github/workflows/ios.yml'
+d = yaml.safe_load(open(wf))
+assert 'jobs' in d, 'no jobs'
+bad = 0
+for job, spec in d['jobs'].items():
+    for step in spec.get('steps', []):
+        if 'run' not in step:
+            continue
+        with tempfile.NamedTemporaryFile('w', suffix='.sh', delete=False) as f:
+            f.write(step['run']); path = f.name
+        r = subprocess.run(['bash', '-n', path], capture_output=True, text=True)
+        os.unlink(path)
+        if r.returncode:
+            bad += 1
+            print('bad step:', step.get('name'), r.stderr[:200])
+assert bad == 0, f'{bad} steps with bash syntax errors'
+txt = open(wf).read()
+assert txt.index('SIM_UDID=') < txt.index('\$SIM_UDID'), 'SIM_UDID used before set'
+print('workflow ok:', list(d['jobs']))
+PY"
 run "xcodeproj ids well-formed" bash -c "python3 -c '
 import re
 s = open(\"/tmp/iv_xp/Corro.xcodeproj/project.pbxproj\").read()
