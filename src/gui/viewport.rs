@@ -29,11 +29,19 @@ pub struct Viewport {
     pub row_agg_func: Vec<Option<AggFunc>>,
     pub mr: usize,
     pub mc: usize,
+    /// Character width the columns were trimmed to fit. `fill_cells` needs it
+    /// to size text spill into the trailing blank space.
+    pub data_width: usize,
 }
 
 impl Viewport {
     /// Border title string, e.g. `"corro  12r × 3c  ops 5"`. Must match the
     /// format used wherever the title is rendered.
+    /// Character width this viewport was laid out for.
+    pub fn data_width(&self) -> usize {
+        self.data_width
+    }
+
     pub fn border_title(&self, ops: usize) -> String {
         format!("corro  {}r × {}c  ops {}", self.mr, self.mc, ops)
     }
@@ -135,6 +143,7 @@ impl Viewport {
             row_agg_func,
             mr,
             mc,
+            data_width: 0,
         }
     }
 }
@@ -187,5 +196,6 @@ fn build(
         row_agg_func,
         mr,
         mc,
+        data_width,
     }
 }

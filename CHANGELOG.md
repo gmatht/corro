@@ -14,6 +14,12 @@
 - Movie pacing flags (`--movie-typing-cps`, `--movie-confirm-ms`,
   `--movie-menu-hold-ms`) now parse on the CLI for every backend rather than
   only being honored by the ratatui path.
+- The GUI movie painter no longer draws its own copy of the sheet. It now
+  calls the same body renderer the live canvas uses
+  (`gui_backend::render_grid_body`), so margin shading, cell colours, the
+  cursor ring, selection and gutter padlocks cannot drift from the window —
+  the movie had lost the grey margin bands precisely because it was a second
+  implementation. The viewport is likewise built by the shared controller.
 - Fixed two frame-rendering defects in the GUI movie painter: the sheet was
   sized with a *column count* where the viewport expects a *character width*,
   which trimmed it down to the margin columns and left most of the frame blank

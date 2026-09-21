@@ -24,6 +24,7 @@
 
 use super::movie::{GuiMovie, GuiMovieOptions};
 use crate::grid::{HEADER_ROWS, MARGIN_COLS};
+use rswidgets::core::DrawContext as MovieDrawContext;
 use std::collections::HashMap;
 
 /// Canvas geometry used to render movie frames, matching the interactive
@@ -353,7 +354,7 @@ fn paint_sheet(
 ) {
     use crate::gui::viewport::Viewport;
 
-    // Background (mirrors render_grid's clear).
+    // Background (the same clear the live canvas does).
     dc.clear(0.94, 0.94, 0.94, 1.0);
 
     let cursor = app.core.cursor;
@@ -382,18 +383,13 @@ fn paint_sheet(
         )
     };
 
-    let sheet = app.core.workbook.active_sheet();
-    let grid = &sheet.grid;
-    let mr = grid.main_rows();
-    let mc = grid.main_cols();
 
     // Stretch the visible columns across the frame, the way the window does
     // when the sheet is narrower than the canvas. Without this a small
     // workbook renders as a narrow ribbon with an empty right half — the
     // "huge empty spaces" the window had before it sized the viewport from
     // its live canvas size.
-    let stretched = stretch_columns_to_width(&vp, w);
-    let col_widths = if stretched.is_empty() { vp.col_widths.clone() } else { stretched };
+    let col_widths = stretch_columns_to_width(&vp, w);
 
     // Window chrome: menu bar, then formula bar (address + value), matching
     // the interactive window's layout (see `run_gui`: vbox = menu, formula
@@ -401,20 +397,23 @@ fn paint_sheet(
     paint_menu_bar(dc, w);
     paint_formula_bar(dc, app, frame, w);
 
-    // Row gutter, column header strip and the cell body.
-    paint_gutter(dc, &vp.display_rows, mr);
-    paint_headers(dc, &vp.column_layout, &col_widths);
-    let mut sink = MovieSink::new();
-    vp.refill(
-        &mut sink,
-        grid,
-        HEADER_ROWS,
-        MARGIN_COLS,
-        data_width,
+    // The sheet itself is painted by the SAME code the live canvas uses: the
+    // grid region is translated below the chrome and then handed to
+    // `gui_backend::render_grid_body`, so margin shading, cell colours, the
+    // cursor ring, selection and padlocks cannot drift from the window.
+    let body_h = h - CHROME_H as i32;
+    dc.set_origin(0.0, CHROME_H);
+    crate::gui::gui_backend::render_grid_body(
+        dc,
+        app,
+        &vp,
+        &col_widths,
         cursor.row,
         cursor.col,
+        w,
+        body_h,
     );
-    paint_cells(dc, &sink, &vp, &col_widths, cursor.row, cursor.col);
+    dc.set_origin(0.0, 0.0);
 
     // Status band: the movie caption (what is being replayed right now).
     let caption = format!(
@@ -453,24 +452,27 @@ fn stretch_columns_to_width(
     if main.is_empty() {
         return widths;
     }
-    let total_px: f64 = vp
-        .col_ixs
-        .iter()
-        .map(|c| col_px(*widths.get(c).unwrap_or(&4)))
-        .sum();
-    let spare = (w as f64 - ROW_LABEL_W) - total_px;
-    if spare <= 0.0 {
-        return widths;
-    }
-    // Spread the spare width evenly, in whole characters so text still aligns
-    // to the grid.
-    let per_col_chars = (spare / (main.len() as f64 * CHAR_W)).floor().max(0.0) as usize;
-    if per_col_chars == 0 {
-        return widths;
-    }
-    for c in main {
-        let cur = *widths.get(&c).unwrap_or(&4);
-        widths.insert(c, cur + per_col_chars);
+    let total_px =
+        |widths: &HashMap<usize, usize>| -> f64 {
+            widths
+                .iter()
+                .filter(|(c, _)| vp.col_ixs.contains(c))
+                .map(|(_, w)| col_px(*w))
+                .sum()
+        };
+    let mut spare = (w as f64 - ROW_LABEL_W) - total_px(&widths);
+    // Spread the spare width evenly, one character at a time, so text still
+    // aligns to the grid and the loop can stop as soon as the row is covered.
+    while spare >= CHAR_W {
+        let per_col_chars = (spare / (main.len() as f64 * CHAR_W)).floor() as usize;
+        if per_col_chars == 0 {
+            break;
+        }
+        for c in &main {
+            let cur = *widths.get(c).unwrap_or(&4);
+            widths.insert(*c, cur + per_col_chars);
+        }
+        spare = (w as f64 - ROW_LABEL_W) - total_px(&widths);
     }
     widths
 }
@@ -527,62 +529,6 @@ fn paint_formula_bar(
     dc.draw_text(cx, 35.0, &caption, FONT_SIZE, 0.3, 0.3, 0.45, 1.0);
 }
 
-fn paint_gutter(dc: &mut RasterDrawContext, display_rows: &[usize], mr: usize) {
-    const ROW_H: f64 = 20.0;
-    const ROW_LABEL_W: f64 = 50.0;
-    for (ri, &logical_row) in display_rows.iter().enumerate() {
-        let y = CHROME_H + HEADER_H + ri as f64 * ROW_H;
-        dc.fill_rect(0.0, y, ROW_LABEL_W, ROW_H, 0.9, 0.9, 0.9, 1.0);
-        let label = crate::addr::ui_row_label(logical_row, mr);
-        dc.draw_text(6.0, y + 3.0, &label, FONT_SIZE, 0.3, 0.3, 0.3, 1.0);
-    }
-}
-
-fn paint_headers(dc: &mut RasterDrawContext, layout: &[(u32, u32, String)], col_widths: &HashMap<usize, usize>) {
-    let mut x = ROW_LABEL_W;
-    for (c, width, label) in layout {
-        let cw = col_px(*col_widths.get(&(*c as usize)).unwrap_or(&(*width as usize)));
-        dc.fill_rect(x, CHROME_H, cw, HEADER_H, 0.9, 0.9, 0.9, 1.0);
-        dc.draw_text(x + 2.0, CHROME_H + 5.0, label, FONT_SIZE, 0.3, 0.3, 0.3, 1.0);
-        x += cw;
-    }
-}
-
-fn paint_cells(
-    dc: &mut RasterDrawContext,
-    sink: &MovieSink,
-    vp: &crate::gui::viewport::Viewport,
-    col_widths: &HashMap<usize, usize>,
-    cursor_row: usize,
-    cursor_col: usize,
-) {
-    for (ri, &logical_row) in vp.display_rows.iter().enumerate() {
-        let y = CHROME_H + HEADER_H + ri as f64 * ROW_H;
-        let mut x = ROW_LABEL_W;
-        for &c in vp.col_ixs.iter() {
-            let cw = col_px(*col_widths.get(&c).unwrap_or(&8));
-            let is_cursor = logical_row == cursor_row && c == cursor_col;
-            let key = (ri as u32, c as u32);
-            let text = sink.cells.get(&key).cloned().unwrap_or_default();
-            let bg = if is_cursor {
-                (0.8, 0.9, 1.0, 1.0)
-            } else {
-                (1.0, 1.0, 1.0, 1.0)
-            };
-            dc.fill_rect(x, y, cw, ROW_H, bg.0, bg.1, bg.2, bg.3);
-            dc.stroke_rect(x, y, cw, ROW_H, 0.78, 0.78, 0.78, 1.0, 1.0);
-            if !text.trim().is_empty() {
-                // Cells hold at most `col_width` characters (that is what the
-                // grid guarantees and what the live canvas relies on); drawing
-                // the whole string would run it across the neighbouring cells.
-                let shown: String = text.chars().take(cols_in(cw)).collect();
-                dc.draw_text(x + 2.0, y + 3.0, &shown, FONT_SIZE, 0.0, 0.0, 0.0, 1.0);
-            }
-            x += cw;
-        }
-    }
-}
-
 /// Pixel width of a grid column. One layout character (`CHAR_W`) per character
 /// plus a small gutter, so a column that holds N characters is wide enough to
 /// draw them with the bitmap font's advance.
@@ -590,11 +536,6 @@ fn col_px(width_chars: usize) -> f64 {
     (width_chars as f64 * CHAR_W) + 4.0
 }
 
-/// How many characters fit in a column of `px` pixels (the inverse of
-/// [`col_px`], using the text advance rather than the layout metric).
-fn cols_in(px: f64) -> usize {
-    (((px - 4.0) / glyph_advance(2.0)).floor() as usize).max(1)
-}
 
 fn paint_status(dc: &mut RasterDrawContext, caption: &str, frame: &MovieFrameView, w: i32, h: i32) {
     let y = h as f64 - STATUS_H;
@@ -617,35 +558,6 @@ fn paint_status(dc: &mut RasterDrawContext, caption: &str, frame: &MovieFrameVie
     }
 }
 
-/// A `CellSink` for the movie painter: keeps the formatted text of each
-/// visible cell (the same values the interactive canvas draws).
-struct MovieSink {
-    cells: std::collections::HashMap<(u32, u32), String>,
-}
-
-impl MovieSink {
-    fn new() -> Self {
-        MovieSink {
-            cells: std::collections::HashMap::new(),
-        }
-    }
-}
-
-impl crate::gui::render::CellSink for MovieSink {
-    fn set_cell(&mut self, row: u32, col: u32, text: &str) {
-        self.cells.insert((row, col), text.to_string());
-    }
-    fn set_cell_style(
-        &mut self,
-        _row: u32,
-        _col: u32,
-        _style: crate::gui::compute::CellDisplayStyle,
-    ) {
-    }
-    fn set_raw_cell(&mut self, _row: u32, _col: u32, _text: &str) {}
-    fn set_cursor(&mut self, _row: u32, _col: u32) {}
-}
-
 // ---------------------------------------------------------------------------
 // Raster surface
 // ---------------------------------------------------------------------------
@@ -658,6 +570,12 @@ pub struct RasterDrawContext {
     w: i32,
     h: i32,
     px: Vec<u8>,
+    /// Added to every incoming coordinate. The shared sheet renderer works in
+    /// canvas space (origin at the top-left of the grid), while a movie frame
+    /// has the window's chrome above it; an offset view lets one renderer draw
+    /// into either place without threading an origin through every call.
+    ox: f64,
+    oy: f64,
 }
 
 impl RasterDrawContext {
@@ -668,13 +586,23 @@ impl RasterDrawContext {
             w,
             h,
             px: vec![255u8; (w as usize) * (h as usize) * 3],
+            ox: 0.0,
+            oy: 0.0,
         }
+    }
+
+    /// Shift this surface's origin by `(dx, dy)`. Used to paint the sheet
+    /// below the window chrome: the shared renderer works in canvas space.
+    pub fn set_origin(&mut self, dx: f64, dy: f64) {
+        self.ox = dx;
+        self.oy = dy;
     }
 
     pub fn size(&self) -> (i32, i32) {
         (self.w, self.h)
     }
 
+    /// Clear the whole surface (ignores the offset).
     pub fn clear(&mut self, r: f64, g: f64, b: f64, _a: f64) {
         let (r, g, b) = (chan(r), chan(g), chan(b));
         for i in (0..self.px.len()).step_by(3) {
@@ -686,6 +614,8 @@ impl RasterDrawContext {
 
     pub fn fill_rect(&mut self, x: f64, y: f64, w: f64, h: f64, r: f64, g: f64, b: f64, a: f64) {
         let (r0, g0, b0, a0) = (chan(r), chan(g), chan(b), a.clamp(0.0, 1.0));
+        let x = x + self.ox;
+        let y = y + self.oy;
         let x0 = x.floor() as i32;
         let y0 = y.floor() as i32;
         let x1 = (x + w).ceil() as i32;
@@ -735,6 +665,7 @@ impl RasterDrawContext {
     ) {
         let scale = if size >= 11.0 { 2.0 } else { 1.0 };
         let advance = glyph_advance(scale);
+        let (x, y) = (x + self.ox, y + self.oy);
         let mut cx = x;
         for ch in text.chars() {
             if ch != ' ' {
@@ -773,12 +704,75 @@ impl RasterDrawContext {
 
     /// Serialize as a binary PPM (P6) — lossless and read by ffmpeg, PIL and
     /// ImageMagick without any image crate in the build.
-    pub fn into_ppm(self) -> Vec<u8> {
+    pub fn into_ppm(&self) -> Vec<u8> {
         let header = format!("P6\n{} {}\n255\n", self.w, self.h);
         let mut out = Vec::with_capacity(header.len() + self.px.len());
         out.extend_from_slice(header.as_bytes());
         out.extend_from_slice(&self.px);
         out
+    }
+
+    fn clip(&mut self, _x: f64, _y: f64, _w: f64, _h: f64) {
+        // The raster always covers the whole frame; the shared renderer's clip
+        // calls are a no-op here (as they are for the widget canvas, which
+        // relies on the toolkit's clip).
+    }
+
+}
+
+impl MovieDrawContext for RasterDrawContext {
+    fn fill_rect(&mut self, x: f64, y: f64, w: f64, h: f64, r: f64, g: f64, b: f64, a: f64) {
+        RasterDrawContext::fill_rect(self, x, y, w, h, r, g, b, a)
+    }
+    fn stroke_rect(
+        &mut self,
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        r: f64,
+        g: f64,
+        b: f64,
+        a: f64,
+        lw: f64,
+    ) {
+        RasterDrawContext::stroke_rect(self, x, y, w, h, r, g, b, a, lw)
+    }
+    fn draw_text_styled(
+        &mut self,
+        x: f64,
+        y: f64,
+        text: &str,
+        _font: &str,
+        size: f64,
+        r: f64,
+        g: f64,
+        b: f64,
+        a: f64,
+        _slant: i32,
+        _weight: i32,
+    ) {
+        RasterDrawContext::draw_text(self, x, y, text, size, r, g, b, a)
+    }
+    fn text_extents_styled(
+        &self,
+        text: &str,
+        _font: &str,
+        size: f64,
+        _slant: i32,
+        _weight: i32,
+    ) -> (f64, f64, f64, f64) {
+        let scale = if size >= 11.0 { 2.0 } else { 1.0 };
+        let w = text.chars().count() as f64 * glyph_advance(scale);
+        (0.0, -size, w, size * 1.2)
+    }
+    fn clear(&mut self, r: f64, g: f64, b: f64, a: f64) {
+        RasterDrawContext::clear(self, r, g, b, a)
+    }
+    fn save(&mut self) {}
+    fn restore(&mut self) {}
+    fn clip(&mut self, x: f64, y: f64, w: f64, h: f64) {
+        RasterDrawContext::clip(self, x, y, w, h)
     }
 }
 

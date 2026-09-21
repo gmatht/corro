@@ -249,6 +249,65 @@ fn gui_movie_sheet_fills_the_frame_width() {
     let _ = std::fs::remove_file(path);
 }
 
+/// Regression: the movie painter used to draw its own cell rectangles and
+/// forgot the margin shading, so a recorded frame had no grey gutter/margin
+/// bands at all. The frame is now painted by the same sheet renderer the live
+/// canvas uses, so the margins must be there.
+#[test]
+fn gui_movie_paints_margin_shading() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = movie_file("margins", "SET $1:A1 1\n");
+    let dir = std::env::temp_dir().join(format!("corro-movie-margins-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::env::set_var("CORRO_MOVIE_FRAMES", &dir);
+
+    let mut app = corro::gui::App::new_with_paths(vec![path.clone()]);
+    app.run_movie(fast()).expect("capture run");
+
+    let mut frames: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "ppm"))
+        .collect();
+    frames.sort();
+    let bytes = std::fs::read(frames.last().unwrap()).unwrap();
+    let (w, h, pixels) = parse_ppm(&bytes);
+
+    // The margin band is a flat 0.75 grey (rgb 191); body cells are brighter
+    // (white, or the cursor/selection fill). Sample a row just below a
+    // horizontal gridline: a scan landing exactly on a gridline is uniformly
+    // the line colour and distinguishes nothing.
+    let mut margin_px = 0usize;
+    let mut body_px = 0usize;
+    for y in [121usize, 122, 123] {
+        for x in 0..w {
+            let i = (y * w + x) * 3;
+            let (r, g, b) = (pixels[i], pixels[i + 1], pixels[i + 2]);
+            if (185..=196).contains(&r) && r == g && g == b {
+                margin_px += 1;
+            } else if r >= 210 && g >= 210 && b >= 210 {
+                body_px += 1;
+            }
+        }
+    }
+    assert!(
+        margin_px > w,
+        "expected shaded margin bands (rgb 191), found {margin_px} such pixels"
+    );
+    // ~200px of the row is body (white cells + the 240 background); the rest
+    // of the row is the shaded margin, so require a substantial share of both
+    // without pinning exact pixel counts.
+    assert!(
+        body_px > 100,
+        "expected brighter body cells alongside the margins, found {body_px}"
+    );
+
+    std::env::remove_var("CORRO_MOVIE_FRAMES");
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_file(path);
+}
+
 /// Parse a binary PPM (P6) into `(width, height, rgb bytes)`.
 fn parse_ppm(bytes: &[u8]) -> (usize, usize, Vec<u8>) {
     assert_eq!(&bytes[..2], b"P6", "expected a binary PPM");

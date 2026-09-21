@@ -92,13 +92,13 @@ fn log_key_action(keyval: u32, action: &str, detail: &str) {
 // Constants
 // ---------------------------------------------------------------------------
 
-const FONT_SIZE: f64 = 12.0;
-const ROW_H: f64 = 20.0;
-const HEADER_H: f64 = 24.0;
-const ROW_LABEL_W: f64 = 50.0;
+pub(crate) const FONT_SIZE: f64 = 12.0;
+pub(crate) const ROW_H: f64 = 20.0;
+pub(crate) const HEADER_H: f64 = 24.0;
+pub(crate) const ROW_LABEL_W: f64 = 50.0;
 const MAX_RENDER_ROWS: usize = 500;
 const MAX_RENDER_COLS: usize = 50;
-const CHAR_W: f64 = 7.2;
+pub(crate) const CHAR_W: f64 = 7.2;
 
 // ---------------------------------------------------------------------------
 // Mode
@@ -929,128 +929,215 @@ fn handle_tab_click(x: f64, state_rc: &Rc<GuiState>) {
 }
 
 fn render_grid(dc: &mut dyn DrawContext, state: &GuiState, w: i32, h: i32) {
-    dc.clear(0.94, 0.94, 0.94, 1.0);
-    dc.clip(0.0, 0.0, w as f64, h as f64);
-
     let app = state.app_ref();
-    let hr = HEADER_ROWS;
-    let lm = MARGIN_COLS;
     let cursor_row = state.last_row.get();
     let cursor_col = state.last_col.get();
-
     let display_rows: Vec<usize> = displayed_rows(state);
     let col_ixs: Vec<usize> = displayed_cols(state);
-    let mr = app.core.workbook.active_sheet().grid.main_rows();
     let mc = app.core.workbook.active_sheet().grid.main_cols();
-
-    let col_widths: HashMap<usize, usize> = col_ixs.iter()
+    let col_widths: HashMap<usize, usize> = col_ixs
+        .iter()
         .map(|&c| (c, display_col_width(&app.core.workbook.active_sheet(), c, mc)))
         .collect();
-
-    // Row headers (padlock hit rects refresh every frame for click mapping).
     let pinned_rows: std::collections::BTreeSet<usize> =
         state.pinned_rows.borrow().iter().copied().collect();
     let pinned_cols: std::collections::BTreeSet<usize> =
         state.pinned_cols.borrow().iter().copied().collect();
+    let vp = viewport_from_parts(&display_rows, &col_ixs, &col_widths, app);
+
+    dc.clear(0.94, 0.94, 0.94, 1.0);
     let mut padlocks: Vec<GutterPadlock> = Vec::new();
-    // Header coverage mirrors the body's selection rectangle (anchor↔cursor
-    // on both axes — the GUI has no Rows/Cols-only modes). None while
-    // navigating plainly, so unselected chrome renders exactly as before.
+    render_grid_body_inner(
+        dc,
+        app,
+        &vp,
+        &col_widths,
+        cursor_row,
+        cursor_col,
+        w,
+        h,
+        state.editing.get(),
+        &state.edit_buf.borrow(),
+        true,
+        &pinned_rows,
+        &pinned_cols,
+        &mut padlocks,
+    );
+    *state.padlocks.borrow_mut() = padlocks;
+}
+
+/// Assemble a full [`Viewport`] from display rows/columns the caller already
+/// resolved. Keeps the row labels, column layout and row-aggregate derivation
+/// in one place for callers that compute their own visible sets (the live
+/// canvas state and the movie painter).
+fn viewport_from_parts(
+    display_rows: &[usize],
+    col_ixs: &[usize],
+    col_widths: &HashMap<usize, usize>,
+    app: &super::App,
+) -> crate::gui::viewport::Viewport {
+    let g = &app.core.workbook.active_sheet().grid;
+    let mr = g.main_rows();
+    let mc = g.main_cols();
+    let row_labels: Vec<(u32, String)> = display_rows
+        .iter()
+        .enumerate()
+        .map(|(idx, &r)| (idx as u32, crate::addr::ui_row_label(r, mr)))
+        .collect();
+    let column_layout: Vec<(u32, u32, String)> = col_ixs
+        .iter()
+        .map(|&c| {
+            let w = *col_widths.get(&c).unwrap_or(&1);
+            (c as u32, w as u32, crate::addr::ui_column_fragment(c, mc))
+        })
+        .collect();
+    let row_agg_func = compute::compute_row_agg_func(g, display_rows, HEADER_ROWS, mr);
+    crate::gui::viewport::Viewport {
+        display_rows: display_rows.to_vec(),
+        col_ixs: col_ixs.to_vec(),
+        col_widths: col_widths.clone(),
+        row_labels,
+        column_layout,
+        row_agg_func,
+        mr,
+        mc,
+        data_width: col_widths.values().copied().sum(),
+    }
+}
+
+/// Paint a complete sheet body (gutter, column headers, cells, selection) for
+/// an already-computed [`Viewport`].
+///
+/// This is the single sheet renderer: the interactive canvas calls it with its
+/// live state, and the `--movie` painter calls it with a frame's viewport, so a
+/// recorded frame is pixel-identical to the window (margin shading included)
+/// instead of being a second, drifting implementation.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_grid_body(
+    dc: &mut dyn DrawContext,
+    app: &super::App,
+    vp: &crate::gui::viewport::Viewport,
+    col_widths: &HashMap<usize, usize>,
+    cursor_row: usize,
+    cursor_col: usize,
+    w: i32,
+    h: i32,
+) {
+    let mut padlocks: Vec<GutterPadlock> = Vec::new();
+    let (pinned_rows, pinned_cols) = (Default::default(), Default::default());
+    render_grid_body_inner(
+        dc,
+        app,
+        vp,
+        col_widths,
+        cursor_row,
+        cursor_col,
+        w,
+        h,
+        false,
+        "",
+        true,
+        &pinned_rows,
+        &pinned_cols,
+        &mut padlocks,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_grid_body_inner(
+    dc: &mut dyn DrawContext,
+    app: &super::App,
+    vp: &crate::gui::viewport::Viewport,
+    col_widths: &HashMap<usize, usize>,
+    cursor_row: usize,
+    cursor_col: usize,
+    w: i32,
+    h: i32,
+    is_editing: bool,
+    edit_buf: &str,
+    publish_pins: bool,
+    pinned_rows: &std::collections::BTreeSet<usize>,
+    pinned_cols: &std::collections::BTreeSet<usize>,
+    padlocks: &mut Vec<GutterPadlock>,
+) {
+    let display_rows = &vp.display_rows;
+    let col_ixs = &vp.col_ixs;
+    let hr = HEADER_ROWS;
+    let lm = MARGIN_COLS;
+    let mr = vp.mr;
+    let mc = vp.mc;
+    dc.clip(0.0, 0.0, w as f64, h as f64);
+
+    // Header coverage mirrors the body's selection rectangle (anchor↔cursor on
+    // both axes — the GUI has no Rows/Cols-only modes). None while navigating
+    // plainly, so unselected chrome renders exactly as before.
     let cover: Option<((usize, usize), (usize, usize))> = app.core.anchor.map(|a| {
         let (r0, r1) = (a.row.min(cursor_row), a.row.max(cursor_row));
         let (c0, c1) = (a.col.min(cursor_col), a.col.max(cursor_col));
         ((r0, r1), (c0, c1))
     });
-    paint_row_headers(dc, &display_rows, mr, &pinned_rows, &mut padlocks, cover.map(|(r, _)| r));
+    paint_row_headers(dc, display_rows, mr, pinned_rows, padlocks, cover.map(|(r, _)| r));
+    paint_col_headers(dc, col_ixs, col_widths, mc, pinned_cols, padlocks, cover.map(|(_, c)| c));
 
-    // Selection rectangle (anchor..cursor, rows AND columns). None while
-    // navigating plainly — only explicit selections highlight.
-
-    // Column headers
-    paint_col_headers(dc, &col_ixs, &col_widths, mc, &pinned_cols, &mut padlocks, cover.map(|(_, c)| c));
-    *state.padlocks.borrow_mut() = padlocks;
-
-    let row_agg_func = compute::compute_row_agg_func(
+    // Fill cells via the shared render pipeline.
+    let mut sink = GuiCanvasSink::new();
+    render::fill_cells(
+        &mut sink,
+        display_rows,
+        col_ixs,
+        col_widths,
         &app.core.workbook.active_sheet().grid,
-        &display_rows, hr, mr,
+        hr,
+        mr,
+        mc,
+        lm,
+        vp.data_width(),
+        cursor_row,
+        cursor_col,
+        &vp.row_agg_func,
+    );
+    render_to(
+        &sink,
+        dc,
+        col_ixs,
+        col_widths,
+        display_rows,
+        hr,
+        mr,
+        mc,
+        lm,
+        cursor_row,
+        cursor_col,
+        is_editing,
+        edit_buf,
+        app.core.anchor.map(|a| (a.row, a.col)),
     );
 
-    // Fill cells via the shared render pipeline
-    let sink_snapshot: HashMap<(u32, u32), String>;
-    {
-        let mut sink = GuiCanvasSink::new();
-        render::fill_cells(
-            &mut sink, &display_rows, &col_ixs, &col_widths,
-            &app.core.workbook.active_sheet().grid,
-            hr, mr, mc,
-            lm, state.data_cols.get(),
-            cursor_row, cursor_col,
-            &row_agg_func,
-        );
-        sink_snapshot = sink.cells.borrow().clone();
-        render_to(
-            &sink, dc, &col_ixs, &col_widths, &display_rows,
-            hr, mr, mc, lm,
-            cursor_row, cursor_col,
-            state.editing.get(),
-            &state.edit_buf.borrow(),
-            app.core.anchor.map(|a| (a.row, a.col)),
-        );
-    }
-
-    // Status line at bottom
+    // Status line at the bottom of the body.
     if h as f64 > HEADER_H + 20.0 {
         dc.fill_rect(0.0, h as f64 - 20.0, w as f64, 20.0, 0.9, 0.9, 0.9, 1.0);
     }
 
     // Diagnostic overlay (cell/sink/cursor/key state) painted over the grid.
-    // Opt-in via CORRO_DEBUG_OVERLAY (any value): off by default so normal
-    // runs render a clean sheet. Previously this always drew, obscuring cells
-    // and breaking pixel-level assertions about grid content.
-    if std::env::var_os("CORRO_DEBUG_OVERLAY").is_some() {
-        let first_row = hr;
-        let first_col = lm;
-        let main_row = first_row.saturating_sub(hr);
-        let main_col = first_col.saturating_sub(lm);
-        let addr = crate::grid::CellAddr::Main { row: main_row as u32, col: main_col as u32 };
+    // Opt-in via CORRO_DEBUG_OVERLAY (any value): off by default so normal runs
+    // render a clean sheet.
+    if std::env::var_os("CORRO_DEBUG_OVERLAY").is_some() && publish_pins {
+        let addr = crate::grid::CellAddr::Main { row: 0, col: 0 };
         let cell_val = app.core.workbook.active_sheet().grid.get(&addr).unwrap_or_default();
-        let is_editing = if state.editing.get() { "EDIT" } else { "NORM" };
-        let eb = state.edit_buf.borrow().clone();
-        let buf_display = if eb.is_empty() { "(empty)" } else { &eb };
-        let sink_key_col = MARGIN_COLS as u32;
-        let sink_first = sink_snapshot.get(&(0u32, sink_key_col)).cloned().unwrap_or_default();
-        let cur = (state.last_row.get(), state.last_col.get());
-        let lk = state.last_key.get();
-        let kc = state.key_counter.get();
-        dc.draw_text(100.0, h as f64 - 140.0, &format!("Grid(0,0)='{cell_val}' Sink(0,{sink_key_col})='{sink_first}' Cur=({},{})", cur.0, cur.1), "monospace", 12.0, 0.0, 0.5, 0.0, 1.0);
-        dc.draw_text(100.0, h as f64 - 120.0, &format!("lastKey=0x{lk:04x} cnt={kc}", ), "monospace", 12.0, 1.0, 0.0, 0.0, 1.0);
-        dc.draw_text(100.0, h as f64 - 100.0, &format!("Mode:{is_editing} Buf:'{buf_display}'"), "monospace", 14.0, 0.5, 0.0, 0.5, 1.0);
+        let mode = if is_editing { "EDIT" } else { "NORM" };
+        dc.draw_text(
+            100.0,
+            h as f64 - 100.0,
+            &format!("Cell A1='{cell_val}' Mode:{mode} Buf:'{edit_buf}'"),
+            "monospace",
+            12.0,
+            0.5,
+            0.0,
+            0.5,
+            1.0,
+        );
     }
 }
-
-fn sheet_rec_col_width(sheet: &crate::ops::SheetState, col: usize) -> usize {
-    sheet.grid.col_width(col).max(1)
-}
-
-/// On-screen width of a column in characters: the recorded width plus one
-/// spare character when the column header carries a padlock, so the icon
-/// fits inside its own column instead of overlapping the neighbor's
-/// gridline. Single source of truth for every width accumulation (render
-/// headers, render cells, click mapping, viewport sizing) — they must all
-/// agree or columns misalign.
-fn display_col_width(sheet: &crate::ops::SheetState, c: usize, mc: usize) -> usize {
-    sheet_rec_col_width(sheet, c)
-        + usize::from(wants_padlock(&crate::addr::ui_column_fragment(c, mc)))
-}
-
-// ---------------------------------------------------------------------------
-// Keyboard handling
-// ---------------------------------------------------------------------------
-
-/// Handle a key while the interactive extrapolate modal is active. Mirrors the
-/// ratatui reference `Mode::Extrapolate`: arrows/navigation extend the selection
-/// (the anchor stays put), Enter commits, Esc cancels. The modal state lives in
-/// `extrapolate.rs` and is shared by all GUI backends.
 fn handle_extrapolate_key(key: u32, state: &GuiState) -> bool {
     match key {
         ESCAPE => {
@@ -4534,6 +4621,22 @@ mod tab_tests {
         assert_eq!((hits[2].x0, hits[2].x1), (74.0, 104.0));
     }
 }
+
+fn sheet_rec_col_width(sheet: &crate::ops::SheetState, col: usize) -> usize {
+    sheet.grid.col_width(col).max(1)
+}
+
+/// On-screen width of a column in characters: the recorded width plus one
+/// spare character when the column header carries a padlock, so the icon fits
+/// inside its own column instead of overlapping the neighbor's gridline.
+/// Single source of truth for every width accumulation (render headers, render
+/// cells, click mapping, viewport sizing) — they must all agree or columns
+/// misalign.
+fn display_col_width(sheet: &crate::ops::SheetState, c: usize, mc: usize) -> usize {
+    sheet_rec_col_width(sheet, c)
+        + usize::from(wants_padlock(&crate::addr::ui_column_fragment(c, mc)))
+}
+
 
 #[cfg(test)]
 mod brightness_tests {
