@@ -44,12 +44,19 @@ FEATURES = [
         "Subtotals and summary labels",
         "One marker in the left margin creates a subtotal or grand total column. "
         "corro never double counts: the grand total sums the subtotals, not the raw data.",
+        None,
     ),
     (
         "docs/tests/main.corro",
         "Sheets, moves and formats",
         "A workbook is a log: sheets are created, copied and activated, rows are moved, "
         "and column formats are applied - each replayed as the interaction that produced it.",
+        # This fixture is a feature tour that deliberately includes broken
+        # formulas, so cells showing #NAME/#PARSE/#CIRC are real evaluator
+        # output. Say so on the card instead of letting a viewer read them as
+        # rendering bugs. `scripts/movie_errors.py` lists them from the log.
+        "Note: this test workbook intentionally contains broken formulas, so a few "
+        "cells show #NAME / #PARSE / #CIRC.",
     ),
 ]
 
@@ -63,8 +70,8 @@ def font(name: str, size: int) -> ImageFont.FreeTypeFont:
     return ImageFont.load_default()
 
 
-def card(title: str, desc: str, out: Path) -> None:
-    """Render a title/description card."""
+def card(title: str, desc: str, out: Path, note: str | None = None) -> None:
+    """Render a title/description card, optionally with a highlighted note."""
     im = Image.new("RGB", (WIDTH, HEIGHT), (18, 22, 30))
     d = ImageDraw.Draw(im)
     d.text((60, 210), "corro", font=font("DejaVuSansMono-Bold.ttf", 96), fill=(120, 190, 255))
@@ -83,6 +90,20 @@ def card(title: str, desc: str, out: Path) -> None:
     for ln in lines:
         d.text((60, y), ln, font=body, fill=(190, 200, 215))
         y += 32
+    if note:
+        y += 18
+        nlines, cur = [], ""
+        for word in note.split():
+            if len(cur) + len(word) + 1 > 68:
+                nlines.append(cur)
+                cur = word
+            else:
+                cur = (cur + " " + word).strip()
+        if cur:
+            nlines.append(cur)
+        for ln in nlines:
+            d.text((60, y), ln, font=body, fill=(230, 180, 110))
+            y += 30
     d.text(
         (60, 715),
         "corro --gui --movie  ·  recorded from the running window",
@@ -139,9 +160,9 @@ def main() -> int:
         )
         hold(Image.open(c), args.title_secs)
 
-        for path, title, desc in FEATURES:
+        for path, title, desc, note in FEATURES:
             c = work / (Path(path).stem + ".png")
-            card(title, desc, c)
+            card(title, desc, c, note)
             hold(Image.open(c), args.title_secs)
 
             # Replay through the real window and take the frames it produced.

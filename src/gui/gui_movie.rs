@@ -91,6 +91,8 @@ pub fn run_gui_movie(
     // previous version of this file reimplemented the sheet and did drift
     // (missing margin shading, missing text, wrong column sizing).
     options.publish_to_env();
+    // A replay reads the log; it must not append to it. See `detach_source`.
+    let _bound = GuiMovie::detach_source(app);
     eprintln!(
         "[corro] movie: replaying {} steps through the GUI window",
         movie.len()

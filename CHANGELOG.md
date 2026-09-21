@@ -6,16 +6,23 @@
   movie reads identically whichever UI replays it; only the frame-painting half
   is backend-specific (`src/gui/gui_movie.rs` for the widget backends,
   `run_pancurses_movie` for pancurses).
-- **`--movie-frames DIR`** replays a movie through the GUI renderer and writes
-  one lossless image per frame, with no display server involved. Together with
-  the new `scripts/gui_movie.py` (which drives the run and encodes with ffmpeg)
-  this makes the demo video reproducible from a checkout; a recording is
-  checked in at `dist/corro-gui-movie.mp4`.
+- `scripts/gui_movie.py` records a movie from the running window under a
+  throwaway X server and encodes it with ffmpeg, so the demo video is
+  reproducible from a checkout; a recording is checked in at
+  `dist/corro-gui-movie.mp4`. `scripts/demo_movie.py` builds the shipped demo
+  from title cards plus those replays.
 - Movie pacing flags (`--movie-typing-cps`, `--movie-confirm-ms`,
   `--movie-menu-hold-ms`) now parse on the CLI for every backend rather than
   only being honored by the ratatui path.
+- **A movie replay no longer writes to the log it is reading.** Every GUI
+  commit path appends to `app.core.path`, and the replay left the movie's own
+  file bound, so each recording appended its steps to the fixture — the demo
+  workbooks grew on every run. The replay now detaches the file (as the TUI
+  replayer already did) while keeping it as the display source.
 - `scripts/demo_movie.py` builds the shipped demo video from title cards plus a
   replay of each featured workbook, recorded from the running window. The
+  `main.corro` card notes that its `#NAME`/`#PARSE`/`#CIRC` cells are deliberate
+  broken-formula fixtures rather than rendering faults. The
   typing speed is a flag (`--cps`), and the demo uses a deliberately readable
   6.5 characters/second (a quarter of the old 26) so the typed values can
   actually be followed in the recording.

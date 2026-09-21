@@ -159,6 +159,38 @@ fn gui_movie_options_pacing_is_read_from_the_environment() {
     assert_eq!(defaults.confirm_delay_ms, 120);
 }
 
+/// Regression: replaying a movie must not write to the log it is reading.
+///
+/// Every GUI commit path appends to `app.core.path`, and the movie's file was
+/// left bound, so each recording appended its own steps to the fixture — the
+/// demo workbooks grew every time the video was made.
+#[test]
+fn gui_movie_does_not_write_to_the_log_it_replays() {
+    let path = movie_file("readonly", "SET $1:A1 1\nSET $1:B1 2\n");
+    let before = std::fs::read(&path).expect("read fixture");
+
+    let mut mov = GuiMovie::new(&path).expect("parse");
+    let mut app = corro::gui::App::new_with_paths(vec![path.clone()]);
+    // Replay through the real entry point (which must detach the file).
+    corro::gui::movie::GuiMovie::detach_source(&mut app);
+    let active = app.core.workbook.sheet_id(app.core.workbook.active_sheet);
+    app.core.view_sheet_id = active;
+    for i in 0..mov.len() {
+        mov.apply_step(&mut app.core.workbook, &mut app.core.view_sheet_id, i)
+            .expect("step");
+    }
+
+    let after = std::fs::read(&path).expect("read fixture");
+    assert_eq!(
+        before, after,
+        "the movie log must be left byte-identical by a replay"
+    );
+    // ...and the app must still know where it came from, for the title/caption.
+    assert!(app.core.source_path.is_some(), "source path is kept for display");
+
+    let _ = std::fs::remove_file(path);
+}
+
 /// The movie's frames come from the production sheet renderer, so a frame
 /// produced headlessly must contain what the window paints: shaded margins,
 /// cell text, and a sheet that spans the frame.

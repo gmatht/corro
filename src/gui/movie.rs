@@ -171,6 +171,24 @@ impl GuiMovie {
             .to_string()
     }
 
+    /// Detach `app` from its on-disk file for the duration of the replay.
+    ///
+    /// A movie is a *reading* of a log, so replaying must never write back to
+    /// it. Every GUI commit path appends to `app.core.path`, so leaving the
+    /// movie's own file bound made a recording append its steps to the fixture
+    /// it was replaying (the file grew on every run). The TUI replayer detaches
+    /// the same way (`ui::App::reset_workbook_for_movie` sets `path = None` and
+    /// keeps the file as `source_path`); do that here too, and hand the caller
+    /// the real path back so it can report the title.
+    pub fn detach_source(app: &mut crate::gui::App) -> Option<std::path::PathBuf> {
+        let bound = app.core.path.take();
+        let source = bound
+            .clone()
+            .or_else(|| app.core.source_path.clone());
+        app.core.source_path = source;
+        bound
+    }
+
     /// Reset to a freshly-parsed state (a rewind for a second pass).
     pub fn rewind(&mut self) {
         self.cursor = None;
