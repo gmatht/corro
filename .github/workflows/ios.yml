@@ -113,25 +113,37 @@ jobs:
       - name: Install and launch corro
         run: |
           xcrun simctl install "$SIM_UDID" /tmp/corro_ios_build/iphonesimulator/corro.app
-          # --console-pty streams the app's stdout/stderr (including NSLog and
-          # any Rust panic) into this step's log, which is what makes a launch
-          # failure diagnosable: the previous run only showed that the process
-          # was gone, with no reason why. The `|| true` keeps the step alive so
-          # the capture is still printed when the app dies immediately.
-          xcrun simctl launch --console-pty "$SIM_UDID" com.corro.corro > /tmp/corro-console.log 2>&1 || true
+          # Launch in the background so this step can report the PID and then
+          # let the first frame land. `--console-pty` would hold the terminal
+          # open for the app's lifetime, so stdout/stderr are captured via the
+          # simulator's log instead (see the "Dump the Rust log lines" step,
+          # which greps for the rswidgets/corro tags).
+          xcrun simctl launch "$SIM_UDID" com.corro.corro | tee /tmp/corro-launch.txt
           sleep 20
-          echo "--- console output ---"
-          tail -40 /tmp/corro-console.log || true
+          echo "--- is the app process alive? ---"
+          # `simctl spawn <udid> launchctl list` proved unreliable for app
+          # processes (it lists the simulator's own jobs). pgrep against the
+          # executable name is the direct check.
+          if xcrun simctl spawn "$SIM_UDID" pgrep -fl corro; then
+            echo "ALIVE"
+          else
+            echo "NOT RUNNING (pgrep found nothing)"
+          fi
 
       - name: Screenshot the first frame
         run: xcrun simctl io "$SIM_UDID" screenshot ios-first-frame.png
 
       - name: Check the app is still alive (did not crash on launch)
         run: |
-          if xcrun simctl spawn "$SIM_UDID" launchctl list | grep -qi corro; then
+          # pgrep on the executable name: `simctl spawn launchctl list` lists
+          # the simulator's own jobs and did not reliably show the app, which
+          # made an earlier run report a crash that may not have happened.
+          if xcrun simctl spawn "$SIM_UDID" pgrep -fl corro >/dev/null 2>&1; then
             echo "corro is running"
             exit 0
           fi
+          echo "--- processes containing 'corro' ---"
+          xcrun simctl spawn "$SIM_UDID" ps -ax 2>/dev/null | grep -i corro || echo "(none)"
           echo "::error::corro is not running after launch"
           # Diagnose rather than just fail: crash reports first (they name the
           # signal and the faulting thread), then the console capture.
