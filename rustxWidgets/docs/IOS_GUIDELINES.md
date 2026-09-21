@@ -218,7 +218,7 @@ that — a `.a`, a `.dylib`, an app — needs a linker and therefore an SDK.
 Debug in order, mirroring the Android section: shim present → dispatch fired →
 pixels.
 
-* **System log.** `log_ios` writes to `NSLog`, i.e. the device console:
+* **System log.** `log_apple`/`log_ios` writes to the process's **stderr** (tagged `[rswidgets]`), which the simulator console already captures:
   `xcrun simctl spawn booted log stream --predicate 'eventMessage CONTAINS
   "rswidgets"'` (or Console.app). Keep permanent call sites to lifecycle
   events; per-frame logging is diagnosis-only and must be removed before

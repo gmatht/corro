@@ -472,33 +472,31 @@ pub fn log_apple(msg: &str) {
     if !is_initialized() {
         return;
     }
-    // The message crosses into Foundation as an `NSString`, and the format is a
-    // literal. Both details are load-bearing, and both cost a CI run to learn:
+    // Logging goes to stderr, NOT through NSLog's variadic interface.
     //
-    //  1. A variadic call whose format is a runtime `char*` (`NSLog(fmt, msg)`)
-    //     SEGFAULTS on arm64 macOS/Simulator. Reproduced in isolation on the
-    //     runner with ten lines of C; a literal format — `NSLog(@"%@", obj)` or
-    //     `NSLog(@"literal %s", ptr)` — works.
-    //  2. The first version additionally passed
-    //     `concat!("%s", "\0").as_bytes()`, a temporary dropped at the end of
-    //     the statement, so the variadic call got a dangling pointer. That
-    //     crashed the app on its very first log line with EXC_BAD_ACCESS
-    //     (SIGSEGV, "possible pointer authentication failure") inside
-    //     objc_msgSend / _CFLogvEx3 / _NSLogv / NSLog, called from
-    //     ios_backend::log_ios <- corro_ios_root_ready.
+    // Three attempts died here, each a different way:
+    //   1. a pointer passed as the FORMAT (`NSLog(fmt, msg)` with a runtime
+    //      char*) segfaults on arm64 macOS/Simulator;
+    //   2. a format string built from `concat!(...).as_bytes()` was a temporary
+    //      dropped before the call, so the variadic received a dangling
+    //      pointer;
+    //   3. even with a literal format and an NSString argument, the variadic
+    //      call still crashed inside objc_msgSend/_CFLogvEx3 — Rust's variadic
+    //      FFI does not apply the argument marshalling Clang does for `%@`, so
+    //      hand-rolled variadic Foundation calls are simply not safe from Rust.
     //
-    // So: an NSString argument to a literal `%@` format. Nothing dangles, there
-    // is no runtime format string, and a literal '%' in the message cannot
-    // become a format specifier.
-    let s = nsstring(msg);
-    if s.is_null() {
-        return;
-    }
+    // stderr is what the simulator's console already captures (and what
+    // `simctl launch --console-pty` shows), so nothing is lost, and the line is
+    // tagged with the same prefixes the docs tell people to grep for.
+    let mut line = String::with_capacity(msg.len() + 10);
+    line.push_str("[rswidgets] ");
+    line.push_str(msg);
+    line.push('\n');
     unsafe {
         unsafe extern "C" {
-            fn NSLog(format: *const std::os::raw::c_char, ...);
+            fn write(fd: i32, buf: *const std::os::raw::c_void, count: usize) -> isize;
         }
-        NSLog(b"%@\0".as_ptr() as *const std::os::raw::c_char, s);
+        write(2, line.as_ptr() as *const std::os::raw::c_void, line.len());
     }
 }
 

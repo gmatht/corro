@@ -38,6 +38,16 @@ if isinstance(faulting, int) and faulting < len(threads):
     print("--- faulting thread (first frames) ---")
     for fr in (threads[faulting].get("frames") or [])[:16]:
         print("   ", fr.get("symbol") or fr.get("imageOffset"))
+else:
+    print("(faultingThread not usable:", faulting, "of", len(threads), "threads)")
+# Belt and braces: the raw head of the report, so the frames are visible
+# whatever shape the payload takes (the structured extraction came back empty
+# once, which is worse than useless).
+print("--- raw report head ---")
+for line in open(sys.argv[1]).read().splitlines()[:1]:
+    pass
+for line in open(sys.argv[1]).read().splitlines()[1:120]:
+    print("   ", line[:200])
 PY
 fi
 

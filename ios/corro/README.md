@@ -80,7 +80,7 @@ compiling a single line of iOS-specific code.
 Logs
 ----
 
-Rust-side messages go to `NSLog`, i.e. the device/simulator console:
+Rust-side messages go to stderr, tagged `[rswidgets]`/`[corro]`, which the simulator console captures:
 
     xcrun simctl spawn booted log stream --predicate 'eventMessage CONTAINS "rswidgets"'
 
