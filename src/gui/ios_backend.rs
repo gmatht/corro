@@ -132,6 +132,11 @@ pub fn ios_main(
     root: *mut std::os::raw::c_void,
     view_controller: *mut std::os::raw::c_void,
 ) -> Result<(), String> {
+    // Step markers: a panic inside an extern "C" frame aborts the process with
+    // no unwinding and no symbolised frames (the release build strips them), so
+    // the only reliable way to locate a failure here is to say where we got to.
+    // Cheap, and the alternative is a CI round trip per guess.
+    log_ios("ios_main: init_with_root");
     // SAFETY: the host guarantees both pointers are live Objective-C objects
     // (a UIView and its UIViewController) that outlive the app — the same
     // contract Android's `nativeInit(activity, rootLayout)` has.
@@ -139,6 +144,14 @@ pub fn ios_main(
         rswidgets::backends::ios::init_with_root(root, view_controller)
             .map_err(|e| format!("corro backend init failed: {e}"))?;
     }
-    run_ios_default().map_err(|e| format!("corro run failed: {e}"))?;
+    log_ios("ios_main: building the App");
+    let app = super::App::new_with_paths(Vec::<PathBuf>::new());
+    log_ios("ios_main: load_initial");
+    let app: &'static mut super::App = Box::leak(Box::new(app));
+    app.set_backend(super::Backend::Gui);
+    app.load_initial().map_err(|e| format!("corro load failed: {e}"))?;
+    log_ios("ios_main: entering run_gui");
+    run_ios(app).map_err(|e| format!("corro run failed: {e}"))?;
+    log_ios("ios_main: run_gui returned");
     Ok(())
 }
