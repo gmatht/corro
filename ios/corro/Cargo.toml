@@ -20,6 +20,14 @@ rswidgets = { path = "../../rustxWidgets/rswidgets", default-features = false, f
 
 [profile.release]
 opt-level = "z"
-lto = "fat"
 codegen-units = 1
-strip = "symbols"
+# `strip = "symbols"` and `lto = "fat"` make release builds small and fast but
+# erase every frame name, so a Rust panic in the app prints a backtrace where
+# all twelve frames read `_corro_ios_root_ready` (found the hard way, chasing a
+# launch abort). Debug information is kept so the simulator's backtrace names
+# the actual functions; the binary is not shipped, and the size difference is
+# irrelevant next to being able to diagnose a crash.
+debug = 1
+# lto = "fat" deliberately off for the same reason: it inlines across crates,
+# which collapses the very frames one needs to see.
+lto = false
