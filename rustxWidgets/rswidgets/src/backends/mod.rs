@@ -63,6 +63,13 @@ pub mod android;
 #[cfg(all(target_os = "android", not(feature = "zork")))]
 pub use self::android::init_backend as init;
 
+// Shared Apple runtime (ObjC runtime + Foundation + registries), compiled on
+// every Apple platform (iOS, macOS). No widget class is named here; the
+// UIKit (`backends::ios`) and AppKit (`backends_macos_adapter`) layers build
+// on top. See `backends/apple.rs`.
+#[cfg(all(target_vendor = "apple", not(feature = "zork")))]
+pub mod apple;
+
 // iOS: same shape as android (a backend whose init does not enter a loop —
 // the host's UIApplicationMain owns the run loop), same priority position:
 // a platform-native backend wins over pancurses/ratatui.
@@ -70,6 +77,14 @@ pub use self::android::init_backend as init;
 pub mod ios;
 #[cfg(all(target_os = "ios", not(feature = "zork")))]
 pub use self::ios::init_backend as init;
+
+// macOS: the AppKit sibling. Same host-owns-the-loop shape as iOS — the
+// NSApplication run loop drives callbacks — so `init` is re-exported here
+// too, and a native backend wins over pancurses/ratatui exactly as on iOS.
+#[cfg(all(target_os = "macos", not(feature = "zork")))]
+pub mod macos;
+#[cfg(all(target_os = "macos", not(feature = "zork")))]
+pub use self::macos::init_backend as init;
 
 #[cfg(feature = "pancurses")]
 pub mod pancurses;

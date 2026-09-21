@@ -52,6 +52,11 @@ pub mod backends_android_adapter;
 /// `rustxWidgets/docs/IOS_GUIDELINES.md` and `ios/corro`.
 #[cfg(all(target_os = "ios", not(feature = "zork")))]
 pub mod backends_ios_adapter;
+/// macOS backend adapter (AppKit over the *same* Objective-C runtime layer the
+/// iOS adapter uses — see `backends/apple.rs`) — see
+/// `rustxWidgets/docs/MACOS_GUIDELINES.md`.
+#[cfg(all(target_os = "macos", not(feature = "zork")))]
+pub mod backends_macos_adapter;
 /// Android resource generation for downstream app crates: a `build.rs` can
 /// call [`android_generator::run`] to materialise a Material 3 theme, the
 /// palette it references, an adaptive launcher icon and a manifest when the

@@ -86,6 +86,13 @@ headless = []
 # builds against UIKit and nothing else.
 ios = []
 
+# macOS: selects the AppKit backend. Same shape as `ios` (the backend is
+# cfg-gated on `target_os = "macos"`; the feature exists for symmetry and for
+# host crates that name their backend explicitly). The AppKit adapter builds on
+# the *shared* Apple runtime module (`backends/apple.rs`), which the `ios`
+# feature also uses — no new dependencies either way.
+macos = []
+
 [dev-dependencies]
 proptest = "1.6"
 serde_json = "1.0"
