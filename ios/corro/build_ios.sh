@@ -162,12 +162,24 @@ if [ ! -f "$CG_TBD" ]; then
 fi
 cp "$CG_TBD" "$SHIM_DIR/libCoreGraphics.tbd"
 
+# Foundation as well. rustc's iOS spec links CoreFoundation but NOT Foundation,
+# and rswidgets' `log_ios` calls NSLog (a Foundation symbol) - which the linker
+# reports as `"_NSLog", referenced from ... ios_backend::log_ios`. Same shim
+# trick: the framework's own tbd under the name -lFoundation searches for.
+FDN_TBD="$SDKROOT/System/Library/Frameworks/Foundation.framework/Foundation.tbd"
+if [ -f "$FDN_TBD" ]; then
+  cp "$FDN_TBD" "$SHIM_DIR/libFoundation.tbd"
+else
+  echo "Foundation.tbd not found in $SDKROOT" >&2
+  exit 1
+fi
+
 IPHONEOS_DEPLOYMENT_TARGET="$IOS_DEPLOYMENT_TARGET" \
 SDKROOT="$SDKROOT" \
   cargo +nightly build --release \
     --target "$RUST_TARGET" \
     -Zbuild-std=std,panic_abort \
-    --config "build.rustflags=[\"-C\",\"link-arg=-isysroot\",\"-C\",\"link-arg=$SDKROOT\",\"-C\",\"link-arg=-L$SHIM_DIR\"]"
+    --config "build.rustflags=[\"-C\",\"link-arg=-isysroot\",\"-C\",\"link-arg=$SDKROOT\",\"-C\",\"link-arg=-L$SHIM_DIR\",\"-C\",\"link-arg=-lFoundation\"]"
 
 RLIB="$SCRIPT_DIR/target/$RUST_TARGET/release/libcorro_ios.a"
 if [ ! -f "$RLIB" ]; then
