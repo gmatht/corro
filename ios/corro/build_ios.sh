@@ -90,11 +90,34 @@ fi
 # alone would not do — this has to produce a real staticlib for the link step —
 # so an Xcode install is genuinely required from here on, unlike the host-side
 # `cargo check` in /tmp/corro_ios_check.sh.
+# SDKROOT is the load-bearing line here, and it took a CI run to find out.
+#
+# rustc's iOS target spec links system libraries by NAME (`-lobjc`,
+# `-lCoreGraphics`, `-liconv`). Those do not live in /usr/lib on macOS — they
+# are inside the SDK — so without SDKROOT clang searches the default library
+# paths, finds nothing, and dies with `ld: library 'CoreGraphics' not found`
+# after the whole Rust side has already compiled. Pointing SDKROOT at the right
+# SDK is what makes the link work; it is also what rustc asks for in its own
+# error note ("pass ... an SDK with the SDKROOT environment variable").
+SDKROOT="$(xcrun --sdk "$XCODE_SDK" --show-sdk-path)"
+if [ ! -d "$SDKROOT" ]; then
+  echo "could not resolve the $XCODE_SDK SDK (is Xcode installed?)" >&2
+  exit 1
+fi
+echo "    SDKROOT=$SDKROOT"
+
+# The deployment target goes through the target triple, not through -mios-version-min.
+#
+# Passing the flag as a link-arg does not work: rustc already emits
+# `-target arm64-apple-ios14.0.0-simulator`, and clang only warns before
+# honouring the triple, so 12.0 would be silently discarded. Setting
+# IPHONEOS_DEPLOYMENT_TARGET is what makes rustc build the triple with the
+# requested version in the first place.
 IPHONEOS_DEPLOYMENT_TARGET="$IOS_DEPLOYMENT_TARGET" \
+SDKROOT="$SDKROOT" \
   cargo +nightly build --release \
     --target "$RUST_TARGET" \
-    -Zbuild-std=std,panic_abort \
-    --config "build.rustflags=[\"-C\",\"link-arg=-mios-version-min=$IOS_DEPLOYMENT_TARGET\"]"
+    -Zbuild-std=std,panic_abort
 
 RLIB="$SCRIPT_DIR/target/$RUST_TARGET/release/libcorro_ios.a"
 if [ ! -f "$RLIB" ]; then
