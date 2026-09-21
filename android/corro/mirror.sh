@@ -49,6 +49,7 @@ sleep 4
 #
 # So measure the frame instead of guessing, and let the VNC viewer do any
 # scaling the user wants (it can zoom; feh cannot).
+#
 FRAME_W=$(python3 -c "
 import struct
 with open('$FRAME','rb') as f:
@@ -63,6 +64,27 @@ print(struct.unpack('>I', d[20:24])[0] if d[:8] == b'\x89PNG\r\n\x1a\n' else 0)
 " 2>/dev/null)
 [ "${FRAME_W:-0}" -gt 0 ] 2>/dev/null || FRAME_W=1080
 [ "${FRAME_H:-0}" -gt 0 ] 2>/dev/null || FRAME_H=2280
+# Sizing the window to the frame has its own trap: the X display then has to be
+# at least that tall, or the bottom of the sheet falls off the screen. The VNC
+# display here is often shorter than the phone (2127 vs 2280 in one session), so
+# grow the framebuffer to fit before opening the window. `xrandr --fb` resizes a
+# running Xvnc in place; the max is 32768, so this is safe to attempt and a
+# no-op on a display that is already big enough (or one without RandR).
+if command -v xrandr >/dev/null 2>&1; then
+  # `xrandr` prints "current 1280 x 800" (spaces around the x), while `xdpyinfo`
+  # prints "1280x800". Parse the xrandr form explicitly: splitting on "x" gets
+  # only the width, and leaves the height empty.
+  DISP_W=$(xrandr 2>/dev/null | awk '/current/ {for(i=1;i<=NF;i++) if($i=="current"){print $(i+1); exit}}')
+  DISP_H=$(xrandr 2>/dev/null | awk '/current/ {for(i=1;i<=NF;i++) if($i=="current"){gsub(/,/,"",$(i+3)); print $(i+3); exit}}')
+  if [ -n "${DISP_W:-}" ] && [ -n "${DISP_H:-}" ]; then
+    NEED_W=$(( FRAME_W > DISP_W ? FRAME_W : DISP_W ))
+    NEED_H=$(( FRAME_H > DISP_H ? FRAME_H : DISP_H ))
+    if [ "$NEED_W" != "$DISP_W" ] || [ "$NEED_H" != "$DISP_H" ]; then
+      echo "growing display ${DISP_W}x${DISP_H} -> ${NEED_W}x${NEED_H} for the frame" >>/tmp/live_loop.log
+      xrandr --fb "${NEED_W}x${NEED_H}" >/dev/null 2>&1 || true
+    fi
+  fi
+fi
 echo "feh window: ${FRAME_W}x${FRAME_H} (from the frame itself)" >>/tmp/live_loop.log
 setsid feh --reload 1 --geometry "${FRAME_W}x${FRAME_H}" --title "corro on Android" "$FRAME" \
   </dev/null >>/tmp/live_loop.log 2>&1 &
