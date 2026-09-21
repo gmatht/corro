@@ -17,10 +17,39 @@
 # DISPLAY (e.g. :0) would draw the window onto a display nobody is watching.
 set -uo pipefail
 
-ANDROID_SDK=${ANDROID_SDK:-$HOME/android-sdk}
-PATH="$ANDROID_SDK/platform-tools:$PATH"
+# Locate the Android SDK rather than assuming a fixed path.
+#
+# `$HOME/android-sdk` is the documented default, but it does not always exist:
+# in this container HOME is /home/ai_corro while the SDK actually lives at
+# /root/android-sdk. The script then only worked by accident, because some
+# *earlier* PATH entry happened to supply adb — the exact assumption the
+# PATH line below is meant to remove. Probe the usual locations instead, and
+# fall back to whatever adb is already on PATH.
+find_android_sdk() {
+  if [ -n "${ANDROID_SDK_DIR:-}" ] && [ -d "$ANDROID_SDK_DIR/platform-tools" ]; then
+    echo "$ANDROID_SDK_DIR"; return
+  fi
+  if [ -n "${ANDROID_HOME:-}" ] && [ -d "$ANDROID_HOME/platform-tools" ]; then
+    echo "$ANDROID_HOME"; return
+  fi
+  for d in "$HOME/android-sdk" /root/android-sdk /home/*/android-sdk "$HOME/Android/Sdk"; do
+    if [ -d "$d/platform-tools" ]; then echo "$d"; return; fi
+  done
+  echo ""
+}
+ANDROID_SDK=$(find_android_sdk)
+if [ -n "$ANDROID_SDK" ]; then
+  PATH="$ANDROID_SDK/platform-tools:$PATH"
+else
+  echo "mirror.sh: no Android SDK found; relying on adb already on PATH" >&2
+fi
 export PATH
 export DISPLAY=${CORRO_DISPLAY:-:99}
+
+if ! command -v adb >/dev/null 2>&1; then
+  echo "mirror.sh: adb not found (set ANDROID_SDK_DIR to your SDK)" >&2
+  exit 1
+fi
 
 FRAME=${CORRO_FRAME:-/tmp/live_frame.png}
 
