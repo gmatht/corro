@@ -160,24 +160,25 @@ jobs:
           echo "--- console (tail) ---"
           tail -10 /tmp/corro-console.log 2>/dev/null || true
           echo "--- is the app process alive? ---"
-          # `simctl spawn <udid> launchctl list` proved unreliable for app
-          # processes (it lists the simulator's own jobs). pgrep against the
-          # executable name is the direct check.
-          if xcrun simctl spawn "$SIM_UDID" pgrep -fl corro; then
-            echo "ALIVE"
-          else
-            echo "NOT RUNNING (pgrep found nothing)"
-          fi
+          # `ps -ax` inside the simulator DOES list app processes; `pgrep` there
+          # does not (it failed with NSPOSIXErrorDomain code=2 - pgrep is not
+          # present in the simulator's environment, which made a perfectly
+          # healthy launch look like a crash).
+          xcrun simctl spawn "$SIM_UDID" ps -ax 2>/dev/null | grep -i "[c]orro" || true
 
       - name: Screenshot the first frame
         run: xcrun simctl io "$SIM_UDID" screenshot ios-first-frame.png
 
       - name: Check the app is still alive (did not crash on launch)
         run: |
-          # pgrep on the executable name: `simctl spawn launchctl list` lists
-          # the simulator's own jobs and did not reliably show the app, which
-          # made an earlier run report a crash that may not have happened.
-          if xcrun simctl spawn "$SIM_UDID" pgrep -fl corro >/dev/null 2>&1; then
+          # `ps -ax` inside the simulator is the check that works. Two earlier
+          # probes gave FALSE NEGATIVES on a healthy launch:
+          #   * `simctl spawn launchctl list` shows the simulator's own jobs;
+          #   * `simctl spawn pgrep` fails outright - pgrep is not in the
+          #     simulator's environment (NSPOSIXErrorDomain code=2).
+          # Both reported "not running" while the app was up, which sent the
+          # investigation after a crash that had not happened.
+          if xcrun simctl spawn "$SIM_UDID" ps -ax 2>/dev/null | grep -qi "[c]orro"; then
             echo "corro is running"
             exit 0
           fi
