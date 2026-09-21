@@ -113,21 +113,31 @@ echo "    SDKROOT=$SDKROOT"
 # honouring the triple, so 12.0 would be silently discarded. Setting
 # IPHONEOS_DEPLOYMENT_TARGET is what makes rustc build the triple with the
 # requested version in the first place.
-# Two channels are needed, and the first CI attempt only used one:
+# Three separate problems, all found by running this on a real Mac (each one
+# masked the next, so the fix is cumulative):
 #
-#   * SDKROOT in the environment — rustc reads it for its own resolution;
-#   * `-isysroot` as an explicit link argument — `cc` does NOT inherit SDKROOT
-#     from the environment, and rustc emits no `-isysroot` of its own, so
-#     without this the linker still searches the default paths and reports
-#     `ld: library 'CoreGraphics' not found`.
-#
-# The deployment target goes through the triple (see above).
+#   1. rustc links system libraries by NAME and needs to know which SDK to
+#      search — SDKROOT in the environment (rustc's own error note asks for
+#      it) plus `-isysroot` as a link argument, because `cc` does not inherit
+#      SDKROOT and rustc emits no `-isysroot` itself.
+#   2. `CoreGraphics` does not exist as a plain library in the SDK. Verified
+#      on iPhoneSimulator17.5.sdk: there is a `CoreGraphics.framework` but no
+#      `usr/lib/libCoreGraphics.tbd`, so rustc's `-lCoreGraphics` cannot
+#      resolve however the SDK is passed — probe result on the runner:
+#          -lCoreGraphics          -> ld: library 'CoreGraphics' not found
+#          -framework CoreGraphics -> ok
+#      Hence the explicit `-framework CoreGraphics`. (`objc` and `iconv` DO
+#      exist as plain libs, so rustc's `-lobjc`/`-liconv` are fine.)
+#   3. The deployment target goes through the triple, not -mios-version-min:
+#      rustc already emits `-target arm64-apple-ios14.0.0-simulator` and clang
+#      merely warns before honouring the triple, silently discarding the flag.
+#      IPHONEOS_DEPLOYMENT_TARGET is what makes the triple carry the version.
 IPHONEOS_DEPLOYMENT_TARGET="$IOS_DEPLOYMENT_TARGET" \
 SDKROOT="$SDKROOT" \
   cargo +nightly build --release \
     --target "$RUST_TARGET" \
     -Zbuild-std=std,panic_abort \
-    --config "build.rustflags=[\"-C\",\"link-arg=-isysroot\",\"-C\",\"link-arg=$SDKROOT\"]"
+    --config "build.rustflags=[\"-C\",\"link-arg=-isysroot\",\"-C\",\"link-arg=$SDKROOT\",\"-C\",\"link-arg=-framework\",\"-C\",\"link-arg=CoreGraphics\"]"
 
 RLIB="$SCRIPT_DIR/target/$RUST_TARGET/release/libcorro_ios.a"
 if [ ! -f "$RLIB" ]; then
