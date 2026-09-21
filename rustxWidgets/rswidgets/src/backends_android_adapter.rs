@@ -667,13 +667,32 @@ mod android_adapter {
             if let Some(SendDrawCallback(ptr)) = map.get_mut(&self.canvas_id()) {
                 let cb: &mut dyn FnMut(&mut dyn DrawContext, i32, i32) = unsafe { &mut **ptr };
                 let mut dc = AndroidDrawContext;
-                let (w, h) = CANVAS_SIZE.lock().unwrap().get(&self.canvas_id()).copied().unwrap_or((800, 600));
+                let (w, h) = self.replay_size();
                 cb(&mut dc, w, h);
             }
         }
 
         pub fn set_size_request(&self, w: i32, h: i32) {
-            CANVAS_SIZE.lock().unwrap().insert(self.canvas_id(), (w.max(1), h.max(1)));
+            CANVAS_SIZE_REQUEST
+                .lock()
+                .unwrap()
+                .insert(self.canvas_id(), (w.max(1), h.max(1)));
+        }
+
+        /// Size to replay the draw closure at: the real laid-out size once
+        /// `onDraw` has reported one, else the requested size (Android has
+        /// not measured the view yet), else a conservative default.
+        fn replay_size(&self) -> (i32, i32) {
+            let id = self.canvas_id();
+            if let Some(&(w, h)) = CANVAS_SIZE.lock().unwrap().get(&id) {
+                return (w, h);
+            }
+            CANVAS_SIZE_REQUEST
+                .lock()
+                .unwrap()
+                .get(&id)
+                .copied()
+                .unwrap_or((800, 600))
         }
 
         pub fn set_content_size(&self, w: i32, h: i32) {
@@ -708,12 +727,12 @@ mod android_adapter {
             if let Some(SendDrawCallback(ptr)) = map.get_mut(&self.canvas_id()) {
                 let cb: &mut dyn FnMut(&mut dyn DrawContext, i32, i32) = unsafe { &mut **ptr };
                 let mut dc = AndroidDrawContext;
-                let (w, h) = CANVAS_SIZE
-                    .lock()
-                    .unwrap()
-                    .get(&self.canvas_id())
-                    .copied()
-                    .unwrap_or((fallback_w.max(1), fallback_h.max(1)));
+                // Prefer the live laid-out size; fall back to the caller's
+                // hint only when the view has never been drawn.
+                let (w, h) = match CANVAS_SIZE.lock().unwrap().get(&self.canvas_id()).copied() {
+                    Some(size) => size,
+                    None => (fallback_w.max(1), fallback_h.max(1)),
+                };
                 cb(&mut dc, w, h);
             }
         }
@@ -726,7 +745,16 @@ mod android_adapter {
 
     static KEY_CALLBACKS: Lazy<Mutex<HashMap<u64, SendKeyCallback>>> =
         Lazy::new(|| Mutex::new(HashMap::new()));
+    /// The view's *laid-out* size in pixels, learned from `View.onDraw`
+    /// (`dispatch_draw`). This is the size the draw closure must be replayed
+    /// at: Android does the layout, so Rust cannot know it any earlier.
     static CANVAS_SIZE: Lazy<Mutex<HashMap<u64, (i32, i32)>>> =
+        Lazy::new(|| Mutex::new(HashMap::new()));
+    /// The size Rust *asked* for via `set_size_request` (often a 1x1
+    /// placeholder, since Android measures children itself). Kept separate
+    /// from [`CANVAS_SIZE`] so a placeholder request can never overwrite a
+    /// real laid-out size and shrink the viewport to a single row.
+    static CANVAS_SIZE_REQUEST: Lazy<Mutex<HashMap<u64, (i32, i32)>>> =
         Lazy::new(|| Mutex::new(HashMap::new()));
 
     struct SendDrawCallback(*mut dyn FnMut(&mut dyn DrawContext, i32, i32));
