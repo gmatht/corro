@@ -138,8 +138,12 @@ jobs:
           # the variables that matter for diagnosing a Rust panic.
           true
           sleep 20
-          echo "--- console (head: the panic message comes first) ---"
-          head -25 /tmp/corro-console.log 2>/dev/null || echo "(no console output)"
+          echo "--- console (panic message) ---"
+          grep -n -m1 -A3 "panicked at" /tmp/corro-console.log 2>/dev/null || echo "(no panic line)"
+          echo "--- console (application frames; the backtrace's tail names the caller) ---"
+          # The frames we care about are the LAST ones: everything before is
+          # std's own backtrace printing machinery.
+          tail -25 /tmp/corro-console.log 2>/dev/null || true
           echo "--- console (tail) ---"
           tail -10 /tmp/corro-console.log 2>/dev/null || true
           echo "--- is the app process alive? ---"
