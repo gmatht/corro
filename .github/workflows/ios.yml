@@ -143,13 +143,22 @@ jobs:
           # actually works.
           xcrun simctl launch "$SIM_UDID" com.corro.corro | tee /tmp/corro-launch.txt
           sleep 20
-          echo "--- app output (unified log, our tag + errors) ---"
-          xcrun simctl spawn "$SIM_UDID" log show --last 2m --style compact \
-            --predicate 'process == "corro"' 2>/dev/null \
-            | grep -aiE "rswidgets|panicked|panic|abort|fatal|error|assert" | head -30 || true
-          true
-          echo "--- console (tail) ---"
-          tail -10 /tmp/corro-console.log 2>/dev/null || true
+
+          # Our stderr writes are NOT in the unified log (probed: only Apple's
+          # own frames appear), so read them the supported way - simctl's
+          # --console / --console-pty attached to the app *through* the
+          # simulator, which has to be the foreground process of a pipeline
+          # rather than a backgrounded subshell.
+          #
+          # `simctl launch --console` (no pty) writes the app's stdout/stderr to
+          # our stdout, so a short-lived second launch is what actually shows
+          # the startup lines.
+          echo "--- app output (second launch, console attached) ---"
+          timeout 25 xcrun simctl terminate "$SIM_UDID" com.corro.corro 2>/dev/null || true
+          : > /tmp/corro-console.log
+          timeout 25 xcrun simctl launch --console "$SIM_UDID" com.corro.corro \
+            > /tmp/corro-console.log 2>&1 || true
+          tr -d '\000' < /tmp/corro-console.log | head -40 || echo "(no output)"
           echo "--- is the app process alive? ---"
           # `ps -ax` inside the simulator DOES list app processes; `pgrep` there
           # does not (it failed with NSPOSIXErrorDomain code=2 - pgrep is not
