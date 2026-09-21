@@ -185,12 +185,17 @@
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
 				INFOPLIST_FILE = Info.plist;
+				// RUST_LIB_PATH must be the DIRECTORY holding
+				// libcorro_ios.a (build_ios.sh passes the right one), and
+				// the library itself is named via -lcorro_ios. Concatenating
+				// the ".a" onto the path here produced
+				// ".../libcorro_ios.a/libcorro_ios.a" - clang: no such file.
 				LIBRARY_SEARCH_PATHS = (
 					"$(RUST_LIB_PATH)",
 					"$(inherited)",
 				);
 				OTHER_LDFLAGS = (
-					"$(RUST_LIB_PATH)/libcorro_ios.a",
+					"-lcorro_ios",
 					"-lobjc",
 					"-framework",
 					"UIKit",
@@ -210,12 +215,17 @@
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
 				INFOPLIST_FILE = Info.plist;
+				// RUST_LIB_PATH must be the DIRECTORY holding
+				// libcorro_ios.a (build_ios.sh passes the right one), and
+				// the library itself is named via -lcorro_ios. Concatenating
+				// the ".a" onto the path here produced
+				// ".../libcorro_ios.a/libcorro_ios.a" - clang: no such file.
 				LIBRARY_SEARCH_PATHS = (
 					"$(RUST_LIB_PATH)",
 					"$(inherited)",
 				);
 				OTHER_LDFLAGS = (
-					"$(RUST_LIB_PATH)/libcorro_ios.a",
+					"-lcorro_ios",
 					"-lobjc",
 					"-framework",
 					"UIKit",

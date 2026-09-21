@@ -201,6 +201,10 @@ fi
 # Xcode's build dir is redirected into BUILD_DIR so nothing lands in the
 # source tree (and so a CI cache can own it).
 echo "==> xcodebuild ($XCODE_SDK, $XCODE_ARCH)"
+# RUST_LIB_PATH is a DIRECTORY: the project links the Rust library by name
+# (-lcorro_ios) from that search path. Passing the .a file itself made the
+# project append a second "/libcorro_ios.a" and clang reported a missing file.
+# See gen_xcodeproj.sh for the matching build settings.
 xcodebuild \
   -project "$PROJECT" \
   -scheme corro \
@@ -210,7 +214,7 @@ xcodebuild \
   -derivedDataPath "$BUILD_DIR/DerivedData" \
   CONFIGURATION_BUILD_DIR="$BUILD_DIR/$XCODE_SDK" \
   IPHONEOS_DEPLOYMENT_TARGET="$IOS_DEPLOYMENT_TARGET" \
-  RUST_LIB_PATH="$RLIB" \
+  RUST_LIB_PATH="$(dirname "$RLIB")" \
   ${DEVELOPMENT_TEAM:+DEVELOPMENT_TEAM="$DEVELOPMENT_TEAM"} \
   "${SIGN_ARGS[@]}" \
   build | tail -20
