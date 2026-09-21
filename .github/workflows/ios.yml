@@ -147,12 +147,7 @@ jobs:
           echo "::error::corro is not running after launch"
           # Diagnose rather than just fail: crash reports first (they name the
           # signal and the faulting thread), then the console capture.
-          echo "--- crash reports ---"
-          ls -t ~/Library/Logs/DiagnosticReports/*.ips 2>/dev/null | head -3 | while read -r f; do
-            echo "== $f"; head -40 "$f"
-          done
-          echo "--- console ---"
-          tail -60 /tmp/corro-console.log 2>/dev/null || true
+          "$GITHUB_WORKSPACE/ios/corro/scripts/report_crash.sh" "$SIM_UDID"
           exit 1
 
       # Rust-side logging goes to NSLog (IOS_GUIDELINES.md §9). A crash on an
