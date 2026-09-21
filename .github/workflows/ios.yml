@@ -134,35 +134,20 @@ jobs:
             exit 1
           fi
           echo "install ok"
-          # Launch in the background so this step can report the PID and then
-          # let the first frame land. `--console-pty` would hold the terminal
-          # open for the app's lifetime, so stdout/stderr are captured via the
-          # simulator's log instead (see the "Dump the Rust log lines" step,
-          # which greps for the rswidgets/corro tags).
-          # Run in the background with --console-pty so the app's stderr (where
-          # a Rust panic and our [rswidgets] lines go) lands in a file we can
-          # print. A detached launch discards it, which is why several runs
-          # showed a crash with no message.
-          # RUST_BACKTRACE makes the panic print symbolised frames, which is
-          # what identifies the panicking function (the crash report only has
-          # offsets into the stripped staticlib).
-          # SIMCTL_CHILD_* variables are how simctl passes environment into the
-          # launched app; plain env vars do NOT cross the simulator boundary.
-          # Pre-created so an empty file means "the app printed nothing",
-          # not "the capture never ran"; $! is then the launch's own pid.
-          : > /tmp/corro-console.log
-          SIMCTL_CHILD_RUST_BACKTRACE=full \
-            xcrun simctl launch --console-pty "$SIM_UDID" com.corro.corro \
-              >> /tmp/corro-console.log 2>&1 &
-          LAUNCH_PID=$!
-          echo "launch pid $LAUNCH_PID; console -> /tmp/corro-console.log"
+          # Launch detached, then read the app's output from the simulator's
+          # own log below. `simctl launch --console-pty` in the background is
+          # NOT usable: probed on the runner, a backgrounded --console-pty
+          # produced an empty file, while a foreground `simctl spawn` printed
+          # normally. Launching detached and grepping the unified log (which
+          # captures our stderr writes and the crash) is the combination that
+          # actually works.
+          xcrun simctl launch "$SIM_UDID" com.corro.corro | tee /tmp/corro-launch.txt
           sleep 20
-          echo "--- console (panic message) ---"
-          # The log contains NUL bytes (Rust's backtrace printer), so grep says
-          # "Binary file matches" instead of printing the line.
-          tr -d '\000' < /tmp/corro-console.log | grep -a -m1 -B2 -A4 "panicked at" || echo "(no panic line)"
-          echo "--- console (tail) ---"
-          tr -d '\000' < /tmp/corro-console.log | tail -30 || true
+          echo "--- app output (unified log, our tag + errors) ---"
+          xcrun simctl spawn "$SIM_UDID" log show --last 2m --style compact \
+            --predicate 'process == "corro"' 2>/dev/null \
+            | grep -aiE "rswidgets|panicked|panic|abort|fatal|error|assert" | head -30 || true
+          true
           echo "--- console (tail) ---"
           tail -10 /tmp/corro-console.log 2>/dev/null || true
           echo "--- is the app process alive? ---"
