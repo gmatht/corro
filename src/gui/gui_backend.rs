@@ -153,6 +153,25 @@ pub(crate) fn metrics_scale() -> f64 {
     1.0
 }
 
+/// Startup phase marker for the mobile backends.
+///
+/// A panic inside the host's `extern "C"` entry point aborts the process, and
+/// the release build's optimisations can leave the backtrace unreadable — so on
+/// iOS/Android the only reliable way to locate a startup failure is to say how
+/// far the GUI got. On every desktop backend this compiles to nothing, so no
+/// existing behaviour or output changes.
+#[inline(always)]
+pub(crate) fn phase(marker: &str) {
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    {
+        rswidgets::backends::ios::log_ios(marker);
+    }
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        let _ = marker;
+    }
+}
+
 pub(crate) fn font_size() -> f64 { FONT_SIZE_BASE * metrics_scale() }
 pub(crate) fn row_h() -> f64 { ROW_H_BASE * metrics_scale() }
 pub(crate) fn header_h() -> f64 { HEADER_H_BASE * metrics_scale() }
@@ -3872,19 +3891,24 @@ pub fn run_gui_with_movie(
     mut movie: Option<super::movie::GuiMovie>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     rswidgets::core::install_debug_crash_handlers();
+    phase("run_gui: crash handlers installed");
     // TEMPORARY Win95 diagnosis: startup progression (see mark95 below).
     #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
     unsafe {
         mark95(b"nwgpre\n");
     }
+    phase("run_gui: App::init");
     let rxapp = rswidgets::App::init()
         .map_err(|e| format!("GUI init failed: {e}"))?;
+    phase("run_gui: App::init ok");
     #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
     unsafe {
         mark95(b"nwgpost\n");
     }
 
+    phase("run_gui: new_window");
     let win = rxapp.new_window()?;
+    phase("run_gui: new_window ok");
     // TEMPORARY Win95 diagnosis.
     #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
     unsafe {
@@ -3904,7 +3928,9 @@ pub fn run_gui_with_movie(
     // TEMPORARY ReactOS diagnosis.
     #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
     unsafe { mark95(b"m-size\n"); }
+    phase("run_gui: new_box");
     let vbox = rxapp.new_box(Orientation::Vertical, 0)?;
+    phase("run_gui: new_box ok");
     // TEMPORARY ReactOS diagnosis.
     #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
     unsafe { mark95(b"m-box\n"); }
