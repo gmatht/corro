@@ -13,8 +13,13 @@ jobs:
               @autoreleasepool {
                   char *fmt = "%s";
                   char *msg = "hello from NSLog";
-                  NSLog(fmt, msg);                        // variadic, named locals
-                  NSLog(@"direct %s", "literal-ok");      // literal format
+                  fprintf(stderr, "before variadic\n"); fflush(stderr);
+                  // NSLog(fmt, msg);                     // the form that crashed
+                  fprintf(stderr, "skipped variadic\n"); fflush(stderr);
+                  NSLog(@"literal format %s", "literal-ok");
+                  fprintf(stderr, "after literal\n"); fflush(stderr);
+                  NSLog(@"plain literal with no args");
+                  fprintf(stderr, "after plain\n"); fflush(stderr);
               }
               return 0;
           }
