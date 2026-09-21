@@ -28,6 +28,12 @@
 @property (nonatomic, assign) uint64_t corroCanvasId;
 @end
 
+// Declared ahead of use so the availability annotation is visible at the call
+// site as well as at the definition (clang checks both).
+@interface SheetView ()
+- (void)corroHandlePresses:(NSSet<UIPress *> *)presses API_AVAILABLE(ios(13.4));
+@end
+
 @implementation SheetView
 
 - (void)corroSetCanvasId:(int64_t)canvasId {
@@ -77,7 +83,11 @@
     [super pressesBegan:presses withEvent:event];
 }
 
-- (void)corroHandlePresses:(NSSet<UIPress *> *)presses {
+// Annotated API_AVAILABLE so clang accepts the UIKey uses inside; the caller
+// checks the same availability before calling. (Guarding only at the call site
+// is not enough - clang analyses each method body on its own, which is why the
+// warning persisted after the previous attempt.)
+- (void)corroHandlePresses:(NSSet<UIPress *> *)presses API_AVAILABLE(ios(13.4)) {
     for (UIPress *press in presses) {
         UIKey *key = press.key;
         if (key == nil) {
