@@ -472,35 +472,33 @@ pub fn log_apple(msg: &str) {
     if !is_initialized() {
         return;
     }
-    // A fixed `"%s"` format is used deliberately: passing user text as the
-    // format string would make a literal '%' a format specifier, and reading a
-    // variadic argument that was never passed is undefined behaviour.
+    // The message crosses into Foundation as an `NSString`, and the format is a
+    // literal. Both details are load-bearing, and both cost a CI run to learn:
     //
-    // BOTH strings are owned `Vec<u8>`s held in named locals. That is not
-    // style: `NSLog` is variadic, and the first version passed
-    // `concat!("%s", "\0").as_bytes()` — a temporary slice that is dropped at
-    // the end of the statement, so the variadic call received a dangling
-    // pointer. On an arm64 simulator that surfaced as
+    //  1. A variadic call whose format is a runtime `char*` (`NSLog(fmt, msg)`)
+    //     SEGFAULTS on arm64 macOS/Simulator. Reproduced in isolation on the
+    //     runner with ten lines of C; a literal format — `NSLog(@"%@", obj)` or
+    //     `NSLog(@"literal %s", ptr)` — works.
+    //  2. The first version additionally passed
+    //     `concat!("%s", "\0").as_bytes()`, a temporary dropped at the end of
+    //     the statement, so the variadic call got a dangling pointer. That
+    //     crashed the app on its very first log line with EXC_BAD_ACCESS
+    //     (SIGSEGV, "possible pointer authentication failure") inside
+    //     objc_msgSend / _CFLogvEx3 / _NSLogv / NSLog, called from
+    //     ios_backend::log_ios <- corro_ios_root_ready.
     //
-    //     EXC_BAD_ACCESS (SIGSEGV), "possible pointer authentication failure"
-    //     ... objc_msgSend / _CFLogvEx3 / _NSLogv / NSLog
-    //     ... rswidgets::backends::ios::ios_backend::log_ios
-    //     ... corro_ios_root_ready / -[CorroViewController viewDidLoad]
-    //
-    // i.e. the very first log line killed the app at launch.
-    let mut fmt: Vec<u8> = Vec::with_capacity(3);
-    fmt.extend_from_slice(b"%s ");
-    let mut buf: Vec<u8> = Vec::with_capacity(msg.len() + 1);
-    buf.extend_from_slice(msg.as_bytes());
-    buf.push(0);
+    // So: an NSString argument to a literal `%@` format. Nothing dangles, there
+    // is no runtime format string, and a literal '%' in the message cannot
+    // become a format specifier.
+    let s = nsstring(msg);
+    if s.is_null() {
+        return;
+    }
     unsafe {
         unsafe extern "C" {
             fn NSLog(format: *const std::os::raw::c_char, ...);
         }
-        NSLog(
-            fmt.as_ptr() as *const std::os::raw::c_char,
-            buf.as_ptr() as *const std::os::raw::c_char,
-        );
+        NSLog(b"%@\0".as_ptr() as *const std::os::raw::c_char, s);
     }
 }
 
