@@ -43,7 +43,22 @@ scripts/demo_movie.py                                                       # th
 ```
 
 `demo_movie.py` builds the shipped demo: title card, a replay of each featured
-workbook, closing card. `--cps` sets the typing speed (characters per second).
+workbook, two live-collaboration demos, closing card. `--cps` sets the typing
+speed (characters per second).
+
+### Concurrent editing
+
+The workbook is an append-only log, so two corro processes on the same file stay
+in sync with no save step. `two_window_movie.py` records that:
+
+```bash
+scripts/two_window_movie.py -o dist/corro-two-windows.mp4              # two windows
+scripts/two_window_movie.py --pair gui-tui -o dist/corro-gui-tui.mp4   # GUI + terminal
+```
+
+Each window is given a script of edits to make (`CORRO_EDIT_SCRIPT`, e.g.
+`1000:A5=111,5000:A7=333`); they go through the ordinary commit path, so the
+recording shows real commits from both sides rather than synthesized keystrokes.
 
 The test workbooks deliberately contain broken formulas, so a recording shows
 real evaluator output (`#NAME`, `#PARSE`, `#CIRC`, ...) in those cells. To list

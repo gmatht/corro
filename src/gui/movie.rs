@@ -91,6 +91,8 @@ impl GuiMovieOptions {
     }
 }
 
+pub use crate::ui_core::{edit_script_from_env, EditStep};
+
 /// One replay step: a log line and the sheet it targets.
 #[derive(Clone, Debug)]
 pub struct MovieStep {

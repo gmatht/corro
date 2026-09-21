@@ -4376,6 +4376,10 @@ pub fn run_gui_with_movie(
     // mapped instead of after several seconds of event pumping.
     if let Some(movie) = movie.take() {
         arm_movie_driver(&shared, movie);
+    } else {
+        // A plain `--gui` session can also be scripted, so a demo can show two
+        // windows *editing* one file rather than replaying it.
+        arm_edit_script(&shared);
     }
 
     eprintln!("PHASE: after_present");
@@ -4490,6 +4494,52 @@ pub fn run_gui_with_movie(
 // ---------------------------------------------------------------------------
 // `--movie` driver
 // ---------------------------------------------------------------------------
+
+/// Drive a scripted *editing* session through the live window.
+///
+/// Unlike `arm_movie_driver` (which replays a finished log), this makes the
+/// window *produce* edits via the ordinary commit path, so a second window
+/// watching the same file sees them arrive. Used by the two-window demo.
+fn arm_edit_script(state: &Rc<GuiState>) {
+    let steps = super::movie::edit_script_from_env();
+    if steps.is_empty() {
+        return;
+    }
+    let step_count = steps.len();
+    let state_for_tick = state.clone();
+    let idx = std::cell::Cell::new(0usize);
+    let start = std::time::Instant::now();
+    let tick = move || -> bool {
+        let i = idx.get();
+        let Some(step) = steps.get(i) else {
+            return false;
+        };
+        if start.elapsed() < std::time::Duration::from_millis(step.at_ms) {
+            return true; // not due yet
+        }
+        let app = state_for_tick.app_mut();
+        let addr = crate::grid::CellAddr::Main { row: step.row, col: step.col };
+        // The real commit path: applies to the sheet and appends to the log,
+        // which is what makes the other window's tail pick it up.
+        super::actions::commit_cell(app, addr.clone(), step.value.clone());
+        app.core.status = format!(
+            "{} = {}",
+            crate::addr::cell_ref_text(&addr, app.core.workbook.active_sheet().grid.main_cols()),
+            step.value
+        );
+        app.core.state = app.core.workbook.active_sheet().clone();
+        update_state_cursor(&state_for_tick, app.core.cursor.row, app.core.cursor.col);
+        sync_chrome_labels(&state_for_tick);
+        state_for_tick.canvas.queue_redraw();
+        state_for_tick.window.queue_redraw();
+        idx.set(i + 1);
+        true
+    };
+    match rswidgets::add_periodic_tick(&state.window, 100, Box::new(tick)) {
+        Ok(()) => eprintln!("[corro] edit script armed ({step_count} steps)"),
+        Err(e) => eprintln!("[corro] edit-script timer unavailable: {e}"),
+    }
+}
 
 /// Drive a `--movie` replay through the live window.
 ///

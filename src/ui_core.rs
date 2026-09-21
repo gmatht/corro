@@ -32,6 +32,69 @@ pub use crate::addr::ui_row_label as sheet_row_label;
 /// (clipboard), missing path, directory, or a non-writing action.
 /// Callers resolve aliases first (e.g. ratatui Save appends `.corro`);
 /// this checks exactly the path it is given.
+/// A scripted *edit* a window performs during a live session.
+///
+/// `--movie` replays a finished log; a live-collaboration demo needs the
+/// opposite — several windows each *making* edits, so a recording can show one
+/// window's commit appearing in the other. Driving that with synthetic
+/// keystrokes means calibrating pixel coordinates against the window manager
+/// (brittle, and it silently writes to the wrong cell when it drifts), so the
+/// app applies the edit itself through the same commit path a typed value uses.
+///
+/// Lives here rather than in the GUI module because the ratatui front-end needs
+/// it too, and its builds do not compile the GUI module.
+#[derive(Clone, Debug)]
+pub struct EditStep {
+    /// Main-row index (0 = first data row) and main-column index.
+    pub row: u32,
+    pub col: u32,
+    pub value: String,
+    /// Milliseconds after the session starts to perform this edit.
+    pub at_ms: u64,
+}
+
+/// Parse `CORRO_EDIT_SCRIPT`: `MS:ADDR=VALUE` steps separated by `,` or newlines
+/// (e.g. `500:A5=111,2000:B2=5`). Unparsable items are skipped, so a typo in a
+/// demo script degrades to fewer edits rather than a crash.
+pub fn edit_script_from_env() -> Vec<EditStep> {
+    let Ok(raw) = std::env::var("CORRO_EDIT_SCRIPT") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for item in raw.split([',', '\n']).map(str::trim).filter(|s| !s.is_empty()) {
+        let Some((when, rest)) = item.split_once(':') else {
+            continue;
+        };
+        let Some((addr, value)) = rest.split_once('=') else {
+            continue;
+        };
+        let Ok(at_ms) = when.trim().parse::<u64>() else {
+            continue;
+        };
+        let addr = addr.trim();
+        let col_part: String = addr.chars().take_while(|c| c.is_ascii_alphabetic()).collect();
+        let row_part: String = addr.chars().skip_while(|c| c.is_ascii_alphabetic()).collect();
+        if col_part.is_empty() || row_part.is_empty() {
+            continue;
+        }
+        let mut col = 0u32;
+        for ch in col_part.chars() {
+            col = col * 26 + (ch.to_ascii_uppercase() as u32 - 'A' as u32 + 1);
+        }
+        let Ok(row_1based) = row_part.parse::<u32>() else {
+            continue;
+        };
+        out.push(EditStep {
+            row: row_1based.saturating_sub(1),
+            col: col.saturating_sub(1),
+            value: value.to_string(),
+            at_ms,
+        });
+    }
+    out.sort_by_key(|s| s.at_ms);
+    out
+}
+
 pub fn prompt_action_write_target(action: &str, text: &str) -> Option<std::path::PathBuf> {
     match action {
         "save_as" | "export_tsv" | "export_csv" | "export_ods" | "export_ascii" | "export_all" => {}

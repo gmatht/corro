@@ -4199,6 +4199,27 @@ impl App {
         cells
     }
 
+    /// Apply one scripted edit (see `CORRO_EDIT_SCRIPT`) through the ordinary
+    /// commit path, so it is appended to the log like a typed value.
+    fn apply_scripted_edit(&mut self, step: &crate::ui_core::EditStep) {
+        let addr = CellAddr::Main { row: step.row, col: step.col };
+        if let Err(e) = self.apply_single_op(Op::SetCell {
+            addr: addr.clone(),
+            value: step.value.clone(),
+        }) {
+            self.status = format!("Scripted edit failed: {e}");
+            return;
+        }
+        self.status = format!(
+            "{} = {}",
+            crate::addr::cell_ref_text(&addr, self.state.grid.main_cols()),
+            step.value
+        );
+        self.cursor.row = HEADER_ROWS + step.row as usize;
+        self.cursor.col = MARGIN_COLS + step.col as usize;
+        self.cursor.clamp(&self.state.grid);
+    }
+
     fn sync_external(&mut self) -> Result<bool, IoError> {
         let mut changed = false;
 
@@ -9008,9 +9029,24 @@ impl App {
             use std::time::{Duration, Instant};
             let mut pending_redraw = true;
             let mut last_paint = Instant::now();
+            // Optional scripted editing (CORRO_EDIT_SCRIPT), the TUI twin of the
+            // GUI's `arm_edit_script`: it lets a demo drive this window through
+            // the ordinary edit path so another window watching the same file
+            // sees the commits arrive. Empty (and therefore free) by default.
+            let edit_script = crate::ui_core::edit_script_from_env();
+            let script_start = Instant::now();
+            let mut script_next = 0usize;
             loop {
                 self.sync_cursor_floor();
                 if self.sync_external()? {
+                    pending_redraw = true;
+                }
+                while let Some(step) = edit_script.get(script_next) {
+                    if script_start.elapsed() < std::time::Duration::from_millis(step.at_ms) {
+                        break;
+                    }
+                    self.apply_scripted_edit(step);
+                    script_next += 1;
                     pending_redraw = true;
                 }
 

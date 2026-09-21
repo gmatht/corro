@@ -19,6 +19,13 @@
   file bound, so each recording appended its steps to the fixture — the demo
   workbooks grew on every run. The replay now detaches the file (as the TUI
   replayer already did) while keeping it as the display source.
+- **Concurrent editing demos.** `scripts/two_window_movie.py` records two
+  front-ends editing one file (`--pair gui-gui` or `gui-tui`), showing each
+  window's commit appear in the other. Both windows are scripted via
+  `CORRO_EDIT_SCRIPT` and apply their edits through the ordinary commit path
+  (`ui_core::edit_script_from_env`; the GUI arms it from its timer, the TUI from
+  its loop), because driving them with synthetic keystrokes needs pixel
+  calibration that silently writes to the wrong cell when it drifts.
 - `scripts/demo_movie.py` builds the shipped demo video from title cards plus a
   replay of each featured workbook, recorded from the running window. The
   `main.corro` card notes that its `#NAME`/`#PARSE`/`#CIRC` cells are deliberate

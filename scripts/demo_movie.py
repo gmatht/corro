@@ -37,6 +37,27 @@ DEFAULT_FONT_DIRS = [
 # matches; the replays come back at the same size.
 WIDTH, HEIGHT = 1200, 800
 
+# Live-collaboration demos: (pair, card title, card description, extra note).
+# These are recorded by `two_window_movie.py`, which runs two front-ends over
+# one shared log.
+TWO_WINDOW = [
+    (
+        "gui-gui",
+        "Two windows, one file",
+        "corro's workbook is an append-only log, so two windows on the same file "
+        "stay in sync with no save step: every edit is appended and the other "
+        "window tails it while you work.",
+        None,
+    ),
+    (
+        "gui-tui",
+        "GUI and terminal together",
+        "The same log is shared across front-ends: a native window and a terminal "
+        "session edit one workbook, and each sees the other's edits as they land.",
+        None,
+    ),
+]
+
 # Features replayed in the video: (workbook, card title, card description).
 FEATURES = [
     (
@@ -187,6 +208,34 @@ def main() -> int:
                 sys.exit(f"error: no frames captured for {path}")
             for f in captured:
                 emit(Image.open(f))
+            shutil.rmtree(d, ignore_errors=True)
+
+        for pair, title, desc, note in TWO_WINDOW:
+            c = work / f"two-{pair}.png"
+            card(title, desc, c, note)
+            hold(Image.open(c), args.title_secs)
+
+            d = work / f"two-{pair}-frames"
+            d.mkdir()
+            subprocess.run(
+                [
+                    sys.executable, "scripts/two_window_movie.py",
+                    "--pair", pair,
+                    "--frames-dir", str(d),
+                    "--keep-frames",
+                    "-o", str(work / f"two-{pair}.mp4"),
+                ],
+                check=True,
+                cwd=str(ROOT),
+            )
+            captured = sorted(d.glob("frame-*.ppm"))
+            if not captured:
+                sys.exit(f"error: no frames captured for {pair}")
+            # The capture is two windows side by side on a 2400px screen; scale
+            # to the video's 1200px width so the whole demo stays one size.
+            for f in captured:
+                im = Image.open(f)
+                emit(im.resize((WIDTH, int(im.height * WIDTH / im.width)), Image.LANCZOS))
             shutil.rmtree(d, ignore_errors=True)
 
         c = work / "end.png"
