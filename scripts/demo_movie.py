@@ -36,6 +36,9 @@ DEFAULT_FONT_DIRS = [
 # Cards are rendered at the recording resolution so every frame in the video
 # matches; the replays come back at the same size.
 WIDTH, HEIGHT = 1200, 800
+# Screen the two-window capture runs on (`two_window_movie.py` puts one 1200x800
+# window at x=0 and another at x=1200 on a 2400x820 screen).
+TWO_WINDOW_SCREEN = (2400, 820)
 
 # Live-collaboration demos: (pair, card title, card description, extra note).
 # These are recorded by `two_window_movie.py`, which runs two front-ends over
@@ -273,14 +276,21 @@ def main() -> int:
             captured = sorted(d.glob("frame-*.ppm"))
             if not captured:
                 sys.exit(f"error: no frames captured for {pair}")
-            # Two windows sit side by side on a 2400px screen. Scaling that to
+            # Two windows sit side by side on a 2400x820 screen. Scaling that to
             # the video's 1200px width halves the height too (2400x820 ->
             # 1200x410), which squashes both windows into a letterbox strip.
-            # Halve *both* dimensions instead: each window keeps its true
-            # aspect and the pair still fits the 1200x800 frame.
+            # Halve *both* dimensions instead, so each window keeps its true
+            # aspect, then centre the pair in the 1200x800 frame. The sizes are
+            # written out rather than derived from `iw`/`ih`: inside a filter
+            # chain `ih` still refers to the *original* input, so
+            # `pad=...:trunc(ih/2)*2` asks for a box shorter than its input and
+            # ffmpeg rejects the whole graph.
             add_frames(
                 d / "frame-%05d.ppm", len(captured),
-                f"scale={WIDTH // 2}:trunc(ih/2)*2,pad={WIDTH}:{HEIGHT}:(ow-iw)/2:(oh-ih)/2:color=0x12161e",
+                f"scale={TWO_WINDOW_SCREEN[0] // 4}:{TWO_WINDOW_SCREEN[1] // 2},"
+                f"pad={WIDTH}:{HEIGHT}:"
+                f"{(WIDTH - TWO_WINDOW_SCREEN[0] // 4) // 2}:{(HEIGHT - TWO_WINDOW_SCREEN[1] // 2) // 2}"
+                f":color=0x12161e",
                 args.fps,
             )
             shutil.rmtree(d, ignore_errors=True)
