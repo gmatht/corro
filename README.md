@@ -38,8 +38,12 @@ screenshots it as it plays, and encodes the result with ffmpeg:
 
 ```bash
 cargo build --features gui
-scripts/gui_movie.py docs/tests/subtotal.corro -o dist/corro-gui-movie.mp4
+scripts/gui_movie.py docs/tests/subtotal.corro -o dist/corro-gui-movie.mp4   # one workbook
+scripts/demo_movie.py                                                       # the full demo
 ```
+
+`demo_movie.py` builds the shipped demo: title card, a replay of each featured
+workbook, closing card. `--cps` sets the typing speed (characters per second).
 
 A pre-built recording is checked in at `dist/corro-gui-movie.mp4`. Recording
 the live window (rather than rendering frames through a parallel code path)

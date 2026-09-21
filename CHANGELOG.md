@@ -14,6 +14,11 @@
 - Movie pacing flags (`--movie-typing-cps`, `--movie-confirm-ms`,
   `--movie-menu-hold-ms`) now parse on the CLI for every backend rather than
   only being honored by the ratatui path.
+- `scripts/demo_movie.py` builds the shipped demo video from title cards plus a
+  replay of each featured workbook, recorded from the running window. The
+  typing speed is a flag (`--cps`), and the demo uses a deliberately readable
+  6.5 characters/second (a quarter of the old 26) so the typed values can
+  actually be followed in the recording.
 - **Movie mode is now the normal UI.** `--gui --movie` opens the same window,
   builds the same widget tree and runs the same draw callbacks as an
   interactive session; a periodic timer applies one movie step per tick instead
