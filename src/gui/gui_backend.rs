@@ -5,10 +5,10 @@
 use rswidgets::prelude::*;
 #[cfg(target_os = "linux")]
 use rswidgets::common::{Canvas, Entry, Label, MenuBar, Orientation, Window};
-// iOS and Android name the common wrappers explicitly for the same reason
-// Windows does: their prelude is the platform adapter's, and mixing the two
-// would silently rebind `Window`/`Canvas`/... to adapter-local handles.
-#[cfg(any(target_os = "ios", target_os = "android"))]
+// iOS, Android and macOS name the common wrappers explicitly for the same
+// reason Windows does: their prelude is the platform adapter's, and mixing the
+// two would silently rebind `Window`/`Canvas`/... to adapter-local handles.
+#[cfg(any(target_os = "ios", target_os = "android", target_os = "macos"))]
 use rswidgets::common::{Canvas, Entry, Label, MenuBar, Orientation, Window};
 // Windows uses the same common wrappers explicitly: under pancurses the
 // root prelude flips to pancurses-adapter types, so the glob alone would
@@ -148,7 +148,25 @@ pub(crate) fn metrics_scale() -> f64 {
     })
 }
 
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
+/// macOS: `NSScreen.backingScaleFactor` (1.0 non-Retina, 2.0 Retina). Same
+/// purpose as the iOS/Android density — a Retina panel needs bigger *points*
+/// for the same nominal pixel number to be legible — and resolved once (it
+/// cannot change while the app runs).
+///
+/// Note there is no macOS touch-target floor: the AppKit adapter uses compact
+/// desktop control metrics, so this scale only affects corro's own chrome.
+#[cfg(target_os = "macos")]
+pub(crate) fn metrics_scale() -> f64 {
+    use std::sync::OnceLock;
+    static SCALE: OnceLock<f64> = OnceLock::new();
+    *SCALE.get_or_init(|| {
+        rswidgets::backends_macos_adapter::display_density()
+            .unwrap_or(1.0)
+            .max(1.0)
+    })
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios", target_os = "macos")))]
 pub(crate) fn metrics_scale() -> f64 {
     1.0
 }
@@ -166,7 +184,11 @@ pub(crate) fn phase(marker: &str) {
     {
         rswidgets::backends::ios::log_ios(marker);
     }
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[cfg(target_os = "macos")]
+    {
+        rswidgets::backends::macos::log_macos(marker);
+    }
+    #[cfg(not(any(target_os = "android", target_os = "ios", target_os = "macos")))]
     {
         let _ = marker;
     }
@@ -2414,7 +2436,7 @@ fn maintain_extent(state: &GuiState, allow_shrink: bool) {
     // large screen; on a touch device the body should fill what the user can
     // actually see. Growth only, and capped by the viewport, so it cannot run
     // away or shrink a stored extent.
-    #[cfg(any(target_os = "android", target_os = "ios"))]
+    #[cfg(any(target_os = "android", target_os = "ios", target_os = "macos"))]
     {
         let visible_rows = state.data_rows.get().max(1);
         let visible_cols = state.data_cols.get().max(1);
@@ -3761,7 +3783,7 @@ fn on_formula_entry_changed(state: &GuiState) {
     // and must be ignored. On Android, entry text that differs from the
     // committed cell value can only be user input, so adopt it as a fresh
     // edit (mirrors start_edit_with on first keystroke).
-    #[cfg(any(target_os = "android", target_os = "ios"))]
+    #[cfg(any(target_os = "android", target_os = "ios", target_os = "macos"))]
     if !state.editing.get() {
         if let Some(text) = state.formula_entry.get_text() {
             let app = state.app_ref();
@@ -3782,7 +3804,7 @@ fn on_formula_entry_changed(state: &GuiState) {
             return;
         }
     }
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[cfg(not(any(target_os = "android", target_os = "ios", target_os = "macos")))]
     if !state.editing.get() {
         return;
     }
@@ -4106,6 +4128,16 @@ pub fn run_gui_with_movie(
         publish_mobile_menu_state(&shared);
         if let Err(e) = super::ios_backend::install_menu_model(&rxapp, &shared) {
             eprintln!("ios menu model unavailable: {e}");
+        }
+    }
+    // macOS: a real `NSMenu` can be built from the same model, so the host
+    // gets the model and renders a genuine menubar (unlike iOS's overflow
+    // item). Same publication, same `app.*` names.
+    #[cfg(target_os = "macos")]
+    {
+        publish_mobile_menu_state(&shared);
+        if let Err(e) = super::macos_backend::install_menu_model(&rxapp, &shared) {
+            eprintln!("macos menu model unavailable: {e}");
         }
     }
     vbox.append(&menubar);

@@ -53,6 +53,21 @@ pub mod android_backend;
 // everywhere is what keeps those honest.
 #[cfg(any(feature = "gui", feature = "gui-mobile"))]
 pub mod ios_backend;
+/// macOS backend: the `extern "C"` entry point + bootstrap for the AppKit
+/// adapter (see `rustxWidgets/docs/MACOS_GUIDELINES.md`).
+///
+/// Deliberately the smallest of the backend modules: the widget tree is the
+/// shared [`gui_backend`] one, the AppKit widgets come from
+/// `rswidgets::backends_macos_adapter` through the `rswidgets::common`
+/// wrappers, and the menu model/dispatcher are re-exported from
+/// [`ios_backend`] rather than copied. Only the bootstrap
+/// (`rswidgets::backends::macos::init_with_root`) is platform-specific.
+///
+/// Not target-gated, for the same reason `ios_backend` is not: the menu model
+/// and dispatcher must keep compiling (and being tested) on a desktop, so a
+/// drift is caught without an Apple host.
+#[cfg(any(feature = "gui", feature = "gui-mobile"))]
+pub mod macos_backend;
 #[cfg(feature = "pancurses")]
 mod pnc_backend;
 
