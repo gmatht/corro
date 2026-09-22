@@ -186,8 +186,27 @@ jobs:
       - name: Screenshot the first frame
         run: xcrun simctl io "$SIM_UDID" screenshot ios-first-frame.png
 
-      # Runs AFTER the liveness check and the screenshot, because it stops the
-      # app in order to attach --console.
+      - name: Capture the app's startup output
+        if: always()
+        run: |
+          : > /tmp/corro-console.log
+          xcrun simctl terminate "$SIM_UDID" com.corro.corro 2>/dev/null || true
+          xcrun simctl launch --console "$SIM_UDID" com.corro.corro \
+            > /tmp/corro-console.log 2>&1 &
+          CONSOLE_PID=$!
+          sleep 20
+          kill "$CONSOLE_PID" 2>/dev/null || true
+          wait "$CONSOLE_PID" 2>/dev/null || true
+          echo "--- app output ---"
+          tr -d '\000' < /tmp/corro-console.log | head -60 || echo "(no output)"
+
+      # Rust-side logging goes to NSLog (IOS_GUIDELINES.md §9). A crash on an
+      # objc_msgSend signature mismatch shows up here, not in a backtrace.
+      # Runs BEFORE the health check, and that order is deliberate: attaching
+      # --console requires stopping the app, AND this capture is the only place
+      # our stderr output is visible (it does not go to the unified log), so it
+      # is both the diagnostic and the evidence the check reads.
+      # It therefore runs after the screenshot but before the check.
       - name: Check the app is still alive (did not crash on launch)
         run: |
           # The PRIMARY health signal is the app's own output, not a process
@@ -201,17 +220,23 @@ jobs:
           #     app as dead on EVERY run.
           #
           # What cannot lie is evidence the app produced itself: the Rust
-          # startup markers, and the host's UIKit callbacks (layoutSubviews /
-          # drawRect), which only run in a live process. If those are present,
-          # the app ran - whatever any process table says.
-          LOG="$(xcrun simctl spawn "$SIM_UDID" log show --last 2m --style compact \
-                 --predicate 'process == "corro"' 2>/dev/null || true)"
-          if printf '%s' "$LOG" | grep -qa "ios backend initialised" \
-             && printf '%s' "$LOG" | grep -qa "SheetView.drawRect"; then
+          # startup markers and the host's UIKit callbacks, which only run in a
+          # live process. If those are present the app ran, whatever a process
+          # table says.
+          #
+          # Read them from the CONSOLE CAPTURE, not the unified log: our lines
+          # are written to stderr, and (probed earlier) stderr does NOT appear
+          # in `log show` - only `--console` sees it. An earlier version of this
+          # check queried the unified log and therefore reported "no evidence"
+          # while the drawRect: lines were sitting in the capture.
+          CONSOLE=/tmp/corro-console.log
+          if [ -f "$CONSOLE" ] \
+             && tr -d '\000' < "$CONSOLE" | grep -qa "ios backend initialised" \
+             && tr -d '\000' < "$CONSOLE" | grep -qa "SheetView.drawRect"; then
             echo "corro ran and drew (Rust startup + a Core Graphics draw both seen)"
             exit 0
           fi
-          echo "::error::no evidence the app ran - neither the Rust startup nor a drawRect: appeared"
+          echo "::error::no evidence the app ran - see the console capture step below"
           echo "--- launchctl entries containing 'corro' (supplementary) ---"
           xcrun simctl spawn "$SIM_UDID" launchctl list 2>/dev/null | grep -i corro || echo "(none)"
           echo "::error::corro is not running after launch"
@@ -232,22 +257,6 @@ jobs:
           fi
           exit 1
 
-      - name: Capture the app's startup output
-        if: always()
-        run: |
-          : > /tmp/corro-console.log
-          xcrun simctl terminate "$SIM_UDID" com.corro.corro 2>/dev/null || true
-          xcrun simctl launch --console "$SIM_UDID" com.corro.corro \
-            > /tmp/corro-console.log 2>&1 &
-          CONSOLE_PID=$!
-          sleep 20
-          kill "$CONSOLE_PID" 2>/dev/null || true
-          wait "$CONSOLE_PID" 2>/dev/null || true
-          echo "--- app output ---"
-          tr -d '\000' < /tmp/corro-console.log | head -60 || echo "(no output)"
-
-      # Rust-side logging goes to NSLog (IOS_GUIDELINES.md §9). A crash on an
-      # objc_msgSend signature mismatch shows up here, not in a backtrace.
       - name: Dump the Rust log lines
         if: always()
         run: |
