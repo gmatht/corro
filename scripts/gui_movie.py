@@ -102,6 +102,8 @@ def run_movie(binary: Path, corro_file: Path, frames_dir: Path, args: argparse.N
     display = args.display
     env = dict(os.environ)
     env["DISPLAY"] = display
+    if args.tour:
+        env["CORRO_MENU_TOUR"] = args.tour
 
     # Clear a stale server on this display first: if one is still bound, our
     # Xvfb fails to start while the old one keeps serving, and the recording
@@ -231,6 +233,13 @@ def main() -> int:
     ap.add_argument("--width", type=int, default=1200, help="window width to record")
     ap.add_argument("--height", type=int, default=800, help="window height to record")
     ap.add_argument("--capture-fps", type=float, default=8.0, help="screenshot rate while recording")
+    ap.add_argument(
+        "--tour",
+        default=None,
+        help="menu tour to run after the replay, as a CORRO_MENU_TOUR script "
+             "(MS:Section>Item#index stops). The driver opens each menu and "
+             "dispatches the item, with the drawn pointer travelling to it.",
+    )
     ap.add_argument("--max-frames", type=int, default=6000, help="safety cap on captured frames")
     ap.add_argument("--timeout", type=float, default=900, help="max seconds to let the movie play")
     args = ap.parse_args()

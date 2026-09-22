@@ -62,6 +62,10 @@ TWO_WINDOW = [
 ]
 
 # Features replayed in the video: (workbook, card title, card description).
+#
+# `main.corro` used to be the second entry. It is a 241-step regression fixture
+# that types and retypes values — accurate as a test, tedious to watch — so its
+# slot is now the menu tour below. The fixture stays in the test suite.
 FEATURES = [
     (
         "docs/tests/subtotal.corro",
@@ -70,19 +74,65 @@ FEATURES = [
         "corro never double counts: the grand total sums the subtotals, not the raw data.",
         None,
     ),
-    (
-        "docs/tests/main.corro",
-        "Sheets, moves and formats",
-        "A workbook is a log: sheets are created, copied and activated, rows are moved, "
-        "and column formats are applied - each replayed as the interaction that produced it.",
-        # This fixture is a feature tour that deliberately includes broken
-        # formulas, so cells showing #NAME/#PARSE/#CIRC are real evaluator
-        # output. Say so on the card instead of letting a viewer read them as
-        # rendering bugs. `scripts/movie_errors.py` lists them from the log.
-        "Note: this test workbook intentionally contains broken formulas, so a few "
-        "cells show #NAME / #PARSE / #CIRC.",
-    ),
 ]
+
+# The menu tour that closes the video: `MS:Section>Item#index` stops, run by the
+# movie driver after its replay finishes. Every stop opens the real menu and
+# dispatches the item through the app's own action path. Items that open a file
+# dialog, write a file, launch an editor, need typed input or quit the app are
+# deliberately absent — the tour has to run unattended.
+#
+# `index` is the item's row within its popover, which is where the pointer is
+# aimed; it does not affect which action runs.
+MENU_TOUR = [
+    ("File", "Default width", 4),
+    ("File", "Column width", 4),
+    ("File", "Sort view", 5),
+    ("File", "Persist sort", 6),
+    ("Edit", "Select all", 3),
+    ("Edit", "Copy", 1),
+    ("Edit", "Cut", 0),
+    ("Insert", "Rows", 0),
+    ("Insert", "Cols", 3),
+    ("Insert", "Date", 6),
+    ("Insert", "Time", 7),
+    ("Insert", "Special Char", 4),
+    ("Insert", "Aggregate", 5),
+    ("Format", "All", 0),
+    ("Format", "Currency ($)", 1),
+    ("Format", "Right", 2),
+    ("Format", "Reset", 3),
+    ("Sheet", "New sheet", 2),
+    ("Sheet", "Rename sheet", 3),
+    ("Sheet", "Copy sheet", 4),
+    ("Sheet", "Next sheet", 1),
+    ("Sheet", "Prev sheet", 0),
+    ("Sheet", "Balance books", 7),
+    ("Help", "Row ops", 1),
+    ("Help", "Col ops", 2),
+]
+
+# Milliseconds between tour stops. Long enough to watch the pointer travel, the
+# menu open and the item take effect, short enough to stay watchable.
+MENU_TOUR_STEP_MS = 1500
+
+# Workbook the tour runs on: a small, readable sheet, so the effects of the
+# Sheet and Format items are visible against it.
+MENU_TOUR_WORKBOOK = """SET A1 1
+SET A2 7
+SET A3 4
+SET B1 2
+SET B2 3
+SET B3 6
+"""
+
+
+def menu_tour_script() -> str:
+    """The `CORRO_MENU_TOUR` value for [`MENU_TOUR`]."""
+    return ",".join(
+        f"{i * MENU_TOUR_STEP_MS}:{section}>{item}#{index}"
+        for i, (section, item, index) in enumerate(MENU_TOUR)
+    )
 
 
 def font(name: str, size: int) -> ImageFont.FreeTypeFont:
@@ -260,6 +310,49 @@ def main() -> int:
             # segment is encoded. Keeping every segment's frames until the end
             # of the run exhausts the disk.
             shutil.rmtree(d, ignore_errors=True)
+
+        # The menu tour: the pointer travels to each menu, the menu opens, and
+        # the item fires — closing the video on the menus rather than on another
+        # log replay. `gui_movie.py` hands the tour to the driver, which runs it
+        # once the (trivial) replay finishes.
+        c = work / "menu-tour.png"
+        card(
+            "The menus",
+            "Every item in corro's menus, driven end to end: the pointer travels to the "
+            "menu, it opens, and the item runs through the same action path a click uses.",
+            c,
+            "File, Edit, Insert, Format, Sheet and Help. Items that would open a dialog, "
+            "write a file, launch an editor or quit are left out — this tour runs unattended.",
+        )
+        add_card(Image.open(c), args.title_secs, f"card-{len(segments)}")
+
+        d = work / "menu-tour-frames"
+        d.mkdir()
+        tour_work = work / "menu-tour-base.corro"
+        tour_work.write_text(MENU_TOUR_WORKBOOK)
+        tour_seconds = len(MENU_TOUR) * MENU_TOUR_STEP_MS / 1000.0
+        subprocess.run(
+            [
+                sys.executable, "scripts/gui_movie.py", str(tour_work),
+                "--frames-dir", str(d),
+                # The replay itself is three short lines; the tour is the
+                # content, so type fast and hold briefly.
+                "--cps", str(max(args.cps, 30)),
+                "--confirm-ms", "60",
+                "--menu-hold-ms", "200",
+                "--capture-fps", str(args.capture_fps),
+                "--max-frames", str(int(args.capture_fps * (tour_seconds + 30))),
+                "--tour", menu_tour_script(),
+                "-o", str(work / "menu-tour.mp4"),
+            ],
+            check=True,
+            cwd=str(ROOT),
+        )
+        captured = sorted(d.glob("frame-*.ppm"))
+        if not captured:
+            sys.exit("error: no frames captured for the menu tour")
+        add_frames(d / "frame-%05d.ppm", len(captured), None, args.fps)
+        shutil.rmtree(d, ignore_errors=True)
 
         for pair, title, desc, note in TWO_WINDOW:
             c = work / f"two-{pair}.png"
