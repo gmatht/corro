@@ -329,27 +329,30 @@ mod android_adapter {
                     "(IIF)V",
                     &[child_w.into(), child_h.into(), weight.into()],
                 )?;
-                // An empty EditText measures to zero width; give it a floor
-                // in px (density-independent ≈ 9px per character at mdpi).
+                // Sizing floors, in px. The density is needed for both, so it
+                // is resolved once here.
+                let density = env
+                    .call_method(&layout, "getResources", "()Landroid/content/res/Resources;", &[])
+                    .ok()
+                    .and_then(|r| r.l().ok())
+                    .and_then(|res| {
+                        env.call_method(&res, "getDisplayMetrics", "()Landroid/util/DisplayMetrics;", &[])
+                            .ok()
+                            .and_then(|m| m.l().ok())
+                    })
+                    .and_then(|metrics| env.get_field(&metrics, "density", "F").ok())
+                    .and_then(|f| f.f().ok())
+                    .unwrap_or(1.0);
+
+                // Width: an empty EditText measures to zero, so give it a floor
+                // (density-independent, ≈9px per character at mdpi). Expanding
+                // children (the formula entry) get a usable width even when
+                // nothing set one explicitly.
                 let min_chars = {
                     let n = crate::backends::android::view_min_chars(child_ptr);
-                    // Expanding children (the formula entry) default to a
-                    // usable width even when nothing set one explicitly.
                     if n > 0 { n } else if expands { 12 } else { 0 }
                 };
                 if min_chars > 0 {
-                    let density = env
-                        .call_method(&layout, "getResources", "()Landroid/content/res/Resources;", &[])
-                        .ok()
-                        .and_then(|r| r.l().ok())
-                        .and_then(|res| {
-                            env.call_method(&res, "getDisplayMetrics", "()Landroid/util/DisplayMetrics;", &[])
-                                .ok()
-                                .and_then(|m| m.l().ok())
-                        })
-                        .and_then(|metrics| env.get_field(&metrics, "density", "F").ok())
-                        .and_then(|f| f.f().ok())
-                        .unwrap_or(1.0);
                     let min_px = (min_chars as f32 * 9.0 * density) as i32;
                     let _ = env.call_method(
                         &child_obj,
@@ -358,6 +361,37 @@ mod android_adapter {
                         &[min_px.into()],
                     );
                 }
+
+                // Height: an expanding child that is NOT the canvas is the
+                // formula entry.
+                //
+                // It is laid out with height=MATCH_PARENT and weight 1 inside a
+                // HORIZONTAL bar (see `child_h` above), so its own
+                // `setMinimumHeight` is ignored - the bar's height comes from
+                // whichever of its children is tallest, and the two labels in
+                // it measure only ~51px. The address label and "fx" marker then
+                // lay out at y=36..87 relative to that 51px bar, so they were
+                // clipped away entirely and the formula bar rendered as an
+                // empty strip - well under Android's 48dp minimum touch target.
+                //
+                // Set the floor on the PARENT, which is what actually
+                // determines the bar's height.
+                if expands && !is_canvas {
+                    let min_h_px = (48.0 * density) as i32;
+                    let _ = env.call_method(
+                        &child_obj,
+                        "setMinimumHeight",
+                        "(I)V",
+                        &[min_h_px.into()],
+                    );
+                    let _ = env.call_method(
+                        &layout,
+                        "setMinimumHeight",
+                        "(I)V",
+                        &[min_h_px.into()],
+                    );
+                }
+
                 env.call_method(
                     &layout,
                     "addView",
