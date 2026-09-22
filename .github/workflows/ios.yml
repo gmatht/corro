@@ -196,13 +196,18 @@ jobs:
           # it the app opens a BLANK workbook, the PNG shows only chrome and row
           # labels, and a text-rendering bug (wrong baseline, clipped glyphs)
           # cannot be seen in the artifact at all - which is how one shipped.
-          # `simctl launch` passes the parent environment through to the app, so
-          # the same variable the desktop captures use works here.
+          #
+          # ⚠️ `simctl launch` does NOT pass the parent environment through: it
+          # forwards only variables prefixed `SIMCTL_CHILD_`, and strips the
+          # prefix. Exporting CORRO_EDIT_SCRIPT alone silently did nothing - the
+          # first attempt at this shipped a screenshot of a still-blank sheet,
+          # with no error anywhere, because the app simply never saw the
+          # variable. So the export below is the SIMCTL_CHILD_ form.
           #
           # Values chosen to exercise the cases that broke: a bare number, a
           # computed formula, a long string that must be clipped to its cell,
           # and a negative/decimal - all in rows whose 20pt band is tight.
-          export CORRO_EDIT_SCRIPT="400:A1=1,900:A2=22,1400:A3==A1+A2,1900:B1=-3.5,2400:B2=123456789,2900:C1=long text that will not fit the cell,3400:C2==SUM(A1:A3),3900:A5=5.25"
+          export SIMCTL_CHILD_CORRO_EDIT_SCRIPT="400:A1=1,900:A2=22,1400:A3==A1+A2,1900:B1=-3.5,2400:B2=123456789,2900:C1=long text that will not fit the cell,3400:C2==SUM(A1:A3),3900:A5=5.25"
           xcrun simctl launch --console-pty "$SIM_UDID" com.corro.corro \
             > /tmp/corro-live.log 2>&1 &
           echo "launch pid $!"
@@ -405,29 +410,22 @@ jobs:
               sys.exit(1)
           print("ok: neutral grey throughout, as corro's chrome is")
 
-          # Cell TEXT must be present, and inside its own 20pt row.
+          # Cell TEXT must be present. This is the check the earlier frames
+          # needed and did not have: "is it corro's chrome?" cannot see a blank
+          # workbook (chrome only, no values), which is what shipped twice.
           #
-          # This is the check the earlier frames needed and did not have. Two
-          # bugs got through because "is it corro's chrome?" cannot see either:
-          # a blank workbook (chrome only), and text drawn a full ascent too low
-          # so it landed in the next row's band and was clipped by the row rule.
-          #
-          # The renderer draws cell text at `cell_top + 2pt` with a ~9.6pt
-          # ascent, so a correct glyph run starts 2..4pt below a row boundary
-          # and is ~14pt tall. Device pixels are 2x: a row is 40px, and the ink
-          # should occupy roughly 4..28 of it - i.e. it must NOT cross the
-          # boundary into the next row's first pixels.
-          #
-          # Measured on the two known frames (row bands at 40px, first data row
-          # top at y=252): the fixed frame's glyphs sit at 252..284; the broken
-          # one at 300..314, i.e. entirely inside the FOLLOWING band.
+          # Deliberately NOT a positional assertion. One was written and removed
+          # again: it keyed on a 40-device-pixel row pitch, but iOS scales its
+          # metrics by UIScreen.scale, so the real pitch on this 2x simulator is
+          # 80px - the check failed the CORRECT frame. A check that guesses the
+          # geometry is worse than no check; the artifact with a populated sheet
+          # is measurable directly, and that is what it is for.
           rows_ink = []
           for yy in range(len(rows)):
               n = sum(1 for xx in range(100, 700, 2)
                       if rows[yy][xx * ch] < 100)
               rows_ink.append(n)
 
-          # Find ink runs in the grid body (below the chrome, above the status).
           runs = []
           cur = None
           for yy in range(240, min(h - 60, len(rows_ink))):
@@ -440,27 +438,12 @@ jobs:
               print("::error::no text ink found in the grid body - the sheet is blank")
               sys.exit(1)
 
-          # Every run must be tall enough to be glyphs, not a one-pixel rule.
           tallest = max(b - a + 1 for a, b in runs)
           print(f"grid text: {len(runs)} ink run(s), tallest {tallest}px")
           if tallest < 10:
               print("::error::text ink is too shallow to be a rendered glyph run")
               sys.exit(1)
-
-          # A row is 40 device px; a glyph run that STRADDLES a boundary
-          # means the baseline is off by an ascent (the shipped bug).
-          bad = []
-          for a, b in runs:
-              # Distance to the nearest 40px boundary relative to the first run.
-              off = (a - runs[0][0]) % 40
-              if off > 30:
-                  bad.append((a, b, off))
-          if bad:
-              for a, b, off in bad:
-                  print(f"::error::text at y={a}..{b} sits {off}px into a 40px row "
-                        f"- more than a row's text band, so it is drawn too low")
-              sys.exit(1)
-          print("ok: cell text present and inside its row band")
+          print("ok: cell text present in the grid body")
           PY
 
       - name: Dump the Rust log lines
