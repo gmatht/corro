@@ -159,34 +159,37 @@ jobs:
           fi
           echo "install ok"
 
-          # Launch DETACHED and LEAVE IT RUNNING. This is the process the
-          # screenshot must show, so it is not stopped until after the shot.
+          # Launch in the FOREGROUND with `--console-pty`, which streams the
+          # app's stdout/stderr to this step, and LEAVE IT RUNNING by putting
+          # the whole thing in the background *as one pipeline* - the app keeps
+          # running and its output keeps landing in the file.
           #
-          # `--console-pty` in the background is not usable (probed: it produced
-          # an empty file), which is why the app's stdout/stderr is read in a
-          # later step via a terminating `--console` relaunch. That relaunch is
-          # also why the health check had to be tightened: it must be tied to
-          # THIS process, not to the relaunch.
-          echo "--- launching (detached) ---"
-          xcrun simctl launch "$SIM_UDID" com.corro.corro | tee /tmp/corro-launch.txt
+          # Why this shape, after two failed attempts:
+          #   * `simctl launch` with no console: the app's stderr goes nowhere
+          #     we can read. `log show` does NOT capture it (probed originally:
+          #     only `--console` sees our lines). Run #98 proved this the hard
+          #     way - the readiness poll below grepped the unified log for 180 s
+          #     and never saw `ios backend initialised`, then screenshotted the
+          #     home screen, while the same marker appeared instantly once the
+          #     app was relaunched with `--console`.
+          #   * a *backgrounded* `--console-pty` produced an empty file (probed).
+          #     Redirecting the pipeline's own stdout to a file, with the
+          #     pipeline backgrounded, is what makes it both stream and survive.
+          echo "--- launching (foreground console, backgrounded as a pipeline) ---"
+          xcrun simctl launch --console-pty "$SIM_UDID" com.corro.corro \
+            > /tmp/corro-live.log 2>&1 &
+          echo "launch pid $!"
 
           # Wait for the app's own readiness marker. `ios backend initialised`
           # is printed by Rust once the host has handed over the root view, so
           # it is strictly before anything can draw - the earliest honest "the
           # UI exists" signal, and one a dead process cannot produce.
           #
-          # Read from the unified log, not a console file: this launch is
-          # detached, so there is no `--console` to read. `NSLog`/stderr from
-          # the Rust side does reach the unified log for a *detached* launch
-          # (the --console requirement applies to attaching to it).
-          #
           # 180 s budget: a cold first launch measured ~90 s on this runner.
           echo "--- waiting for the UI to come up (the app needs ~90s cold) ---"
           READY=0
           for i in $(seq 1 180); do
-            if xcrun simctl spawn "$SIM_UDID" log show --last 2m --style compact \
-                 --predicate 'eventMessage CONTAINS "rswidgets"' 2>/dev/null \
-                 | grep -qa "ios backend initialised"; then
+            if grep -qa "ios backend initialised" /tmp/corro-live.log 2>/dev/null; then
               echo "  t+${i}s: ios backend initialised"
               READY=1
               break
@@ -224,14 +227,11 @@ jobs:
       - name: Capture the app's startup output (stops the app)
         if: always()
         run: |
-          : > /tmp/corro-console.log
+          # The app has been running with `--console-pty` since the launch step,
+          # streaming to /tmp/corro-live.log - so there is nothing to relaunch.
+          # Copy it aside for the check, then stop the app.
+          cp /tmp/corro-live.log /tmp/corro-console.log 2>/dev/null || : > /tmp/corro-console.log
           xcrun simctl terminate "$SIM_UDID" com.corro.corro 2>/dev/null || true
-          xcrun simctl launch --console "$SIM_UDID" com.corro.corro \
-            > /tmp/corro-console.log 2>&1 &
-          CONSOLE_PID=$!
-          sleep 25
-          kill "$CONSOLE_PID" 2>/dev/null || true
-          wait "$CONSOLE_PID" 2>/dev/null || true
           echo "--- app output ---"
           tr -d '\000' < /tmp/corro-console.log | head -80 || echo "(no output)"
 
