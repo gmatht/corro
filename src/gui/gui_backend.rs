@@ -364,6 +364,15 @@ pub(crate) struct GuiState {
     /// entry keystroke (repair) or cleared by navigation/commit/cancel
     /// (then typing starts a fresh value, ratatui parity).
     entry_clicked: Cell<bool>,
+    /// Synthetic pointer for `--movie`: `(x, y, pressed)` in canvas pixels.
+    ///
+    /// X11 does not composite the cursor into an `x11grab` capture (verified: a
+    /// moved pointer changes no pixels in the grab), so a recording cannot show
+    /// the real mouse. The movie driver instead animates this position and the
+    /// canvas paints it, which is what makes a menu tour read as a pointer
+    /// travelling to an item and clicking it. `None` means nothing is drawn, so
+    /// ordinary interactive use is untouched.
+    movie_pointer: Cell<Option<(f64, f64, bool)>>,
     /// Cell address last shown in the formula bar. A bar refresh for a
     /// different cell ends click-edit intent (navigation resets to
     /// ratatui-style replace for the next keystroke).
@@ -1168,6 +1177,62 @@ fn render_grid(dc: &mut dyn DrawContext, state: &GuiState, w: i32, h: i32) {
         &mut padlocks,
     );
     *state.padlocks.borrow_mut() = padlocks;
+}
+
+/// Draw the synthetic movie pointer, if one is armed.
+///
+/// Drawn rather than relying on the X cursor, which `x11grab` does not capture
+/// (a moved pointer changes no pixels in the grab, verified) — so an
+/// unassisted recording cannot show the mouse at all. The arrow is outlined in
+/// white and filled in a dark colour so it stays legible over the grid, the
+/// menu bar and an open menu alike; `pressed` turns it red so a click reads in
+/// the recording.
+fn paint_movie_pointer(dc: &mut dyn DrawContext, state: &GuiState) {
+    // `(x, y)` is in **canvas** coordinates, not window coordinates: the canvas
+    // widget sits below the menu bar and the formula bar, so its origin is
+    // `2 * header_h()` down from the window top (48px at the default metrics).
+    // Anything computing a window-relative position for the pointer has to
+    // subtract that, or the arrow draws ~48px below where it was aimed.
+    let Some((x, y, pressed)) = state.movie_pointer.get() else {
+        return;
+    };
+    // Classic arrow: tip at (x, y), a tall leading edge and a notched tail.
+    const BODY: &[(f64, f64)] = &[
+        (0.0, 0.0),
+        (0.0, 17.0),
+        (4.5, 12.5),
+        (7.5, 19.0),
+        (10.5, 17.5),
+        (7.5, 11.0),
+        (13.5, 11.0),
+    ];
+    // Outline first, then the fill, so the arrow stays legible whether it sits
+    // over the pale grid or a dark menu surface. `pressed` turns it red, which
+    // is what makes a click read in a recording.
+    for i in 0..BODY.len() {
+        let (ax, ay) = BODY[i];
+        let (bx, by) = BODY[(i + 1) % BODY.len()];
+        stroke_segment(dc, x + ax, y + ay, x + bx, y + by, 3.5, 1.0, 1.0, 1.0);
+    }
+    let (r, g, b) = if pressed { (0.85, 0.1, 0.1) } else { (0.05, 0.05, 0.15) };
+    for row in 0..17 {
+        let t = row as f64 / 17.0;
+        stroke_segment(dc, x + 1.0, y + t * 17.0, x + 1.0 + 5.0 * (1.0 - t), y + t * 17.0, 2.0, r, g, b);
+    }
+    for row in 0..7 {
+        stroke_segment(dc, x + 7.0, y + 11.5 + row as f64, x + 10.0, y + 11.5 + row as f64, 3.0, r, g, b);
+    }
+}
+
+/// Draw a line of arbitrary direction as a thin filled rectangle.
+fn stroke_segment(dc: &mut dyn DrawContext, x0: f64, y0: f64, x1: f64, y1: f64, w: f64, r: f64, g: f64, b: f64) {
+    let steps = ((x1 - x0).abs().max((y1 - y0).abs())).ceil().max(1.0) as i32;
+    for i in 0..=steps {
+        let t = i as f64 / steps as f64;
+        let px = x0 + t * (x1 - x0);
+        let py = y0 + t * (y1 - y0);
+        dc.fill_rect(px - w / 2.0, py - w / 2.0, w, w, r, g, b, 1.0);
+    }
 }
 
 /// Assemble a full [`Viewport`] from display rows/columns the caller already
@@ -4066,6 +4131,7 @@ pub fn run_gui_with_movie(
         canvas_size: Cell::new((0, 0)),
         entry_snapshot: RefCell::new(String::new()),
         entry_clicked: Cell::new(false),
+        movie_pointer: Cell::new(None),
         entry_shown: Cell::new((usize::MAX, usize::MAX)),
         mode: Cell::new(GuiMode::Normal),
         last_row: Cell::new(cursor_row),
@@ -4591,6 +4657,10 @@ pub fn run_gui_with_movie(
         // The in-grid aggregate dropdown paints last so it sits above the
         // cells (and above the header/margin chrome).
         render_agg_dropdown(dc, &shared_draw, w, h);
+        // The synthetic movie pointer goes last of all: it has to be visible
+        // over the grid, the chrome and any open dropdown.
+        dc.clip(0.0, 0.0, w as f64, h as f64);
+        paint_movie_pointer(dc, &shared_draw);
         // Test marker: 8x8 square of 0xFEEDBE at top-left, drawn AFTER render_grid
         // so it appears on top of the grid background and is visible in screenshots.
         dc.fill_rect(0.0, 0.0, 8.0, 8.0, 254.0/255.0, 237.0/255.0, 190.0/255.0, 1.0);
