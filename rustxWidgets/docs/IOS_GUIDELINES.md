@@ -213,6 +213,57 @@ objects rather than a linked image. That is the closest thing to a
 `scripts/check_*_ios.sh` already do in `--emit=metadata` form. Anything past
 that — a `.a`, a `.dylib`, an app — needs a linker and therefore an SDK.
 
+## 8c. Where the simulator run actually stands
+
+`ios/corro/scripts/verify_all.sh` passes, and the app **builds, installs,
+launches and runs its full Rust startup** on a hosted macOS runner. The console
+capture shows the whole sequence, which is the fastest way to see where a
+future break is:
+
+```
+[rswidgets] ios_main: init_with_root
+[rswidgets] ios backend initialised
+[rswidgets] ios_main: building the App
+[rswidgets] ios_main: load_initial
+[rswidgets] ios_main: entering run_gui
+[rswidgets] run_gui: crash handlers installed
+[rswidgets] run_gui: App::init
+[rswidgets] run_gui: App::init ok
+[rswidgets] run_gui: new_window
+[rswidgets] run_gui: new_window ok
+[rswidgets] run_gui: new_box
+[rswidgets] run_gui: new_box ok
+[rswidgets] corro: menu model ready (6 menus, 64 items)
+[rswidgets] ios_main: run_gui returned
+PHASE: before_set_draw_callback
+DRAW_CALLBACK called: w=1 h=1
+PHASE: after_set_draw_callback
+PHASE: about_to_present
+PHASE: after_present
+```
+
+**Two known gaps**, both visible in that output:
+
+1. **The canvas is 1x1.** `DRAW_CALLBACK called: w=1 h=1` is the placeholder
+   from `canvas.set_size_request(1, 1)`, so the backend never learns the real
+   laid-out size. On Android that arrives from `View.onDraw`; on iOS the host
+   `SheetView` must report it (`corro_ios_canvas_size` does not exist yet), so
+   the sheet would render one row stretched over the screen — the same symptom
+   Android had before `CANVAS_SIZE` was wired up.
+2. **The process does not stay up.** It runs the whole startup and then exits
+   within ~15 s. `run_gui` returns normally (`IosApp::run` is documented as
+   returning immediately because UIKit owns the loop), no Rust code calls
+   `process::exit` on that path (both calls are inside `save_before_quit`), and
+   no crash report is produced for the app — so this is not a panic. The next
+   step is to find what terminates it; a `UIApplication` delegate logging in
+   `applicationWillTerminate:` plus `NSLog` from `main` after
+   `UIApplicationMain` returns would settle whether UIKit is being torn down or
+   the process is being reaped.
+
+Neither gap is a mystery in kind: both are "the host has not supplied something
+the backend needs", which is the same category as the five missing selectors
+that crashed `create_box` (see §3).
+
 ## 9. Debugging, and the iOS 7.1.2 path
 
 Debug in order, mirroring the Android section: shim present → dispatch fired →
