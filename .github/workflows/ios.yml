@@ -16,21 +16,33 @@ name: iOS
 #
 # Simulator builds need no signing identity, so no secrets are required.
 #
-# ⚠️ UNTESTED — this workflow has never been executed.
+# ✅ WORKING — run #97 (commit 7d64ee60) is green, every step.
 #
-# It was written and reviewed on a Linux host with no Xcode, no simulator, no
-# GitHub credentials and no network to GitHub, so none of the following is
-# confirmed: that the macos-14 image's Xcode accepts this project, that the
-# nightly toolchain + rust-src steps resolve, that the simulator device query
-# finds a name it expects, and that the app launches rather than crashing on an
-# objc_msgSend signature mismatch. The YAML and every `run` step are checked
-# for syntax by ios/corro/scripts/verify_all.sh, and nothing more.
+# It was written on a Linux host with no Xcode, no simulator and no GitHub
+# access, so the early runs were a debugging exercise against a real runner:
+# ~97 runs total, and most failures were this workflow's own probes rather than
+# the app. What that bought, all confirmed on a runner:
 #
-# Expect to iterate once or twice on first run, most likely on the toolchain
-# steps: ios/corro is a STANDALONE workspace (its own Cargo.lock), so the
-# rust-cache action and the component install are the parts most likely to
-# need adjusting. If it fails, the fix belongs here — not in the Rust code,
-# which is verified separately by the linux job below.
+#   * the ObjC compiles and links (the build step reached the simulator step at
+#     run #12, i.e. the bundle was produced);
+#   * the simulator boots, the app installs and launches, and it DRAWS:
+#     `SheetView.layoutSubviews`/`drawRect` fire at real sizes (375x616,
+#     375x667) with live CGContexts, which is exactly the evidence the health
+#     check now reads;
+#   * the first frame is captured and uploaded as `ios-simulator-screenshots`.
+#
+# The three liveness probes that were tried and are all wrong are kept written
+# down below so they are not retried: `launchctl list` reads the simulator's own
+# daemons, `pgrep` is absent, and `ps` is absent too (so it always printed
+# nothing and reported a healthy app as dead on every run). The pass condition
+# is now the app's own output, which a dead process cannot produce.
+#
+# Still NOT covered: iOS 7.1.2 (no hosted runner has the archived SDK), and
+# anything interactive — this captures one frame. The manual `simctl` taps in
+# docs/ios/README.md remain the way to exercise touch and typing.
+#
+# If it breaks, the fix belongs here — not in the Rust code, which is verified
+# separately by the linux job below (and by ios/corro/scripts/verify_all.sh).
 on:
   workflow_dispatch:
   push:

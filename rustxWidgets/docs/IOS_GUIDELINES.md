@@ -293,7 +293,10 @@ pixels.
   events; per-frame logging is diagnosis-only and must be removed before
   committing.
 * **Screenshots.** `xcrun simctl io booted screenshot shot.png`; taps via
-  `xcrun simctl io booted tap X Y` (Xcode 15+) or `idb`.
+  `xcrun simctl io booted tap X Y` (Xcode 15+) or `idb`. CI already captures
+  the first frame this way (§9's workflow note); the taps are what is left to
+  do by hand, since a touch or a keystroke cannot be scripted through
+  `simctl io` alone.
 * **Crash reports.** `objc_msgSend` with a wrong signature is the classic iOS
   crash and it does *not* produce a nice message — it lands in the wrong
   register. If a build crashes immediately on a call that works elsewhere,
@@ -322,21 +325,42 @@ pixels.
   The gate for all of them is the same: *something* must produce a build first.
   A farm or a streaming simulator cannot; only a Mac (or a rented one) can.
 
-* **`.github/workflows/ios.yml` is written for exactly that** — but note the
-  caveat: **it has never been executed.** It is a first draft, reviewed on a
-  host with no Xcode, no simulator and no GitHub access. It builds the app on
-  `macos-14`, boots a simulator, launches corro, screenshots the first frame,
-  asserts the process is still alive (catching an `objc_msgSend` signature
-  crash, which is the one iOS-specific failure mode that gives no backtrace),
-  and uploads the log lines under the `rswidgets`/`corro` tags. Simulator
-  builds need no signing identity, so the workflow needs no secrets. Its
-  companion `rust-ios-check` job runs the Linux cfg checks first, so a failure
-  points at the port rather than the Xcode plumbing.
+* **`.github/workflows/ios.yml` does exactly that, and it works.** It builds
+  the app on `macos-14`, boots a simulator, launches corro, screenshots the
+  first frame, asserts the app is alive *and drew* (an `objc_msgSend` signature
+  crash is the one iOS-specific failure mode that gives no backtrace), and
+  uploads the frame as the `ios-simulator-screenshots` artifact. Simulator
+  builds need no signing identity, so no secrets are required. Its companion
+  `rust-ios-check` job runs the Linux cfg checks first, so a failure points at
+  the port rather than the Xcode plumbing.
 
-  What *is* verified about it: the YAML parses and every `run` step passes
-  `bash -n` (`ios/corro/scripts/verify_all.sh` checks both). What is not: that
-  the steps actually succeed on a runner. Expect to iterate on the toolchain
-  steps at first run, since `ios/corro` is a standalone workspace and the
-  cache/component setup is the likeliest place to need adjusting.
+  **Status: green.** Run **#97** (commit `7d64ee60`) passed every step, and the
+  artifact is downloadable:
+
+  ```
+  gh run download --repo gmatht/corro --name ios-simulator-screenshots
+  ```
+
+  That answers §9's standing question — the first frame has been seen, not
+  merely compiled. Two things worth knowing about how it got there, because
+  they are the reusable lessons:
+
+  * The first ~96 runs were mostly the workflow debugging *itself*. In
+    particular three liveness probes were each wrong in a different direction
+    (`launchctl list` reads the simulator's own daemons; `pgrep` and `ps` do not
+    exist inside the simulator, so they printed nothing and reported a healthy
+    app as dead on every run). The pass condition is now evidence the app
+    produced itself — the Rust startup marker plus a `SheetView.drawRect` line,
+    neither of which a dead process can emit.
+  * The canvas needed a host-side fix that only showed up here: attached
+    subviews had a 0x0 frame, so `drawRect:` never ran (`w=1 h=1` in the
+    callback). That is the class of bug a compile-only check cannot catch, and
+    the reason the screenshot step is worth its CI minutes.
+
+  Earlier failures along the way are visible in the Actions tab; they are not
+  the app's — the port's Rust half is verified separately by the Linux cfg
+  checks, which have passed throughout.
 
   It cannot cover iOS 7.1.2: no hosted runner carries the archived SDK (§0).
+  Nor is any of it *interactive*: one frame is captured, so the touch and
+  soft-keyboard paths still need the manual `simctl` taps below.

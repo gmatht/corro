@@ -1,40 +1,68 @@
 # iOS screenshots — what exists, and what does not
 
-**There is no screenshot of the iOS 12+ UI.** The app has not been run: its
-Objective-C has never been compiled, because that needs macOS and an Apple SDK
-(`../rustxWidgets/docs/IOS_GUIDELINES.md` §3, §8b). Any image claiming to be
-"the iOS UI" would be fabricated.
+**A real iOS screenshot exists**, and this file was wrong for a while in saying
+otherwise. The app *has* been run: `.github/workflows/ios.yml` builds it on a
+hosted `macos-14` runner, boots an iPhone simulator, launches it, and
+`screencapture`s the first frame. As of **run #97** (commit `7d64ee60`) the
+whole job is green — build, boot, install, launch, **screenshot**, and the
+health check that verifies the app drew.
 
-What this directory does contain is the closest honestly-obtainable artefact:
-the **same widget tree and the same draw pipeline** rendered by the desktop
-backend, so the sheet, the formula bar and the chrome can be inspected rather
-than taken on trust.
+Where to get it:
+
+```
+gh run download --repo gmatht/corro --name ios-simulator-screenshots
+# or: Actions -> iOS -> a green run -> Artifacts -> ios-simulator-screenshots
+```
+
+That artifact (`ios-first-frame.png`, ~1.2 MB) is the image this directory used
+to say did not exist. It needs an authenticated `gh`/browser session, which is
+why it cannot be fetched and checked in from an unattended Linux checkout.
+
+## What this directory contains
+
+`desktop-tree-render.png` is the **fallback**: the same widget tree and draw
+pipeline rendered by the desktop backend, so the sheet, the formula bar and the
+chrome can be inspected offline (in a git clone, with no GitHub session). It is
+useful for that, and it is *not* an iOS render — see the table below.
+
+`../dist/screenshots/` holds a larger, regenerable set of the same kind,
+produced by `../../../scripts/screenshot.sh` on a Linux host.
 
 | File | What it is | What it proves | What it does NOT prove |
 |---|---|---|---|
 | `desktop-tree-render.png` | corro's real GUI (`cargo run --features gui -- --gui subtotal.corro`) captured from X on a Linux host | The sheet renders correctly through the shared `gui_backend` pipeline — grid lines, header bands, formula bar, the seeded sheet | Anything about iOS: not the iPhone metrics (`UIScreen.scale`), not the `UIStackView` layout, not Core Graphics text, not touch |
+| `ios-simulator-screenshots` (CI artifact, not checked in) | `xcrun simctl io … screenshot` on a booted iPhone simulator, from `ios.yml` | The iOS build is real and the first frame draws: Rust startup + `SheetView.drawRect` at a live CGContext, observed at real sizes (375x616, 375x667) | Interaction: it is one frame, and the touch/keyboard paths still need the manual `simctl` taps below |
 
 A larger, regenerable set of the same kind of image lives in
 [`dist/screenshots/`](../../dist/screenshots/SCREENSHOTS.md) (blank workbook,
 populated grid, formula entry), produced by `scripts/screenshot.sh`. None of
 them is an iOS screenshot, for the reasons below.
 
-## Why the iOS render cannot be produced here
+## Why the iOS render cannot be produced *in this checkout*
 
-1. **The ObjC never compiles** without `UIKit/UIKit.h` and `Foundation/Foundation.h`
-   — Zig does not ship them, and neither does this host (§8b of the guidelines).
-2. **No simulator** without Xcode, so there is no `simctl` to screenshot.
+1. **The ObjC does not compile here** — it needs `UIKit/UIKit.h` and
+   `Foundation/Foundation.h`, which this Linux host has nowhere (§8b of the
+   guidelines). The CI run compiles it on macOS, which is the whole point of
+   that workflow.
+2. **No simulator** without Xcode, so there is no `simctl` to screenshot. The
+   simulator runs on the `macos-14` runner, not here.
 3. The `ios-ui` example deliberately **exits before the event loop** (it is a CI
    check of the tree's *structure*, and a headless runner has no display), so it
    has no window to photograph.
 
+So the split is: **the image is produced by CI** (which is real, and green), and
+**this clone keeps a desktop-rendered stand-in** for offline inspection. Neither
+one is a substitute for the other.
+
 ## How to get the real ones
 
-**Without a Mac of your own:** `.github/workflows/ios.yml` is written to do
-this — builds on a hosted `macos-14` runner, boots a simulator, launches the
-app, screenshots the first frame and uploads the PNG as a build artifact. Be
-aware it is **untested**: it was authored without Xcode or GitHub access, so
-only its syntax is verified. The first run may need fixes.
+**Without a Mac of your own:** this is already working.
+`.github/workflows/ios.yml` builds on a hosted `macos-14` runner, boots a
+simulator, launches the app, screenshots the first frame and uploads the PNG as
+an artifact — **verified green on run #97** (`7d64ee60`), with every step
+passing including the screenshot and the health check. Earlier runs are in the
+Actions tab (97 of them at the time of writing); the failures along the way were
+mostly the workflow's own probes, not the app (see the workflow header).
 
 That runner is the *only* route to a real iOS screenshot from a non-Mac host,
 and it is a cloud build rather than a cloud *capture*: the simulator must run
