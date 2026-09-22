@@ -200,7 +200,11 @@ def main() -> int:
 
     for tool in ("Xvfb", "xdotool", "ffmpeg"):
         require(tool)
-    binary = REPO_ROOT / "target" / "debug" / "corro"
+    # See `gui_movie.find_binary`: the shared `target/debug/corro` is not safe
+    # to depend on while anything else may be building in this repo, because
+    # `gui` is not a default feature.
+    override = os.environ.get("CORRO_MOVIE_BIN")
+    binary = Path(override) if override else REPO_ROOT / "target" / "debug" / "corro"
     if not binary.exists():
         sys.exit(f"error: {binary} not found — run: cargo build --features gui")
     # `gui` is not a default feature, so a `cargo test`/`cargo run` in between

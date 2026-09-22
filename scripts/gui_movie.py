@@ -42,6 +42,19 @@ def find_binary(explicit: str | None, release: bool) -> Path:
         if not p.exists():
             sys.exit(f"error: binary not found: {p}")
         return p
+    # `CORRO_MOVIE_BIN` overrides the default location. The shared
+    # `target/debug/corro` is not safe to depend on: `gui` is not a default
+    # feature, so any other `cargo build`/`cargo test` in this repo silently
+    # replaces it with a binary that has no GUI, and the recording then fails in
+    # ways that look like rendering bugs. Point this at a private target
+    # directory (`CARGO_TARGET_DIR=/tmp/... cargo build --features gui`) when
+    # something else may be building.
+    override = os.environ.get("CORRO_MOVIE_BIN")
+    if override:
+        p = Path(override)
+        if not p.exists():
+            sys.exit(f"error: CORRO_MOVIE_BIN={override} does not exist")
+        return p
     profile = "release" if release else "debug"
     candidate = REPO_ROOT / "target" / profile / "corro"
     if candidate.exists():
