@@ -122,6 +122,25 @@ A good capture is recognisable numerically: ~500 distinct colours, grid grey
 `#BFBFBF` dominant, and most rows being grid lines. A blank window shows one or
 two colours instead - which is how the earlier blank canvases were caught.
 
+### Driving it (verified, not just launched)
+
+`xdotool` works against the toplevel, and the whole keystroke path can be
+confirmed without trusting the pixels:
+
+```sh
+DISPLAY=:99 xdotool windowactivate 0x400003
+DISPLAY=:99 xdotool type --window 0x400003 --delay 120 hello
+DISPLAY=:99 xdotool key  --window 0x400003 Return
+tail -3 ~/.corro/debug.log        # the app's own trace
+tail -1 subtotal.corro            # the op it committed
+```
+
+Typing `hello` then Return produced `SET A1 hello` in the workbook and
+`DRAW_CALLBACK called: w=1185 h=720` in the debug log - so keyboard input,
+the commit path and the redraw all work. (`subtotal.corro` is a checked-in
+fixture, so restore it with `git checkout --` afterwards; the run in this
+container did.)
+
 ## Reproducing it
 
 ```
