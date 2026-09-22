@@ -2567,11 +2567,16 @@ fn schedule_timer(ms: u32, f: Box<dyn FnMut() -> bool>) -> Result<(), crate::cor
             *mut std::os::raw::c_void,
             *mut std::os::raw::c_void,
         ) = std::mem::transmute(crate::backends::apple::msg_shim());
+        // The mode is the string VALUE of NSRunLoopCommonModes, which is
+        // "kCFRunLoopCommonModes" - not the constant's name. Passing
+        // "NSRunLoopCommonModes" looks right and silently registers the timer
+        // under a mode nothing runs in, i.e. it never fires. (Cost: one CI run
+        // in which every timer was created and none ever fired.)
         add(
             main_loop,
             selector("addTimer:forMode:"),
             timer,
-            crate::backends::apple::nsstring("NSRunLoopCommonModes"),
+            crate::backends::apple::nsstring("kCFRunLoopCommonModes"),
         );
     }
     crate::backends::apple::log_apple(&format!(
