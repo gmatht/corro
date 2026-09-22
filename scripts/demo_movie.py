@@ -241,6 +241,12 @@ def main() -> int:
                     "--confirm-ms", str(args.confirm_ms),
                     "--menu-hold-ms", str(args.menu_hold_ms),
                     "--capture-fps", str(args.capture_fps),
+                    # The cap is a per-segment safety net, and the 6000 default
+                    # is sized for the old 8/s rate. At 16/s a long workbook
+                    # (`main.corro` is 241 steps) runs past it and the segment
+                    # is silently truncated, so scale the allowance with the
+                    # capture rate.
+                    "--max-frames", str(int(args.capture_fps * 900)),
                     "-o", str(work / (Path(path).stem + ".mp4")),
                 ],
                 check=True,
