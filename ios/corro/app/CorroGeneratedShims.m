@@ -9,6 +9,18 @@
 
 // The C entry points emitted by the host crate (ios/corro or macos/corro).
 extern void corro_ios_callback(uint64_t callback_id);
+// Canvas callbacks, also exported by the host crate. Reached through macros so
+// the generated body stays free of platform-specific strings.
+extern void corro_ios_canvas_size(uint64_t canvas_id, int32_t w, int32_t h);
+extern void corro_ios_canvas_draw(uint64_t canvas_id, void *ctx, int32_t w, int32_t h);
+extern void corro_ios_canvas_click(uint64_t canvas_id, double x, double y);
+extern int  corro_ios_canvas_key(uint64_t canvas_id, uint32_t keyval, uint32_t mods);
+
+#define CORRO_CANVAS_SIZE(id, w, h)    corro_ios_canvas_size((id), (w), (h))
+#define CORRO_CANVAS_DRAW(id, c, w, h) corro_ios_canvas_draw((id), (c), (w), (h))
+#define CORRO_CANVAS_CLICK(id, x, y)   corro_ios_canvas_click((id), (x), (y))
+#define CORRO_CANVAS_KEY(id, k, m)     corro_ios_canvas_key((id), (k), (m))
+#define CORRO_GRAPHICS_CONTEXT()      UIGraphicsGetCurrentContext()
 
 #pragma mark - Callback trampoline
 
@@ -109,7 +121,7 @@ extern void corro_ios_callback(uint64_t callback_id);
     (void)arg0;
 }
 
-- (void)corroSetFlex:(NSInteger)arg0 {
+- (void)corroSetFlex:(BOOL)arg0 {
     (void)arg0;
 }
 
@@ -122,12 +134,10 @@ extern void corro_ios_callback(uint64_t callback_id);
     (void)arg0;
 }
 
-- (CGFloat)corroBoundsWidth {
-    return 0;
-}
-
-- (CGFloat)corroBoundsHeight {
-    return 0;
-}
-
 @end
+
+// The canvas view is hand-written by this host (ShimConfig::emit_canvas was
+// false); CorroGeneratedShims.h declares its contract.
+
+// The text measurer/drawer is hand-written by this host
+// (ShimConfig::emit_text was false); the header declares its contract.

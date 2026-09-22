@@ -15,7 +15,15 @@ import os, re, sys
 
 root = os.environ["CORRO_ROOT"]
 adapter = open(os.path.join(root, "rustxWidgets/rswidgets/src/backends_ios_adapter.rs")).read()
-shim = open(os.path.join(root, "ios/corro/app/CorroIosShims.m")).read()
+# BOTH files implement this contract: CorroGeneratedShims.m is the generator's
+# output (the forwarding shims) and CorroIosShims.m is the hand-written half
+# (canvas and text measurer). Checking only one reports false positives for
+# everything the other owns.
+shim = ""
+for rel in ("ios/corro/app/CorroGeneratedShims.m", "ios/corro/app/CorroIosShims.m"):
+    path = os.path.join(root, rel)
+    if os.path.exists(path):
+        shim += open(path).read()
 
 # Selectors the backend sends, in the `corro*` namespace it owns.
 sent = set(re.findall(r'"(corro[A-Za-z]+:?)"', adapter))

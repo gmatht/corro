@@ -31,19 +31,20 @@
 // The class the Rust backend instantiates for `create_canvas` (registered
 // with `set_sheet_view_class`, see corro_ios_root_ready). It remembers the
 // Rust canvas id so draw and touch callbacks can name it.
-@interface SheetView : UIView
+// `SheetView : UIView` is declared by the GENERATED header; this is the
+// extension carrying the state the hand-written body needs. (Re-declaring the
+// class itself is what collided with the generated header.)
+@interface SheetView ()
 /// Set by the backend right after construction (`corroSetCanvasId:`).
 @property (nonatomic, assign) uint64_t corroCanvasId;
 /// Re-entrancy guard for the fill-the-superview adjustment in layoutSubviews.
 @property (nonatomic, assign) BOOL corroFillingSuperview;
+/// Declared with its availability so clang accepts the UIKey uses inside.
+- (void)corroHandlePresses:(NSSet<UIPress *> *)presses API_AVAILABLE(ios(13.4));
 @end
 
 // Declared ahead of use so the availability annotation is visible at the call
 // site as well as at the definition (clang checks both).
-@interface SheetView ()
-- (void)corroHandlePresses:(NSSet<UIPress *> *)presses API_AVAILABLE(ios(13.4));
-@end
-
 @implementation SheetView
 
 - (void)corroSetCanvasId:(int64_t)canvasId {
@@ -213,64 +214,6 @@
 // declared here. Adding a method to the generated set therefore does not
 // require touching this file, and changing one of its signatures cannot
 // silently diverge.
-@interface UIView (CorroLayout)
-- (void)corroSetSpacing:(NSInteger)spacing;
-- (void)corroSetFlex:(BOOL)flex;
-- (void)corroSetMinWidth:(NSInteger)width;
-- (CGFloat)corroBoundsWidth;
-- (CGFloat)corroBoundsHeight;
-@end
-
-@implementation UIView (CorroLayout)
-
-// Declared as methods, not @property: a category cannot synthesise storage, and
-// the earlier @property form compiled to a warning about missing accessors.
-// Nothing needs to read these back - the Rust side only sends them, and
-// UIStackView keeps the real spacing via `setSpacing:`. They exist because
-// sending an unimplemented selector raises 'unrecognized selector' and crashed
-// create_box (see the header note above).
-- (void)corroSetSpacing:(NSInteger)spacing {
-    // UIStackView reads real spacing from `setSpacing:` (a CGFloat); this
-    // integer variant exists so the Rust side does not have to get the
-    // CGFloat ABI right on both 32- and 64-bit targets.
-    if ([self isKindOfClass:[UIStackView class]]) {
-        [(UIStackView *)self setSpacing:(CGFloat)spacing];
-    }
-}
-
-- (void)corroSetFlex:(BOOL)flex {
-    // A flexible child in a UIStackView is one with a low content-hugging
-    // priority, which is what lets it absorb the leftover space.
-    if ([self isKindOfClass:[UIStackView class]]) {
-        (void)flex;
-    }
-}
-
-// Border accessors, so the Rust side can size a child to its parent without
-// reading a CGRect back through objc_msgSend. A CGRect return uses the HFA
-// register convention on arm64, and guessing at that is the class of bug this
-// backend exists to avoid.
-- (CGFloat)corroBoundsWidth {
-    return CGRectGetWidth(self.bounds);
-}
-
-- (CGFloat)corroBoundsHeight {
-    return CGRectGetHeight(self.bounds);
-}
-
-- (void)corroSetMinWidth:(NSInteger)width {
-    if (width <= 0) {
-        return;
-    }
-    // A minimum width constraint keeps an empty text field tappable: an empty
-    // UITextField measures ~0, and without this the formula entry would have no
-    // hit area.
-    NSLayoutConstraint *c =
-        [self.widthAnchor constraintGreaterThanOrEqualToConstant:(CGFloat)width];
-    c.active = YES;
-}
-
-@end
 
 // ---------------------------------------------------------------------------
 // CorroIosTarget — the callback trampoline
@@ -285,20 +228,6 @@
 @property (nonatomic, assign) uint64_t callbackId;
 @end
 
-@implementation CorroIosTarget
-
-+ (instancetype)targetWithCallbackId:(NSInteger)callbackId {
-    CorroIosTarget *t = [[CorroIosTarget alloc] init];
-    t.callbackId = (uint64_t)callbackId;
-    return t;
-}
-
-- (void)corroFired:(id)sender {
-    (void)sender;
-    corro_ios_callback(self.callbackId);
-}
-
-@end
 
 // ---------------------------------------------------------------------------
 // CorroIosPicker — the drop-down contract
@@ -311,6 +240,19 @@
 @interface CorroIosPicker : UIButton
 @property (nonatomic, strong) NSMutableArray<NSString *> *corroItems;
 @property (nonatomic, assign) NSInteger corroIndex;
+@end
+
+// The generated header declares `corroBoundsWidth`/`corroBoundsHeight` but
+// emits no body for them (the generator's stub would return 0, and the adapter
+// sizes children to their parent with these - a 0 return is the 0x0 canvas
+// that made the sheet never draw). The bodies live here.
+@implementation UIView (CorroBounds)
+- (CGFloat)corroBoundsWidth {
+    return CGRectGetWidth(self.bounds);
+}
+- (CGFloat)corroBoundsHeight {
+    return CGRectGetHeight(self.bounds);
+}
 @end
 
 @implementation CorroIosPicker
@@ -351,31 +293,12 @@
 // slant:weight:` are declared in the generated header. The font helper below is
 // this file's own business, so it stays in an extension.
 @interface CorroIosText ()
+// `measure:` and `drawText:` are declared by the GENERATED header
+// (CorroGeneratedShims.h) from the same signature table the Rust adapter
+// sends, so they are deliberately not restated here - a second declaration is
+// what produced the conflicting-types errors, and one source of truth is the
+// point of generating them.
 + (UIFont *)fontForFamily:(NSString *)family size:(CGFloat)size weight:(NSInteger)weight;
-
-// Declared here so clang knows the real signatures. Without these, the
-// message sends below are checked against an implicit `id`-typed guess, and
-// clang warns 'conflicting parameter types in implementation of
-// drawText:...: "__strong id" vs "CGContextRef"' - the Rust side passes the
-// context as a raw pointer, which is an `id` to the compiler.
-- (CGRect *)measure:(NSString *)text
-               font:(NSString *)family
-               size:(CGFloat)size
-              slant:(NSInteger)slant
-             weight:(NSInteger)weight;
-
-- (void)drawText:(NSString *)text
-             ctx:(CGContextRef)ctx
-            font:(NSString *)family
-               x:(CGFloat)x
-               y:(CGFloat)y
-            size:(CGFloat)size
-               r:(CGFloat)red
-               g:(CGFloat)green
-               b:(CGFloat)blue
-               a:(CGFloat)alpha
-           slant:(NSInteger)slant
-          weight:(NSInteger)weight;
 @end
 
 @implementation CorroIosText
@@ -494,48 +417,6 @@
 @property (nonatomic, strong) NSMutableArray<NSString *> *titles;
 @end
 
-@implementation CorroIosAlert
-
-+ (instancetype)corroNewAlert {
-    CorroIosAlert *wrapper = [[CorroIosAlert alloc] init];
-    wrapper.titles = [NSMutableArray array];
-    if ([UIAlertController class] != nil) {
-        wrapper.native = [UIAlertController alertControllerWithTitle:nil
-                                                            message:nil
-                                                     preferredStyle:UIAlertControllerStyleAlert];
-    } else {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-        wrapper.native = [[UIAlertView alloc] initWithTitle:nil
-                                                   message:nil
-                                                  delegate:nil
-                                         cancelButtonTitle:nil
-                                         otherButtonTitles:nil];
-#pragma clang diagnostic pop
-    }
-    return wrapper;
-}
-
-- (void)corroSetTitle:(NSString *)title {
-    [self.native setValue:title forKey:@"title"];
-}
-
-- (void)corroAddAction:(NSString *)title {
-    [self.titles addObject:title];
-    if ([self.native isKindOfClass:[UIAlertController class]]) {
-        UIAlertController *ac = (UIAlertController *)self.native;
-        [ac addAction:[UIAlertAction actionWithTitle:title
-                                              style:UIAlertActionStyleDefault
-                                            handler:nil]];
-    } else {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-        [(UIAlertView *)self.native addButtonWithTitle:title];
-#pragma clang diagnostic pop
-    }
-}
-
-@end
 
 // `corroPresentDialog:` on a view controller: present whatever the alert
 // wrapper holds. Declared as a category so the backend's message send resolves.
@@ -543,21 +424,7 @@
 - (void)corroPresentDialog:(id)dialog;
 @end
 
-@implementation UIViewController (CorroIosPresent)
-
-- (void)corroPresentDialog:(id)dialog {
-    CorroIosAlert *wrapper = (CorroIosAlert *)dialog;
-    if (wrapper == nil) {
-        return;
-    }
-    if ([wrapper.native isKindOfClass:[UIAlertController class]]) {
-        [self presentViewController:(UIAlertController *)wrapper.native animated:YES completion:nil];
-    } else {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-        [(UIAlertView *)wrapper.native show];
-#pragma clang diagnostic pop
-    }
-}
-
-@end
+// `corroPresentDialog:` is implemented by the GENERATED category
+// `UIViewController (CorroPresent)` in CorroGeneratedShims.m. It was also
+// implemented here, which is two implementations of one selector across two
+// categories of the same class - the later-loaded one silently wins.

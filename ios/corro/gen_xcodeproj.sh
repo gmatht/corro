@@ -43,7 +43,11 @@ ID_PLIST="$(hexid 17)"
 # build files at 0x40+, so the two sets can never collide.
 # main.m first: the app needs a process entry point, or the link fails with
 # `"_main", referenced from ...` (found by CI).
-declare -a SRC_NAMES=("main.m" "AppDelegate.m" "SceneDelegate.m" "CorroViewController.m" "CorroIosShims.m")
+# CorroGeneratedShims.m is rswidgets' generated ABI contract (one signature
+# table -> ObjC). It must be COMPILED, not just imported: the header declares
+# the classes and the .m provides the forwarding bodies, so omitting it left
+# the declarations checked but the implementations unlinked.
+declare -a SRC_NAMES=("main.m" "AppDelegate.m" "SceneDelegate.m" "CorroViewController.m" "CorroGeneratedShims.m" "CorroIosShims.m")
 declare -a HDR_NAMES=("AppDelegate.h" "SceneDelegate.h" "CorroViewController.h" "CorroBridge.h")
 SRC_IDS=()
 HDR_IDS=()

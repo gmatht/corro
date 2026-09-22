@@ -1407,11 +1407,25 @@ mod ios_adapter {
         // pointer in, one pointer out, no struct-return register rules to get
         // wrong on 32-bit. The host frees its own buffer contract by handing
         // ownership over; we free it with the same C allocator (`free`).
+        // The selector has FIVE colon-separated parts, so it takes five
+        // arguments: text, font, size, slant, weight. This call used to pass
+        // only four - `ns_font` was computed, null-checked and then never
+        // handed over - so the ObjC side read the `font:` parameter out of a
+        // register the caller had never set. Found by generating the ObjC
+        // declarations from the adapters' own signatures: they disagreed.
         let rect_ptr = raw_send!(
             shim,
             "measure:font:size:slant:weight:",
-            unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, f64, i32, i32) -> *mut CGRect,
-            (ns_text, size, slant, weight)
+            unsafe extern "C" fn(
+                *mut c_void,
+                *mut c_void,
+                *mut c_void,
+                *mut c_void,
+                f64,
+                i32,
+                i32,
+            ) -> *mut CGRect,
+            (ns_text, ns_font, size, slant, weight)
         );
         if rect_ptr.is_null() {
             return None;

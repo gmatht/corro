@@ -51,5 +51,33 @@ fn main() {
         std::env::set_var(apple_generator::PROJECT_ENV, root);
     }
 
-    apple_generator::run();
+    // The iOS app's configuration: the canvas needs the fill-the-superview
+    // fallback (it attaches the sheet inside a container, not a stack view) and
+    // deploys below the 13.4 that UIKey needs, so the key path is guarded.
+    // See rswidgets::apple_generator::CanvasViewConfig for every knob.
+    let mut config = apple_generator::ShimConfig::for_platform(apple_generator::Platform::Ios);
+    config.canvas = apple_generator::CanvasViewConfig::ios("SheetView");
+    config.text = apple_generator::TextShimConfig::ios("CorroIosText");
+    // The canvas and text classes are already hand-written and richer than the
+    // generated defaults here (the version table, the diagnostic tracing), so
+    // this app generates only the forwarding shims + the declarations. That is
+    // the `override` half of "generated with manual overrides": delete a file
+    // and the generator fills it in.
+    config.emit_canvas = false;
+    config.emit_text = false;
+
+    if let Some(root) = apple_generator::project_root_from_env() {
+        if let Err(e) = apple_generator::generate_with(&root, apple_generator::Platform::Ios, &config) {
+            println!("cargo:warning=rswidgets Apple shim generation failed ({e})");
+        }
+    } else {
+        println!(
+            "cargo:warning=rswidgets Apple shim generation skipped; set {} to an Apple project root",
+            apple_generator::PROJECT_ENV
+        );
+    }
+    println!(
+        "cargo:rerun-if-env-changed={}",
+        apple_generator::PROJECT_ENV
+    );
 }
