@@ -67,6 +67,36 @@ pub unsafe extern "C" fn corro_ios_root_ready(root: *mut c_void, view_controller
     }
 }
 
+
+/// Run `f`, and if it panics report the *real* message before re-panicking.
+///
+/// Every `extern "C"` entry point here needs this. A panic inside a
+/// non-unwinding frame aborts with "panic in a function that cannot unwind" and
+/// the original message is lost - which is exactly what happened to the draw
+/// callback: the app died on its first real frame and the only thing the CI log
+/// could show was `panicking.rs:225`, a location inside the standard library.
+/// The frames that would have named the closure were in the log; the *message*
+/// was not. This recovers it.
+///
+/// Re-panicking after reporting is deliberate: swallowing the panic would leave
+/// a half-drawn UI running, and the caller (an ObjC callback) has no way to
+/// handle an error.
+#[inline]
+fn report_panics<R>(what: &str, f: impl FnOnce() -> R) -> R {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(v) => v,
+        Err(payload) => {
+            let msg = payload
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_owned())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "<non-string panic payload>".to_owned());
+            rswidgets::backends::ios::log_ios(&format!("PANIC in {what}: {msg}"));
+            std::panic::resume_unwind(payload);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Canvas (SheetView)
 // ---------------------------------------------------------------------------
@@ -87,9 +117,13 @@ pub unsafe extern "C" fn corro_ios_canvas_draw(
     w: i32,
     h: i32,
 ) {
-    // SAFETY: contract above; dispatch_draw runs the closure synchronously
-    // and does not retain the context.
-    unsafe { rswidgets::backends_ios_adapter::dispatch_draw(canvas_id, ctx, w, h) };
+    // Wrapped: this is where the app died (see `report_panics`), and the
+    // unwrapped form left only `panicking.rs:225` in the log.
+    report_panics("corro_ios_canvas_draw", || {
+        // SAFETY: contract above; dispatch_draw runs the closure synchronously
+        // and does not retain the context.
+        unsafe { rswidgets::backends_ios_adapter::dispatch_draw(canvas_id, ctx, w, h) };
+    });
 }
 
 /// Called from `SheetView.layoutSubviews`: tells the backend the size the host
