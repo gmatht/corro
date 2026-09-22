@@ -33,6 +33,8 @@ NSNotificationName const CorroWillSuspendNotification = @"CorroWillSuspend";
 // delegate still has to keep this method for the older deployment targets.
 - (BOOL)application:(UIApplication *)application
 didFinishLaunchingWithOptions:(NSDictionary<UIApplicationLaunchOptionsKey, id> *)launchOptions {
+    fprintf(stderr, "[corro] application:didFinishLaunchingWithOptions\n");
+    fflush(stderr);
     (void)application;
     (void)launchOptions;
     if (@available(iOS 13.0, *)) {

@@ -9,12 +9,21 @@
 
 #import "SceneDelegate.h"
 #import "CorroViewController.h"
+#import <stdio.h>
 
 @implementation SceneDelegate
 
 - (void)scene:(UIScene *)scene
 willConnectToSession:(UISceneSession *)session
       options:(UISceneConnectionOptions *)connectionOptions {
+    // Decisive probe: if this never prints, the plist's
+    // UISceneDelegateClassName did not resolve and UIKit never connected a
+    // scene - which is exactly the shape of the observed failure (the app
+    // starts, runs its whole Rust setup, then SpringBoard removes the scene
+    // and the process goes away without applicationWillTerminate).
+    fprintf(stderr, "[corro] scene:willConnectToSession (%s)\n",
+            NSStringFromClass([scene class]).UTF8String);
+    fflush(stderr);
     (void)session;
     (void)connectionOptions;
     if (![scene isKindOfClass:[UIWindowScene class]]) {
@@ -36,6 +45,8 @@ willConnectToSession:(UISceneSession *)session
     nav.navigationBarHidden = NO;
     self.window.rootViewController = nav;
     [self.window makeKeyAndVisible];
+    fprintf(stderr, "[corro] scene: window made key\n");
+    fflush(stderr);
 }
 
 @end
