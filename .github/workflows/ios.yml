@@ -141,24 +141,15 @@ jobs:
           # normally. Launching detached and grepping the unified log (which
           # captures our stderr writes and the crash) is the combination that
           # actually works.
-          xcrun simctl launch "$SIM_UDID" com.corro.corro | tee /tmp/corro-launch.txt
-          sleep 20
-
-          # Our stderr writes are NOT in the unified log (probed: only Apple's
-          # own frames appear), so read them the supported way - simctl's
-          # --console / --console-pty attached to the app *through* the
-          # simulator, which has to be the foreground process of a pipeline
-          # rather than a backgrounded subshell.
+          # ORDER MATTERS, and getting it wrong wasted a run: the console
+          # capture below has to stop the app to attach, so it must NOT run
+          # before the liveness check or the check always reports a process we
+          # ourselves killed.
           #
-          # `simctl launch --console` (no pty) writes the app's stdout/stderr to
-          # our stdout, so a short-lived second launch is what actually shows
-          # the startup lines.
-          echo "--- app output (second launch, console attached) ---"
-          # `timeout` does not exist on macOS runners (found by a failed run),
-          # so the bounded wait is done by backgrounding the launch and killing
-          # it after a fixed sleep. --console stays attached to the app for its
-          # lifetime, hence the kill.
-          xcrun simctl terminate "$SIM_UDID" com.corro.corro 2>/dev/null || true
+          # 1. capture startup output (this launch is killed at the end of the
+          #    step, because --console stays attached for the app's lifetime);
+          # 2. then relaunch detached, which is what stays up for the check.
+          echo "--- app output (launch with console attached) ---"
           : > /tmp/corro-console.log
           xcrun simctl launch --console "$SIM_UDID" com.corro.corro \
             > /tmp/corro-console.log 2>&1 &
@@ -167,6 +158,11 @@ jobs:
           kill "$CONSOLE_PID" 2>/dev/null || true
           wait "$CONSOLE_PID" 2>/dev/null || true
           tr -d '\000' < /tmp/corro-console.log | head -40 || echo "(no output)"
+
+          echo "--- relaunching detached for the liveness check ---"
+          xcrun simctl terminate "$SIM_UDID" com.corro.corro 2>/dev/null || true
+          xcrun simctl launch "$SIM_UDID" com.corro.corro | tee /tmp/corro-launch.txt
+          sleep 10
           echo "--- is the app process alive? ---"
           # `ps -ax` inside the simulator DOES list app processes; `pgrep` there
           # does not (it failed with NSPOSIXErrorDomain code=2 - pgrep is not
