@@ -449,7 +449,11 @@ pub fn install_debug_crash_handlers() {
     }
 }
 
-#[cfg(unix)]
+// Gated to match its only callers (`write_backtrace_to_stderr` and the signal
+// handlers, both `all(unix, not(target_os = "android"))`). Android is unix but
+// has no `backtrace()`, so a plain `unix` gate compiled this into the Android
+// build with nothing able to call it.
+#[cfg(all(unix, not(target_os = "android")))]
 unsafe fn write_stderr(msg: &[u8]) {
     libc::write(libc::STDERR_FILENO, msg.as_ptr() as *const libc::c_void, msg.len());
 }

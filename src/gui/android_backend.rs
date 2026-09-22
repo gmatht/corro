@@ -46,10 +46,7 @@ pub fn run_android_default() -> Result<(), Box<dyn std::error::Error>> {
 /// actions plus an overflow popup holding every top-level menu, and each
 /// item dispatches the same `app.*` action name the desktop build uses.
 #[cfg(target_os = "android")]
-pub fn install_menu_strip(
-    rxapp: &rswidgets::App,
-    shared: &std::rc::Rc<super::gui_backend::GuiState>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub fn install_menu_strip() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use crate::gui::menu;
 
     let strip_ptr = rswidgets::backends::android::create_menu_strip("corro")?;
@@ -88,9 +85,8 @@ pub fn install_menu_strip(
         root.as_obj().as_raw() as *mut std::os::raw::c_void,
         strip_ptr as *mut std::os::raw::c_void,
     );
-    // Keep the strip alive for the process lifetime (the layout holds a
-    // global ref; the Rust handle is only needed for the calls above).
-    let _ = rxapp;
+    // The layout holds a global ref, so the strip stays alive for the process
+    // lifetime; the Rust handle is only needed for the calls above.
     Ok(())
 }
 

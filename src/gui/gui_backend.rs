@@ -180,7 +180,17 @@ pub(crate) fn metrics_scale() -> f64 {
 /// existing behaviour or output changes.
 #[inline(always)]
 pub(crate) fn phase(marker: &str) {
-    #[cfg(any(target_os = "android", target_os = "ios"))]
+    // Android and iOS need the same startup breadcrumb, but the loggers are
+    // different modules and each exists only on its own target: `log_ios`
+    // lives behind `cfg(target_os = "ios")`, so calling it unconditionally
+    // from an android|ios gate failed to compile on Android. Route each to
+    // its own sink - logcat on Android (via the helper below), the UIKit
+    // logger on iOS.
+    #[cfg(target_os = "android")]
+    {
+        super::android_backend::logcat(marker);
+    }
+    #[cfg(target_os = "ios")]
     {
         rswidgets::backends::ios::log_ios(marker);
     }
@@ -3493,14 +3503,6 @@ pub(crate) fn dispatch_mobile_menu_action(action: &str) {
     }
 }
 
-/// Android-facing alias, kept because `src/gui/android_backend.rs` and the
-/// Android cdylib call it by this name (and because the name appears in
-/// ANDROID_GUIDELINES.md). The implementation is the shared one above.
-#[cfg(target_os = "android")]
-pub(crate) fn publish_android_menu_state(state: &Rc<GuiState>) {
-    publish_mobile_menu_state(state);
-}
-
 /// Android-facing alias for [`dispatch_mobile_menu_action`] (see above).
 #[cfg(target_os = "android")]
 pub(crate) fn dispatch_android_menu_action(action: &str) {
@@ -4130,7 +4132,7 @@ pub fn run_gui_with_movie(
         publish_mobile_menu_state(&shared);
         // A missing/mismatched MenuStrip class must not take the whole UI
         // down: the sheet is still usable without menus.
-        if let Err(e) = super::android_backend::install_menu_strip(&rxapp, &shared) {
+        if let Err(e) = super::android_backend::install_menu_strip() {
             eprintln!("android menu strip unavailable: {e}");
         }
     }

@@ -4876,6 +4876,7 @@ impl App {
             );
             crate::debug_log::log(&post_msg);
             eprintln!("{}", post_msg);
+            #[cfg(debug_assertions)]
             debug_instrumentation::trace_setcell_construction(&addr, dbg_ui_mc, dbg_wb_mc);
         }
         // Use apply_single_op which will push the inverse op and then either
