@@ -92,6 +92,36 @@ check measures the achromatic fraction of the lower two thirds and requires
 >50% (corro's chrome is neutral grey throughout — measured 100% for this frame,
 98.7% for a real desktop render, 2.2% for the home screen that shipped once).
 
+## Running corro's GUI here (verified)
+
+`xwininfo -root -tree` on `:99` shows a real toplevel:
+
+```
+0x400003 "corro 0.7.0": ("corro" "Corro")  1200x800+0+0
+```
+
+Two requirements, both learned by watching it fail:
+
+* **Use a LIVE display.** X sockets exist for `:0`, `:66` and `:78` in this
+  container, but only `:99` answers `xdpyinfo`. Launching on a dead one produces
+  NO error: the process sits in state `S` indefinitely while GTK waits, and
+  stderr has been redirected to `~/.corro/debug.log` (`src/main.rs` does that),
+  so the log stays empty too.
+* **Detach with `setsid`.** A plain background job ends up in state `T`
+  (stopped), because job control stops it as the parent command exits.
+
+```sh
+setsid env DISPLAY=:99 ./target/debug/corro --gui subtotal.corro \
+  > /tmp/gui.log 2>&1 < /dev/null &
+sleep 45
+DISPLAY=:99 xwininfo -root -tree | grep corro        # the toplevel
+DISPLAY=:99 import -window 0x400003 shot.png         # capture it
+```
+
+A good capture is recognisable numerically: ~500 distinct colours, grid grey
+`#BFBFBF` dominant, and most rows being grid lines. A blank window shows one or
+two colours instead - which is how the earlier blank canvases were caught.
+
 ## Reproducing it
 
 ```
