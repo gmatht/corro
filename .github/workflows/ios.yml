@@ -190,21 +190,29 @@ jobs:
       # app in order to attach --console.
       - name: Check the app is still alive (did not crash on launch)
         run: |
-          # Probe history, because three attempts gave FALSE NEGATIVES and
-          # each sent the investigation after a crash that had not happened:
-          #   * `simctl spawn launchctl list`  -> shows only the simulator's own
-          #     daemons (apps do appear once launched, but the naive grep was
-          #     wrong about what absence meant);
-          #   * `simctl spawn pgrep`           -> pgrep does not exist there;
-          #   * `simctl spawn ps -ax`          -> ps does not exist there; it
-          #     printed nothing, so the grep ALWAYS failed and this step
-          #     reported a healthy app as dead on every single run.
-          # `launchctl list` is verified to work on a runner.
-          if xcrun simctl spawn "$SIM_UDID" launchctl list 2>/dev/null | grep -qi "corro"; then
-            echo "corro is running"
+          # The PRIMARY health signal is the app's own output, not a process
+          # probe. Three probes have been tried and all three were wrong in at
+          # least one direction:
+          #   * `simctl spawn launchctl list` -> lists the simulator's own
+          #     daemons; an app may or may not appear, so absence proves little;
+          #   * `simctl spawn pgrep`          -> pgrep does not exist there;
+          #   * `simctl spawn ps -ax`         -> ps does not exist there either,
+          #     so its output was always empty and this step reported a healthy
+          #     app as dead on EVERY run.
+          #
+          # What cannot lie is evidence the app produced itself: the Rust
+          # startup markers, and the host's UIKit callbacks (layoutSubviews /
+          # drawRect), which only run in a live process. If those are present,
+          # the app ran - whatever any process table says.
+          LOG="$(xcrun simctl spawn "$SIM_UDID" log show --last 2m --style compact \
+                 --predicate 'process == "corro"' 2>/dev/null || true)"
+          if printf '%s' "$LOG" | grep -qa "ios backend initialised" \
+             && printf '%s' "$LOG" | grep -qa "SheetView.drawRect"; then
+            echo "corro ran and drew (Rust startup + a Core Graphics draw both seen)"
             exit 0
           fi
-          echo "--- launchctl entries containing 'corro' ---"
+          echo "::error::no evidence the app ran - neither the Rust startup nor a drawRect: appeared"
+          echo "--- launchctl entries containing 'corro' (supplementary) ---"
           xcrun simctl spawn "$SIM_UDID" launchctl list 2>/dev/null | grep -i corro || echo "(none)"
           echo "::error::corro is not running after launch"
           # Diagnose rather than just fail: crash reports first (they name the
