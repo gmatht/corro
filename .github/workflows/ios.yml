@@ -141,28 +141,17 @@ jobs:
           # normally. Launching detached and grepping the unified log (which
           # captures our stderr writes and the crash) is the combination that
           # actually works.
-          # ORDER MATTERS, and getting it wrong wasted a run: the console
-          # capture below has to stop the app to attach, so it must NOT run
-          # before the liveness check or the check always reports a process we
-          # ourselves killed.
+          # Startup output is captured in the NEXT step, not here: attaching
+          # --console requires the app to be stopped first, and the liveness
+          # check below needs it running. Mixing the two in one step is what
+          # made an earlier run report a process this script had itself killed.
           #
-          # 1. capture startup output (this launch is killed at the end of the
-          #    step, because --console stays attached for the app's lifetime);
-          # 2. then relaunch detached, which is what stays up for the check.
-          echo "--- app output (launch with console attached) ---"
-          : > /tmp/corro-console.log
-          xcrun simctl launch --console "$SIM_UDID" com.corro.corro \
-            > /tmp/corro-console.log 2>&1 &
-          CONSOLE_PID=$!
-          sleep 20
-          kill "$CONSOLE_PID" 2>/dev/null || true
-          wait "$CONSOLE_PID" 2>/dev/null || true
-          tr -d '\000' < /tmp/corro-console.log | head -40 || echo "(no output)"
-
-          echo "--- relaunching detached for the liveness check ---"
-          xcrun simctl terminate "$SIM_UDID" com.corro.corro 2>/dev/null || true
+          # Launch detached and leave it up - this is the process the check
+          # verifies.
           xcrun simctl launch "$SIM_UDID" com.corro.corro | tee /tmp/corro-launch.txt
-          sleep 10
+          sleep 15
+          echo "--- is the app process alive? ---"
+          xcrun simctl spawn "$SIM_UDID" ps -ax 2>/dev/null | grep -i "[c]orro" || true
           echo "--- is the app process alive? ---"
           # `ps -ax` inside the simulator DOES list app processes; `pgrep` there
           # does not (it failed with NSPOSIXErrorDomain code=2 - pgrep is not
@@ -172,6 +161,22 @@ jobs:
 
       - name: Screenshot the first frame
         run: xcrun simctl io "$SIM_UDID" screenshot ios-first-frame.png
+
+      # Runs AFTER the liveness check and the screenshot, because it stops the
+      # app in order to attach --console.
+      - name: Capture the app's startup output
+        if: always()
+        run: |
+          : > /tmp/corro-console.log
+          xcrun simctl terminate "$SIM_UDID" com.corro.corro 2>/dev/null || true
+          xcrun simctl launch --console "$SIM_UDID" com.corro.corro \
+            > /tmp/corro-console.log 2>&1 &
+          CONSOLE_PID=$!
+          sleep 20
+          kill "$CONSOLE_PID" 2>/dev/null || true
+          wait "$CONSOLE_PID" 2>/dev/null || true
+          echo "--- app output ---"
+          tr -d '\000' < /tmp/corro-console.log | head -60 || echo "(no output)"
 
       - name: Check the app is still alive (did not crash on launch)
         run: |
