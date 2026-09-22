@@ -149,8 +149,21 @@ jobs:
           # Launch detached and leave it up - this is the process the check
           # verifies.
           xcrun simctl launch "$SIM_UDID" com.corro.corro | tee /tmp/corro-launch.txt
-          sleep 15
-          echo "--- is the app process alive? ---"
+          # Poll instead of a single sleep+check. If the app is launched,
+          # suspended and reaped by the environment, an immediate check will
+          # catch it alive and a later one will not - which distinguishes
+          # "never started" from "started then dropped", and gives the
+          # screenshot step a window in which the UI actually exists.
+          echo "--- polling for the app process ---"
+          for i in $(seq 1 20); do
+            if xcrun simctl spawn "$SIM_UDID" ps -ax 2>/dev/null | grep -qi "[c]orro"; then
+              echo "  t+${i}s: alive"
+            else
+              echo "  t+${i}s: gone"
+            fi
+            sleep 1
+          done
+          echo "--- final state ---"
           xcrun simctl spawn "$SIM_UDID" ps -ax 2>/dev/null | grep -i "[c]orro" || true
           echo "--- is the app process alive? ---"
           # `ps -ax` inside the simulator DOES list app processes; `pgrep` there
