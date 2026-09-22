@@ -154,17 +154,28 @@ jobs:
           # catch it alive and a later one will not - which distinguishes
           # "never started" from "started then dropped", and gives the
           # screenshot step a window in which the UI actually exists.
+          # `launchctl list` is the probe that works. THREE earlier attempts
+          # were wrong, and each reported a healthy app as crashed:
+          #   * `simctl spawn launchctl list` -> only shows the simulator's own
+          #     daemons, and apps were assumed absent;
+          #   * `simctl spawn pgrep`          -> pgrep does not exist there;
+          #   * `simctl spawn ps -ax`         -> ps does not exist there either,
+          #     so it printed NOTHING and grep always failed. That is what the
+          #     't+1s: gone ... t+20s: gone' poll was measuring: a missing
+          #     binary, not a dead app.
+          # `launchctl list` prints a PID column and app processes appear in it
+          # (verified on a runner, where it lists e.g. com.apple.homed).
           echo "--- polling for the app process ---"
           for i in $(seq 1 20); do
-            if xcrun simctl spawn "$SIM_UDID" ps -ax 2>/dev/null | grep -qi "[c]orro"; then
+            if xcrun simctl spawn "$SIM_UDID" launchctl list 2>/dev/null | grep -qi "corro"; then
               echo "  t+${i}s: alive"
             else
-              echo "  t+${i}s: gone"
+              echo "  t+${i}s: not listed"
             fi
             sleep 1
           done
-          echo "--- final state ---"
-          xcrun simctl spawn "$SIM_UDID" ps -ax 2>/dev/null | grep -i "[c]orro" || true
+          echo "--- final state (launchctl) ---"
+          xcrun simctl spawn "$SIM_UDID" launchctl list 2>/dev/null | grep -i corro || echo "(not listed)"
           echo "--- is the app process alive? ---"
           # `ps -ax` inside the simulator DOES list app processes; `pgrep` there
           # does not (it failed with NSPOSIXErrorDomain code=2 - pgrep is not
@@ -179,19 +190,22 @@ jobs:
       # app in order to attach --console.
       - name: Check the app is still alive (did not crash on launch)
         run: |
-          # `ps -ax` inside the simulator is the check that works. Two earlier
-          # probes gave FALSE NEGATIVES on a healthy launch:
-          #   * `simctl spawn launchctl list` shows the simulator's own jobs;
-          #   * `simctl spawn pgrep` fails outright - pgrep is not in the
-          #     simulator's environment (NSPOSIXErrorDomain code=2).
-          # Both reported "not running" while the app was up, which sent the
-          # investigation after a crash that had not happened.
-          if xcrun simctl spawn "$SIM_UDID" ps -ax 2>/dev/null | grep -qi "[c]orro"; then
+          # Probe history, because three attempts gave FALSE NEGATIVES and
+          # each sent the investigation after a crash that had not happened:
+          #   * `simctl spawn launchctl list`  -> shows only the simulator's own
+          #     daemons (apps do appear once launched, but the naive grep was
+          #     wrong about what absence meant);
+          #   * `simctl spawn pgrep`           -> pgrep does not exist there;
+          #   * `simctl spawn ps -ax`          -> ps does not exist there; it
+          #     printed nothing, so the grep ALWAYS failed and this step
+          #     reported a healthy app as dead on every single run.
+          # `launchctl list` is verified to work on a runner.
+          if xcrun simctl spawn "$SIM_UDID" launchctl list 2>/dev/null | grep -qi "corro"; then
             echo "corro is running"
             exit 0
           fi
-          echo "--- processes containing 'corro' ---"
-          xcrun simctl spawn "$SIM_UDID" ps -ax 2>/dev/null | grep -i corro || echo "(none)"
+          echo "--- launchctl entries containing 'corro' ---"
+          xcrun simctl spawn "$SIM_UDID" launchctl list 2>/dev/null | grep -i corro || echo "(none)"
           echo "::error::corro is not running after launch"
           # Diagnose rather than just fail: crash reports first (they name the
           # signal and the faulting thread), then the console capture.
