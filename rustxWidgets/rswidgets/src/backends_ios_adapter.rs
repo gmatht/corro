@@ -2156,8 +2156,16 @@ mod ios_adapter {
         let class_name = core_ios::sheet_view_class().unwrap_or_else(|| "UIView".to_owned());
         let class = cls(&class_name);
         let view = if class.is_null() {
+            // Falling back to a plain UIView keeps the tree valid, but that
+            // view never calls corro_ios_canvas_draw, so the sheet silently
+            // never paints - a running app with a blank screen. Say so: this
+            // is the single most consequential fallback in the backend.
+            core_ios::log_ios(&format!(
+                "create_canvas: class '{class_name}' NOT FOUND - falling back to a plain UIView;                  the canvas will never draw (is the class registered with set_sheet_view_class                  and linked into the app?)"
+            ));
             new_widget("UIView", Kind::Canvas)
         } else {
+            core_ios::log_ios(&format!("create_canvas: using class '{class_name}'"));
             let obj = alloc_init(class);
             if obj.is_null() {
                 std::ptr::null_mut()
