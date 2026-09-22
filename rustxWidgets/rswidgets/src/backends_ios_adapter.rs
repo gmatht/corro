@@ -2513,6 +2513,16 @@ fn schedule_timer(ms: u32, f: Box<dyn FnMut() -> bool>) -> Result<(), crate::cor
     }
     let interval = (ms.max(1) as f64) / 1000.0;
     unsafe {
+        // `+[NSTimer timerWithTimeInterval:target:selector:userInfo:repeats:]`
+        // then added to the MAIN run loop in NSRunLoopCommonModes.
+        //
+        // Deliberately NOT `scheduledTimerWithTimeInterval:...`: that adds the
+        // timer to the *current* run loop in the *default* mode, and it was
+        // observed to fire exactly once and then stop - a repeating timer in a
+        // mode the loop is not running in (UIKit switches modes, e.g. while a
+        // scroll is being tracked) simply never fires again. Naming
+        // NSRunLoopCommonModes covers the modes UIKit actually runs.
+        //
         // id (*)(id, SEL, double, id, SEL, id, BOOL)
         let send: unsafe extern "C" fn(
             *mut std::os::raw::c_void,
@@ -2526,7 +2536,7 @@ fn schedule_timer(ms: u32, f: Box<dyn FnMut() -> bool>) -> Result<(), crate::cor
             std::mem::transmute(crate::backends::apple::msg_shim());
         let timer = send(
             timer_cls,
-            selector("scheduledTimerWithTimeInterval:target:selector:userInfo:repeats:"),
+            selector("timerWithTimeInterval:target:selector:userInfo:repeats:"),
             interval,
             target,
             selector("corroFired:"),
@@ -2535,15 +2545,37 @@ fn schedule_timer(ms: u32, f: Box<dyn FnMut() -> bool>) -> Result<(), crate::cor
         );
         if timer.is_null() {
             return Err(crate::core::Error::Backend(
-                "scheduledTimerWithTimeInterval: returned nil".into(),
+                "timerWithTimeInterval: returned nil".into(),
             ));
         }
-        // The run loop retains its timers; an extra retain keeps the handle
-        // valid for the process lifetime, matching every other handle here.
-        crate::backends::apple::retain(timer);
+        // Hold it: an unscheduled timer is not retained by anything yet.
+        let timer = own(timer);
+
+        // `[[NSRunLoop mainRunLoop] addTimer:forMode:]`
+        let run_loop_cls = cls("NSRunLoop");
+        if run_loop_cls.is_null() {
+            return Err(crate::core::Error::Backend("NSRunLoop unavailable".into()));
+        }
+        let main_loop = crate::backends::apple::msg0(run_loop_cls, "mainRunLoop");
+        if main_loop.is_null() {
+            return Err(crate::core::Error::Backend("mainRunLoop returned nil".into()));
+        }
+        // void (*)(id, SEL, id, id)
+        let add: unsafe extern "C" fn(
+            *mut std::os::raw::c_void,
+            *mut std::os::raw::c_void,
+            *mut std::os::raw::c_void,
+            *mut std::os::raw::c_void,
+        ) = std::mem::transmute(crate::backends::apple::msg_shim());
+        add(
+            main_loop,
+            selector("addTimer:forMode:"),
+            timer,
+            crate::backends::apple::nsstring("NSRunLoopCommonModes"),
+        );
     }
     crate::backends::apple::log_apple(&format!(
-        "ios: NSTimer scheduled ({ms}ms, target CorroIosTarget#{registered})"
+        "ios: NSTimer on the main run loop ({ms}ms, common modes, target CorroIosTarget#{registered})"
     ));
     Ok(())
 }
