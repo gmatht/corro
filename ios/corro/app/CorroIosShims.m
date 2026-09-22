@@ -214,18 +214,21 @@
 // require touching this file, and changing one of its signatures cannot
 // silently diverge.
 @interface UIView (CorroLayout)
-@property (nonatomic, assign) CGFloat corroSpacing;
-@property (nonatomic, assign) BOOL corroFlex;
-@property (nonatomic, assign) CGFloat corroMinWidth;
+- (void)corroSetSpacing:(NSInteger)spacing;
+- (void)corroSetFlex:(BOOL)flex;
+- (void)corroSetMinWidth:(NSInteger)width;
+- (CGFloat)corroBoundsWidth;
+- (CGFloat)corroBoundsHeight;
 @end
 
 @implementation UIView (CorroLayout)
 
-// Associative storage would be needed for real properties in a category; the
-// values are only ever read back by the same class that stores them, and
-// UIStackView already handles axis/spacing/distribution itself, so for a
-// UIStackView these hints are recorded and ignored. Kept as explicit no-ops
-// with the reason rather than omitted, which is what crashed.
+// Declared as methods, not @property: a category cannot synthesise storage, and
+// the earlier @property form compiled to a warning about missing accessors.
+// Nothing needs to read these back - the Rust side only sends them, and
+// UIStackView keeps the real spacing via `setSpacing:`. They exist because
+// sending an unimplemented selector raises 'unrecognized selector' and crashed
+// create_box (see the header note above).
 - (void)corroSetSpacing:(NSInteger)spacing {
     // UIStackView reads real spacing from `setSpacing:` (a CGFloat); this
     // integer variant exists so the Rust side does not have to get the
@@ -349,6 +352,30 @@
 // this file's own business, so it stays in an extension.
 @interface CorroIosText ()
 + (UIFont *)fontForFamily:(NSString *)family size:(CGFloat)size weight:(NSInteger)weight;
+
+// Declared here so clang knows the real signatures. Without these, the
+// message sends below are checked against an implicit `id`-typed guess, and
+// clang warns 'conflicting parameter types in implementation of
+// drawText:...: "__strong id" vs "CGContextRef"' - the Rust side passes the
+// context as a raw pointer, which is an `id` to the compiler.
+- (CGRect *)measure:(NSString *)text
+               font:(NSString *)family
+               size:(CGFloat)size
+              slant:(NSInteger)slant
+             weight:(NSInteger)weight;
+
+- (void)drawText:(NSString *)text
+             ctx:(CGContextRef)ctx
+            font:(NSString *)family
+               x:(CGFloat)x
+               y:(CGFloat)y
+            size:(CGFloat)size
+               r:(CGFloat)red
+               g:(CGFloat)green
+               b:(CGFloat)blue
+               a:(CGFloat)alpha
+           slant:(NSInteger)slant
+          weight:(NSInteger)weight;
 @end
 
 @implementation CorroIosText

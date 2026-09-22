@@ -54,6 +54,7 @@ txt = open(wf).read()
 assert txt.index('SIM_UDID=') < txt.index('\$SIM_UDID'), 'SIM_UDID used before set'
 print('workflow ok:', list(d['jobs']))
 PY"
+run "every selector the backend sends is implemented in the shim" "$HERE/check_selectors.sh"
 run "xcodeproj definitions are unique" bash -c "python3 - <<'PY'
 import re, sys
 from collections import Counter
