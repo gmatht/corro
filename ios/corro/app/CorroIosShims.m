@@ -40,6 +40,22 @@
     self.corroCanvasId = (uint64_t)canvasId;
 }
 
+// Report the laid-out size as soon as UIKit knows it.
+//
+// Rust replays the draw closure BEFORE UIKit's first `drawRect:` (registration
+// time and every `queue_redraw`), so if the size only arrived with the first
+// frame the early replays would use the 1x1 placeholder from
+// `set_size_request` and lay the sheet out as a single row.
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    CGRect b = self.bounds;
+    if (CGRectGetWidth(b) > 0 && CGRectGetHeight(b) > 0) {
+        corro_ios_canvas_size(self.corroCanvasId,
+                              (int32_t)CGRectGetWidth(b),
+                              (int32_t)CGRectGetHeight(b));
+    }
+}
+
 // All rendering is in Rust: hand the live CGContext over and let the
 // registered draw closure replay its primitives.
 - (void)drawRect:(CGRect)rect {

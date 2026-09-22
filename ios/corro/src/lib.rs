@@ -92,6 +92,20 @@ pub unsafe extern "C" fn corro_ios_canvas_draw(
     unsafe { rswidgets::backends_ios_adapter::dispatch_draw(canvas_id, ctx, w, h) };
 }
 
+/// Called from `SheetView.layoutSubviews`: tells the backend the size the host
+/// has laid the canvas out to.
+///
+/// This has to be separate from the draw callback. UIKit only calls
+/// `drawRect:` when it decides to paint, and Rust replays the draw closure
+/// earlier than that (registration time, and on every `queue_redraw`), so
+/// without this the first replay used the 1x1 placeholder from
+/// `set_size_request` and the sheet laid itself out as a single row — visible
+/// in the simulator log as `DRAW_CALLBACK called: w=1 h=1`.
+#[no_mangle]
+pub extern "C" fn corro_ios_canvas_size(canvas_id: u64, w: i32, h: i32) {
+    rswidgets::backends_ios_adapter::record_canvas_size(canvas_id, w, h);
+}
+
 /// Called from `SheetView.touchesEnded:` (or its tap recogniser): moves the
 /// cursor to the tapped cell and redraws.
 #[no_mangle]

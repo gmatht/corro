@@ -28,6 +28,10 @@ void corro_ios_root_ready(void *root, void *view_controller);
 /// SheetView draw: replay the Rust draw closure against the live CGContext.
 void corro_ios_canvas_draw(uint64_t canvas_id, void *ctx, int32_t w, int32_t h);
 
+/// SheetView size report (from `layoutSubviews`): lets Rust lay the sheet out
+/// at the real size before UIKit's first draw.
+void corro_ios_canvas_size(uint64_t canvas_id, int32_t w, int32_t h);
+
 /// SheetView tap: move the cursor to the tapped cell.
 void corro_ios_canvas_click(uint64_t canvas_id, double x, double y);
 

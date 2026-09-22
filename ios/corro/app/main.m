@@ -14,10 +14,21 @@
 //
 
 #import <UIKit/UIKit.h>
+#import <stdio.h>
 #import "AppDelegate.h"
 
 int main(int argc, char *argv[]) {
+    int rc = 0;
     @autoreleasepool {
-        return UIApplicationMain(argc, argv, nil, NSStringFromClass([AppDelegate class]));
+        fprintf(stderr, "[corro] main: entering UIApplicationMain\n");
+        fflush(stderr);
+        // UIApplicationMain is documented never to return for a normal app. If
+        // it DOES return, the process has been told to exit and the app will
+        // disappear right after a clean startup - which is exactly what the
+        // simulator showed. Logging both sides makes that unambiguous.
+        rc = UIApplicationMain(argc, argv, nil, NSStringFromClass([AppDelegate class]));
+        fprintf(stderr, "[corro] main: UIApplicationMain RETURNED %d - the app is exiting\n", rc);
+        fflush(stderr);
     }
+    return rc;
 }

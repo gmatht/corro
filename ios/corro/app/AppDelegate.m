@@ -15,6 +15,7 @@
 
 #import "AppDelegate.h"
 #import "CorroViewController.h"
+#import <stdio.h>
 
 /// Posted when the app becomes active again. The root view controller listens
 /// and asks the sheet to redraw, because the framebuffer is not preserved
@@ -66,7 +67,11 @@ didFinishLaunchingWithOptions:(NSDictionary<UIApplicationLaunchOptionsKey, id> *
 - (void)applicationWillTerminate:(UIApplication *)application {
     (void)application;
     // iOS gives no time for real work here: this exists so a future save hook
-    // has a place to live, not to run one now.
+    // has a place to live, not to run one now. The log is diagnostic: if the
+    // app disappears after a clean startup, this line says whether UIKit was
+    // tearing it down or the process was reaped without any callback.
+    fprintf(stderr, "[corro] applicationWillTerminate\n");
+    fflush(stderr);
 }
 
 @end

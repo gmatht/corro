@@ -932,6 +932,21 @@ mod ios_adapter {
         /// split, including the reason for the split: a 1x1 placeholder
         /// request must never shrink a real laid-out size to one row.
         fn replay_size(&self) -> (i32, i32) {
+            // Prefer the size the host actually laid the view out to, which
+            // `dispatch_draw` records by canvas id. Consulting the id map here
+            // (rather than relying on `set_canvas_laid_out` to have copied it
+            // onto the handle) is deliberate: that copy was never called, so
+            // the 1x1 placeholder below was always winning and the sheet
+            // replayed at one pixel - `DRAW_CALLBACK called: w=1 h=1` in the
+            // simulator log, and a sheet that could not render.
+            let canvas_id = core_ios::canvas_id_for_view(self.0);
+            if let Some((w, h)) = canvas_laid_out(canvas_id) {
+                if w > 0 && h > 0 {
+                    return (w, h);
+                }
+            }
+            // Then any laid-out size copied onto the handle, then what Rust
+            // asked for.
             let (laid_out, requested) = core_ios::with_meta(self.0, |m| (m.laid_out, m.size_request))
                 .unwrap_or(((0, 0), (0, 0)));
             if laid_out.0 > 0 && laid_out.1 > 0 {
@@ -1059,10 +1074,7 @@ mod ios_adapter {
         let (w, h) = (w.max(1), h.max(1));
         // Record the live size so `replay_size` stops guessing. Handles are
         // keyed by canvas id here (Android keys the same map by id).
-        {
-            let mut sizes = CANVAS_SIZE.lock().unwrap();
-            sizes.insert(canvas_id, (w, h));
-        }
+        record_canvas_size(canvas_id, w, h);
         let raw = {
             let map = DRAW_CALLBACKS.lock().unwrap();
             map.get(&canvas_id).map(|s| s.0)
@@ -1089,24 +1101,30 @@ mod ios_adapter {
         }
     }
 
-    /// The view's *laid-out* size in points, learned from the host's draw
-    /// callback. Kept so `replay_size` can answer without the host.
+    /// The view's *laid-out* size in points, learned from the host. Kept so
+    /// `replay_size` can answer without the host.
     static CANVAS_SIZE: Lazy<Mutex<HashMap<u64, (i32, i32)>>> =
         Lazy::new(|| Mutex::new(HashMap::new()));
+
+    /// Record a laid-out canvas size, called by the host from
+    /// `layoutSubviews` (and by [`dispatch_draw`], which also knows it).
+    ///
+    /// Separate from the draw path on purpose: Rust replays the draw closure
+    /// before UIKit's first `drawRect:`, so a size that only arrived with the
+    /// first frame would come too late and the sheet would lay itself out at
+    /// the 1x1 placeholder.
+    pub fn record_canvas_size(canvas_id: u64, w: i32, h: i32) {
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        CANVAS_SIZE.lock().unwrap().insert(canvas_id, (w, h));
+    }
 
     /// Record a laid-out size for a canvas handle (called by
     /// [`dispatch_draw`], which knows the size by canvas id — the adapter
     /// then copies it onto the handle via [`set_canvas_laid_out`]).
     pub fn canvas_laid_out(canvas_id: u64) -> Option<(i32, i32)> {
         CANVAS_SIZE.lock().unwrap().get(&canvas_id).copied()
-    }
-
-    /// Copy a laid-out size onto the widget handle so `replay_size` (which
-    /// only has the handle) can see it.
-    pub fn set_canvas_laid_out(handle: *mut c_void, canvas_id: u64) {
-        if let Some(size) = canvas_laid_out(canvas_id) {
-            core_ios::with_meta_mut(handle, |m| m.laid_out = size);
-        }
     }
 
     // ------------------------------------------------------------------
