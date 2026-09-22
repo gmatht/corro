@@ -2460,34 +2460,89 @@ mod tests {
 /// selector, which calls `corro_ios_callback(id)` -> `dispatch_callback(id)`.
 /// That is the same trampoline the buttons and pickers use.
 #[cfg(target_os = "ios")]
-/// Create an `NSTimer` on the main run loop that dispatches `f` every `ms`,
-/// returning the registered callback id.
+/// Create an `NSTimer` on the main run loop that dispatches `f` every `ms`.
 ///
-/// Split out from [`add_periodic_tick`] so the liveness probe below uses the
-/// identical scheduling path - a probe that took a different route would not
-/// prove anything about the real timer.
+/// Split out so the liveness probe in [`add_periodic_tick`] uses the identical
+/// scheduling path - a probe taking a different route would prove nothing about
+/// the real timer.
 #[cfg(target_os = "ios")]
-fn schedule_timer(ms: u32, f: Box<dyn FnMut() -> bool>) -> Result<u64, crate::core::Error> {
-use crate::backends::apple::{cls, msg0, msg_shim, own, selector, retain};
-    use std::os::raw::c_void;
+fn schedule_timer(ms: u32, f: Box<dyn FnMut() -> bool>) -> Result<(), crate::core::Error> {
+    use crate::backends::apple::{cls, own, selector};
 
     if !crate::backends::apple::is_initialized() {
         return Err(crate::core::Error::Backend(
-            "add_periodic_tick before the iOS backend was initialised".into(),
+            "periodic tick requested before the iOS backend was initialised".into(),
         ));
     }
 
+    // The id is needed inside the closure to unregister itself when it returns
+    // false, so it goes through a Cell the closure reads at call time.
     let id_cell: std::rc::Rc<std::cell::Cell<u64>> = std::rc::Rc::new(std::cell::Cell::new(0));
     let id_for_cb = id_cell.clone();
     let mut f = f;
     let registered = crate::backends::apple::register_callback(Box::new(move || {
-        let keep = f();
-        if !keep {
+        if !f() {
             crate::backends::apple::unregister_callback(id_for_cb.get());
         }
     }));
     id_cell.set(registered);
-    Ok(registered)
+
+    // `CorroIosTarget targetWithCallbackId:` - the host's trampoline class,
+    // which calls corro_ios_callback(id) -> dispatch_callback(id).
+    let shim = cls("CorroIosTarget");
+    if shim.is_null() {
+        crate::backends::apple::log_apple(
+            "ios: CorroIosTarget shim missing; periodic tick not scheduled",
+        );
+        return Err(crate::core::Error::Backend(
+            "CorroIosTarget shim missing (cannot schedule a timer)".into(),
+        ));
+    }
+    let target =
+        unsafe { crate::backends::apple::msg1i(shim, "targetWithCallbackId:", registered as isize) };
+    if target.is_null() {
+        return Err(crate::core::Error::Backend(
+            "CorroIosTarget targetWithCallbackId: returned nil".into(),
+        ));
+    }
+    let target = own(target);
+
+    let timer_cls = cls("NSTimer");
+    if timer_cls.is_null() {
+        return Err(crate::core::Error::Backend("NSTimer unavailable".into()));
+    }
+    let interval = (ms.max(1) as f64) / 1000.0;
+    unsafe {
+        // id (*)(id, SEL, double, id, SEL, id, BOOL)
+        let send: unsafe extern "C" fn(
+            *mut std::os::raw::c_void,
+            *mut std::os::raw::c_void,
+            f64,
+            *mut std::os::raw::c_void,
+            *mut std::os::raw::c_void,
+            *mut std::os::raw::c_void,
+            bool,
+        ) -> *mut std::os::raw::c_void =
+            std::mem::transmute(crate::backends::apple::msg_shim());
+        let timer = send(
+            timer_cls,
+            selector("scheduledTimerWithTimeInterval:target:selector:userInfo:repeats:"),
+            interval,
+            target,
+            selector("corroFired:"),
+            std::ptr::null_mut(),
+            true,
+        );
+        if timer.is_null() {
+            return Err(crate::core::Error::Backend(
+                "scheduledTimerWithTimeInterval: returned nil".into(),
+            ));
+        }
+        // The run loop retains its timers; an extra retain keeps the handle
+        // valid for the process lifetime, matching every other handle here.
+        crate::backends::apple::retain(timer);
+    }
+    Ok(())
 }
 
 /// Schedule `f` to run every `ms` milliseconds on the main run loop, returning
