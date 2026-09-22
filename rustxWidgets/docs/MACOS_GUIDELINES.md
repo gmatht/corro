@@ -223,27 +223,59 @@ shells removes that class of bug outright.
 | `<base view> (CorroLayout)`: `corroSetSpacing:`, `corroSetFlex:`, `corroSetMinWidth:`, `corroSetCanvasId:`, `corroBoundsWidth/Height` | the layout category |
 | the `corroPresentDialog:` category on `UIViewController`/`NSWindowController` | the presentation category |
 
-**Deliberately NOT generated**, and this is the important half:
+**Also generated — but *configured***, because these have no single correct
+body. Both are emitted by default and controlled by `ShimConfig`:
 
-* **The canvas view** (`SheetView` / `CorroSheetView`). Its body is
-  *behaviour*: `drawRect:` reports the laid-out size before replaying Rust's
-  draw closure, touches/mouse events convert coordinates, `pressesBegan:`/
-  `keyDown:` handle a hardware keyboard, and there are documented degradation
-  paths found by CI (an older SDK without a selector). Those are the lines a
-  human reads when the sheet does not draw. On macOS it also needs
-  `isFlipped` — the generator's *header* says so, the body cannot be guessed.
-* **The text measurer** (`CorroIosText` / `CorroMacText`). Its bodies are the
-  SDK version table (`boundingRectWithSize:` on iOS 7+ vs `sizeWithFont:` on
-  iOS 6; `UIFont`/`NSFont` resolution). A wrong body there is a layout bug,
-  not a crash — and a generator cannot validate it without an SDK anyway.
+* **The canvas view** (`SheetView` / `CorroSheetView`), from
+  `CanvasViewConfig`. The generated body covers the size report in both the
+  layout and draw passes, the context handover, the click/key events, and — on
+  AppKit only — the `isFlipped` override. The knobs exist because plausible
+  hosts differ:
 
-For both of those the generator still emits the **declarations**, and the
-hand-written `.m` imports the generated header and *adopts* them (its
-`@interface` blocks no longer restate the contract methods). A signature that
-drifts from the Rust side is therefore a compile error in the host — which is
-the most that is checkable without an SDK on this machine.
+  | Field | Why it is a knob |
+  |---|---|
+  | `hardware_keys` | a headless or touch-only harness wants no first-responder plumbing |
+  | `fill_superview` | the self-resizing fallback (and its re-entrancy guard) is only needed when the canvas is attached with `addSubview:`, not when a stack view sizes it |
+  | `report_size_on_layout` | Rust replays the draw closure before the framework's first draw, so dropping the earlier report collapses the sheet to a 1x1 placeholder — kept as a knob so the tradeoff is explicit |
+  | `trace_events` | the `fprintf` tracing the iOS app enabled while bringing itself up |
+  | `deployment_target` | on iOS `UIKey` is 13.4+, so a lower target must guard the key path (on both the declaration and the definition — clang analyses each body separately) |
+
+* **The text measurer** (`CorroIosText` / `CorroMacText`), from
+  `TextShimConfig`: the font-fallback family, whether to emit the legacy API as
+  a `respondsToSelector:` fallback, and `baseline_from_ascent` — the offset
+  that converts the shared top-left convention to the baseline the text APIs
+  want. That last one is a *named field* rather than a line in a `.m` body on
+  purpose: without it every glyph in the sheet shifts up by the ascent, and a
+  silent one-line deletion is exactly how that happens.
+
+`emit_canvas` / `emit_text` turn either off, which is the **manual-override**
+half: a host that already has a richer hand-written class keeps it, and the
+generator still emits its **declarations** into the header. That host's `.m`
+imports the generated header and *adopts* them, so a signature that drifts from
+the Rust side is a compile error rather than a mismatched `objc_msgSend`.
+
+`ios/corro` uses exactly that: `emit_canvas = false, emit_text = false` (its
+canvas carries host-specific layout and its text class carries the SDK version
+table), so its generated file is the 151-line forwarding set, while a fresh
+host with no shims at all gets the whole 344-line canvas + text implementation
+from the defaults.
 
 A test in `apple_generator.rs` asserts that every `(class, selector)` pair the
 adapters send — transcribed as `IOS_ADAPTER_SENDS` / `MACOS_ADAPTER_SENDS` —
 is covered by the tables, so adding a `raw_send!` to an adapter without
 registering it fails the suite rather than crashing at runtime.
+
+That check runs from both ends:
+
+* `apple_generator.rs`'s own tests assert the tables cover the transcribed
+  `(class, selector)` lists.
+* `ios/corro/scripts/check_selectors.sh` checks the **iOS** shim files really
+  implement every selector the iOS adapter sends (it found a live crash:
+  `create_box` sends `corroSetSpacing:`, which nothing implemented), and — since
+  no macOS host exists yet — checks the **macOS** adapter's selectors are all
+  *generatable*, which is what makes writing that host a "run the generator"
+  step rather than a "reinvent the shims" step.
+* `c7d73b01` is the case that justifies all of it: generating the declarations
+  exposed `measure:` being declared with four arguments for a five-part
+  selector, i.e. the ObjC side would have read an unset register. A hand-written
+  pair of files cannot catch that without an SDK; a single signature table can.

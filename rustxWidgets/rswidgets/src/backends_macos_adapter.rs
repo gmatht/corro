@@ -1093,6 +1093,20 @@ mod macos_adapter {
     static CANVAS_SIZE: Lazy<Mutex<HashMap<u64, (i32, i32)>>> =
         Lazy::new(|| Mutex::new(HashMap::new()));
 
+    /// Record a laid-out canvas size, called by the host from its canvas
+    /// view's layout/draw pass (and by [`dispatch_draw`], which also knows it).
+    ///
+    /// Separate from the draw path on purpose, and the same shape as the iOS
+    /// adapter's function: Rust replays the draw closure before AppKit's first
+    /// `drawRect:`, so a size that only arrived with the first frame would
+    /// come too late and the sheet would lay itself out at the 1x1 placeholder.
+    pub fn record_canvas_size(canvas_id: u64, w: i32, h: i32) {
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        CANVAS_SIZE.lock().unwrap().insert(canvas_id, (w, h));
+    }
+
     /// Record a laid-out size for a canvas handle (called by
     /// [`dispatch_draw`], which knows the size by canvas id — the adapter
     /// then copies it onto the handle via [`set_canvas_laid_out`]).
