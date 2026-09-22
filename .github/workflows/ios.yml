@@ -42,9 +42,16 @@ name: iOS
 # reported a healthy app as dead on every run). The signal that cannot lie is
 # output the app produced.
 #
-# Still NOT covered: iOS 7.1.2 (no hosted runner has the archived SDK), and
-# anything interactive — this captures one frame. The manual `simctl` taps in
-# docs/ios/README.md remain the way to exercise touch and typing.
+# Still NOT covered, and this is the honest list rather than a to-do:
+#   * iOS 7.1.2 — no hosted runner has the archived SDK (IOS_GUIDELINES §0/§9).
+#   * Interaction ON A SIMULATOR. `xcrun simctl` cannot synthesise touches:
+#     `simctl io <dev> tap` does not exist (proposed, never shipped), the app
+#     cannot read XCTest's events, and idb/WebDriverAgent are not on the
+#     runner. So the simulator proves startup → first frame and stops there.
+#     Touch and typing are instead covered on every push by the cheap Linux
+#     job below, which drives the *same* adapter code through the UIKit-free
+#     host preview (`rswidgets/examples/ios_pipeline.rs`); a real finger needs
+#     a real device or a farm (docs/ios/README.md § Lambdatest).
 #
 # If it breaks, the fix belongs here — not in the Rust code, which is verified
 # separately by the linux job below (and by ios/corro/scripts/verify_all.sh).
@@ -72,6 +79,13 @@ jobs:
   # Runs first because it is fast and needs no macOS minutes. It is the same
   # check the repo script does, so a failure here means the port itself broke
   # rather than the Xcode plumbing.
+  #
+  # It also runs the host-pipeline preview, which is the closest thing to an
+  # interactive test available without a Mac: it links the same
+  # `backends_ios_adapter` code the staticlib links and drives a UIKit-free
+  # shim, so a click and a keystroke travel the whole chain (shim → adapter →
+  # corro::gui::ios_backend → committed op + redraw). The Mac job below cannot
+  # do that with `simctl` — it has no way to synthesise touches.
   rust-ios-check:
     runs-on: ubuntu-latest
     steps:
@@ -82,6 +96,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: iOS cfg checks (simulator, arm64 device, 32-bit armv7s)
         run: ios/corro/scripts/check_rswidgets_ios.sh && ios/corro/scripts/check_corro_ios.sh
+      - name: Run the iOS pipeline preview (click + keystroke end to end)
+        run: rustxWidgets/rswidgets/scripts/run_ios_pipeline_preview.sh
 
   # ── The real half: build + boot the app on a Mac ────────────────────
   build-and-boot:
@@ -176,6 +192,17 @@ jobs:
           #     Redirecting the pipeline's own stdout to a file, with the
           #     pipeline backgrounded, is what makes it both stream and survive.
           echo "--- launching (foreground console, backgrounded as a pipeline) ---"
+          # CORRO_EDIT_SCRIPT populates the sheet before the screenshot. Without
+          # it the app opens a BLANK workbook, the PNG shows only chrome and row
+          # labels, and a text-rendering bug (wrong baseline, clipped glyphs)
+          # cannot be seen in the artifact at all - which is how one shipped.
+          # `simctl launch` passes the parent environment through to the app, so
+          # the same variable the desktop captures use works here.
+          #
+          # Values chosen to exercise the cases that broke: a bare number, a
+          # computed formula, a long string that must be clipped to its cell,
+          # and a negative/decimal - all in rows whose 20pt band is tight.
+          export CORRO_EDIT_SCRIPT="400:A1=1,900:A2=22,1400:A3==A1+A2,1900:B1=-3.5,2400:B2=123456789,2900:C1=long text that will not fit the cell,3400:C2==SUM(A1:A3),3900:A5=5.25"
           xcrun simctl launch --console-pty "$SIM_UDID" com.corro.corro \
             > /tmp/corro-live.log 2>&1 &
           echo "launch pid $!"
@@ -284,7 +311,7 @@ jobs:
           fi
           exit 1
 
-      - name: Verify the screenshot shows corro, not the home screen
+      - name: Verify the screenshot shows corro's sheet WITH text
         if: always()
         run: |
           # The image was uploaded once while showing the springboard (run #97),
@@ -377,6 +404,63 @@ jobs:
               print("::error::failure: the screenshot captured the simulator's home screen.")
               sys.exit(1)
           print("ok: neutral grey throughout, as corro's chrome is")
+
+          # Cell TEXT must be present, and inside its own 20pt row.
+          #
+          # This is the check the earlier frames needed and did not have. Two
+          # bugs got through because "is it corro's chrome?" cannot see either:
+          # a blank workbook (chrome only), and text drawn a full ascent too low
+          # so it landed in the next row's band and was clipped by the row rule.
+          #
+          # The renderer draws cell text at `cell_top + 2pt` with a ~9.6pt
+          # ascent, so a correct glyph run starts 2..4pt below a row boundary
+          # and is ~14pt tall. Device pixels are 2x: a row is 40px, and the ink
+          # should occupy roughly 4..28 of it - i.e. it must NOT cross the
+          # boundary into the next row's first pixels.
+          #
+          # Measured on the two known frames (row bands at 40px, first data row
+          # top at y=252): the fixed frame's glyphs sit at 252..284; the broken
+          # one at 300..314, i.e. entirely inside the FOLLOWING band.
+          rows_ink = []
+          for yy in range(len(rows)):
+              n = sum(1 for xx in range(100, 700, 2)
+                      if rows[yy][xx * ch] < 100)
+              rows_ink.append(n)
+
+          # Find ink runs in the grid body (below the chrome, above the status).
+          runs = []
+          cur = None
+          for yy in range(240, min(h - 60, len(rows_ink))):
+              if rows_ink[yy] > 0 and cur is None:
+                  cur = yy
+              elif rows_ink[yy] == 0 and cur is not None:
+                  runs.append((cur, yy - 1))
+                  cur = None
+          if not runs:
+              print("::error::no text ink found in the grid body - the sheet is blank")
+              sys.exit(1)
+
+          # Every run must be tall enough to be glyphs, not a one-pixel rule.
+          tallest = max(b - a + 1 for a, b in runs)
+          print(f"grid text: {len(runs)} ink run(s), tallest {tallest}px")
+          if tallest < 10:
+              print("::error::text ink is too shallow to be a rendered glyph run")
+              sys.exit(1)
+
+          # A row is 40 device px; a glyph run that STRADDLES a boundary
+          # means the baseline is off by an ascent (the shipped bug).
+          bad = []
+          for a, b in runs:
+              # Distance to the nearest 40px boundary relative to the first run.
+              off = (a - runs[0][0]) % 40
+              if off > 30:
+                  bad.append((a, b, off))
+          if bad:
+              for a, b, off in bad:
+                  print(f"::error::text at y={a}..{b} sits {off}px into a 40px row "
+                        f"- more than a row's text band, so it is drawn too low")
+              sys.exit(1)
+          print("ok: cell text present and inside its row band")
           PY
 
       - name: Dump the Rust log lines
