@@ -3684,13 +3684,22 @@ fn run_menu_tour_stop(state: &Rc<GuiState>, section: &str, item: &str) {
         sync_chrome_labels(state);
         return;
     };
-    let action = root
-        .submenu
-        .as_deref()
-        .unwrap_or(&[])
-        .iter()
-        .find(|i| i.label == item)
-        .map(|i| super::menu::action_kind_to_name(i.action));
+    // Search nested submenus too (`File > Width > Default width`,
+    // `Format > Scope > All`), so a tour can address items at any depth.
+    fn find_action(items: &[super::menu::MenuAction], label: &str) -> Option<&'static str> {
+        for i in items {
+            if i.label == label && i.submenu.is_none() {
+                return Some(super::menu::action_kind_to_name(i.action));
+            }
+            if let Some(sub) = i.submenu.as_deref() {
+                if let Some(found) = find_action(sub, label) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+    let action = find_action(root.submenu.as_deref().unwrap_or(&[]), item);
     let Some(action) = action else {
         state.app_mut().core.status = format!("Menu tour: no item {section} ▸ {item}");
         sync_chrome_labels(state);
