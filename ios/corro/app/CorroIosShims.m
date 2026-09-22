@@ -371,8 +371,9 @@
     return r;
 }
 
-// Draws at the shared top-left convention: the caller gives a top edge, the
-// text API wants a baseline, so offset by the ascent.
+// Draws at the shared top-left convention: the caller gives a TOP edge, and
+// these NSString drawing methods take a top-left point too, so the point is
+// passed through unchanged. (No ascent offset - see the body.)
 + (void)drawText:(NSString *)text
              ctx:(CGContextRef)ctx
             font:(NSString *)family
@@ -394,9 +395,24 @@
     // UIKit's coordinate system is top-left origin, y down — matching the
     // shared draw convention, so no flip is needed inside drawRect:'s context.
     [[UIColor colorWithRed:red green:green blue:blue alpha:alpha] setFill];
-    CGFloat baseline = y + font.ascender;
+    // ⚠️ NO baseline offset here. `drawAtPoint:withAttributes:` (and the older
+    // `drawAtPoint:withFont:`) take a **top-left** point in UIKit's flipped
+    // coordinate space, which is already the convention the shared renderer
+    // uses: it passes `ry + 2.0` for cell text in a 20pt row and expects the
+    // glyphs to sit just inside the top of the cell.
+    //
+    // An earlier version added `font.ascender` here, on the theory that the
+    // text API wanted a baseline. That double-counted: at font size 12 the
+    // ascent is ~9.6pt, so every glyph was pushed ~9.6pt below where it
+    // belonged — enough to land in the *next* row's band and have its lower
+    // half clipped by the row rule. Visible in ios/corro/ios-first-frame.png
+    // as text hugging the bottom of each cell with descenders cut off.
+    //
+    // (Contrast Core Graphics' `CGContextShowTextAtPoint`, which DOES take a
+    // baseline. These NSString drawing methods do not.)
+    CGPoint topLeft = CGPointMake(x, y);
     if ([text respondsToSelector:@selector(drawAtPoint:withAttributes:)]) {
-        [text drawAtPoint:CGPointMake(x, baseline)
+        [text drawAtPoint:topLeft
            withAttributes:@{ NSFontAttributeName: font,
                              NSForegroundColorAttributeName:
                                  [UIColor colorWithRed:red green:green blue:blue alpha:alpha] }];
@@ -404,7 +420,7 @@
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
         [[UIColor colorWithRed:red green:green blue:blue alpha:alpha] set];
-        [text drawAtPoint:CGPointMake(x, baseline) withFont:font];
+        [text drawAtPoint:topLeft withFont:font];
 #pragma clang diagnostic pop
     }
     CGContextRestoreGState(ctx);

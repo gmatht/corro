@@ -467,12 +467,24 @@ pub struct TextShimConfig {
     /// `size:` on macOS) with the legacy one as the `respondsToSelector:`
     /// fallback. `false` emits only the modern call. Default `true`.
     pub legacy_fallback: bool,
-    /// Offset the draw `y` by the font ascent, converting the shared top-left
-    /// convention to the baseline the text APIs want.
+    /// Offset the draw `y` by the font ascent.
     ///
-    /// **This is a semantically load-bearing knob**: with it `false`, every
-    /// glyph in the sheet shifts up by the ascent. It is a field rather than a
-    /// line in a `.m` body precisely so that it cannot be dropped silently.
+    /// **Leave this `false`.** The shared `DrawContext` convention is a
+    /// top-left point, and `NSString`'s `drawAtPoint:withAttributes:` /
+    /// `drawAtPoint:withFont:` take a top-left point too (in UIKit's or
+    /// AppKit's flipped space), so no offset is needed.
+    ///
+    /// It shipped as `true` on the theory that the text API wanted a baseline
+    /// — true of Core Graphics' `CGContextShowTextAtPoint`, but not of these
+    /// NSString methods. The result was a double-count: at font size 12 the
+    /// ascent (~9.6pt) pushed every glyph a full ascent below where it
+    /// belonged, landing it in the *next* row's band with its lower half
+    /// clipped by the row rule. Visible in `ios/corro/ios-first-frame.png`
+    /// before the fix.
+    ///
+    /// Kept as a field because a host with a text API that *does* take a
+    /// baseline may need it — but the default, and this comment, now say which
+    /// is correct for the shims generated here.
     pub baseline_from_ascent: bool,
 }
 
@@ -482,7 +494,9 @@ impl TextShimConfig {
             class_name: class_name.to_owned(),
             fallback_family: fallback_family.to_owned(),
             legacy_fallback: true,
-            baseline_from_ascent: true,
+            // See the field's docs: top-left in, top-left out. `true` is the
+            // double-count bug.
+            baseline_from_ascent: false,
         }
     }
 
@@ -1923,7 +1937,23 @@ mod tests {
         rust_key_value("NOT_A_KEY");
     }
 
-    /// The ascent offset is load-bearing: dropping it shifts every glyph.
+    /// The ascent offset must be OFF by default: `drawAtPoint:` takes a
+    /// top-left point, so adding the ascent shifts every glyph down a full
+    /// ascent and clips it against the row rule. It shipped ON, and that is
+    /// exactly what the first real iOS screenshot showed.
+    #[test]
+    fn text_ascent_offset_is_off_by_default() {
+        let default = TextShimConfig::ios("CorroIosText");
+        assert!(
+            !default.baseline_from_ascent,
+            "the default must not add an ascent offset - see the field docs"
+        );
+        assert!(!render_text_impl(Platform::Ios, &default).contains("font.ascender"));
+        assert!(!render_text_impl(Platform::Macos, &TextShimConfig::macos("CorroMacText"))
+            .contains("font.ascender"));
+    }
+
+    /// ...but it stays configurable, for a text API that does want a baseline.
     #[test]
     fn text_ascent_offset_is_configurable_and_documented() {
         let with = render_text_impl(
