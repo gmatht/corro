@@ -243,9 +243,39 @@ jobs:
           # step can assert the shot and the evidence describe the same process.
           echo "UI_READY_BEFORE_SCREENSHOT=$READY" >> "$GITHUB_ENV"
 
-          # Let the first frame commit to the screen. The readiness marker
-          # precedes the first draw; this is the gap between them.
-          sleep 10
+          # ⚠️ Wait for the SCRIPTED EDITS to land, not merely for readiness.
+          #
+          # `ios backend initialised` fires early in run_gui — before the widget
+          # tree is built, before `present`, and before `arm_edit_script`. The
+          # edit steps are scheduled 400..3900ms after *arming*, so a screenshot
+          # taken readiness+10s captured the sheet BEFORE the first edit
+          # committed. Measured: the shot was written at 13:43:18.6 while the
+          # script armed at 13:43:20.2 — which is why the "populated sheet" run
+          # still produced a blank one.
+          #
+          # `edit script armed (N steps, ...)` is the marker that the edits are
+          # running, and the last step's `at_ms` is the earliest the sheet can be
+          # complete. Waiting for the armed line plus the final step's deadline
+          # is deterministic, rather than another guess at a sleep.
+          echo "--- waiting for the scripted edits to commit ---"
+          LAST_MS=$(printf '%s' "${SIMCTL_CHILD_CORRO_EDIT_SCRIPT:-}" \
+            | tr ',' '\n' | sed -n 's/^\([0-9]\+\):.*/\1/p' | sort -n | tail -1)
+          LAST_MS=${LAST_MS:-0}
+          ARMED=0
+          for i in $(seq 1 120); do
+            if grep -qa "edit script armed" /tmp/corro-live.log 2>/dev/null; then
+              echo "  t+${i}s: edit script armed"
+              ARMED=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$ARMED" -ne 1 ]; then
+            echo "::warning::edit script never armed - the screenshot may show an unedited sheet"
+          fi
+          WAIT_S=$(( (LAST_MS + 4000) / 1000 ))
+          echo "  last edit at ${LAST_MS}ms; waiting ${WAIT_S}s more for it to commit"
+          sleep "$WAIT_S"
 
       - name: Screenshot the first frame
         # Runs while the detached launch from the previous step is still alive.
@@ -426,24 +456,26 @@ jobs:
                       if rows[yy][xx * ch] < 100)
               rows_ink.append(n)
 
-          runs = []
-          cur = None
-          for yy in range(240, min(h - 60, len(rows_ink))):
-              if rows_ink[yy] > 0 and cur is None:
-                  cur = yy
-              elif rows_ink[yy] == 0 and cur is not None:
-                  runs.append((cur, yy - 1))
-                  cur = None
-          if not runs:
-              print("::error::no text ink found in the grid body - the sheet is blank")
-              sys.exit(1)
+          def ink(x0, x1):
+              return sum(1 for yy in range(240, min(h - 60, len(rows_ink)))
+                         for xx in range(x0, x1) if rows[yy][xx * ch] < 100)
 
-          tallest = max(b - a + 1 for a, b in runs)
-          print(f"grid text: {len(runs)} ink run(s), tallest {tallest}px")
-          if tallest < 10:
-              print("::error::text ink is too shallow to be a rendered glyph run")
+          # The gutter (row labels) is always drawn, so it proves nothing about
+          # the SHEET. Require ink in the first TWO data columns: the scripted
+          # edits put values in A AND B, so a sheet where only the gutter has
+          # text - i.e. the blank-workbook case that shipped twice - fails here.
+          gutter = ink(4, 60)
+          col_a = ink(90, 190)
+          col_b = ink(190, 300)
+          print(f"ink px: gutter={gutter} colA={col_a} colB={col_b}")
+
+          if col_a < 50 or col_b < 50:
+              print("::error::no cell text in the data columns - the sheet is blank")
+              print("::error::(the row-label gutter having text is not enough: that")
+              print("::error::is chrome, and it is what made the earlier blank sheets")
+              print("::error::pass a text-presence check.)")
               sys.exit(1)
-          print("ok: cell text present in the grid body")
+          print("ok: cell text present in at least two data columns")
           PY
 
       - name: Dump the Rust log lines
