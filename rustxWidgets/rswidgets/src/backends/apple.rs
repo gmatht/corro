@@ -507,7 +507,26 @@ pub fn log_apple(msg: &str) {
 // Callback registry
 // ------------------------------------------------------------------
 
-static CALLBACKS: Lazy<Mutex<HashMap<u64, Box<dyn FnMut() + Send>>>> =
+/// A main-thread-only closure, storable in a `static`.
+///
+/// The registry holds these in a `Mutex` for interior mutability (the map is
+/// shared, and `dispatch_callback` needs `&mut`), and Rust therefore demands
+/// `Send`. Dispatch is in fact single-threaded on the UI main thread - every
+/// callback in both Apple backends comes from UIKit/AppKit or from an NSTimer
+/// on the main run loop - so `Send` is not a property these closures have; it
+/// is a property the *storage* wants.
+///
+/// Rather than require every registration site to prove a thread-safety they do
+/// not have (which pushed the iOS periodic tick into a chain of `Send` wrapper
+/// types), the assertion is made once, here, where the reasoning belongs.
+struct StoredCallback(Box<dyn FnMut()>);
+// SAFETY: `dispatch_callback` is only ever called from the main thread (UIKit
+// delegates, the canvas draw callback, the NSTimer tick); the mutex is not
+// contended across threads in practice, and the pointer it hands out is
+// dereferenced inside the same call.
+unsafe impl Send for StoredCallback {}
+
+static CALLBACKS: Lazy<Mutex<HashMap<u64, StoredCallback>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 static NEXT_CALLBACK_ID: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
@@ -516,9 +535,9 @@ static NEXT_CALLBACK_ID: std::sync::atomic::AtomicU64 =
 /// (as an `NSNumber` target/`tag`, or a raw `NSInteger` in the shim), and
 /// the shim calls the host's callback entry point which lands in
 /// [`dispatch_callback`].
-pub fn register_callback(f: Box<dyn FnMut() + Send>) -> u64 {
+pub fn register_callback(f: Box<dyn FnMut()>) -> u64 {
     let id = NEXT_CALLBACK_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    CALLBACKS.lock().unwrap().insert(id, f);
+    CALLBACKS.lock().unwrap().insert(id, StoredCallback(f));
     id
 }
 
@@ -531,10 +550,10 @@ pub fn unregister_callback(id: u64) {
 /// draw closure), and holding the lock across the call deadlocks. Same
 /// rule as ANDROID_GUIDELINES.md §5.
 pub fn dispatch_callback(id: u64) {
-    let raw: Option<*mut (dyn FnMut() + Send)> = {
+    let raw: Option<*mut dyn FnMut()> = {
         let mut map = CALLBACKS.lock().unwrap();
         match map.get_mut(&id) {
-            Some(f) => Some(&mut **f as *mut (dyn FnMut() + Send)),
+            Some(StoredCallback(f)) => Some(&mut **f as *mut dyn FnMut()),
             None => None,
         }
     };

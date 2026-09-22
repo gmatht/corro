@@ -18,6 +18,32 @@ run() {
     echo "FAIL  $label"; tail -8 /tmp/ios_verify_out | sed 's/^/        /'; fail=$((fail+1))
   fi
 }
+
+# The `ios-ui` example opens a window, and opening one on a dead X display
+# hangs (GTK waits silently). Say what DISPLAY points at so a hang later in
+# the sweep is diagnosable rather than mysterious, and pick a live display
+# below when the one in the environment is not answering.
+#
+# Every probe here is wrapped in `timeout`: `xdpyinfo -display :0` against a
+# socket that exists but answers nothing BLOCKS FOREVER (measured — it hung
+# this script for 35 minutes the first time, which is exactly the failure the
+# probe was meant to prevent).
+if command -v xdpyinfo >/dev/null 2>&1; then
+  probe() { timeout 5 xdpyinfo -display "$1" >/dev/null 2>&1; }
+  if probe "${DISPLAY:-:0}"; then
+    echo "note: DISPLAY=${DISPLAY:-:0} answers (the ios-ui step can open a window)"
+  else
+    for cand in :99 :0 :1; do
+      if probe "$cand"; then
+        echo "note: DISPLAY=${DISPLAY:-:0} is dead; using $cand for the ios-ui step"
+        export DISPLAY="$cand"; break
+      fi
+    done
+    if ! probe "${DISPLAY:-:0}"; then
+      echo "note: no answering X display found; the ios-ui step will rely on its timeout"
+    fi
+  fi
+fi
 run "rswidgets iOS check (sim + arm64 + armv7s)" "$HERE/check_rswidgets_ios.sh"
 run "corro iOS check (sim + arm64 + armv7s)"     "$HERE/check_corro_ios.sh"
 run "host cdylib check"                          "$HERE/check_host_ios.sh"
@@ -26,7 +52,18 @@ run "desktop corro gui check" bash -c "cd '$CORRO_ROOT' && cargo check --feature
 run "desktop TUI check"       bash -c "cd '$CORRO_ROOT' && cargo check"
 run "corro tests"             bash -c "cd '$CORRO_ROOT' && cargo test --lib --quiet"
 run "rswidgets tests"         bash -c "cd '$CORRO_ROOT' && cargo test -p rswidgets --quiet"
-run "ios-ui example runs"     bash -c "cd '$CORRO_ROOT' && cargo run --quiet --example ios-ui --features gui-mobile-host"
+# `timeout` because the example calls `window.present()`, which blocks forever
+# on a DEAD X display: GTK waits with no error and the process sits in state S
+# (measured here with DISPLAY pointing at a socket that exists but answers
+# nothing — see docs/ios/README.md § "Running corro's GUI here"). A `-e` shell
+# does not catch that, and before the timeout was added this step hung the
+# whole sweep indefinitely.
+run "ios-ui example runs"     bash -c "cd '$CORRO_ROOT' && timeout 120 cargo run --quiet --example ios-ui --features gui-mobile-host"
+# The corro-side of the host contract: the menu model the Swift side builds
+# its UIMenu from, and the entry points its shims call. The simulator cannot
+# test interaction (simctl cannot synthesise touches), so this is what stands
+# in for it on a Linux runner — see tests/ios_pipeline_preview.rs.
+run "ios host-pipeline preview" bash -c "cd '$CORRO_ROOT' && cargo test --quiet --features gui-mobile-host --test ios_pipeline_preview"
 run "xcodeproj generator"     bash -c "rm -rf /tmp/iv_xp && mkdir -p /tmp/iv_xp && '$HERE/../gen_xcodeproj.sh' /tmp/iv_xp/Corro.xcodeproj"
 run "ios workflow parses and steps are bash-clean" bash -c "python3 - <<'PY'
 import subprocess, sys, tempfile, os

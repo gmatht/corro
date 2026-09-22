@@ -1939,12 +1939,33 @@ pub fn add_periodic_tick(
     window.inner.start_repeating_timer(0, ms, f)
 }
 
+/// iOS: an `NSTimer` on the main run loop, driven through the host's existing
+/// callback trampoline.
+///
+/// This used to fall through to the no-op arm below, which returned `Ok(())`
+/// and did nothing - so nothing on iOS ever polled: `CORRO_EDIT_SCRIPT` armed
+/// and then ran no steps, and the append-only log tail that keeps two windows
+/// in sync never fired. A silent success is the worst shape for this, because
+/// every caller assumes the tick exists.
+#[cfg(all(target_os = "ios", not(feature = "zork")))]
+pub fn add_periodic_tick(
+    _window: &crate::common::Window,
+    ms: u32,
+    f: Box<dyn FnMut() -> bool>,
+) -> Result<(), Error> {
+    crate::backends_ios_adapter::add_periodic_tick(ms, f)
+}
+
 /// Backends that drive their own event loop and already poll for external
 /// changes (pancurses/terminal, wasm, zork, android) need no timer, so the
 /// request is accepted and dropped.
+///
+/// NOTE: iOS is deliberately NOT in this list - it needs a real timer, and
+/// returning Ok without one hid that for as long as it did.
 #[cfg(not(any(
     any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))),
-    all(windows, not(feature = "zork"))
+    all(windows, not(feature = "zork")),
+    all(target_os = "ios", not(feature = "zork"))
 )))]
 pub fn add_periodic_tick(
     _window: &crate::common::Window,

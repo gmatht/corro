@@ -40,6 +40,34 @@ path. What they cannot cover is compiling the ObjC and running the app: that
 is `build_ios.sh sim --run` on macOS, and it is the one thing still untested
 here (`rustxWidgets/docs/IOS_GUIDELINES.md` §9).
 
+Interaction, and why it is not tested in the simulator
+------------------------------------------------------
+
+`xcrun simctl` cannot synthesise touches: `simctl io <device> tap` does not
+exist (it was proposed and never shipped), the app cannot read XCTest's events
+without XCTest, and `idb`/WebDriverAgent are not on a hosted runner. So the
+macOS job in `.github/workflows/ios.yml` proves *startup → first frame* and
+stops there.
+
+Two things stand in for it, and neither is the simulator:
+
+* `corro/tests/ios_pipeline_preview.rs` (run by `verify_all.sh`, and by the
+  Linux job in the iOS workflow) checks the corro half of the host contract:
+  the menu model the Swift side turns into a `UIMenu` is non-empty, covers
+  every top-level menu, and *every* published `app.<action>` name maps back to
+  a real menu action — a name that does not would give the user a menu item
+  that silently does nothing when tapped, which is the failure a phone user
+  cannot diagnose. It also asserts the host entry points exist with the shapes
+  `CorroBridge.h` declares, and that passing a null root view is reported
+  rather than accepted.
+* The shared click/type-and-commit path is covered by the desktop live-GUI
+  tests (`tests/gui_click_commit.rs`, `tests/gui_edit_parity.rs`), which drive
+  the *same* `gui_backend` code the iOS build runs. What is iOS-specific is
+  only the shim → `corro_ios_*` hop, and that is the part that needs a device.
+
+For a real finger, the two routes are a simulator screenshot driven by hand
+(`docs/ios/README.md`) or a signed device build on Lambdatest App Live.
+
 Building
 --------
 

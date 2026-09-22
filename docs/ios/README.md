@@ -34,9 +34,32 @@ the tree builds, and Core Graphics draws it at the right size.
 
 ## What it does NOT show
 
-* **Interaction.** It is one frame. Touch → canvas click, and soft-keyboard
-  typing → `corro_ios_entry_changed` → commit, are the paths still unverified;
-  `docs/ios/README.md` has the `simctl` recipe for those.
+* **Simulator interaction — the real build now has it, this image cannot.**
+  `xcrun simctl` on a hosted runner cannot synthesise touches: `simctl io
+  <dev> tap` does not exist (it was proposed and never shipped), the app cannot
+  read `XCTest`'s events, and `idb`/WebDriverAgent are not on the runner. So the
+  simulator can prove *startup → first frame* and nothing beyond it.
+
+  Two paths were taken instead, and the interaction claims below are backed by
+  the first of them:
+
+  1. **The Linux-hosted preview of the identical pipeline** —
+     `rswidgets/examples/ios_pipeline.rs` (run it with
+     `rswidgets/scripts/run_ios_pipeline_preview.sh`). It links the same
+     `backends_ios_adapter::*` code the iOS staticlib links and drives the
+     UIKit-free `HostPreview` shim, so a click and a keystroke go through the
+     whole chain: host shim → adapter → `corro::gui::ios_backend` → back to the
+     shim as a committed op and a redrawn canvas. It asserts both and exits
+     non-zero if either regresses, which is what the CI step
+     "run the iOS pipeline preview" gates on.
+  2. **A real device or a device farm** for a real touchscreen; Lambdatest's
+     App Live re-signs a device build of `build_ios.sh device --ipa`
+     (`docs/ios/README.md` § Lambdatest).
+
+  So: "touch → canvas click" and "soft-keyboard typing →
+  `corro_ios_entry_changed` → commit" are verified against the shared adapter
+  and the corro-side host contract, on every push, on a Linux runner. What is
+  *not* machine-verified in CI is a real finger on a real screen.
 * **The iPhone metrics at their best.** This is a 375x667 device; the retina
   scaling (`UIScreen.scale`) is exercised, the Plus/X-era 3x path is not.
 * **iOS 7.1.2.** No hosted runner has the archived SDK (§0 of the guidelines).
