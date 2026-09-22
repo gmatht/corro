@@ -143,25 +143,30 @@ def main() -> int:
     ap.add_argument(
         "--cps",
         type=float,
-        default=3.25,
-        help="typing speed in chars/sec for the replayed workbooks (default: 3.25; "
+        default=6.5,
+        help="typing speed in chars/sec for the replayed workbooks (default: 6.5; "
              "lower is slower)",
     )
-    ap.add_argument("--confirm-ms", type=int, default=800, help="per-step hold while replaying")
-    ap.add_argument("--menu-hold-ms", type=int, default=2800, help="menu flash hold while replaying")
+    ap.add_argument("--confirm-ms", type=int, default=400, help="per-step hold while replaying")
+    ap.add_argument("--menu-hold-ms", type=int, default=1400, help="menu flash hold while replaying")
     ap.add_argument(
         "--tempo",
         type=float,
-        default=2.0,
-        help="scales the two-window edit timings (2.0 = half speed, matching --cps)",
+        default=1.0,
+        help="scales the two-window edit timings (1.0 = the scripted speed, "
+             "matching --cps; 2.0 = half speed)",
     )
-    ap.add_argument("--fps", type=int, default=12, help="output frame rate")
+    # Kept at the capture rate: downsampling 16/s to 12/s would throw away a
+    # quarter of the frames, and at 6.5 chars/sec a character only spans about
+    # two frames to begin with.
+    ap.add_argument("--fps", type=int, default=16, help="output frame rate")
     ap.add_argument("--crf", type=int, default=20, help="x264 quality (lower is better)")
-    ap.add_argument("--title-secs", type=float, default=6.0, help="how long each card holds")
-    # Kept at 8/s while everything else halves: slower pacing means longer
-    # segments, and a lower capture rate would drop the frames that show the
-    # replay advancing.
-    ap.add_argument("--capture-fps", type=float, default=8.0, help="screenshot rate while replaying")
+    ap.add_argument("--title-secs", type=float, default=3.0, help="how long each card holds")
+    # Must stay well above the typing rate or the per-character animation falls
+    # between captured frames and a replay reads as values simply appearing.
+    # At the default 6.5 chars/sec a character lands every ~154ms, so 16/s
+    # captures each one about twice.
+    ap.add_argument("--capture-fps", type=float, default=16.0, help="screenshot rate while replaying")
     ap.add_argument("--keep-frames", action="store_true", help="keep the intermediate frames")
     args = ap.parse_args()
 
@@ -261,8 +266,8 @@ def main() -> int:
                 [
                     sys.executable, "scripts/two_window_movie.py",
                     "--pair", pair,
-                    # Match the replay pacing: the collaboration segments
-                    # halve in speed along with everything else.
+                    # Match the replay pacing: both kinds of segment run at
+                    # the same speed in the finished video.
                     "--tempo", str(args.tempo),
                     # Match the replay's typing rate so both kinds of segment
                     # read the same way in the finished video.
