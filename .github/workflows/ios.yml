@@ -207,7 +207,13 @@ jobs:
           # Values chosen to exercise the cases that broke: a bare number, a
           # computed formula, a long string that must be clipped to its cell,
           # and a negative/decimal - all in rows whose 20pt band is tight.
-          export SIMCTL_CHILD_CORRO_EDIT_SCRIPT="400:A1=1,900:A2=22,1400:A3==A1+A2,1900:B1=-3.5,2400:B2=123456789,2900:C1=long text that will not fit the cell,3400:C2==SUM(A1:A3),3900:A5=5.25"
+          # Kept in a variable as well as exported: the wait below needs the
+          # script text, and reading it back from the environment proved
+          # unreliable here (LAST_MS parsed to 0 twice, with the export
+          # demonstrably in the same run block). A plain shell variable cannot
+          # be affected by whatever the launch does to the environment.
+          EDIT_SCRIPT="400:A1=1,900:A2=22,1400:A3==A1+A2,1900:B1=-3.5,2400:B2=123456789,2900:C1=long text that will not fit the cell,3400:C2==SUM(A1:A3),3900:A5=5.25"
+          export SIMCTL_CHILD_CORRO_EDIT_SCRIPT="$EDIT_SCRIPT"
           xcrun simctl launch --console-pty "$SIM_UDID" com.corro.corro \
             > /tmp/corro-live.log 2>&1 &
           echo "launch pid $!"
@@ -262,8 +268,12 @@ jobs:
           # collapsed by YAML and parsed to nothing, so LAST_MS came out 0 and
           # the wait was 4s instead of 8s. Same family of bug as the earlier
           # multi-line inline python.
-          LAST_MS=$(printf '%s' "${SIMCTL_CHILD_CORRO_EDIT_SCRIPT:-}" | tr ',' '\n' | sed -n 's/^\([0-9]\+\):.*/\1/p' | sort -n | tail -1)
+          LAST_MS=$(printf '%s' "${EDIT_SCRIPT:-}" | tr ',' '\n' | sed -n 's/^\([0-9]\+\):.*/\1/p' | sort -n | tail -1)
           LAST_MS=${LAST_MS:-0}
+          if [ "$LAST_MS" -eq 0 ]; then
+            echo "::error::could not parse an edit deadline from EDIT_SCRIPT - the wait would be wrong"
+            exit 1
+          fi
           echo "last scripted edit at ${LAST_MS}ms"
           ARMED=0
           for i in $(seq 1 120); do
