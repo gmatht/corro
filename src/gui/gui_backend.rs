@@ -5214,12 +5214,13 @@ fn arm_movie_driver(state: &Rc<GuiState>, movie: super::movie::GuiMovie) {
                             tour_start.set(Some(std::time::Instant::now()));
                         }
                         let elapsed = tour_start.get().unwrap().elapsed().as_millis() as u64;
-                        // Keep the window open for as long as any stop is still
-                        // pending, and refresh the settle budget each tick: the
-                        // final stop's pointer/click phases need it, and a later
-                        // stop can be scheduled seconds away.
+                        // Keep the window open while any stop is pending.
                         tour_settle_frames.set(8);
-                        if steps[ti].at_ms <= elapsed {
+                        // `at_ms` is the delay from the *previous* stop (0 for
+                        // the first one, which fires immediately).
+                        let due = if ti == 0 { 0 } else { steps[ti].at_ms - steps[ti - 1].at_ms };
+                        let _ = elapsed;
+                        if due <= elapsed {
                             let step = steps[ti].clone();
                             // Aim at the section's menu button (the bar runs
                             // along the top of the window) and press there.
@@ -5237,6 +5238,11 @@ fn arm_movie_driver(state: &Rc<GuiState>, movie: super::movie::GuiMovie) {
                                 press_after: Some((step.section.clone(), step.item.clone())),
                             };
                             tour_idx.set(ti + 1);
+                            // Re-anchor the schedule to *now*: the next stop is
+                            // due one step from this moment, not from the start
+                            // of the tour. An absolute clock drifts, because
+                            // each stop's own phases take real time.
+                            tour_start.set(Some(std::time::Instant::now()));
                         }
                         drop(steps);
                         return true;
