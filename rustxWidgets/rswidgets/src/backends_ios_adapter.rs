@@ -135,6 +135,13 @@ mod ios_adapter {
         unsafe { msg4cv(view, "setFrame:", x, y, w, h) };
     }
 
+    /// Send a `CGFloat`-returning, no-argument message. `msg0c` already picks
+    /// the right signature by pointer width (f64 on arm64, f32 on armv7s), so
+    /// this is only a naming shim that makes the call sites read honestly.
+    unsafe fn msg0c_double(obj: *mut c_void, selname: &str) -> f64 {
+        unsafe { crate::backends::ios::msg0c(obj, selname) }
+    }
+
     /// Put `child` inside `parent` (`addSubview:`), keeping the child's own
     /// frame. Null-safe: a null parent (backend not initialised) means the
     /// child is simply never attached, which is what makes host runs work.
@@ -151,7 +158,33 @@ mod ios_adapter {
             ));
             return;
         }
-        unsafe { msg1v(parent, "addSubview:", child) };
+        unsafe {
+            msg1v(parent, "addSubview:", child);
+            // Give the child a real frame and let it fill the parent.
+            //
+            // Without this an `alloc`/`init` UIView has a ZERO frame and, with
+            // no constraints, Auto Layout leaves it at 0x0 - which is exactly
+            // what the simulator showed: `SheetView.layoutSubviews
+            // canvas=1 0x0`, and `drawRect:` never called at all because a
+            // zero-sized view is never drawn. The app then runs, reports
+            // success everywhere, and shows a white screen.
+            //
+            // `autoresizingMask` is the pre-Auto-Layout mechanism and is
+            // exactly right here: the child tracks the parent's bounds. It
+            // needs no constraint bookkeeping and works the same on every iOS
+            // version this backend targets - the property that made the whole
+            // backend viable on the iOS 7 path.
+            // Size via the two CGFloat accessors rather than reading `bounds`
+            // as a struct: a CGRect return goes through the HFA register
+            // convention on arm64, and the whole point of this backend is not
+            // to guess at ABIs. `bounds` is a category method added by the
+            // CorroLayout/geometry shim on the UIView side.
+            let w = msg0c_double(parent, "corroBoundsWidth").max(1.0);
+            let h = msg0c_double(parent, "corroBoundsHeight").max(1.0);
+            set_frame(child, 0.0, 0.0, w, h);
+            // 1 = width flexible, 2 = height flexible.
+            msg1iv(child, "setAutoresizingMask:", 1 | 2);
+        }
     }
 
     // ------------------------------------------------------------------

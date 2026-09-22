@@ -205,6 +205,18 @@
     }
 }
 
+// Border accessors, so the Rust side can size a child to its parent without
+// reading a CGRect back through objc_msgSend. A CGRect return uses the HFA
+// register convention on arm64, and guessing at that is the class of bug this
+// backend exists to avoid.
+- (CGFloat)corroBoundsWidth {
+    return CGRectGetWidth(self.bounds);
+}
+
+- (CGFloat)corroBoundsHeight {
+    return CGRectGetHeight(self.bounds);
+}
+
 - (void)corroSetMinWidth:(NSInteger)width {
     if (width <= 0) {
         return;
