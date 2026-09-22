@@ -334,32 +334,36 @@ pixels.
   `rust-ios-check` job runs the Linux cfg checks first, so a failure points at
   the port rather than the Xcode plumbing.
 
-  **Status: green.** Run **#97** (commit `7d64ee60`) passed every step, and the
-  artifact is downloadable:
+  **Status: green, with a real screenshot.** The first frame has been seen —
+  `ios/corro/ios-first-frame.png` and `docs/ios/README.md`.
 
-  ```
-  gh run download --repo gmatht/corro --name ios-simulator-screenshots
-  ```
+  It took ~100 runs, and the last two failures are the lessons worth keeping:
 
-  That answers §9's standing question — the first frame has been seen, not
-  merely compiled. Two things worth knowing about how it got there, because
-  they are the reusable lessons:
+  * **A green run whose artifact was the home screen.** Run #97 passed every
+    step and shipped a PNG of the simulator's springboard: the app needs ~90 s
+    to reach the first frame cold, and the screenshot step ran 22 s before it
+    started. The health check did not notice, because it grepped a *second*
+    launch for readiness — proving corro can run, not that the process
+    screenshotted did. Both are fixed (wait for the app's own readiness marker
+    from the *console*, since our stderr does not reach `log show`; and require
+    that readiness happened before the shot), and the workflow now also refuses
+    to publish a non-corro image.
+  * **The bug underneath.** A `CorroIosText` selector sent to the class but
+    implemented as an instance method raised an ObjC exception that surfaced
+    only as `fatal runtime error: Rust cannot catch foreign exceptions` — the
+    selector named nowhere. That is §3's shim contract being wrong in one word
+    (`+` vs `-`), and it is now checked on Linux by
+    `ios/corro/scripts/check_selectors.sh`.
 
-  * The first ~96 runs were mostly the workflow debugging *itself*. In
-    particular three liveness probes were each wrong in a different direction
-    (`launchctl list` reads the simulator's own daemons; `pgrep` and `ps` do not
-    exist inside the simulator, so they printed nothing and reported a healthy
-    app as dead on every run). The pass condition is now evidence the app
-    produced itself — the Rust startup marker plus a `SheetView.drawRect` line,
-    neither of which a dead process can emit.
-  * The canvas needed a host-side fix that only showed up here: attached
-    subviews had a 0x0 frame, so `drawRect:` never ran (`w=1 h=1` in the
-    callback). That is the class of bug a compile-only check cannot catch, and
-    the reason the screenshot step is worth its CI minutes.
+  Also fixed along the way, and only findable here: attached subviews had a 0x0
+  frame, so `drawRect:` never ran (`w=1 h=1` in the callback). That class of bug
+  is exactly what a compile-only check cannot catch, and the reason the
+  screenshot step earns its CI minutes.
 
-  Earlier failures along the way are visible in the Actions tab; they are not
-  the app's — the port's Rust half is verified separately by the Linux cfg
-  checks, which have passed throughout.
+  The early failures are in the Actions tab; most were the workflow's own probes
+  (three liveness checks were each wrong: `launchctl list` reads the simulator's
+  daemons, `pgrep` and `ps` are absent from the simulator). The port's Rust half
+  is verified separately by the Linux cfg checks, which have passed throughout.
 
   It cannot cover iOS 7.1.2: no hosted runner carries the archived SDK (§0).
   Nor is any of it *interactive*: one frame is captured, so the touch and
