@@ -268,10 +268,14 @@ jobs:
           # collapsed by YAML and parsed to nothing, so LAST_MS came out 0 and
           # the wait was 4s instead of 8s. Same family of bug as the earlier
           # multi-line inline python.
-          LAST_MS=$(printf '%s' "${EDIT_SCRIPT:-}" | tr ',' '\n' | sed -n 's/^\([0-9]\+\):.*/\1/p' | sort -n | tail -1)
+          # Diagnostic-first: this parsed to 0 on the runner twice while working
+          # verbatim in a local bash, so print what the shell actually sees
+          # rather than guessing a third time.
+          echo "EDIT_SCRIPT is ${#EDIT_SCRIPT} chars: [${EDIT_SCRIPT}]"
+          LAST_MS=$(printf '%s' "$EDIT_SCRIPT" | tr ',' '\n' | sed -n 's/^\([0-9][0-9]*\):.*/\1/p' | sort -n | tail -1)
           LAST_MS=${LAST_MS:-0}
           if [ "$LAST_MS" -eq 0 ]; then
-            echo "::error::could not parse an edit deadline from EDIT_SCRIPT - the wait would be wrong"
+            echo "::error::could not parse an edit deadline from EDIT_SCRIPT (see the line above) - the wait would be wrong"
             exit 1
           fi
           echo "last scripted edit at ${LAST_MS}ms"
