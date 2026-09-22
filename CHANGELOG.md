@@ -54,6 +54,14 @@
   ffmpeg's `x11grab`, which captures continuously at the requested rate. The
   shipped demo is also half its previous speed throughout (typing, step holds,
   card durations and the collaboration timings), and is 298s rather than 60s.
+- **The demo replays at double speed.** The shipped video had become sluggish:
+  3.25 chars/sec with an 800ms per-step hold and a 2800ms menu hold. The typing
+  rate and every hold move together (`--cps 6.5`, `--confirm-ms 400`,
+  `--menu-hold-ms 1400`, two-window `--tempo 1.0`, cards 3s), roughly halving
+  the replay wall-clock. Capture and output both go to 16/s so the
+  per-character animation stays visible at the faster pace, and a long workbook
+  (`main.corro`) no longer hits the capture frame cap, which had been silently
+  truncating it.
 - **Concurrent editing demos.** `scripts/two_window_movie.py` records two
   front-ends editing one file (`--pair gui-gui` or `gui-tui`), showing each
   window's commit appear in the other. Both windows are scripted via
