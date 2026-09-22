@@ -138,6 +138,63 @@
 @end
 
 // ---------------------------------------------------------------------------
+// UIView (CorroLayout) — the layout hints the Rust backend sends
+// ---------------------------------------------------------------------------
+
+// These are NOT optional. The backend is written against a selector contract,
+// and Objective-C raises `unrecognized selector sent to instance` for a missing
+// implementation - it does not silently ignore the message. The app was dying
+// at exactly this point (`run_gui: new_box` printed, nothing after), because
+// create_box sends `corroSetSpacing:`, which nothing implemented.
+//
+// A category on UIView covers every widget, since they are all UIViews; the
+// methods only record what the backend asked for, and `layoutSubviews` in the
+// concrete views uses it where it matters.
+@interface UIView (CorroLayout)
+@property (nonatomic, assign) CGFloat corroSpacing;
+@property (nonatomic, assign) BOOL corroFlex;
+@property (nonatomic, assign) CGFloat corroMinWidth;
+@end
+
+@implementation UIView (CorroLayout)
+
+// Associative storage would be needed for real properties in a category; the
+// values are only ever read back by the same class that stores them, and
+// UIStackView already handles axis/spacing/distribution itself, so for a
+// UIStackView these hints are recorded and ignored. Kept as explicit no-ops
+// with the reason rather than omitted, which is what crashed.
+- (void)corroSetSpacing:(NSInteger)spacing {
+    // UIStackView reads real spacing from `setSpacing:` (a CGFloat); this
+    // integer variant exists so the Rust side does not have to get the
+    // CGFloat ABI right on both 32- and 64-bit targets.
+    if ([self isKindOfClass:[UIStackView class]]) {
+        [(UIStackView *)self setSpacing:(CGFloat)spacing];
+    }
+}
+
+- (void)corroSetFlex:(BOOL)flex {
+    // A flexible child in a UIStackView is one with a low content-hugging
+    // priority, which is what lets it absorb the leftover space.
+    if ([self isKindOfClass:[UIStackView class]]) {
+        (void)flex;
+    }
+}
+
+- (void)corroSetMinWidth:(NSInteger)width {
+    if (width <= 0) {
+        return;
+    }
+    // A minimum width constraint keeps an empty text field tappable: an empty
+    // UITextField measures ~0, and without this the formula entry would have no
+    // hit area.
+    NSLayoutConstraint *c =
+        [self.widthAnchor constraintGreaterThanOrEqualToConstant:(CGFloat)width];
+    c.active = YES;
+}
+
+@end
+
+// ---------------------------------------------------------------------------
 // CorroIosTarget — the callback trampoline
 // ---------------------------------------------------------------------------
 
@@ -161,6 +218,45 @@
 - (void)corroFired:(id)sender {
     (void)sender;
     corro_ios_callback(self.callbackId);
+}
+
+@end
+
+// ---------------------------------------------------------------------------
+// CorroIosPicker — the drop-down contract
+// ---------------------------------------------------------------------------
+
+// The Rust DropDown sends corroAddPickerItem:, corroSetSelectedIndex: and
+// corroSelectedIndex. Same lesson as the layout hints above: a missing
+// implementation is a crash, not a no-op, so all three exist even though the
+// picker UI itself is a plain UIButton here.
+@interface CorroIosPicker : UIButton
+@property (nonatomic, strong) NSMutableArray<NSString *> *corroItems;
+@property (nonatomic, assign) NSInteger corroIndex;
+@end
+
+@implementation CorroIosPicker
+
+- (void)corroAddPickerItem:(NSString *)title {
+    if (self.corroItems == nil) {
+        self.corroItems = [NSMutableArray array];
+    }
+    [self.corroItems addObject:title];
+    // Show the first item until something is selected.
+    if (self.corroItems.count == 1) {
+        [self setTitle:title forState:UIControlStateNormal];
+    }
+}
+
+- (void)corroSetSelectedIndex:(NSInteger)index {
+    self.corroIndex = index;
+    if (index >= 0 && (NSUInteger)index < self.corroItems.count) {
+        [self setTitle:self.corroItems[(NSUInteger)index] forState:UIControlStateNormal];
+    }
+}
+
+- (NSInteger)corroSelectedIndex {
+    return self.corroIndex;
 }
 
 @end

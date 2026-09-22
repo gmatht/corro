@@ -2152,7 +2152,11 @@ mod ios_adapter {
     }
 
     pub fn create_dropdown(items: &[&str]) -> Result<DropDown, Error> {
-        let btn = new_widget("UIButton", Kind::Container);
+        // CorroIosPicker: the app's UIButton subclass implementing
+        // corroAddPickerItem: / corroSetSelectedIndex: / corroSelectedIndex.
+        // A plain UIButton would raise 'unrecognized selector' on the first of
+        // them - the same failure that killed the app at create_box.
+        let btn = new_widget("CorroIosPicker", Kind::Container);
         if btn.is_null() {
             return Ok(DropDown(btn));
         }
