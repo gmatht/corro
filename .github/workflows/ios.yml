@@ -48,10 +48,11 @@ name: iOS
 #     `simctl io <dev> tap` does not exist (proposed, never shipped), the app
 #     cannot read XCTest's events, and idb/WebDriverAgent are not on the
 #     runner. So the simulator proves startup → first frame and stops there.
-#     Touch and typing are instead covered on every push by the cheap Linux
-#     job below, which drives the *same* adapter code through the UIKit-free
-#     host preview (`rswidgets/examples/ios_pipeline.rs`); a real finger needs
-#     a real device or a farm (docs/ios/README.md § Lambdatest).
+#     The Linux job below covers the half that does not need a device: the
+#     menu model the Swift side builds its UIMenu from, and the entry points
+#     `CorroBridge.h` declares. The shared click/type-commit path already has
+#     desktop live-GUI tests against the same `gui_backend` code. A real
+#     finger needs a real device or a farm (docs/ios/README.md § Lambdatest).
 #
 # If it breaks, the fix belongs here — not in the Rust code, which is verified
 # separately by the linux job below (and by ios/corro/scripts/verify_all.sh).
@@ -80,12 +81,14 @@ jobs:
   # check the repo script does, so a failure here means the port itself broke
   # rather than the Xcode plumbing.
   #
-  # It also runs the host-pipeline preview, which is the closest thing to an
-  # interactive test available without a Mac: it links the same
-  # `backends_ios_adapter` code the staticlib links and drives a UIKit-free
-  # shim, so a click and a keystroke travel the whole chain (shim → adapter →
-  # corro::gui::ios_backend → committed op + redraw). The Mac job below cannot
-  # do that with `simctl` — it has no way to synthesise touches.
+  # It also runs corro's half of the host contract
+  # (tests/ios_pipeline_preview.rs): the menu model the Swift side turns into
+  # a `UIMenu`, and every `app.<action>` name in it mapping back to a real
+  # menu action. The Mac job below cannot do that with `simctl` — it has no
+  # way to synthesise touches, so an interactive simulator test is not
+  # available at all — and the shared click/commit path is covered by the
+  # desktop live-GUI tests (tests/gui_click_commit.rs, tests/gui_edit_parity.rs)
+  # against the same `gui_backend` code.
   rust-ios-check:
     runs-on: ubuntu-latest
     steps:
@@ -96,8 +99,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: iOS cfg checks (simulator, arm64 device, 32-bit armv7s)
         run: ios/corro/scripts/check_rswidgets_ios.sh && ios/corro/scripts/check_corro_ios.sh
-      - name: Run the iOS pipeline preview (click + keystroke end to end)
-        run: rustxWidgets/rswidgets/scripts/run_ios_pipeline_preview.sh
+      - name: Run the iOS host-pipeline preview
+        # corro's half of the host contract: the menu model the Swift side
+        # turns into a UIMenu, and the entry points CorroBridge.h declares.
+        # There is no adapter call here — backends_ios_adapter.rs only compiles
+        # for target_os = "ios", and `simctl` cannot synthesise touches, so
+        # this is what replaces an interactive simulator test on Linux.
+        run: cargo test --quiet --features gui-mobile-host --test ios_pipeline_preview
 
   # ── The real half: build + boot the app on a Mac ────────────────────
   build-and-boot:
