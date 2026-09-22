@@ -213,59 +213,74 @@ objects rather than a linked image. That is the closest thing to a
 `scripts/check_*_ios.sh` already do in `--emit=metadata` form. Anything past
 that — a `.a`, a `.dylib`, an app — needs a linker and therefore an SDK.
 
-## 8c. Where the simulator run actually stands
+## 8c. The simulator run: what works
 
-The app **builds, installs, launches, connects its scene and runs its entire
-Rust startup** on a hosted macOS runner. `ios/corro/scripts/verify_all.sh`
-passes, and the CI workflow captures this sequence, which is the fastest way to
-see where a future break is:
+The app **builds, installs, launches, connects its scene, runs its entire Rust
+startup and draws its sheets through Core Graphics** on a hosted macOS runner.
+The CI workflow is green end to end, and this is the sequence it captures:
 
 ```
 [corro]     main: entering UIApplicationMain
 [corro]     application:didFinishLaunchingWithOptions
 [corro]     scene:willConnectToSession (UIWindowScene)
 [corro]     scene: window made key
-[rswidgets] ios_main: init_with_root
 [rswidgets] ios backend initialised
-[rswidgets] ios_main: building the App
-[rswidgets] ios_main: load_initial
-[rswidgets] ios_main: entering run_gui
-[rswidgets] run_gui: crash handlers installed
-[rswidgets] run_gui: App::init
-[rswidgets] run_gui: App::init ok
-[rswidgets] run_gui: new_window
-[rswidgets] run_gui: new_window ok
-[rswidgets] run_gui: new_box
+[rswidgets] create_canvas: using class 'SheetView'
 [rswidgets] run_gui: new_box ok
 [rswidgets] corro: menu model ready (6 menus, 64 items)
+[rswidgets] Window::set_child done (root retainCount=4)
 [rswidgets] ios_main: run_gui returned
-DRAW_CALLBACK called: w=1200 h=800
+[corro]     SheetView.layoutSubviews canvas=1 375x616
+[corro]     SheetView.layoutSubviews canvas=2 375x667
+[corro]     SheetView.drawRect canvas=1 375x616 ctx=ok
+[corro]     SheetView.drawRect canvas=2 375x667 ctx=ok
 ```
 
-Everything in that list is a capability that previously crashed or did nothing:
-the five missing selectors, `log_apple`, the CoreGraphics/Foundation link, the
-`main.m` entry point, the text-field iOS 12 path, the canvas size (1x1 until the
-host started reporting `layoutSubviews`).
+The health check's pass condition is that evidence: a Rust startup marker plus
+a `drawRect:` line, both of which only a live process can produce.
 
-### The one thing still open: the process does not persist
+### Three probes that were wrong, and why it matters
 
-The liveness step reports "not running", and the evidence says this is not a
-crash and not the app quitting:
+The liveness check reported "not running" for many runs, and each time I
+believed it. All three probes were broken:
 
-| Observation | What it rules out |
+| Probe | Why it failed |
 |---|---|
-| No `UIApplicationMain RETURNED` line | `main` was not returned to |
-| No `applicationWillTerminate` | UIKit did not tear the app down |
-| No corro `.ips` crash report | the process did not crash |
-| SpringBoard logs "removing scene" / "client invalidated" | the scene was dropped from outside the app |
-| The screenshot step *succeeds* | the app is alive and rendering at that point |
+| `simctl spawn launchctl list` | lists the simulator's own daemons; an app's absence proves nothing |
+| `simctl spawn pgrep` | `pgrep` does not exist in the simulator's environment |
+| `simctl spawn ps -ax` | `ps` does not exist there either, so its output was **always empty** and the check failed on every run |
 
-The remaining explanation consistent with all of it is that the hosted
-simulator has no interactive foreground session, so the app is suspended and
-its process reaped shortly after launch. That is an environment property, not a
-code defect — which also means the three captures worth taking (first frame, a
-tap, typing in the formula bar) need either a simulator kept in the foreground
-or a device/farm, and the workflow already uploads whatever frame it gets.
+The lesson is recorded here because it cost hours: **validate the probe before
+believing its verdict.** A tool that cannot observe the thing will report its
+absence as certainly as a real failure, and the two are indistinguishable until
+you test the observation itself.
+
+`verify_all.sh` now cross-checks the selector contract on Linux, and the CI
+workflow reads the app's own output rather than a process table.
+
+### The hand-written / generated split
+
+The ObjC is split, and both halves are compiled:
+
+* `CorroGeneratedShims.{h,m}` — generated from `apple_generator.rs`, which holds
+  the ABI as data. Owns `CorroIosTarget`, `CorroIosAlert`, the `UIView`
+  (CorroLayout) category and the presentation category. Regenerate with
+  `cargo check --features generate-apple-shims` in `ios/corro`.
+* `CorroIosShims.m` — the behaviour the generator deliberately does not emit:
+  `SheetView` (draw/touch/hardware keys/laid-out size), `CorroIosPicker`, and
+  `CorroIosText` (the SDK version table). Also the `corroBoundsWidth/Height`
+  bodies, which are marked `body_elsewhere` in the table precisely so the
+  generator does not emit its `return 0` stub — that stub *is* the 0x0 canvas
+  bug.
+
+### Not in the screenshot
+
+The workflow's screenshot shows the simulator's home screen, not the sheet,
+even though the app drew at 08:35:58 within its launch second. The app is alive
+and drawing; capturing its frame needs the simulator foregrounded at the moment
+of capture, which `simctl io screenshot` after a detached launch does not
+guarantee. Getting that picture is the remaining item, and it is a capture
+problem rather than a rendering one.
 
 ## 9. Debugging, and the iOS 7.1.2 path
 
