@@ -15,6 +15,7 @@
 #import <objc/runtime.h>
 
 #import "CorroBridge.h"
+#import <stdio.h>
 
 // ---------------------------------------------------------------------------
 // SheetView — the grid canvas
@@ -49,6 +50,9 @@
 - (void)layoutSubviews {
     [super layoutSubviews];
     CGRect b = self.bounds;
+    fprintf(stderr, "[corro] SheetView.layoutSubviews canvas=%llu %dx%d\n",
+            self.corroCanvasId, (int)CGRectGetWidth(b), (int)CGRectGetHeight(b));
+    fflush(stderr);
     if (CGRectGetWidth(b) > 0 && CGRectGetHeight(b) > 0) {
         corro_ios_canvas_size(self.corroCanvasId,
                               (int32_t)CGRectGetWidth(b),
@@ -60,6 +64,11 @@
 // registered draw closure replay its primitives.
 - (void)drawRect:(CGRect)rect {
     CGContextRef ctx = UIGraphicsGetCurrentContext();
+    fprintf(stderr, "[corro] SheetView.drawRect canvas=%llu %dx%d ctx=%s\n",
+            self.corroCanvasId,
+            (int)CGRectGetWidth(self.bounds), (int)CGRectGetHeight(self.bounds),
+            ctx == NULL ? "NULL" : "ok");
+    fflush(stderr);
     if (ctx == NULL) {
         return;
     }
