@@ -897,7 +897,9 @@ fn displayed_rows(state: &GuiState) -> Vec<usize> {
     // outside. Passing the remembered anchor is what lets a click choose the
     // position (see `centre_on_cursor`); 0 is the "derive from cursor" default.
     let prev = state.viewport_anchor.get().map(|(r, _)| r).unwrap_or(0);
-    let (display, start) = {
+    // Only the window is needed here; the start offset is for callers that
+    // aim the viewport (see `centre_on_cursor`, which computes it itself).
+    let (display, _) = {
         let app = state.app_ref();
         let sheet = app.core.workbook.active_sheet();
         ui_core::visible_row_indices(sheet, app.core.cursor, state.data_rows.get(), prev)
@@ -2427,7 +2429,12 @@ fn maintain_extent(state: &GuiState, allow_shrink: bool) {
     } else {
         mc
     };
+    // The mobile block below raises these to cover the viewport; on desktop
+    // they are never reassigned, so silence the `mut` warning there rather
+    // than leaving one that fires on every desktop build.
+    #[cfg_attr(not(any(target_os = "android", target_os = "ios")), allow(unused_mut))]
     let mut target_r = (content_r + 1).max(floor_r).max(2);
+    #[cfg_attr(not(any(target_os = "android", target_os = "ios")), allow(unused_mut))]
     let mut target_c = (content_c + 1).max(floor_c).max(2);
     // Android: a phone screen shows ~38 rows and ~17 columns at once, but the
     // minimal 2x2 body above leaves all the rest as header/footer rows that
@@ -3442,15 +3449,15 @@ fn prompt_chrome(action: &str, current_sheet_title: &str) -> (String, String, St
     }
 }
 
-/// The live GUI state, reachable from an `app.<name>` string.
-///
-/// The Android menu strip and the iOS menu bar both dispatch action names
-/// across an FFI boundary (neither platform can hand a Rust closure to a
-/// native menu), so the live state has to be reachable from a plain function.
-/// `run_gui` publishes its `Rc<GuiState>` here once the state exists; the
-/// menu UI is only built after that, and both platforms drive the UI on one
-/// thread, so a process-wide slot is sufficient.
-///
+// The live GUI state, reachable from an `app.<name>` string.
+//
+// The Android menu strip and the iOS/macOS menu bars dispatch action names
+// across an FFI boundary (neither platform can hand a Rust closure to a native
+// menu), so the live state has to be reachable from a plain function. `run_gui`
+// publishes its `Rc<GuiState>` here once the state exists; the menu UI is only
+// built after that, and both platforms drive the UI on one thread, so a
+// process-wide slot is sufficient.
+//
 // thread_local, not a static Mutex: GuiState holds Rc/Cell/RefCell and is
 // deliberately !Send (the whole GUI runs on one thread), so a global would
 // need an unsafe Send impl. The platform's UI thread is the only caller.
@@ -3466,6 +3473,10 @@ thread_local! {
 /// Publish the live state for [`dispatch_mobile_menu_action`]. Called once
 /// per `run_gui`; a second call (a second window) replaces the first, which
 /// matches the single-activity/single-scene model on both platforms.
+// Called only from the mobile/macOS menu blocks below (each cfg-gated), so
+// gate the definition to match: a plain desktop build compiled it and then
+// warned that nothing used it.
+#[cfg(any(target_os = "android", target_os = "ios", target_os = "macos"))]
 pub(crate) fn publish_mobile_menu_state(state: &Rc<GuiState>) {
     MOBILE_MENU_STATE.with(|s| *s.borrow_mut() = Some(state.clone()));
 }
@@ -3512,6 +3523,9 @@ pub(crate) fn dispatch_android_menu_action(action: &str) {
 /// deliberately NOT called: dragging is navigation over existing content,
 /// and growing the grid on every drag frame would extend the sheet without
 /// bound (the scrollbar path grows only on an explicit thumb drag).
+// Reached only through `android_backend::scroll_viewport` (cfg-gated on
+// Android), where the touch-drag path lives.
+#[cfg(target_os = "android")]
 pub(crate) fn scroll_viewport_by_cells(d_rows: i32, d_cols: i32) {
     let state = match MOBILE_MENU_STATE.with(|s| s.borrow().clone()) {
         Some(state) => state,

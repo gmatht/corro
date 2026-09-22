@@ -21,5 +21,19 @@ mod android_generator;
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/android_generator.rs");
+
+    // `cfg(feature = "gtk4-rs")` appears ~80 times as a gate on the local-path
+    // gtk4-rs stack. That stack was removed in a1bd343a (its path deps broke
+    // every CI build), which deliberately left the gates in place: they are
+    // inert, and the adapter source is kept for local use. Without this
+    // declaration rustc warns on every one of them ("unexpected cfg condition
+    // value"), and 122 such warnings bury the handful of real ones.
+    //
+    // Declaring the name is the precise fix: it tells rustc the feature is
+    // expected, so the gates stay inert and silent, while any *other* typo'd
+    // feature name still warns. Do not "fix" these by deleting the gates —
+    // that would drop the scaffolding for the dlopen adapter.
+    println!("cargo::rustc-check-cfg=cfg(feature, values(\"gtk4-rs\"))");
+
     android_generator::run();
 }

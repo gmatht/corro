@@ -19,6 +19,10 @@
 //! See `rustxWidgets/docs/IOS_GUIDELINES.md` for the host-side contract (what
 //! the Swift/ObjC app must supply) and `ios/corro/README.md` for the build.
 
+// Only the iOS entry points below use this (they pass an empty path list to
+// `App::new_with_paths`). Gated so a desktop build -- which compiles this
+// module for the shared menu model -- does not warn about it.
+#[cfg(target_os = "ios")]
 use std::path::PathBuf;
 
 /// Run the corro GUI on iOS. Mirrors `gui_backend::run_gui`: same

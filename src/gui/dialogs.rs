@@ -470,7 +470,6 @@ pub fn choice_dialog_parented<F: FnOnce(Option<usize>) + 'static>(
         use rswidgets::backends_nwg_adapter::DropDown;
         #[cfg(not(any(target_os = "linux", target_os = "windows")))]
         use rswidgets::prelude::DropDown;
-        use rswidgets::common::Orientation;
         if let Ok(rxapp) = rswidgets::App::init() {
             let refs: Vec<&str> = items.iter().map(String::as_str).collect();
             if let (Ok(dialog), Ok(dropdown)) =

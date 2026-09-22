@@ -32,6 +32,9 @@
 //! (what the ObjC app must supply) and `rustxWidgets/docs/IOS_GUIDELINES.md`
 //! for the iOS twin of this document.
 
+// Only the macOS entry points below use this; gated for the same reason as
+// the iOS twin (a desktop build compiles this module for the shared model).
+#[cfg(target_os = "macos")]
 use std::path::PathBuf;
 
 // The menu model and the action dispatcher are *shared*, not per-platform: on

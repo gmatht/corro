@@ -27,10 +27,11 @@ use rswidgets::core::DrawContext as MovieDrawContext;
 use std::collections::HashMap;
 
 /// Canvas geometry used to render movie frames, matching the interactive
-/// GUI's pixel contract (see `gui_backend`: `FONT_SIZE`, `ROW_H`, ...).
+/// GUI's pixel contract (`gui_backend`'s `ROW_H`/`CHAR_W`/...). Font size is
+/// not among them: the frame renderer receives text already sized by the
+/// shared render pipeline, so it has no constant of its own for it.
 const FRAME_W: i32 = 1200;
 const FRAME_H: i32 = 800;
-const FONT_SIZE: f64 = 12.0;
 /// Height of the window chrome above the grid: menu bar + formula bar, the
 /// same two strips the interactive window stacks over the canvas.
 const CHROME_H: f64 = 56.0;
