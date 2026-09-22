@@ -59,10 +59,32 @@ def require(tool: str) -> str:
     return path
 
 
+def require_gui_feature(binary: Path) -> None:
+    """Fail early if `binary` was built without the `gui` feature.
+
+    The `gui` feature is not in `default`, so an ordinary `cargo test` or
+    `cargo run` rebuilds `target/debug/corro` *without* it. That binary answers
+    `GTK GUI not compiled in` and exits instantly, which the capture then
+    reports as zero frames, a missing window, or an empty recording — symptoms
+    that look like a bug in the thing being recorded. Checking costs one
+    process spawn and turns an hour of confusion into a one-line error.
+    """
+    probe = subprocess.run(
+        [str(binary), "--gui", os.devnull],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=30,
+    )
+    if "GUI not compiled in" in (probe.stderr or ""):
+        sys.exit(
+            f"error: {binary} was built without the gui feature.\n"
+            f"       Rebuild it: cargo build --features gui"
+        )
+
+
 def run_movie(binary: Path, corro_file: Path, frames_dir: Path, args: argparse.Namespace) -> None:
     """Play the movie in a real window under Xvfb, screenshotting as it runs."""
     xvfb = require("Xvfb")
     require("ffmpeg")
+    require_gui_feature(binary)
 
     display = args.display
     env = dict(os.environ)

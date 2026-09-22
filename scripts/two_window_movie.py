@@ -203,6 +203,20 @@ def main() -> int:
     binary = REPO_ROOT / "target" / "debug" / "corro"
     if not binary.exists():
         sys.exit(f"error: {binary} not found — run: cargo build --features gui")
+    # `gui` is not a default feature, so a `cargo test`/`cargo run` in between
+    # silently rebuilds this binary without it. It then exits instantly with
+    # "GTK GUI not compiled in" and no windows ever appear, which surfaces here
+    # as "expected two windows (left=None, right=None)" — an error that points
+    # at window management rather than at the binary.
+    probe = subprocess.run(
+        [str(binary), "--gui", os.devnull],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=30,
+    )
+    if "GUI not compiled in" in (probe.stderr or ""):
+        sys.exit(
+            f"error: {binary} was built without the gui feature.\n"
+            f"       Rebuild it: cargo build --features gui"
+        )
     if args.pair == "gui-tui" and not shutil.which("xterm"):
         sys.exit("error: xterm is needed for --pair gui-tui")
 
