@@ -217,6 +217,38 @@ pub type GtkWidgetUnparent = unsafe extern "C" fn(widget: *mut c_void);
 pub type GtkWidgetGetParent = unsafe extern "C" fn(widget: *mut c_void) -> *mut c_void;
 
 // GtkWidget tree traversal
+/// `GList* gtk_container_get_children(GtkContainer*)` (GTK3). The returned list
+/// is owned by the caller and must be freed with `g_list_free`.
+pub type GtkContainerGetChildren = unsafe extern "C" fn(*mut c_void) -> *mut c_void;
+/// `GtkWidget* gtk_menu_item_get_submenu(GtkMenuItem*)`.
+pub type GtkMenuItemGetSubmenu = unsafe extern "C" fn(*mut c_void) -> *mut c_void;
+/// `gboolean gtk_widget_is_visible(GtkWidget*)`.
+pub type GtkWidgetIsVisible = unsafe extern "C" fn(*mut c_void) -> i32;
+/// `void g_list_free(GList*)`.
+pub type GListFree = unsafe extern "C" fn(*mut GListC);
+/// `void gtk_container_foreach(GtkContainer*, GtkCallback, gpointer)`.
+pub type GtkContainerForeach =
+    unsafe extern "C" fn(*mut c_void, unsafe extern "C" fn(*mut c_void, *mut c_void), *mut c_void);
+/// `void gtk_menu_item_activate(GtkMenuItem*)`.
+pub type GtkMenuItemActivate = unsafe extern "C" fn(*mut c_void);
+/// `void gtk_menu_popup(GtkMenu*, GtkWidget*, GtkWidget*, GtkMenuPositionFunc,
+/// gpointer, guint, guint32)`.
+pub type GtkMenuPopup = unsafe extern "C" fn(
+    *mut c_void,
+    *mut c_void,
+    *mut c_void,
+    *mut c_void,
+    *mut c_void,
+    u32,
+    u32,
+);
+/// `GList`: `{ gpointer data; GList *next; GList *prev; }`.
+#[repr(C)]
+pub struct GListC {
+    pub data: *mut c_void,
+    pub next: *mut GListC,
+    pub prev: *mut GListC,
+}
 pub type GtkWidgetGetFirstChild = unsafe extern "C" fn(widget: *mut c_void) -> *mut c_void;
 pub type GtkWidgetGetNextSibling = unsafe extern "C" fn(widget: *mut c_void) -> *mut c_void;
 
@@ -540,6 +572,35 @@ pub struct Symbols {
 
     // GtkWidget tree traversal
     pub gtk_widget_get_first_child: Option<GtkWidgetGetFirstChild>,
+    /// GTK3 equivalent of `gtk_widget_get_first_child`: the dynamic child list
+    /// of a `GtkContainer`. GTK3 has no `gtk_widget_get_first_child` at all
+    /// (verified: `nm -D libgtk-3.so.0` does not export it), so anything that
+    /// walks a widget's children must use this on GTK3 or fail outright.
+    /// `GtkWidget* gtk_menu_item_get_submenu(GtkMenuItem*)`.
+    pub gtk_menu_item_get_submenu: Option<GtkMenuItemGetSubmenu>,
+    /// `gboolean gtk_widget_is_visible(GtkWidget*)`.
+    pub gtk_widget_is_visible: Option<GtkWidgetIsVisible>,
+    pub gtk_container_get_children: Option<GtkContainerGetChildren>,
+    /// `void g_list_free(GList*)` — `gtk_container_get_children` returns an
+    /// owned list.
+    pub g_list_free: Option<GListFree>,
+    /// `void gtk_container_foreach(GtkContainer*, GtkCallback, gpointer)` — the
+    /// way to iterate a GTK3 container without freeing a GList.
+    pub gtk_container_foreach: Option<GtkContainerForeach>,
+    /// `void gtk_menu_item_activate(GtkMenuItem*)` — opens a submenu. GTK3's
+    /// `GtkMenuBar` children are `GtkMenuItem`s; there is no
+    /// `gtk_menu_shell_activate_item` shortcut for a mnemonic.
+    /// `void gtk_menu_popup(GtkMenu*, GtkWidget*, GtkWidget*, GtkMenuPositionFunc,
+    /// gpointer, guint button, guint32 activate_time)` — the GTK3 way to open a
+    /// menu programmatically.
+    ///
+    /// `gtk_menu_item_activate` does NOT do this, which is worth stating plainly
+    /// because it looks like it should: verified in a 20-line C program against
+    /// this machine's GTK3, activating a `GtkMenuItem` that has a submenu leaves
+    /// that submenu `visible=0 mapped=0` - nothing appears on screen and no
+    /// error is raised. `gtk_menu_popup` on the same menu gives `1/1`.
+    pub gtk_menu_popup: Option<GtkMenuPopup>,
+    pub gtk_menu_item_activate: Option<GtkMenuItemActivate>,
     pub gtk_widget_get_next_sibling: Option<GtkWidgetGetNextSibling>,
 
     // GtkPopoverMenuBarItem
@@ -871,6 +932,13 @@ impl Symbols {
 
         // GtkWidget tree traversal
         let gtk_widget_get_first_child = unsafe { sym::<GtkWidgetGetFirstChild>(gtk, "gtk_widget_get_first_child") };
+        let gtk_container_get_children = unsafe { sym::<GtkContainerGetChildren>(gtk, "gtk_container_get_children") };
+        let gtk_menu_item_get_submenu = unsafe { sym::<GtkMenuItemGetSubmenu>(gtk, "gtk_menu_item_get_submenu") };
+        let gtk_widget_is_visible = unsafe { sym::<GtkWidgetIsVisible>(gtk, "gtk_widget_is_visible") };
+        let g_list_free = unsafe { sym::<GListFree>(gtk, "g_list_free") };
+        let gtk_container_foreach = unsafe { sym::<GtkContainerForeach>(gtk, "gtk_container_foreach") };
+        let gtk_menu_item_activate = unsafe { sym::<GtkMenuItemActivate>(gtk, "gtk_menu_item_activate") };
+        let gtk_menu_popup = unsafe { sym::<GtkMenuPopup>(gtk, "gtk_menu_popup") };
         let gtk_widget_get_next_sibling = unsafe { sym::<GtkWidgetGetNextSibling>(gtk, "gtk_widget_get_next_sibling") };
 
         // GtkPopoverMenuBarItem
@@ -967,6 +1035,7 @@ impl Symbols {
             gtk_editable_get_position,
             gtk_widget_unparent, gtk_widget_get_parent,
             gtk_widget_get_first_child, gtk_widget_get_next_sibling,
+            gtk_container_get_children, gtk_container_foreach, gtk_menu_item_activate, g_list_free, gtk_menu_item_get_submenu, gtk_widget_is_visible, gtk_menu_popup,
             gtk_popover_menu_bar_item_get_popover, gtk_popover_get_child, gtk_popover_new, gtk_popover_set_child,
             gtk_menu_button_get_label, gtk_menu_button_set_active,
             gtk_menu_button_new, gtk_menu_button_set_popover, gtk_menu_button_set_label,

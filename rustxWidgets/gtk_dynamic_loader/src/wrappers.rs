@@ -1,3 +1,10 @@
+/// `GDK_CURRENT_TIME` is 0 in GDK. The earlier `u32::MAX` was a guess and is an
+/// absurd event timestamp; a popup given a nonsense time can be ignored by the
+/// windowing layer. Kept as a named fn so the value is visible.
+fn gtk_current_time_ok() -> u32 {
+    0
+}
+
 use crate::loader::{Loader, Version};
 use crate::error::Error;
 use std::ffi::CString;
@@ -2431,15 +2438,22 @@ impl MenuBar {
                 return Err(Error::Other("gtk_popover_menu_bar_new_from_model returned null".into()));
             }
             take_ownership(&symbols, &loader.version, inner);
-            let mut mnemonic_index = HashMap::new();
-            for (i, item) in model.items.iter().enumerate() {
-                // Honor the app-layer '_' mnemonic marker: the marked
-                // character is the mnemonic ("_File" → 'F', "Fo_r_mat"
-                // → 'R'). '__' is a literal underscore, never a marker.
-                // Fall back to the first character only when no marker is
-                // present. GTK4 menu handling itself is untouched.
-                let label = &item.label;
-                let mut chars = label.chars().peekable();
+            let mnemonic_index = build_mnemonic_index(&model.items);
+            return Ok(MenuBar { inner, loader, mnemonic_index, model_items: model.items.clone(), action_group, keyboard_menu_active: Rc::new(Cell::new(false)), active_submenu_idx: Rc::new(Cell::new(None)), _not_send: PhantomData });
+        }
+        // Map each top-level item's mnemonic to its position, so a caller can
+        // open a menu with `activate_submenu_by_mnemonic`. Both the GTK4
+        // popover path and the GTK3 menu-bar path need this; building it in
+        // only one of them silently disabled programmatic menu opening on the
+        // other.
+        fn build_mnemonic_index(items: &[MenuItem]) -> HashMap<char, usize> {
+            let mut index = HashMap::new();
+            for (i, item) in items.iter().enumerate() {
+                // Honor the app-layer '_' mnemonic marker: the marked character
+                // is the mnemonic ("_File" -> 'F', "Fo_r_mat" -> 'R'). '__' is a
+                // literal underscore, never a marker. Fall back to the first
+                // character only when no marker is present.
+                let mut chars = item.label.chars().peekable();
                 let mut marked = None;
                 while let Some(c) = chars.next() {
                     if c != '_' {
@@ -2457,14 +2471,15 @@ impl MenuBar {
                     }
                 }
                 let m = marked
-                    .or_else(|| label.replace('_', "").chars().next())
+                    .or_else(|| item.label.replace('_', "").chars().next())
                     .map(|c| c.to_ascii_uppercase());
                 if let Some(m) = m {
-                    mnemonic_index.entry(m).or_insert(i);
+                    index.entry(m).or_insert(i);
                 }
             }
-            return Ok(MenuBar { inner, loader, mnemonic_index, model_items: model.items.clone(), action_group, keyboard_menu_active: Rc::new(Cell::new(false)), active_submenu_idx: Rc::new(Cell::new(None)), _not_send: PhantomData });
+            index
         }
+
         // GTK3: build GtkMenuBar from the Rust-side items
         if let (Some(menu_bar_new), Some(_), Some(_)) = (
             symbols.gtk_menu_bar_new,
@@ -2477,7 +2492,12 @@ impl MenuBar {
             }
             Self::build_gtk3(&loader, inner, &model.items, &symbols, action_group);
             take_ownership(&symbols, &loader.version, inner);
-            return Ok(MenuBar { inner, loader, mnemonic_index: HashMap::new(), model_items: model.items.clone(), action_group, keyboard_menu_active: Rc::new(Cell::new(false)), active_submenu_idx: Rc::new(Cell::new(None)), _not_send: PhantomData });
+            // The mnemonic index has to be built here too. It was left empty on
+            // this path, so `activate_submenu_by_mnemonic` always failed its
+            // lookup and returned false, i.e. nothing could open a menu
+            // programmatically on GTK3 (the movie tour relied on it).
+            let mnemonic_index = build_mnemonic_index(&model.items);
+            return Ok(MenuBar { inner, loader, mnemonic_index, model_items: model.items.clone(), action_group, keyboard_menu_active: Rc::new(Cell::new(false)), active_submenu_idx: Rc::new(Cell::new(None)), _not_send: PhantomData });
         }
         Err(Error::MissingSymbol("gtk_popover_menu_bar_new_from_model".into()))
     }
@@ -2511,6 +2531,19 @@ impl MenuBar {
                         if let Some(set_sub) = symbols.gtk_menu_item_set_submenu {
                             unsafe { set_sub(gtk_item, submenu_widget); }
                         }
+                        // ⚠️ A GtkMenu attached as a submenu must be SHOWN
+                        // before it can pop up. `gtk_menu_item_activate` calls
+                        // `gtk_menu_popup` on it, and GTK's popup path checks
+                        // `gtk_widget_get_visible` first - an unshown menu is
+                        // silently not popped, so the activation "succeeds"
+                        // (returns, no error) with nothing appearing on screen.
+                        //
+                        // That is the second half of the menu-tour bug: with the
+                        // GTK3 symbol fix the activation started returning true,
+                        // and the popover still never appeared.
+                        if let Some(show_all) = symbols.gtk_widget_show_all {
+                            unsafe { show_all(submenu_widget); }
+                        }
                     }
                 } else if !item.detailed_action.is_empty() && !action_group.is_null() {
                     let _ = set_detailed_action_name(symbols, gtk_item, &item.detailed_action);
@@ -2527,43 +2560,137 @@ impl MenuBar {
     /// Returns true if a matching button was found and activated.
     pub fn activate_submenu_by_mnemonic(&self, keyval: u32) -> bool {
         let symbols = &self.loader.symbols;
-        let get_first = match symbols.gtk_widget_get_first_child {
-            Some(f) => f,
-            None => return false,
-        };
-        let get_next = match symbols.gtk_widget_get_next_sibling {
-            Some(f) => f,
-            None => return false,
-        };
-        let activate = match symbols.gtk_widget_activate {
-            Some(f) => f,
-            None => return false,
-        };
 
         let key_upper = char::from_u32(keyval)
             .map(|c| c.to_ascii_uppercase())
             .unwrap_or('\0');
+
         let &idx = match self.mnemonic_index.get(&key_upper) {
             Some(i) => i,
             None => return false,
         };
 
-        // The GtkPopoverMenuBar has a single child: a GtkBox that contains the
-        // menu item buttons.  Get the box, then iterate its children.
-        let box_widget = unsafe { get_first(self.inner) };
-        if box_widget.is_null() { return false; }
-        let mut child = unsafe { get_first(box_widget) };
-        let mut i = 0usize;
-        while !child.is_null() && i < idx {
-            child = unsafe { get_next(child) };
-            i += 1;
-        }
-        if child.is_null() {
-            return false;
-        }
+        // GTK3 and GTK4 need completely different walks, and getting this
+        // wrong is silent: GTK3 exports none of `gtk_widget_get_first_child`,
+        // `_get_next_sibling` or `gtk_widget_activate` (they are GTK4 APIs -
+        // verified with `nm -D libgtk-3.so.0`). The previous version required
+        // them unconditionally and returned `false` when they were missing, so
+        // on GTK3 - the *default* backend - no menu could ever be opened
+        // programmatically. The demo's menu tour therefore fired every item
+        // with the menu never appearing on screen.
+        if self.loader.version == crate::loader::Version::Gtk3 {
+            // `gtk_menu_bar_...`: a GtkMenuBar is a GtkContainer whose children
+            // are GtkMenuItems, in insertion order.
+            let get_children = match symbols.gtk_container_get_children {
+                Some(f) => f,
+                None => return false,
+            };
+            let activate_item = match symbols.gtk_menu_item_activate {
+                Some(f) => f,
+                None => return false,
+            };
+            let free_list = symbols.g_list_free;
 
-        unsafe { activate(child); }
-        true
+            let list = unsafe { get_children(self.inner) }
+                as *mut crate::symbols::GListC;
+            if list.is_null() {
+                return false;
+            }
+            // Walk to the idx-th entry (children are in insertion order).
+            let mut node = list;
+            let mut i = 0usize;
+            while !node.is_null() && i < idx {
+                node = unsafe { (*node).next };
+                i += 1;
+            }
+            let child = if node.is_null() {
+                std::ptr::null_mut()
+            } else {
+                unsafe { (*node).data }
+            };
+            // The GList is ours to free (the widgets belong to GTK).
+            if let Some(free) = free_list {
+                unsafe { free(list) };
+            }
+            if child.is_null() {
+                return false;
+            }
+            // ⚠️ `gtk_menu_item_activate` does NOT open a submenu.
+            //
+            // It looks like the right call and silently does nothing: verified
+            // in a standalone C program on this machine, activating an item that
+            // has a submenu leaves it visible=0 mapped=0 - no popup, no error.
+            // `gtk_menu_popup` on the submenu gives visible=1 mapped=1.
+            //
+            // So: show the submenu, then pop it up at the item's position.
+            // (`gtk_menu_popup` is deprecated in favour of the `_at_rect`
+            // family, but it is present in every GTK3 and the `_at_*` calls are
+            // not, so it is the one to rely on here.)
+            let submenu = symbols
+                .gtk_menu_item_get_submenu
+                .map(|f| unsafe { f(child) })
+                .unwrap_or(std::ptr::null_mut());
+            if submenu.is_null() {
+                // No submenu attached: fall back to plain activation (a leaf
+                // item in the bar, which is not the usual case).
+                unsafe { activate_item(child) };
+                return true;
+            }
+            if let Some(show_all) = symbols.gtk_widget_show_all {
+                unsafe { show_all(submenu) };
+            }
+            match symbols.gtk_menu_popup {
+                Some(popup) => unsafe {
+                    // (menu, parent_menu_shell, parent_menu_item,
+                    //  position_fn, user_data, button, activate_time)
+                    popup(
+                        submenu,
+                        std::ptr::null_mut(),
+                        child,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        0,
+                        gtk_current_time_ok(),
+                    );
+                },
+                None => {
+                    // No popup symbol (very old GTK3): the activation is the
+                    // only thing left to try.
+                    unsafe { activate_item(child) };
+                }
+            }
+            true
+        } else {
+            // GTK4: the popover menu bar has a single child (a GtkBox) holding
+            // the menu buttons, and `gtk_widget_activate` opens one.
+            let get_first = match symbols.gtk_widget_get_first_child {
+                Some(f) => f,
+                None => return false,
+            };
+            let get_next = match symbols.gtk_widget_get_next_sibling {
+                Some(f) => f,
+                None => return false,
+            };
+            let activate = match symbols.gtk_widget_activate {
+                Some(f) => f,
+                None => return false,
+            };
+            let box_widget = unsafe { get_first(self.inner) };
+            if box_widget.is_null() {
+                return false;
+            }
+            let mut child = unsafe { get_first(box_widget) };
+            let mut i = 0usize;
+            while !child.is_null() && i < idx {
+                child = unsafe { get_next(child) };
+                i += 1;
+            }
+            if child.is_null() {
+                return false;
+            }
+            unsafe { activate(child) };
+            true
+        }
     }
 
     /// Activate a submenu item whose mnemonic matches `keyval` when a popover

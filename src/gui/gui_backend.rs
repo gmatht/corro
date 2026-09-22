@@ -3682,7 +3682,10 @@ fn menu_section_pointer_target(section: &str, item_index: u32) -> (f64, f64) {
 ///
 /// A missing section or item is reported in the status line instead of being
 /// silently ignored, so a typo in a tour script is visible in the recording.
-fn run_menu_tour_stop(state: &Rc<GuiState>, section: &str, item: &str) {
+/// Open the menu for a tour stop and leave it OPEN. Returns the action to
+/// dispatch (see [`finish_menu_tour_stop`]), or `None` when the section/item
+/// could not be resolved (the status line says so, and the driver retries).
+fn run_menu_tour_stop(state: &Rc<GuiState>, section: &str, item: &str) -> Option<&'static str> {
     // Resolve the item to its action name from the shared menu definition (the
     // same tree every backend builds from, so the tour cannot drift from the
     // real menus).
@@ -3690,7 +3693,7 @@ fn run_menu_tour_stop(state: &Rc<GuiState>, section: &str, item: &str) {
     let Some(root) = bar.iter().find(|r| r.label == section) else {
         state.app_mut().core.status = format!("Menu tour: no section {section:?}");
         sync_chrome_labels(state);
-        return;
+        return None;
     };
     // Search nested submenus too (`File > Width > Default width`,
     // `Format > Scope > All`), so a tour can address items at any depth.
@@ -3711,10 +3714,14 @@ fn run_menu_tour_stop(state: &Rc<GuiState>, section: &str, item: &str) {
     let Some(action) = action else {
         state.app_mut().core.status = format!("Menu tour: no item {section} ▸ {item}");
         sync_chrome_labels(state);
-        return;
+        return None;
     };
 
     // Open the section's popover for real, so the recording shows the menu.
+    crate::debug_log::log(&format!(
+        "TOURMENUBAR present={} label={:?}",
+        state.menubar.get().is_some(), root.label
+    ));
     if let Some(menubar) = state.menubar.get() {
         if let Some(c) = root.label.chars().next() {
             let keyval = c.to_ascii_lowercase() as u32;
@@ -3733,6 +3740,22 @@ fn run_menu_tour_stop(state: &Rc<GuiState>, section: &str, item: &str) {
         app.core.status = format!("Menu tour: {section} ▸ {item}");
     }
     sync_chrome_labels(state);
+    state.canvas.queue_redraw();
+    state.window.queue_redraw();
+    Some(action)
+}
+
+/// Second half of a tour stop: dispatch the item and close the menu.
+///
+/// Split from [`run_menu_tour_stop`] because the two must happen on DIFFERENT
+/// frames. Opening and closing the popover inside one tick means it exists for
+/// microseconds and is never on screen for any captured frame - the recording
+/// showed the item taking effect with no menu ever visible, which is exactly the
+/// "the menu tour demonstrates no menu items" symptom. Holding it open for the
+/// configured `--movie-menu-hold-ms` is what makes the open menu part of the
+/// recording.
+fn finish_menu_tour_stop(state: &Rc<GuiState>, section: &str, item: &str, action: &'static str) {
+    let _ = (section, item);
     handle_menu_action(action, state);
 
     // Close so the next stop starts from a clean menu state.
@@ -5138,6 +5161,17 @@ fn arm_movie_driver(state: &Rc<GuiState>, movie: super::movie::GuiMovie) {
         },
         /// Hold the pressed state briefly so a click is legible.
         PointerPress { until: u32, then_menu: Option<(String, String)> },
+        /// Keep a tour stop's popover open for `frames`, then dispatch.
+        ///
+        /// The menu has to survive several captured frames to appear in the
+        /// recording at all: opening and closing it within one tick made its
+        /// lifetime shorter than a single frame.
+        MenuHold {
+            frames: u32,
+            section: String,
+            item: String,
+            action: &'static str,
+        },
     }
     let phase = std::cell::RefCell::new(Phase::LeadIn(lead_in_ticks.max(1)));
 
@@ -5151,6 +5185,13 @@ fn arm_movie_driver(state: &Rc<GuiState>, movie: super::movie::GuiMovie) {
     // Ticks to keep the window alive after the last stop starts, so its
     // pointer/click phases can finish before the replay quits.
     let tour_settle_frames = std::cell::Cell::new(0u32);
+    // How many ticks to keep a tour stop's menu open. The tick is ~11ms, and
+    // `--movie-menu-hold-ms` is the same knob the replay's own menu steps use,
+    // so a menu is on screen for the configured time in both.
+    let menu_hold_frames = {
+        let ms = super::movie::GuiMovieOptions::from_env().menu_hold_ms;
+        ((ms as f64 / 11.0).round() as u32).max(2)
+    };
 
     let tick = move || -> bool {
         if finished.get() {
@@ -5218,8 +5259,42 @@ fn arm_movie_driver(state: &Rc<GuiState>, movie: super::movie::GuiMovie) {
                 state_for_tick.canvas.queue_redraw();
                 state_for_tick.window.queue_redraw();
                 if let Some((section, item)) = then_menu {
-                    run_menu_tour_stop(&state_for_tick, &section, &item);
+                    // Open the menu and leave it open: the dispatch happens
+                    // after MenuHold, on a later frame, so the recording
+                    // actually contains the open menu. (Dispatching here made
+                    // the popover's lifetime shorter than one frame, which is
+                    // why the tour showed no menus.)
+                    let action = run_menu_tour_stop(&state_for_tick, &section, &item);
+                    match action {
+                        Some(action) => {
+                            *current = Phase::MenuHold {
+                                frames: menu_hold_frames,
+                                section,
+                                item,
+                                action,
+                            };
+                        }
+                        None => *current = Phase::Idle,
+                    }
+                } else {
+                    *current = Phase::Idle;
                 }
+                true
+            }
+            Phase::MenuHold { frames, section, item, action } => {
+                if frames > 1 {
+                    *current = Phase::MenuHold {
+                        frames: frames - 1,
+                        section,
+                        item,
+                        action,
+                    };
+                    // Keep the popover painted while it is held.
+                    state_for_tick.canvas.queue_redraw();
+                    state_for_tick.window.queue_redraw();
+                    return true;
+                }
+                finish_menu_tour_stop(&state_for_tick, &section, &item, action);
                 *current = Phase::Idle;
                 true
             }
