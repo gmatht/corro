@@ -179,11 +179,24 @@ mod ios_adapter {
             // convention on arm64, and the whole point of this backend is not
             // to guess at ABIs. `bounds` is a category method added by the
             // CorroLayout/geometry shim on the UIView side.
-            let w = msg0c_double(parent, "corroBoundsWidth").max(1.0);
-            let h = msg0c_double(parent, "corroBoundsHeight").max(1.0);
+            // Use the parent's bounds when they are known, but do not clamp to
+            // 1: at construction time a parent can legitimately be 0 tall (it
+            // has not been laid out yet), and sizing the child to 1 point then
+            // is what produced `layoutSubviews canvas=1 376x1` - a canvas one
+            // pixel tall, which "draws" and shows nothing.
+            //
+            // The autoresizing mask below makes the child track the parent's
+            // size once UIKit lays things out, so an approximate initial frame
+            // is harmless and a wrong *small* one is not.
+            let w = msg0c_double(parent, "corroBoundsWidth");
+            let h = msg0c_double(parent, "corroBoundsHeight");
+            let w = if w > 1.0 { w } else { 320.0 };
+            let h = if h > 1.0 { h } else { 480.0 };
             set_frame(child, 0.0, 0.0, w, h);
-            // 1 = width flexible, 2 = height flexible.
-            msg1iv(child, "setAutoresizingMask:", 1 | 2);
+            // 1 = flexible width, 2 = flexible height, 16 = flexible top
+            // margin, 32 = flexible bottom margin: the child fills and follows
+            // the parent as it is laid out.
+            msg1iv(child, "setAutoresizingMask:", 1 | 2 | 16 | 32);
         }
     }
 
