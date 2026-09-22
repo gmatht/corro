@@ -68,13 +68,33 @@ def run_movie(binary: Path, corro_file: Path, frames_dir: Path, args: argparse.N
     env = dict(os.environ)
     env["DISPLAY"] = display
 
+    # Clear a stale server on this display first: if one is still bound, our
+    # Xvfb fails to start while the old one keeps serving, and the recording
+    # then captures whatever that server holds.
+    subprocess.run(["pkill", "-f", f"Xvfb {display}"], capture_output=True)
+    time.sleep(0.5)
     xvfb_proc = subprocess.Popen(
         [xvfb, display, "-screen", "0", f"{args.width}x{args.height}x24"],
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
     )
     try:
-        time.sleep(1.5)  # let the server come up
+        # Wait for the server to answer rather than guessing a sleep: a slow
+        # machine can take longer than the old fixed 1.5s, and recording before
+        # it is up yields empty or partial frames.
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            probe = subprocess.run(
+                ["xdpyinfo", "-display", display],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            if probe.returncode == 0:
+                break
+            if xvfb_proc.poll() is not None:
+                sys.exit(f"error: Xvfb {display} exited immediately")
+            time.sleep(0.25)
+        else:
+            sys.exit(f"error: Xvfb {display} never became ready")
         cmd = [
             str(binary),
             "--gui",

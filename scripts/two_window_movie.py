@@ -219,10 +219,29 @@ def main() -> int:
     shared = work / "shared.corro"
     build_file(shared)
 
+    # A stale server on this display would make our Xvfb fail to bind while the
+    # old one keeps serving, so the windows we start are not the ones we think
+    # we are looking at and `find_window` never finds them. Clear it first and
+    # then wait for the new server to answer before starting anything.
+    subprocess.run(["pkill", "-f", f"Xvfb {_DISPLAY}"], capture_output=True)
+    time.sleep(0.5)
     xvfb = subprocess.Popen(
         ["Xvfb", _DISPLAY, "-screen", "0", f"{SCREEN_W}x{SCREEN_H}x24"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
     )
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        probe = subprocess.run(
+            ["xdpyinfo", "-display", _DISPLAY],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        if probe.returncode == 0:
+            break
+        if xvfb.poll() is not None:
+            sys.exit(f"error: Xvfb {_DISPLAY} exited immediately")
+        time.sleep(0.25)
+    else:
+        sys.exit(f"error: Xvfb {_DISPLAY} never became ready")
     # A window manager is required, not cosmetic: without one, focus and
     # stacking between two toplevels are undefined and the second window can
     # end up hidden behind the first.
