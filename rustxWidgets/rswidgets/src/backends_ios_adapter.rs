@@ -2460,11 +2460,15 @@ mod tests {
 /// selector, which calls `corro_ios_callback(id)` -> `dispatch_callback(id)`.
 /// That is the same trampoline the buttons and pickers use.
 #[cfg(target_os = "ios")]
-pub fn add_periodic_tick(
-    ms: u32,
-    mut f: Box<dyn FnMut() -> bool>,
-) -> Result<(), crate::core::Error> {
-    use crate::backends::apple::{cls, msg0, msg_shim, own, selector, retain};
+/// Create an `NSTimer` on the main run loop that dispatches `f` every `ms`,
+/// returning the registered callback id.
+///
+/// Split out from [`add_periodic_tick`] so the liveness probe below uses the
+/// identical scheduling path - a probe that took a different route would not
+/// prove anything about the real timer.
+#[cfg(target_os = "ios")]
+fn schedule_timer(ms: u32, f: Box<dyn FnMut() -> bool>) -> Result<u64, crate::core::Error> {
+use crate::backends::apple::{cls, msg0, msg_shim, own, selector, retain};
     use std::os::raw::c_void;
 
     if !crate::backends::apple::is_initialized() {
@@ -2473,9 +2477,6 @@ pub fn add_periodic_tick(
         ));
     }
 
-    // Register the tick body. The id is needed inside the closure to
-    // unregister itself when it returns false, so it goes through a Cell that
-    // the closure reads at call time (by then the id is assigned).
     let id_cell: std::rc::Rc<std::cell::Cell<u64>> = std::rc::Rc::new(std::cell::Cell::new(0));
     let id_for_cb = id_cell.clone();
     let mut f = f;
@@ -2486,67 +2487,53 @@ pub fn add_periodic_tick(
         }
     }));
     id_cell.set(registered);
-    let id = registered;
+    Ok(registered)
+}
 
-    // `CorroIosTarget targetWithCallbackId:` — the host's trampoline class.
-    let shim = cls("CorroIosTarget");
-    if shim.is_null() {
-        crate::backends::apple::log_apple(
-            "ios: CorroIosTarget shim missing; periodic tick not scheduled",
-        );
-        return Err(crate::core::Error::Backend(
-            "CorroIosTarget shim missing (cannot schedule a timer)".into(),
-        ));
-    }
-    let target = unsafe {
-        crate::backends::apple::msg1i(shim, "targetWithCallbackId:", id as isize)
-    };
-    if target.is_null() {
-        return Err(crate::core::Error::Backend(
-            "CorroIosTarget targetWithCallbackId: returned nil".into(),
-        ));
-    }
-    let target = own(target);
+/// Schedule `f` to run every `ms` milliseconds on the main run loop, returning
+/// `false` from `f` to stop.
+///
+/// Until this existed, `add_periodic_tick` fell through to the "backends that
+/// drive their own event loop need no timer" arm in `core.rs` and returned
+/// `Ok(())` **without doing anything**. That is a silent no-op: on iOS nothing
+/// polled at all, so
+///   * `CORRO_EDIT_SCRIPT` printed "edit script armed (N steps)" and then ran
+///     none of them (the iOS CI screenshots were of a blank sheet for exactly
+///     this reason), and
+///   * the append-only log tail that keeps two windows in sync never polled, so
+///     a second window would never see the first's commits.
+///
+/// A silent success is the worst shape for this: every caller assumes the tick
+/// exists, so the failure surfaces far away as "the sheet is empty".
+///
+/// Implemented as an `NSTimer` on the main run loop, whose target is the host's
+/// existing `CorroIosTarget` shim and whose selector is `corroFired:` - the same
+/// trampoline the buttons use, so no new host code is needed.
+#[cfg(target_os = "ios")]
+pub fn add_periodic_tick(
+    ms: u32,
+    f: Box<dyn FnMut() -> bool>,
+) -> Result<(), crate::core::Error> {
+    schedule_timer(ms, f)?;
 
-    // +[NSTimer scheduledTimerWithTimeInterval:target:selector:userInfo:repeats:]
-    // The class method is a message send to the NSTimer class object.
-    let timer_cls = cls("NSTimer");
-    if timer_cls.is_null() {
-        return Err(crate::core::Error::Backend("NSTimer unavailable".into()));
-    }
-    let interval = (ms.max(1) as f64) / 1000.0;
-    let sel = selector("corroFired:");
-    unsafe {
-        // id (*)(id, SEL, double, id, SEL, id, BOOL)
-        let f: unsafe extern "C" fn(
-            *mut c_void,
-            *mut c_void,
-            f64,
-            *mut c_void,
-            *mut c_void,
-            *mut c_void,
-            bool,
-        ) -> *mut c_void = std::mem::transmute(msg_shim());
-        let timer = f(
-            timer_cls,
-            selector("scheduledTimerWithTimeInterval:target:selector:userInfo:repeats:"),
-            interval,
-            target,
-            sel,
-            std::ptr::null_mut(),
-            true,
-        );
-        if timer.is_null() {
-            return Err(crate::core::Error::Backend(
-                "scheduledTimerWithTimeInterval: returned nil".into(),
-            ));
-        }
-        // The run loop retains the timer, and the timer retains the target; the
-        // extra retain keeps the handle valid for the process lifetime, matching
-        // every other handle in this backend.
-        let _ = msg0(timer, "retain");
-        retain(timer);
-    }
-    crate::backends::apple::log_apple(&format!("ios: periodic tick armed ({ms}ms)"));
-    Ok(())
+    // Prove the timer actually FIRES, not merely that it was scheduled.
+    //
+    // Scheduling an `NSTimer` is not the same as having it run: a timer added to
+    // a run loop that is not yet running fires never, and the only symptom would
+    // be an absence somewhere else - which is exactly how this bug hid for as
+    // long as it did. These lines say whether the mechanism is live.
+    let fired = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    schedule_timer(
+        250,
+        Box::new(move || {
+            let n = fired.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n == 4 || n == 20 {
+                crate::backends::apple::log_apple(&format!(
+                    "ios: periodic tick has fired {n} times (timer is live)"
+                ));
+            }
+            true
+        }),
+    )
+    .map(|_| ())
 }

@@ -165,6 +165,12 @@ def run_movie(binary: Path, corro_file: Path, frames_dir: Path, args: argparse.N
                 cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True
             )
             corro.wait(timeout=args.timeout)
+            # Surface the app's own diagnostics: a crash here is otherwise
+            # invisible (stderr is captured but nothing reads it), and the
+            # symptom is just "the recording is short".
+            _err = corro.stderr.read() if corro.stderr else ""
+            if _err.strip():
+                sys.stderr.write("[gui_movie] app stderr:\n" + _err[-4000:])
             # A short tail so the last replayed frame is on screen when the
             # recorder stops.
             time.sleep(0.5)

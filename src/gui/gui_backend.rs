@@ -1196,31 +1196,39 @@ fn paint_movie_pointer(dc: &mut dyn DrawContext, state: &GuiState) {
     let Some((x, y, pressed)) = state.movie_pointer.get() else {
         return;
     };
-    // Classic arrow: tip at (x, y), a tall leading edge and a notched tail.
-    const BODY: &[(f64, f64)] = &[
-        (0.0, 0.0),
-        (0.0, 17.0),
-        (4.5, 12.5),
-        (7.5, 19.0),
-        (10.5, 17.5),
-        (7.5, 11.0),
-        (13.5, 11.0),
-    ];
-    // Outline first, then the fill, so the arrow stays legible whether it sits
-    // over the pale grid or a dark menu surface. `pressed` turns it red, which
-    // is what makes a click read in a recording.
-    for i in 0..BODY.len() {
-        let (ax, ay) = BODY[i];
-        let (bx, by) = BODY[(i + 1) % BODY.len()];
-        stroke_segment(dc, x + ax, y + ay, x + bx, y + by, 3.5, 1.0, 1.0, 1.0);
-    }
+    // Drawn with a handful of solid rectangles rather than a stroked polygon:
+    // the arrow is small, and wide strokes made of many overlapping fills are
+    // both slower and harder to keep crisp at this size.
     let (r, g, b) = if pressed { (0.85, 0.1, 0.1) } else { (0.05, 0.05, 0.15) };
-    for row in 0..17 {
-        let t = row as f64 / 17.0;
-        stroke_segment(dc, x + 1.0, y + t * 17.0, x + 1.0 + 5.0 * (1.0 - t), y + t * 17.0, 2.0, r, g, b);
+    // Generous proportions: this has to stay legible in a 1200x800 video and
+    // against both the pale grid and the dark menu popovers, so the shaft is
+    // wide enough to survive scaling and the outline is a full 2px.
+    let w: f64 = 3.0;
+    let outline = (1.0, 1.0, 1.0);
+
+    // Leading edge: a vertical bar from the tip down, tapering to a point at
+    // the top. Drawn as one rect per row so the tip is a true point.
+    let height: f64 = 24.0;
+    let mut row: f64 = 0.0;
+    while row < height {
+        // Width grows from 1px at the tip to the full shaft.
+        let t = (row / height).min(1.0);
+        let half = (w / 2.0) * (0.35 + 0.65 * t);
+        let yy = y + row;
+        dc.fill_rect(x - half - 2.0, yy, 4.0 + 2.0 * half, 1.0, outline.0, outline.1, outline.2, 1.0);
+        dc.fill_rect(x - half, yy, 2.0 * half, 1.0, r, g, b, 1.0);
+        dc.fill_rect(x - half - 2.0, yy + 1.0, 2.0 * half + 4.0, 1.0, outline.0, outline.1, outline.2, 1.0);
+        row += 1.0;
     }
-    for row in 0..7 {
-        stroke_segment(dc, x + 7.0, y + 11.5 + row as f64, x + 10.0, y + 11.5 + row as f64, 3.0, r, g, b);
+    // Tail: a short horizontal bar angling down-right from mid-shaft, so the
+    // shape reads as the familiar arrow rather than a plain cross.
+    let mut t2: f64 = 0.0;
+    while t2 < 11.0 {
+        let yy = y + 13.0 + t2;
+        let xx = x + 1.5 + t2 * 0.8;
+        dc.fill_rect(xx - 2.0, yy, 7.0, 1.0, outline.0, outline.1, outline.2, 1.0);
+        dc.fill_rect(xx, yy, 3.0, 1.0, r, g, b, 1.0);
+        t2 += 1.0;
     }
 }
 
@@ -5209,6 +5217,10 @@ fn arm_movie_driver(state: &Rc<GuiState>, movie: super::movie::GuiMovie) {
                     // the recording ends before the menu is even opened.
                     let steps = tour.borrow();
                     let ti = tour_idx.get();
+                    crate::debug_log::log(&format!(
+                        "TOURDECIDE ti={ti} len={} settle={}",
+                        steps.len(), tour_settle_frames.get()
+                    ));
                     if ti < steps.len() {
                         if tour_start.get().is_none() {
                             tour_start.set(Some(std::time::Instant::now()));
