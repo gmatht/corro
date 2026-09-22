@@ -54,6 +54,12 @@
   ffmpeg's `x11grab`, which captures continuously at the requested rate. The
   shipped demo is also half its previous speed throughout (typing, step holds,
   card durations and the collaboration timings), and is 298s rather than 60s.
+- **The two-window segments keep their true shape.** They are still distorted if
+  the pair is not scaled by the same factor on both axes: scaling 2400x820 to
+  the video width alone left each window 2x too wide, and the 600x410 the demo
+  then settled on squashed each one 2x too *narrow*. The pair is now scaled
+  uniformly (2400x820 -> 1200x410, so one window is 600x410 against a true 1.50
+  aspect) and centred vertically.
 - **The demo replays at double speed.** The shipped video had become sluggish:
   3.25 chars/sec with an 800ms per-step hold and a 2800ms menu hold. The typing
   rate and every hold move together (`--cps 6.5`, `--confirm-ms 400`,

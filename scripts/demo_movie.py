@@ -287,21 +287,27 @@ def main() -> int:
             captured = sorted(d.glob("frame-*.ppm"))
             if not captured:
                 sys.exit(f"error: no frames captured for {pair}")
-            # Two windows sit side by side on a 2400x820 screen. Scaling that to
-            # the video's 1200px width halves the height too (2400x820 ->
-            # 1200x410), which squashes both windows into a letterbox strip.
-            # Halve *both* dimensions instead, so each window keeps its true
-            # aspect, then centre the pair in the 1200x800 frame. The sizes are
-            # written out rather than derived from `iw`/`ih`: inside a filter
-            # chain `ih` still refers to the *original* input, so
-            # `pad=...:trunc(ih/2)*2` asks for a box shorter than its input and
-            # ffmpeg rejects the whole graph.
+            # Two 1200x800 windows sit side by side on a 2400x820 screen. The
+            # pair has to be scaled by the *same* factor on both axes or every
+            # window comes out distorted: halving the width alone (2400 ->
+            # 1200) left the height at 820, which stretched each window 2x too
+            # wide; picking a smaller width factor than the height factor (the
+            # 600x410 this used to do) squashed each one 2x too narrow. Scale
+            # uniformly to the video width — 2400x820 -> 1200x410, so one window
+            # is 600x410 against a true 1.50 aspect — then centre the pair
+            # vertically.
+            #
+            # The target size is written out literally rather than derived from
+            # `iw`/`ih`: inside a filter chain `ih` still refers to the
+            # *original* input, so `pad=...:trunc(ih/2)*2` asks for a box
+            # shorter than its input and ffmpeg rejects the whole graph.
+            scaled_w = WIDTH
+            scaled_h = round(TWO_WINDOW_SCREEN[1] * WIDTH / TWO_WINDOW_SCREEN[0])
+            scaled_h -= scaled_h % 2  # yuv420p wants even dimensions
             add_frames(
                 d / "frame-%05d.ppm", len(captured),
-                f"scale={TWO_WINDOW_SCREEN[0] // 4}:{TWO_WINDOW_SCREEN[1] // 2},"
-                f"pad={WIDTH}:{HEIGHT}:"
-                f"{(WIDTH - TWO_WINDOW_SCREEN[0] // 4) // 2}:{(HEIGHT - TWO_WINDOW_SCREEN[1] // 2) // 2}"
-                f":color=0x12161e",
+                f"scale={scaled_w}:{scaled_h},"
+                f"pad={WIDTH}:{HEIGHT}:0:{(HEIGHT - scaled_h) // 2}:color=0x12161e",
                 args.fps,
             )
             shutil.rmtree(d, ignore_errors=True)
