@@ -140,6 +140,15 @@ mod ios_adapter {
     /// child is simply never attached, which is what makes host runs work.
     fn attach(parent: *mut c_void, child: *mut c_void) {
         if parent.is_null() || child.is_null() {
+            // A null handle here is silent failure: the widget exists in Rust
+            // but is never added to the view hierarchy, so the app runs with a
+            // blank screen and no error anywhere. That is exactly the symptom
+            // being chased (alive process, white screen), so say so.
+            core_ios::log_ios(&format!(
+                "attach skipped: parent={} child={}",
+                if parent.is_null() { "null" } else { "ok" },
+                if child.is_null() { "null" } else { "ok" },
+            ));
             return;
         }
         unsafe { msg1v(parent, "addSubview:", child) };
@@ -215,7 +224,17 @@ mod ios_adapter {
         }
 
         pub fn set_child(&self, child: &impl AsRef<*mut c_void>) {
+            // The one attachment that decides whether ANYTHING is visible: the
+            // tree's root goes onto the host's view. Logged because its silent
+            // failure mode is a running app with a blank screen.
+            core_ios::log_ios("Window::set_child (attaching the tree to the host view)");
             attach(self.0, *child.as_ref());
+            let n = if self.0.is_null() {
+                -1
+            } else {
+                unsafe { msg0i(self.0, "retainCount") }
+            };
+            core_ios::log_ios(&format!("Window::set_child done (root retainCount={n})"));
         }
 
         pub fn set_child_box(&self, bx: &BoxWidget) {
