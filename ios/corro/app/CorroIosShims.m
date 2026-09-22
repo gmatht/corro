@@ -27,6 +27,8 @@
 @interface SheetView : UIView
 /// Set by the backend right after construction (`corroSetCanvasId:`).
 @property (nonatomic, assign) uint64_t corroCanvasId;
+/// Re-entrancy guard for the fill-the-superview adjustment in layoutSubviews.
+@property (nonatomic, assign) BOOL corroFillingSuperview;
 @end
 
 // Declared ahead of use so the availability annotation is visible at the call
@@ -50,6 +52,21 @@
 - (void)layoutSubviews {
     [super layoutSubviews];
     CGRect b = self.bounds;
+    // A view that is part of a stack view is sized by it; this only matters for
+    // the ones attached with addSubview: (the canvas inside its container),
+    // where nothing else gives it a height. Filling the superview is the
+    // intended behaviour for a sheet, and it stops the 0-height case that made
+    // drawRect: never fire.
+    if (self.superview != nil && (CGRectGetHeight(b) < 1.0 || CGRectGetWidth(b) < 1.0)) {
+        // Guarded: changing the frame inside layoutSubviews schedules another
+        // pass, and without the flag that recurses until the stack runs out.
+        if (!self.corroFillingSuperview) {
+            self.corroFillingSuperview = YES;
+            self.frame = self.superview.bounds;
+            b = self.bounds;
+            self.corroFillingSuperview = NO;
+        }
+    }
     fprintf(stderr, "[corro] SheetView.layoutSubviews canvas=%llu %dx%d\n",
             self.corroCanvasId, (int)CGRectGetWidth(b), (int)CGRectGetHeight(b));
     fflush(stderr);
@@ -64,11 +81,20 @@
 // registered draw closure replay its primitives.
 - (void)drawRect:(CGRect)rect {
     CGContextRef ctx = UIGraphicsGetCurrentContext();
+    CGRect b = self.bounds;
     fprintf(stderr, "[corro] SheetView.drawRect canvas=%llu %dx%d ctx=%s\n",
             self.corroCanvasId,
-            (int)CGRectGetWidth(self.bounds), (int)CGRectGetHeight(self.bounds),
+            (int)CGRectGetWidth(b), (int)CGRectGetHeight(b),
             ctx == NULL ? "NULL" : "ok");
     fflush(stderr);
+    // Report the size here as well as in layoutSubviews: at draw time the
+    // bounds are final, which is exactly what Rust needs before it replays the
+    // draw closure.
+    if (CGRectGetWidth(b) > 0 && CGRectGetHeight(b) > 0) {
+        corro_ios_canvas_size(self.corroCanvasId,
+                              (int32_t)CGRectGetWidth(b),
+                              (int32_t)CGRectGetHeight(b));
+    }
     if (ctx == NULL) {
         return;
     }
