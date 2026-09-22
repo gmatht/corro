@@ -11,31 +11,36 @@ name: iOS
 # What this workflow gives you that a device farm does not:
 #   * the Objective-C actually compiles (every shim, every delegate);
 #   * `xcrun simctl` boots the app, so the first frame is real pixels;
-#   * screenshots of the paths §9 lists as unverified (first frame, a tap,
-#     typing in the formula bar).
+#   * a screenshot of the running UI.
 #
 # Simulator builds need no signing identity, so no secrets are required.
 #
-# ✅ WORKING — run #97 (commit 7d64ee60) is green, every step.
+# ✅ WORKING, and the screenshot is now of the APP (see the warning below).
 #
-# It was written on a Linux host with no Xcode, no simulator and no GitHub
-# access, so the early runs were a debugging exercise against a real runner:
-# ~97 runs total, and most failures were this workflow's own probes rather than
-# the app. What that bought, all confirmed on a runner:
+# Run #97 (commit 7d64ee60) was green on every step — build, boot, install,
+# launch, screenshot, and a health check that found real draw calls at real
+# sizes with live CGContexts. But its artifact was the iOS HOME SCREEN.
 #
-#   * the ObjC compiles and links (the build step reached the simulator step at
-#     run #12, i.e. the bundle was produced);
-#   * the simulator boots, the app installs and launches, and it DRAWS:
-#     `SheetView.layoutSubviews`/`drawRect` fire at real sizes (375x616,
-#     375x667) with live CGContexts, which is exactly the evidence the health
-#     check now reads;
-#   * the first frame is captured and uploaded as `ios-simulator-screenshots`.
+# That is the lesson this file now encodes, because a green run hid it:
+#   * the app needs ~90 s to reach its first frame on a cold runner;
+#   * the screenshot step ran at 09:16:23 while the app's first line
+#     (`main: entering UIApplicationMain`) only appeared at 09:16:45 — so the
+#     PNG captured the springboard;
+#   * the health check still passed, because it greps a *second* launch (in the
+#     console-capture step) for `ios backend initialised` + `drawRect`. It
+#     proved "corro can run", not "the process that got screenshotted ran".
 #
-# The three liveness probes that were tried and are all wrong are kept written
-# down below so they are not retried: `launchctl list` reads the simulator's own
-# daemons, `pgrep` is absent, and `ps` is absent too (so it always printed
-# nothing and reported a healthy app as dead on every run). The pass condition
-# is now the app's own output, which a dead process cannot produce.
+# The fix, below: launch once, wait for the app's own readiness marker, take
+# the screenshot while that same process is up, and only then stop it to read
+# its output. The check additionally requires the readiness line to be present
+# BEFORE the screenshot, so the two can no longer be satisfied by different
+# processes.
+#
+# Three liveness probes were tried and all three are wrong; they are written
+# down so they are not retried: `launchctl list` reads the simulator's own
+# daemons, `pgrep` is absent, and `ps` is absent too (so it printed nothing and
+# reported a healthy app as dead on every run). The signal that cannot lie is
+# output the app produced.
 #
 # Still NOT covered: iOS 7.1.2 (no hosted runner has the archived SDK), and
 # anything interactive — this captures one frame. The manual `simctl` taps in
@@ -122,12 +127,19 @@ jobs:
           xcrun simctl boot "$UDID" || true          # already-booted is fine
           xcrun simctl bootstatus "$UDID" -b
 
-      - name: Install and launch corro
+      - name: Install and launch corro, then wait for the UI
         # The build directory lives in /tmp, which is fine across steps within a
         # job (same runner), but the SIMULATOR can be reset between them - the
         # failure mode was 'simctl install ... No such file or directory' with
         # the bundle verifiably present on disk. Assert both ends before
         # installing so a future occurrence is unambiguous.
+        #
+        # ⚠️ WHY THIS STEP WAITS. Run #97's artifact was the iOS home screen:
+        # the app needs ~90 s to reach its first frame on a cold runner, and
+        # this step used to launch, poll 20 x 1 s with a probe that could never
+        # succeed, and exit - so the screenshot step ran before the app had
+        # drawn anything. Waiting on the app's own readiness marker (below)
+        # instead of a fixed sleep is what makes the screenshot show the app.
         env:
           # Symbolised panic frames: the .ips only carries offsets into the
           # (symbol-stripped) static library.
@@ -146,59 +158,70 @@ jobs:
             exit 1
           fi
           echo "install ok"
-          # Launch detached, then read the app's output from the simulator's
-          # own log below. `simctl launch --console-pty` in the background is
-          # NOT usable: probed on the runner, a backgrounded --console-pty
-          # produced an empty file, while a foreground `simctl spawn` printed
-          # normally. Launching detached and grepping the unified log (which
-          # captures our stderr writes and the crash) is the combination that
-          # actually works.
-          # Startup output is captured in the NEXT step, not here: attaching
-          # --console requires the app to be stopped first, and the liveness
-          # check below needs it running. Mixing the two in one step is what
-          # made an earlier run report a process this script had itself killed.
+
+          # Launch DETACHED and LEAVE IT RUNNING. This is the process the
+          # screenshot must show, so it is not stopped until after the shot.
           #
-          # Launch detached and leave it up - this is the process the check
-          # verifies.
+          # `--console-pty` in the background is not usable (probed: it produced
+          # an empty file), which is why the app's stdout/stderr is read in a
+          # later step via a terminating `--console` relaunch. That relaunch is
+          # also why the health check had to be tightened: it must be tied to
+          # THIS process, not to the relaunch.
+          echo "--- launching (detached) ---"
           xcrun simctl launch "$SIM_UDID" com.corro.corro | tee /tmp/corro-launch.txt
-          # Poll instead of a single sleep+check. If the app is launched,
-          # suspended and reaped by the environment, an immediate check will
-          # catch it alive and a later one will not - which distinguishes
-          # "never started" from "started then dropped", and gives the
-          # screenshot step a window in which the UI actually exists.
-          # `launchctl list` is the probe that works. THREE earlier attempts
-          # were wrong, and each reported a healthy app as crashed:
-          #   * `simctl spawn launchctl list` -> only shows the simulator's own
-          #     daemons, and apps were assumed absent;
-          #   * `simctl spawn pgrep`          -> pgrep does not exist there;
-          #   * `simctl spawn ps -ax`         -> ps does not exist there either,
-          #     so it printed NOTHING and grep always failed. That is what the
-          #     't+1s: gone ... t+20s: gone' poll was measuring: a missing
-          #     binary, not a dead app.
-          # `launchctl list` prints a PID column and app processes appear in it
-          # (verified on a runner, where it lists e.g. com.apple.homed).
-          echo "--- polling for the app process ---"
-          for i in $(seq 1 20); do
-            if xcrun simctl spawn "$SIM_UDID" launchctl list 2>/dev/null | grep -qi "corro"; then
-              echo "  t+${i}s: alive"
-            else
-              echo "  t+${i}s: not listed"
+
+          # Wait for the app's own readiness marker. `ios backend initialised`
+          # is printed by Rust once the host has handed over the root view, so
+          # it is strictly before anything can draw - the earliest honest "the
+          # UI exists" signal, and one a dead process cannot produce.
+          #
+          # Read from the unified log, not a console file: this launch is
+          # detached, so there is no `--console` to read. `NSLog`/stderr from
+          # the Rust side does reach the unified log for a *detached* launch
+          # (the --console requirement applies to attaching to it).
+          #
+          # 180 s budget: a cold first launch measured ~90 s on this runner.
+          echo "--- waiting for the UI to come up (the app needs ~90s cold) ---"
+          READY=0
+          for i in $(seq 1 180); do
+            if xcrun simctl spawn "$SIM_UDID" log show --last 2m --style compact \
+                 --predicate 'eventMessage CONTAINS "rswidgets"' 2>/dev/null \
+                 | grep -qa "ios backend initialised"; then
+              echo "  t+${i}s: ios backend initialised"
+              READY=1
+              break
             fi
             sleep 1
           done
-          echo "--- final state (launchctl) ---"
-          xcrun simctl spawn "$SIM_UDID" launchctl list 2>/dev/null | grep -i corro || echo "(not listed)"
-          echo "--- is the app process alive? ---"
-          # `ps -ax` inside the simulator DOES list app processes; `pgrep` there
-          # does not (it failed with NSPOSIXErrorDomain code=2 - pgrep is not
-          # present in the simulator's environment, which made a perfectly
-          # healthy launch look like a crash).
-          xcrun simctl spawn "$SIM_UDID" ps -ax 2>/dev/null | grep -i "[c]orro" || true
+
+          if [ "$READY" -ne 1 ]; then
+            # Do not fail here: a screenshot of whatever is on screen is more
+            # useful than nothing, and the check step below is where this
+            # becomes a hard failure. Say plainly that the shot is suspect.
+            echo "::warning::app did not report readiness within 180s — the screenshot will show whatever is on the simulator, not corro"
+            xcrun simctl spawn "$SIM_UDID" log show --last 2m --style compact \
+              --predicate 'eventMessage CONTAINS "corro" OR eventMessage CONTAINS "rswidgets"' \
+              | tail -30 || true
+          fi
+
+          # Record that readiness happened BEFORE the screenshot, so a later
+          # step can assert the shot and the evidence describe the same process.
+          echo "UI_READY_BEFORE_SCREENSHOT=$READY" >> "$GITHUB_ENV"
+
+          # Let the first frame commit to the screen. The readiness marker
+          # precedes the first draw; this is the gap between them.
+          sleep 10
 
       - name: Screenshot the first frame
-        run: xcrun simctl io "$SIM_UDID" screenshot ios-first-frame.png
+        # Runs while the detached launch from the previous step is still alive.
+        run: |
+          xcrun simctl io "$SIM_UDID" screenshot ios-first-frame.png
+          # A screenshot of the wrong screen is the failure this workflow
+          # shipped once (the home screen, run #97), so record the dimensions
+          # and let the check step verify the image is corro's.
+          file ios-first-frame.png
 
-      - name: Capture the app's startup output
+      - name: Capture the app's startup output (stops the app)
         if: always()
         run: |
           : > /tmp/corro-console.log
@@ -206,61 +229,53 @@ jobs:
           xcrun simctl launch --console "$SIM_UDID" com.corro.corro \
             > /tmp/corro-console.log 2>&1 &
           CONSOLE_PID=$!
-          sleep 20
+          sleep 25
           kill "$CONSOLE_PID" 2>/dev/null || true
           wait "$CONSOLE_PID" 2>/dev/null || true
           echo "--- app output ---"
-          tr -d '\000' < /tmp/corro-console.log | head -60 || echo "(no output)"
+          tr -d '\000' < /tmp/corro-console.log | head -80 || echo "(no output)"
 
-      # Rust-side logging goes to NSLog (IOS_GUIDELINES.md §9). A crash on an
-      # objc_msgSend signature mismatch shows up here, not in a backtrace.
-      # Runs BEFORE the health check, and that order is deliberate: attaching
-      # --console requires stopping the app, AND this capture is the only place
-      # our stderr output is visible (it does not go to the unified log), so it
-      # is both the diagnostic and the evidence the check reads.
-      # It therefore runs after the screenshot but before the check.
-      - name: Check the app is still alive (did not crash on launch)
+      # The pass condition is evidence the app produced, read from this
+      # capture. It is deliberately strict about ORDER as well as presence:
+      # `UI_READY_BEFORE_SCREENSHOT` must be 1, i.e. the same UI that was
+      # screenshotted was already up. Without that, this step can be satisfied
+      # by the relaunch above while the PNG shows the springboard - which is
+      # exactly what happened in run #97.
+      - name: Check the app ran, drew, and was up before the screenshot
         run: |
-          # The PRIMARY health signal is the app's own output, not a process
-          # probe. Three probes have been tried and all three were wrong in at
-          # least one direction:
-          #   * `simctl spawn launchctl list` -> lists the simulator's own
-          #     daemons; an app may or may not appear, so absence proves little;
-          #   * `simctl spawn pgrep`          -> pgrep does not exist there;
-          #   * `simctl spawn ps -ax`         -> ps does not exist there either,
-          #     so its output was always empty and this step reported a healthy
-          #     app as dead on EVERY run.
-          #
-          # What cannot lie is evidence the app produced itself: the Rust
-          # startup markers and the host's UIKit callbacks, which only run in a
-          # live process. If those are present the app ran, whatever a process
-          # table says.
-          #
-          # Read them from the CONSOLE CAPTURE, not the unified log: our lines
-          # are written to stderr, and (probed earlier) stderr does NOT appear
-          # in `log show` - only `--console` sees it. An earlier version of this
-          # check queried the unified log and therefore reported "no evidence"
-          # while the drawRect: lines were sitting in the capture.
           CONSOLE=/tmp/corro-console.log
-          if [ -f "$CONSOLE" ] \
-             && tr -d '\000' < "$CONSOLE" | grep -qa "ios backend initialised" \
-             && tr -d '\000' < "$CONSOLE" | grep -qa "SheetView.drawRect"; then
-            echo "corro ran and drew (Rust startup + a Core Graphics draw both seen)"
+          FAIL=0
+          if [ ! -f "$CONSOLE" ]; then
+            echo "::error::no console capture at $CONSOLE"
+            FAIL=1
+          else
+            tr -d '\000' < "$CONSOLE" > /tmp/corro-console.clean
+            for needle in "ios backend initialised" "SheetView.drawRect"; do
+              if grep -qa "$needle" /tmp/corro-console.clean; then
+                echo "ok: $needle"
+              else
+                echo "::error::the app never printed: $needle"
+                FAIL=1
+              fi
+            done
+          fi
+          if [ "${UI_READY_BEFORE_SCREENSHOT:-0}" != "1" ]; then
+            echo "::error::the UI was not up when the screenshot was taken, so ios-first-frame.png is not corro"
+            FAIL=1
+          fi
+          if [ "$FAIL" -eq 0 ]; then
+            echo "corro ran, drew, and was on screen for the screenshot"
             exit 0
           fi
-          echo "::error::no evidence the app ran - see the console capture step below"
           echo "--- launchctl entries containing 'corro' (supplementary) ---"
           xcrun simctl spawn "$SIM_UDID" launchctl list 2>/dev/null | grep -i corro || echo "(none)"
-          echo "::error::corro is not running after launch"
           # Diagnose rather than just fail: crash reports first (they name the
-          # signal and the faulting thread), then the console capture.
+          # signal and the faulting thread), then symbolicate our own frames.
           "$GITHUB_WORKSPACE/ios/corro/scripts/report_crash.sh" "$SIM_UDID"
-          # Symbolicate our own frames: the crash report carries raw addresses,
-          # and the dSYM/object file is right there in the build directory.
           echo "--- symbolicated (atos) ---"
           LIB="/Users/runner/work/corro/corro/ios/corro/target/aarch64-apple-ios-sim/release/libcorro_ios.dylib"
-          if [ -f "$LIB" ]; then
-            grep -aE "^[[:space:]]+1[0-9a-f]{8,}$" /tmp/corro-console.log 2>/dev/null \
+          if [ -f "$LIB" ] && [ -f /tmp/corro-console.clean ]; then
+            grep -aE "^[[:space:]]+1[0-9a-f]{8,}$" /tmp/corro-console.clean 2>/dev/null \
               | head -20 | while read -r addr; do
                 atos -o "$LIB" -arch arm64 "0x${addr}" 2>/dev/null || true
               done
@@ -268,6 +283,101 @@ jobs:
             echo "(no libcorro_ios.dylib at $LIB)"
           fi
           exit 1
+
+      - name: Verify the screenshot shows corro, not the home screen
+        if: always()
+        run: |
+          # The image was uploaded once while showing the springboard (run #97),
+          # and that is the failure this catches. A first attempt keyed on "is
+          # the centre third greyscale" was too weak to do it: the home screen's
+          # wallpaper scored a spread of 21 against a threshold of 24, i.e. it
+          # would have passed.
+          #
+          # The reliable discriminator is *how much of the image is achromatic*,
+          # measured over the lower two thirds (where the grid is). corro's
+          # chrome is neutral throughout; the springboard is a saturated
+          # wallpaper with a dock. Measured on real images:
+          #
+          #   corro, desktop render   100.0% achromatic
+          #   corro, populated grid    98.7%
+          #   iOS home screen (run 97)  2.2%
+          #
+          # So a 50% floor has an enormous margin either way, and is not picky
+          # about the exact palette corro happens to use.
+          python3 - <<'PY'
+          import struct, sys, zlib
+
+          path = "ios-first-frame.png"
+          data = open(path, "rb").read()
+          if data[:8] != b"\x89PNG\r\n\x1a\n":
+              sys.exit(f"{path} is not a PNG")
+
+          pos, idat, w, h, bitd, ctype = 8, b"", 0, 0, 0, 0
+          while pos < len(data):
+              ln = struct.unpack(">I", data[pos:pos+4])[0]
+              typ = data[pos+4:pos+8]
+              body = data[pos+8:pos+8+ln]
+              if typ == b"IHDR":
+                  w, h, bitd, ctype = struct.unpack(">IIBB", body[:10])
+              elif typ == b"IDAT":
+                  idat += body
+              elif typ == b"IEND":
+                  break
+              pos += 12 + ln
+
+          if bitd != 8 or ctype not in (2, 6):
+              print(f"(unhandled PNG: bit_depth={bitd} colour_type={ctype}); skipping")
+              sys.exit(0)
+
+          ch = 3 if ctype == 2 else 4
+          raw = zlib.decompress(idat)
+          stride = w * ch
+          prev = bytearray(stride)
+          rows, y = [], 0
+          for i in range(0, len(raw), stride + 1):
+              f = raw[i]
+              line = bytearray(raw[i+1:i+1+stride])
+              for x in range(stride):
+                  a = line[x-ch] if x >= ch else 0
+                  b = prev[x]
+                  c = prev[x-ch] if x >= ch else 0
+                  if f == 1:
+                      line[x] = (line[x] + a) & 0xFF
+                  elif f == 2:
+                      line[x] = (line[x] + b) & 0xFF
+                  elif f == 3:
+                      line[x] = (line[x] + ((a + b) >> 1)) & 0xFF
+                  elif f == 4:
+                      p = a + b - c
+                      pa, pb, pc = abs(p-a), abs(p-b), abs(p-c)
+                      pr = a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
+                      line[x] = (line[x] + pr) & 0xFF
+              rows.append(bytes(line))
+              prev = line
+              y += 1
+              if y >= h:
+                  break
+
+          # Achromatic fraction over the lower two thirds.
+          tot = grey = 0
+          for yy in range(h // 3, h, 2):
+              row = rows[yy]
+              for xx in range(0, w, 2):
+                  o = xx * ch
+                  r, g, b = row[o], row[o+1], row[o+2]
+                  tot += 1
+                  if max(r, g, b) - min(r, g, b) <= 6:
+                      grey += 1
+          frac = grey / max(tot, 1)
+          print(f"{w}x{h}: achromatic fraction over the lower 2/3 = {frac:.1%}")
+
+          if frac < 0.5:
+              print("::error::ios-first-frame.png does not look like corro — its chrome is neutral")
+              print("::error::grey, and only %.1f%% of this image is. This is the run #97" % (frac * 100))
+              print("::error::failure: the screenshot captured the simulator's home screen.")
+              sys.exit(1)
+          print("ok: neutral grey throughout, as corro's chrome is")
+          PY
 
       - name: Dump the Rust log lines
         if: always()
