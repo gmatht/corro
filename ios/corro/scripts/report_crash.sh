@@ -12,9 +12,20 @@ set -uo pipefail
 UDID="${1:-}"
 
 echo "--- crash report ---"
-LATEST="$(ls -t ~/Library/Logs/DiagnosticReports/*.ips 2>/dev/null | head -1)"
+# Filter by process name. Taking simply the newest .ips picked up unrelated
+# system components (AccessibilityControlsExtension on one run), and its
+# EXC_BREAKPOINT was then read as though it were corro's - which sent an
+# investigation after a crash that had nothing to do with this app.
+LATEST=""
+for f in $(ls -t ~/Library/Logs/DiagnosticReports/*.ips 2>/dev/null | head -20); do
+  case "$(basename "$f")" in
+    corro-*|corro_*|*/corro-*) LATEST="$f"; break ;;
+  esac
+done
 if [ -z "$LATEST" ]; then
-  echo "(no .ips report - the process may have exited rather than crashed)"
+  echo "(no corro .ips report - the process exited without crashing)"
+  echo "recent reports (other processes, for context):"
+  ls -t ~/Library/Logs/DiagnosticReports/*.ips 2>/dev/null | head -5 | sed 's/^/    /'
 else
   echo "== $LATEST"
   python3 - "$LATEST" <<'PY'

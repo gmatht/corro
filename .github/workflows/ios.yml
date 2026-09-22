@@ -164,20 +164,6 @@ jobs:
 
       # Runs AFTER the liveness check and the screenshot, because it stops the
       # app in order to attach --console.
-      - name: Capture the app's startup output
-        if: always()
-        run: |
-          : > /tmp/corro-console.log
-          xcrun simctl terminate "$SIM_UDID" com.corro.corro 2>/dev/null || true
-          xcrun simctl launch --console "$SIM_UDID" com.corro.corro \
-            > /tmp/corro-console.log 2>&1 &
-          CONSOLE_PID=$!
-          sleep 20
-          kill "$CONSOLE_PID" 2>/dev/null || true
-          wait "$CONSOLE_PID" 2>/dev/null || true
-          echo "--- app output ---"
-          tr -d '\000' < /tmp/corro-console.log | head -60 || echo "(no output)"
-
       - name: Check the app is still alive (did not crash on launch)
         run: |
           # `ps -ax` inside the simulator is the check that works. Two earlier
@@ -210,6 +196,20 @@ jobs:
             echo "(no libcorro_ios.dylib at $LIB)"
           fi
           exit 1
+
+      - name: Capture the app's startup output
+        if: always()
+        run: |
+          : > /tmp/corro-console.log
+          xcrun simctl terminate "$SIM_UDID" com.corro.corro 2>/dev/null || true
+          xcrun simctl launch --console "$SIM_UDID" com.corro.corro \
+            > /tmp/corro-console.log 2>&1 &
+          CONSOLE_PID=$!
+          sleep 20
+          kill "$CONSOLE_PID" 2>/dev/null || true
+          wait "$CONSOLE_PID" 2>/dev/null || true
+          echo "--- app output ---"
+          tr -d '\000' < /tmp/corro-console.log | head -60 || echo "(no output)"
 
       # Rust-side logging goes to NSLog (IOS_GUIDELINES.md §9). A crash on an
       # objc_msgSend signature mismatch shows up here, not in a backtrace.
