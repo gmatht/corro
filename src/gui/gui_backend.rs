@@ -3718,7 +3718,10 @@ fn run_menu_tour_stop(state: &Rc<GuiState>, section: &str, item: &str) {
     if let Some(menubar) = state.menubar.get() {
         if let Some(c) = root.label.chars().next() {
             let keyval = c.to_ascii_lowercase() as u32;
-            let _ = menubar.activate_submenu_by_mnemonic(keyval);
+            let opened = menubar.activate_submenu_by_mnemonic(keyval);
+            crate::debug_log::log(&format!(
+                "TOUROPEN section={section:?} keyval={keyval} opened={opened}"
+            ));
         }
     }
 
@@ -5047,6 +5050,21 @@ fn arm_edit_script(state: &Rc<GuiState>) {
             // window's tail pick the value up.
             let app = state_for_tick.app_mut();
             super::actions::commit_cell(app, addr.clone(), step.value.clone());
+            // One line per committed edit. The iOS screenshots were blank for
+            // several runs and the only way to tell "the edits never ran" from
+            // "the edits ran but did not reach the screen" was to read the
+            // canvas by eye - which is how a silent no-op tick (see
+            // `backends_ios_adapter::add_periodic_tick`) stayed hidden. This
+            // makes the commit itself observable.
+            {
+                let g = &app.core.workbook.active_sheet().grid;
+                eprintln!(
+                    "[corro] scripted edit committed {} = {:?} (now {:?})",
+                    crate::addr::cell_ref_text(&addr, g.main_cols()),
+                    step.value,
+                    g.get(&addr).unwrap_or_default()
+                );
+            }
             app.core.state = app.core.workbook.active_sheet().clone();
             state_for_tick.editing.set(false);
             state_for_tick.edit_buf.borrow_mut().clear();

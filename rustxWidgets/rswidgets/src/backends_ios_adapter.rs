@@ -2542,6 +2542,9 @@ fn schedule_timer(ms: u32, f: Box<dyn FnMut() -> bool>) -> Result<(), crate::cor
         // valid for the process lifetime, matching every other handle here.
         crate::backends::apple::retain(timer);
     }
+    crate::backends::apple::log_apple(&format!(
+        "ios: NSTimer scheduled ({ms}ms, target CorroIosTarget#{registered})"
+    ));
     Ok(())
 }
 
@@ -2582,7 +2585,7 @@ pub fn add_periodic_tick(
         250,
         Box::new(move || {
             let n = fired.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            if n == 4 || n == 20 {
+            if n == 1 || n == 4 || n == 20 {
                 crate::backends::apple::log_apple(&format!(
                     "ios: periodic tick has fired {n} times (timer is live)"
                 ));
