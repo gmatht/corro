@@ -258,9 +258,13 @@ jobs:
           # complete. Waiting for the armed line plus the final step's deadline
           # is deterministic, rather than another guess at a sleep.
           echo "--- waiting for the scripted edits to commit ---"
-          LAST_MS=$(printf '%s' "${SIMCTL_CHILD_CORRO_EDIT_SCRIPT:-}" \
-            | tr ',' '\n' | sed -n 's/^\([0-9]\+\):.*/\1/p' | sort -n | tail -1)
+          # One line on purpose: the backslash-continued $( ) form above was
+          # collapsed by YAML and parsed to nothing, so LAST_MS came out 0 and
+          # the wait was 4s instead of 8s. Same family of bug as the earlier
+          # multi-line inline python.
+          LAST_MS=$(printf '%s' "${SIMCTL_CHILD_CORRO_EDIT_SCRIPT:-}" | tr ',' '\n' | sed -n 's/^\([0-9]\+\):.*/\1/p' | sort -n | tail -1)
           LAST_MS=${LAST_MS:-0}
+          echo "last scripted edit at ${LAST_MS}ms"
           ARMED=0
           for i in $(seq 1 120); do
             if grep -qa "edit script armed" /tmp/corro-live.log 2>/dev/null; then
