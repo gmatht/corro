@@ -15,6 +15,13 @@
 #import <objc/runtime.h>
 
 #import "CorroBridge.h"
+// The generated half of the Rust<->ObjC ABI contract: the forwarding shims and
+// the layout category live in CorroGeneratedShims.{h,m} (regenerate with
+// `cargo build --features generate-apple-shims` in this crate). Importing it
+// here means the classes below *adopt* those declarations rather than restate
+// them, so a signature that drifts from the Rust side is a compile error
+// instead of a mismatched objc_msgSend at runtime.
+#import "CorroGeneratedShims.h"
 #import <stdio.h>
 
 // ---------------------------------------------------------------------------
@@ -201,6 +208,11 @@
 // A category on UIView covers every widget, since they are all UIViews; the
 // methods only record what the backend asked for, and `layoutSubviews` in the
 // concrete views uses it where it matters.
+// The method *signatures* come from CorroGeneratedShims.h (generated from the
+// Rust side's `raw_send!` calls); only the storage the implementation needs is
+// declared here. Adding a method to the generated set therefore does not
+// require touching this file, and changing one of its signatures cannot
+// silently diverge.
 @interface UIView (CorroLayout)
 @property (nonatomic, assign) CGFloat corroSpacing;
 @property (nonatomic, assign) BOOL corroFlex;
@@ -264,10 +276,10 @@
 // UIControl targets are (id, SEL, id), so the callback id has to travel as an
 // object or as the target itself. The target is the simpler carrier: the
 // backend calls `targetWithCallbackId:` and we hold the id.
-@interface CorroIosTarget : NSObject
+// `targetWithCallbackId:` and `corroFired:` are declared in the generated
+// header; this extension adds the storage the implementation needs.
+@interface CorroIosTarget ()
 @property (nonatomic, assign) uint64_t callbackId;
-+ (instancetype)targetWithCallbackId:(NSInteger)callbackId;
-- (void)corroFired:(id)sender;
 @end
 
 @implementation CorroIosTarget
@@ -332,7 +344,10 @@
 // branch on the deployment target:
 //   iOS 7+  boundingRectWithSize:options:attributes: / drawAtPoint:withAttributes:
 //   iOS 6- sizeWithFont: / drawAtPoint:withFont:
-@interface CorroIosText : NSObject
+// `measure:font:size:slant:weight:` and `drawText:ctx:font:x:y:size:r:g:b:a:
+// slant:weight:` are declared in the generated header. The font helper below is
+// this file's own business, so it stays in an extension.
+@interface CorroIosText ()
 + (UIFont *)fontForFamily:(NSString *)family size:(CGFloat)size weight:(NSInteger)weight;
 @end
 
@@ -445,12 +460,8 @@
 // `corroNewAlert` returns a UIAlertController on iOS 8+ and a UIAlertView on
 // iOS 7, wrapped so the Rust side sees one API. The wrapper is an NSObject
 // holding whichever concrete object the running OS supports.
-@interface CorroIosAlert : NSObject
-+ (instancetype)corroNewAlert;
-- (void)corroAddAction:(NSString *)title;
-- (void)corroSetTitle:(NSString *)title;
-@end
-
+// `corroNewAlert`, `corroAddAction:` and `corroSetTitle:` are declared in the
+// generated header; only the private storage is declared here.
 @interface CorroIosAlert ()
 @property (nonatomic, strong) id native;       // UIAlertController or UIAlertView
 @property (nonatomic, strong) NSMutableArray<NSString *> *titles;

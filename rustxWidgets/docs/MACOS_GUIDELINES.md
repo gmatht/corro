@@ -198,3 +198,52 @@ it is the first question a macOS port raises:
   the AppKit selector surface ever proves too large to hand-roll, `objc2` is
   the escape hatch — and it must be cfg-gated to `target_os = "macos"` only,
   so the iOS path keeps its current, old-SDK-capable shape.
+
+## 10. Generating the shims (what is generated, and what is not)
+
+The shims in §3 are not all hand-written. `rustxWidgets/rswidgets/src/apple_generator.rs`
+holds the Rust↔ObjC **ABI contract as data** and emits
+`app/CorroGeneratedShims.{h,m}`; the iOS host runs it from its own
+`build.rs` (`--features generate-apple-shims`), exactly the pattern
+`android/corro/build.rs` uses for `android_generator`.
+
+**Why generate them at all.** The Rust side already names every selector and
+its exact signature (in the adapters' `raw_send!` calls). Restating that by
+hand is two independent declarations of one ABI, and a drift between them is
+*not* a compile error — it is a mismatched `objc_msgSend`, the register-file
+corruption §5 and `IOS_GUIDELINES.md` warn about. Generating the forwarding
+shells removes that class of bug outright.
+
+**Generated** (pure forwarding, no behaviour):
+
+| Emitted | Was hand-written as |
+|---|---|
+| `Corro<Platform>Target` (+`targetWithCallbackId:`, -`corroFired:`) | the callback trampoline |
+| `Corro<Platform>Alert` (+`corroNewAlert`, -`corroSetTitle:`, -`corroAddAction:`) over `UIAlertController`/`UIAlertView` (iOS) or `NSAlert` (macOS) | the dialog wrapper |
+| `<base view> (CorroLayout)`: `corroSetSpacing:`, `corroSetFlex:`, `corroSetMinWidth:`, `corroSetCanvasId:`, `corroBoundsWidth/Height` | the layout category |
+| the `corroPresentDialog:` category on `UIViewController`/`NSWindowController` | the presentation category |
+
+**Deliberately NOT generated**, and this is the important half:
+
+* **The canvas view** (`SheetView` / `CorroSheetView`). Its body is
+  *behaviour*: `drawRect:` reports the laid-out size before replaying Rust's
+  draw closure, touches/mouse events convert coordinates, `pressesBegan:`/
+  `keyDown:` handle a hardware keyboard, and there are documented degradation
+  paths found by CI (an older SDK without a selector). Those are the lines a
+  human reads when the sheet does not draw. On macOS it also needs
+  `isFlipped` — the generator's *header* says so, the body cannot be guessed.
+* **The text measurer** (`CorroIosText` / `CorroMacText`). Its bodies are the
+  SDK version table (`boundingRectWithSize:` on iOS 7+ vs `sizeWithFont:` on
+  iOS 6; `UIFont`/`NSFont` resolution). A wrong body there is a layout bug,
+  not a crash — and a generator cannot validate it without an SDK anyway.
+
+For both of those the generator still emits the **declarations**, and the
+hand-written `.m` imports the generated header and *adopts* them (its
+`@interface` blocks no longer restate the contract methods). A signature that
+drifts from the Rust side is therefore a compile error in the host — which is
+the most that is checkable without an SDK on this machine.
+
+A test in `apple_generator.rs` asserts that every `(class, selector)` pair the
+adapters send — transcribed as `IOS_ADAPTER_SENDS` / `MACOS_ADAPTER_SENDS` —
+is covered by the tables, so adding a `raw_send!` to an adapter without
+registering it fails the suite rather than crashing at runtime.

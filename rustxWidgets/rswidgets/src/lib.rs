@@ -67,6 +67,12 @@ pub mod backends_macos_adapter;
 /// Xcode project, `Info.plist` and asset catalog, which the Rust side cannot
 /// sensibly synthesise. See `docs/IOS_GUIDELINES.md` §1.
 pub mod android_generator;
+/// Generate the Objective-C forwarding shims the Apple backends send messages
+/// to (the Rust<->ObjC ABI contract, derived from one table), so the two sides
+/// cannot drift. The canvas view and text measurer stay hand-written
+/// deliberately — their bodies are behaviour, not forwarding. See
+/// `rustxWidgets/docs/MACOS_GUIDELINES.md` §3 and `IOS_GUIDELINES.md` §3.
+pub mod apple_generator;
 #[cfg(feature = "pancurses")]
 pub mod backends_pancurses_adapter;
 #[cfg(feature = "pancurses")]

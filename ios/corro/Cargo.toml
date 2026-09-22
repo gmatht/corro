@@ -9,6 +9,12 @@ edition = "2021"
 [lib]
 crate-type = ["staticlib", "cdylib"]
 
+[features]
+# Generate app/CorroGeneratedShims.{h,m} from rswidgets' signature table when
+# this crate is built (see build.rs). Only needed when the shim contract
+# changes; the generated files are checked in like any other source.
+generate-apple-shims = []
+
 [dependencies]
 # `gui-mobile` is the shared GUI pipeline without the GTK half: exactly the
 # feature set the iOS backend needs. See Cargo.toml at the repo root.
