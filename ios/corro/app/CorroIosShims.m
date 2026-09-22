@@ -298,6 +298,15 @@
 // sends, so they are deliberately not restated here - a second declaration is
 // what produced the conflicting-types errors, and one source of truth is the
 // point of generating them.
+//
+// ⚠️ Both are CLASS methods (`+`). The Rust adapter resolves this class with
+// `objc_getClass` and sends the selectors to the CLASS, because the shim is
+// stateless and never instantiated. Implementing them as instance methods made
+// `[CorroIosText drawText:...]` raise "unrecognized selector sent to instance",
+// which the Rust side reported as
+//   fatal runtime error: Rust cannot catch foreign exceptions
+// on the first real frame - an ObjC exception crossing into Rust, and the
+// offending selector appeared nowhere in the log. Keep them `+`.
 + (UIFont *)fontForFamily:(NSString *)family size:(CGFloat)size weight:(NSInteger)weight;
 @end
 
@@ -332,7 +341,7 @@
 // Returns a malloc'd CGRect* (or NULL) so the ABI is one pointer in / one
 // pointer out — no struct-return register rules to get wrong on 32-bit armv7.
 // The caller (Rust) frees it with `free`.
-- (CGRect *)measure:(NSString *)text
++ (CGRect *)measure:(NSString *)text
                font:(NSString *)family
                size:(CGFloat)size
               slant:(NSInteger)slant
@@ -364,7 +373,7 @@
 
 // Draws at the shared top-left convention: the caller gives a top edge, the
 // text API wants a baseline, so offset by the ascent.
-- (void)drawText:(NSString *)text
++ (void)drawText:(NSString *)text
              ctx:(CGContextRef)ctx
             font:(NSString *)family
                x:(CGFloat)x

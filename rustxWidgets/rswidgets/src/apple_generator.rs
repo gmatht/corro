@@ -361,7 +361,15 @@ pub const HAND_WRITTEN_METHODS: &[ShimMethod] = &[
             ArgKind::Integer,
         ],
         ret: ArgKind::Void,
-        class_method: false,
+        // CLASS method, and that is load-bearing. The Rust adapter resolves
+        // this class with `objc_getClass` and sends both text selectors to the
+        // CLASS, because the shim is stateless and never instantiated. When
+        // this was declared and implemented as an instance method,
+        // `[CorroIosText drawText:...]` raised "unrecognized selector sent to
+        // instance", which surfaced as `fatal runtime error: Rust cannot catch
+        // foreign exceptions` on the first real frame - an ObjC exception
+        // crossing into Rust, with the offending selector named nowhere.
+        class_method: true,
         hand_written_note: Some("body resolves the font; see CorroIosShims.m"),
         body_elsewhere: false,
     },

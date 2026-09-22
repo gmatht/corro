@@ -51,6 +51,59 @@ if missing:
 print(f"iOS: all {len(sent)} custom selectors implemented")
 
 # ---------------------------------------------------------------------------
+# Class methods vs instance methods.
+#
+# Rust resolves each shim class with `objc_getClass` and sends the selector to
+# the CLASS (`cls("CorroIosText")` + `msg_shim`), so every shim entry point must
+# be declared AND implemented as a class method (`+`). One implemented as an
+# instance method raises `unrecognized selector sent to instance`, and the Rust
+# side reports that as
+#   fatal runtime error: Rust cannot catch foreign exceptions
+# with the offending selector named nowhere - which is exactly how the
+# CorroIosText drawText: bug reached the simulator. Checking the sign here
+# catches it on Linux in a second.
+#
+# Classes whose selectors Rust sends to an INSTANCE are the view/widget classes
+# created by the adapter (SheetView, and the UIControl targets), so they are
+# checked the other way round.
+instance_sent = {"SheetView", "CorroIosTarget", "CorroIosAlert", "UIView",
+                 "UIViewController", "CorroIosPicker"}
+
+# Every class whose selectors the adapter sends to the CLASS, and which must
+# therefore be implemented with `+`. The adapter resolves these with
+# `objc_getClass` and never instantiates them.
+CLASS_SENT = ("CorroIosText",)
+
+bad = []
+for name in CLASS_SENT:
+    # The @implementation block, to its @end.
+    m = re.search(r"@implementation\s+" + name + r"\b", shim)
+    if not m:
+        bad.append(f"{name} has no @implementation")
+        continue
+    rest = shim[m.end():]
+    end = rest.find("@end")
+    body = rest[:end if end >= 0 else len(rest)]
+    # Every method DEFINITION in the block: a line starting with - or + that has
+    # a body (`{`) rather than being a bare declaration (`;`). Definitions and
+    # declarations look identical up to the brace, so match both and drop the
+    # ones ending in `;`.
+    defs = re.findall(r"^\s*([-+])\s*\([^)]*\)\s*[^;{]*\{", body, re.M)
+    if "-" in defs:
+        # Name the offending selector, not just the class: the class having some
+        # class methods is not the point, the specific selector is.
+        for dm in re.finditer(r"^\s*-\s*\([^)]*\)\s*([A-Za-z_]\w*)", body, re.M):
+            bad.append(f"{name} implements -{dm.group(1)} as an INSTANCE method, "
+                       f"but the adapter sends it to the CLASS")
+
+if bad:
+    for b in bad:
+        print("   ", b)
+    sys.exit(1)
+print(f"class-sent shims are class methods, as the adapter sends them: "
+      f"{', '.join(CLASS_SENT)}")
+
+# ---------------------------------------------------------------------------
 # macOS: no host crate exists yet, so check the contract from the other end.
 # ---------------------------------------------------------------------------
 macos_adapter = open(

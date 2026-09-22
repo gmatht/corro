@@ -50,7 +50,7 @@
 /// mismatch is a compile error.
 @interface CorroIosText : NSObject
 + (id)measure:(id)arg0 font:(id)arg1 size:(CGFloat)arg2 slant:(NSInteger)arg3 weight:(NSInteger)arg4;
-- (void)drawText:(id)arg0 ctx:(id)arg1 font:(id)arg2 x:(CGFloat)arg3 y:(CGFloat)arg4 size:(CGFloat)arg5 r:(CGFloat)arg6 g:(CGFloat)arg7 b:(CGFloat)arg8 a:(CGFloat)arg9 slant:(NSInteger)arg10 weight:(NSInteger)arg11;
++ (void)drawText:(id)arg0 ctx:(id)arg1 font:(id)arg2 x:(CGFloat)arg3 y:(CGFloat)arg4 size:(CGFloat)arg5 r:(CGFloat)arg6 g:(CGFloat)arg7 b:(CGFloat)arg8 a:(CGFloat)arg9 slant:(NSInteger)arg10 weight:(NSInteger)arg11;
 @end
 
 /// The canvas view the host must ship (see the backend's
