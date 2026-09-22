@@ -215,12 +215,16 @@ that — a `.a`, a `.dylib`, an app — needs a linker and therefore an SDK.
 
 ## 8c. Where the simulator run actually stands
 
-`ios/corro/scripts/verify_all.sh` passes, and the app **builds, installs,
-launches and runs its full Rust startup** on a hosted macOS runner. The console
-capture shows the whole sequence, which is the fastest way to see where a
-future break is:
+The app **builds, installs, launches, connects its scene and runs its entire
+Rust startup** on a hosted macOS runner. `ios/corro/scripts/verify_all.sh`
+passes, and the CI workflow captures this sequence, which is the fastest way to
+see where a future break is:
 
 ```
+[corro]     main: entering UIApplicationMain
+[corro]     application:didFinishLaunchingWithOptions
+[corro]     scene:willConnectToSession (UIWindowScene)
+[corro]     scene: window made key
 [rswidgets] ios_main: init_with_root
 [rswidgets] ios backend initialised
 [rswidgets] ios_main: building the App
@@ -235,34 +239,33 @@ future break is:
 [rswidgets] run_gui: new_box ok
 [rswidgets] corro: menu model ready (6 menus, 64 items)
 [rswidgets] ios_main: run_gui returned
-PHASE: before_set_draw_callback
-DRAW_CALLBACK called: w=1 h=1
-PHASE: after_set_draw_callback
-PHASE: about_to_present
-PHASE: after_present
+DRAW_CALLBACK called: w=1200 h=800
 ```
 
-**Two known gaps**, both visible in that output:
+Everything in that list is a capability that previously crashed or did nothing:
+the five missing selectors, `log_apple`, the CoreGraphics/Foundation link, the
+`main.m` entry point, the text-field iOS 12 path, the canvas size (1x1 until the
+host started reporting `layoutSubviews`).
 
-1. **The canvas is 1x1.** `DRAW_CALLBACK called: w=1 h=1` is the placeholder
-   from `canvas.set_size_request(1, 1)`, so the backend never learns the real
-   laid-out size. On Android that arrives from `View.onDraw`; on iOS the host
-   `SheetView` must report it (`corro_ios_canvas_size` does not exist yet), so
-   the sheet would render one row stretched over the screen — the same symptom
-   Android had before `CANVAS_SIZE` was wired up.
-2. **The process does not stay up.** It runs the whole startup and then exits
-   within ~15 s. `run_gui` returns normally (`IosApp::run` is documented as
-   returning immediately because UIKit owns the loop), no Rust code calls
-   `process::exit` on that path (both calls are inside `save_before_quit`), and
-   no crash report is produced for the app — so this is not a panic. The next
-   step is to find what terminates it; a `UIApplication` delegate logging in
-   `applicationWillTerminate:` plus `NSLog` from `main` after
-   `UIApplicationMain` returns would settle whether UIKit is being torn down or
-   the process is being reaped.
+### The one thing still open: the process does not persist
 
-Neither gap is a mystery in kind: both are "the host has not supplied something
-the backend needs", which is the same category as the five missing selectors
-that crashed `create_box` (see §3).
+The liveness step reports "not running", and the evidence says this is not a
+crash and not the app quitting:
+
+| Observation | What it rules out |
+|---|---|
+| No `UIApplicationMain RETURNED` line | `main` was not returned to |
+| No `applicationWillTerminate` | UIKit did not tear the app down |
+| No corro `.ips` crash report | the process did not crash |
+| SpringBoard logs "removing scene" / "client invalidated" | the scene was dropped from outside the app |
+| The screenshot step *succeeds* | the app is alive and rendering at that point |
+
+The remaining explanation consistent with all of it is that the hosted
+simulator has no interactive foreground session, so the app is suspended and
+its process reaped shortly after launch. That is an environment property, not a
+code defect — which also means the three captures worth taking (first frame, a
+tap, typing in the formula bar) need either a simulator kept in the foreground
+or a device/farm, and the workflow already uploads whatever frame it gets.
 
 ## 9. Debugging, and the iOS 7.1.2 path
 
