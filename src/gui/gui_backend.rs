@@ -3016,7 +3016,7 @@ fn build_menu(rxapp: &rswidgets::App, win: &Window, state: &Rc<GuiState>) -> Res
     // Build the full menu tree from the shared definition (menu::menu_bar),
     // the same tree the ratatui reference and the pancurses backend build
     // from, so the GTK menus can never drift from them.
-    let bar = menu::menu_bar();
+    let bar = super::menu::menu_bar();
     let mut menubar_model = rxapp.new_menu()?;
     for root in &bar {
         let sub = menu::build_common_menu(rxapp, root.submenu.as_deref().unwrap_or(&[]), "app")?;
@@ -3628,6 +3628,99 @@ pub(crate) fn scroll_viewport_by_cells(d_rows: i32, d_cols: i32) {
         return; // already at the edge: no redraw churn per drag event
     }
     update_state_cursor(&state, row, col);
+}
+
+/// Where the drawn pointer should sit for a menu tour stop, in **canvas**
+/// coordinates (see `paint_movie_pointer` for why that is not the same as
+/// window coordinates).
+///
+/// The menu bar is a real GTK widget above the canvas, so the pointer cannot be
+/// drawn over it; the arrow is aimed at the top edge of the canvas beneath the
+/// section's button, which reads as pointing at the open menu.
+///
+/// The horizontal position is estimated from each label's rendered width. The
+/// menu bar lays its buttons out left to right in `menu::menu_bar()` order with
+/// a little padding, which is stable enough for a demo pointer; a drift of a
+/// few pixels under a button is not noticeable, and the item activation does
+/// not depend on the pointer's position at all.
+fn menu_section_pointer_target(section: &str, item_index: u32) -> (f64, f64) {
+    // Approximate width of a menu label at the default metrics.
+    let label_w = |s: &str| (s.chars().count() as f64 + 2.0) * char_w();
+    let mut x = 0.0;
+    for root in super::menu::menu_bar() {
+        let w = label_w(root.label);
+        if root.label == section {
+            // Down into the popover far enough to sit beside the item row that
+            // is about to activate (rows are about one row-height tall).
+            let y = (item_index as f64 + 0.5) * row_h() - 2.0 * header_h();
+            return (x + w / 2.0, y.max(4.0));
+        }
+        x += w;
+    }
+    // Unknown section: park the pointer at the left of the bar.
+    (20.0, 4.0)
+}
+
+/// Open a menu-bar section and activate one of its items, for the movie tour.
+///
+/// The popover is opened through the real GTK mnemonic path — the same thing a
+/// user pressing Alt+letter triggers — because that is the one input route that
+/// provably reaches this widget tree under a synthetic driver: keys arrive,
+/// while synthetic X11 pointer events do not reach GTK4's gesture handling at
+/// all (verified by capture; see `movie_pointer`). The item itself is then
+/// dispatched by name through [`handle_menu_action`], the same entry point the
+/// menu's own action callbacks use, so the tour exercises the production path
+/// rather than a demo-only shortcut.
+///
+/// A missing section or item is reported in the status line instead of being
+/// silently ignored, so a typo in a tour script is visible in the recording.
+fn run_menu_tour_stop(state: &Rc<GuiState>, section: &str, item: &str) {
+    // Resolve the item to its action name from the shared menu definition (the
+    // same tree every backend builds from, so the tour cannot drift from the
+    // real menus).
+    let bar = super::menu::menu_bar();
+    let Some(root) = bar.iter().find(|r| r.label == section) else {
+        state.app_mut().core.status = format!("Menu tour: no section {section:?}");
+        sync_chrome_labels(state);
+        return;
+    };
+    let action = root
+        .submenu
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .find(|i| i.label == item)
+        .map(|i| super::menu::action_kind_to_name(i.action));
+    let Some(action) = action else {
+        state.app_mut().core.status = format!("Menu tour: no item {section} ▸ {item}");
+        sync_chrome_labels(state);
+        return;
+    };
+
+    // Open the section's popover for real, so the recording shows the menu.
+    if let Some(menubar) = state.menubar.get() {
+        if let Some(c) = root.label.chars().next() {
+            let keyval = c.to_ascii_lowercase() as u32;
+            let _ = menubar.activate_submenu_by_mnemonic(keyval);
+        }
+    }
+
+    // The status write has to be scoped: `app_mut()` is a `RefCell` borrow and
+    // `sync_chrome_labels`/`handle_menu_action` take it again internally, so
+    // holding it across those calls panics inside the draw callback.
+    {
+        let app = state.app_mut();
+        app.core.status = format!("Menu tour: {section} ▸ {item}");
+    }
+    sync_chrome_labels(state);
+    handle_menu_action(action, state);
+
+    // Close so the next stop starts from a clean menu state.
+    if let Some(menubar) = state.menubar.get() {
+        menubar.menu_close();
+    }
+    state.canvas.queue_redraw();
+    state.window.queue_redraw();
 }
 
 fn handle_menu_action(name: &str, state: &Rc<GuiState>) {
@@ -4994,8 +5087,35 @@ fn arm_movie_driver(state: &Rc<GuiState>, movie: super::movie::GuiMovie) {
         Moving { step: usize, value: String, hold: u32 },
         Typing { step: usize, typed: usize, value: String, hold: u32 },
         Holding { step: usize, hold: u32 },
+        /// Ease the drawn pointer toward a target, then run `then`.
+        ///
+        /// The pointer is painted by the app (X11 does not composite the cursor
+        /// into an `x11grab` capture, so the real one is invisible in a
+        /// recording). Motion is eased so it reads as a hand moving rather than
+        /// a jump, and `total` frames gives the travel a duration.
+        PointerMove {
+            from: (f64, f64),
+            to: (f64, f64),
+            frame: u32,
+            total: u32,
+            /// Menu stop to run once the press completes, if this is a tour move.
+            press_after: Option<(String, String)>,
+        },
+        /// Hold the pressed state briefly so a click is legible.
+        PointerPress { until: u32, then_menu: Option<(String, String)> },
     }
     let phase = std::cell::RefCell::new(Phase::LeadIn(lead_in_ticks.max(1)));
+
+    // An optional menu tour, run after the replay finishes: "the user opens
+    // each menu and picks an item". Kept out of the `.corro` log because a tour
+    // is a presentation concern — expressing it as an op would mean a new kind
+    // in the log format and in every backend's parser.
+    let tour = std::cell::RefCell::new(crate::ui_core::menu_tour_from_env());
+    let tour_idx = std::cell::Cell::new(0usize);
+    let tour_start = std::cell::Cell::new(None::<std::time::Instant>);
+    // Ticks to keep the window alive after the last stop starts, so its
+    // pointer/click phases can finish before the replay quits.
+    let tour_settle_frames = std::cell::Cell::new(0u32);
 
     let tick = move || -> bool {
         if finished.get() {
@@ -5017,10 +5137,110 @@ fn arm_movie_driver(state: &Rc<GuiState>, movie: super::movie::GuiMovie) {
                 }
                 true
             }
+            Phase::PointerMove { from, to, frame, total, press_after } => {
+                let f = (frame + 1).min(total);
+                let t = f as f64 / total.max(1) as f64;
+                // Ease-in-out: a hand accelerates away and settles, rather than
+                // travelling at a constant rate. Cubic on both halves is enough
+                // to read as deliberate movement at 16fps.
+                let e = if t < 0.5 {
+                    4.0 * t * t * t
+                } else {
+                    1.0 - (-2.0 * t + 2.0).powi(3) / 2.0
+                };
+                let x = from.0 + (to.0 - from.0) * e;
+                let y = from.1 + (to.1 - from.1) * e;
+                state_for_tick.movie_pointer.set(Some((x, y, false)));
+                state_for_tick.canvas.queue_redraw();
+                state_for_tick.window.queue_redraw();
+                if f >= total {
+                    state_for_tick.movie_pointer.set(Some((to.0, to.1, false)));
+                    match press_after {
+                        Some((section, item)) => {
+                            state_for_tick.movie_pointer.set(Some((to.0, to.1, true)));
+                            *current = Phase::PointerPress {
+                                until: 2,
+                                then_menu: Some((section, item)),
+                            };
+                        }
+                        None => *current = Phase::Idle,
+                    }
+                } else {
+                    *current = Phase::PointerMove { from, to, frame: f, total, press_after };
+                }
+                true
+            }
+            Phase::PointerPress { until, then_menu } => {
+                if until > 1 {
+                    *current = Phase::PointerPress { until: until - 1, then_menu };
+                    return true;
+                }
+                // Release: the pointer returns to its normal colour and the
+                // queued action runs.
+                if let Some((x, y, _)) = state_for_tick.movie_pointer.get() {
+                    state_for_tick.movie_pointer.set(Some((x, y, false)));
+                }
+                state_for_tick.canvas.queue_redraw();
+                state_for_tick.window.queue_redraw();
+                if let Some((section, item)) = then_menu {
+                    run_menu_tour_stop(&state_for_tick, &section, &item);
+                }
+                *current = Phase::Idle;
+                true
+            }
             Phase::Idle => {
                 let i = index.get();
                 let mut movie = movie.borrow_mut();
                 if i >= movie.len() {
+                    // Run any scripted menu tour before the window closes.
+                    //
+                    // The tour owns the driver until it is finished: starting a
+                    // stop must NOT fall through to the quit below, or the
+                    // window closes while the pointer is still travelling and
+                    // the recording ends before the menu is even opened.
+                    let steps = tour.borrow();
+                    let ti = tour_idx.get();
+                    if ti < steps.len() {
+                        if tour_start.get().is_none() {
+                            tour_start.set(Some(std::time::Instant::now()));
+                        }
+                        let elapsed = tour_start.get().unwrap().elapsed().as_millis() as u64;
+                        // Keep the window open for as long as any stop is still
+                        // pending, and refresh the settle budget each tick: the
+                        // final stop's pointer/click phases need it, and a later
+                        // stop can be scheduled seconds away.
+                        tour_settle_frames.set(8);
+                        if steps[ti].at_ms <= elapsed {
+                            let step = steps[ti].clone();
+                            // Aim at the section's menu button (the bar runs
+                            // along the top of the window) and press there.
+                            let target = menu_section_pointer_target(&step.section, step.item_index);
+                            let from = state_for_tick
+                                .movie_pointer
+                                .get()
+                                .map(|(x, y, _)| (x, y))
+                                .unwrap_or((target.0 - 120.0, target.1 + 180.0));
+                            *current = Phase::PointerMove {
+                                from,
+                                to: target,
+                                frame: 0,
+                                total: 12,
+                                press_after: Some((step.section.clone(), step.item.clone())),
+                            };
+                            tour_idx.set(ti + 1);
+                        }
+                        drop(steps);
+                        return true;
+                    }
+                    // Every stop has been started, but the last one may still be
+                    // animating: wait for its phases to finish before quitting,
+                    // or the window closes mid-click.
+                    let left = tour_settle_frames.get();
+                    if left > 0 {
+                        tour_settle_frames.set(left - 1);
+                        return true;
+                    }
+                    drop(steps);
                     finished.set(true);
                     state_for_tick.app_mut().core.status =
                         format!("Movie complete: {} lines", movie.applied);

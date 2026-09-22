@@ -95,6 +95,61 @@ pub fn edit_script_from_env() -> Vec<EditStep> {
     out
 }
 
+/// One stop on a scripted menu tour.
+///
+/// `--movie` replays a workbook log; a menu tour is a different kind of demo —
+/// "the user opens each menu and picks an item". Expressing that as a `.corro`
+/// op would mean a new op kind in the log format (and every backend's parser);
+/// it is a presentation concern, so it lives with the other scripted-session
+/// types instead.
+#[derive(Clone, Debug)]
+pub struct MenuTourStep {
+    /// Milliseconds after the tour starts.
+    pub at_ms: u64,
+    /// Menu-bar section to open, e.g. "File" (its mnemonic is pressed).
+    pub section: String,
+    /// Leaf item to activate, e.g. "Sort view".
+    pub item: String,
+    /// Zero-based index of the item within the opened popover, so the pointer
+    /// can be aimed at the row it is about to activate.
+    pub item_index: u32,
+}
+
+/// Parse `CORRO_MENU_TOUR`: `MS:Section>Item#index` steps separated by `,` or
+/// newlines, e.g. `0:File>New#0,3000:Edit>Cut#0`.
+///
+/// Unparsable items are skipped, so a typo in a demo script degrades to fewer
+/// stops rather than a crash — the same contract as `edit_script_from_env`.
+pub fn menu_tour_from_env() -> Vec<MenuTourStep> {
+    let Ok(raw) = std::env::var("CORRO_MENU_TOUR") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for item in raw.split([',', '\n']).map(str::trim).filter(|s| !s.is_empty()) {
+        let Some((when, rest)) = item.split_once(':') else {
+            continue;
+        };
+        let Ok(at_ms) = when.trim().parse::<u64>() else {
+            continue;
+        };
+        let (path, index) = match rest.rsplit_once('#') {
+            Some((p, i)) => (p, i.trim().parse::<u32>().unwrap_or(0)),
+            None => (rest, 0),
+        };
+        let Some((section, leaf)) = path.split_once('>') else {
+            continue;
+        };
+        out.push(MenuTourStep {
+            at_ms,
+            section: section.trim().to_string(),
+            item: leaf.trim().to_string(),
+            item_index: index,
+        });
+    }
+    out.sort_by_key(|s| s.at_ms);
+    out
+}
+
 pub fn prompt_action_write_target(action: &str, text: &str) -> Option<std::path::PathBuf> {
     match action {
         "save_as" | "export_tsv" | "export_csv" | "export_ods" | "export_ascii" | "export_all" => {}
