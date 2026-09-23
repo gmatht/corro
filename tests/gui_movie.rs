@@ -31,14 +31,6 @@ fn movie_file(tag: &str, text: &str) -> PathBuf {
     path
 }
 
-fn fast() -> GuiMovieOptions {
-    GuiMovieOptions {
-        typing_cps: 10_000.0,
-        confirm_delay_ms: 0,
-        menu_hold_ms: 0,
-    }
-}
-
 fn apply_all(path: &std::path::Path, text: &str) -> (GuiMovie, corro::gui::App) {
     let mut movie = GuiMovie::new(path).expect("parse movie");
     let mut app = corro::gui::App::new_with_paths(vec![path.to_path_buf()]);
@@ -92,7 +84,7 @@ fn gui_movie_flashes_the_menu_a_step_would_have_used() {
     // A cleared range is the Edit ▸ Cut path; the replay reports the menu so
     // the window can show what a user would have done.
     let path = movie_file("menu", "SET $1:A1 x\nSET $1:B1 y\nFILL A1= B1=\n");
-    let (mut movie, mut app) = apply_all(&path, "");
+    let (_, mut app) = apply_all(&path, "");
     let active = app.core.workbook.sheet_id(app.core.workbook.active_sheet);
     app.core.view_sheet_id = active;
     let mut movie = GuiMovie::new(&path).unwrap();

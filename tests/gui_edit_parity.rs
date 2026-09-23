@@ -95,18 +95,6 @@ impl Drop for KillOnDrop {
     }
 }
 
-/// Window origin (root coords). Under Xvfb with no WM client coords equal
-/// root coords, so this is what `mousemove` needs.
-fn win_xy(id: &str) -> (i32, i32) {
-    let g = xdotool(&["getwindowgeometry", "--shell", id]);
-    let (mut x, mut y) = (-1, -1);
-    for l in g.lines() {
-        if let Some(v) = l.strip_prefix("X=") { x = v.trim().parse().unwrap_or(-1); }
-        if let Some(v) = l.strip_prefix("Y=") { y = v.trim().parse().unwrap_or(-1); }
-    }
-    (x, y)
-}
-
 fn spawn_gui(path: &PathBuf) -> KillOnDrop {
     let bin = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/corro");
     KillOnDrop(

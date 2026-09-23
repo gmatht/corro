@@ -481,7 +481,7 @@ mod footer_key_column_repro {
     /// TOTAL/MAX/MIN). Clicking `[A_2` / `[A_3` must pop the dropdown, blank
     /// or not, exactly like `[A_1` and `]?~1`.
     #[test]
-    fn clicking_A_2_and_A_3_footer_keys_opens_the_dropdown() {
+    fn clicking_a_2_and_a_3_footer_keys_opens_the_dropdown() {
         for row in 1..=4u32 {
             let mut a = App::new_with_paths(vec![]);
             let key = footer(&mut a, row);

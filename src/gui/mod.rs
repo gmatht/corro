@@ -348,7 +348,7 @@ impl App {
     /// not perturb the workbook it is replaying, but the viewport math needs
     /// `&mut App`. The clone is read-only from the caller's perspective —
     /// nothing done to it is ever copied back.
-    #[cfg(any(feature = "gui", feature = "gui-mobile", feature = "pancurses"))]
+    #[cfg(any(feature = "gui", feature = "gui-mobile", all(feature = "wasm", target_arch = "wasm32")))]
     pub(crate) fn copy_for_layout(&self) -> App {
         App {
             core: CoreApp {

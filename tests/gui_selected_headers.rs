@@ -93,20 +93,27 @@ fn screenshot(wid: &str, tag: &str) -> PathBuf {
 
 /// Count exact-match pixels of SEL_RGB in a window-relative rect.
 fn count_sel(png: &PathBuf, x0: i32, y0: i32, x1: i32, y1: i32) -> u64 {
-    let script = r#"
+    // The target colour is interpolated from SEL_RGB so the Rust constant is
+    // the single source of truth (a hardcoded tuple here could drift from it).
+    let script = format!(
+        r#"
 import sys
 from PIL import Image
 im = Image.open(sys.argv[1]).convert('RGB')
 px = im.load()
 w, h = im.size
-want = (230, 243, 255)
+want = ({r}, {g}, {b})
 n = 0
 for y in range(max(0, int(sys.argv[3])), min(h, int(sys.argv[5]))):
     for x in range(max(0, int(sys.argv[2])), min(w, int(sys.argv[4]))):
         if px[x, y] == want:
             n += 1
 print(n)
-"#;
+"#,
+        r = SEL_RGB.0,
+        g = SEL_RGB.1,
+        b = SEL_RGB.2,
+    );
     let out = Command::new("python3")
         .arg("-c")
         .arg(script)

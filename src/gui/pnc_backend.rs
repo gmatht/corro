@@ -1368,7 +1368,6 @@ pub fn run_pancurses_movie(
     let mr = g.main_rows();
     let mc = g.main_cols();
     let lm = MARGIN_COLS;
-    let row_agg_func = compute::compute_row_agg_func(g, &display_rows, hr, mr);
 
     let total_rows = display_rows.len() as u32;
     let total_cols = col_ixs.len() as u32;

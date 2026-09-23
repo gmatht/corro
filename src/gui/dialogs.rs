@@ -452,6 +452,11 @@ pub fn choice_dialog<F: FnOnce(Option<usize>) + 'static>(
 /// As [`choice_dialog`], but parented to `parent` so the window manager
 /// places it as a child dialog (centred on the main window) rather than
 /// wherever an unparented window happens to land (often a screen corner).
+///
+/// The parameters are only consumed with the `gui` feature: without it this
+/// degrades to "no dialog, report cancel" (see the `#[cfg]` block), so they
+/// are unused there by design.
+#[cfg_attr(not(feature = "gui"), allow(unused_variables))]
 pub fn choice_dialog_parented<F: FnOnce(Option<usize>) + 'static>(
     title: &'static str,
     ok_label: &'static str,
@@ -659,6 +664,9 @@ pub fn balance_books_dialog<F: FnOnce(Option<BalanceChoice>) + 'static>(on_resul
                 // A second radio in the same group; the backend draws the
                 // exclusivity.
                 let neg_pos = rxapp.create_radiobutton(Some(&pos_neg), "Match -ve number with multiple +ve numbers");
+                if let Ok(ref rb) = neg_pos {
+                    vbox.append(rb);
+                }
 
                 dialog.append_content_area(&vbox);
                 dialog.add_button("Cancel", 0);

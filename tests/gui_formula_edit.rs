@@ -300,7 +300,7 @@ fn gui_grid_click_shows_cell_value() {
     ]);
     // Appearance event with a deadline: the entry must show the value.
     let deadline = Instant::now() + Duration::from_secs(45);
-    let mut last = String::new();
+    let mut last;
     loop {
         let shot = screenshot(&wid, "clickshow");
         last = ocr_entry_zone(&shot);

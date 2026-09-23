@@ -1397,7 +1397,6 @@ fn finish_tab_drag(state_rc: &Rc<GuiState>) {
         pos = drag.to;
     }
     let pos = pos.min(count) as u32;
-    drop(app);
     apply_reorder_sheet(state_rc, id, pos);
     crate::debug_log::log(&format!(
         "TABDRAG from={} to={} id={id} pos={pos}",
@@ -1440,7 +1439,6 @@ fn apply_reorder_sheet(state_rc: &Rc<GuiState>, id: u32, pos: u32) {
     } else {
         app.core.status = "Move sheet failed".to_string();
     }
-    drop(app);
     sync_tabbar(state_rc);
     sync_chrome_labels(state);
     state.canvas.queue_redraw();
@@ -1577,17 +1575,6 @@ fn paint_movie_pointer(dc: &mut dyn DrawContext, state: &GuiState) {
         dc.fill_rect(xx - 2.0, yy, 7.0, 1.0, outline.0, outline.1, outline.2, 1.0);
         dc.fill_rect(xx, yy, 3.0, 1.0, r, g, b, 1.0);
         t2 += 1.0;
-    }
-}
-
-/// Draw a line of arbitrary direction as a thin filled rectangle.
-fn stroke_segment(dc: &mut dyn DrawContext, x0: f64, y0: f64, x1: f64, y1: f64, w: f64, r: f64, g: f64, b: f64) {
-    let steps = ((x1 - x0).abs().max((y1 - y0).abs())).ceil().max(1.0) as i32;
-    for i in 0..=steps {
-        let t = i as f64 / steps as f64;
-        let px = x0 + t * (x1 - x0);
-        let py = y0 + t * (y1 - y0);
-        dc.fill_rect(px - w / 2.0, py - w / 2.0, w, w, r, g, b, 1.0);
     }
 }
 
@@ -3829,7 +3816,6 @@ fn delegate_shared_action(name: &str, state: &Rc<GuiState>) {
                 if let Some(choice) = choice {
                     let app = state2.app_mut();
                     super::actions::run_balance_books(app, &choice);
-                    drop(app);
                     recompute_viewport(&state2);
                     state2.canvas.queue_redraw();
                     state2.window.queue_redraw();
@@ -6819,7 +6805,7 @@ mod agg_drop_tests {
     /// Every row's band maps to that row; points outside the box hit nothing.
     #[test]
     fn row_bands_are_contiguous_and_bounded() {
-        let (bx, by, _bw, _bh, row_h) = agg_drop_layout_for_cell(158, 24, 50, 1200.0, 800.0);
+        let (_bx, by, _bw, _bh, row_h) = agg_drop_layout_for_cell(158, 24, 50, 1200.0, 800.0);
         let rows = agg_drop_rows().len();
         for i in 0..rows {
             let top = by + 1.0 + i as f64 * row_h;

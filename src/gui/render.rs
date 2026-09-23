@@ -384,7 +384,6 @@ mod tests {
         sheet.grid.set_main_size(3, 1);
         let g = &sheet.grid;
         let hr = crate::grid::HEADER_ROWS;
-        let mr = g.main_rows();
         let rows: Vec<usize> = (0..5).map(|i| hr + i).collect();
 
         let mut sink = RecordingSink::default();
