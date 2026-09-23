@@ -12,6 +12,7 @@ pub mod clipboard;
 pub mod viewport;
 pub mod compute;
 pub mod dialogs;
+pub mod balance_picker;
 pub mod edit;
 pub mod extrapolate;
 pub mod keymap;
@@ -96,6 +97,13 @@ pub struct App {
     pub agg_picker: Option<usize>,
     /// Cell the aggregate picker edits; committed directive is written here.
     pub agg_picker_target: Option<crate::grid::CellAddr>,
+    /// Sheet > Balance Books picker selection (shared by all GUI backends):
+    /// `Some(idx)` while the picker is open. Backends render
+    /// [`balance_picker::items`] and drive it via that module's
+    /// open/step/set/close/take functions, then hand the chosen
+    /// [`balance_picker::BalancePick`] to
+    /// [`actions::run_balance_books`].
+    pub balance_picker: Option<usize>,
 }
 
 impl App {
@@ -159,6 +167,7 @@ impl App {
             special_picker: None,
             agg_picker: None,
             agg_picker_target: None,
+            balance_picker: None,
         }
     }
 
@@ -378,6 +387,7 @@ impl App {
             special_picker: None,
             agg_picker: None,
             agg_picker_target: None,
+            balance_picker: None,
         }
     }
 

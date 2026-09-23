@@ -426,6 +426,7 @@ fn step_sheet_id(op: WorkbookOp) -> u32 {
         | WorkbookOp::CopySheet { id, .. }
         | WorkbookOp::RenameSheet { id, .. }
         | WorkbookOp::MoveSheet { id }
+        | WorkbookOp::MoveSheetTo { id, .. }
         | WorkbookOp::DeleteSheet { id }
         | WorkbookOp::LinkSheet { id, .. }
         | WorkbookOp::BalanceReport { id, .. } => id,
@@ -487,7 +488,9 @@ fn menu_for_workbook_op(op: &WorkbookOp) -> Option<(String, String)> {
         WorkbookOp::NewSheet { .. } => pair("Sheet", "New sheet"),
         WorkbookOp::CopySheet { .. } => pair("Sheet", "Copy sheet"),
         WorkbookOp::RenameSheet { .. } => pair("Sheet", "Rename sheet"),
-        WorkbookOp::MoveSheet { .. } => pair("Sheet", "Move sheet"),
+        WorkbookOp::MoveSheet { .. } | WorkbookOp::MoveSheetTo { .. } => {
+            pair("Sheet", "Move sheet")
+        }
         WorkbookOp::DeleteSheet { .. } => pair("Sheet", "Delete sheet"),
         WorkbookOp::BalanceReport { .. } => pair("Sheet", "Balance books"),
         WorkbookOp::ActivateSheet { .. } | WorkbookOp::LinkSheet { .. } => None,
@@ -576,6 +579,7 @@ fn describe_workbook_op(op: &WorkbookOp, workbook: &ops::WorkbookState) -> Strin
         WorkbookOp::CopySheet { title, .. } => format!("copy sheet to {title}"),
         WorkbookOp::RenameSheet { title, .. } => format!("rename sheet to {title}"),
         WorkbookOp::MoveSheet { .. } => "move sheet".into(),
+        WorkbookOp::MoveSheetTo { pos, .. } => format!("move sheet to position {pos}"),
         WorkbookOp::DeleteSheet { .. } => "delete sheet".into(),
         WorkbookOp::ActivateSheet { id } => format!("activate sheet {id}"),
         WorkbookOp::LinkSheet { id, .. } => format!("link sheet {id}"),

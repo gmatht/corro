@@ -431,6 +431,17 @@ pub enum WorkbookOp {
     MoveSheet {
         id: u32,
     },
+    /// Move sheet `id` to a 1-based position in the tab order.
+    ///
+    /// Added for drag-reordering tabs: `MoveSheet` can only send a sheet to
+    /// the end, which cannot express "drop it between those two tabs". Kept
+    /// separate rather than changing `MoveSheet`, because the existing op is
+    /// already written into workbook logs and parsed back by `ops::parse`.
+    MoveSheetTo {
+        id: u32,
+        /// 1-based target position (1 = first tab).
+        pos: u32,
+    },
     DeleteSheet {
         id: u32,
     },
@@ -1768,6 +1779,7 @@ impl WorkbookOp {
             WorkbookOp::ActivateSheet { id } => format!("${id}:ACTIVATE_SHEET"),
             WorkbookOp::RenameSheet { id, title } => format!("${id}:RENAME_SHEET {title}"),
             WorkbookOp::MoveSheet { id } => format!("${id}:MOVE_SHEET"),
+            WorkbookOp::MoveSheetTo { id, pos } => format!("${id}:MOVE_SHEET_TO {pos}"),
             WorkbookOp::DeleteSheet { id } => format!("${id}:DELETE_SHEET"),
             WorkbookOp::BalanceReport {
                 id,
@@ -2035,6 +2047,17 @@ pub fn parse_workbook_line(line: &str) -> Result<WorkbookOp, std::io::Error> {
             })
         }
         "MOVE_SHEET" => Ok(WorkbookOp::MoveSheet { id: sheet_id }),
+        "MOVE_SHEET_TO" => {
+            let pos = parts
+                .next()
+                .ok_or_else(|| bad("bad move-sheet-to line"))?
+                .parse::<u32>()
+                .map_err(|_| bad("bad move-sheet-to position"))?;
+            if pos == 0 {
+                return Err(bad("move-sheet-to position is 1-based"));
+            }
+            Ok(WorkbookOp::MoveSheetTo { id: sheet_id, pos })
+        }
         "DELETE_SHEET" => Ok(WorkbookOp::DeleteSheet { id: sheet_id }),
         "BALANCE_REPORT" => {
             let title = parts
@@ -2227,6 +2250,25 @@ pub fn apply_workbook_op(
                 .ok_or_else(|| bad("unknown sheet id"))?;
             let sheet = workbook.sheets.remove(idx);
             workbook.sheets.push(sheet);
+            workbook.active_sheet = workbook
+                .sheet_index_by_id(id)
+                .unwrap_or(workbook.active_sheet);
+            *active_sheet = id;
+            Ok(())
+        }
+        WorkbookOp::MoveSheetTo { id, pos } => {
+            let from = workbook
+                .sheet_index_by_id(id)
+                .ok_or_else(|| bad("unknown sheet id"))?;
+            // `pos` is 1-based and clamped to the sheet count, so a drop past
+            // the last tab lands at the end rather than erroring (the caller is
+            // a drag, and clamping is what the user means).
+            let count = workbook.sheets.len();
+            let target = (pos as usize).saturating_sub(1).min(count.saturating_sub(1));
+            if target != from {
+                let sheet = workbook.sheets.remove(from);
+                workbook.sheets.insert(target, sheet);
+            }
             workbook.active_sheet = workbook
                 .sheet_index_by_id(id)
                 .unwrap_or(workbook.active_sheet);
@@ -3565,6 +3607,76 @@ addr: CellAddr::Header { row: 0, col: ColumnAddr::Main(1) },
                 .as_deref(),
             Some("src")
         );
+    }
+
+    #[test]
+    fn move_sheet_to_places_at_position_and_clamps() {
+        let mut workbook = WorkbookState::new();
+        workbook.add_sheet("Two".into(), SheetState::new(1, 1));
+        workbook.add_sheet("Three".into(), SheetState::new(1, 1));
+        let mut active_sheet = workbook.sheet_id(workbook.active_sheet);
+        // ids are 1,2,3 in order.
+        assert_eq!(
+            workbook.sheets.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+
+        // Move the first sheet to position 2 -> [2,1,3].
+        apply_workbook_op(
+            &mut workbook,
+            &mut active_sheet,
+            WorkbookOp::MoveSheetTo { id: 1, pos: 2 },
+        )
+        .unwrap();
+        assert_eq!(
+            workbook.sheets.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![2, 1, 3]
+        );
+        assert_eq!(active_sheet, 1, "moved sheet becomes active");
+
+        // Move it to the front -> [1,2,3].
+        apply_workbook_op(
+            &mut workbook,
+            &mut active_sheet,
+            WorkbookOp::MoveSheetTo { id: 1, pos: 1 },
+        )
+        .unwrap();
+        assert_eq!(
+            workbook.sheets.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+
+        // A position past the end clamps to the last tab.
+        apply_workbook_op(
+            &mut workbook,
+            &mut active_sheet,
+            WorkbookOp::MoveSheetTo { id: 1, pos: 99 },
+        )
+        .unwrap();
+        assert_eq!(
+            workbook.sheets.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![2, 3, 1]
+        );
+    }
+
+    #[test]
+    fn move_sheet_to_round_trips_through_the_log() {
+        let line = WorkbookOp::MoveSheetTo { id: 7, pos: 3 }.to_log_line(0);
+        assert_eq!(line, "$7:MOVE_SHEET_TO 3");
+        match parse_workbook_line(&line).unwrap() {
+            WorkbookOp::MoveSheetTo { id, pos } => {
+                assert_eq!(id, 7);
+                assert_eq!(pos, 3);
+            }
+            other => panic!("wrong op: {other:?}"),
+        }
+        // The old op must keep parsing unchanged: existing logs depend on it.
+        assert!(matches!(
+            parse_workbook_line("$4:MOVE_SHEET").unwrap(),
+            WorkbookOp::MoveSheet { id: 4 }
+        ));
+        // A 1-based position is required; 0 is a bug, not the first tab.
+        assert!(parse_workbook_line("$4:MOVE_SHEET_TO 0").is_err());
     }
 
     #[test]

@@ -425,6 +425,21 @@ pub(crate) struct GuiState {
     tabbar: Canvas,
     tab_hits: RefCell<Vec<TabHit>>,
     tabbar_visible: Cell<bool>,
+    /// In-progress tab drag, or `None`.
+    ///
+    /// Set on a left press that lands on a tab and cleared on release; while
+    /// set, pointer motion over the strip paints a live preview of where the
+    /// tab would land. The reorder is only committed on release, so an
+    /// abandoned drag (release outside the strip) leaves the workbook alone.
+    tab_drag: RefCell<Option<TabDrag>>,
+    /// Tab-strip x of a right-press waiting to open the Sheet menu, or `None`.
+    ///
+    /// The menu opens on the button *release*, not the press. Opening it on the
+    /// press (even deferred by an idle) leaves it non-interactive: GTK pops the
+    /// menu up while button 3 is still down, so the following release is taken
+    /// as a dismissal/cancel and no row ever activates. The keyboard-opened
+    /// menu has no button held at all, which is exactly why it works.
+    tab_context_pending: Cell<Option<f64>>,
     // Scrollbar sync: native scrollbars around the sheet (thumb tracks the
     // viewport; dragging/clicking moves the cursor, which pulls the
     // viewport along, so the selection stays visible). Guard against reentrancy between programmatic sets and the
@@ -1006,6 +1021,61 @@ struct TabHit {
     index: usize,
 }
 
+/// An in-progress drag of a sheet tab.
+///
+/// `from` is the tab's index at press time; `to` is where it would land if
+/// released now, recomputed from pointer motion so the preview and the commit
+/// always agree. Both are sheet indices into the current tab order.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TabDrag {
+    from: usize,
+    to: usize,
+    /// Pointer x at press time, in tab-strip coordinates. Motion only becomes a
+    /// drag once the pointer has travelled past a small threshold, so a plain
+    /// click (press + release in place) still just switches sheets.
+    press_x: f64,
+    /// Whether that threshold was crossed. Before it is, no preview is painted.
+    moved: bool,
+}
+
+impl TabDrag {
+    /// Whether both indices still address the painted tabs.
+    ///
+    /// The two can drift out of range if the workbook changed under an
+    /// in-progress drag (a menu action adding or deleting a sheet), so this
+    /// guards the preview paint rather than indexing blindly.
+    fn index_in_range(&self, len: usize) -> bool {
+        len > 0 && self.from < len && self.to < len
+    }
+}
+
+/// Pointer travel (device px) before a press-and-hold becomes a drag.
+///
+/// Without a threshold, an ordinary click with one pixel of wobble would
+/// register as a reorder. 4px is below the width of any tab but comfortably
+/// above click jitter.
+const TAB_DRAG_THRESHOLD_BASE: f64 = 4.0;
+fn tab_drag_threshold() -> f64 { TAB_DRAG_THRESHOLD_BASE * metrics_scale() }
+
+/// Which tab slot a pointer at strip-x would drop into.
+///
+/// Uses the *midpoints* between the painted tabs rather than their boxes: a
+/// drag is dropped "between" tabs, and using the boxes themselves makes the
+/// boundary depend on the dragged tab's own width, so the preview jumps as the
+/// tab it is dragging changes size.
+fn tab_drop_index(hits: &[TabHit], x: f64) -> usize {
+    if hits.is_empty() {
+        return 0;
+    }
+    for (i, hit) in hits.iter().enumerate() {
+        let mid = (hit.x0 + hit.x1) / 2.0;
+        if x < mid {
+            return i;
+        }
+    }
+    hits.len() - 1
+}
+
 /// Lay out sheet tabs left to right from x=2: each tab pads its measured
 /// title by tab_pad_x() on both sides, tab_gap() separates tabs. The active tab
 /// measures bold (weight 1), like it paints. Pure apart from measuring, so
@@ -1102,7 +1172,44 @@ fn render_tabbar(dc: &mut dyn DrawContext, state: &GuiState, w: i32, h: i32) {
             weight,
         );
     }
+    // Live drag preview: a caret at the slot the tab would drop into, plus a
+    // dashed outline of the tab being dragged. Painted after the tabs so it
+    // sits on top, and skipped for a press that has not yet moved (that is
+    // still just a click).
+    if let Some(drag) = *state.tab_drag.borrow() {
+        if drag.moved && drag.index_in_range(hits.len()) {
+            paint_tab_drag_preview(dc, &hits, drag);
+        }
+    }
     *state.tab_hits.borrow_mut() = hits;
+}
+
+/// Draw the drag preview: a drop caret between tabs and an outline of the
+/// dragged tab. Purely visual — the reorder happens on release.
+fn paint_tab_drag_preview(dc: &mut dyn DrawContext, hits: &[TabHit], drag: TabDrag) {
+    const CARET: (f64, f64, f64) = (0.1, 0.35, 0.9);
+    // Drop caret at the boundary the tab would land on. `to` is a slot index
+    // in the current order: 0 means "before the first tab", `len-1` the last.
+    let caret_x = if drag.to == 0 {
+        hits.first().map(|h| h.x0 - tab_gap() / 2.0).unwrap_or(2.0)
+    } else {
+        hits.get(drag.to)
+            .map(|h| h.x0 - tab_gap() / 2.0)
+            .or_else(|| hits.last().map(|h| h.x1 + tab_gap() / 2.0))
+            .unwrap_or(2.0)
+    };
+    dc.fill_rect(caret_x - 1.0, 1.0, 2.0, tab_h() - 2.0, CARET.0, CARET.1, CARET.2, 1.0);
+    // Outline the tab being dragged so it reads as "picked up".
+    if let Some(from) = hits.get(drag.from) {
+        for (x, y, w, h) in [
+            (from.x0, 2.0, from.x1 - from.x0, 1.0),
+            (from.x0, tab_h() - 3.0, from.x1 - from.x0, 1.0),
+            (from.x0, 2.0, 1.0, tab_h() - 4.0),
+            (from.x1 - 1.0, 2.0, 1.0, tab_h() - 4.0),
+        ] {
+            dc.fill_rect(x, y, w, h, CARET.0, CARET.1, CARET.2, 1.0);
+        }
+    }
 }
 
 /// Switch to the tabbed sheet (mirrors sheet_prev/sheet_next arrival:
@@ -1138,6 +1245,247 @@ fn handle_tab_click(x: f64, state_rc: &Rc<GuiState>) {
     let hit = state.tab_hits.borrow().iter().find(|h| x >= h.x0 && x < h.x1).copied();
     if let Some(hit) = hit {
         switch_to_sheet(state_rc, hit.index);
+    }
+}
+
+/// Tab strip with the button number: right-click opens the Sheet menu as a
+/// context menu over the tab, left-click switches sheets.
+///
+/// LibreOffice Calc pops up the sheet's own menu on a right-click anywhere in
+/// the tab strip, and the menu acts on the sheet under the pointer. corro's
+/// Sheet menu already has the per-sheet items (New/Rename/Copy/Move), so the
+/// same menu tree is reused rather than duplicated — only the popup position
+/// and the "which sheet" target differ.
+///
+/// The Sheet menu is opened through the menu bar (mnemonic 'S'), which is the
+/// one path that already works on GTK3 and GTK4 alike (see
+/// `MenuBar::activate_submenu_by_mnemonic`). Positioning is best-effort: GTK4's
+/// popover menu bar has no position hook, so there the menu opens in its
+/// default place rather than failing.
+fn handle_tab_click_button(x: f64, button: u32, state_rc: &Rc<GuiState>) {
+    let state: &GuiState = &**state_rc;
+    if button == 1 {
+        // Left press: arm a possible drag, then switch sheets as before.
+        // Arming here (rather than in a separate handler) matters because this
+        // is the press; a drag is press -> motion -> release, and motion has
+        // nothing to extend unless the press armed it.
+        handle_tab_press(x, button, state_rc);
+        handle_tab_click(x, state_rc);
+        return;
+    }
+    if button == 3 {
+        // Right press over a tab: remember where, and open the menu on the
+        // *release*. Opening it now (even from an idle callback) leaves the
+        // menu up while button 3 is still down, so the release that follows is
+        // treated as a dismissal and none of the rows ever activate — verified
+        // by a 5-run loop: the popup appeared every time and clicking "New
+        // sheet" never worked. A right-press past the last tab is ignored
+        // rather than opening a menu about nothing.
+        let hit = state.tab_hits.borrow().iter().find(|h| x >= h.x0 && x < h.x1).copied();
+        if hit.is_none() {
+            return;
+        }
+        // The menu acts on the clicked sheet, so a right-press on an inactive
+        // tab selects it first (Calc's behaviour: the menu's items then apply
+        // to that sheet).
+        if let Some(hit) = hit {
+            switch_to_sheet(state_rc, hit.index);
+        }
+        state.tab_context_pending.set(Some(x));
+    }
+}
+
+/// Right-button release on the tab strip: open the Sheet menu there.
+fn handle_tab_release_button(x: f64, button: u32, state_rc: &Rc<GuiState>) {
+    let state: &GuiState = &**state_rc;
+    if button == 1 {
+        finish_tab_drag(state_rc);
+        return;
+    }
+    if button != 3 {
+        return;
+    }
+    // Only if a right-press actually armed this; a stray release (or one after
+    // the drag) must not pop a menu.
+    let Some(pending) = state.tab_context_pending.take() else {
+        return;
+    };
+    // Prefer the release position; fall back to the press position if the
+    // release reports no usable coordinate.
+    let at = if x.is_finite() && x >= 0.0 { x } else { pending };
+    open_sheet_context_menu(state_rc, at);
+}
+
+/// Begin, update, or finish a tab drag, driven by the button-aware pointer
+/// events.
+///
+/// A left press on a tab arms a drag; motion past the threshold previews the
+/// landing slot; release commits a reorder (if the slot actually changed). A
+/// right press or a press off the tabs is ignored here — the menu path and the
+/// plain click handler own those.
+fn handle_tab_press(x: f64, button: u32, state_rc: &Rc<GuiState>) {
+    let state: &GuiState = &**state_rc;
+    if button != 1 {
+        return;
+    }
+    let hit = state.tab_hits.borrow().iter().find(|h| x >= h.x0 && x < h.x1).copied();
+    let Some(hit) = hit else {
+        // Press off the tabs: nothing to drag.
+        return;
+    };
+    *state.tab_drag.borrow_mut() = Some(TabDrag {
+        from: hit.index,
+        to: hit.index,
+        press_x: x,
+        moved: false,
+    });
+}
+
+/// Pointer moved over the tab strip: extend an armed drag.
+fn handle_tab_motion(x: f64, state_rc: &Rc<GuiState>) {
+    let state: &GuiState = &**state_rc;
+    let mut drag = state.tab_drag.borrow_mut();
+    let Some(d) = drag.as_mut() else { return };
+    if !d.moved && (x - d.press_x).abs() < tab_drag_threshold() {
+        return;
+    }
+    d.moved = true;
+    let to = {
+        let hits = state.tab_hits.borrow();
+        tab_drop_index(&hits, x)
+    };
+    if d.to != to {
+        d.to = to;
+        drop(drag);
+        // Repaint so the preview follows the pointer. Only the strip needs it.
+        state.tabbar.queue_redraw();
+    }
+}
+
+/// Commit an in-progress drag, if any: a real reorder to the previewed slot.
+fn finish_tab_drag(state_rc: &Rc<GuiState>) {
+    let state: &GuiState = &**state_rc;
+    let Some(drag) = state.tab_drag.borrow_mut().take() else {
+        return;
+    };
+    if !drag.moved || drag.to == drag.from {
+        // A click, or a drag that came back to where it started: the click
+        // handler already switched sheets; nothing to reorder.
+        //
+        // Guard the repaint: this path runs for EVERY left-button release over
+        // the strip, including the release that commits a *menu* selection.
+        // Repainting the tab strip while a context menu is closing was enough
+        // to lose the click (verified: with this repaint unconditional, the
+        // right-click menu appeared but its rows did not activate). Only
+        // repaint when a preview was actually on screen and now needs clearing.
+        if drag.moved {
+            state.tabbar.queue_redraw();
+        }
+        return;
+    }
+    let app = state.app_mut();
+    let wb = &app.core.workbook;
+    let Some(id) = (0..wb.sheet_count()).find(|&i| i == drag.from).map(|i| wb.sheet_id(i)) else {
+        return;
+    };
+    let count = wb.sheet_count();
+    // The workbook op is 1-based and applies to the order *after* the sheet is
+    // lifted out. `tab_drop_index` returns a slot in the current order, so
+    // moving right means the target shifts down by one once the tab is removed.
+    let mut pos = drag.to + 1;
+    if drag.to > drag.from {
+        pos = drag.to;
+    }
+    let pos = pos.min(count) as u32;
+    drop(app);
+    apply_reorder_sheet(state_rc, id, pos);
+    crate::debug_log::log(&format!(
+        "TABDRAG from={} to={} id={id} pos={pos}",
+        drag.from, drag.to
+    ));
+}
+
+/// Apply `MOVE_SHEET_TO` to the live workbook and refresh the chrome.
+///
+/// Routed through the same commit path the menu actions use, so the reorder is
+/// written to the workbook log (a drag is a real edit, not a view-only shuffle)
+/// and the ops counter stays in step.
+fn apply_reorder_sheet(state_rc: &Rc<GuiState>, id: u32, pos: u32) {
+    let state: &GuiState = &**state_rc;
+    let app = state.app_mut();
+    let op = crate::ops::WorkbookOp::MoveSheetTo { id, pos };
+    let mut active = id;
+    let committed = match app.core.path.clone() {
+        Some(ref p) => {
+            let r = crate::io::commit_workbook_op(
+                p,
+                &mut app.core.offset,
+                &mut app.core.workbook,
+                &mut active,
+                &op,
+            );
+            if r.is_ok() {
+                app.core.ops_applied = app.core.ops_applied.saturating_add(1);
+            }
+            r.is_ok()
+        }
+        None => {
+            // Unsaved workbook: no log to write, so apply in memory only.
+            crate::ops::apply_workbook_op(&mut app.core.workbook, &mut active, op).is_ok()
+        }
+    };
+    if committed {
+        app.core.view_sheet_id = active;
+        app.core.status = format!("Sheet moved to position {pos}");
+    } else {
+        app.core.status = "Move sheet failed".to_string();
+    }
+    drop(app);
+    sync_tabbar(state_rc);
+    sync_chrome_labels(state);
+    state.canvas.queue_redraw();
+    state.window.queue_redraw();
+}
+
+/// Show the Sheet menu popup for a right-click at tab-strip x.
+fn open_sheet_context_menu(state_rc: &Rc<GuiState>, x: f64) {
+    let state: &GuiState = &**state_rc;
+    let Some(menubar) = state.menubar.get() else {
+        // No menu bar (a backend without one): say so rather than
+        // silently swallowing the click.
+        state.app_mut().core.status = "Sheet menu unavailable".to_string();
+        sync_chrome_labels(state);
+        return;
+    };
+    // 'S' is the Sheet menu's mnemonic (see `menu_bar`); the loader uppercases
+    // it against the mnemonic index built from the same tree.
+    let keyval = 's' as u32;
+    // Screen coordinates for the popup: the click x is widget-relative, and
+    // `gtk_menu_popup` wants root coordinates. `None` (widget not yet realized,
+    // or a backend without the origin symbols) means open unpositioned, which
+    // still shows the menu.
+    let origin = state.tabbar.screen_origin();
+    let menubar = menubar.clone();
+    let tab_y = (tab_h() as f64 / 2.0) as i32;
+    let tab_x = x.round() as i32;
+
+    // Open it inline: this runs from the button *release*, so no button is
+    // still held and GTK gives the menu its own input grab normally. Opening
+    // from the press (even deferred to an idle turn) left the menu visible but
+    // inert, because the release that followed dismissed it.
+    let opened = match origin {
+        Some((ox, oy)) => menubar.popup_submenu_by_mnemonic_at(keyval, ox + tab_x, oy + tab_y),
+        None => menubar.activate_submenu_by_mnemonic(keyval),
+    };
+    crate::debug_log::log(&format!(
+        "TABCTXMENU x={tab_x} origin={origin:?} opened={opened}"
+    ));
+    if !opened {
+        // A backend whose menus cannot be opened programmatically (the mobile
+        // and terminal ones report `false`). Say so rather than swallowing the
+        // click silently.
+        state.app_mut().core.status = "Sheet menu unavailable".to_string();
+        sync_chrome_labels(state);
     }
 }
 
@@ -3471,6 +3819,23 @@ fn delegate_shared_action(name: &str, state: &Rc<GuiState>) {
                 }
             }
         }
+        MenuDispatch::BalanceBooks => {
+            // The dialog owns three choices the old single-field prompt threw
+            // away (see `MenuDispatch::BalanceBooks`). The callback runs later,
+            // on the GTK main loop, so it reaches the app through the same
+            // published state the menu actions use.
+            let state2 = state.clone();
+            dialogs::balance_books_dialog(move |choice| {
+                if let Some(choice) = choice {
+                    let app = state2.app_mut();
+                    super::actions::run_balance_books(app, &choice);
+                    drop(app);
+                    recompute_viewport(&state2);
+                    state2.canvas.queue_redraw();
+                    state2.window.queue_redraw();
+                }
+            });
+        }
         MenuDispatch::SpecialPicker => {
             open_special_char_picker(state);
         }
@@ -4288,6 +4653,8 @@ pub fn run_gui_with_movie(
         padlocks: RefCell::new(Vec::new()),
         tabbar: tabbar.clone(),
         tab_hits: RefCell::new(Vec::new()),
+        tab_drag: RefCell::new(None),
+        tab_context_pending: Cell::new(None),
         tabbar_visible: Cell::new(false),
         #[cfg(feature = "gtk4")]
         last_dedup_key: Cell::new(0),
@@ -4405,6 +4772,28 @@ pub fn run_gui_with_movie(
     tabbar.on_click(Box::new(move |x: f64, _y: f64| {
         handle_tab_click(x, &shared_tabclick);
     }));
+    // Button-aware variant: right-click on a tab opens the Sheet menu there.
+    // `on_click` above still fires (both handlers are connected), but switching
+    // sheets on the same click is idempotent, so the two do not conflict. Only
+    // the GTK backends deliver a real button number; elsewhere `button` is 1
+    // and this path is exactly the left-click behaviour.
+    let shared_tabclick_btn = shared.clone();
+    tabbar.on_click_button(Box::new(move |x: f64, _y: f64, button: u32, _state: u32| {
+        handle_tab_click_button(x, button, &shared_tabclick_btn);
+    }));
+    // Drag-reorder: motion tracks the pointer while a left button is held, and
+    // release commits. Both go through the same armed-drag state, so a
+    // press/release without movement stays a plain click.
+    let shared_tabmotion = shared.clone();
+    tabbar.on_motion(Box::new(move |x: f64, _y: f64, _state: u32| {
+        handle_tab_motion(x, &shared_tabmotion);
+    }));
+    let shared_tabrelease = shared.clone();
+    tabbar.on_release(Box::new(
+        move |x: f64, _y: f64, button: u32, _state: u32| {
+            handle_tab_release_button(x, button, &shared_tabrelease);
+        },
+    ));
 
     // Formula entry change
     let shared_entry = shared.clone();
@@ -5844,6 +6233,34 @@ mod tab_tests {
     /// Tabs lay out left to right from x=2, padded by tab_pad_x() on both
     /// sides with tab_gap() between. "Sheet1" at the stub 8px/char measures
     /// 48px, so tab 1 spans 2..70 and tab 2 starts at 76.
+    #[test]
+    fn tab_drop_index_picks_the_slot_under_the_pointer() {
+        let hits = vec![
+            TabHit { x0: 0.0, x1: 100.0, index: 0 },
+            TabHit { x0: 106.0, x1: 206.0, index: 1 },
+            TabHit { x0: 212.0, x1: 312.0, index: 2 },
+        ];
+        // Left of every midpoint -> slot 0 (before the first tab).
+        assert_eq!(tab_drop_index(&hits, 0.0), 0);
+        assert_eq!(tab_drop_index(&hits, 49.0), 0);
+        // Past the first midpoint -> slot 1.
+        assert_eq!(tab_drop_index(&hits, 51.0), 1);
+        assert_eq!(tab_drop_index(&hits, 150.0), 1);
+        // Past the last midpoint -> the final slot.
+        assert_eq!(tab_drop_index(&hits, 260.0), 2);
+        assert_eq!(tab_drop_index(&hits, 9999.0), 2);
+        // No tabs at all: slot 0, never an underflow.
+        assert_eq!(tab_drop_index(&[], 10.0), 0);
+    }
+
+    #[test]
+    fn tab_drag_index_range_guard() {
+        let d = TabDrag { from: 1, to: 2, press_x: 0.0, moved: true };
+        assert!(d.index_in_range(3));
+        assert!(!d.index_in_range(2), "to == len is out of range");
+        assert!(!d.index_in_range(0), "an empty strip has no valid slot");
+    }
+
     #[test]
     fn tab_layout_pads_and_gaps_tabs() {
         let titles = vec!["Sheet1".to_string(), "Sheet2".to_string()];

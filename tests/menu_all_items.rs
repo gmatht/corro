@@ -134,6 +134,7 @@ fn dispatch_hint(d: &MenuDispatch) -> &'static str {
         MenuDispatch::HelpFull { .. } => "HelpFull",
         MenuDispatch::HelpKeybinds { .. } => "HelpKeybinds",
         MenuDispatch::AggregatePicker => "AggregatePicker",
+        MenuDispatch::BalanceBooks => "BalanceBooks",
     }
 }
 
@@ -293,6 +294,10 @@ fn prompt_actions_run_cleanly() {
         ("insert_hyperlink", "https://example.com"),
         ("sort_view", "A,"),
         ("persist_sort", "A!"),
+        // NOTE: balance_books is no longer free-text (it dispatches
+        // MenuDispatch::BalanceBooks -> the three-field dialog, see
+        // gui_routing_covers_every_menu_item). The direct run_prompt_action
+        // path still exists for the movie driver, so it stays covered here.
         ("balance_books", "A"),
     ];
 
@@ -503,7 +508,6 @@ fn gui_routing_covers_every_menu_item() {
     const GUI_DIALOG_DELEGATED: &[&str] = &[
         "find",
         "replace",
-        "balance_books",
         "rename_sheet",
         "export_tsv",
         "export_csv",
@@ -528,6 +532,12 @@ fn gui_routing_covers_every_menu_item() {
     // NOTE: delete_cell has dispatch/handler code but no menu item (Delete is
     // keyboard-only), so it is intentionally absent here.
     const GUI_NATIVE_OTHER: &[&str] = &["extrapolate", "quit"];
+    // gui_backend arms that open a backend-native multi-field dialog and do
+    // NOT delegate to run_prompt_action: the three-field Balance Books dialog
+    // (column / report type / direction) that replaced the old one-field
+    // "Balance column" prompt, which silently discarded two choices. It
+    // dispatches `MenuDispatch::BalanceBooks`, asserted below.
+    const GUI_DIALOG_NATIVE_MULTI: &[&str] = &["balance_books"];
 
     let leaves = all_leaves();
     let leaf_names: HashSet<&str> = leaves.iter().map(|l| l.action).collect();
@@ -537,6 +547,7 @@ fn gui_routing_covers_every_menu_item() {
         .iter()
         .chain(GUI_DIALOG_DELEGATED.iter())
         .chain(GUI_NATIVE_OTHER.iter())
+        .chain(GUI_DIALOG_NATIVE_MULTI.iter())
     {
         assert!(
             leaf_names.contains(name),
@@ -571,9 +582,28 @@ fn gui_routing_covers_every_menu_item() {
             !dialog_set.contains(n)
                 && !GUI_NATIVE_DIALOG.contains(n)
                 && !GUI_NATIVE_OTHER.contains(n)
+                && !GUI_DIALOG_NATIVE_MULTI.contains(n)
         })
         .collect();
     uncovered.sort_unstable();
+
+    // The multi-field dialog leaf must dispatch its own variant (not a stub
+    // status), so no backend can silently fall back to the old one-field
+    // prompt shape.
+    {
+        let mut app = seeded_app(None);
+        let mut scope = 0u8;
+        let mut clipboard = String::new();
+        for name in GUI_DIALOG_NATIVE_MULTI.iter().copied() {
+            let d = dispatch_menu_action(&mut app, name, &mut scope, &mut clipboard);
+            assert!(
+                matches!(d, MenuDispatch::BalanceBooks),
+                "{name} must dispatch MenuDispatch::BalanceBooks, got {}",
+                dispatch_hint(&d)
+            );
+        }
+    }
+
     let mut app = seeded_app(None);
     let mut pending_scope = 0u8;
     let mut clipboard = String::new();

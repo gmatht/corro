@@ -49,6 +49,19 @@ fn show_info_dialog(title: &str, text: &str) {
     rswidgets::backends::pancurses::show_dialog(title, text);
 }
 
+/// The Excel-style column letter of the cursor's main column, or `""` when
+/// the cursor sits in the margin. Used by the Balance Books picker as its
+/// column choice: the toolkit modal has no text field, so the cursor's own
+/// column stands in, and an empty string means "auto-detect a numeric
+/// column" (the same fallback a blank prompt submission used).
+fn cursor_column_letter(app: &super::App) -> String {
+    let col = app.core.cursor.col;
+    if col < MARGIN_COLS {
+        return String::new();
+    }
+    crate::addr::excel_column_name(col - MARGIN_COLS)
+}
+
 /// Splice a picked special character into the widget's in-progress edit at
 /// its caret (ratatui parity: the picker never commits, it splices and
 /// stays in edit mode; the user commits with Enter). When not editing,
@@ -613,6 +626,20 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                 rswidgets::backends::pancurses::show_list_picker(" Special Char ", &rows, 0);
                 rswidgets::backends::pancurses::request_redraw();
             }
+            MenuDispatch::BalanceBooks => {
+                // Three-choice dialog (column / report type / direction) the
+                // old single-field prompt threw two of away. The toolkit has
+                // no multi-field modal, so the report-type × direction
+                // combinations are presented as one list over shared picker
+                // state (key hook below); the column is resolved the same way
+                // the prompt path resolved it (cursor cell / auto-detect).
+                super::balance_picker::open(app);
+                let rows: Vec<String> =
+                    super::balance_picker::items().into_iter().collect();
+                let sel = super::balance_picker::index(app).unwrap_or(0);
+                rswidgets::backends::pancurses::show_list_picker(" Balance books ", &rows, sel);
+                rswidgets::backends::pancurses::request_redraw();
+            }
             MenuDispatch::About { status } => {
                 show_info_dialog(" About ", &about_body());
                 apply_status(&status);
@@ -732,6 +759,60 @@ pub fn run_pancurses(app: &mut super::App) -> Result<(), Box<dyn std::error::Err
                     if let Some(idx) = super::special_picker::index_for_digit(*c) {
                         super::special_picker::set(app, idx);
                         commit_sel(app);
+                    }
+                    true
+                }
+                _ => false,
+            }
+        } else if app.balance_picker.is_some() {
+            let step_bal = |app: &mut super::App, delta: i32| {
+                super::balance_picker::step(app, delta);
+                let idx = super::balance_picker::index(app).unwrap_or(0);
+                rswidgets::backends::pancurses::set_list_picker_selection(idx);
+                rswidgets::backends::pancurses::request_redraw();
+            };
+            let commit_bal = |app: &mut super::App| {
+                if let Some(pick) = super::balance_picker::take(app) {
+                    // The picker has no text field, so the column is the
+                    // cursor's own column when it sits on a main column,
+                    // else empty (auto-detect) — the same fallback the old
+                    // prompt path used for blank input.
+                    let column = cursor_column_letter(app);
+                    super::actions::run_balance_books(
+                        app,
+                        &super::dialogs::BalanceChoice {
+                            column,
+                            persist: pick.persist,
+                            direction: pick.direction,
+                        },
+                    );
+                }
+                rswidgets::backends::pancurses::close_list_picker();
+                rswidgets::backends::pancurses::request_redraw();
+            };
+            match key {
+                Some(KeyInput::ArrowDown) | Some(KeyInput::ArrowRight) => {
+                    step_bal(app, 1);
+                    true
+                }
+                Some(KeyInput::ArrowUp) | Some(KeyInput::ArrowLeft) => {
+                    step_bal(app, -1);
+                    true
+                }
+                Some(KeyInput::Enter) => {
+                    commit_bal(app);
+                    true
+                }
+                Some(KeyInput::Escape) => {
+                    super::balance_picker::close(app);
+                    rswidgets::backends::pancurses::close_list_picker();
+                    rswidgets::backends::pancurses::request_redraw();
+                    true
+                }
+                Some(KeyInput::Char(c)) if c.is_ascii_digit() => {
+                    if let Some(idx) = super::balance_picker::index_for_digit(*c) {
+                        super::balance_picker::set(app, idx);
+                        commit_bal(app);
                     }
                     true
                 }

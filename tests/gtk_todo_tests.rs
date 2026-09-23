@@ -21,7 +21,7 @@ fn gui_menu_items_available() {
            content.contains("find_dialog(") &&
            content.contains("replace_dialog(") &&
            content.contains("sort_dialog(") &&
-           content.contains("balance_dialog(")
+           content.contains("balance_books_dialog(")
         {
             all_menu_items_found = true;
             break;

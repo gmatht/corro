@@ -8788,7 +8788,7 @@ impl App {
                     menu_hold,
                 )?;
             }
-            crate::ops::WorkbookOp::MoveSheet { .. } => {
+            crate::ops::WorkbookOp::MoveSheet { .. } | crate::ops::WorkbookOp::MoveSheetTo { .. } => {
                 self.movie_show_menu(
                     terminal,
                     MenuSection::Sheet,

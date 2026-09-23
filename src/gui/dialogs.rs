@@ -2,6 +2,7 @@ use crate::ops::WorkbookState;
 #[cfg(feature = "gui")]
 use crate::gui::app_alias::App;
 use std::path::PathBuf;
+use crate::balance::BalanceDirection;
 
 #[allow(dead_code, unused_variables)] // only used by the gui feature
 fn log_dialog_action(action: &str, detail: &str) {
@@ -589,34 +590,125 @@ pub fn sort_dialog<F: FnOnce(Option<(usize, bool)>) + 'static>(_workbook: &Workb
     on_result(None);
 }
 
-pub fn balance_dialog<F: FnOnce(Option<String>) + 'static>(on_result: F) {
+/// The Balance Books dialog: column, report type and direction.
+///
+/// Mirrors the TUI's `Mode::BalanceBooks` field for field
+/// (`src/ui/mod.rs`), because a one-field prompt silently discarded two of the
+/// three choices: `run_prompt_action` hardcoded `PosToNeg` and `persist = true`,
+/// so a GUI user could not ask for the other direction or for a view-only
+/// report. The TUI exposes all three, and this dialog matches it:
+///
+///   * `Column to Balance:` — which numeric column scores the rows;
+///   * `Report Type:` — View only (default, as in the TUI) or Persisted report;
+///   * `Balance direction:` — PosToNeg or NegToPos;
+///   * `Generate` / `Cancel`.
+///
+/// Returns `None` on cancel.
+pub fn balance_books_dialog<F: FnOnce(Option<BalanceChoice>) + 'static>(on_result: F) {
     #[cfg(feature = "gui")]
     {
-        use rswidgets::common::Entry as CommonEntry;
+        use rswidgets::common::{Entry as CommonEntry, Orientation};
+
+        // The widget types differ per backend exactly as in `sort_dialog`.
+        // These are the adapter types `create_checkbutton` / `create_radiobutton`
+        // actually return on each backend (the prelude's names differ).
+        #[cfg(target_os = "linux")]
+        use rswidgets::backends_gtk_adapter::{CheckButton, RadioButton};
+        #[cfg(windows)]
+        use rswidgets::backends_nwg_adapter::{CheckButton, RadioButton};
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        use rswidgets::prelude::{CheckButton, RadioButton};
+
         if let Ok(rxapp) = rswidgets::App::init() {
-            if let (Ok(dialog), Ok(entry)) = (rxapp.new_dialog(), rxapp.new_entry()) {
-                dialog.set_title("Balance Books");
-                if let Ok(label) = rxapp.new_label("Column to balance:") {
-                    dialog.append_content_area(&label);
+            let built = (
+                rxapp.new_dialog(),
+                rxapp.new_entry(),
+                rxapp.create_checkbutton("Persisted report"),
+                rxapp.create_radiobutton(None, "Match +ve number with multiple -ve numbers"),
+                rxapp.new_box(Orientation::Vertical, 6),
+            );
+            if let (Ok(dialog), Ok(entry), Ok(persist), Ok(pos_neg), Ok(vbox)) = built {
+                dialog.set_title("Balance books");
+                dialog.set_default_size(420, 260);
+
+                if let Ok(l) = rxapp.new_label(
+                    "Balance rows into groups that sum to zero. The selected numeric column \
+                     is used to score rows; all other columns are copied unchanged.",
+                ) {
+                    vbox.append(&l);
                 }
-                entry.set_text("A");
+                if let Ok(l) = rxapp.new_label("Column to Balance:") {
+                    vbox.append(&l);
+                }
                 entry.set_hexpand(true);
-                dialog.append_content_area(&entry);
+                vbox.append(&entry);
+
+                if let Ok(l) = rxapp.new_label("Report Type:") {
+                    vbox.append(&l);
+                }
+                // View only is the TUI default (`persist: false`), so the
+                // checkbox starts clear.
+                persist.set_active(false);
+                vbox.append(&persist);
+
+                if let Ok(l) = rxapp.new_label("Balance direction:") {
+                    vbox.append(&l);
+                }
+                pos_neg.set_active(true);
+                vbox.append(&pos_neg);
+                // A second radio in the same group; the backend draws the
+                // exclusivity.
+                let neg_pos = rxapp.create_radiobutton(Some(&pos_neg), "Match -ve number with multiple +ve numbers");
+
+                dialog.append_content_area(&vbox);
                 dialog.add_button("Cancel", 0);
-                dialog.add_button("Balance", 1);
+                dialog.add_button("Generate", 1);
+
+                // The widgets outlive the callback, so they are moved to the
+                // heap and referred to by pointer (the same lifetime trick
+                // `sort_dialog` uses).
                 let entry_ptr = Box::into_raw(Box::new(entry)) as usize;
+                let persist_ptr = Box::into_raw(Box::new(persist)) as usize;
+                let neg_pos_ptr = neg_pos.ok().map(|r| Box::into_raw(Box::new(r)) as usize);
                 let mut on_result = Some(on_result);
-                dialog.connect_response(move |response_id| {
-                    if let Some(f) = on_result.take() {
-                        let entry: &CommonEntry = unsafe { &*(entry_ptr as *const CommonEntry) };
-                        if response_id == 1 {
-                            f(entry.get_text());
-                        } else {
-                            f(None);
+                let called = std::cell::RefCell::new(false);
+                dialog
+                    .connect_response(move |response_id| {
+                        let mut done = called.borrow_mut();
+                        if *done {
+                            return;
                         }
-                    }
-                }).ok();
+                        *done = true;
+                        let Some(f) = on_result.take() else { return };
+                        if response_id != 1 {
+                            f(None);
+                            return;
+                        }
+                        let entry: &CommonEntry = unsafe { &*(entry_ptr as *const CommonEntry) };
+                        let persist: &CheckButton =
+                            unsafe { &*(persist_ptr as *const CheckButton) };
+                        let direction = match neg_pos_ptr {
+                            Some(p) => {
+                                let rb: &RadioButton = unsafe { &*(p as *const RadioButton) };
+                                if rb.is_active() {
+                                    BalanceDirection::NegToPos
+                                } else {
+                                    BalanceDirection::PosToNeg
+                                }
+                            }
+                            None => BalanceDirection::PosToNeg,
+                        };
+                        f(Some(BalanceChoice {
+                            column: entry.get_text().unwrap_or_default(),
+                            persist: persist.is_active(),
+                            direction,
+                        }));
+                    })
+                    .ok();
                 dialog.present();
+
+                // The TUI focuses the column field first, so the dialog can be
+                // used without reaching for the mouse.
                 focus_dialog_entry(entry_ptr);
                 let _ = Box::into_raw(Box::new(dialog));
                 return;
@@ -624,4 +716,19 @@ pub fn balance_dialog<F: FnOnce(Option<String>) + 'static>(on_result: F) {
         }
     }
     on_result(None);
+}
+
+/// What the Balance Books dialog collected.
+///
+/// A named struct rather than a tuple: three fields where two are booleans/enums
+/// read as an opaque `(String, bool, BalanceDirection)` at every call site.
+#[derive(Clone, Debug)]
+pub struct BalanceChoice {
+    /// Column expression the user typed (`"A"`, `"B"`, ...); parsed by the
+    /// caller, which can also fall back to the auto-chosen column when empty.
+    pub column: String,
+    /// Persisted report (TUI's `persist`).
+    pub persist: bool,
+    /// Which sign pairing to balance against.
+    pub direction: BalanceDirection,
 }

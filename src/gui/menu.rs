@@ -242,10 +242,11 @@ pub fn handle_action(name: &str, rxapp: &rswidgets::App) {
                 }
             });
         }
-        "balance_books" => dialogs::balance_dialog(|result| {
-            if let Some(col) = result {
-                eprintln!("Balance col: {}", col);
-            }
+        "balance_books" => dialogs::balance_books_dialog(|_choice| {
+            // This dispatcher is the standalone/debug menu path (it only
+            // prints); the live GUI reaches Balance Books through
+            // `MenuDispatch::BalanceBooks` in gui_backend.
+            eprintln!("Balance books dialog dismissed");
         }),
         "about" => dialogs::show_about_dialog(),
         "help_keybinds" => dialogs::show_keybinds_help(),

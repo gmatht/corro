@@ -209,7 +209,6 @@ pub fn menu_action_needs_prompt(name: &str) -> Option<&'static str> {
         "insert_hyperlink" => "Insert hyperlink",
         "sort_view" => "sort cols [A,B,C]",
         "persist_sort" => "sort cols [A,B,C] (save)",
-        "balance_books" => "Balance column",
         _ => return None,
     })
 }
@@ -250,6 +249,13 @@ pub enum MenuDispatch {
     HelpFull { status: String },
     /// Render the Keybindings dialog (backend-specific); show `status`.
     HelpKeybinds { status: String },
+    /// Backend should open the Balance Books dialog: column, report type
+    /// (view-only vs persisted) and direction.
+    ///
+    /// Not a free-text prompt: the TUI's `Mode::BalanceBooks` has three
+    /// choices, and the old single-field prompt silently fixed the other two
+    /// (`PosToNeg`, persisted), so a GUI user could not pick them.
+    BalanceBooks,
 }
 
 /// Perform an immediate (non-prompt) menu action on `app`, returning how the
@@ -305,6 +311,7 @@ pub fn dispatch_menu_action(
                 MenuDispatch::Status("Inserted row".into())
             }
         }
+        "balance_books" => MenuDispatch::BalanceBooks,
         "insert_special_chars" => {
             // Picker, not free-text (ratatui parity): the backend opens
             // its 10-choice dialog/popup over shared picker state.
@@ -689,6 +696,90 @@ pub fn dispatch_menu_action(
     }
 }
 
+/// Apply the Balance Books dialog's choices.
+///
+/// The three fields map onto the TUI's `Mode::BalanceBooks` exactly:
+/// `choice.column` is the scoring column, `choice.persist` selects a persisted
+/// report over a view-only one, and `choice.direction` picks which sign pairing
+/// to balance against. The TUI defaults are `PosToNeg` and view-only
+/// (`persist: false`), which is what the dialog opens with.
+///
+/// `app.core.status` carries the outcome, as the other actions do.
+pub fn run_balance_books(app: &mut App, choice: &super::dialogs::BalanceChoice) {
+    let col = {
+        let trimmed = choice.column.trim();
+        if trimmed.is_empty() {
+            crate::balance::choose_balance_column(&app.core.workbook.active_sheet().grid)
+        } else {
+            crate::addr::parse_excel_column(trimmed).map(|c| c as usize)
+        }
+    };
+    let Some(col) = col else {
+        app.core.status = "No balance column found".into();
+        return;
+    };
+    let direction = choice.direction;
+    let persist = choice.persist;
+    let grid = &app.core.workbook.active_sheet().grid;
+    let report = crate::balance::build_balance_report(grid, col, direction);
+    let source_sheet_id = app.core.workbook.sheet_id(app.core.workbook.active_sheet);
+    let source_title = app
+        .core
+        .workbook
+        .sheet_title(app.core.workbook.active_sheet)
+        .to_string();
+    let id = app.core.workbook.next_sheet_id;
+    let title = format!("Balance-{id}");
+    let plan = crate::balance::balance_copy_plan(
+        source_sheet_id,
+        source_title,
+        id,
+        title.clone(),
+        col,
+        app.core.workbook.active_sheet().grid.main_rows(),
+        &report,
+        persist,
+    );
+    let report_sheet =
+        crate::balance::materialize_report_sheet(&app.core.workbook.active_sheet().clone(), &plan);
+    app.core.workbook.add_sheet(title.clone(), report_sheet);
+    app.core.workbook.active_sheet = app
+        .core
+        .workbook
+        .sheet_index_by_id(id)
+        .unwrap_or(app.core.workbook.active_sheet);
+    app.core.view_sheet_id = id;
+    if persist {
+        if let Some(ref p) = app.core.path.clone() {
+            let mut active_sheet = id;
+            let wbo = WorkbookOp::BalanceReport {
+                id,
+                title: title.clone(),
+                source_sheet_id,
+                amount_col: col,
+                direction,
+                row_order: plan.row_order.clone(),
+                show_unmatched_heading: plan.show_unmatched_heading,
+                unmatched_start: plan.unmatched_start,
+                preserve_formulas: true,
+            };
+            let _ = crate::io::commit_workbook_op(
+                p,
+                &mut app.core.offset,
+                &mut app.core.workbook,
+                &mut active_sheet,
+                &wbo,
+            );
+            app.core.ops_applied = app.core.ops_applied.saturating_add(1);
+        }
+    }
+    app.core.status = if persist {
+        format!("Balanced {title} (persisted)")
+    } else {
+        format!("Balanced {title} (view only)")
+    };
+}
+
 /// Perform the file/name operation submitted via a backend text prompt.
 /// Mutates `app.core.status`; the backend then updates its formula bar.
 /// Pure corro logic — no widget code.
@@ -841,8 +932,10 @@ pub fn run_prompt_action(app: &mut App, action: &str, text: &str) {
             app.core.status = "View sort saved".into();
         }
         "balance_books" => {
-            // Generate a balance report sheet from the chosen amount column,
-            // matching ratatui's BalanceBooks (persist=true).
+            // Direct path with a pre-resolved column (the movie driver's
+            // `MS:Sheet>Balance books#n` step and the tests): the dialog path is
+            // `MenuDispatch::BalanceBooks` -> `run_balance_books`, which carries
+            // the direction and persist choices this one cannot express.
             let col = if path.trim().is_empty() {
                 crate::balance::choose_balance_column(&app.core.workbook.active_sheet().grid)
             } else {
@@ -852,37 +945,14 @@ pub fn run_prompt_action(app: &mut App, action: &str, text: &str) {
                 app.core.status = "No balance column found".into();
                 return;
             };
-            let direction = crate::balance::BalanceDirection::PosToNeg;
-            let report = crate::balance::build_balance_report(
-                &app.core.workbook.active_sheet().grid, col, direction,
+            run_balance_books(
+                app,
+                &super::dialogs::BalanceChoice {
+                    column: crate::addr::excel_column_name(col),
+                    persist: true,
+                    direction: crate::balance::BalanceDirection::PosToNeg,
+                },
             );
-            let source_sheet_id = app.core.workbook.sheet_id(app.core.workbook.active_sheet);
-            let source_title = app.core.workbook.sheet_title(app.core.workbook.active_sheet).to_string();
-            let title = format!("Balance-{}", app.core.workbook.next_sheet_id);
-            let id = app.core.workbook.next_sheet_id;
-            let plan = crate::balance::balance_copy_plan(
-                source_sheet_id, source_title.clone(), id, title.clone(), col,
-                app.core.workbook.active_sheet().grid.main_rows(), &report, true,
-            );
-            let report_sheet = crate::balance::materialize_report_sheet(
-                &app.core.workbook.active_sheet().clone(), &plan,
-            );
-            app.core.workbook.add_sheet(title.clone(), report_sheet);
-            app.core.workbook.active_sheet = app.core.workbook.sheet_index_by_id(id).unwrap_or(app.core.workbook.active_sheet);
-            app.core.view_sheet_id = id;
-            if let Some(ref p) = app.core.path.clone() {
-                let mut active_sheet = id;
-                let wbo = WorkbookOp::BalanceReport {
-                    id, title: title.clone(), source_sheet_id, amount_col: col, direction,
-                    row_order: plan.row_order.clone(),
-                    show_unmatched_heading: plan.show_unmatched_heading,
-                    unmatched_start: plan.unmatched_start,
-                    preserve_formulas: true,
-                };
-                let _ = crate::io::commit_workbook_op(p, &mut app.core.offset, &mut app.core.workbook, &mut active_sheet, &wbo);
-                app.core.ops_applied = app.core.ops_applied.saturating_add(1);
-            }
-            app.core.status = format!("Balance report saved as {title}");
         }
         "go_to_cell" => {
             if !path.is_empty() {

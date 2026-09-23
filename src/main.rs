@@ -1041,6 +1041,11 @@ fn try_main() -> (Result<(), Box<dyn std::error::Error>>, Option<String>) {
         }
         #[cfg(feature = "pancurses")]
         UiKind::Pancurses => {
+            // Kept for the movie reset below: `args.files` is moved into the
+            // `App` constructor. (The `gui` branch above needs the same value;
+            // each arm binds its own because only one arm is compiled per
+            // feature set.)
+            let movie_input = args.files.first().cloned();
             let mut app = match args.revision {
                 None => GuiApp::new_with_paths(args.files),
                 Some(RevisionMode::Browse) => GuiApp::new_with_revision_browser(args.files.first().cloned()),
