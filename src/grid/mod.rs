@@ -2701,6 +2701,52 @@ pub fn addr_logical_col(addr: &CellAddr, grid: &Grid) -> usize {
 
 #[cfg(test)]
 mod tests {
+
+    /// What the view sort does with non-numeric columns — the properties worth
+    /// knowing, pinned so a change to `compare_sort_values` is deliberate.
+    #[test]
+    fn view_sort_handles_non_numeric_columns() {
+        // `MARGIN_COLS` and `SortSpec` are already in scope in this module.
+        use crate::addr::GlobalCol;
+
+        let mut g = Grid::new(1, 1);
+        g.set_main_size(6, 1);
+        let col = MARGIN_COLS;
+        let set = |g: &mut Grid, r: u32, v: &str| {
+            g.set(&CellAddr::Main { row: r, col: 0 }, v.to_string());
+        };
+        // A text column, deliberately mixed-case and with a numeric-looking
+        // entry so both buckets are exercised at once.
+        set(&mut g, 0, "banana");
+        set(&mut g, 1, "Apple");
+        set(&mut g, 2, "cherry");
+        set(&mut g, 3, "10");
+        set(&mut g, 4, "");        // blank
+        set(&mut g, 5, "2");
+
+        g.set_view_sort_cols(vec![SortSpec { col, desc: false }]);
+        let order = g.sorted_main_rows();
+        let values: Vec<&str> = order
+            .iter()
+            .map(|r| g.get(&CellAddr::Main { row: *r as u32, col: 0 }).unwrap_or(""))
+            .collect();
+        println!("ascending:  {values:?}");
+
+        // Documents the current contract: case-SENSITIVE (uppercase first),
+        // text before numbers, blanks last.
+        assert_eq!(values, vec!["Apple", "banana", "cherry", "2", "10", ""]);
+
+        g.set_view_sort_cols(vec![SortSpec { col, desc: true }]);
+        let order = g.sorted_main_rows();
+        let values: Vec<&str> = order
+            .iter()
+            .map(|r| g.get(&CellAddr::Main { row: *r as u32, col: 0 }).unwrap_or(""))
+            .collect();
+        println!("descending: {values:?}");
+        // Blanks still last, and the text/number split inverts.
+        assert_eq!(values.last(), Some(&""));
+        let _ = GlobalCol(0);
+    }
     use super::*;
 
     /// Brute-force occupancy (the pre-index implementation) for cross-checks.
