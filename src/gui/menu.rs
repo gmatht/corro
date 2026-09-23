@@ -242,10 +242,11 @@ pub fn handle_action(name: &str, rxapp: &rswidgets::App) {
                 }
             });
         }
-        "balance_books" => dialogs::balance_books_dialog(|_choice| {
+        "balance_books" => dialogs::balance_books_dialog(&[], 0, |_choice| {
             // This dispatcher is the standalone/debug menu path (it only
             // prints); the live GUI reaches Balance Books through
-            // `MenuDispatch::BalanceBooks` in gui_backend.
+            // `MenuDispatch::BalanceBooks` in gui_backend, which passes the
+            // workbook's numeric columns.
             eprintln!("Balance books dialog dismissed");
         }),
         "about" => dialogs::show_about_dialog(),

@@ -73,6 +73,29 @@ pub fn choose_balance_column(grid: &Grid) -> Option<usize> {
     first_numeric
 }
 
+/// Main columns that carry at least one non-blank numeric value, in order.
+///
+/// Drives the Balance Books column drop-down: only columns that can actually
+/// score rows are offered, so the list never presents a blank or text-only
+/// column that would silently balance to nothing. A column counts as numeric
+/// when any of its cells parses as an amount ([`parse_amount_cents`], the same
+/// predicate `choose_balance_column` and the report builder use), so the
+/// drop-down and the auto-detected default agree on what "numeric" means.
+pub fn numeric_columns(grid: &Grid) -> Vec<usize> {
+    (0..grid.main_cols())
+        .filter(|&col| {
+            (0..grid.main_rows()).any(|row| {
+                let addr = CellAddr::Main {
+                    row: row as u32,
+                    col: col as u32,
+                };
+                grid.get(&addr)
+                    .is_some_and(|raw| !raw.trim().is_empty() && parse_amount_cents(&raw).is_some())
+            })
+        })
+        .collect()
+}
+
 pub fn source_rows_from_grid(grid: &Grid, col: usize) -> Vec<BalanceSourceRow> {
     let mut rows = Vec::new();
     for row in 0..grid.main_rows() {
@@ -606,5 +629,46 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `numeric_columns` offers exactly the non-blank, numeric-bearing main
+    /// columns, in order — the Balance Books drop-down's source list. A column
+    /// holding only text, or only blanks, must not appear; a column whose
+    /// numbers are mixed with blanks must.
+    #[test]
+    fn numeric_columns_lists_only_nonblank_numeric_columns() {
+        let mut grid = GridBox::from(Grid::new(3, 4));
+        // A: numbers (mixed with a blank cell).
+        grid.set(&CellAddr::Main { row: 0, col: 0 }, "10".into());
+        grid.set(&CellAddr::Main { row: 2, col: 0 }, "-5".into());
+        // B: text only.
+        grid.set(&CellAddr::Main { row: 0, col: 1 }, "note".into());
+        // C: blank.
+        // D: one number, one blank.
+        grid.set(&CellAddr::Main { row: 1, col: 3 }, "2.50".into());
+
+        assert_eq!(numeric_columns(&grid), vec![0, 3]);
+    }
+
+    /// A blank-looking numeric string (`"   "`) is not a value, and a column
+    /// with only such cells is not offered.
+    #[test]
+    fn numeric_columns_ignores_whitespace_only_cells() {
+        let mut grid = GridBox::from(Grid::new(2, 2));
+        grid.set(&CellAddr::Main { row: 0, col: 0 }, "   ".into());
+        grid.set(&CellAddr::Main { row: 1, col: 1 }, "7".into());
+        assert_eq!(numeric_columns(&grid), vec![1]);
+    }
+
+    /// The drop-down list and the auto-detected default must agree: whenever
+    /// `choose_balance_column` picks a column, that column is in
+    /// `numeric_columns`.
+    #[test]
+    fn chosen_balance_column_is_always_offered() {
+        let mut grid = GridBox::from(Grid::new(3, 3));
+        grid.set(&CellAddr::Main { row: 0, col: 1 }, "5".into());
+        grid.set(&CellAddr::Main { row: 1, col: 1 }, "-5".into());
+        let auto = choose_balance_column(&grid).expect("a mixed-sign column exists");
+        assert!(numeric_columns(&grid).contains(&auto));
     }
 }

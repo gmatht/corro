@@ -1045,7 +1045,7 @@ impl TabDrag {
     /// in-progress drag (a menu action adding or deleting a sheet), so this
     /// guards the preview paint rather than indexing blindly.
     fn index_in_range(&self, len: usize) -> bool {
-        len > 0 && self.from < len && self.to < len
+        len > 0 && self.from < len && self.to <= len
     }
 }
 
@@ -1073,7 +1073,7 @@ fn tab_drop_index(hits: &[TabHit], x: f64) -> usize {
             return i;
         }
     }
-    hits.len() - 1
+    hits.len()
 }
 
 /// Lay out sheet tabs left to right from x=2: each tab pads its measured
@@ -3810,9 +3810,29 @@ fn delegate_shared_action(name: &str, state: &Rc<GuiState>) {
             // The dialog owns three choices the old single-field prompt threw
             // away (see `MenuDispatch::BalanceBooks`). The callback runs later,
             // on the GTK main loop, so it reaches the app through the same
-            // published state the menu actions use.
+            // published state the menu actions use. The column drop-down is
+            // built from the workbook's non-blank numeric columns, so the list
+            // only offers columns that can actually score rows; the
+            // auto-detected column stays preselected.
+            //
+            // Labels are bare column names ("A", "B", ...) because the chosen
+            // label flows back as `BalanceChoice.column`, which
+            // `run_balance_books` parses as an Excel column expression.
+            let (column_choices, initial_column) = {
+                let app = state.app_ref();
+                let grid = &app.core.workbook.active_sheet().grid;
+                let cols = crate::balance::numeric_columns(grid);
+                let labels: Vec<String> = cols
+                    .iter()
+                    .map(|&c| crate::addr::excel_column_name(c))
+                    .collect();
+                let initial = crate::balance::choose_balance_column(grid)
+                    .and_then(|auto| cols.iter().position(|&c| c == auto))
+                    .unwrap_or(0);
+                (labels, initial)
+            };
             let state2 = state.clone();
-            dialogs::balance_books_dialog(move |choice| {
+            dialogs::balance_books_dialog(&column_choices, initial_column, move |choice| {
                 if let Some(choice) = choice {
                     let app = state2.app_mut();
                     super::actions::run_balance_books(app, &choice);
@@ -6232,9 +6252,10 @@ mod tab_tests {
         // Past the first midpoint -> slot 1.
         assert_eq!(tab_drop_index(&hits, 51.0), 1);
         assert_eq!(tab_drop_index(&hits, 150.0), 1);
-        // Past the last midpoint -> the final slot.
+        // Past the last midpoint -> past the final tab: a drop slot *after*
+        // the last sheet, so the slot range is 0..=len (not 0..len-1).
         assert_eq!(tab_drop_index(&hits, 260.0), 2);
-        assert_eq!(tab_drop_index(&hits, 9999.0), 2);
+        assert_eq!(tab_drop_index(&hits, 9999.0), 3, "past every tab drops at the end");
         // No tabs at all: slot 0, never an underflow.
         assert_eq!(tab_drop_index(&[], 10.0), 0);
     }
@@ -6243,7 +6264,9 @@ mod tab_tests {
     fn tab_drag_index_range_guard() {
         let d = TabDrag { from: 1, to: 2, press_x: 0.0, moved: true };
         assert!(d.index_in_range(3));
-        assert!(!d.index_in_range(2), "to == len is out of range");
+        // `to == len` is the slot after the last tab, which is a valid drop
+        // position (the commit clamps it), so it stays in range.
+        assert!(d.index_in_range(2), "to == len is the after-last slot");
         assert!(!d.index_in_range(0), "an empty strip has no valid slot");
     }
 

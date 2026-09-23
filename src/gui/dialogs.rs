@@ -603,36 +603,59 @@ pub fn sort_dialog<F: FnOnce(Option<(usize, bool)>) + 'static>(_workbook: &Workb
 /// so a GUI user could not ask for the other direction or for a view-only
 /// report. The TUI exposes all three, and this dialog matches it:
 ///
-///   * `Column to Balance:` — which numeric column scores the rows;
+///   * `Column to Balance:` — which numeric column scores the rows, offered as
+///     a drop-down of `column_choices` (the caller passes the non-blank,
+///     numeric-bearing columns, so the list cannot point at a column that
+///     would balance to nothing);
 ///   * `Report Type:` — View only (default, as in the TUI) or Persisted report;
 ///   * `Balance direction:` — PosToNeg or NegToPos;
 ///   * `Generate` / `Cancel`.
 ///
+/// `column_choices` are the labels the drop-down shows; `initial_column` is the
+/// index preselected (the caller's auto-detected column, or 0). An empty
+/// `column_choices` still opens the dialog — the column then stays empty and
+/// `run_balance_books` falls back to its own auto-detection.
+///
 /// Returns `None` on cancel.
-pub fn balance_books_dialog<F: FnOnce(Option<BalanceChoice>) + 'static>(on_result: F) {
+pub fn balance_books_dialog<F: FnOnce(Option<BalanceChoice>) + 'static>(
+    column_choices: &[String],
+    initial_column: usize,
+    on_result: F,
+) {
     #[cfg(feature = "gui")]
     {
-        use rswidgets::common::{Entry as CommonEntry, Orientation};
+        use rswidgets::common::Orientation;
 
         // The widget types differ per backend exactly as in `sort_dialog`.
         // These are the adapter types `create_checkbutton` / `create_radiobutton`
-        // actually return on each backend (the prelude's names differ).
+        // / `create_dropdown` actually return on each backend (the prelude's
+        // names differ).
         #[cfg(target_os = "linux")]
-        use rswidgets::backends_gtk_adapter::{CheckButton, RadioButton};
+        use rswidgets::backends_gtk_adapter::{CheckButton, DropDown, RadioButton};
         #[cfg(windows)]
-        use rswidgets::backends_nwg_adapter::{CheckButton, RadioButton};
+        use rswidgets::backends_nwg_adapter::{CheckButton, DropDown, RadioButton};
         #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-        use rswidgets::prelude::{CheckButton, RadioButton};
+        use rswidgets::prelude::{CheckButton, DropDown, RadioButton};
 
         if let Ok(rxapp) = rswidgets::App::init() {
+            // A drop-down needs at least one row to be usable; when no numeric
+            // column exists fall back to a single placeholder so the widget is
+            // well-formed, and the commit treats it as "no explicit column"
+            // (run_balance_books then auto-detects and reports honestly).
+            let labels: Vec<&str> = if column_choices.is_empty() {
+                vec!["(no numeric column found)"]
+            } else {
+                column_choices.iter().map(String::as_str).collect()
+            };
+            let no_choices = column_choices.is_empty();
             let built = (
                 rxapp.new_dialog(),
-                rxapp.new_entry(),
+                rxapp.create_dropdown(&labels),
                 rxapp.create_checkbutton("Persisted report"),
                 rxapp.create_radiobutton(None, "Match +ve number with multiple -ve numbers"),
                 rxapp.new_box(Orientation::Vertical, 6),
             );
-            if let (Ok(dialog), Ok(entry), Ok(persist), Ok(pos_neg), Ok(vbox)) = built {
+            if let (Ok(dialog), Ok(column), Ok(persist), Ok(pos_neg), Ok(vbox)) = built {
                 dialog.set_title("Balance books");
                 dialog.set_default_size(420, 260);
 
@@ -645,8 +668,15 @@ pub fn balance_books_dialog<F: FnOnce(Option<BalanceChoice>) + 'static>(on_resul
                 if let Ok(l) = rxapp.new_label("Column to Balance:") {
                     vbox.append(&l);
                 }
-                entry.set_hexpand(true);
-                vbox.append(&entry);
+                column.set_hexpand(true);
+                // Preselect the caller's column, clamped into range.
+                let initial = if no_choices {
+                    0
+                } else {
+                    initial_column.min(column_choices.len() - 1)
+                };
+                column.set_active(Some(initial as u32));
+                vbox.append(&column);
 
                 if let Ok(l) = rxapp.new_label("Report Type:") {
                     vbox.append(&l);
@@ -675,9 +705,12 @@ pub fn balance_books_dialog<F: FnOnce(Option<BalanceChoice>) + 'static>(on_resul
                 // The widgets outlive the callback, so they are moved to the
                 // heap and referred to by pointer (the same lifetime trick
                 // `sort_dialog` uses).
-                let entry_ptr = Box::into_raw(Box::new(entry)) as usize;
+                let column_ptr = Box::into_raw(Box::new(column)) as usize;
                 let persist_ptr = Box::into_raw(Box::new(persist)) as usize;
                 let neg_pos_ptr = neg_pos.ok().map(|r| Box::into_raw(Box::new(r)) as usize);
+                // The response closure is `'static`, so it owns a copy of the
+                // choices it maps the drop-down index back through.
+                let column_choices_owned: Vec<String> = column_choices.to_vec();
                 let mut on_result = Some(on_result);
                 let called = std::cell::RefCell::new(false);
                 dialog
@@ -692,7 +725,7 @@ pub fn balance_books_dialog<F: FnOnce(Option<BalanceChoice>) + 'static>(on_resul
                             f(None);
                             return;
                         }
-                        let entry: &CommonEntry = unsafe { &*(entry_ptr as *const CommonEntry) };
+                        let column: &DropDown = unsafe { &*(column_ptr as *const DropDown) };
                         let persist: &CheckButton =
                             unsafe { &*(persist_ptr as *const CheckButton) };
                         let direction = match neg_pos_ptr {
@@ -706,8 +739,22 @@ pub fn balance_books_dialog<F: FnOnce(Option<BalanceChoice>) + 'static>(on_resul
                             }
                             None => BalanceDirection::PosToNeg,
                         };
+                        // The drop-down reports an index; map it back to the
+                        // column label. With no numeric columns the placeholder
+                        // row must not masquerade as a column name, so the
+                        // selection is left empty for run_balance_books to
+                        // auto-detect (and report if it still finds nothing).
+                        let idx = column.get_active();
+                        let selected = if no_choices || idx < 0 {
+                            String::new()
+                        } else {
+                            column_choices_owned
+                                .get(idx as usize)
+                                .cloned()
+                                .unwrap_or_default()
+                        };
                         f(Some(BalanceChoice {
-                            column: entry.get_text().unwrap_or_default(),
+                            column: selected,
                             persist: persist.is_active(),
                             direction,
                         }));
@@ -717,12 +764,14 @@ pub fn balance_books_dialog<F: FnOnce(Option<BalanceChoice>) + 'static>(on_resul
 
                 // The TUI focuses the column field first, so the dialog can be
                 // used without reaching for the mouse.
-                focus_dialog_entry(entry_ptr);
+                let column: &DropDown = unsafe { &*(column_ptr as *const DropDown) };
+                column.grab_focus();
                 let _ = Box::into_raw(Box::new(dialog));
                 return;
             }
         }
     }
+    let _ = (column_choices, initial_column);
     on_result(None);
 }
 
