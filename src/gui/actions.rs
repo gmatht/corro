@@ -599,26 +599,65 @@ pub fn dispatch_menu_action(
         }
         "replay" => {
             // Replay the current file (reload all revisions), matching
-            // ratatui's Replay action. Status text matches.
-            if let Some(ref p) = app.core.path.clone() {
-                if p.exists() {
-                    let mut workbook = crate::ops::WorkbookState::new();
-                    let mut active_sheet = workbook.sheet_id(workbook.active_sheet);
-                    match crate::io::load_workbook_revisions_partial(p, usize::MAX, &mut workbook, &mut active_sheet) {
-                        Ok((off, replay)) => {
-                            app.core.workbook = workbook;
-                            app.core.offset = off;
-                            app.core.ops_applied = replay.op_count;
-                            app.core.cursor = SheetCursor { row: HEADER_ROWS, col: MARGIN_COLS };
-                            MenuDispatch::Status(format!("Replayed {} @ revision {}", p.display(), replay.op_count))
-                        }
-                        Err(e) => MenuDispatch::Status(format!("Replay error: {e}")),
+            // ratatui's Replay action. The reference accepts a detached
+            // source too (`path.or(source_path)`), so a workbook shown from a
+            // movie/revision source can still be replayed before it is saved.
+            let source = app.core.path.clone().or(app.core.source_path.clone());
+            let Some(p) = source else {
+                // Ratatui opens its Open Path prompt here; the backend decides
+                // how to offer that (the GUI opens its file dialog), so report
+                // an actionable status rather than a silent no-op.
+                return MenuDispatch::Status(
+                    "Replay: open a .corro file first (File \u{25b8} Open)".into(),
+                );
+            };
+            if !p.exists() {
+                return MenuDispatch::Status(format!(
+                    "Replay: {} not found",
+                    p.display()
+                ));
+            }
+            if p.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("corro"))
+                != Some(true)
+            {
+                return MenuDispatch::Status(format!(
+                    "Replay: {} is not a .corro log",
+                    p.display()
+                ));
+            }
+            let mut workbook = crate::ops::WorkbookState::new();
+            let mut active_sheet = workbook.sheet_id(workbook.active_sheet);
+            match crate::io::load_workbook_revisions_partial(
+                &p,
+                usize::MAX,
+                &mut workbook,
+                &mut active_sheet,
+            ) {
+                Ok((off, replay)) => {
+                    app.core.workbook = workbook;
+                    app.core.workbook.ensure_active_sheet();
+                    app.core.view_sheet_id = active_sheet;
+                    if let Some(idx) = app.core.workbook.sheet_index_by_id(active_sheet) {
+                        app.core.workbook.active_sheet = idx;
+                        app.core.state = app.core.workbook.sheets[idx].state.clone();
                     }
-                } else {
-                    MenuDispatch::Status("Replay: file not found".into())
+                    app.core.offset = off;
+                    app.core.ops_applied = replay.op_count;
+                    app.core.cursor = SheetCursor { row: HEADER_ROWS, col: MARGIN_COLS };
+                    app.core.anchor = None;
+                    // Same revision-browse bookkeeping as the reference, so the
+                    // reloaded log is treated as a browsable revision set
+                    // rather than a fresh edit stream.
+                    app.core.revision_browse = true;
+                    app.core.revision_browse_limit = replay.op_count;
+                    app.core.source_path = Some(p.clone());
+                    MenuDispatch::Status(format!(
+                        "Replayed {} @ revision {}",
+                        p.display(),
+                        replay.op_count
+                    ))
                 }
-            } else {
-                MenuDispatch::Status("Replay: no file loaded".into())
+                Err(e) => MenuDispatch::Status(format!("Replay error: {e}")),
             }
         }
         // NOTE: no "extrapolate" arm here on purpose. Both GUI backends

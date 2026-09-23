@@ -595,6 +595,180 @@ pub fn sort_dialog<F: FnOnce(Option<(usize, bool)>) + 'static>(_workbook: &Workb
     on_result(None);
 }
 
+/// Sort View dialog: a text entry for multi-column sort specs with a
+/// column-picker dropdown populated from the workbook's non-empty columns.
+///
+/// The entry is pre-filled with an example showing two-column sort syntax.
+/// Selecting a column from the dropdown and clicking "Add" appends it to the
+/// entry (with `!` prefix when "Descending" is checked). The user can also
+/// edit the entry directly.
+///
+/// Returns the raw sort-spec string (e.g. `"A,B"`, `"!C,D"`) on Sort, or
+/// `None` on Cancel.
+///
+/// `workbook` is only consumed with the `gui` feature (it derives the column
+/// list); without it this degrades to "no dialog, report cancel", so it is
+/// unused there by design.
+#[cfg_attr(not(feature = "gui"), allow(unused_variables))]
+pub fn sort_view_dialog<F: FnOnce(Option<String>) + 'static>(
+    workbook: &WorkbookState,
+    on_result: F,
+) {
+    #[cfg(feature = "gui")]
+    {
+        use crate::grid::CellAddr;
+        use rswidgets::common::{Entry as CommonEntry, Orientation};
+
+        #[cfg(target_os = "linux")]
+        use rswidgets::backends_gtk_adapter::{CheckButton, DropDown};
+        #[cfg(windows)]
+        use rswidgets::backends_nwg_adapter::{CheckButton, DropDown};
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        use rswidgets::prelude::{CheckButton, DropDown};
+
+        // Collect non-empty columns from the active sheet.
+        let sheet = workbook.active_sheet();
+        let mc = sheet.grid.main_cols();
+        let mut col_names: Vec<String> = Vec::new();
+        for c in 0..mc {
+            let has_content = (0..sheet.grid.main_rows()).any(|r| {
+                sheet
+                    .grid
+                    .get(&CellAddr::Main { row: r as u32, col: c as u32 })
+                    .is_some_and(|v| !v.is_empty())
+            });
+            if has_content {
+                col_names.push(crate::addr::excel_column_name(c));
+            }
+        }
+        // Fall back to at least A–E so the dialog is never empty.
+        if col_names.is_empty() {
+            for c in 0..mc.min(5) {
+                col_names.push(crate::addr::excel_column_name(c));
+            }
+        }
+        let col_refs: Vec<&str> = col_names.iter().map(|s| s.as_str()).collect();
+
+        if let Ok(rxapp) = rswidgets::App::init() {
+            let built = (
+                rxapp.new_dialog(),
+                rxapp.new_entry(),
+                rxapp.create_dropdown(&col_refs),
+                rxapp.create_checkbutton("Descending"),
+                rxapp.new_box(Orientation::Vertical, 6),
+                rxapp.new_box(Orientation::Horizontal, 4),
+            );
+            if let (Ok(dialog), Ok(entry), Ok(dd), Ok(desc_chk), Ok(vbox), Ok(picker)) = built {
+                dialog.set_title("Sort view");
+                dialog.set_default_size(380, 220);
+
+                // Hint with example syntax.
+                if let Ok(l) = rxapp.new_label(
+                    "Sort by columns (left = primary).  e.g. A,B sorts by A then B; \
+                     ! prefix = descending (e.g. !A,B).",
+                ) {
+                    vbox.append(&l);
+                }
+
+                // Editable sort-spec entry.
+                entry.set_hexpand(true);
+                // Pre-fill with an example using the first two non-empty columns,
+                // or the first column if only one exists.
+                let example = if col_names.len() >= 2 {
+                    format!("{},{}", col_names[0], col_names[1])
+                } else if !col_names.is_empty() {
+                    col_names[0].clone()
+                } else {
+                    "A".into()
+                };
+                entry.set_text(&example);
+                vbox.append(&entry);
+
+                // Column picker row: dropdown + descending checkbox + Add button.
+                if let Ok(l) = rxapp.new_label("Add column:") {
+                    vbox.append(&l);
+                }
+                dd.set_hexpand(true);
+                picker.append(&dd);
+                picker.append(&desc_chk);
+                vbox.append(&picker);
+
+                dialog.append_content_area(&vbox);
+                dialog.add_button("Cancel", 0);
+                dialog.add_button("Sort", 1);
+
+                // Leak widgets so the closures can reference them.
+                let entry_ptr = Box::into_raw(Box::new(entry)) as usize;
+                let dd_ptr = Box::into_raw(Box::new(dd)) as usize;
+                let desc_ptr = Box::into_raw(Box::new(desc_chk)) as usize;
+
+                // Wire the dropdown change to auto-append the selected column
+                // to the entry when the user picks one.
+                {
+                    let dd_ref: &DropDown = unsafe { &*(dd_ptr as *const DropDown) };
+                    // Connect dropdown "changed" signal: when user selects a column.
+                    let entry_ptr2 = entry_ptr;
+                    let dd_ptr2 = dd_ptr;
+                    let desc_ptr2 = desc_ptr;
+                    dd_ref.connect_changed(move || {
+                        let entry: &CommonEntry = unsafe { &*(entry_ptr2 as *const CommonEntry) };
+                        let dd: &DropDown = unsafe { &*(dd_ptr2 as *const DropDown) };
+                        let desc: &CheckButton = unsafe { &*(desc_ptr2 as *const CheckButton) };
+                        let idx = dd.get_active();
+                        if idx < 0 {
+                            return;
+                        }
+                        let idx = idx as usize;
+                        if idx >= col_names.len() {
+                            return;
+                        }
+                        let name = &col_names[idx];
+                        let mut current = entry.get_text().unwrap_or_default();
+                        if !current.is_empty() && !current.ends_with(',') {
+                            current.push(',');
+                        }
+                        if desc.is_active() {
+                            current.push('!');
+                        }
+                        current.push_str(name);
+                        entry.set_text(&current);
+                    }).ok();
+                }
+
+                // Wire OK/Cancel.
+                let entry_ptr2 = entry_ptr;
+                let mut on_result = Some(on_result);
+                let called = std::cell::RefCell::new(false);
+                dialog.connect_response(move |response_id| {
+                    let mut done = called.borrow_mut();
+                    if *done {
+                        return;
+                    }
+                    *done = true;
+                    let Some(f) = on_result.take() else { return };
+                    if response_id == 1 {
+                        let entry: &CommonEntry = unsafe { &*(entry_ptr2 as *const CommonEntry) };
+                        let text = entry.get_text().unwrap_or_default();
+                        if text.trim().is_empty() {
+                            f(None);
+                        } else {
+                            f(Some(text));
+                        }
+                    } else {
+                        f(None);
+                    }
+                }).ok();
+
+                dialog.present();
+                focus_dialog_entry(entry_ptr);
+                let _ = Box::into_raw(Box::new(dialog));
+                return;
+            }
+        }
+    }
+    on_result(None);
+}
+
 /// The Balance Books dialog: column, report type and direction.
 ///
 /// Mirrors the TUI's `Mode::BalanceBooks` field for field

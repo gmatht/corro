@@ -4282,6 +4282,14 @@ fn handle_menu_action(name: &str, state: &Rc<GuiState>) {
                         refresh_after_dialog(&st);
                     }
                 });
+            } else if action == "sort_view" {
+                let wb = st.app_ref().core.workbook.clone();
+                dialogs::sort_view_dialog(&wb, move |result| {
+                    if let Some(text) = result {
+                        run_prompt_action(st.app_mut(), &action, &text);
+                        refresh_after_dialog(&st);
+                    }
+                });
             } else {
                 let (title, ok, initial) = {
                     let app = st.app_ref();
@@ -4315,7 +4323,40 @@ fn handle_menu_action(name: &str, state: &Rc<GuiState>) {
         "submenu" => {
             app.core.status = "Menu action: submenu placeholder (never dispatched)".into();
         }
-        "replay" | "duplicate" | "sheet_prev" | "sheet_next" | "move_sheet" => {
+        "replay" => {
+            // Shared replay logic (reload every revision from the bound file,
+            // or from a detached source). Ratatui falls back to its Open Path
+            // prompt when no path is bound; the GUI equivalent is its file
+            // dialog, so offer to open one instead of leaving the user with
+            // only a status saying nothing happened.
+            let has_source = {
+                let app = state.app_ref();
+                app.core.path.is_some() || app.core.source_path.is_some()
+            };
+            if has_source {
+                delegate_shared_action(name, state);
+            } else if let Some(path) = dialogs::file_open_dialog() {
+                match crate::io::load_workbook_file(&path) {
+                    Ok(workbook) => {
+                        let app = state.app_mut();
+                        app.core.workbook = workbook;
+                        app.core.workbook.ensure_active_sheet();
+                        app.core.view_sheet_id =
+                            app.core.workbook.sheet_id(app.core.workbook.active_sheet);
+                        app.core.offset = 0;
+                        app.core.ops_applied = 0;
+                        app.core.path = Some(path.clone());
+                        app.core.status = format!("Replayed {}", path.display());
+                        refresh_after_dialog(state);
+                    }
+                    Err(e) => {
+                        state.app_mut().core.status = format!("Replay error: {e}");
+                        refresh_after_dialog(state);
+                    }
+                }
+            }
+        }
+        "duplicate" | "sheet_prev" | "sheet_next" | "move_sheet" => {
             // Shared workbook logic (same as pancurses/ratatui).
             delegate_shared_action(name, state);
         }
