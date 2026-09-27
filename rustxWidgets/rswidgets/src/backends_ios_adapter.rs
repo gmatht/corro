@@ -564,14 +564,19 @@ mod ios_adapter {
             if self.0.is_null() {
                 return;
             }
+            core_ios::log_ios("set_fixed_width: sending corroSetPinnedWidth:");
             unsafe {
                 msg1iv(self.0, "corroSetPinnedWidth:", w.unwrap_or(-1) as isize);
+            }
+            core_ios::log_ios("set_fixed_width: corroSetPinnedWidth ok");
+            unsafe {
                 msg1iv(
                     self.0,
                     "corroSetContentHugging:",
                     if w.is_some() { 1000 } else { 250 },
                 );
             }
+            core_ios::log_ios("set_fixed_width: corroSetContentHugging ok");
             unsafe { msg0v(self.0, "setNeedsLayout") };
         }
 
