@@ -48,7 +48,23 @@ on:
       - "rustxWidgets/rswidgets/src/backends/apple.rs"
       - "rustxWidgets/rswidgets/src/backends_macos_adapter.rs"
       - "rustxWidgets/rswidgets/src/apple_generator.rs"
+      # The shared GUI pipeline and the *other* Apple adapter, deliberately.
+      # `backends_ios_adapter.rs` builds on the same `backends/apple.rs` this
+      # workflow checks, so a change there that breaks macOS must not slip
+      # through unnoticed just because it lives in a file named "ios".
+      - "rustxWidgets/rswidgets/src/backends_ios_adapter.rs"
       - "src/gui/macos_backend.rs"
+      # ...and the shared code these two platforms both compile. `gui_backend`
+      # and `ui` are the tree the macOS host runs, so a change there is a
+      # change to the macOS build; the earlier filter omitted them and a
+      # commit touching only `src/ui/mod.rs` produced NO run at all, which
+      # looked like the workflow being green rather than never having run.
+      - "src/gui/gui_backend.rs"
+      - "src/ui/**"
+      - "src/gui/actions.rs"
+      - "src/gui/menu.rs"
+      - "src/gui/mod.rs"
+      - "src/lib.rs"
       - "tests/macos_pipeline_preview.rs"
       - ".github/workflows/macos.yml"
   pull_request:
@@ -57,8 +73,14 @@ on:
       - "rustxWidgets/rswidgets/src/backends/macos.rs"
       - "rustxWidgets/rswidgets/src/backends/apple.rs"
       - "rustxWidgets/rswidgets/src/backends_macos_adapter.rs"
-      - "rustxWidgets/rswidgets/src/apple_generator.rs"
+      - "rustxWidgets/rswidgets/src/backends_ios_adapter.rs"
       - "src/gui/macos_backend.rs"
+      - "src/gui/gui_backend.rs"
+      - "src/ui/**"
+      - "src/gui/actions.rs"
+      - "src/gui/menu.rs"
+      - "src/gui/mod.rs"
+      - "src/lib.rs"
       - "tests/macos_pipeline_preview.rs"
 
 env:
