@@ -361,6 +361,14 @@ jobs:
             # its readiness marker. It is still foreground: `simctl terminate`
             # has not run, so there is nothing for a re-activation to achieve.
             sleep 3
+            # Is the app still running? A screenshot of a dead process is a
+            # screenshot of the springboard, which is the failure this whole
+            # step exists to catch, and "is it corro's sheet" cannot tell that
+            # from a live-but-wrong frame. `simctl spawn launchctl list` is
+            # the one probe that answers it.
+            if ! "${SIMCTL[@]}" spawn "$SIM_UDID" launchctl list 2>/dev/null | grep -q corro; then
+              echo "::warning::the app is no longer running at attempt ${attempt}"
+            fi
             "${SIMCTL[@]}" io "$SIM_UDID" screenshot "$SHOT" >/dev/null 2>&1 || true
             # `--populated`, not just the light-surface gate: the chrome draws
             # before the scripted edits land, so a plain light-surface check
