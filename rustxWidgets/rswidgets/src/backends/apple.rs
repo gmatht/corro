@@ -599,6 +599,13 @@ pub fn dispatch_callback(id: u64) {
             None => None,
         }
     };
+    // Unconditional, because this is the boundary where "did the trampoline
+    // fire at all" is decided. A per-caller counter could not answer it: the
+    // periodic tick's own body never ran, so the counter was itself inside
+    // the thing being measured, and a timer that fires once and then stops is
+    // indistinguishable from one that never fires without a log that is not
+    // downstream of the fault.
+    log_apple(&format!("callback {id} fired"));
     if let Some(raw) = raw {
         // SAFETY: the registry owns this closure for the process
         // lifetime (entries are never dropped, only replaced), and
