@@ -41,7 +41,7 @@ mod ios_adapter {
 
     use crate::backends::ios::{
         self as core_ios, alloc_init, cls, msg0, msg0i, msg0v, msg1bv, msg1cv, msg1i, msg1iv,
-        msg1v, msg4cv, nsstring, nsstring_to_rust, own, Kind, WidgetMeta,
+        msg1v, msg1vi, msg4cv, nsstring, nsstring_to_rust, own, Kind, WidgetMeta,
     };
     use crate::core::{DrawContext, Error, Widget};
 
@@ -2309,7 +2309,9 @@ mod ios_adapter {
         );
         let title = nsstring(label);
         if !title.is_null() {
-            unsafe { msg1v(btn, "setTitle:forState:", title) };
+            // UIControlStateNormal == 0. Two arguments, so `msg1vi` -
+            // `msg1v` would leave `forState:` reading a stale register.
+            unsafe { msg1vi(btn, "setTitle:forState:", title, 0) };
         }
         // Minimum touch target, in points.
         unsafe { set_frame(btn, 0.0, 0.0, 0.0, MIN_TOUCH_PT) };
@@ -2321,14 +2323,21 @@ mod ios_adapter {
         if lbl.is_null() {
             return Ok(Label(lbl));
         }
+        core_ios::log_ios("create_label: constructed UILabel");
         core_ios::with_meta_mut(lbl, |m| m.text = text.to_owned());
         let s = nsstring(text);
         if !s.is_null() {
             unsafe { msg1v(lbl, "setText:", s) };
         }
+        core_ios::log_ios("create_label: setText ok");
         // `adjustsFontSizeToFitWidth` keeps a long status line inside the
         // screen instead of clipping it (a phone has no room for overflow).
+        //
+        // It is the one call here whose BOOL is sent through a Rust `bool`.
+        // A foreign throw is uncatchable, so each step is marked; see
+        // `alloc_init_class` for why that makes a difference.
         unsafe { msg1bv(lbl, "setAdjustsFontSizeToFitWidth:", true) };
+        core_ios::log_ios("create_label: setAdjustsFontSizeToFitWidth ok");
         Ok(Label(lbl))
     }
 
@@ -2503,7 +2512,7 @@ mod ios_adapter {
         let s = nsstring(label);
         if !s.is_null() {
             unsafe {
-                msg1v(rb, "setTitle:forState:", s);
+                msg1vi(rb, "setTitle:forState:", s, 0);
                 // Selection state is the radio indicator; the host shim draws
                 // the group's exclusivity.
                 msg1iv(rb, "setSelected:", 0);

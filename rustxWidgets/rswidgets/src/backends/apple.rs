@@ -188,6 +188,29 @@ pub unsafe fn msg1iv(obj: *mut std::os::raw::c_void, selname: &str, v: isize) {
     unsafe { f(obj, sel(selname), v) }
 }
 
+/// `void (*)(id, SEL, id, NSInteger)` — a setter taking an object and a
+/// state/flag integer, e.g. `-setTitle:forState:`.
+///
+/// Needed as its own wrapper because [`msg1v`] passes exactly one argument.
+/// Sending a two-part selector through it leaves the second register
+/// whatever the call happened to hold, so `forState:` arrives as garbage —
+/// and if the value is out of range for the state enum, UIKit raises, which
+/// is a *foreign* exception no `catch_unwind` can intercept.
+pub unsafe fn msg1vi(
+    obj: *mut std::os::raw::c_void,
+    selname: &str,
+    a: *mut std::os::raw::c_void,
+    b: isize,
+) {
+    let f: unsafe extern "C" fn(
+        *mut std::os::raw::c_void,
+        *mut std::os::raw::c_void,
+        *mut std::os::raw::c_void,
+        isize,
+    ) = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+    unsafe { f(obj, sel(selname), a, b) }
+}
+
 /// `void (*)(id, SEL, CGFloat)` — setters taking a point value
 /// (`setHeadIndent:`, `constraintEqualToConstant:`). Split by width for the
 /// same reason as [`msg4cv`]: `CGFloat` is `double` on 64-bit and `float` on
