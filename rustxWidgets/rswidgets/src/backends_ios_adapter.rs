@@ -1297,7 +1297,13 @@ mod ios_adapter {
     // `DrawContext` contract, it is available on every iOS version back to
     // 2.0, and it needs no shader pipeline. See IOS_GUIDELINES.md §5.
 
-    #[link(name = "CoreGraphics")]
+    // `kind = "framework"` — CoreGraphics is an umbrella framework, not a
+    // `libCoreGraphics.dylib`, so the link flag must be `-framework
+    // CoreGraphics` and not the `-lCoreGraphics` a bare `#[link(name=...)]`
+    // produces. The plain spelling happens to go unnoticed here because a
+    // staticlib is archived rather than linked (the macOS host crate also
+    // builds a cdylib, which *is* linked, and CI caught it there).
+    #[link(name = "CoreGraphics", kind = "framework")]
     unsafe extern "C" {
         fn CGContextSetRGBFillColor(ctx: *mut c_void, r: f64, g: f64, b: f64, a: f64);
         fn CGContextSetRGBStrokeColor(ctx: *mut c_void, r: f64, g: f64, b: f64, a: f64);

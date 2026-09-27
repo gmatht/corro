@@ -1363,7 +1363,20 @@ mod macos_adapter {
     // *drawing* is reached through a host view (and its framework), not
     // through the runtime layer.
 
-    #[link(name = "CoreGraphics")]
+    // `kind = "framework"`, and that word is load-bearing: without it rustc
+    // emits `-lCoreGraphics`, which ld cannot resolve — CoreGraphics is an
+    // umbrella *framework*, not a `libCoreGraphics.dylib`, so the only correct
+    // flag is `-framework CoreGraphics` (the form IOS_GUIDELINES.md §8 records
+    // for the iOS link step). The plain spelling only went unnoticed because
+    // `ios/corro` builds a **staticlib**, which is merely archived and never
+    // linked, so the bad flag was never passed to ld there. `macos/corro` also
+    // builds a **cdylib**, which *is* linked, and the very first CI run failed
+    // with `ld: library 'CoreGraphics' not found`.
+    //
+    // The same applies to `objc` in `backends/apple.rs` for the same crate —
+    // but `-lobjc` happens to resolve on a Mac (there is a real
+    // `libobjc.A.dylib` in the SDK), so it is left alone rather than churned.
+    #[link(name = "CoreGraphics", kind = "framework")]
     unsafe extern "C" {
         fn CGContextSetRGBFillColor(ctx: *mut c_void, r: f64, g: f64, b: f64, a: f64);
         fn CGContextSetRGBStrokeColor(ctx: *mut c_void, r: f64, g: f64, b: f64, a: f64);
